@@ -1,0 +1,49 @@
+host = "127.0.0.1"
+port = 3456
+local_key = "ato-local-dev"
+default_channel = "anthropic"
+active_provider_id = "zai-anthropic"
+workspace_fingerprint = "default-workspace"
+updated_at = "2026-06-18T00:00:00Z"
+
+[[providers]]
+id = "zai-anthropic"
+name = "Z.ai"
+base_url = "https://api.z.ai/api/anthropic"
+channel = "anthropic"
+enabled = true
+created_at = "2026-06-18T00:00:00Z"
+updated_at = "2026-06-18T00:00:00Z"
+
+[[providers.models]]
+id = "GLM-5.2"
+display_name = "GLM-5.2"
+context_window = 1000000
+supports_tools = true
+supports_streaming = true
+enabled = true
+
+[[providers.models]]
+id = "GLM-5-Turbo"
+display_name = "GLM-5-Turbo"
+context_window = 200000
+supports_tools = true
+supports_streaming = true
+enabled = true
+
+[[route_profiles]]
+name = "anthropic"
+client_channel = "anthropic"
+upstream_channel = "anthropic"
+provider_id = "zai-anthropic"
+long_context_threshold = 60000
+
+[cache]
+enabled = true
+exact_enabled = true
+semantic_enabled = true
+semantic_threshold = 0.985
+max_age_seconds = 86400
+max_entries = 10000
+persist_encrypted = true
+prewarm_enabled = false
