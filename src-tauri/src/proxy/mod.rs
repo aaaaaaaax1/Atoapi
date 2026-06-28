@@ -59,6 +59,7 @@ struct UpstreamRequestDiagnostics {
     headers_ms: u64,
     gzip_attempted: bool,
     gzip_fallback_used: bool,
+    gzip_skipped_cold_stream: bool,
     sent_body_bytes: u64,
 }
 
@@ -70,6 +71,7 @@ impl UpstreamRequestDiagnostics {
         self.headers_ms += next.headers_ms;
         self.gzip_attempted |= next.gzip_attempted;
         self.gzip_fallback_used |= next.gzip_fallback_used;
+        self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
         self.sent_body_bytes = next.sent_body_bytes;
     }
 }
@@ -1223,6 +1225,14 @@ async fn handle_generation(
         prefix_state_update_key = None;
     }
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
+    let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
+        &state,
+        &active_request_channel,
+        provider_prefix_control_key.as_deref(),
+        client_requested_stream,
+        &active_upstream_body,
+    )
+    .await;
     let send_outcome = match send_main_upstream_request(
         &state,
         &active_url,
@@ -1230,7 +1240,7 @@ async fn handle_generation(
         &active_request_channel,
         &active_upstream_body,
         skip_prefix_guard_for_sync_responses,
-        decision.provider.request_body_gzip_enabled,
+        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
         !client_requested_stream,
     )
     .await
@@ -1248,6 +1258,7 @@ async fn handle_generation(
         }
     };
     upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+    upstream_request_diagnostics.gzip_skipped_cold_stream |= skip_gzip_for_cold_stream;
     let mut upstream = send_outcome.response;
     let mut upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
 
@@ -3229,6 +3240,26 @@ fn upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
     }
 }
 
+async fn should_skip_request_body_gzip_for_cold_stream(
+    state: &AppState,
+    channel: &Channel,
+    provider_prefix_control_key: Option<&str>,
+    client_requested_stream: bool,
+    body: &Value,
+) -> bool {
+    if !client_requested_stream || !matches!(channel, Channel::Responses) {
+        return false;
+    }
+    if upstream_request_body_bytes(channel, body).len() < 614_400 {
+        return false;
+    }
+    let Some(key) = provider_prefix_control_key else {
+        return false;
+    };
+    let states = state.prefix_states.lock().await;
+    !states.contains_key(key)
+}
+
 fn gzip_request_body(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(bytes)?;
@@ -3275,6 +3306,9 @@ async fn note_request_body_gzip_fallback(state: &AppState, key: &str) {
 }
 
 fn upstream_header_wait_class(diagnostics: &UpstreamRequestDiagnostics) -> String {
+    if diagnostics.gzip_skipped_cold_stream {
+        return "cold_stream_gzip_skipped".to_string();
+    }
     if diagnostics.attempts > 1 || diagnostics.retry_wait_ms > 0 {
         return "retry_header_wait".to_string();
     }
@@ -17308,6 +17342,55 @@ mod tests {
         assert!(!request_body_gzip_cooldown_active(&state, &key).await);
         note_request_body_gzip_fallback(&state, &key).await;
         assert!(request_body_gzip_cooldown_active(&state, &key).await);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn cold_large_responses_stream_skips_first_gzip_attempt() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cold-stream-gzip-skip-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{
+                "role": "user",
+                "content": "x".repeat(700_000)
+            }]
+        });
+
+        assert!(
+            should_skip_request_body_gzip_for_cold_stream(
+                &state,
+                &Channel::Responses,
+                Some("ls\0gpt-5.5\0responses\0stable-prefix"),
+                true,
+                &body,
+            )
+            .await,
+            "a first large streaming request to an exact-cold provider must avoid an extra gzip fallback attempt"
+        );
+
+        state.prefix_states.lock().await.insert(
+            "ls\0gpt-5.5\0responses\0stable-prefix".to_string(),
+            prefix_state(160_000, 159_744, 0),
+        );
+        assert!(
+            !should_skip_request_body_gzip_for_cold_stream(
+                &state,
+                &Channel::Responses,
+                Some("ls\0gpt-5.5\0responses\0stable-prefix"),
+                true,
+                &body,
+            )
+            .await,
+            "once the same upstream has exact prefix state, keep the user's gzip setting available"
+        );
 
         fs::remove_dir_all(dir).ok();
     }

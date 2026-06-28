@@ -73,8 +73,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.49";
+const appVersion = "v0.1.50";
 const appVersionNotes = [
+  "v0.1.50: 按当前 v0.1.49 日志修复冷上游大流式请求，exact 热状态不存在时跳过首次 gzip，避免同一主请求内先压缩失败再回退",
+  "v0.1.50: 保留 v0.1.41 主命中线和 v0.1.45+ 压缩兼容成功线，不新增热补、不恢复普通 main session-delta、不增加同步请求",
+  "v0.1.50: 新增底层 cold_stream_gzip_skipped 诊断，便于区分真实上游慢、gzip 失败回退和冷上游保护",
   "v0.1.49: 主命中线恢复到 v0.1.41 稳定基线，压缩线保留 v0.1.45+ 的成功回退和冷却",
   "v0.1.49: 当前版本只恢复正确组合基线，不夹带未验证的 v0.1.48 动态尾巴实验策略",
   "v0.1.49: 后续命中优化必须基于当前真实日志验证，历史正优化只做参考，不直接照搬",
