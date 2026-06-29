@@ -119,8 +119,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.51";
+const appVersion = "v0.1.52";
 const appVersionNotes = [
+  "v0.1.52: 同前缀 cache_read=0 但 previous_seen 已高于 32k 时，新增 cold_read_after_warm 诊断，避免把同类异常简单当成普通冷启动",
+  "v0.1.52: Responses 长空闲后的中等工具尾巴新增 5 秒内探测保护，并允许 512 对齐的中等工具尾巴推进水线，减少下一轮继续掉尾巴",
+  "v0.1.52: 保留 v0.1.51 的 gzip provider/channel 冷却和 prefix_break_isolated 诊断，不新增热补、不新增同步请求、不恢复普通 main session-delta",
   "v0.1.51: 同一上游的 gzip fallback 冷却扩大到 provider/channel 级别，并延长到 6 小时，避免不支持 gzip 的上游在长测试中反复双 attempt",
   "v0.1.51: 低命中 prefix break 不再误标为 full，新增 prefix_break_isolated 底层诊断，避免把大输入低命中异常当作满桶",
   "v0.1.51: 保留 v0.1.50 冷大流式跳过首次 gzip，不新增热补、不新增同步请求、不恢复普通 main session-delta",

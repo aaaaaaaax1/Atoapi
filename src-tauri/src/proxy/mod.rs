@@ -2729,6 +2729,9 @@ fn responses_stale_prefix_recovery_wait(
     }
 
     if !(severe_cold_read || avoidable > 0 || unstable_tail) {
+        if responses_stale_medium_tool_tail_probe(state, current_tail, elapsed) {
+            return Some(responses_foreground_wait_cap());
+        }
         if responses_stale_large_tool_tail_catchup(state, current_tail, elapsed) {
             return Some(TokioDuration::from_secs(5));
         }
@@ -2781,6 +2784,32 @@ fn responses_stale_prefix_recovery_wait(
     };
 
     Some(wait.min(responses_non_avoidable_wait_cap(state)))
+}
+
+fn responses_stale_medium_tool_tail_probe(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    elapsed: std::time::Duration,
+) -> bool {
+    if state.input_tokens < 32_000 || state.cache_read_tokens < 32_000 {
+        return false;
+    }
+    if elapsed < std::time::Duration::from_secs(30)
+        || elapsed > std::time::Duration::from_secs(12 * 60)
+    {
+        return false;
+    }
+    if matches!(
+        current_tail.source.as_deref(),
+        Some("message") | Some("tool_call")
+    ) {
+        return false;
+    }
+    let medium_tail =
+        current_tail.tool_output_chars >= 2_048 || current_tail.largest_tool_output_chars >= 2_048;
+    let not_huge_tail =
+        current_tail.tool_output_chars < 20_000 && current_tail.largest_tool_output_chars < 12_000;
+    medium_tail && not_huge_tail
 }
 
 fn responses_stale_large_tool_tail_catchup(
@@ -3013,6 +3042,12 @@ fn provider_prefix_wait_reason_for_channel(
                 Some("responses_noisy_tool_output_tail_guard_1024".to_string())
             } else if state.tail_tool_output_chars >= 8_000 {
                 Some("responses_large_tool_output_tail_guard".to_string())
+            } else if responses_stale_medium_tool_tail_probe(
+                state,
+                current_tail,
+                state.finished_at.elapsed(),
+            ) {
+                Some("responses_stale_medium_tool_tail_probe".to_string())
             } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
                 Some("responses_current_tail_guard".to_string())
             } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
@@ -3344,8 +3379,13 @@ async fn prefix_lag_diagnostics(
     let ratio = provider_cache_ratio(record).unwrap_or_default();
     let real_provider_shortfall = provider_cache_shortfall(record);
 
+    let previous_seen = provider_prefix_raw_seen_bucket(&previous);
     let classification = if record.cache_read_tokens == 0 && real_provider_shortfall >= 1024 {
-        "cold_start"
+        if previous_seen >= 32_000 {
+            "cold_read_after_warm"
+        } else {
+            "cold_start"
+        }
     } else if current_gap == 0 && real_provider_shortfall >= 4096 && ratio < 0.90 {
         "prefix_break_isolated"
     } else if current_gap == 0 {
@@ -3910,14 +3950,23 @@ fn should_learn_sent_provider_bucket(
     if used_response_session || record.cache_read_tokens == 0 {
         return false;
     }
-    if current_shortfall_128 <= 2048 {
-        return false;
-    }
 
     let Some(previous) = previous else {
         return false;
     };
     if previous.cache_read_tokens == 0 || previous.seen_bucket_tokens_128 == 0 {
+        return false;
+    }
+    if responses_precise_tool_tail_can_learn_sent_bucket(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+    ) {
+        return true;
+    }
+    if current_shortfall_128 <= 2048 {
         return false;
     }
     if !(2560..=4096).contains(&current_shortfall) || current_shortfall % 512 != 0 {
@@ -3939,6 +3988,52 @@ fn should_learn_sent_provider_bucket(
         return false;
     }
     true
+}
+
+fn responses_precise_tool_tail_can_learn_sent_bucket(
+    previous: &PrefixWarmState,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("message") | Some("tool_call")
+    ) {
+        return false;
+    }
+    if tail_input_diagnostics.tool_output_chars < 512
+        && tail_input_diagnostics.largest_tool_output_chars < 512
+    {
+        return false;
+    }
+    if current_shortfall < 512 || current_shortfall > 8192 || current_shortfall % 512 != 0 {
+        return false;
+    }
+    if current_shortfall_128 > current_shortfall.saturating_add(512) {
+        return false;
+    }
+    if record.input_tokens < 32_000 || previous.seen_bucket_tokens_128 < 32_000 {
+        return false;
+    }
+    if responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics) {
+        return false;
+    }
+    if tail_input_diagnostics.tool_output_chars >= 40_000
+        || tail_input_diagnostics.largest_tool_output_chars >= 20_000
+    {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or(0.0);
+    let required_ratio = if current_shortfall <= 2048 {
+        0.97
+    } else if current_shortfall <= 4096 {
+        0.95
+    } else {
+        0.92
+    };
+    ratio >= required_ratio
 }
 
 fn responses_small_avoidable_tail_granularity(
@@ -16031,6 +16126,33 @@ mod tests {
     }
 
     #[test]
+    fn responses_long_idle_medium_tool_tail_gets_probe_guard() {
+        let mut state = prefix_state(89_559, 89_088, 0);
+        state.finished_at = Instant::now() - std::time::Duration::from_secs(90);
+        state.avoidable_shortfall_tokens = 0;
+        state.avoidable_shortfall_tokens_128 = 0;
+        state.shortfall_tokens = 0;
+        state.shortfall_tokens_128 = 0;
+        state.cache_instability_score = 0;
+
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            tool_output_chars: 3_009,
+            largest_tool_output_chars: 3_009,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let wait = provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail);
+        let reason = provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &tail);
+
+        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(
+            reason.as_deref(),
+            Some("responses_stale_medium_tool_tail_probe")
+        );
+    }
+
+    #[test]
     fn responses_huge_mixed_history_tail_does_not_mark_old_waterline_as_avoidable() {
         let current_tail = TailInputDiagnostics {
             input_items: 332,
@@ -16485,6 +16607,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn medium_tool_tail_advances_aligned_bucket_for_next_guard() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-medium-tool-tail-waterline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 90_120,
+            output_tokens: 10,
+            cache_read_tokens: 87_040,
+            cache_creation_tokens: 0,
+        };
+        let medium_tool_tail = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 93_617,
+            output_tokens: 10,
+            cache_read_tokens: 87_040,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            tool_output_chars: 7_558,
+            largest_tool_output_chars: 7_558,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        assert_eq!(provider_cache_shortfall(&medium_tool_tail), 6_144);
+        assert!(should_learn_sent_provider_bucket(
+            state.prefix_states.lock().await.get("main-prefix"),
+            &medium_tool_tail,
+            provider_cache_shortfall(&medium_tool_tail),
+            provider_cache_shortfall_128(&medium_tool_tail),
+            &tail,
+            false
+        ));
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&medium_tool_tail),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(
+            kept.seen_bucket_tokens,
+            provider_cache_bucket_max(medium_tool_tail.input_tokens)
+        );
+        drop(states);
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&medium_tool_tail),
+            Some(&tail),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gap.avoidable_tokens, 6_144);
+        assert_eq!(gap.new_tail_tokens, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn large_low_hit_tool_tail_does_not_advance_sent_bucket() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -16611,6 +16810,53 @@ mod tests {
         assert_eq!(diag.previous_gap_tokens, Some(512));
         assert_eq!(diag.cache_delta_tokens, Some(0));
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn prefix_lag_diagnostic_marks_same_prefix_zero_read_as_cold_read_after_warm() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-lag-cold-read-after-warm-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let previous = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 89_559,
+            output_tokens: 10,
+            cache_read_tokens: 89_088,
+            cache_creation_tokens: 0,
+        };
+        let zero_read = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 89_800,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&previous), false, false)
+            .await;
+        let gap = ProviderCacheGapBreakdown {
+            total_tokens: 0,
+            new_tail_tokens: 0,
+            avoidable_tokens: 0,
+        };
+
+        let diag = prefix_lag_diagnostics(
+            &state,
+            Some("main-prefix"),
+            Some(&zero_read),
+            Some(&gap),
+            &PrefixGuardWaitDiagnostics::default(),
+            &TailInputDiagnostics::default(),
+        )
+        .await;
+
+        assert_eq!(diag.classification.as_deref(), Some("cold_read_after_warm"));
         fs::remove_dir_all(dir).ok();
     }
 
