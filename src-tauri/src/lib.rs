@@ -12,7 +12,8 @@ use admin::{
     apply_enabled_agent_injections, clear_cache, delete_model, delete_provider,
     fetch_provider_models, get_agent_injections, get_config, get_metrics, get_proxy_status,
     reload_config, reveal_provider_api_key, save_cache_policy, save_config, select_provider,
-    set_agent_injection_enabled, start_proxy, stop_proxy, update_agent_injection_route,
+    set_agent_injection_enabled, start_proxy, stop_proxy, test_provider_key,
+    test_provider_key_pool, update_agent_injection_route,
 };
 use state::AppState;
 use std::sync::Arc;
@@ -35,6 +36,8 @@ pub fn run() {
             delete_provider,
             reveal_provider_api_key,
             fetch_provider_models,
+            test_provider_key,
+            test_provider_key_pool,
             add_or_update_model,
             delete_model,
             start_proxy,

@@ -22,6 +22,26 @@ fn default_request_body_gzip_enabled() -> bool {
     false
 }
 
+fn default_compact_compatibility_mode() -> CompactCompatibilityMode {
+    CompactCompatibilityMode::CcSwitchFast
+}
+
+fn default_provider_channel_mode() -> ProviderChannelMode {
+    ProviderChannelMode::Auto
+}
+
+fn default_key_failure_threshold() -> u32 {
+    3
+}
+
+fn default_key_recovery_minutes() -> u32 {
+    5
+}
+
+fn default_key_priority() -> u32 {
+    5
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
@@ -64,6 +84,12 @@ pub struct AppConfig {
     pub cache: CacheConfig,
     #[serde(default = "default_agent_injections")]
     pub agent_injections: Vec<AgentInjectionConfig>,
+    #[serde(default)]
+    pub provider_key_pools: Vec<ProviderKeyPoolConfig>,
+    #[serde(default)]
+    pub provider_compact_modes: Vec<ProviderCompactModeConfig>,
+    #[serde(default)]
+    pub provider_channel_modes: Vec<ProviderChannelModeConfig>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -99,13 +125,177 @@ pub struct ProviderInput {
     #[serde(default)]
     pub is_full_url: bool,
     pub custom_user_agent: Option<String>,
+    #[serde(default = "default_provider_channel_mode")]
+    pub channel_mode: ProviderChannelMode,
     pub channel: Channel,
     #[serde(default = "default_prompt_cache_retention_enabled")]
     pub prompt_cache_retention_enabled: bool,
     #[serde(default = "default_request_body_gzip_enabled")]
     pub request_body_gzip_enabled: bool,
+    #[serde(default)]
+    pub non_sse_compact_compat_enabled: bool,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub key_pool: Option<ProviderKeyPoolInput>,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompactCompatibilityMode {
+    CcSwitchFast,
+    NonSseValidation,
+}
+
+impl Default for CompactCompatibilityMode {
+    fn default() -> Self {
+        Self::CcSwitchFast
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCompactModeConfig {
+    pub provider_id: String,
+    #[serde(default = "default_compact_compatibility_mode")]
+    pub mode: CompactCompatibilityMode,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderChannelMode {
+    Auto,
+    Manual,
+}
+
+impl Default for ProviderChannelMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderChannelModeConfig {
+    pub provider_id: String,
+    #[serde(default = "default_provider_channel_mode")]
+    pub mode: ProviderChannelMode,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyLoadBalanceStrategy {
+    RoundRobin,
+    Priority,
+    LeastUsed,
+    Random,
+    Sequential,
+}
+
+impl Default for KeyLoadBalanceStrategy {
+    fn default() -> Self {
+        Self::RoundRobin
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKeyStatus {
+    Unknown,
+    Healthy,
+    Unhealthy,
+}
+
+impl Default for ProviderKeyStatus {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyPoolConfig {
+    pub provider_id: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub strategy: KeyLoadBalanceStrategy,
+    #[serde(default = "default_key_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_key_recovery_minutes")]
+    pub recovery_minutes: u32,
+    #[serde(default)]
+    pub next_index: usize,
+    #[serde(default)]
+    pub keys: Vec<ProviderKeyConfig>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyConfig {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub key_encrypted: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_key_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub status: ProviderKeyStatus,
+    #[serde(default)]
+    pub total_requests: u64,
+    #[serde(default)]
+    pub successes: u64,
+    #[serde(default)]
+    pub failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_until: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyPoolInput {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub strategy: KeyLoadBalanceStrategy,
+    #[serde(default = "default_key_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_key_recovery_minutes")]
+    pub recovery_minutes: u32,
+    #[serde(default)]
+    pub keys: Vec<ProviderKeyInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyInput {
+    pub id: Option<String>,
+    pub alias: Option<String>,
+    pub key: Option<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_key_priority")]
+    pub priority: u32,
+    #[serde(default)]
+    pub status: ProviderKeyStatus,
+    #[serde(default)]
+    pub total_requests: u64,
+    #[serde(default)]
+    pub successes: u64,
+    #[serde(default)]
+    pub failures: u64,
+    #[serde(default)]
+    pub last_checked_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub disabled_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,14 +420,49 @@ pub struct PublicProvider {
     pub models_url: Option<String>,
     pub is_full_url: bool,
     pub custom_user_agent: Option<String>,
+    pub channel_mode: ProviderChannelMode,
     pub channel: Channel,
     pub prompt_cache_retention_enabled: bool,
     pub request_body_gzip_enabled: bool,
+    pub non_sse_compact_compat_enabled: bool,
     pub has_api_key: bool,
+    pub key_pool: Option<PublicProviderKeyPool>,
     pub models: Vec<ModelConfig>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicProviderKeyPool {
+    pub enabled: bool,
+    pub strategy: KeyLoadBalanceStrategy,
+    pub failure_threshold: u32,
+    pub recovery_minutes: u32,
+    pub available_keys: usize,
+    pub keys: Vec<PublicProviderKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicProviderKey {
+    pub id: String,
+    pub alias: Option<String>,
+    pub preview: String,
+    pub enabled: bool,
+    pub priority: u32,
+    pub status: ProviderKeyStatus,
+    pub total_requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub last_checked_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub disabled_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedProviderKey {
+    pub secret: String,
+    pub key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,8 +478,15 @@ pub struct PublicConfig {
     pub route_profiles: Vec<RouteProfile>,
     pub cache: CacheConfig,
     pub agent_injections: Vec<AgentInjectionConfig>,
+    pub provider_key_pools: Vec<PublicProviderKeyPoolEntry>,
     pub updated_at: DateTime<Utc>,
     pub config_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicProviderKeyPoolEntry {
+    pub provider_id: String,
+    pub pool: PublicProviderKeyPool,
 }
 
 impl Default for AppConfig {
@@ -299,6 +531,9 @@ impl Default for AppConfig {
             ],
             cache: CacheConfig::smart_max_hit(),
             agent_injections: default_agent_injections(),
+            provider_key_pools: Vec::new(),
+            provider_compact_modes: Vec::new(),
+            provider_channel_modes: Vec::new(),
             updated_at: now,
         }
     }
@@ -364,10 +599,14 @@ impl AppConfig {
                     models_url: provider.models_url.clone(),
                     is_full_url: provider.is_full_url,
                     custom_user_agent: provider.custom_user_agent.clone(),
+                    channel_mode: self.provider_channel_mode_for_provider(&provider.id),
                     channel: provider.channel.clone(),
                     prompt_cache_retention_enabled: provider.prompt_cache_retention_enabled,
                     request_body_gzip_enabled: provider.request_body_gzip_enabled,
+                    non_sse_compact_compat_enabled: self
+                        .non_sse_compact_compat_enabled_for_provider(&provider.id),
                     has_api_key: provider.api_key_encrypted.is_some(),
+                    key_pool: self.public_key_pool_for_provider(&provider.id),
                     models: provider.models.clone(),
                     enabled: provider.enabled,
                     created_at: provider.created_at,
@@ -377,6 +616,14 @@ impl AppConfig {
             route_profiles: self.route_profiles.clone(),
             cache: self.cache.clone(),
             agent_injections: self.agent_injections.clone(),
+            provider_key_pools: self
+                .provider_key_pools
+                .iter()
+                .map(|pool| PublicProviderKeyPoolEntry {
+                    provider_id: pool.provider_id.clone(),
+                    pool: public_key_pool(pool),
+                })
+                .collect(),
             updated_at: self.updated_at,
             config_path,
         }
@@ -391,6 +638,198 @@ impl AppConfig {
             .as_deref()
             .map(decrypt_secret)
             .transpose()
+    }
+
+    pub fn select_provider_key_for_request(
+        &mut self,
+        provider_id: &str,
+        exclude_key_id: Option<&str>,
+    ) -> Result<Option<SelectedProviderKey>> {
+        let now = Utc::now();
+        if let Some(pool) = self
+            .provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id && pool.enabled)
+        {
+            let mut candidates = pool
+                .keys
+                .iter()
+                .enumerate()
+                .filter(|(_, key)| {
+                    key.enabled
+                        && key.key_encrypted.is_some()
+                        && key.disabled_until.map(|until| until <= now).unwrap_or(true)
+                        && exclude_key_id.map(|id| id != key.id).unwrap_or(true)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                let selected_index = match pool.strategy {
+                    KeyLoadBalanceStrategy::RoundRobin => {
+                        candidates.sort_unstable();
+                        let selected = candidates
+                            .iter()
+                            .copied()
+                            .find(|index| *index >= pool.next_index)
+                            .unwrap_or(candidates[0]);
+                        pool.next_index = (selected + 1) % pool.keys.len().max(1);
+                        selected
+                    }
+                    KeyLoadBalanceStrategy::Priority => candidates
+                        .into_iter()
+                        .max_by_key(|index| {
+                            let key = &pool.keys[*index];
+                            (
+                                key.priority,
+                                std::cmp::Reverse(key.total_requests),
+                                key.successes,
+                            )
+                        })
+                        .unwrap_or(0),
+                    KeyLoadBalanceStrategy::LeastUsed => candidates
+                        .into_iter()
+                        .min_by_key(|index| {
+                            let key = &pool.keys[*index];
+                            (key.total_requests, std::cmp::Reverse(key.priority))
+                        })
+                        .unwrap_or(0),
+                    KeyLoadBalanceStrategy::Random => {
+                        let seed = now
+                            .timestamp_nanos_opt()
+                            .unwrap_or_else(|| now.timestamp_micros() * 1000)
+                            .unsigned_abs() as usize;
+                        candidates[seed % candidates.len()]
+                    }
+                    KeyLoadBalanceStrategy::Sequential => {
+                        candidates.sort_unstable();
+                        candidates[0]
+                    }
+                };
+                let selected = &mut pool.keys[selected_index];
+                selected.total_requests = selected.total_requests.saturating_add(1);
+                selected.updated_at = now;
+                let secret = selected
+                    .key_encrypted
+                    .as_deref()
+                    .map(decrypt_secret)
+                    .transpose()?;
+                if let Some(secret) = secret {
+                    return Ok(Some(SelectedProviderKey {
+                        secret,
+                        key_id: Some(selected.id.clone()),
+                    }));
+                }
+            }
+        }
+
+        self.provider_api_key(provider_id).map(|key| {
+            key.map(|secret| SelectedProviderKey {
+                secret,
+                key_id: None,
+            })
+        })
+    }
+
+    pub fn mark_provider_key_success(&mut self, provider_id: &str, key_id: Option<&str>) {
+        let Some(key_id) = key_id else {
+            return;
+        };
+        let now = Utc::now();
+        if let Some(key) = self.provider_key_mut(provider_id, key_id) {
+            key.successes = key.successes.saturating_add(1);
+            key.status = ProviderKeyStatus::Healthy;
+            key.last_checked_at = Some(now);
+            key.last_error = None;
+            key.disabled_until = None;
+            key.updated_at = now;
+            self.updated_at = now;
+        }
+    }
+
+    pub fn mark_provider_key_failure(
+        &mut self,
+        provider_id: &str,
+        key_id: Option<&str>,
+        message: &str,
+        force_disable: bool,
+    ) {
+        let Some(key_id) = key_id else {
+            return;
+        };
+        let now = Utc::now();
+        let pool_settings = self
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)
+            .map(|pool| (pool.failure_threshold.max(1), pool.recovery_minutes.max(1)));
+        let Some((failure_threshold, recovery_minutes)) = pool_settings else {
+            return;
+        };
+        if let Some(key) = self.provider_key_mut(provider_id, key_id) {
+            key.failures = key.failures.saturating_add(1);
+            key.status = ProviderKeyStatus::Unhealthy;
+            key.last_checked_at = Some(now);
+            key.last_error = Some(message.chars().take(180).collect());
+            if force_disable || key.failures >= failure_threshold as u64 {
+                key.enabled = false;
+                key.disabled_until = Some(now + chrono::Duration::minutes(recovery_minutes as i64));
+            }
+            key.updated_at = now;
+            self.updated_at = now;
+        }
+    }
+
+    pub fn provider_key_secret(&self, provider_id: &str, key_id: &str) -> Result<Option<String>> {
+        self.provider_key(provider_id, key_id)
+            .and_then(|key| key.key_encrypted.as_deref())
+            .map(decrypt_secret)
+            .transpose()
+    }
+
+    pub fn compact_compatibility_mode_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> CompactCompatibilityMode {
+        self.provider_compact_modes
+            .iter()
+            .find(|item| item.provider_id == provider_id)
+            .map(|item| item.mode.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn non_sse_compact_compat_enabled_for_provider(&self, provider_id: &str) -> bool {
+        self.compact_compatibility_mode_for_provider(provider_id)
+            == CompactCompatibilityMode::NonSseValidation
+    }
+
+    pub fn provider_channel_mode_for_provider(&self, provider_id: &str) -> ProviderChannelMode {
+        self.provider_channel_modes
+            .iter()
+            .find(|item| item.provider_id == provider_id)
+            .map(|item| item.mode.clone())
+            .unwrap_or_default()
+    }
+
+    fn provider_key(&self, provider_id: &str, key_id: &str) -> Option<&ProviderKeyConfig> {
+        self.provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)?
+            .keys
+            .iter()
+            .find(|key| key.id == key_id)
+    }
+
+    fn provider_key_mut(
+        &mut self,
+        provider_id: &str,
+        key_id: &str,
+    ) -> Option<&mut ProviderKeyConfig> {
+        self.provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id)?
+            .keys
+            .iter_mut()
+            .find(|key| key.id == key_id)
     }
 
     pub fn upsert_provider(&mut self, input: ProviderInput) -> Result<String> {
@@ -439,9 +878,223 @@ impl AppConfig {
             });
         }
 
+        if let Some(key_pool) = input.key_pool {
+            self.upsert_provider_key_pool(&id, key_pool)?;
+        }
+        self.upsert_provider_compact_mode(
+            &id,
+            if input.non_sse_compact_compat_enabled {
+                CompactCompatibilityMode::NonSseValidation
+            } else {
+                CompactCompatibilityMode::CcSwitchFast
+            },
+        );
+        self.upsert_provider_channel_mode(&id, input.channel_mode);
+
         self.updated_at = now;
         Ok(id)
     }
+
+    pub fn upsert_provider_compact_mode(
+        &mut self,
+        provider_id: &str,
+        mode: CompactCompatibilityMode,
+    ) {
+        let now = Utc::now();
+        if mode == CompactCompatibilityMode::CcSwitchFast {
+            self.provider_compact_modes
+                .retain(|item| item.provider_id != provider_id);
+            self.updated_at = now;
+            return;
+        }
+        if let Some(item) = self
+            .provider_compact_modes
+            .iter_mut()
+            .find(|item| item.provider_id == provider_id)
+        {
+            item.mode = mode;
+            item.updated_at = now;
+        } else {
+            self.provider_compact_modes.push(ProviderCompactModeConfig {
+                provider_id: provider_id.to_string(),
+                mode,
+                updated_at: now,
+            });
+        }
+        self.updated_at = now;
+    }
+
+    pub fn upsert_provider_channel_mode(&mut self, provider_id: &str, mode: ProviderChannelMode) {
+        let now = Utc::now();
+        if mode == ProviderChannelMode::Auto {
+            self.provider_channel_modes
+                .retain(|item| item.provider_id != provider_id);
+            self.updated_at = now;
+            return;
+        }
+        if let Some(item) = self
+            .provider_channel_modes
+            .iter_mut()
+            .find(|item| item.provider_id == provider_id)
+        {
+            item.mode = mode;
+            item.updated_at = now;
+        } else {
+            self.provider_channel_modes.push(ProviderChannelModeConfig {
+                provider_id: provider_id.to_string(),
+                mode,
+                updated_at: now,
+            });
+        }
+        self.updated_at = now;
+    }
+
+    pub fn public_key_pool_for_provider(&self, provider_id: &str) -> Option<PublicProviderKeyPool> {
+        self.provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)
+            .map(public_key_pool)
+    }
+
+    pub fn upsert_provider_key_pool(
+        &mut self,
+        provider_id: &str,
+        input: ProviderKeyPoolInput,
+    ) -> Result<()> {
+        let now = Utc::now();
+        let existing_pool = self
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)
+            .cloned();
+        let keys = input
+            .keys
+            .into_iter()
+            .map(|item| {
+                let id = item
+                    .id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| format!("key-{}", Uuid::new_v4().simple()));
+                let existing = existing_pool
+                    .as_ref()
+                    .and_then(|pool| pool.keys.iter().find(|key| key.id == id));
+                let encrypted = item
+                    .key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty())
+                    .map(encrypt_secret)
+                    .transpose()?
+                    .or_else(|| existing.and_then(|key| key.key_encrypted.clone()));
+                Ok(ProviderKeyConfig {
+                    id,
+                    alias: clean_optional_string(item.alias),
+                    key_encrypted: encrypted,
+                    enabled: item.enabled,
+                    priority: item.priority,
+                    status: item.status,
+                    total_requests: item.total_requests,
+                    successes: item.successes,
+                    failures: item.failures,
+                    last_checked_at: item.last_checked_at,
+                    last_error: clean_optional_string(item.last_error),
+                    disabled_until: item.disabled_until,
+                    created_at: existing.map(|key| key.created_at).unwrap_or(now),
+                    updated_at: now,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if let Some(pool) = self
+            .provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id)
+        {
+            pool.enabled = input.enabled;
+            pool.strategy = input.strategy;
+            pool.failure_threshold = input.failure_threshold.max(1);
+            pool.recovery_minutes = input.recovery_minutes.max(1);
+            pool.keys = keys;
+            if !pool.keys.is_empty() {
+                pool.next_index %= pool.keys.len();
+            } else {
+                pool.next_index = 0;
+            }
+            pool.updated_at = now;
+        } else {
+            self.provider_key_pools.push(ProviderKeyPoolConfig {
+                provider_id: provider_id.to_string(),
+                enabled: input.enabled,
+                strategy: input.strategy,
+                failure_threshold: input.failure_threshold.max(1),
+                recovery_minutes: input.recovery_minutes.max(1),
+                next_index: 0,
+                keys,
+                updated_at: now,
+            });
+        }
+        self.updated_at = now;
+        Ok(())
+    }
+}
+
+fn public_key_pool(pool: &ProviderKeyPoolConfig) -> PublicProviderKeyPool {
+    let now = Utc::now();
+    let keys = pool
+        .keys
+        .iter()
+        .map(|key| PublicProviderKey {
+            id: key.id.clone(),
+            alias: key.alias.clone(),
+            preview: key_preview(key.key_encrypted.as_deref()),
+            enabled: key.enabled,
+            priority: key.priority,
+            status: key.status.clone(),
+            total_requests: key.total_requests,
+            successes: key.successes,
+            failures: key.failures,
+            last_checked_at: key.last_checked_at,
+            last_error: key.last_error.clone(),
+            disabled_until: key.disabled_until,
+        })
+        .collect::<Vec<_>>();
+    let available_keys = pool
+        .keys
+        .iter()
+        .filter(|key| {
+            key.enabled
+                && key.key_encrypted.is_some()
+                && key.disabled_until.map(|until| until <= now).unwrap_or(true)
+        })
+        .count();
+    PublicProviderKeyPool {
+        enabled: pool.enabled,
+        strategy: pool.strategy.clone(),
+        failure_threshold: pool.failure_threshold,
+        recovery_minutes: pool.recovery_minutes,
+        available_keys,
+        keys,
+    }
+}
+
+fn key_preview(encrypted: Option<&str>) -> String {
+    let Some(encrypted) = encrypted else {
+        return "未保存".to_string();
+    };
+    match decrypt_secret(encrypted) {
+        Ok(secret) => mask_secret(&secret),
+        Err(_) => "解密失败".to_string(),
+    }
+}
+
+fn mask_secret(secret: &str) -> String {
+    let trimmed = secret.trim();
+    if trimmed.len() <= 10 {
+        return "*".repeat(trimmed.len().max(4));
+    }
+    let start = &trimmed[..trimmed.len().min(6)];
+    let end = &trimmed[trimmed.len().saturating_sub(4)..];
+    format!("{start}...{end}")
 }
 
 fn strip_builtin_demo_provider(config: &mut AppConfig) -> bool {
@@ -651,5 +1304,135 @@ prewarm_enabled = true
         let config: AppConfig = toml::from_str(raw).expect("legacy config should parse");
         assert!(config.proxy_auto_start);
         assert!(!config.cache.background_prewarm_enabled);
+    }
+
+    #[test]
+    fn provider_key_pool_encrypts_and_preserves_saved_keys() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::RoundRobin,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![key_input("key-a", Some("sk-first-secret"), true, 5)],
+            })))
+            .expect("provider should save");
+
+        let pool = config
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)
+            .expect("pool should exist");
+        assert_ne!(
+            pool.keys[0].key_encrypted.as_deref(),
+            Some("sk-first-secret")
+        );
+        assert_eq!(
+            config
+                .provider_key_secret(&provider_id, "key-a")
+                .expect("secret should decrypt")
+                .as_deref(),
+            Some("sk-first-secret")
+        );
+        let public = config
+            .public_key_pool_for_provider(&provider_id)
+            .expect("public pool should exist");
+        assert_eq!(public.available_keys, 1);
+        assert_ne!(public.keys[0].preview, "sk-first-secret");
+
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::RoundRobin,
+                    failure_threshold: 3,
+                    recovery_minutes: 5,
+                    keys: vec![key_input("key-a", None, true, 7)],
+                },
+            )
+            .expect("pool update should preserve saved key");
+        assert_eq!(
+            config
+                .provider_key_secret(&provider_id, "key-a")
+                .expect("secret should still decrypt")
+                .as_deref(),
+            Some("sk-first-secret")
+        );
+    }
+
+    #[test]
+    fn provider_key_pool_round_robin_skips_failed_keys() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::RoundRobin,
+                failure_threshold: 1,
+                recovery_minutes: 5,
+                keys: vec![
+                    key_input("key-a", Some("sk-a"), true, 5),
+                    key_input("key-b", Some("sk-b"), true, 5),
+                ],
+            })))
+            .expect("provider should save");
+
+        let first = config
+            .select_provider_key_for_request(&provider_id, None)
+            .expect("key selection should work")
+            .expect("first key should exist");
+        assert_eq!(first.key_id.as_deref(), Some("key-a"));
+        assert_eq!(first.secret, "sk-a");
+
+        let second = config
+            .select_provider_key_for_request(&provider_id, None)
+            .expect("key selection should work")
+            .expect("second key should exist");
+        assert_eq!(second.key_id.as_deref(), Some("key-b"));
+        assert_eq!(second.secret, "sk-b");
+
+        config.mark_provider_key_failure(&provider_id, Some("key-a"), "HTTP 429", true);
+        let next = config
+            .select_provider_key_for_request(&provider_id, None)
+            .expect("key selection should work")
+            .expect("healthy key should exist");
+        assert_eq!(next.key_id.as_deref(), Some("key-b"));
+    }
+
+    fn provider_input(key_pool: Option<ProviderKeyPoolInput>) -> ProviderInput {
+        ProviderInput {
+            id: Some("share".to_string()),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel_mode: ProviderChannelMode::Auto,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: false,
+            non_sse_compact_compat_enabled: false,
+            api_key: None,
+            key_pool,
+            enabled: true,
+        }
+    }
+
+    fn key_input(id: &str, key: Option<&str>, enabled: bool, priority: u32) -> ProviderKeyInput {
+        ProviderKeyInput {
+            id: Some(id.to_string()),
+            alias: None,
+            key: key.map(ToOwned::to_owned),
+            enabled,
+            priority,
+            status: ProviderKeyStatus::Unknown,
+            total_requests: 0,
+            successes: 0,
+            failures: 0,
+            last_checked_at: None,
+            last_error: None,
+            disabled_until: None,
+        }
     }
 }

@@ -53,6 +53,28 @@ pub struct ProviderModelFetchInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyTestInput {
+    pub provider_id: Option<String>,
+    pub key_id: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: String,
+    pub models_url: Option<String>,
+    #[serde(default)]
+    pub is_full_url: bool,
+    pub custom_user_agent: Option<String>,
+    pub channel: Channel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderKeyTestResult {
+    pub provider_id: Option<String>,
+    pub key_id: Option<String>,
+    pub ok: bool,
+    pub message: String,
+    pub models_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInput {
     pub provider_id: String,
     pub model: ModelConfig,
@@ -132,6 +154,15 @@ pub async fn delete_provider(
     config
         .providers
         .retain(|provider| provider.id != provider_id);
+    config
+        .provider_key_pools
+        .retain(|pool| pool.provider_id != provider_id);
+    config
+        .provider_compact_modes
+        .retain(|item| item.provider_id != provider_id);
+    config
+        .provider_channel_modes
+        .retain(|item| item.provider_id != provider_id);
     if config.active_provider_id.as_deref() == Some(provider_id.as_str()) {
         config.active_provider_id = config.providers.first().map(|provider| provider.id.clone());
     }
@@ -145,6 +176,100 @@ pub async fn delete_provider(
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);
     Ok(state.public_config().await)
+}
+
+#[tauri::command]
+pub async fn test_provider_key(
+    state: State<'_, Arc<AppState>>,
+    input: ProviderKeyTestInput,
+) -> CommandResult<ProviderKeyTestResult> {
+    let result = test_provider_key_inner(&state, &input).await;
+    if let Some(provider_id) = input.provider_id.as_deref() {
+        if let Some(key_id) = input.key_id.as_deref() {
+            let mut config = state.config.write().await;
+            match &result {
+                Ok(result) if result.ok => {
+                    config.mark_provider_key_success(provider_id, Some(key_id))
+                }
+                Ok(result) => config.mark_provider_key_failure(
+                    provider_id,
+                    Some(key_id),
+                    &result.message,
+                    true,
+                ),
+                Err(err) => config.mark_provider_key_failure(
+                    provider_id,
+                    Some(key_id),
+                    &err.to_string(),
+                    true,
+                ),
+            }
+            config.save(&state.config_path).map_err(to_command_error)?;
+        }
+    }
+    result.map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn test_provider_key_pool(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<Vec<ProviderKeyTestResult>> {
+    let provider = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| format!("provider {provider_id} was not found"))?
+    };
+    let key_ids = {
+        let config = state.config.read().await;
+        config
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id)
+            .map(|pool| {
+                pool.keys
+                    .iter()
+                    .map(|key| key.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let mut results = Vec::new();
+    for key_id in key_ids {
+        let input = ProviderKeyTestInput {
+            provider_id: Some(provider_id.clone()),
+            key_id: Some(key_id),
+            api_key: None,
+            base_url: provider.base_url.clone(),
+            models_url: provider.models_url.clone(),
+            is_full_url: provider.is_full_url,
+            custom_user_agent: provider.custom_user_agent.clone(),
+            channel: provider.channel.clone(),
+        };
+        let result = test_provider_key_inner(&state, &input)
+            .await
+            .map_err(to_command_error)?;
+        {
+            let mut config = state.config.write().await;
+            if result.ok {
+                config.mark_provider_key_success(&provider_id, input.key_id.as_deref());
+            } else {
+                config.mark_provider_key_failure(
+                    &provider_id,
+                    input.key_id.as_deref(),
+                    &result.message,
+                    true,
+                );
+            }
+            config.save(&state.config_path).map_err(to_command_error)?;
+        }
+        results.push(result);
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -215,6 +340,63 @@ pub async fn fetch_provider_models(
     .map_err(to_command_error)?;
 
     Ok(models)
+}
+
+async fn test_provider_key_inner(
+    state: &State<'_, Arc<AppState>>,
+    input: &ProviderKeyTestInput,
+) -> Result<ProviderKeyTestResult> {
+    let mut upstream_secret = input
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if upstream_secret.is_none() {
+        if let (Some(provider_id), Some(key_id)) =
+            (input.provider_id.as_deref(), input.key_id.as_deref())
+        {
+            let config = state.config.read().await;
+            upstream_secret = config
+                .provider_key_secret(provider_id, key_id)
+                .map_err(to_command_error)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
+    let Some(upstream_secret) = upstream_secret else {
+        return Ok(ProviderKeyTestResult {
+            provider_id: input.provider_id.clone(),
+            key_id: input.key_id.clone(),
+            ok: false,
+            message: "key is empty".to_string(),
+            models_count: 0,
+        });
+    };
+    let models = fetch_models_from_upstream_with_options(
+        &state.client,
+        &input.base_url,
+        input.channel.clone(),
+        Some(upstream_secret.as_str()),
+        input.is_full_url,
+        input.models_url.as_deref(),
+        input.custom_user_agent.as_deref(),
+    )
+    .await;
+    match models {
+        Ok(models) => Ok(ProviderKeyTestResult {
+            provider_id: input.provider_id.clone(),
+            key_id: input.key_id.clone(),
+            ok: true,
+            message: format!("可用，获取到 {} 个模型", models.len()),
+            models_count: models.len(),
+        }),
+        Err(err) => Ok(ProviderKeyTestResult {
+            provider_id: input.provider_id.clone(),
+            key_id: input.key_id.clone(),
+            ok: false,
+            message: err.to_string(),
+            models_count: 0,
+        }),
+    }
 }
 
 #[tauri::command]

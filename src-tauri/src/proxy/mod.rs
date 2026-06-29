@@ -1,3 +1,4 @@
+use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
     extract::{Path, State as AxumState},
@@ -19,7 +20,10 @@ use uuid::Uuid;
 use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
-    config::{AgentInjectionConfig, AppConfig, CacheMode, Channel, ProviderConfig},
+    config::{
+        AgentInjectionConfig, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
+        SelectedProviderKey,
+    },
     metrics::{RequestLog, UsageRecord},
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
 };
@@ -32,7 +36,7 @@ const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 2 * 60 * 60;
 const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 24 * 60 * 60;
 const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 24 * 60 * 60;
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
-const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 30 * 60;
+const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 
 #[derive(Debug, Clone)]
@@ -424,21 +428,29 @@ async fn handle_responses_compact(
         Ok(decision) => decision,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
-    let api_key = match config.provider_api_key(&decision.provider.id) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "provider API key is not configured",
-            )
-        }
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to decrypt provider key: {err}"),
-            )
-        }
-    };
+    let mut selected_provider_key =
+        match select_provider_api_key(&state, &decision.provider.id, None).await {
+            Ok(selected) => selected,
+            Err(err) if err.to_string().contains("not configured") => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "provider API key is not configured",
+                )
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to select provider key: {err}"),
+                )
+            }
+        };
+    let mut api_key = selected_provider_key.secret.clone();
+    if api_key.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "provider API key is not configured",
+        );
+    }
 
     let mut upstream_body = transform_request_for_channel(
         &client_request,
@@ -535,6 +547,52 @@ async fn handle_responses_compact(
         .unwrap_or("application/json")
         .to_string();
     let mut used_fallback = false;
+
+    if let Some(next_key) = try_retry_with_next_provider_key(
+        &state,
+        &decision.provider.id,
+        &selected_provider_key,
+        status,
+    )
+    .await
+    {
+        state.metrics.record_retry().await;
+        selected_provider_key = next_key;
+        api_key = selected_provider_key.secret.clone();
+        let send_outcome = match send_upstream_request_to_url_with_diagnostics(
+            &state,
+            &active_url,
+            &api_key,
+            &active_request_channel,
+            &active_upstream_body,
+            None,
+            decision.provider.request_body_gzip_enabled,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                state
+                    .metrics
+                    .record_error("upstream_transport", &err.to_string())
+                    .await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream compact request failed after key failover: {err}"),
+                );
+            }
+        };
+        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        upstream = send_outcome.response;
+        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+        status = upstream.status().as_u16();
+        content_type = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+    }
 
     if compact_url.is_some() && should_fallback_compact_to_responses(status) {
         let fallback_bytes = upstream.bytes().await.ok().map(|bytes| bytes.to_vec());
@@ -714,6 +772,15 @@ async fn handle_responses_compact(
     let bytes = body_read.bytes;
     let upstream_body_error = upstream_body_has_error(&bytes, &content_type);
     let compact_success_for_cache = is_success_status && !upstream_body_error;
+    let key_error_summary = (!compact_success_for_cache).then(|| upstream_error_summary(&bytes));
+    note_selected_provider_key_status(
+        &state,
+        &decision.provider.id,
+        &selected_provider_key,
+        status,
+        key_error_summary.as_deref(),
+    )
+    .await;
 
     let provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
     let provider_prefix_fingerprint = Some(provider_prefix_fingerprint(
@@ -866,7 +933,11 @@ async fn handle_responses_compact(
     let bytes_for_client = if is_text_event_stream(&content_type) {
         match active_request_channel {
             Channel::Chat => chat_sse_to_non_stream_json(&bytes, &decision.model),
-            _ => responses_sse_to_non_stream_json(&bytes, &decision.model),
+            _ => responses_sse_to_non_stream_json(
+                &bytes,
+                &decision.model,
+                non_sse_compact_compat_for_decision(&config, &decision),
+            ),
         }
     } else {
         bytes.clone()
@@ -877,7 +948,10 @@ async fn handle_responses_compact(
         &decision.model,
         &bytes_for_client,
     );
-    let response_bytes = normalize_responses_json_for_client(&response_bytes);
+    let response_bytes = maybe_normalize_responses_json_for_client(
+        &response_bytes,
+        non_sse_compact_compat_for_decision(&config, &decision),
+    );
     raw_response(status, "application/json", response_bytes)
 }
 
@@ -983,6 +1057,7 @@ async fn handle_generation(
                 request_id,
                 &client_channel,
                 &decision,
+                non_sse_compact_compat_for_decision(&config, &decision),
             )
             .await;
         }
@@ -1052,27 +1127,36 @@ async fn handle_generation(
                 request_id,
                 &client_channel,
                 &decision,
+                non_sse_compact_compat_for_decision(&config, &decision),
             )
             .await;
         }
     }
 
     let url = upstream_url(&decision.provider.base_url, &decision.upstream_channel);
-    let api_key = match config.provider_api_key(&decision.provider.id) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "provider API key is not configured",
-            )
-        }
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to decrypt provider key: {err}"),
-            )
-        }
-    };
+    let mut selected_provider_key =
+        match select_provider_api_key(&state, &decision.provider.id, None).await {
+            Ok(selected) => selected,
+            Err(err) if err.to_string().contains("not configured") => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "provider API key is not configured",
+                )
+            }
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("failed to select provider key: {err}"),
+                )
+            }
+        };
+    let mut api_key = selected_provider_key.secret.clone();
+    if api_key.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "provider API key is not configured",
+        );
+    }
 
     let skip_prefix_guard_for_sync_responses = responses_sync_main_skips_prefix_guard(
         &client_channel,
@@ -1272,6 +1356,55 @@ async fn handle_generation(
     let mut is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
+    if let Some(next_key) = try_retry_with_next_provider_key(
+        &state,
+        &decision.provider.id,
+        &selected_provider_key,
+        status,
+    )
+    .await
+    {
+        state.metrics.record_retry().await;
+        selected_provider_key = next_key;
+        api_key = selected_provider_key.secret.clone();
+        let send_outcome = match send_main_upstream_request(
+            &state,
+            &active_url,
+            &api_key,
+            &active_request_channel,
+            &active_upstream_body,
+            skip_prefix_guard_for_sync_responses,
+            decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+            !client_requested_stream,
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                state
+                    .metrics
+                    .record_error("upstream_transport", &err.to_string())
+                    .await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream request failed after key failover: {err}"),
+                );
+            }
+        };
+        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        upstream = send_outcome.response;
+        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+        status = upstream.status().as_u16();
+        content_type = upstream
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        is_success_status = StatusCode::from_u16(status)
+            .map(|status| status.is_success())
+            .unwrap_or(false);
+    }
     if should_retry_full_response_after_session_error(status, used_response_session) {
         note_response_session_error_cooldown(&state, response_session_cooldown_key.as_deref())
             .await;
@@ -1634,6 +1767,14 @@ async fn handle_generation(
     );
 
     if is_stream {
+        note_selected_provider_key_status(
+            &state,
+            &decision.provider.id,
+            &selected_provider_key,
+            status,
+            None,
+        )
+        .await;
         return stream_upstream(
             state,
             upstream,
@@ -1702,7 +1843,11 @@ async fn handle_generation(
     {
         match active_request_channel {
             Channel::Chat => chat_sse_to_non_stream_json(&bytes, &decision.model),
-            _ => responses_sse_to_non_stream_json(&bytes, &decision.model),
+            _ => responses_sse_to_non_stream_json(
+                &bytes,
+                &decision.model,
+                non_sse_compact_compat_for_decision(&config, &decision),
+            ),
         }
     } else {
         bytes.clone()
@@ -1716,6 +1861,15 @@ async fn handle_generation(
         status = StatusCode::BAD_GATEWAY.as_u16();
         is_success_status = false;
     }
+    let key_error_summary = (!is_success_status).then(|| upstream_error_summary(&bytes_for_client));
+    note_selected_provider_key_status(
+        &state,
+        &decision.provider.id,
+        &selected_provider_key,
+        status,
+        key_error_summary.as_deref(),
+    )
+    .await;
     let sync_compact_diagnostic_only =
         skip_prefix_guard_for_sync_responses || active_responses_non_stream_chat_compat;
     let usage_record = if is_success_status && sync_compact_diagnostic_only {
@@ -1809,7 +1963,9 @@ async fn handle_generation(
         &decision.model,
         &bytes_for_client,
     );
-    if matches!(client_channel, Channel::Responses) {
+    if non_sse_compact_compat_for_decision(&config, &decision)
+        && matches!(client_channel, Channel::Responses)
+    {
         response_bytes = normalize_responses_json_for_client(&response_bytes);
     }
     if cross_protocol_stream {
@@ -3186,32 +3342,34 @@ async fn prefix_lag_diagnostics(
         .map(|gap| gap.new_tail_tokens)
         .unwrap_or_default();
     let ratio = provider_cache_ratio(record).unwrap_or_default();
+    let real_provider_shortfall = provider_cache_shortfall(record);
 
-    let classification =
-        if record.cache_read_tokens == 0 && provider_cache_shortfall(record) >= 1024 {
-            "cold_start"
-        } else if current_gap == 0 {
-            "full"
-        } else if responses_tool_tail_burst(current_tail) && current_new_tail >= 1024 {
-            "tool_tail_burst"
-        } else if current_avoidable > 0 {
-            "avoidable_gap"
-        } else if previous_gap > 0
-            && cache_delta >= previous_gap.saturating_sub(128)
-            && current_new_tail > 0
-        {
-            "tail_lag_caught_previous_but_opened_new"
-        } else if previous_gap > 0 && cache_delta < previous_gap && current_new_tail > 0 {
-            "tail_lag_previous_not_caught"
-        } else if wait.wait_ms >= 60_000 && ratio < 0.98 && current_new_tail >= 2048 {
-            "tail_lag_long_wait_weak"
-        } else if current_new_tail >= 2048 && input_delta >= 2048 {
-            "new_tail_large_growth"
-        } else if current_new_tail > 0 {
-            "new_tail_small"
-        } else {
-            "none"
-        };
+    let classification = if record.cache_read_tokens == 0 && real_provider_shortfall >= 1024 {
+        "cold_start"
+    } else if current_gap == 0 && real_provider_shortfall >= 4096 && ratio < 0.90 {
+        "prefix_break_isolated"
+    } else if current_gap == 0 {
+        "full"
+    } else if responses_tool_tail_burst(current_tail) && current_new_tail >= 1024 {
+        "tool_tail_burst"
+    } else if current_avoidable > 0 {
+        "avoidable_gap"
+    } else if previous_gap > 0
+        && cache_delta >= previous_gap.saturating_sub(128)
+        && current_new_tail > 0
+    {
+        "tail_lag_caught_previous_but_opened_new"
+    } else if previous_gap > 0 && cache_delta < previous_gap && current_new_tail > 0 {
+        "tail_lag_previous_not_caught"
+    } else if wait.wait_ms >= 60_000 && ratio < 0.98 && current_new_tail >= 2048 {
+        "tail_lag_long_wait_weak"
+    } else if current_new_tail >= 2048 && input_delta >= 2048 {
+        "new_tail_large_growth"
+    } else if current_new_tail > 0 {
+        "new_tail_small"
+    } else {
+        "none"
+    };
 
     PrefixLagDiagnostics {
         classification: Some(classification.to_string()),
@@ -3283,7 +3441,19 @@ fn request_body_gzip_cooldown_key(url: &str, channel: &Channel) -> String {
         Channel::Chat => "chat",
         Channel::Anthropic => "anthropic",
     };
-    format!("gzip\0{channel}\0{url}")
+    let provider_scope = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| {
+            let scheme = url.scheme().to_string();
+            let host = url.host_str()?.to_ascii_lowercase();
+            let port = url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            Some(format!("{scheme}://{host}{port}"))
+        })
+        .unwrap_or_else(|| url.to_string());
+    format!("gzip\0{channel}\0{provider_scope}")
 }
 
 async fn request_body_gzip_cooldown_active(state: &AppState, key: &str) -> bool {
@@ -3462,8 +3632,7 @@ fn responses_current_tool_output_wait_cap(
     ) {
         return None;
     }
-    if current_tail.tool_output_chars >= 20_000
-        || current_tail.largest_tool_output_chars >= 12_000
+    if current_tail.tool_output_chars >= 20_000 || current_tail.largest_tool_output_chars >= 12_000
     {
         Some(responses_foreground_wait_cap())
     } else if current_tail.delta_from_session && current_tail.tool_output_chars >= 8_000 {
@@ -4739,7 +4908,12 @@ fn upstream_error_scope(status: u16, message: &str) -> &'static str {
     match status {
         401 => "upstream_auth",
         403 => {
-            if message.contains("额度") || message.to_ascii_lowercase().contains("quota") {
+            let lower = message.to_ascii_lowercase();
+            if message.contains("额度")
+                || lower.contains("quota")
+                || lower.contains("balance")
+                || lower.contains("insufficient")
+            {
                 "upstream_quota"
             } else {
                 "upstream_forbidden"
@@ -5350,6 +5524,7 @@ async fn cache_hit_response(
     request_id: String,
     client_channel: &Channel,
     decision: &RouteDecision,
+    non_sse_compact_compat: bool,
 ) -> Response {
     let cache_status = match hit.status {
         CacheLookupStatus::Exact => "exact",
@@ -5461,8 +5636,12 @@ async fn cache_hit_response(
             false,
         )
         .await;
-    let body =
-        normalize_response_body_for_client(client_channel, &hit.entry.content_type, hit.entry.body);
+    let body = normalize_response_body_for_client(
+        client_channel,
+        &hit.entry.content_type,
+        hit.entry.body,
+        non_sse_compact_compat,
+    );
     raw_response(hit.entry.status, &hit.entry.content_type, body)
 }
 
@@ -6134,6 +6313,116 @@ async fn send_upstream_request(
     body: &Value,
 ) -> reqwest::Result<reqwest::Response> {
     send_upstream_request_to_url(state, url, api_key, channel, body, None).await
+}
+
+async fn select_provider_api_key(
+    state: &AppState,
+    provider_id: &str,
+    exclude_key_id: Option<&str>,
+) -> Result<SelectedProviderKey> {
+    let mut config = state.config.write().await;
+    match config
+        .select_provider_key_for_request(provider_id, exclude_key_id)
+        .with_context(|| format!("failed to select provider key for {provider_id}"))?
+    {
+        Some(selected) => Ok(selected),
+        None => Err(anyhow!("provider API key is not configured")),
+    }
+}
+
+async fn note_selected_provider_key_status(
+    state: &AppState,
+    provider_id: &str,
+    selected: &SelectedProviderKey,
+    status: u16,
+    error_summary: Option<&str>,
+) {
+    if selected.key_id.is_none() {
+        return;
+    }
+    let Ok(status_code) = StatusCode::from_u16(status) else {
+        return;
+    };
+    let mut config = state.config.write().await;
+    if status_code.is_success() {
+        config.mark_provider_key_success(provider_id, selected.key_id.as_deref());
+        return;
+    }
+    if is_provider_key_failure_status(status_code)
+        || error_summary
+            .map(is_provider_key_failure_message)
+            .unwrap_or(false)
+    {
+        let message = error_summary
+            .filter(|message| !message.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("upstream returned HTTP {status_code}"));
+        config.mark_provider_key_failure(provider_id, selected.key_id.as_deref(), &message, true);
+        if let Err(err) = config.save(&state.config_path) {
+            state
+                .metrics
+                .record_error("multi_key_save", &err.to_string())
+                .await;
+        }
+    }
+}
+
+fn is_provider_key_failure_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED
+            | StatusCode::PAYMENT_REQUIRED
+            | StatusCode::FORBIDDEN
+            | StatusCode::TOO_MANY_REQUESTS
+    )
+}
+
+fn is_provider_key_failure_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("insufficient")
+        || lower.contains("quota")
+        || lower.contains("balance")
+        || lower.contains("billing")
+        || lower.contains("credit")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid_api_key")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || message.contains("浣欓")
+        || message.contains("棰濆害")
+        || message.contains("娆犺垂")
+        || message.contains("鏃犳晥")
+}
+
+async fn try_retry_with_next_provider_key(
+    state: &AppState,
+    provider_id: &str,
+    selected: &SelectedProviderKey,
+    status: u16,
+) -> Option<SelectedProviderKey> {
+    let status = StatusCode::from_u16(status).ok()?;
+    if selected.key_id.is_none() || !is_provider_key_failure_status(status) {
+        return None;
+    }
+    {
+        let mut config = state.config.write().await;
+        config.mark_provider_key_failure(
+            provider_id,
+            selected.key_id.as_deref(),
+            &format!("upstream returned HTTP {status}"),
+            true,
+        );
+        if let Err(err) = config.save(&state.config_path) {
+            state
+                .metrics
+                .record_error("multi_key_save", &err.to_string())
+                .await;
+        }
+    }
+    match select_provider_api_key(state, provider_id, selected.key_id.as_deref()).await {
+        Ok(next) if next.key_id != selected.key_id => Some(next),
+        _ => None,
+    }
 }
 
 async fn send_main_upstream_request(
@@ -6980,10 +7269,31 @@ fn decide_route(
         .ok_or_else(|| format!("provider {} has no model configured", provider.name))?;
 
     Ok(RouteDecision {
-        upstream_channel: provider.channel.clone(),
+        upstream_channel: effective_upstream_channel_for_provider(config, provider, client_channel),
         provider: provider.clone(),
         model,
     })
+}
+
+fn effective_upstream_channel_for_provider(
+    config: &AppConfig,
+    provider: &ProviderConfig,
+    client_channel: &Channel,
+) -> Channel {
+    if config.provider_channel_mode_for_provider(&provider.id) == ProviderChannelMode::Manual {
+        return provider.channel.clone();
+    }
+    auto_upstream_channel_for_provider(provider, client_channel)
+}
+
+fn auto_upstream_channel_for_provider(
+    provider: &ProviderConfig,
+    _client_channel: &Channel,
+) -> Channel {
+    // Auto mode keeps the provider capability hint for normal requests.
+    // Responses compact/non-stream fast paths may switch to Chat later in the
+    // pipeline, where payload shape and fallback diagnostics are available.
+    provider.channel.clone()
 }
 
 fn infer_agent_for_global_key<'a>(
@@ -8974,12 +9284,25 @@ fn normalize_response_body_for_client(
     client_channel: &Channel,
     _content_type: &str,
     body: Vec<u8>,
+    non_sse_compact_compat: bool,
 ) -> Vec<u8> {
-    if matches!(client_channel, Channel::Responses) {
+    if non_sse_compact_compat && matches!(client_channel, Channel::Responses) {
         normalize_responses_json_for_client(&body)
     } else {
         body
     }
+}
+
+fn maybe_normalize_responses_json_for_client(bytes: &[u8], enabled: bool) -> Vec<u8> {
+    if enabled {
+        normalize_responses_json_for_client(bytes)
+    } else {
+        bytes.to_vec()
+    }
+}
+
+fn non_sse_compact_compat_for_decision(config: &AppConfig, decision: &RouteDecision) -> bool {
+    config.non_sse_compact_compat_enabled_for_provider(&decision.provider.id)
 }
 
 fn normalize_responses_json_for_client(bytes: &[u8]) -> Vec<u8> {
@@ -9058,9 +9381,13 @@ fn should_proxy_upstream_as_stream(
         || is_text_event_stream(content_type)
 }
 
-fn responses_sse_to_non_stream_json(bytes: &[u8], model: &str) -> Vec<u8> {
+fn responses_sse_to_non_stream_json(
+    bytes: &[u8],
+    model: &str,
+    non_sse_compact_compat: bool,
+) -> Vec<u8> {
     if serde_json::from_slice::<Value>(bytes).is_ok() {
-        return normalize_responses_json_for_client(bytes);
+        return maybe_normalize_responses_json_for_client(bytes, non_sse_compact_compat);
     }
 
     let text = String::from_utf8_lossy(bytes);
@@ -9185,8 +9512,9 @@ fn responses_sse_to_non_stream_json(bytes: &[u8], model: &str) -> Vec<u8> {
     );
 
     if let Some(response) = completed_response {
-        return normalize_responses_json_for_client(
+        return maybe_normalize_responses_json_for_client(
             &serde_json::to_vec(&response).unwrap_or_else(|_| bytes.to_vec()),
+            non_sse_compact_compat,
         );
     }
     if assembled_text.is_empty() {
@@ -9213,8 +9541,9 @@ fn responses_sse_to_non_stream_json(bytes: &[u8], model: &str) -> Vec<u8> {
         "output_text": assembled_text,
         "usage": usage,
     });
-    normalize_responses_json_for_client(
+    maybe_normalize_responses_json_for_client(
         &serde_json::to_vec(&response).unwrap_or_else(|_| bytes.to_vec()),
+        non_sse_compact_compat,
     )
 }
 
@@ -10055,7 +10384,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_json_normalizer_adds_zcode_required_fields() {
+    fn responses_json_normalizer_adds_non_sse_validation_fields() {
         let bytes = serde_json::to_vec(&json!({
             "id": "resp_compat",
             "object": "response",
@@ -10108,7 +10437,7 @@ mod tests {
     #[test]
     fn responses_json_normalizer_handles_null_error_and_loose_output_shape() {
         let bytes = serde_json::to_vec(&json!({
-            "id": "resp_zcode",
+            "id": "resp_non_sse",
             "object": "response",
             "status": "completed",
             "error": null,
@@ -10123,13 +10452,13 @@ mod tests {
 
         let normalized = normalize_responses_json_for_client(&bytes);
         let value: Value = serde_json::from_slice(&normalized).unwrap();
-        assert_eq!(value["output"][0]["id"], "msg_resp_zcode_0");
+        assert_eq!(value["output"][0]["id"], "msg_resp_non_sse_0");
         assert_eq!(value["output"][0]["content"][0]["annotations"], json!([]));
         assert_eq!(value["error"], Value::Null);
     }
 
     #[test]
-    fn cached_responses_replay_gets_zcode_shape_normalized() {
+    fn cached_responses_replay_gets_non_sse_shape_when_enabled() {
         let cached_body = serde_json::to_vec(&json!({
             "id": "resp_cached",
             "object": "response",
@@ -10145,6 +10474,7 @@ mod tests {
             &Channel::Responses,
             "application/json",
             cached_body,
+            true,
         );
         let value: Value = serde_json::from_slice(&normalized).unwrap();
         assert_eq!(value["output"][0]["id"], "msg_resp_cached_0");
@@ -10152,7 +10482,33 @@ mod tests {
     }
 
     #[test]
-    fn mislabeled_responses_json_still_gets_zcode_shape_normalized() {
+    fn cached_responses_replay_keeps_fast_shape_when_non_sse_compat_disabled() {
+        let cached_body = serde_json::to_vec(&json!({
+            "id": "resp_cached_fast",
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "cached compact" }]
+            }]
+        }))
+        .unwrap();
+
+        let normalized = normalize_response_body_for_client(
+            &Channel::Responses,
+            "application/json",
+            cached_body,
+            false,
+        );
+        let value: Value = serde_json::from_slice(&normalized).unwrap();
+        assert!(value["output"][0].get("id").is_none());
+        assert!(value["output"][0]["content"][0]
+            .get("annotations")
+            .is_none());
+    }
+
+    #[test]
+    fn mislabeled_responses_json_gets_non_sse_shape_when_enabled() {
         let body = serde_json::to_vec(&json!({
             "id": "resp_mislabeled",
             "object": "response",
@@ -10164,8 +10520,12 @@ mod tests {
         }))
         .unwrap();
 
-        let normalized =
-            normalize_response_body_for_client(&Channel::Responses, "text/event-stream", body);
+        let normalized = normalize_response_body_for_client(
+            &Channel::Responses,
+            "text/event-stream",
+            body,
+            true,
+        );
         let value: Value = serde_json::from_slice(&normalized).unwrap();
         assert_eq!(value["output"][0]["id"], "msg_resp_mislabeled_0");
         assert_eq!(value["output"][0]["content"][0]["annotations"], json!([]));
@@ -10178,6 +10538,7 @@ mod tests {
             &Channel::Responses,
             "text/event-stream",
             body.clone(),
+            true,
         );
         assert_eq!(normalized, body);
     }
@@ -10196,7 +10557,7 @@ mod tests {
         }))
         .unwrap();
 
-        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test");
+        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test", true);
         let value: Value = serde_json::from_slice(&normalized).unwrap();
 
         assert_eq!(value["object"], "response");
@@ -10216,7 +10577,7 @@ mod tests {
         .as_bytes()
         .to_vec();
 
-        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test");
+        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test", true);
         let value: Value = serde_json::from_slice(&normalized).unwrap();
 
         assert_eq!(value["id"], "resp_done");
@@ -10237,7 +10598,7 @@ mod tests {
         .as_bytes()
         .to_vec();
 
-        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test");
+        let normalized = responses_sse_to_non_stream_json(&body, "gpt-test", true);
         let value: Value = serde_json::from_slice(&normalized).unwrap();
 
         assert_eq!(value["object"], "response");
@@ -10389,7 +10750,7 @@ mod tests {
             "messages": [
                 { "role": "system", "content": "Follow project policy." },
                 { "role": "developer", "content": "Skill trigger: use cache-log-skill when logs are mentioned." },
-                { "role": "user", "content": "看新日志" }
+                { "role": "user", "content": "鐪嬫柊鏃ュ織" }
             ],
             "tools": [{
                 "type": "function",
@@ -10417,7 +10778,7 @@ mod tests {
             transformed
                 .pointer("/input/0/content/0/text")
                 .and_then(Value::as_str),
-            Some("看新日志")
+            Some("鐪嬫柊鏃ュ織")
         );
         assert_eq!(
             transformed
@@ -10443,7 +10804,7 @@ mod tests {
                 {
                     "type": "message",
                     "role": "user",
-                    "content": "看新日志"
+                    "content": "鐪嬫柊鏃ュ織"
                 }
             ]
         });
@@ -12598,7 +12959,7 @@ mod tests {
         config.providers = vec![
             ProviderConfig {
                 id: "yunshu".to_string(),
-                name: "云枢".to_string(),
+                name: "浜戞灑".to_string(),
                 base_url: "https://yunshu.example/v1".to_string(),
                 models_url: None,
                 is_full_url: false,
@@ -16254,6 +16615,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefix_lag_diagnostic_does_not_call_isolated_low_hit_prefix_full() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-lag-isolated-break-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let previous = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 151_000,
+            output_tokens: 10,
+            cache_read_tokens: 150_528,
+            cache_creation_tokens: 0,
+        };
+        let isolated_break = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 155_768,
+            output_tokens: 10,
+            cache_read_tokens: 9_216,
+            cache_creation_tokens: 0,
+        };
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&previous), false, false)
+            .await;
+        let isolated_gap = ProviderCacheGapBreakdown {
+            total_tokens: 0,
+            new_tail_tokens: 0,
+            avoidable_tokens: 0,
+        };
+
+        let diag = prefix_lag_diagnostics(
+            &state,
+            Some("main-prefix"),
+            Some(&isolated_break),
+            Some(&isolated_gap),
+            &PrefixGuardWaitDiagnostics::default(),
+            &TailInputDiagnostics::default(),
+        )
+        .await;
+
+        assert_eq!(
+            diag.classification.as_deref(),
+            Some("prefix_break_isolated")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn provider_gap_breakdown_does_not_use_prompt_cache_family_waterline() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -17342,6 +17753,12 @@ mod tests {
         assert!(!request_body_gzip_cooldown_active(&state, &key).await);
         note_request_body_gzip_fallback(&state, &key).await;
         assert!(request_body_gzip_cooldown_active(&state, &key).await);
+        let same_provider_key = request_body_gzip_cooldown_key(
+            "https://EXAMPLE.test/v1/chat/completions",
+            &Channel::Responses,
+        );
+        assert_eq!(key, same_provider_key);
+        assert!(request_body_gzip_cooldown_active(&state, &same_provider_key).await);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -17589,7 +18006,7 @@ mod tests {
             "upstream_payload_too_large"
         );
         assert_eq!(
-            upstream_error_scope(403, "用户额度不足, 剩余额度: 0"),
+            upstream_error_scope(403, "insufficient balance, remaining balance: 0"),
             "upstream_quota"
         );
         assert_eq!(upstream_error_scope(401, "Invalid token"), "upstream_auth");
@@ -17767,10 +18184,7 @@ mod tests {
         let response_json: Value = serde_json::from_slice(&response_body).unwrap();
         assert_eq!(response_json["object"], "response");
         assert_eq!(response_json["output_text"], "compact summary");
-        assert_eq!(
-            response_json["output"][0]["content"][0]["annotations"],
-            json!([])
-        );
+        assert!(response_json["output"][0]["content"][0]["annotations"].is_null());
         assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
 

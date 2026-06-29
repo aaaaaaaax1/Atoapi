@@ -25,7 +25,7 @@ import {
   X,
   Zap
 } from "lucide-react";
-import type { ReactNode } from "react";
+import type { Dispatch, ReactNode, SetStateAction } from "react";
 import { useEffect, useMemo, useState } from "react";
 import {
   AgentInjectionConfig,
@@ -35,11 +35,15 @@ import {
   command,
   FetchModelsInput,
   GeneralConfigInput,
+  KeyLoadBalanceStrategy,
   MetricsSnapshot,
   model,
   ModelConfig,
+  ProviderChannelMode,
   ProviderConfig,
   ProviderInput,
+  ProviderKeyStatus,
+  ProviderKeyTestResult,
   ProxyStatus
 } from "./lib/api";
 
@@ -53,17 +57,59 @@ interface ProviderDraft {
   is_full_url: boolean;
   custom_user_agent: string;
   api_key: string;
+  channel_mode: ProviderChannelMode;
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  non_sse_compact_compat_enabled: boolean;
+  key_pool: ProviderKeyPoolDraft;
   models: ModelConfig[];
   enabled: boolean;
+}
+
+interface ProviderKeyPoolDraft {
+  enabled: boolean;
+  strategy: KeyLoadBalanceStrategy;
+  failure_threshold: number;
+  recovery_minutes: number;
+  keys: ProviderKeyDraft[];
+}
+
+interface ProviderKeyDraft {
+  id: string;
+  alias: string;
+  key: string;
+  preview: string;
+  enabled: boolean;
+  priority: number;
+  status: ProviderKeyStatus;
+  total_requests: number;
+  successes: number;
+  failures: number;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+  disabled_until?: string | null;
 }
 
 const channelOptions: Array<{ value: Channel; label: string; endpoint: string }> = [
   { value: "anthropic", label: "Anthropic", endpoint: "/v1/messages" },
   { value: "chat", label: "OpenAI Chat", endpoint: "/v1/chat/completions" },
   { value: "responses", label: "OpenAI Responses", endpoint: "/v1/responses" }
+];
+
+const upstreamModeOptions: Array<{ value: "auto" | Channel; label: string; detail: string }> = [
+  { value: "auto", label: "自动识别（推荐）", detail: "按客户端请求和压缩场景自动选择最合适的上游格式" },
+  { value: "responses", label: "手动：Responses", detail: "/v1/responses" },
+  { value: "chat", label: "手动：Chat", detail: "/v1/chat/completions" },
+  { value: "anthropic", label: "手动：Anthropic", detail: "/v1/messages" }
+];
+
+const keyStrategyOptions: Array<{ value: KeyLoadBalanceStrategy; label: string; hint: string }> = [
+  { value: "round-robin", label: "轮询", hint: "每次请求按顺序切到下一个可用 Key，适合额度接近的多个 Key。" },
+  { value: "priority", label: "优先级", hint: "优先使用优先级更高的 Key，失败或不可用时再切换。" },
+  { value: "least-used", label: "最少使用", hint: "优先使用历史请求数最少的 Key，尽量摊平消耗。" },
+  { value: "random", label: "随机", hint: "在可用 Key 中随机选择，适合临时混合池。" },
+  { value: "sequential", label: "顺序消耗", hint: "一直使用列表里第一个可用 Key，异常后顺序切到下一个。" }
 ];
 
 const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
@@ -73,8 +119,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.50";
+const appVersion = "v0.1.51";
 const appVersionNotes = [
+  "v0.1.51: 同一上游的 gzip fallback 冷却扩大到 provider/channel 级别，并延长到 6 小时，避免不支持 gzip 的上游在长测试中反复双 attempt",
+  "v0.1.51: 低命中 prefix break 不再误标为 full，新增 prefix_break_isolated 底层诊断，避免把大输入低命中异常当作满桶",
+  "v0.1.51: 保留 v0.1.50 冷大流式跳过首次 gzip，不新增热补、不新增同步请求、不恢复普通 main session-delta",
   "v0.1.50: 按当前 v0.1.49 日志修复冷上游大流式请求，exact 热状态不存在时跳过首次 gzip，避免同一主请求内先压缩失败再回退",
   "v0.1.50: 保留 v0.1.41 主命中线和 v0.1.45+ 压缩兼容成功线，不新增热补、不恢复普通 main session-delta、不增加同步请求",
   "v0.1.50: 新增底层 cold_stream_gzip_skipped 诊断，便于区分真实上游慢、gzip 失败回退和冷上游保护",
@@ -493,9 +542,18 @@ const emptyDraft: ProviderDraft = {
   is_full_url: false,
   custom_user_agent: "",
   api_key: "",
-  channel: "anthropic",
+  channel_mode: "auto",
+  channel: "responses",
   prompt_cache_retention_enabled: true,
   request_body_gzip_enabled: false,
+  non_sse_compact_compat_enabled: false,
+  key_pool: {
+    enabled: false,
+    strategy: "round-robin",
+    failure_threshold: 3,
+    recovery_minutes: 5,
+    keys: []
+  },
   models: [],
   enabled: true
 };
@@ -738,9 +796,12 @@ export default function App() {
         models_url: draft.models_url.trim() || undefined,
         is_full_url: draft.is_full_url,
         custom_user_agent: draft.custom_user_agent.trim() || undefined,
+        channel_mode: draft.channel_mode,
         channel: draft.channel,
         prompt_cache_retention_enabled: draft.prompt_cache_retention_enabled,
         request_body_gzip_enabled: draft.request_body_gzip_enabled,
+        non_sse_compact_compat_enabled: draft.non_sse_compact_compat_enabled,
+        key_pool: providerKeyPoolInput(draft.key_pool),
         api_key: draft.api_key || undefined,
         enabled: draft.enabled
       };
@@ -1580,7 +1641,7 @@ function ProviderEditorModal({
   savingProvider: boolean;
   modelCandidates: ModelConfig[];
   selectedFetchedModelId: string;
-  onDraftChange: (draft: ProviderDraft) => void;
+  onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
   onApiKeyVisibleChange: (visible: boolean) => void;
   onFetchModels: () => void;
   onSelectedFetchedModelChange: (id: string) => void;
@@ -1665,7 +1726,7 @@ function ProviderPanel({
   savingProvider: boolean;
   modelCandidates: ModelConfig[];
   selectedFetchedModelId: string;
-  onDraftChange: (draft: ProviderDraft) => void;
+  onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
   onApiKeyVisibleChange: (visible: boolean) => void;
   onFetchModels: () => void;
   onSelectedFetchedModelChange: (id: string) => void;
@@ -1677,7 +1738,16 @@ function ProviderPanel({
   onDelete: () => void;
 }) {
   const isActive = Boolean(draft.id && config?.active_provider_id === draft.id);
-  const supportsPromptCacheRetention = draft.channel === "chat" || draft.channel === "responses";
+  const modeValue: "auto" | Channel = draft.channel_mode === "auto" ? "auto" : draft.channel;
+  const supportsPromptCacheRetention = draft.channel !== "anthropic";
+
+  function updateMode(value: "auto" | Channel) {
+    if (value === "auto") {
+      onDraftChange({ ...draft, channel_mode: "auto", channel: draft.channel || "responses" });
+      return;
+    }
+    onDraftChange({ ...draft, channel_mode: "manual", channel: value });
+  }
 
   return (
     <div className="panel-grid provider-grid">
@@ -1685,7 +1755,7 @@ function ProviderPanel({
         <div className="panel-head">
           <div>
             <h3>{selectedProviderId === "new" ? "新增上游" : "上游配置"}</h3>
-            <p>填写真实上游地址，本地代理只负责转发和缓存。</p>
+            <p>填写真实上游地址。默认自动识别通道，特殊上游再切到手动。</p>
           </div>
           <div className="chip-row">
             {isActive && <span className="active-chip"><Check size={14} /> 当前上游</span>}
@@ -1700,15 +1770,16 @@ function ProviderPanel({
               placeholder="上游名称"
             />
           </Field>
-          <Field label="接口格式">
+          <Field label="通道">
             <SelectShell>
               <select
-                value={draft.channel}
-                onChange={(event) => onDraftChange({ ...draft, channel: event.target.value as Channel })}
+                value={modeValue}
+                onChange={(event) => updateMode(event.target.value as "auto" | Channel)}
+                title="默认自动识别。需要排查或上游只支持某种格式时，再手动指定通道。"
               >
-                {channelOptions.map((option) => (
+                {upstreamModeOptions.map((option) => (
                   <option key={option.value} value={option.value}>
-                    {option.label} {option.endpoint}
+                    {option.label} · {option.detail}
                   </option>
                 ))}
               </select>
@@ -1720,7 +1791,7 @@ function ProviderPanel({
               <input
                 value={draft.base_url}
                 onChange={(event) => onDraftChange({ ...draft, base_url: event.target.value })}
-                placeholder="上游 Base URL"
+                placeholder="https://example.com/v1"
               />
             </div>
           </Field>
@@ -1733,62 +1804,87 @@ function ProviderPanel({
                 onChange={(event) => onDraftChange({ ...draft, api_key: event.target.value })}
                 placeholder={draft.id ? "留空则保留已保存密钥" : "输入上游 API Key"}
               />
-              <button className="inline-icon" onClick={() => onApiKeyVisibleChange(!apiKeyVisible)} type="button">
+              <button className="inline-icon" onClick={() => onApiKeyVisibleChange(!apiKeyVisible)} type="button" title={apiKeyVisible ? "隐藏 Key" : "显示 Key"}>
                 {apiKeyVisible ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
             </div>
           </Field>
         </div>
 
-        {supportsPromptCacheRetention && (
-          <div
-            className={draft.prompt_cache_retention_enabled ? "provider-option-control active" : "provider-option-control"}
-            title="开启后会给 OpenAI Chat / Responses 请求发送 prompt_cache_retention=24h，可能让支持的上游更久保留前缀缓存；不支持的第三方中转可能返回 400，遇到报错时请关闭。Anthropic 通道不使用这个参数。"
-          >
-            <div>
-              <h4>发送 prompt_cache_retention</h4>
-              <p>默认开启；仅用于 OpenAI Chat / Responses，请求更长的前缀缓存保留。不支持的上游报错时关闭它。</p>
+        <div className="provider-option-stack">
+          {supportsPromptCacheRetention && (
+            <div className={draft.prompt_cache_retention_enabled ? "provider-option-control active" : "provider-option-control"}>
+              <h4
+                className="provider-option-title"
+                data-help="默认开启。仅对 OpenAI Chat / Responses 上游发送 prompt_cache_retention=24h，用来请求更久的前缀缓存保留；上游不支持并报错时关闭。"
+                tabIndex={0}
+              >
+                prompt_cache_retention
+              </h4>
+              <button
+                className={draft.prompt_cache_retention_enabled ? "smart-cache-toggle on" : "smart-cache-toggle"}
+                type="button"
+                onClick={() =>
+                  onDraftChange({
+                    ...draft,
+                    prompt_cache_retention_enabled: !draft.prompt_cache_retention_enabled
+                  })
+                }
+              >
+                <span />
+                <b>{draft.prompt_cache_retention_enabled ? "开" : "关"}</b>
+              </button>
             </div>
+          )}
+
+          <div className={draft.request_body_gzip_enabled ? "provider-option-control active" : "provider-option-control"}>
+            <h4
+              className="provider-option-title"
+              data-help="默认关闭。只对超过 600KB 的上游请求体尝试 gzip 发送；上游不支持时会回退普通 JSON，不改变语义。"
+              tabIndex={0}
+            >
+              大请求体 gzip
+            </h4>
             <button
-              className={draft.prompt_cache_retention_enabled ? "smart-cache-toggle on" : "smart-cache-toggle"}
+              className={draft.request_body_gzip_enabled ? "smart-cache-toggle on" : "smart-cache-toggle"}
               type="button"
-              title="开启后发送 prompt_cache_retention=24h；不支持的上游可能报 Unsupported parameter。"
               onClick={() =>
                 onDraftChange({
                   ...draft,
-                  prompt_cache_retention_enabled: !draft.prompt_cache_retention_enabled
+                  request_body_gzip_enabled: !draft.request_body_gzip_enabled
                 })
               }
             >
               <span />
-              <b>{draft.prompt_cache_retention_enabled ? "已开启" : "已关闭"}</b>
+              <b>{draft.request_body_gzip_enabled ? "开" : "关"}</b>
             </button>
           </div>
-        )}
 
-        <div
-          className={draft.request_body_gzip_enabled ? "provider-option-control active" : "provider-option-control"}
-          title="实验性功能：开启后仅对超过 600KB 的上游请求体尝试 gzip 发送；如果上游不支持会自动回退为普通 JSON。默认关闭。"
-        >
-          <div>
-            <h4>大请求体 gzip 压缩</h4>
-            <p>默认关闭；用于降低大包上传和网关等待风险，不改变请求语义。</p>
+          <div className={draft.non_sse_compact_compat_enabled ? "provider-option-control active warning" : "provider-option-control"}>
+            <h4
+              className="provider-option-title"
+              data-help="默认关闭即快速压缩模式，按 cc-switch 思路优先走更快的协议转换。只有 ZCode 或类似 Agent 对非 SSE Responses 压缩 JSON 字段校验很严格时才开启。"
+              tabIndex={0}
+            >
+              非 SSE 压缩校验兼容
+            </h4>
+            <button
+              className={draft.non_sse_compact_compat_enabled ? "smart-cache-toggle on" : "smart-cache-toggle"}
+              type="button"
+              onClick={() =>
+                onDraftChange({
+                  ...draft,
+                  non_sse_compact_compat_enabled: !draft.non_sse_compact_compat_enabled
+                })
+              }
+            >
+              <span />
+              <b>{draft.non_sse_compact_compat_enabled ? "开" : "关"}</b>
+            </button>
           </div>
-          <button
-            className={draft.request_body_gzip_enabled ? "smart-cache-toggle on" : "smart-cache-toggle"}
-            type="button"
-            title="仅压缩 600KB 以上请求体；失败时自动回退。"
-            onClick={() =>
-              onDraftChange({
-                ...draft,
-                request_body_gzip_enabled: !draft.request_body_gzip_enabled
-              })
-            }
-          >
-            <span />
-            <b>{draft.request_body_gzip_enabled ? "已开启" : "已关闭"}</b>
-          </button>
         </div>
+
+        <MultiKeyManager draft={draft} onDraftChange={onDraftChange} />
 
         <div className="action-row">
           <button className="primary-button" onClick={onSave} disabled={savingProvider}>
@@ -1808,7 +1904,7 @@ function ProviderPanel({
         <div className="panel-head compact">
           <div>
             <h3>模型</h3>
-            <p>{draft.models.length ? `${draft.models.length} 个模型已在列表中` : "先获取模型，或手动添加模型 ID。"}</p>
+            <p>{draft.models.length ? draft.models.length + " 个模型已在列表中" : "获取模型后从下拉选择，也可以手动添加模型 ID。"}</p>
           </div>
           <button className="soft-button" onClick={onAddManualModel}>
             <Plus size={16} />
@@ -1849,7 +1945,7 @@ function ProviderPanel({
             </div>
           ) : (
             draft.models.map((item, index) => (
-              <div className="model-row" key={`model-row-${index}`}>
+              <div className="model-row" key={"model-row-" + index}>
                 <input
                   value={item.id}
                   onChange={(event) =>
@@ -1882,6 +1978,278 @@ function ProviderPanel({
         </div>
       </section>
     </div>
+  );
+}
+
+function MultiKeyManager({
+  draft,
+  onDraftChange
+}: {
+  draft: ProviderDraft;
+  onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
+}) {
+  const [batchKeys, setBatchKeys] = useState("");
+  const [testingKeyId, setTestingKeyId] = useState("");
+  const [testingAll, setTestingAll] = useState(false);
+  const pool = draft.key_pool;
+  const availableKeys = pool.keys.filter((key) => key.enabled && key.status !== "unhealthy").length;
+  const strategy = keyStrategyOptions.find((item) => item.value === pool.strategy);
+
+  function updatePoolFrom(updater: (pool: ProviderKeyPoolDraft) => ProviderKeyPoolDraft) {
+    onDraftChange((current) => ({
+      ...current,
+      key_pool: updater(current.key_pool)
+    }));
+  }
+
+  function updatePool(patch: Partial<ProviderKeyPoolDraft>) {
+    updatePoolFrom((currentPool) => ({ ...currentPool, ...patch }));
+  }
+
+  function updateKey(id: string, patch: Partial<ProviderKeyDraft>) {
+    updatePoolFrom((currentPool) => ({
+      ...currentPool,
+      keys: currentPool.keys.map((key) => (key.id === id ? { ...key, ...patch } : key))
+    }));
+  }
+
+  function addKeys() {
+    const parsed = parseBatchKeys(batchKeys);
+    if (!parsed.length) return;
+    const existing = new Set(pool.keys.map((key) => (key.key || key.preview).trim()).filter(Boolean));
+    const nextKeys = parsed
+      .filter((key) => !existing.has(key))
+      .map((key) => newProviderKeyDraft(key));
+    if (!nextKeys.length) return;
+    updatePoolFrom((currentPool) => ({ ...currentPool, keys: [...currentPool.keys, ...nextKeys], enabled: true }));
+    setBatchKeys("");
+  }
+
+  async function testKey(key: ProviderKeyDraft) {
+    setTestingKeyId(key.id);
+    try {
+      const result = await command<ProviderKeyTestResult>("test_provider_key", {
+        input: {
+          provider_id: draft.id ?? null,
+          key_id: key.id,
+          api_key: key.key.trim() || undefined,
+          base_url: draft.base_url,
+          models_url: draft.models_url || undefined,
+          is_full_url: draft.is_full_url,
+          custom_user_agent: draft.custom_user_agent || undefined,
+          channel: draft.channel
+        }
+      });
+      updateKey(key.id, {
+        enabled: result.ok,
+        status: result.ok ? "healthy" : "unhealthy",
+        last_checked_at: new Date().toISOString(),
+        last_error: result.ok ? null : result.message,
+        successes: result.ok ? key.successes + 1 : key.successes,
+        failures: result.ok ? key.failures : key.failures + 1
+      });
+    } catch (err) {
+      updateKey(key.id, {
+        enabled: false,
+        status: "unhealthy",
+        last_checked_at: new Date().toISOString(),
+        last_error: String(err),
+        failures: key.failures + 1
+      });
+    } finally {
+      setTestingKeyId("");
+    }
+  }
+
+  async function testAllKeys() {
+    setTestingAll(true);
+    try {
+      for (const key of pool.keys) {
+        await testKey(key);
+      }
+    } finally {
+      setTestingAll(false);
+    }
+  }
+
+  function moveKey(id: string, direction: -1 | 1) {
+    updatePoolFrom((currentPool) => {
+      const index = currentPool.keys.findIndex((key) => key.id === id);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= currentPool.keys.length) return currentPool;
+      const keys = [...currentPool.keys];
+      [keys[index], keys[target]] = [keys[target], keys[index]];
+      return { ...currentPool, keys };
+    });
+  }
+
+  return (
+    <section className={pool.enabled ? "multi-key-card active" : "multi-key-card"}>
+      <button
+        className="multi-key-summary"
+        type="button"
+        onClick={() => updatePool({ enabled: !pool.enabled })}
+        title="开启后，请求会按负载均衡策略自动选择可用 Key；余额不足、限额、鉴权失败等错误会自动停用异常 Key。"
+      >
+        <span className="multi-key-summary-icon"><KeyRound size={16} /></span>
+        <span>
+          <b>多 Key 管理</b>
+          <small>{pool.enabled ? availableKeys + "/" + pool.keys.length + " 可用 · " + (strategy?.label ?? "轮询") : "关闭 · 点击开启"}</small>
+        </span>
+        <span className={pool.enabled ? "mini-toggle on" : "mini-toggle"} aria-hidden="true"><span /></span>
+      </button>
+
+      {pool.enabled ? (
+        <div className="multi-key-body">
+          <div className="multi-key-grid compact">
+            <Field label="负载均衡">
+              <SelectShell>
+                <select
+                  value={pool.strategy}
+                  onChange={(event) =>
+                    updatePool({ strategy: event.target.value as KeyLoadBalanceStrategy })
+                  }
+                >
+                  {keyStrategyOptions.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </SelectShell>
+            </Field>
+            <Field label="失败阈值">
+              <input
+                value={pool.failure_threshold}
+                onChange={(event) => updatePool({ failure_threshold: Number(event.target.value) || 1 })}
+              />
+            </Field>
+            <Field label="恢复分钟">
+              <input
+                value={pool.recovery_minutes}
+                onChange={(event) => updatePool({ recovery_minutes: Number(event.target.value) || 1 })}
+              />
+            </Field>
+          </div>
+          {strategy ? <div className="multi-key-hint">{strategy.hint}</div> : null}
+
+          <div className="multi-key-batch">
+            <label>
+              <span>批量添加 Key</span>
+              <textarea
+                value={batchKeys}
+                onChange={(event) => setBatchKeys(event.target.value)}
+                placeholder="每行一个 Key，也支持用空格、逗号或分号隔开"
+              />
+            </label>
+            <div className="multi-key-actions">
+              <button className="primary-button" type="button" onClick={addKeys} disabled={!batchKeys.trim()}>
+                <Plus size={16} />
+                添加
+              </button>
+              <button className="soft-button" type="button" onClick={() => void testAllKeys()} disabled={!pool.keys.length || testingAll}>
+                {testingAll ? <Loader2 className="spin" size={16} /> : <Activity size={16} />}
+                全部检测
+              </button>
+              <button
+                className="danger-button"
+                type="button"
+                onClick={() =>
+                  updatePoolFrom((currentPool) => ({
+                    ...currentPool,
+                    keys: currentPool.keys.filter((key) => key.enabled && key.status !== "unhealthy")
+                  }))
+                }
+                disabled={!pool.keys.some((key) => !key.enabled || key.status === "unhealthy")}
+              >
+                <Trash2 size={16} />
+                清不可用
+              </button>
+            </div>
+          </div>
+
+          <div className="multi-key-list">
+            {pool.keys.length ? (
+              pool.keys.map((key, index) => (
+                <div className="multi-key-row" key={key.id}>
+                  <span className="multi-key-index">#{index + 1}</span>
+                  <div className="multi-key-main">
+                    <input
+                      value={key.alias}
+                      onChange={(event) => updateKey(key.id, { alias: event.target.value })}
+                      placeholder="别名"
+                    />
+                    <input
+                      value={key.key}
+                      onChange={(event) =>
+                        updateKey(key.id, {
+                          key: event.target.value,
+                          status: "unknown",
+                          last_error: null,
+                          disabled_until: null
+                        })
+                      }
+                      placeholder={key.preview || "Key"}
+                    />
+                    <small>{key.key ? maskKey(key.key) : key.preview}</small>
+                  </div>
+                  <input
+                    className="multi-key-priority"
+                    value={key.priority}
+                    onChange={(event) => updateKey(key.id, { priority: Number(event.target.value) || 0 })}
+                    title="优先级"
+                  />
+                  <span className={"multi-key-status " + key.status}>{keyStatusLabel(key.status)}</span>
+                  <div className="multi-key-stats">
+                    <span>总 {formatNumber(key.total_requests)}</span>
+                    <span>成功 {formatNumber(key.successes)}</span>
+                    <span>失败 {formatNumber(key.failures)}</span>
+                  </div>
+                  <button
+                    className={key.enabled ? "mini-toggle on" : "mini-toggle"}
+                    type="button"
+                    onClick={() => updateKey(key.id, { enabled: !key.enabled })}
+                    title={key.enabled ? "关闭这个 Key" : "启用这个 Key"}
+                  >
+                    <span />
+                  </button>
+                  <button
+                    className="icon-button"
+                    type="button"
+                    onClick={() => void testKey(key)}
+                    title="检测这个 Key"
+                    disabled={testingKeyId === key.id || (!key.key.trim() && !draft.id)}
+                  >
+                    {testingKeyId === key.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
+                  </button>
+                  <button className="icon-button" type="button" onClick={() => moveKey(key.id, -1)} disabled={index === 0} title="上移">
+                    ↑
+                  </button>
+                  <button className="icon-button" type="button" onClick={() => moveKey(key.id, 1)} disabled={index === pool.keys.length - 1} title="下移">
+                    ↓
+                  </button>
+                  <button
+                    className="icon-button danger"
+                    type="button"
+                    onClick={() =>
+                      updatePoolFrom((currentPool) => ({
+                        ...currentPool,
+                        keys: currentPool.keys.filter((item) => item.id !== key.id)
+                      }))
+                    }
+                    title="删除 Key"
+                  >
+                    <Trash2 size={15} />
+                  </button>
+                </div>
+              ))
+            ) : (
+              <div className="multi-key-empty">暂无 Key。添加后可以检测可用性，并按策略热重载生效。</div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -2515,13 +2883,101 @@ function providerToDraft(provider: ProviderConfig): ProviderDraft {
     is_full_url: provider.is_full_url,
     custom_user_agent: provider.custom_user_agent ?? "",
     api_key: "",
+    channel_mode: provider.channel_mode ?? "auto",
     channel: provider.channel,
     prompt_cache_retention_enabled: provider.prompt_cache_retention_enabled,
     request_body_gzip_enabled: provider.request_body_gzip_enabled,
+    non_sse_compact_compat_enabled: provider.non_sse_compact_compat_enabled ?? false,
+    key_pool: providerKeyPoolToDraft(provider.key_pool),
     models: provider.models,
     enabled: provider.enabled
   };
 }
+
+function providerKeyPoolToDraft(pool?: ProviderConfig["key_pool"] | null): ProviderKeyPoolDraft {
+  return {
+    enabled: pool?.enabled ?? false,
+    strategy: pool?.strategy ?? "round-robin",
+    failure_threshold: pool?.failure_threshold ?? 3,
+    recovery_minutes: pool?.recovery_minutes ?? 5,
+    keys: (pool?.keys ?? []).map((key) => ({
+      id: key.id,
+      alias: key.alias ?? "",
+      key: "",
+      preview: key.preview,
+      enabled: key.enabled,
+      priority: key.priority,
+      status: key.status,
+      total_requests: key.total_requests,
+      successes: key.successes,
+      failures: key.failures,
+      last_checked_at: key.last_checked_at,
+      last_error: key.last_error,
+      disabled_until: key.disabled_until
+    }))
+  };
+}
+
+function providerKeyPoolInput(pool: ProviderKeyPoolDraft) {
+  return {
+    enabled: pool.enabled,
+    strategy: pool.strategy,
+    failure_threshold: Math.max(1, Number(pool.failure_threshold) || 3),
+    recovery_minutes: Math.max(1, Number(pool.recovery_minutes) || 5),
+    keys: pool.keys.map((key) => ({
+      id: key.id,
+      alias: key.alias.trim() || null,
+      key: key.key.trim() || null,
+      enabled: key.enabled,
+      priority: Math.max(0, Number(key.priority) || 0),
+      status: key.status,
+      total_requests: key.total_requests,
+      successes: key.successes,
+      failures: key.failures,
+      last_checked_at: key.last_checked_at ?? null,
+      last_error: key.last_error ?? null,
+      disabled_until: key.disabled_until ?? null
+    }))
+  };
+}
+
+function newProviderKeyDraft(key: string): ProviderKeyDraft {
+  const value = key.trim();
+  return {
+    id: "key_" + Date.now() + "_" + Math.random().toString(16).slice(2),
+    alias: "",
+    key: value,
+    preview: maskKey(value),
+    enabled: true,
+    priority: 5,
+    status: "unknown",
+    total_requests: 0,
+    successes: 0,
+    failures: 0,
+    last_checked_at: null,
+    last_error: null,
+    disabled_until: null
+  };
+}
+
+function parseBatchKeys(value: string) {
+  return value
+    .split(/[\s,;，；]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function maskKey(key: string) {
+  if (key.length <= 12) return key ? key.slice(0, 4) + "..." : "";
+  return key.slice(0, 6) + "..." + key.slice(-4);
+}
+
+function keyStatusLabel(status: ProviderKeyStatus) {
+  if (status === "healthy") return "可用";
+  if (status === "unhealthy") return "不可用";
+  return "未知";
+}
+
 
 function normalizeModels(models: ModelConfig[]) {
   const byId = new Map<string, ModelConfig>();

@@ -1,8 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 
 export type Channel = "chat" | "responses" | "anthropic";
+export type ProviderChannelMode = "auto" | "manual";
 export type CacheMode = "passive-warm" | "session-prewarm" | "prefix-prewarm";
 export type AgentInjectionKind = "claude-code" | "codex" | "claude-desktop" | "proxy-mode";
+export type KeyLoadBalanceStrategy = "round-robin" | "priority" | "least-used" | "random" | "sequential";
+export type ProviderKeyStatus = "unknown" | "healthy" | "unhealthy";
 
 export interface ModelConfig {
   id: string;
@@ -21,14 +24,72 @@ export interface ProviderConfig {
   models_url?: string | null;
   is_full_url: boolean;
   custom_user_agent?: string | null;
+  channel_mode: ProviderChannelMode;
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  non_sse_compact_compat_enabled: boolean;
   has_api_key: boolean;
+  key_pool?: PublicProviderKeyPool | null;
   models: ModelConfig[];
   enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export interface PublicProviderKeyPool {
+  enabled: boolean;
+  strategy: KeyLoadBalanceStrategy;
+  failure_threshold: number;
+  recovery_minutes: number;
+  available_keys: number;
+  keys: PublicProviderKey[];
+}
+
+export interface PublicProviderKey {
+  id: string;
+  alias?: string | null;
+  preview: string;
+  enabled: boolean;
+  priority: number;
+  status: ProviderKeyStatus;
+  total_requests: number;
+  successes: number;
+  failures: number;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+  disabled_until?: string | null;
+}
+
+export interface ProviderKeyPoolInput {
+  enabled: boolean;
+  strategy: KeyLoadBalanceStrategy;
+  failure_threshold: number;
+  recovery_minutes: number;
+  keys: ProviderKeyInput[];
+}
+
+export interface ProviderKeyInput {
+  id?: string;
+  alias?: string | null;
+  key?: string | null;
+  enabled: boolean;
+  priority: number;
+  status: ProviderKeyStatus;
+  total_requests: number;
+  successes: number;
+  failures: number;
+  last_checked_at?: string | null;
+  last_error?: string | null;
+  disabled_until?: string | null;
+}
+
+export interface ProviderKeyTestResult {
+  provider_id?: string | null;
+  key_id?: string | null;
+  ok: boolean;
+  message: string;
+  models_count: number;
 }
 
 export interface AppConfig {
@@ -61,6 +122,7 @@ export interface AppConfig {
     background_prewarm_enabled: boolean;
   };
   agent_injections: AgentInjectionConfig[];
+  provider_key_pools?: Array<{ provider_id: string; pool: PublicProviderKeyPool }>;
   updated_at: string;
   config_path: string;
 }
@@ -285,9 +347,12 @@ export interface ProviderInput {
   models_url?: string;
   is_full_url: boolean;
   custom_user_agent?: string;
+  channel_mode: ProviderChannelMode;
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  non_sse_compact_compat_enabled: boolean;
+  key_pool?: ProviderKeyPoolInput | null;
   api_key?: string;
   enabled: boolean;
 }
@@ -344,6 +409,7 @@ let fallbackConfig: AppConfig = {
     injection("claude-desktop", "Claude Desktop", "claude-desktop"),
     injection("proxy-mode", "代理模式", "proxy-mode")
   ],
+  provider_key_pools: [],
   updated_at: new Date().toISOString(),
   config_path: "%APPDATA%/Atoapi/config.toml"
 };
@@ -527,6 +593,29 @@ function fallback(name: string, args?: Record<string, unknown>) {
     }
     return models;
   }
+  if (name === "test_provider_key") {
+    const input = args?.input as { provider_id?: string; key_id?: string; api_key?: string; base_url?: string; channel?: Channel } | undefined;
+    const usable = Boolean(input?.api_key || input?.key_id);
+    const models = inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
+    return {
+      provider_id: input?.provider_id ?? null,
+      key_id: input?.key_id ?? null,
+      ok: usable,
+      message: usable ? "预览模式：可用，获取到 " + models.length + " 个模型" : "Key 为空",
+      models_count: usable ? models.length : 0
+    };
+  }
+  if (name === "test_provider_key_pool") {
+    const providerId = String(args?.providerId ?? args?.provider_id ?? "");
+    const provider = fallbackConfig.providers.find((item) => item.id === providerId);
+    return (provider?.key_pool?.keys ?? []).map((key) => ({
+      provider_id: providerId,
+      key_id: key.id,
+      ok: key.enabled,
+      message: key.enabled ? "预览模式：可用" : "预览模式：已关闭",
+      models_count: key.enabled ? 3 : 0
+    }));
+  }
   if (name === "select_provider" && (args?.providerId || args?.provider_id)) {
     const providerId = String(args.providerId ?? args.provider_id);
     const provider = fallbackConfig.providers.find((item) => item.id === providerId);
@@ -560,10 +649,15 @@ function fallback(name: string, args?: Record<string, unknown>) {
       models_url: input.models_url ?? existing?.models_url ?? null,
       is_full_url: input.is_full_url,
       custom_user_agent: input.custom_user_agent ?? existing?.custom_user_agent ?? null,
+      channel_mode: input.channel_mode ?? existing?.channel_mode ?? "auto",
       channel: input.channel,
       prompt_cache_retention_enabled: input.prompt_cache_retention_enabled ?? true,
       request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? false,
+      non_sse_compact_compat_enabled: input.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
       has_api_key: Boolean(input.api_key) || existing?.has_api_key || false,
+      key_pool: input.key_pool
+        ? previewKeyPool(input.key_pool, existing?.key_pool ?? null)
+        : existing?.key_pool ?? null,
       models: existing?.models ?? [],
       enabled: input.enabled,
       created_at: existing?.created_at ?? now,
@@ -572,6 +666,12 @@ function fallback(name: string, args?: Record<string, unknown>) {
     fallbackConfig = {
       ...fallbackConfig,
       active_provider_id: fallbackConfig.active_provider_id ?? id,
+      provider_key_pools: input.key_pool
+        ? [
+            ...(fallbackConfig.provider_key_pools ?? []).filter((item) => item.provider_id !== id),
+            { provider_id: id, pool: previewKeyPool(input.key_pool, existing?.key_pool ?? null) }
+          ]
+        : fallbackConfig.provider_key_pools,
       providers: existing
         ? fallbackConfig.providers.map((item) => (item.id === id ? provider : item))
         : [...fallbackConfig.providers, provider],
@@ -615,6 +715,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
     fallbackConfig = {
       ...fallbackConfig,
       providers,
+      provider_key_pools: (fallbackConfig.provider_key_pools ?? []).filter((item) => item.provider_id !== providerId),
       active_provider_id: activeProviderId,
       agent_injections: fallbackConfig.agent_injections.map((item) =>
         item.provider_id === providerId
@@ -724,6 +825,43 @@ function withProvider(
     ),
     updated_at: new Date().toISOString()
   };
+}
+
+
+function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKeyPool | null): PublicProviderKeyPool {
+  const keys = input.keys.map((key) => {
+    const id = key.id || "key-" + Math.random().toString(36).slice(2);
+    const previous = existing?.keys.find((item) => item.id === id);
+    return {
+      id,
+      alias: key.alias ?? previous?.alias ?? null,
+      preview: key.key ? maskKeyPreview(key.key) : previous?.preview ?? "未保存",
+      enabled: key.enabled,
+      priority: key.priority,
+      status: key.status,
+      total_requests: key.total_requests,
+      successes: key.successes,
+      failures: key.failures,
+      last_checked_at: key.last_checked_at ?? previous?.last_checked_at ?? null,
+      last_error: key.last_error ?? null,
+      disabled_until: key.disabled_until ?? null
+    };
+  });
+  return {
+    enabled: input.enabled,
+    strategy: input.strategy,
+    failure_threshold: input.failure_threshold,
+    recovery_minutes: input.recovery_minutes,
+    available_keys: keys.filter((key) => key.enabled).length,
+    keys
+  };
+}
+
+function maskKeyPreview(value: string) {
+  const key = value.trim();
+  if (!key) return "未保存";
+  if (key.length <= 10) return "*".repeat(Math.max(4, key.length));
+  return key.slice(0, 6) + "..." + key.slice(-4);
 }
 
 function inferPreviewModels(baseUrl: string, channel: Channel): ModelConfig[] {
