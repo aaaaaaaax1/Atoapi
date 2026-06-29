@@ -1215,6 +1215,7 @@ async fn handle_generation(
             provider_prefix_control_key.as_deref(),
             provider_prefix_family_key.as_deref(),
             &tail_input_diagnostics,
+            prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
         )
         .await
     } else {
@@ -2148,6 +2149,11 @@ async fn acquire_provider_prefix_guard(
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     };
+    if matches!(channel, Channel::Responses) {
+        return tokio::time::timeout(responses_foreground_wait_cap(), lock.lock_owned())
+            .await
+            .ok();
+    }
     Some(lock.lock_owned().await)
 }
 
@@ -2176,6 +2182,7 @@ async fn wait_for_provider_prefix_settle(
     provider_prefix_key: Option<&str>,
     provider_prefix_family_key: Option<&str>,
     current_tail: &TailInputDiagnostics,
+    max_wait: Option<TokioDuration>,
 ) -> PrefixGuardWaitDiagnostics {
     if provider_prefix_key.is_none() && provider_prefix_family_key.is_none() {
         return PrefixGuardWaitDiagnostics {
@@ -2213,9 +2220,15 @@ async fn wait_for_provider_prefix_settle(
     )) = decision
     {
         if let Some(wait) = wait {
+            let wait = max_wait.map(|max_wait| wait.min(max_wait)).unwrap_or(wait);
             if wait.is_zero() {
                 return PrefixGuardWaitDiagnostics {
-                    skip_reason: Some("wait_zero".to_string()),
+                    skip_reason: Some(
+                        max_wait
+                            .map(|_| "local_guard_budget_exhausted")
+                            .unwrap_or("wait_zero")
+                            .to_string(),
+                    ),
                     source: Some(source),
                     cache_instability_score: Some(cache_instability_score),
                     seen_bucket_tokens: Some(seen_bucket_tokens),
@@ -2514,7 +2527,7 @@ fn chat_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDuration {
     } else if observed_shortfall > 2048 {
         responses_foreground_wait_cap()
     } else if observed_shortfall > 1024 {
-        TokioDuration::from_secs(5)
+        responses_foreground_wait_cap()
     } else if observed_shortfall > 512 {
         TokioDuration::from_millis(2500)
     } else if observed_shortfall > 0 {
@@ -2648,13 +2661,13 @@ fn responses_minimum_avoidable_request_wait(
         return responses_foreground_wait_cap();
     }
     if avoidable >= 2048 || (avoidable >= 1024 && mixed_tool_tail) {
-        return TokioDuration::from_secs(4);
+        return responses_foreground_wait_cap();
     }
     if avoidable >= 1024 {
         return TokioDuration::from_secs(3);
     }
     if avoidable >= 512 && state.avoidable_shortfall_streak >= 3 {
-        return TokioDuration::from_secs(4);
+        return responses_foreground_wait_cap();
     }
     if avoidable >= 512 && state.avoidable_shortfall_streak >= 2 {
         return TokioDuration::from_secs(3);
@@ -2705,13 +2718,13 @@ fn responses_stale_prefix_recovery_wait(
         let early_large_tool_tail = current_tail.tool_output_chars >= 8_000
             || current_tail.largest_tool_output_chars >= 8_000;
         if state.cache_read_tokens == 0 && observed_shortfall >= 1024 && early_large_tool_tail {
-            return Some(TokioDuration::from_secs(5));
+            return Some(responses_foreground_wait_cap());
         }
         if state.cache_read_tokens == 0 && observed_shortfall >= 1024 {
-            return Some(TokioDuration::from_secs(4));
+            return Some(responses_foreground_wait_cap());
         }
         if early_large_tool_tail && observed_shortfall >= 2048 {
-            return Some(TokioDuration::from_secs(5));
+            return Some(responses_foreground_wait_cap());
         }
         if avoidable >= 2048 {
             return Some(responses_foreground_wait_cap());
@@ -2733,7 +2746,7 @@ fn responses_stale_prefix_recovery_wait(
             return Some(responses_foreground_wait_cap());
         }
         if responses_stale_large_tool_tail_catchup(state, current_tail, elapsed) {
-            return Some(TokioDuration::from_secs(5));
+            return Some(responses_foreground_wait_cap());
         }
         if responses_long_idle_large_tail_probe(state, current_tail, elapsed) {
             return Some(responses_foreground_wait_cap());
@@ -2761,9 +2774,9 @@ fn responses_stale_prefix_recovery_wait(
     } else if avoidable >= 4096 {
         responses_foreground_wait_cap()
     } else if avoidable >= 2048 {
-        TokioDuration::from_secs(4)
+        responses_foreground_wait_cap()
     } else if avoidable > 0 && medium_current_tool_tail {
-        TokioDuration::from_secs(4)
+        responses_foreground_wait_cap()
     } else if avoidable >= 1024 {
         TokioDuration::from_secs(3)
     } else if stale_small_avoidable_risk {
@@ -2778,7 +2791,7 @@ fn responses_stale_prefix_recovery_wait(
     } else if avoidable > 0 {
         TokioDuration::from_secs(2)
     } else if observed_shortfall >= 2048 {
-        TokioDuration::from_secs(4)
+        responses_foreground_wait_cap()
     } else {
         TokioDuration::from_secs(2)
     };
@@ -3082,7 +3095,18 @@ fn responses_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDurat
 }
 
 fn responses_foreground_wait_cap() -> TokioDuration {
-    TokioDuration::from_secs(5)
+    TokioDuration::from_secs(3)
+}
+
+fn prefix_guard_wait_budget_for_channel(
+    channel: &Channel,
+    elapsed_since_request_start: TokioDuration,
+) -> Option<TokioDuration> {
+    matches!(channel, Channel::Responses).then(|| {
+        responses_foreground_wait_cap()
+            .checked_sub(elapsed_since_request_start)
+            .unwrap_or(TokioDuration::ZERO)
+    })
 }
 
 fn cap_responses_foreground_wait(wait: TokioDuration) -> TokioDuration {
@@ -3237,14 +3261,14 @@ fn responses_cold_unstable_recent_warm_floor(state: &PrefixWarmState) -> TokioDu
         return TokioDuration::ZERO;
     }
     if state.input_tokens >= 96_000 && state.cache_instability_score >= 4 {
-        return TokioDuration::from_secs(5);
+        return responses_foreground_wait_cap();
     }
     let shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
     if shortfall > 2048 {
         return TokioDuration::ZERO;
     }
     let age = state.finished_at.elapsed();
-    let floor = TokioDuration::from_secs(5);
+    let floor = responses_foreground_wait_cap();
     floor.checked_sub(age).unwrap_or(TokioDuration::ZERO)
 }
 
@@ -3264,7 +3288,7 @@ fn responses_avoidable_wait_cap_for_99(state: &PrefixWarmState, avoidable: u64) 
         return responses_non_avoidable_wait_cap(state);
     }
 
-    TokioDuration::from_secs(5)
+    responses_foreground_wait_cap()
 }
 
 fn responses_current_tail_floor(
@@ -6530,7 +6554,8 @@ async fn send_main_upstream_request(
     request_body_gzip_enabled: bool,
     no_internal_retry: bool,
 ) -> reqwest::Result<UpstreamSendOutcome> {
-    let max_attempts = (sync_responses_main || no_internal_retry).then_some(1);
+    let _ = (sync_responses_main, no_internal_retry);
+    let max_attempts = Some(1);
     send_upstream_request_to_url_with_diagnostics(
         state,
         url,
@@ -14211,7 +14236,7 @@ mod tests {
         );
         assert_eq!(
             responses_provider_prefix_settle_delay(&large_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
 
         let mut small_bucket_tail = prefix_state(7_898, 7_168, 512);
@@ -14240,7 +14265,7 @@ mod tests {
         };
         assert_eq!(
             responses_provider_prefix_settle_delay(&huge_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14254,7 +14279,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&large_tool_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
 
         let mut huge_tool_tail = prefix_state(169_815, 156_160, 13_312);
@@ -14265,7 +14290,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&huge_tool_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14282,7 +14307,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&cold_then_warm_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14300,7 +14325,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&noisy_tool_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -14313,7 +14338,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_repeated_small_bucket_tail_keeps_five_second_guard_without_new_tool_noise() {
+    fn responses_repeated_small_bucket_tail_keeps_short_guard_without_new_tool_noise() {
         let mut repeated_small_tail = prefix_state(80_583, 79_872, 512);
         repeated_small_tail.avoidable_shortfall_tokens = 0;
         repeated_small_tail.avoidable_shortfall_tokens_128 = 0;
@@ -14328,7 +14353,7 @@ mod tests {
                 &repeated_small_tail,
                 &TailInputDiagnostics::default(),
             ),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14377,7 +14402,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&repeated_small_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(
@@ -14399,7 +14424,7 @@ mod tests {
         repeated_small_tail.shortfall_tokens_128 = 1_536;
         assert_eq!(
             responses_provider_prefix_settle_delay(&repeated_small_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(
@@ -14443,7 +14468,7 @@ mod tests {
                 &repeated_small_tail,
                 &current_tool_tail,
             ),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -14507,7 +14532,7 @@ mod tests {
         ));
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -14521,7 +14546,7 @@ mod tests {
         stable_gap.cache_instability_score = 3;
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14563,7 +14588,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&tiny),
-            TokioDuration::from_secs(4)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14607,6 +14632,7 @@ mod tests {
                 source: Some("message".to_string()),
                 ..TailInputDiagnostics::default()
             },
+            None,
         )
         .await;
 
@@ -14628,7 +14654,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay(&cold_read_regression),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -14647,7 +14673,7 @@ mod tests {
         huge_cold_read_regression.avoidable_shortfall_streak = 2;
         assert_eq!(
             responses_provider_prefix_settle_delay(&huge_cold_read_regression),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -14674,7 +14700,7 @@ mod tests {
                     ..TailInputDiagnostics::default()
                 }
             ),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -14696,8 +14722,8 @@ mod tests {
         unstable_recent_warm.seen_bucket_tokens_128 = 152_576;
 
         let floor = responses_cold_unstable_recent_warm_floor(&unstable_recent_warm);
-        assert!(floor <= TokioDuration::from_secs(5));
-        assert!(floor >= TokioDuration::from_millis(4_900));
+        assert!(floor <= responses_foreground_wait_cap());
+        assert!(floor >= TokioDuration::from_millis(2_900));
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
                 &Channel::Responses,
@@ -14795,12 +14821,12 @@ mod tests {
             (512, TokioDuration::from_secs(2)),
             (1024, TokioDuration::from_secs(3)),
             (1536, TokioDuration::from_secs(3)),
-            (2560, TokioDuration::from_secs(4)),
-            (4608, TokioDuration::from_secs(5)),
-            (9728, TokioDuration::from_secs(5)),
-            (20_992, TokioDuration::from_secs(5)),
-            (70_144, TokioDuration::from_secs(5)),
-            (92_160, TokioDuration::from_secs(5)),
+            (2560, responses_foreground_wait_cap()),
+            (4608, responses_foreground_wait_cap()),
+            (9728, responses_foreground_wait_cap()),
+            (20_992, responses_foreground_wait_cap()),
+            (70_144, responses_foreground_wait_cap()),
+            (92_160, responses_foreground_wait_cap()),
         ] {
             let mut state = prefix_state(180_000 + gap, 175_000, gap);
             state.avoidable_shortfall_tokens = gap;
@@ -15063,13 +15089,13 @@ mod tests {
     #[test]
     fn responses_prefix_settle_delay_uses_512_bucket_guard_for_new_tail() {
         for (tail, expected) in [
-            (512, 5),
-            (1024, 5),
-            (1536, 5),
-            (2048, 5),
-            (2560, 5),
-            (7168, 5),
-            (9728, 5),
+            (512, 3),
+            (1024, 3),
+            (1536, 3),
+            (2048, 3),
+            (2560, 3),
+            (7168, 3),
+            (9728, 3),
         ] {
             let mut state = prefix_state(240_000 + tail, 235_000, tail);
             state.avoidable_shortfall_tokens = 0;
@@ -15101,7 +15127,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -15126,7 +15152,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
@@ -15153,7 +15179,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
@@ -15592,7 +15618,7 @@ mod tests {
         );
         assert_eq!(
             chat_provider_prefix_settle_delay(&state),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -15608,7 +15634,7 @@ mod tests {
         );
         assert_eq!(
             chat_provider_prefix_settle_delay(&state),
-            TokioDuration::from_secs(5)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -15684,7 +15710,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15722,7 +15748,7 @@ mod tests {
             &TailInputDiagnostics::default(),
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15747,7 +15773,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15772,7 +15798,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(4)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15796,7 +15822,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15824,7 +15850,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_recent_small_tool_tail_lag_gets_full_five_second_guard() {
+    fn responses_recent_small_tool_tail_lag_gets_short_guard() {
         let mut state = prefix_state(156_915, 156_160, 512);
         state.finished_at = Instant::now() - std::time::Duration::from_secs(3);
         state.seen_bucket_tokens = 156_160;
@@ -15849,7 +15875,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15879,7 +15905,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15903,11 +15929,11 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
-    fn responses_early_cold_anchor_large_tool_tail_gets_five_second_guard() {
+    fn responses_early_cold_anchor_large_tool_tail_gets_short_guard() {
         let mut state = prefix_state(7_906, 0, 7_680);
         state.finished_at = Instant::now() - std::time::Duration::from_secs(32);
         state.seen_bucket_tokens = 0;
@@ -15927,7 +15953,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15953,11 +15979,11 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
-    fn responses_small_context_1024_avoidable_prefix_gets_six_second_guard() {
+    fn responses_small_context_1024_avoidable_prefix_gets_short_guard() {
         let mut state = prefix_state(12_408, 7_680, 1_024);
         state.finished_at = Instant::now() - std::time::Duration::from_secs(38);
         state.seen_bucket_tokens = 12_288;
@@ -15972,7 +15998,7 @@ mod tests {
             &TailInputDiagnostics::default(),
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -15999,7 +16025,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(4)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -16052,7 +16078,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -16076,7 +16102,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(4)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -16122,7 +16148,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -16145,7 +16171,7 @@ mod tests {
         let wait = provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail);
         let reason = provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &tail);
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(5)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
         assert_eq!(
             reason.as_deref(),
             Some("responses_stale_medium_tool_tail_probe")
@@ -17002,6 +17028,7 @@ mod tests {
             Some(sibling_key),
             Some(family_key),
             &TailInputDiagnostics::default(),
+            None,
         )
         .await;
         assert_eq!(wait.source.as_deref(), Some("session-sibling"));

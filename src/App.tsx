@@ -119,8 +119,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.52";
+const appVersion = "v0.1.53";
 const appVersionNotes = [
+  "v0.1.53: Responses 本地前缀保护从最多 +5 秒收口到最多 +3 秒，所有 4/5 秒前台 guard 分支统一受 3 秒上限约束",
+  "v0.1.53: 同前缀串行锁等待纳入 3 秒总预算，避免 prefix_guard_wait_ms=0 但 local_prepare_ms 隐性排队二十多秒",
+  "v0.1.53: 主请求关闭内部多轮重试，避免上游 5xx/超时在首字前被本地重试到几十秒；错误更快暴露，多 key/压缩显式兜底保留",
   "v0.1.52: 同前缀 cache_read=0 但 previous_seen 已高于 32k 时，新增 cold_read_after_warm 诊断，避免把同类异常简单当成普通冷启动",
   "v0.1.52: Responses 长空闲后的中等工具尾巴新增 5 秒内探测保护，并允许 512 对齐的中等工具尾巴推进水线，减少下一轮继续掉尾巴",
   "v0.1.52: 保留 v0.1.51 的 gzip provider/channel 冷却和 prefix_break_isolated 诊断，不新增热补、不新增同步请求、不恢复普通 main session-delta",
