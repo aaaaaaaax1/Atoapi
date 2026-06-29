@@ -35,7 +35,11 @@ const rows = requests
       bucketGap,
       blocksShort: Math.floor(bucketGap / 512),
       rawPct: ratio(cached, input),
-      effectivePct: ratio(cached, bucketMax)
+      effectivePct: ratio(cached, bucketMax),
+      loggedNewTailShortfallTokens:
+        item.cache_new_tail_gap_tokens == null ? null : Number(item.cache_new_tail_gap_tokens),
+      loggedAvoidableShortfallTokens:
+        item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens)
     };
   });
 annotateGapCausality(rows);
@@ -100,7 +104,11 @@ function summarizeRequests(sourceFile, sourceRequests) {
         input,
         cached,
         bucketMax,
-        bucketGap
+        bucketGap,
+        loggedNewTailShortfallTokens:
+          item.cache_new_tail_gap_tokens == null ? null : Number(item.cache_new_tail_gap_tokens),
+        loggedAvoidableShortfallTokens:
+          item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens)
       };
     });
   annotateGapCausality(sourceRows);
@@ -236,9 +244,27 @@ function annotateGapCausality(items) {
       priorSeen = item.cached;
     }
     const expectedCached = Math.min(item.bucketMax, priorSeen);
-    const avoidable = Math.max(0, expectedCached - item.cached);
-    item.avoidableShortfallTokens = Math.min(item.bucketGap, avoidable);
-    item.newTailShortfallTokens = Math.max(0, item.bucketGap - item.avoidableShortfallTokens);
+    const inferredAvoidable = Math.max(0, expectedCached - item.cached);
+    const loggedAvoidable =
+      item.loggedAvoidableShortfallTokens == null
+        ? null
+        : Math.max(0, Math.min(item.bucketGap, item.loggedAvoidableShortfallTokens));
+    const loggedNewTail =
+      item.loggedNewTailShortfallTokens == null
+        ? null
+        : Math.max(0, Math.min(item.bucketGap, item.loggedNewTailShortfallTokens));
+    item.avoidableShortfallTokens =
+      loggedAvoidable ?? Math.min(item.bucketGap, inferredAvoidable);
+    item.newTailShortfallTokens =
+      loggedNewTail ?? Math.max(0, item.bucketGap - item.avoidableShortfallTokens);
+    const loggedTotal = item.avoidableShortfallTokens + item.newTailShortfallTokens;
+    if (loggedTotal > item.bucketGap) {
+      item.newTailShortfallTokens = Math.max(0, item.bucketGap - item.avoidableShortfallTokens);
+    } else if (loggedTotal < item.bucketGap && loggedAvoidable != null && loggedNewTail == null) {
+      item.newTailShortfallTokens = item.bucketGap - item.avoidableShortfallTokens;
+    } else if (loggedTotal < item.bucketGap && loggedAvoidable == null && loggedNewTail != null) {
+      item.avoidableShortfallTokens = item.bucketGap - item.newTailShortfallTokens;
+    }
     item.gapCause =
       item.cached === 0
         ? "cold"

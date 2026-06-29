@@ -56,7 +56,8 @@ body {
 
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -799,7 +800,7 @@ button:disabled {
 
 .model-picker {
   display: grid;
-  grid-template-columns: 112px minmax(0, 1fr) 76px;
+  grid-template-columns: 104px minmax(0, 1fr) 68px;
   gap: 9px;
   margin-bottom: 12px;
   align-items: center;
@@ -816,12 +817,12 @@ button:disabled {
   border: 1px solid #3b3d38;
   border-radius: 10px;
   overflow: auto;
-  max-height: 420px;
+  max-height: 320px;
 }
 
 .model-row {
   gap: 9px;
-  padding: 10px;
+  padding: 8px;
   border-bottom: 1px solid #393c36;
 }
 
@@ -840,7 +841,7 @@ button:disabled {
 }
 
 .model-row .context-field {
-  flex: 0 0 96px;
+  flex: 0 0 82px;
 }
 
 .mini-toggle {
@@ -1220,7 +1221,7 @@ button:disabled {
 }
 
 .provider-modal .provider-grid {
-  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.82fr);
+  grid-template-columns: minmax(0, 1.34fr) minmax(300px, 0.66fr);
 }
 
 .provider-modal .surface {
@@ -1993,15 +1994,19 @@ button:disabled {
 
 .multi-key-card {
   margin-top: 8px;
-  border: 1px solid #363933;
+  border: 1px solid #3b443b;
   border-radius: 12px;
-  background: #242622;
+  background:
+    linear-gradient(180deg, rgba(88, 217, 138, 0.035), transparent 42%),
+    #20221f;
   overflow: hidden;
 }
 
 .multi-key-card.active {
-  border-color: rgba(88, 217, 138, 0.28);
-  background: linear-gradient(145deg, #242622, #20221f);
+  border-color: rgba(88, 217, 138, 0.32);
+  background:
+    linear-gradient(145deg, rgba(88, 217, 138, 0.07), transparent 34%),
+    #20221f;
 }
 
 .multi-key-summary {
@@ -2045,7 +2050,7 @@ button:disabled {
 }
 
 .multi-key-grid.compact {
-  grid-template-columns: minmax(160px, 1fr) 96px 96px;
+  grid-template-columns: minmax(180px, 1fr) minmax(82px, 104px) minmax(82px, 104px);
 }
 
 .multi-key-body {
@@ -2072,7 +2077,7 @@ button:disabled {
 
 .multi-key-batch {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 150px;
+  grid-template-columns: minmax(0, 1fr) 136px;
   gap: 10px;
   align-items: stretch;
 }
@@ -2088,6 +2093,19 @@ button:disabled {
 .multi-key-batch textarea {
   min-height: 86px;
   resize: vertical;
+  width: 100%;
+  border: 1px solid #42483f;
+  background: #1a1d19;
+  color: #f2f5ee;
+  border-radius: 9px;
+  outline: 0;
+  padding: 10px 12px;
+  line-height: 1.45;
+}
+
+.multi-key-batch textarea::placeholder,
+.multi-key-field input::placeholder {
+  color: #838a80;
 }
 
 .multi-key-actions {
@@ -2099,8 +2117,7 @@ button:disabled {
 .multi-key-list {
   display: grid;
   gap: 8px;
-  overflow-x: auto;
-  padding-bottom: 2px;
+  overflow: visible;
 }
 
 .multi-key-empty {
@@ -2113,25 +2130,79 @@ button:disabled {
 
 .multi-key-row {
   display: grid;
-  grid-template-columns: 38px minmax(220px, 1fr) 60px 74px 88px repeat(5, 32px);
-  gap: 8px;
-  align-items: center;
-  min-width: 860px;
-  padding: 9px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 9px 10px;
+  align-items: end;
+  padding: 10px;
+  border: 1px solid rgba(85, 92, 82, 0.55);
   border-radius: 10px;
-  background: #1f211e;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent),
+    #1b1e1a;
+}
+
+.multi-key-row-head {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 
 .multi-key-index,
-.multi-key-main small,
+.multi-key-field small,
 .multi-key-stats {
   color: #9ca198;
   font-size: 12px;
 }
 
-.multi-key-main {
+.multi-key-index {
+  font-weight: 850;
+  color: #c7d0c2;
+}
+
+.multi-key-fields {
   display: grid;
-  gap: 6px;
+  grid-template-columns: minmax(118px, 0.34fr) minmax(240px, 1fr) 76px;
+  gap: 8px;
+  min-width: 0;
+}
+
+.multi-key-field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.multi-key-field > span {
+  color: #b7bdb2;
+  font-size: 11px;
+  font-weight: 820;
+}
+
+.multi-key-field input {
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  border: 1px solid #434941;
+  background: #20231f;
+  color: #f2f5ee;
+  border-radius: 8px;
+  outline: 0;
+  padding: 0 10px;
+}
+
+.multi-key-field input:focus,
+.multi-key-batch textarea:focus {
+  border-color: rgba(88, 217, 138, 0.78);
+  box-shadow: 0 0 0 3px rgba(88, 217, 138, 0.12);
+}
+
+.multi-key-secret {
+  font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0;
 }
 
 .multi-key-priority {
@@ -2139,9 +2210,9 @@ button:disabled {
 }
 
 .multi-key-status {
-  padding: 4px 10px;
+  padding: 4px 9px;
   border: 1px solid #444942;
-  border-radius: 999px;
+  border-radius: 8px;
   color: #c8cdc4;
   font-size: 12px;
   font-weight: 850;
@@ -2161,6 +2232,48 @@ button:disabled {
 }
 
 .multi-key-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.multi-key-row-actions {
   display: grid;
-  gap: 2px;
+  grid-template-columns: repeat(5, 32px);
+  gap: 6px;
+  align-items: center;
+  justify-content: end;
+}
+
+.multi-key-row-actions .icon-button {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
+
+.multi-key-row-actions .mini-toggle {
+  align-self: center;
+}
+
+@media (max-width: 1120px) {
+  .provider-modal .provider-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .multi-key-fields {
+    grid-template-columns: minmax(100px, 0.4fr) minmax(220px, 1fr) 72px;
+  }
+}
+
+@media (max-width: 760px) {
+  .multi-key-batch,
+  .multi-key-fields,
+  .multi-key-row {
+    grid-template-columns: 1fr;
+  }
+
+  .multi-key-row-actions {
+    justify-content: start;
+  }
 }

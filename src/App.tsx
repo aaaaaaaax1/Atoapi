@@ -1,5 +1,7 @@
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Bot,
   BrainCircuit,
   Check,
@@ -119,8 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.53";
+const appVersion = "v0.1.54";
 const appVersionNotes = [
+  "v0.1.54: Responses 上游 prompt_cache_key 按稳定会话锚点生成，同一会话不分裂，不同会话分开，减少多会话缓存串扰",
+  "v0.1.54: 日志分析优先使用底层真实新尾巴/可避免缺口字段，避免把真实新尾巴误判成可避免",
+  "v0.1.54: 保留零额外请求、无热补、普通 main session-delta 禁用和 Responses 前台约 +3 秒上限",
   "v0.1.53: Responses 本地前缀保护从最多 +5 秒收口到最多 +3 秒，所有 4/5 秒前台 guard 分支统一受 3 秒上限约束",
   "v0.1.53: 同前缀串行锁等待纳入 3 秒总预算，避免 prefix_guard_wait_ms=0 但 local_prepare_ms 隐性排队二十多秒",
   "v0.1.53: 主请求关闭内部多轮重试，避免上游 5xx/超时在首字前被本地重试到几十秒；错误更快暴露，多 key/压缩显式兜底保留",
@@ -2178,75 +2183,93 @@ function MultiKeyManager({
             {pool.keys.length ? (
               pool.keys.map((key, index) => (
                 <div className="multi-key-row" key={key.id}>
-                  <span className="multi-key-index">#{index + 1}</span>
-                  <div className="multi-key-main">
-                    <input
-                      value={key.alias}
-                      onChange={(event) => updateKey(key.id, { alias: event.target.value })}
-                      placeholder="别名"
-                    />
-                    <input
-                      value={key.key}
-                      onChange={(event) =>
-                        updateKey(key.id, {
-                          key: event.target.value,
-                          status: "unknown",
-                          last_error: null,
-                          disabled_until: null
-                        })
+                  <div className="multi-key-row-head">
+                    <span className="multi-key-index">#{index + 1}</span>
+                    <span className={"multi-key-status " + key.status}>{keyStatusLabel(key.status)}</span>
+                    <div className="multi-key-stats">
+                      <span>总 {formatNumber(key.total_requests)}</span>
+                      <span>成功 {formatNumber(key.successes)}</span>
+                      <span>失败 {formatNumber(key.failures)}</span>
+                    </div>
+                  </div>
+
+                  <div className="multi-key-fields">
+                    <label className="multi-key-field alias-field">
+                      <span>别名</span>
+                      <input
+                        value={key.alias}
+                        onChange={(event) => updateKey(key.id, { alias: event.target.value })}
+                        placeholder="可选"
+                      />
+                    </label>
+                    <label className="multi-key-field key-field">
+                      <span>Key</span>
+                      <input
+                        className="multi-key-secret"
+                        value={key.key}
+                        autoComplete="off"
+                        spellCheck={false}
+                        onChange={(event) =>
+                          updateKey(key.id, {
+                            key: event.target.value,
+                            status: "unknown",
+                            last_error: null,
+                            disabled_until: null
+                          })
+                        }
+                        placeholder={key.preview || "输入 Key"}
+                        title={key.preview ? "已保存 Key 只显示预览；在这里输入新 Key 可替换" : "输入或编辑 Key"}
+                      />
+                    </label>
+                    <label className="multi-key-field priority-field">
+                      <span>优先级</span>
+                      <input
+                        className="multi-key-priority"
+                        value={key.priority}
+                        onChange={(event) => updateKey(key.id, { priority: Number(event.target.value) || 0 })}
+                        title="优先级"
+                      />
+                    </label>
+                  </div>
+
+                  <div className="multi-key-row-actions">
+                    <button
+                      className={key.enabled ? "mini-toggle on" : "mini-toggle"}
+                      type="button"
+                      onClick={() => updateKey(key.id, { enabled: !key.enabled })}
+                      title={key.enabled ? "关闭这个 Key" : "启用这个 Key"}
+                    >
+                      <span />
+                    </button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => void testKey(key)}
+                      title="检测这个 Key"
+                      disabled={testingKeyId === key.id || (!key.key.trim() && !draft.id)}
+                    >
+                      {testingKeyId === key.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
+                    </button>
+                    <button className="icon-button" type="button" onClick={() => moveKey(key.id, -1)} disabled={index === 0} title="上移">
+                      <ArrowUp size={15} />
+                    </button>
+                    <button className="icon-button" type="button" onClick={() => moveKey(key.id, 1)} disabled={index === pool.keys.length - 1} title="下移">
+                      <ArrowDown size={15} />
+                    </button>
+                    <button
+                      className="icon-button danger"
+                      type="button"
+                      onClick={() =>
+                        updatePoolFrom((currentPool) => ({
+                          ...currentPool,
+                          keys: currentPool.keys.filter((item) => item.id !== key.id)
+                        }))
                       }
-                      placeholder={key.preview || "Key"}
-                    />
-                    <small>{key.key ? maskKey(key.key) : key.preview}</small>
+                      title="删除 Key"
+                    >
+                      <Trash2 size={15} />
+                    </button>
                   </div>
-                  <input
-                    className="multi-key-priority"
-                    value={key.priority}
-                    onChange={(event) => updateKey(key.id, { priority: Number(event.target.value) || 0 })}
-                    title="优先级"
-                  />
-                  <span className={"multi-key-status " + key.status}>{keyStatusLabel(key.status)}</span>
-                  <div className="multi-key-stats">
-                    <span>总 {formatNumber(key.total_requests)}</span>
-                    <span>成功 {formatNumber(key.successes)}</span>
-                    <span>失败 {formatNumber(key.failures)}</span>
-                  </div>
-                  <button
-                    className={key.enabled ? "mini-toggle on" : "mini-toggle"}
-                    type="button"
-                    onClick={() => updateKey(key.id, { enabled: !key.enabled })}
-                    title={key.enabled ? "关闭这个 Key" : "启用这个 Key"}
-                  >
-                    <span />
-                  </button>
-                  <button
-                    className="icon-button"
-                    type="button"
-                    onClick={() => void testKey(key)}
-                    title="检测这个 Key"
-                    disabled={testingKeyId === key.id || (!key.key.trim() && !draft.id)}
-                  >
-                    {testingKeyId === key.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => moveKey(key.id, -1)} disabled={index === 0} title="上移">
-                    ↑
-                  </button>
-                  <button className="icon-button" type="button" onClick={() => moveKey(key.id, 1)} disabled={index === pool.keys.length - 1} title="下移">
-                    ↓
-                  </button>
-                  <button
-                    className="icon-button danger"
-                    type="button"
-                    onClick={() =>
-                      updatePoolFrom((currentPool) => ({
-                        ...currentPool,
-                        keys: currentPool.keys.filter((item) => item.id !== key.id)
-                      }))
-                    }
-                    title="删除 Key"
-                  >
-                    <Trash2 size={15} />
-                  </button>
                 </div>
               ))
             ) : (

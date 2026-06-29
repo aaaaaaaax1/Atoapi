@@ -1626,23 +1626,26 @@ async fn handle_generation(
             .map(|status| status.is_success())
             .unwrap_or(false);
     }
-    if status == 413
-        && !active_used_response_session
-        && !active_responses_non_stream_chat_compat
-        && matches!(decision.upstream_channel, Channel::Responses)
-    {
+    if should_attempt_response_session_rescue_after_413(
+        status,
+        active_used_response_session,
+        active_responses_non_stream_chat_compat,
+        &decision.upstream_channel,
+        response_session_cooldown_active,
+    ) {
         diagnostics.payload_too_large_rescue_attempted = true;
-        if let Some(rescue_body) = maybe_rescue_response_session_after_413(
+        let rescue_outcome = maybe_rescue_response_session_after_413(
             &state,
             &upstream_body,
             response_session_key.as_deref(),
             response_session_scope_key.as_deref(),
             &decision,
         )
-        .await
-        {
+        .await;
+        response_session_reuse_diagnostics = rescue_outcome.diagnostics.clone();
+        if response_session_delta_request(&rescue_outcome.body, &upstream_body) {
             state.metrics.record_retry().await;
-            active_upstream_body = rescue_body;
+            active_upstream_body = rescue_outcome.body;
             apply_responses_non_stream_upstream_sse_compat(
                 &mut active_upstream_body,
                 responses_non_stream_upstream_sse_compat,
@@ -2626,6 +2629,9 @@ fn responses_minimum_new_tail_request_wait(
     if small_bucket_tail && noisy_or_tool_tail {
         return responses_foreground_wait_cap();
     }
+    if responses_medium_tool_tail_carryover_guard(state, current_tail, observed_bucket_shortfall) {
+        return responses_foreground_wait_cap();
+    }
     if small_bucket_tail
         && state.input_tokens >= 32_000
         && state.small_gap_recovery_streak > 0
@@ -2635,6 +2641,33 @@ fn responses_minimum_new_tail_request_wait(
     }
 
     TokioDuration::ZERO
+}
+
+fn responses_medium_tool_tail_carryover_guard(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    observed_bucket_shortfall: u64,
+) -> bool {
+    if observed_bucket_shortfall < 2048 || state.input_tokens < 16_000 {
+        return false;
+    }
+    if state.finished_at.elapsed() > std::time::Duration::from_secs(10 * 60) {
+        return false;
+    }
+    if matches!(
+        current_tail.source.as_deref(),
+        Some("message") | Some("tool_call")
+    ) {
+        return false;
+    }
+    let current_tool_signal = current_tail.tool_output_chars >= 512
+        || current_tail.largest_tool_output_chars >= 512
+        || current_tail.tool_output_noise_hint.is_some();
+    let previous_tool_signal = state.tail_tool_output_chars >= 2048
+        || state.tail_largest_tool_output_chars >= 2048
+        || state.tail_tool_output_noise_hint.is_some();
+
+    current_tool_signal || previous_tool_signal
 }
 
 fn responses_minimum_avoidable_request_wait(
@@ -3061,6 +3094,12 @@ fn provider_prefix_wait_reason_for_channel(
                 state.finished_at.elapsed(),
             ) {
                 Some("responses_stale_medium_tool_tail_probe".to_string())
+            } else if responses_medium_tool_tail_carryover_guard(
+                state,
+                current_tail,
+                observed_shortfall,
+            ) {
+                Some("responses_medium_tool_tail_carryover_guard".to_string())
             } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
                 Some("responses_current_tail_guard".to_string())
             } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
@@ -4502,11 +4541,16 @@ async fn maybe_rescue_response_session_after_413(
     session_key: Option<&str>,
     session_scope_key: Option<&str>,
     decision: &RouteDecision,
-) -> Option<Value> {
+) -> ResponseSessionReuseOutcome {
     if request.get("previous_response_id").is_some() {
-        return None;
+        let mut diagnostics = ResponseSessionReuseDiagnostics::default();
+        diagnostics.skip_reason = Some("already_has_previous_response_id".to_string());
+        return ResponseSessionReuseOutcome {
+            body: request.clone(),
+            diagnostics,
+        };
     }
-    let candidate = maybe_reuse_response_session(
+    maybe_reuse_response_session(
         state,
         request,
         session_key,
@@ -4514,8 +4558,21 @@ async fn maybe_rescue_response_session_after_413(
         decision,
         true,
     )
-    .await;
-    response_session_delta_request(&candidate.body, request).then_some(candidate.body)
+    .await
+}
+
+fn should_attempt_response_session_rescue_after_413(
+    status: u16,
+    active_used_response_session: bool,
+    active_responses_non_stream_chat_compat: bool,
+    upstream_channel: &Channel,
+    response_session_cooldown_active: bool,
+) -> bool {
+    status == 413
+        && !active_used_response_session
+        && !active_responses_non_stream_chat_compat
+        && matches!(upstream_channel, Channel::Responses)
+        && !response_session_cooldown_active
 }
 
 fn count_response_session_scope_matches(
@@ -8113,7 +8170,7 @@ fn provider_prefix_sample(request: &Value, channel: &Channel) -> String {
         Channel::Responses => {
             canonicalize_responses_instruction_shape(&mut prefix);
             stabilize_responses_provider_prefix(&mut prefix);
-            strip_responses_dynamic_provider_cache_tail(&mut prefix);
+            trim_responses_provider_cache_tail_to_session_anchor(&mut prefix);
             canonicalize_object_keys(&mut prefix, "$.provider_prefix_sample");
         }
         Channel::Chat => {
@@ -11419,7 +11476,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_prompt_cache_key_is_stable_for_workspace_model_channel() {
+    fn provider_prompt_cache_key_keeps_same_session_and_splits_different_anchor() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace".to_string();
         let provider = ProviderConfig {
@@ -11483,7 +11540,7 @@ mod tests {
         );
 
         assert_eq!(base_key, same_key);
-        assert_eq!(base_key, different_key);
+        assert_ne!(base_key, different_key);
         assert_ne!(base_key, different_model_key);
         assert_eq!(
             provider_prefix_fingerprint(&base, &Channel::Responses),
@@ -11496,7 +11553,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_provider_cache_key_stays_global_but_fingerprint_uses_session_anchor() {
+    fn responses_provider_cache_key_uses_session_anchor_without_tail_split() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace".to_string();
         let provider = ProviderConfig {
@@ -11554,7 +11611,7 @@ mod tests {
         let different_session_cache_key =
             provider_prompt_cache_key(&config, &decision, &different_session, &Channel::Responses);
         assert_eq!(first_cache_key, same_session_cache_key);
-        assert_eq!(first_cache_key, different_session_cache_key);
+        assert_ne!(first_cache_key, different_session_cache_key);
         assert_eq!(
             provider_prefix_fingerprint(&first, &Channel::Responses),
             provider_prefix_fingerprint(&same_session_appended, &Channel::Responses)
@@ -12268,22 +12325,70 @@ mod tests {
             ]
         });
 
-        let rescued = maybe_rescue_response_session_after_413(
+        let rescue = maybe_rescue_response_session_after_413(
             &state,
             &request,
             Some("session-a"),
             Some("scope-a"),
             &decision,
         )
-        .await
-        .unwrap();
+        .await;
+        let rescued = rescue.body;
 
         assert_eq!(rescued["previous_response_id"], "resp_old");
         assert_eq!(
             rescued["input"],
             json!([{ "type": "message", "role": "user", "content": "continue" }])
         );
+        assert!(rescue.diagnostics.append_delta_match);
+        assert_eq!(rescue.diagnostics.delta_items, 1);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn response_session_413_rescue_is_only_for_uncached_responses_overflow() {
+        assert!(should_attempt_response_session_rescue_after_413(
+            413,
+            false,
+            false,
+            &Channel::Responses,
+            false
+        ));
+        assert!(!should_attempt_response_session_rescue_after_413(
+            413,
+            true,
+            false,
+            &Channel::Responses,
+            false
+        ));
+        assert!(!should_attempt_response_session_rescue_after_413(
+            413,
+            false,
+            true,
+            &Channel::Responses,
+            false
+        ));
+        assert!(!should_attempt_response_session_rescue_after_413(
+            413,
+            false,
+            false,
+            &Channel::Chat,
+            false
+        ));
+        assert!(!should_attempt_response_session_rescue_after_413(
+            413,
+            false,
+            false,
+            &Channel::Responses,
+            true
+        ));
+        assert!(!should_attempt_response_session_rescue_after_413(
+            400,
+            false,
+            false,
+            &Channel::Responses,
+            false
+        ));
     }
 
     #[test]
@@ -14358,12 +14463,12 @@ mod tests {
     }
 
     #[test]
-    fn responses_medium_bucket_tail_followed_by_small_tool_tail_does_not_restore_v042_guard() {
+    fn responses_medium_bucket_tail_followed_by_small_tool_tail_gets_short_carryover_guard() {
         let mut medium_tail = prefix_state(151_613, 145_408, 6_144);
         medium_tail.avoidable_shortfall_tokens = 0;
         medium_tail.avoidable_shortfall_tokens_128 = 0;
-        medium_tail.tail_tool_output_chars = 20_356;
-        medium_tail.tail_largest_tool_output_chars = 20_356;
+        medium_tail.tail_tool_output_chars = 4_096;
+        medium_tail.tail_largest_tool_output_chars = 4_096;
 
         let current_small_tool_tail = TailInputDiagnostics {
             input_items: 1,
@@ -14379,6 +14484,39 @@ mod tests {
                 &Channel::Responses,
                 &medium_tail,
                 &current_small_tool_tail,
+            ),
+            responses_foreground_wait_cap()
+        );
+        assert_eq!(
+            provider_prefix_wait_reason_for_channel(
+                &Channel::Responses,
+                &medium_tail,
+                &current_small_tool_tail,
+            ),
+            Some("responses_medium_tool_tail_carryover_guard".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_medium_bucket_tail_does_not_guard_pure_message_tail() {
+        let mut medium_tail = prefix_state(151_613, 145_408, 6_144);
+        medium_tail.avoidable_shortfall_tokens = 0;
+        medium_tail.avoidable_shortfall_tokens_128 = 0;
+        medium_tail.tail_tool_output_chars = 20_356;
+        medium_tail.tail_largest_tool_output_chars = 20_356;
+
+        let current_message_tail = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 184,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(
+            responses_minimum_new_tail_request_wait(
+                &Channel::Responses,
+                &medium_tail,
+                &current_message_tail,
             ),
             TokioDuration::ZERO
         );
