@@ -1243,11 +1243,42 @@ async fn handle_generation(
             if response_session_cooldown_active {
                 diagnostics.cooldown_active = true;
                 diagnostics.skip_reason = Some("provider_session_delta_cooldown".to_string());
+                (upstream_body.clone(), diagnostics)
+            } else if should_attempt_main_response_session_delta(
+                &config,
+                &decision,
+                client_requested_stream,
+                &upstream_body,
+                &tail_input_diagnostics,
+                &session_anchor_diagnostics,
+            ) {
+                let outcome = maybe_reuse_response_session(
+                    &state,
+                    &upstream_body,
+                    response_session_key.as_deref(),
+                    response_session_scope_key.as_deref(),
+                    &decision,
+                    true,
+                    false,
+                )
+                .await;
+                if response_session_delta_request(&outcome.body, &upstream_body)
+                    && response_session_delta_is_beneficial(
+                        &upstream_body,
+                        &outcome.body,
+                        &tail_input_diagnostics,
+                    )
+                {
+                    (outcome.body, outcome.diagnostics)
+                } else {
+                    diagnostics = outcome.diagnostics;
+                    diagnostics.skip_reason = Some("main_session_delta_not_beneficial".to_string());
+                    (upstream_body.clone(), diagnostics)
+                }
             } else {
-                diagnostics.skip_reason =
-                    Some("main_session_delta_disabled_cost_first".to_string());
+                diagnostics.skip_reason = Some("main_session_delta_guard_not_eligible".to_string());
+                (upstream_body.clone(), diagnostics)
             }
-            (upstream_body.clone(), diagnostics)
         } else {
             (
                 upstream_body.clone(),
@@ -4429,6 +4460,7 @@ async fn maybe_reuse_response_session(
     session_scope_key: Option<&str>,
     decision: &RouteDecision,
     allow_stream_delta: bool,
+    allow_scope_fallback: bool,
 ) -> ResponseSessionReuseOutcome {
     let mut diagnostics = ResponseSessionReuseDiagnostics::default();
     let Some(key) = session_key else {
@@ -4473,12 +4505,14 @@ async fn maybe_reuse_response_session(
         }
         diagnostics.scope_match_count =
             count_response_session_scope_matches(&sessions, key, session_scope_key) as u64;
-        candidates.extend(fallback_response_sessions(
-            &sessions,
-            key,
-            session_scope_key,
-            current_input,
-        ));
+        if allow_scope_fallback {
+            candidates.extend(fallback_response_sessions(
+                &sessions,
+                key,
+                session_scope_key,
+                current_input,
+            ));
+        }
         diagnostics.candidate_count = candidates.len() as u64;
         candidates
     };
@@ -4565,8 +4599,73 @@ async fn maybe_rescue_response_session_after_413(
         session_scope_key,
         decision,
         true,
+        true,
     )
     .await
+}
+
+fn should_attempt_main_response_session_delta(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    client_requested_stream: bool,
+    request: &Value,
+    current_tail: &TailInputDiagnostics,
+    session_anchor: &SessionAnchorDiagnostics,
+) -> bool {
+    if !responses_session_reuse_enabled(config)
+        || !config.cache.prewarm_enabled
+        || !matches!(decision.upstream_channel, Channel::Responses)
+        || !client_requested_stream
+    {
+        return false;
+    }
+    if session_anchor.source.as_deref() != Some("exact") {
+        return false;
+    }
+    if request.get("previous_response_id").is_some() {
+        return false;
+    }
+
+    let body_bytes = serialized_body_len(&Channel::Responses, request);
+    if body_bytes >= 96 * 1024 {
+        return true;
+    }
+    if current_tail.delta_from_session
+        && (current_tail.tool_output_chars >= 512
+            || current_tail.largest_tool_output_chars >= 512
+            || current_tail.message_chars >= 512
+            || current_tail.input_items >= 2)
+    {
+        return true;
+    }
+    current_tail.tool_output_chars >= 2_048
+        || current_tail.largest_tool_output_chars >= 2_048
+        || current_tail.message_chars >= 8_192
+}
+
+fn response_session_delta_is_beneficial(
+    original: &Value,
+    delta: &Value,
+    current_tail: &TailInputDiagnostics,
+) -> bool {
+    if !response_session_delta_request(delta, original) {
+        return false;
+    }
+    let original_bytes = serialized_body_len(&Channel::Responses, original);
+    let delta_bytes = serialized_body_len(&Channel::Responses, delta);
+    if delta_bytes >= original_bytes {
+        return false;
+    }
+    if original_bytes >= 96 * 1024 {
+        return delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4);
+    }
+    if current_tail.tool_output_chars >= 2_048
+        || current_tail.largest_tool_output_chars >= 2_048
+        || current_tail.message_chars >= 8_192
+    {
+        return delta_bytes.saturating_mul(10) <= original_bytes.saturating_mul(9);
+    }
+    delta_bytes.saturating_mul(2) <= original_bytes
 }
 
 fn should_attempt_response_session_rescue_after_413(
@@ -12330,6 +12429,7 @@ mod tests {
             Some("scope-a"),
             &decision,
             true,
+            false,
         )
         .await;
         let optimized = outcome.body;
@@ -12344,6 +12444,182 @@ mod tests {
         assert!(outcome.diagnostics.append_delta_match);
         assert_eq!(outcome.diagnostics.delta_items, 1);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn main_response_session_delta_does_not_use_scope_sibling() {
+        let config = AppConfig::default();
+        let decision = RouteDecision {
+            provider: ProviderConfig {
+                id: "share".to_string(),
+                name: "Share".to_string(),
+                base_url: "https://share.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: Vec::new(),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-main-session-no-scope-fallback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        state.response_sessions.lock().await.insert(
+            "sibling-key".to_string(),
+            ResponseSessionState {
+                response_id: "resp_sibling".to_string(),
+                scope_key: Some("scope-a".to_string()),
+                input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
+                finished_at: Instant::now(),
+            },
+        );
+        let request = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor" },
+                { "type": "message", "role": "user", "content": "continue" }
+            ]
+        });
+
+        let outcome = maybe_reuse_response_session(
+            &state,
+            &request,
+            Some("current-key"),
+            Some("scope-a"),
+            &decision,
+            true,
+            false,
+        )
+        .await;
+
+        assert_eq!(outcome.body, request);
+        assert_eq!(outcome.diagnostics.candidate_count, 0);
+        assert_eq!(outcome.diagnostics.scope_match_count, 1);
+        assert_eq!(
+            outcome.diagnostics.skip_reason.as_deref(),
+            Some("no_append_prefix_candidate")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn main_response_session_delta_requires_real_size_win() {
+        let original = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor" },
+                { "type": "message", "role": "user", "content": "tiny" }
+            ]
+        });
+        let delta = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "previous_response_id": "resp_old",
+            "store": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "tiny" }
+            ]
+        });
+        let beneficial_original = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor ".repeat(3000) },
+                { "type": "message", "role": "user", "content": "tiny" }
+            ]
+        });
+
+        assert!(!response_session_delta_is_beneficial(
+            &original,
+            &delta,
+            &TailInputDiagnostics::default()
+        ));
+        assert!(response_session_delta_is_beneficial(
+            &beneficial_original,
+            &delta,
+            &TailInputDiagnostics::default()
+        ));
+    }
+
+    #[test]
+    fn main_response_session_delta_gate_is_strict() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let decision = RouteDecision {
+            provider: ProviderConfig {
+                id: "share".to_string(),
+                name: "Share".to_string(),
+                base_url: "https://share.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: Vec::new(),
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let request = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor ".repeat(20_000) }
+            ]
+        });
+        let exact_anchor = SessionAnchorDiagnostics {
+            source: Some("exact".to_string()),
+            ..SessionAnchorDiagnostics::default()
+        };
+        let sibling_anchor = SessionAnchorDiagnostics {
+            source: Some("scope".to_string()),
+            ..SessionAnchorDiagnostics::default()
+        };
+
+        assert!(should_attempt_main_response_session_delta(
+            &config,
+            &decision,
+            true,
+            &request,
+            &TailInputDiagnostics::default(),
+            &exact_anchor,
+        ));
+        assert!(!should_attempt_main_response_session_delta(
+            &config,
+            &decision,
+            true,
+            &request,
+            &TailInputDiagnostics::default(),
+            &sibling_anchor,
+        ));
+        assert!(!should_attempt_main_response_session_delta(
+            &config,
+            &decision,
+            false,
+            &request,
+            &TailInputDiagnostics::default(),
+            &exact_anchor,
+        ));
     }
 
     #[tokio::test]

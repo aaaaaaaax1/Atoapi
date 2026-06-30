@@ -121,8 +121,12 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.55";
+const appVersion = "v0.1.56";
 const appVersionNotes = [
+  "v0.1.56: Responses 主路新增严格同会话 session-delta 闸门，只有 exact session、流式请求、发送体确实变小时才使用 previous_response_id + delta，减少完整历史和工具尾巴进入上游",
+  "v0.1.56: 保留成本底线：不主动热补、不新增同步请求、不改工具输出、不拉长 Responses 前台约 +3 秒保护；delta 失败会清理旧 response_id、进入冷却并自动全量重试",
+  "v0.1.56: 缓存统计卡片去掉右上角装饰符号，内部指标区改成更清晰的居中信息面板，提升数字和标签区分度",
+  "v0.1.56: 补齐主路 session-delta 防回归测试：不使用 scope sibling、不接受无收益 delta、413 救援仍允许安全 fallback",
   "v0.1.55: 本地前缀等待不再用跨上游 alias 水线驱动，切换上游后的冷启动不会再白等 3 秒或污染当前上游判断",
   "v0.1.55: 多 Key 管理新增同前缀亲和选择，同一 provider/model/prefix 优先复用同一个健康 Key，失败后才切下一个",
   "v0.1.55: 继续保持零额外请求、无主动热补、普通 main session-delta 禁用和 Responses 前台约 +3 秒上限",
@@ -2728,7 +2732,6 @@ function CachePanel({
             <UsageStatCard
               title="历史 Tokens"
               value={formatCompactTokens(totalTokens)}
-              icon="sum"
               rows={[
                 { label: "输入", value: formatCompactTokens(inputTokens), detail: percent(totalTokens > 0 ? inputTokens / totalTokens : 0) },
                 { label: "输出", value: formatCompactTokens(outputTokens), detail: percent(totalTokens > 0 ? outputTokens / totalTokens : 0) },
@@ -2738,7 +2741,6 @@ function CachePanel({
             <UsageStatCard
               title="历史请求数"
               value={formatNumber(totalRequests)}
-              icon="list"
               rows={[
                 { label: "单次平均", value: formatCompactTokens(totalRequests ? Math.round(totalTokens / totalRequests) : 0), detail: "tokens" },
                 { label: "平均输入", value: formatCompactTokens(totalRequests ? Math.round(inputTokens / totalRequests) : 0), detail: percent(inputTokens > 0 ? cacheRatio : 0) },
@@ -2751,7 +2753,6 @@ function CachePanel({
             <UsageStatCard
               title={`${recentWindowLabel} Tokens`}
               value={formatCompactTokens(recentTotalTokens)}
-              icon="sum"
               rows={[
                 { label: "输入", value: formatCompactTokens(recentInputTokens), detail: percent(recentTotalTokens > 0 ? recentInputTokens / recentTotalTokens : 0) },
                 { label: "输出", value: formatCompactTokens(adjustedRecentUsage.outputTokens), detail: percent(recentTotalTokens > 0 ? adjustedRecentUsage.outputTokens / recentTotalTokens : 0) },
@@ -2761,7 +2762,6 @@ function CachePanel({
             <UsageStatCard
               title={`${recentWindowLabel} 请求数`}
               value={formatNumber(recentRequests)}
-              icon="list"
               rows={[
                 { label: "单次平均", value: formatCompactTokens(recentRequests ? Math.round(recentTotalTokens / recentRequests) : 0), detail: "tokens" },
                 { label: "平均输入", value: formatCompactTokens(recentRequests ? Math.round(recentInputTokens / recentRequests) : 0), detail: percent(recentInputTokens > 0 ? recentCacheRatio : 0) },
@@ -2942,19 +2942,16 @@ function Summary({ label, value, tone }: { label: string; value: string; tone?: 
 function UsageStatCard({
   title,
   value,
-  icon,
   rows
 }: {
   title: string;
   value: string;
-  icon: "sum" | "list";
   rows: Array<{ label: string; value: string; detail?: string }>;
 }) {
   return (
     <div className="usage-stat-card">
       <div className="usage-stat-head">
         <span>{title}</span>
-        <b>{icon === "sum" ? "#" : "☷"}</b>
       </div>
       <strong>{value}</strong>
       <div className="usage-stat-rule" />
