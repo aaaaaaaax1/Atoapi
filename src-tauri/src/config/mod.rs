@@ -643,6 +643,7 @@ impl AppConfig {
     pub fn select_provider_key_for_request(
         &mut self,
         provider_id: &str,
+        preferred_key_id: Option<&str>,
         exclude_key_id: Option<&str>,
     ) -> Result<Option<SelectedProviderKey>> {
         let now = Utc::now();
@@ -664,45 +665,55 @@ impl AppConfig {
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
             if !candidates.is_empty() {
-                let selected_index = match pool.strategy {
-                    KeyLoadBalanceStrategy::RoundRobin => {
-                        candidates.sort_unstable();
-                        let selected = candidates
-                            .iter()
-                            .copied()
-                            .find(|index| *index >= pool.next_index)
-                            .unwrap_or(candidates[0]);
-                        pool.next_index = (selected + 1) % pool.keys.len().max(1);
-                        selected
-                    }
-                    KeyLoadBalanceStrategy::Priority => candidates
-                        .into_iter()
-                        .max_by_key(|index| {
-                            let key = &pool.keys[*index];
-                            (
-                                key.priority,
-                                std::cmp::Reverse(key.total_requests),
-                                key.successes,
-                            )
-                        })
-                        .unwrap_or(0),
-                    KeyLoadBalanceStrategy::LeastUsed => candidates
-                        .into_iter()
-                        .min_by_key(|index| {
-                            let key = &pool.keys[*index];
-                            (key.total_requests, std::cmp::Reverse(key.priority))
-                        })
-                        .unwrap_or(0),
-                    KeyLoadBalanceStrategy::Random => {
-                        let seed = now
-                            .timestamp_nanos_opt()
-                            .unwrap_or_else(|| now.timestamp_micros() * 1000)
-                            .unsigned_abs() as usize;
-                        candidates[seed % candidates.len()]
-                    }
-                    KeyLoadBalanceStrategy::Sequential => {
-                        candidates.sort_unstable();
-                        candidates[0]
+                let preferred_index = preferred_key_id.and_then(|preferred| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|index| pool.keys[*index].id == preferred)
+                });
+                let selected_index = if let Some(index) = preferred_index {
+                    index
+                } else {
+                    match pool.strategy {
+                        KeyLoadBalanceStrategy::RoundRobin => {
+                            candidates.sort_unstable();
+                            let selected = candidates
+                                .iter()
+                                .copied()
+                                .find(|index| *index >= pool.next_index)
+                                .unwrap_or(candidates[0]);
+                            pool.next_index = (selected + 1) % pool.keys.len().max(1);
+                            selected
+                        }
+                        KeyLoadBalanceStrategy::Priority => candidates
+                            .into_iter()
+                            .max_by_key(|index| {
+                                let key = &pool.keys[*index];
+                                (
+                                    key.priority,
+                                    std::cmp::Reverse(key.total_requests),
+                                    key.successes,
+                                )
+                            })
+                            .unwrap_or(0),
+                        KeyLoadBalanceStrategy::LeastUsed => candidates
+                            .into_iter()
+                            .min_by_key(|index| {
+                                let key = &pool.keys[*index];
+                                (key.total_requests, std::cmp::Reverse(key.priority))
+                            })
+                            .unwrap_or(0),
+                        KeyLoadBalanceStrategy::Random => {
+                            let seed = now
+                                .timestamp_nanos_opt()
+                                .unwrap_or_else(|| now.timestamp_micros() * 1000)
+                                .unsigned_abs() as usize;
+                            candidates[seed % candidates.len()]
+                        }
+                        KeyLoadBalanceStrategy::Sequential => {
+                            candidates.sort_unstable();
+                            candidates[0]
+                        }
                     }
                 };
                 let selected = &mut pool.keys[selected_index];
@@ -1379,14 +1390,14 @@ prewarm_enabled = true
             .expect("provider should save");
 
         let first = config
-            .select_provider_key_for_request(&provider_id, None)
+            .select_provider_key_for_request(&provider_id, None, None)
             .expect("key selection should work")
             .expect("first key should exist");
         assert_eq!(first.key_id.as_deref(), Some("key-a"));
         assert_eq!(first.secret, "sk-a");
 
         let second = config
-            .select_provider_key_for_request(&provider_id, None)
+            .select_provider_key_for_request(&provider_id, None, None)
             .expect("key selection should work")
             .expect("second key should exist");
         assert_eq!(second.key_id.as_deref(), Some("key-b"));
@@ -1394,10 +1405,40 @@ prewarm_enabled = true
 
         config.mark_provider_key_failure(&provider_id, Some("key-a"), "HTTP 429", true);
         let next = config
-            .select_provider_key_for_request(&provider_id, None)
+            .select_provider_key_for_request(&provider_id, None, None)
             .expect("key selection should work")
             .expect("healthy key should exist");
         assert_eq!(next.key_id.as_deref(), Some("key-b"));
+    }
+
+    #[test]
+    fn provider_key_pool_prefers_affinity_key_when_available() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::RoundRobin,
+                failure_threshold: 1,
+                recovery_minutes: 5,
+                keys: vec![
+                    key_input("key-a", Some("sk-a"), true, 5),
+                    key_input("key-b", Some("sk-b"), true, 5),
+                ],
+            })))
+            .expect("provider should save");
+
+        let selected = config
+            .select_provider_key_for_request(&provider_id, Some("key-b"), None)
+            .expect("key selection should work")
+            .expect("preferred key should exist");
+        assert_eq!(selected.key_id.as_deref(), Some("key-b"));
+        assert_eq!(selected.secret, "sk-b");
+
+        let failover = config
+            .select_provider_key_for_request(&provider_id, Some("key-b"), Some("key-b"))
+            .expect("key selection should work")
+            .expect("fallback key should exist");
+        assert_eq!(failover.key_id.as_deref(), Some("key-a"));
     }
 
     fn provider_input(key_pool: Option<ProviderKeyPoolInput>) -> ProviderInput {

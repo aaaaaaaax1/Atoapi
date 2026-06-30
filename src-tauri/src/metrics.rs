@@ -6,6 +6,9 @@ use std::{
 };
 use tokio::sync::RwLock;
 
+const RECENT_USAGE_WINDOW_MINUTES: i64 = 30;
+const RECENT_USAGE_WINDOW_SECONDS: u64 = 30 * 60;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub started_at: DateTime<Utc>,
@@ -1087,7 +1090,7 @@ fn push_recent_usage(items: &mut VecDeque<TimedUsageRecord>, item: TimedUsageRec
 }
 
 fn prune_recent_usage(items: &mut VecDeque<TimedUsageRecord>) {
-    let cutoff = Utc::now() - Duration::minutes(5);
+    let cutoff = Utc::now() - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES);
     while items.back().is_some_and(|item| item.at < cutoff) {
         items.pop_back();
     }
@@ -1097,9 +1100,9 @@ fn recent_usage_stats(
     items: &VecDeque<TimedUsageRecord>,
     provider: Option<&str>,
 ) -> RecentUsageStats {
-    let cutoff = Utc::now() - Duration::minutes(5);
+    let cutoff = Utc::now() - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES);
     let mut stats = RecentUsageStats {
-        window_seconds: 300,
+        window_seconds: RECENT_USAGE_WINDOW_SECONDS,
         ..RecentUsageStats::default()
     };
 

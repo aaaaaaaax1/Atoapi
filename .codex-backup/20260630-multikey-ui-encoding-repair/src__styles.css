@@ -1,4 +1,4 @@
-:root {
+﻿:root {
   font-family:
     "Segoe UI Variable",
     "Segoe UI",
@@ -1487,104 +1487,6 @@ button:disabled {
   flex: 0 0 auto;
 }
 
-.usage-ledger {
-  display: grid;
-  gap: 12px;
-}
-
-.usage-ledger-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-}
-
-.usage-stat-card {
-  min-height: 218px;
-  border: 1px solid #333742;
-  border-radius: 8px;
-  background: linear-gradient(145deg, #1e2023, #191b1f);
-  padding: 18px 18px 14px;
-  display: grid;
-  grid-template-rows: auto auto auto 1fr;
-  gap: 12px;
-}
-
-.usage-stat-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: #d8dde6;
-  font-size: 13px;
-  font-weight: 760;
-}
-
-.usage-stat-head b {
-  color: #cfd4dd;
-  font-size: 22px;
-  line-height: 1;
-}
-
-.usage-stat-card > strong {
-  color: #dce8ff;
-  font-size: 28px;
-  line-height: 1;
-  letter-spacing: 0;
-}
-
-.usage-stat-rule {
-  height: 1px;
-  background: #c7cbd3;
-  opacity: 0.82;
-}
-
-.usage-stat-rows {
-  display: grid;
-  gap: 8px;
-  align-content: end;
-}
-
-.usage-stat-row {
-  display: grid;
-  grid-template-columns: minmax(76px, 0.58fr) minmax(0, 1fr);
-  gap: 12px;
-  align-items: end;
-  color: #c4ccd5;
-  font-size: 12px;
-}
-
-.usage-stat-row > span {
-  color: #b9c8d9;
-}
-
-.usage-stat-row p {
-  margin: 0;
-  display: grid;
-  justify-items: end;
-  gap: 2px;
-  min-width: 0;
-}
-
-.usage-stat-row p b,
-.usage-stat-row p em {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-}
-
-.usage-stat-row p b {
-  color: #dce8ff;
-  font-size: 12px;
-  font-weight: 780;
-}
-
-.usage-stat-row p em {
-  color: #d9e5ff;
-  font-size: 11px;
-}
-
 .usage-hero {
   min-height: 176px;
   border: 1px solid #333732;
@@ -1969,7 +1871,6 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
-  .usage-ledger-row,
   .usage-breakdown {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -2393,3 +2294,4 @@ button:disabled {
     justify-content: start;
   }
 }
+

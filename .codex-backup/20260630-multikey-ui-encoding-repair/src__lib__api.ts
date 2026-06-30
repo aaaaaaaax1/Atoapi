@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+﻿import { invoke } from "@tauri-apps/api/core";
 
 export type Channel = "chat" | "responses" | "anthropic";
 export type ProviderChannelMode = "auto" | "manual";
@@ -407,7 +407,7 @@ let fallbackConfig: AppConfig = {
     injection("claude-code", "Claude Code", "claude-code"),
     injection("codex", "Codex", "codex"),
     injection("claude-desktop", "Claude Desktop", "claude-desktop"),
-    injection("proxy-mode", "代理模式", "proxy-mode")
+    injection("proxy-mode", "浠ｇ悊妯″紡", "proxy-mode")
   ],
   provider_key_pools: [],
   updated_at: new Date().toISOString(),
@@ -415,7 +415,7 @@ let fallbackConfig: AppConfig = {
 };
 
 const emptyRecentUsage: RecentUsageStats = {
-  window_seconds: 1800,
+  window_seconds: 300,
   requests: 0,
   cache_hit_requests: 0,
   input_tokens: 0,
@@ -539,7 +539,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
               ...item,
               enabled: input.enabled,
               last_injected_at: new Date().toISOString(),
-              last_status: input.enabled ? "预览模式：已注入" : "预览模式：已关闭"
+              last_status: input.enabled ? "棰勮妯″紡锛氬凡娉ㄥ叆" : "棰勮妯″紡锛氬凡鍏抽棴"
             }
           : item
       )
@@ -558,7 +558,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
               provider_id: input.provider_id ?? null,
               model_id: input.model_id ?? null,
               last_injected_at: item.enabled ? new Date().toISOString() : item.last_injected_at,
-              last_status: item.enabled ? "预览模式：已更新模型路由" : item.last_status
+              last_status: item.enabled ? "棰勮妯″紡锛氬凡鏇存柊妯″瀷璺敱" : item.last_status
             }
           : item
       )
@@ -571,7 +571,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       ...fallbackConfig,
       agent_injections: fallbackConfig.agent_injections.map((item) =>
         item.id === id
-          ? { ...item, enabled: true, last_injected_at: new Date().toISOString(), last_status: "预览模式：已注入" }
+          ? { ...item, enabled: true, last_injected_at: new Date().toISOString(), last_status: "棰勮妯″紡锛氬凡娉ㄥ叆" }
           : item
       )
     };
@@ -607,7 +607,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       provider_id: input?.provider_id ?? null,
       key_id: input?.key_id ?? null,
       ok: usable,
-      message: usable ? "预览模式：可用，获取到 " + models.length + " 个模型" : "Key 为空",
+      message: usable ? "棰勮妯″紡锛氬彲鐢紝鑾峰彇鍒?" + models.length + " 涓ā鍨? : "Key 涓虹┖",
       models_count: usable ? models.length : 0
     };
   }
@@ -618,7 +618,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       provider_id: providerId,
       key_id: key.id,
       ok: key.enabled,
-      message: key.enabled ? "预览模式：可用" : "预览模式：已关闭",
+      message: key.enabled ? "棰勮妯″紡锛氬彲鐢? : "棰勮妯″紡锛氬凡鍏抽棴",
       models_count: key.enabled ? 3 : 0
     }));
   }
@@ -823,7 +823,7 @@ function injectionResult(id: string): AgentInjectionResult {
     enabled: true,
     target_path: item?.target_path ?? "%APPDATA%/Atoapi/preview.json",
     backup_path: null,
-    status: "预览模式：已注入当前本地代理",
+    status: "棰勮妯″紡锛氬凡娉ㄥ叆褰撳墠鏈湴浠ｇ悊",
     injected_at: new Date().toISOString()
   };
 }
@@ -853,7 +853,7 @@ function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKey
     return {
       id,
       alias: key.alias ?? previous?.alias ?? null,
-      preview: key.key ? maskKeyPreview(key.key) : previous?.preview ?? "未保存",
+      preview: key.key ? maskKeyPreview(key.key) : previous?.preview ?? "鏈繚瀛?,
       enabled: key.enabled,
       priority: key.priority,
       status: key.status,
@@ -877,7 +877,7 @@ function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKey
 
 function maskKeyPreview(value: string) {
   const key = value.trim();
-  if (!key) return "未保存";
+  if (!key) return "鏈繚瀛?;
   if (key.length <= 10) return "*".repeat(Math.max(4, key.length));
   return key.slice(0, 6) + "..." + key.slice(-4);
 }
@@ -904,3 +904,4 @@ function slugify(value: string) {
     .replace(/^-+|-+$/g, "");
   return slug || `provider-${Date.now()}`;
 }
+

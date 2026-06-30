@@ -5,13 +5,15 @@ Last updated: 2026-06-30
 ## 2026-06-30 Active Rules
 
 - Active project root is `G:\Atoapi`; do not use old `G:\Flutter\ccs++` as source.
-- Current line is v0.1.54+ source. Do not package unless explicitly requested.
+- Current line is v0.1.55+ source. Package only after live-log comparison and build checks.
 - Cache-hit optimization hard gate: no active warmup/prewarm, no companion sync request, no extra upstream request, no normal main-path `previous_response_id + delta`.
 - Main Responses session-delta is allowed only for 413 self-rescue or compact/compatibility paths with strict same provider/model/scope/tool-context checks.
 - Foreground Responses guard budget is capped at about +3s; do not solve hit rate by restoring long waits.
 - Do not change, trim, compress, reorder, or summarize tool output content by default.
 - For log analysis, classify first: real new tail, true avoidable, cold read, session/context split, upstream error, or statistics-label issue. Do not tune blindly.
-- Current live v0.1.53/v0.1.54 analysis showed warm adjusted bucket hit near 99.98% after using logged gap fields; raw hit was mainly lowered by real new tool-output tails, not broad avoidable gaps.
+- Current live v0.1.53/v0.1.54 analysis showed warm adjusted bucket hit near 99.98% after using logged gap fields; raw hit was mainly lowered by real new tool-output tails, cross-upstream cold starts, and upstream errors, not broad avoidable gaps.
+- v0.1.55 keeps outbound `prompt_cache_key` stable, but foreground local prefix waiting must use current-upstream exact/family state only; cross-upstream alias can preserve diagnostics/state, not block a live request.
+- v0.1.55 adds multi-key prefix affinity: same provider/model/prefix should prefer the same healthy key to avoid key-rotation cache cold starts; key failure still clears affinity and fails over.
 - Responses `prompt_cache_key` should be scoped by stable session anchor: same session appended tail keeps the key; different session anchor splits the key to reduce upstream cache cross-talk.
 
 ## Current Flow

@@ -50,6 +50,7 @@ pub struct AppState {
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub response_session_error_cooldowns: Mutex<HashMap<String, ResponseSessionCooldownState>>,
     pub response_sessions: Mutex<HashMap<String, ResponseSessionState>>,
+    pub provider_key_affinity: Mutex<HashMap<String, String>>,
     server: Mutex<Option<ProxyServer>>,
 }
 
@@ -168,6 +169,7 @@ impl AppState {
                 runtime_state.response_session_error_cooldowns,
             ),
             response_sessions: Mutex::new(runtime_state.response_sessions),
+            provider_key_affinity: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
         })
     }
@@ -192,6 +194,7 @@ impl AppState {
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             response_session_error_cooldowns: Mutex::new(HashMap::new()),
             response_sessions: Mutex::new(HashMap::new()),
+            provider_key_affinity: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
         })
     }

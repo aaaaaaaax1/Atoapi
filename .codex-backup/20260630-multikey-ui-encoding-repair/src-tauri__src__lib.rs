@@ -1,4 +1,4 @@
-mod admin;
+﻿mod admin;
 mod agent_injection;
 mod cache;
 mod config;
@@ -11,8 +11,8 @@ use admin::{
     add_or_update_model, add_or_update_provider, apply_agent_injection,
     apply_enabled_agent_injections, clear_cache, delete_model, delete_provider,
     fetch_provider_models, get_agent_injections, get_config, get_metrics, get_proxy_status,
-    reload_config, reveal_provider_api_key, reveal_provider_key, save_cache_policy, save_config,
-    select_provider, set_agent_injection_enabled, start_proxy, stop_proxy, test_provider_key,
+    reload_config, reveal_provider_api_key, reveal_provider_key, save_cache_policy, save_config, select_provider,
+    set_agent_injection_enabled, start_proxy, stop_proxy, test_provider_key,
     test_provider_key_pool, update_agent_injection_route,
 };
 use state::AppState;
@@ -85,3 +85,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running Atoapi");
 }
+

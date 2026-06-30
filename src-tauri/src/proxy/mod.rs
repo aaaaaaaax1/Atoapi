@@ -429,7 +429,7 @@ async fn handle_responses_compact(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
     let mut selected_provider_key =
-        match select_provider_api_key(&state, &decision.provider.id, None).await {
+        match select_provider_api_key(&state, &decision.provider.id, None, None).await {
             Ok(selected) => selected,
             Err(err) if err.to_string().contains("not configured") => {
                 return json_error(
@@ -553,6 +553,7 @@ async fn handle_responses_compact(
         &decision.provider.id,
         &selected_provider_key,
         status,
+        None,
     )
     .await
     {
@@ -1134,22 +1135,28 @@ async fn handle_generation(
     }
 
     let url = upstream_url(&decision.provider.base_url, &decision.upstream_channel);
-    let mut selected_provider_key =
-        match select_provider_api_key(&state, &decision.provider.id, None).await {
-            Ok(selected) => selected,
-            Err(err) if err.to_string().contains("not configured") => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "provider API key is not configured",
-                )
-            }
-            Err(err) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to select provider key: {err}"),
-                )
-            }
-        };
+    let mut selected_provider_key = match select_provider_api_key(
+        &state,
+        &decision.provider.id,
+        None,
+        provider_prefix_control_key.as_deref(),
+    )
+    .await
+    {
+        Ok(selected) => selected,
+        Err(err) if err.to_string().contains("not configured") => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "provider API key is not configured",
+            )
+        }
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to select provider key: {err}"),
+            )
+        }
+    };
     let mut api_key = selected_provider_key.secret.clone();
     if api_key.trim().is_empty() {
         return json_error(
@@ -1362,6 +1369,7 @@ async fn handle_generation(
         &decision.provider.id,
         &selected_provider_key,
         status,
+        provider_prefix_control_key.as_deref(),
     )
     .await
     {
@@ -4230,7 +4238,7 @@ fn lookup_provider_prefix_state_with_source<'a>(
     provider_prefix_family_key: Option<&str>,
 ) -> Option<(&'static str, &'a PrefixWarmState)> {
     provider_prefix_key
-        .and_then(|key| lookup_provider_prefix_state(states, key).map(|state| ("exact", state)))
+        .and_then(|key| states.get(key).map(|state| ("exact", state)))
         .or_else(|| {
             provider_prefix_family_key
                 .and_then(|key| states.get(key).map(|state| ("session-sibling", state)))
@@ -6495,14 +6503,70 @@ async fn select_provider_api_key(
     state: &AppState,
     provider_id: &str,
     exclude_key_id: Option<&str>,
+    affinity_key: Option<&str>,
 ) -> Result<SelectedProviderKey> {
-    let mut config = state.config.write().await;
-    match config
-        .select_provider_key_for_request(provider_id, exclude_key_id)
-        .with_context(|| format!("failed to select provider key for {provider_id}"))?
+    let affinity_map_key = affinity_key.map(|key| provider_key_affinity_map_key(provider_id, key));
+    let preferred_key_id = if exclude_key_id.is_none() {
+        if let Some(map_key) = affinity_map_key.as_deref() {
+            state
+                .provider_key_affinity
+                .lock()
+                .await
+                .get(map_key)
+                .cloned()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let selected = {
+        let mut config = state.config.write().await;
+        config
+            .select_provider_key_for_request(
+                provider_id,
+                preferred_key_id.as_deref(),
+                exclude_key_id,
+            )
+            .with_context(|| format!("failed to select provider key for {provider_id}"))?
+    };
+    let Some(selected) = selected else {
+        return Err(anyhow!("provider API key is not configured"));
+    };
+    if let (Some(map_key), Some(key_id)) = (affinity_map_key, selected.key_id.as_ref()) {
+        state
+            .provider_key_affinity
+            .lock()
+            .await
+            .insert(map_key, key_id.clone());
+    }
+    Ok(selected)
+}
+
+fn provider_key_affinity_map_key(provider_id: &str, affinity_key: &str) -> String {
+    format!("{provider_id}\0{affinity_key}")
+}
+
+async fn clear_provider_key_affinity(
+    state: &AppState,
+    provider_id: &str,
+    affinity_key: Option<&str>,
+    key_id: Option<&str>,
+) {
+    let Some(affinity_key) = affinity_key else {
+        return;
+    };
+    let Some(key_id) = key_id else {
+        return;
+    };
+    let map_key = provider_key_affinity_map_key(provider_id, affinity_key);
+    let mut affinities = state.provider_key_affinity.lock().await;
+    if affinities
+        .get(&map_key)
+        .map(|current| current == key_id)
+        .unwrap_or(false)
     {
-        Some(selected) => Ok(selected),
-        None => Err(anyhow!("provider API key is not configured")),
+        affinities.remove(&map_key);
     }
 }
 
@@ -6575,6 +6639,7 @@ async fn try_retry_with_next_provider_key(
     provider_id: &str,
     selected: &SelectedProviderKey,
     status: u16,
+    affinity_key: Option<&str>,
 ) -> Option<SelectedProviderKey> {
     let status = StatusCode::from_u16(status).ok()?;
     if selected.key_id.is_none() || !is_provider_key_failure_status(status) {
@@ -6595,7 +6660,10 @@ async fn try_retry_with_next_provider_key(
                 .await;
         }
     }
-    match select_provider_api_key(state, provider_id, selected.key_id.as_deref()).await {
+    clear_provider_key_affinity(state, provider_id, affinity_key, selected.key_id.as_deref()).await;
+    match select_provider_api_key(state, provider_id, selected.key_id.as_deref(), affinity_key)
+        .await
+    {
         Ok(next) if next.key_id != selected.key_id => Some(next),
         _ => None,
     }
@@ -17234,7 +17302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_state_alias_keeps_wait_state_after_provider_key_change() {
+    async fn prefix_state_alias_does_not_drive_cross_provider_foreground_wait() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-alias-{}",
@@ -17266,13 +17334,19 @@ mod tests {
         assert!(states.get(api_key).is_none());
         let alias_state = lookup_provider_prefix_state(&states, api_key).unwrap();
         assert_eq!(alias_state.cache_read_tokens, 209_920);
-        assert!(provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            alias_state,
-            &TailInputDiagnostics::default(),
-        )
-        .is_some());
         drop(states);
+
+        let wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(api_key),
+            None,
+            &TailInputDiagnostics::default(),
+            None,
+        )
+        .await;
+        assert_eq!(wait.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert_eq!(wait.wait_ms, 0);
 
         fs::remove_dir_all(dir).ok();
     }

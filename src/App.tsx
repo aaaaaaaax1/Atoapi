@@ -121,8 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.54";
+const appVersion = "v0.1.55";
 const appVersionNotes = [
+  "v0.1.55: 本地前缀等待不再用跨上游 alias 水线驱动，切换上游后的冷启动不会再白等 3 秒或污染当前上游判断",
+  "v0.1.55: 多 Key 管理新增同前缀亲和选择，同一 provider/model/prefix 优先复用同一个健康 Key，失败后才切下一个",
+  "v0.1.55: 继续保持零额外请求、无主动热补、普通 main session-delta 禁用和 Responses 前台约 +3 秒上限",
   "v0.1.54: Responses 上游 prompt_cache_key 按稳定会话锚点生成，同一会话不分裂，不同会话分开，减少多会话缓存串扰",
   "v0.1.54: 日志分析优先使用底层真实新尾巴/可避免缺口字段，避免把真实新尾巴误判成可避免",
   "v0.1.54: 保留零额外请求、无热补、普通 main session-delta 禁用和 Responses 前台约 +3 秒上限",
@@ -2002,6 +2005,7 @@ function MultiKeyManager({
   const [batchKeys, setBatchKeys] = useState("");
   const [testingKeyId, setTestingKeyId] = useState("");
   const [testingAll, setTestingAll] = useState(false);
+  const [revealingKeyId, setRevealingKeyId] = useState("");
   const pool = draft.key_pool;
   const availableKeys = pool.keys.filter((key) => key.enabled && key.status !== "unhealthy").length;
   const strategy = keyStrategyOptions.find((item) => item.value === pool.strategy);
@@ -2022,6 +2026,37 @@ function MultiKeyManager({
       ...currentPool,
       keys: currentPool.keys.map((key) => (key.id === id ? { ...key, ...patch } : key))
     }));
+  }
+
+  async function revealKeySecret(key: ProviderKeyDraft) {
+    const currentSecret = pool.keys.find((item) => item.id === key.id)?.key.trim() || key.key.trim();
+    if (currentSecret) return currentSecret;
+    if (!draft.id) return "";
+    setRevealingKeyId(key.id);
+    try {
+      const revealed = await command<string | null>("reveal_provider_key", {
+        providerId: draft.id,
+        provider_id: draft.id,
+        keyId: key.id,
+        key_id: key.id
+      });
+      if (revealed) {
+        updateKey(key.id, { key: revealed });
+        return revealed;
+      }
+    } catch (err) {
+      updateKey(key.id, { last_error: String(err) });
+    } finally {
+      setRevealingKeyId((current) => (current === key.id ? "" : current));
+    }
+    return "";
+  }
+
+  async function copyKeySecret(key: ProviderKeyDraft) {
+    const secret = await revealKeySecret(key);
+    if (secret) {
+      await navigator.clipboard.writeText(secret);
+    }
   }
 
   function addKeys() {
@@ -2202,25 +2237,37 @@ function MultiKeyManager({
                         placeholder="可选"
                       />
                     </label>
-                    <label className="multi-key-field key-field">
+                                        <div className="multi-key-field key-field">
                       <span>Key</span>
-                      <input
-                        className="multi-key-secret"
-                        value={key.key}
-                        autoComplete="off"
-                        spellCheck={false}
-                        onChange={(event) =>
-                          updateKey(key.id, {
-                            key: event.target.value,
-                            status: "unknown",
-                            last_error: null,
-                            disabled_until: null
-                          })
-                        }
-                        placeholder={key.preview || "输入 Key"}
-                        title={key.preview ? "已保存 Key 只显示预览；在这里输入新 Key 可替换" : "输入或编辑 Key"}
-                      />
-                    </label>
+                      <div className="multi-key-secret-wrap">
+                        <input
+                          className="multi-key-secret"
+                          value={key.key}
+                          autoComplete="off"
+                          spellCheck={false}
+                          onFocus={() => void revealKeySecret(key)}
+                          onChange={(event) =>
+                            updateKey(key.id, {
+                              key: event.target.value,
+                              status: "unknown",
+                              last_error: null,
+                              disabled_until: null
+                            })
+                          }
+                          placeholder={key.preview || "输入 Key"}
+                          title="点击加载已保存的 Key 原文，可直接编辑或复制"
+                        />
+                        <button
+                          className="icon-button multi-key-copy"
+                          type="button"
+                          onClick={() => void copyKeySecret(key)}
+                          disabled={revealingKeyId === key.id || (!key.key.trim() && !draft.id)}
+                          title="复制 Key"
+                        >
+                          {revealingKeyId === key.id ? <Loader2 className="spin" size={14} /> : <Copy size={14} />}
+                        </button>
+                      </div>
+                    </div>
                     <label className="multi-key-field priority-field">
                       <span>优先级</span>
                       <input
@@ -2539,6 +2586,8 @@ function CachePanel({
   const recentCacheReadTokens = recentUsage?.cache_read_tokens ?? 0;
   const recentTotalTokens = adjustedRecentUsage.totalTokens;
   const recentCacheRatio = recentInputTokens > 0 ? recentCacheReadTokens / recentInputTokens : 0;
+  const recentRequests = recentUsage?.requests ?? 0;
+  const recentWindowLabel = formatRecentWindowLabel(recentUsage?.window_seconds ?? 1800);
   const coldStartRequests = selectedProvider === "all"
     ? metrics?.usage.cold_start_requests ?? 0
     : usage?.cold_start_requests ?? traffic?.cold_start_requests ?? 0;
@@ -2619,17 +2668,6 @@ function CachePanel({
           </button>
         </div>
 
-        <div className="cold-start-control">
-          <div>
-            <h4>主动热补</h4>
-            <p>已移除。软件不会为了提高缓存命中率额外发送前台、后台或桶补热同步请求。</p>
-          </div>
-          <div className="cold-start-meta">
-            <span>成本优先</span>
-            <b>已关闭</b>
-            <small>主请求自然续热</small>
-          </div>
-        </div>
 
         <div className="cold-start-control">
           <div>
@@ -2639,7 +2677,7 @@ function CachePanel({
           <div className="cold-start-meta">
             <span>{coldStartScopeLabel}</span>
             <b>{formatNumber(coldStartRequests)} 次</b>
-            <small>近 5 分钟 {formatNumber(recentColdStartRequests)} 次</small>
+            <small>{recentWindowLabel} {formatNumber(recentColdStartRequests)} 次</small>
           </div>
           <button
             className={includeColdStarts ? "smart-cache-toggle on" : "smart-cache-toggle"}
@@ -2685,44 +2723,58 @@ function CachePanel({
             刷新
           </button>
         </div>
-
-        <div className="usage-hero">
-          <div>
-            <div className="usage-title">
-              <Zap size={18} />
-              <span>真实消耗 Tokens</span>
-            </div>
-            <strong>{formatNumber(totalTokens)}</strong>
-            <small>≈ {formatCompactTokens(totalTokens)} tokens</small>
+        <div className="usage-ledger">
+          <div className="usage-ledger-row">
+            <UsageStatCard
+              title="历史 Tokens"
+              value={formatCompactTokens(totalTokens)}
+              icon="sum"
+              rows={[
+                { label: "输入", value: formatCompactTokens(inputTokens), detail: percent(totalTokens > 0 ? inputTokens / totalTokens : 0) },
+                { label: "输出", value: formatCompactTokens(outputTokens), detail: percent(totalTokens > 0 ? outputTokens / totalTokens : 0) },
+                { label: "缓存", value: `读 ${formatCompactTokens(cacheReadTokens)} · 写 ${formatCompactTokens(cacheCreationTokens)}`, detail: `占输入 ${percent(cacheRatio)}` }
+              ]}
+            />
+            <UsageStatCard
+              title="历史请求数"
+              value={formatNumber(totalRequests)}
+              icon="list"
+              rows={[
+                { label: "单次平均", value: formatCompactTokens(totalRequests ? Math.round(totalTokens / totalRequests) : 0), detail: "tokens" },
+                { label: "平均输入", value: formatCompactTokens(totalRequests ? Math.round(inputTokens / totalRequests) : 0), detail: percent(inputTokens > 0 ? cacheRatio : 0) },
+                { label: "平均输出", value: formatCompactTokens(totalRequests ? Math.round(outputTokens / totalRequests) : 0), detail: percent(totalTokens > 0 ? outputTokens / totalTokens : 0) },
+                { label: "平均缓存", value: formatCompactTokens(totalRequests ? Math.round(cacheReadTokens / totalRequests) : 0), detail: `占输入 ${percent(cacheRatio)}` }
+              ]}
+            />
           </div>
-          <div className="usage-side">
-            <span>总请求数</span>
-            <b>{formatNumber(totalRequests)}</b>
-            <span>近 5 分钟</span>
-            <b>{formatCompactTokens(recentTotalTokens)}</b>
-            <span>估算成本</span>
-            <b className="cost">{estimatedCost}</b>
+          <div className="usage-ledger-row">
+            <UsageStatCard
+              title={`${recentWindowLabel} Tokens`}
+              value={formatCompactTokens(recentTotalTokens)}
+              icon="sum"
+              rows={[
+                { label: "输入", value: formatCompactTokens(recentInputTokens), detail: percent(recentTotalTokens > 0 ? recentInputTokens / recentTotalTokens : 0) },
+                { label: "输出", value: formatCompactTokens(adjustedRecentUsage.outputTokens), detail: percent(recentTotalTokens > 0 ? adjustedRecentUsage.outputTokens / recentTotalTokens : 0) },
+                { label: "缓存", value: `读 ${formatCompactTokens(recentCacheReadTokens)} · 写 ${formatCompactTokens(recentUsage?.cache_creation_tokens ?? 0)}`, detail: `占输入 ${percent(recentInputTokens > 0 ? recentCacheRatio : 0)}` }
+              ]}
+            />
+            <UsageStatCard
+              title={`${recentWindowLabel} 请求数`}
+              value={formatNumber(recentRequests)}
+              icon="list"
+              rows={[
+                { label: "单次平均", value: formatCompactTokens(recentRequests ? Math.round(recentTotalTokens / recentRequests) : 0), detail: "tokens" },
+                { label: "平均输入", value: formatCompactTokens(recentRequests ? Math.round(recentInputTokens / recentRequests) : 0), detail: percent(recentInputTokens > 0 ? recentCacheRatio : 0) },
+                { label: "平均输出", value: formatCompactTokens(recentRequests ? Math.round(adjustedRecentUsage.outputTokens / recentRequests) : 0), detail: percent(recentTotalTokens > 0 ? adjustedRecentUsage.outputTokens / recentTotalTokens : 0) },
+                { label: "平均缓存", value: formatCompactTokens(recentRequests ? Math.round(recentCacheReadTokens / recentRequests) : 0), detail: `占输入 ${percent(recentInputTokens > 0 ? recentCacheRatio : 0)}` }
+              ]}
+            />
           </div>
-        </div>
-
-        <div className="usage-breakdown">
-          <MetricTile label="近 5 分钟真实 token" value={formatCompactTokens(recentTotalTokens)} />
-          <MetricTile label="近 5 分钟命中" value={formatCompactTokens(recentCacheReadTokens)} />
-          <MetricTile label="近 5 分钟命中率" value={percent(recentInputTokens > 0 ? recentCacheRatio : 0)} />
-          <MetricTile label="Output" value={formatCompactTokens(outputTokens)} />
-          <MetricTile label="累计真实 token" value={formatCompactTokens(totalTokens)} />
-          <MetricTile label="累计上游命中" value={formatCompactTokens(cacheReadTokens)} />
-          <MetricTile label="主请求" value={formatNumber(totalRequests)} />
-        </div>
-
-        <div className="prewarm-cost-note">
-          <span>主动热补已移除：正常情况下软件不会为了缓存命中额外补发同步请求。</span>
-          <b>中转后台请求数应主要来自真实主请求、失败重试或客户端自己发出的探针。</b>
         </div>
 
         <div className="hit-meter">
           <div>
-            <span>上游前缀缓存命中率（近 5 分钟）</span>
+            <span>上游前缀缓存命中率（{recentWindowLabel}）</span>
             <b>{percent(activeCacheRatio)}</b>
           </div>
           <div className="meter-track">
@@ -2883,6 +2935,40 @@ function Summary({ label, value, tone }: { label: string; value: string; tone?: 
     <div className={tone === "red" ? "summary-card red" : "summary-card"}>
       <span>{label}</span>
       <b>{value}</b>
+    </div>
+  );
+}
+
+function UsageStatCard({
+  title,
+  value,
+  icon,
+  rows
+}: {
+  title: string;
+  value: string;
+  icon: "sum" | "list";
+  rows: Array<{ label: string; value: string; detail?: string }>;
+}) {
+  return (
+    <div className="usage-stat-card">
+      <div className="usage-stat-head">
+        <span>{title}</span>
+        <b>{icon === "sum" ? "#" : "☷"}</b>
+      </div>
+      <strong>{value}</strong>
+      <div className="usage-stat-rule" />
+      <div className="usage-stat-rows">
+        {rows.map((row) => (
+          <div className="usage-stat-row" key={row.label}>
+            <span>{row.label}</span>
+            <p>
+              <b>{row.value}</b>
+              {row.detail ? <em>{row.detail}</em> : null}
+            </p>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -3142,6 +3228,11 @@ function compactChannelLabel(channel?: string | null) {
   if (channel === "chat") return "Chat";
   if (channel === "anthropic") return "Anthropic";
   return channel || "";
+}
+
+function formatRecentWindowLabel(seconds: number) {
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return `近 ${minutes} 分钟`;
 }
 
 function formatContextInput(value?: number | null) {

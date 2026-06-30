@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+﻿use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -400,7 +400,7 @@ async fn test_provider_key_inner(
             provider_id: input.provider_id.clone(),
             key_id: input.key_id.clone(),
             ok: true,
-            message: format!("可用，获取到 {} 个模型", models.len()),
+            message: format!("鍙敤锛岃幏鍙栧埌 {} 涓ā鍨?, models.len()),
             models_count: models.len(),
         }),
         Err(err) => Ok(ProviderKeyTestResult {
@@ -739,7 +739,7 @@ fn truncate_body(body: &str) -> String {
         body.to_string()
     } else {
         let mut truncated = body.chars().take(ERROR_BODY_MAX_CHARS).collect::<String>();
-        truncated.push('…');
+        truncated.push('鈥?);
         truncated
     }
 }
@@ -877,3 +877,4 @@ mod tests {
         assert_eq!(candidates, vec!["https://proxy.example.com/v1/models"]);
     }
 }
+
