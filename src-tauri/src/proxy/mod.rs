@@ -1240,9 +1240,14 @@ async fn handle_generation(
     let (upstream_send_body, mut response_session_reuse_diagnostics) =
         if matches!(decision.upstream_channel, Channel::Responses) {
             let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-            if response_session_cooldown_active {
+            if let Some(cooldown_skip_reason) = response_session_cooldown_skip_reason(
+                &state,
+                response_session_cooldown_key.as_deref(),
+            )
+            .await
+            {
                 diagnostics.cooldown_active = true;
-                diagnostics.skip_reason = Some("provider_session_delta_cooldown".to_string());
+                diagnostics.skip_reason = Some(cooldown_skip_reason);
                 (upstream_body.clone(), diagnostics)
             } else if should_attempt_main_response_session_delta(
                 &config,
@@ -1446,8 +1451,36 @@ async fn handle_generation(
             .unwrap_or(false);
     }
     if should_retry_full_response_after_session_error(status, used_response_session) {
-        note_response_session_error_cooldown(&state, response_session_cooldown_key.as_deref())
-            .await;
+        let session_error_summary = match read_upstream_body_with_diagnostics(
+            upstream,
+            &content_type,
+            started,
+            upstream_response_headers_at_ms,
+        )
+        .await
+        {
+            Ok(outcome) => upstream_error_summary(&outcome.bytes),
+            Err(err) => {
+                state
+                    .metrics
+                    .record_error("response_session_delta_error_body", &err.to_string())
+                    .await;
+                String::new()
+            }
+        };
+        if !session_error_summary.is_empty() {
+            state
+                .metrics
+                .record_error("response_session_delta_rejected", &session_error_summary)
+                .await;
+        }
+        note_response_session_error_cooldown_for_rejection(
+            &state,
+            response_session_cooldown_key.as_deref(),
+            status,
+            &session_error_summary,
+        )
+        .await;
         response_session_reuse_diagnostics.rejected_status = Some(status);
         let stale_response_id = previous_response_id_from_request(&active_upstream_body);
         clear_response_session_reference(
@@ -1734,9 +1767,11 @@ async fn handle_generation(
                 .unwrap_or(false);
             if should_retry_full_response_after_session_error(status, active_used_response_session)
             {
-                note_response_session_error_cooldown(
+                note_response_session_error_cooldown_for_rejection(
                     &state,
                     response_session_cooldown_key.as_deref(),
+                    status,
+                    "",
                 )
                 .await;
                 response_session_reuse_diagnostics.rejected_status = Some(status);
@@ -2390,18 +2425,58 @@ fn response_session_error_cooldown_key(decision: &RouteDecision) -> Option<Strin
 }
 
 async fn response_session_cooldown_active(state: &AppState, key: Option<&str>) -> bool {
+    response_session_cooldown_skip_reason(state, key)
+        .await
+        .is_some()
+}
+
+async fn response_session_cooldown_skip_reason(
+    state: &AppState,
+    key: Option<&str>,
+) -> Option<String> {
     let Some(key) = key else {
-        return false;
+        return None;
     };
     let cooldowns = state.response_session_error_cooldowns.lock().await;
     match cooldowns.get(key).cloned() {
-        Some(cooldown) if cooldown.until > Instant::now() => true,
-        Some(_) => false,
-        None => false,
+        Some(cooldown) if cooldown.until > Instant::now() => {
+            if cooldown.unsupported {
+                Some("provider_session_delta_unsupported".to_string())
+            } else {
+                Some("provider_session_delta_cooldown".to_string())
+            }
+        }
+        Some(_) => None,
+        None => None,
     }
 }
 
 async fn note_response_session_error_cooldown(state: &AppState, key: Option<&str>) {
+    note_response_session_error_cooldown_internal(state, key, false).await;
+}
+
+async fn note_response_session_error_cooldown_for_rejection(
+    state: &AppState,
+    key: Option<&str>,
+    status: u16,
+    summary: &str,
+) {
+    match response_session_rejection_classification(status, summary) {
+        ResponseSessionRejectionClass::StaleReference => return,
+        ResponseSessionRejectionClass::Unsupported => {
+            note_response_session_error_cooldown_internal(state, key, true).await
+        }
+        ResponseSessionRejectionClass::TransientInvalid => {
+            note_response_session_error_cooldown_internal(state, key, false).await
+        }
+    }
+}
+
+async fn note_response_session_error_cooldown_internal(
+    state: &AppState,
+    key: Option<&str>,
+    unsupported: bool,
+) {
     let Some(key) = key else {
         return;
     };
@@ -2410,12 +2485,13 @@ async fn note_response_session_error_cooldown(state: &AppState, key: Option<&str
         .get(key)
         .map(|cooldown| cooldown.failures.saturating_add(1))
         .unwrap_or(1);
-    let seconds = response_session_error_cooldown_secs(failures);
+    let seconds = response_session_error_cooldown_secs(failures, unsupported);
     cooldowns.insert(
         key.to_string(),
         ResponseSessionCooldownState {
             until: Instant::now() + std::time::Duration::from_secs(seconds),
             failures,
+            unsupported,
         },
     );
     drop(cooldowns);
@@ -2427,7 +2503,45 @@ async fn note_response_session_error_cooldown(state: &AppState, key: Option<&str
     }
 }
 
-fn response_session_error_cooldown_secs(failures: u32) -> u64 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseSessionRejectionClass {
+    StaleReference,
+    Unsupported,
+    TransientInvalid,
+}
+
+fn response_session_rejection_classification(
+    status: u16,
+    summary: &str,
+) -> ResponseSessionRejectionClass {
+    let summary = summary.to_ascii_lowercase();
+    if summary.contains("previous_response_not_found")
+        || (summary.contains("previous response") && summary.contains("not found"))
+        || (summary.contains("response id") && summary.contains("not found"))
+    {
+        return ResponseSessionRejectionClass::StaleReference;
+    }
+    if summary.contains("unsupported parameter")
+        || summary.contains("unknown parameter")
+        || summary.contains("unrecognized parameter")
+        || (summary.contains("previous_response_id")
+            && (summary.contains("unsupported")
+                || summary.contains("not supported")
+                || summary.contains("invalid parameter")))
+    {
+        return ResponseSessionRejectionClass::Unsupported;
+    }
+    if matches!(status, 404 | 409 | 410) {
+        ResponseSessionRejectionClass::StaleReference
+    } else {
+        ResponseSessionRejectionClass::TransientInvalid
+    }
+}
+
+fn response_session_error_cooldown_secs(failures: u32, unsupported: bool) -> u64 {
+    if unsupported {
+        return RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS;
+    }
     match failures {
         0 | 1 => RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS,
         2 => RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS,
@@ -4110,7 +4224,7 @@ fn responses_precise_tool_tail_can_learn_sent_bucket(
     {
         return false;
     }
-    if current_shortfall < 512 || current_shortfall > 8192 || current_shortfall % 512 != 0 {
+    if current_shortfall < 512 || current_shortfall > 12_288 || current_shortfall % 512 != 0 {
         return false;
     }
     if current_shortfall_128 > current_shortfall.saturating_add(512) {
@@ -4128,16 +4242,42 @@ fn responses_precise_tool_tail_can_learn_sent_bucket(
         return false;
     }
     let ratio = provider_cache_ratio(record).unwrap_or(0.0);
-    let required_ratio = if current_shortfall <= 2048 {
+    let required_ratio =
+        responses_precise_tool_tail_required_ratio(current_shortfall, tail_input_diagnostics);
+    ratio >= required_ratio
+}
+
+fn responses_precise_tool_tail_required_ratio(
+    current_shortfall: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> f64 {
+    let aligned_512 = current_shortfall >= 512 && current_shortfall % 512 == 0;
+    let tool_only = matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("tool_output")
+    );
+    let compact_tool_tail = tail_input_diagnostics.tool_output_chars <= 16_384
+        && tail_input_diagnostics.largest_tool_output_chars <= 14_336;
+    if aligned_512 && tool_only && compact_tool_tail {
+        if current_shortfall <= 2048 {
+            0.965
+        } else if current_shortfall <= 4096 {
+            0.955
+        } else if current_shortfall <= 8192 {
+            0.92
+        } else if current_shortfall <= 12_288 {
+            0.925
+        } else {
+            0.97
+        }
+    } else if current_shortfall <= 2048 {
         0.97
     } else if current_shortfall <= 4096 {
         0.95
     } else {
         0.92
-    };
-    ratio >= required_ratio
+    }
 }
-
 fn responses_small_avoidable_tail_granularity(
     previous: Option<&PrefixWarmState>,
     record: &UsageRecord,
@@ -5192,7 +5332,8 @@ fn upstream_error_scope(status: u16, message: &str) -> &'static str {
         401 => "upstream_auth",
         403 => {
             let lower = message.to_ascii_lowercase();
-            if message.contains("额度")
+            if message.contains("\u{989d}\u{5ea6}")
+                || message.contains("\u{4f59}\u{989d}")
                 || lower.contains("quota")
                 || lower.contains("balance")
                 || lower.contains("insufficient")
@@ -5221,7 +5362,7 @@ fn truncate_log_message(message: &str) -> String {
         normalized
     } else {
         let mut truncated = normalized.chars().take(MAX_CHARS).collect::<String>();
-        truncated.push('…');
+        truncated.push_str("...");
         truncated
     }
 }
@@ -6727,10 +6868,10 @@ fn is_provider_key_failure_message(message: &str) -> bool {
         || lower.contains("invalid_api_key")
         || lower.contains("unauthorized")
         || lower.contains("forbidden")
-        || message.contains("浣欓")
-        || message.contains("棰濆害")
-        || message.contains("娆犺垂")
-        || message.contains("鏃犳晥")
+        || message.contains("\u{4f59}\u{989d}\u{4e0d}\u{8db3}")
+        || message.contains("\u{989d}\u{5ea6}\u{4e0d}\u{8db3}")
+        || message.contains("\u{6b20}\u{8d39}")
+        || message.contains("\u{4f59}\u{989d}")
 }
 
 async fn try_retry_with_next_provider_key(
@@ -11094,7 +11235,7 @@ mod tests {
             "messages": [
                 { "role": "system", "content": "Follow project policy." },
                 { "role": "developer", "content": "Skill trigger: use cache-log-skill when logs are mentioned." },
-                { "role": "user", "content": "鐪嬫柊鏃ュ織" }
+                { "role": "user", "content": "Please inspect the logs." }
             ],
             "tools": [{
                 "type": "function",
@@ -11122,7 +11263,7 @@ mod tests {
             transformed
                 .pointer("/input/0/content/0/text")
                 .and_then(Value::as_str),
-            Some("鐪嬫柊鏃ュ織")
+            Some("Please inspect the logs.")
         );
         assert_eq!(
             transformed
@@ -11148,7 +11289,7 @@ mod tests {
                 {
                     "type": "message",
                     "role": "user",
-                    "content": "鐪嬫柊鏃ュ織"
+                    "content": "Please inspect the logs."
                 }
             ]
         });
@@ -13528,7 +13669,7 @@ mod tests {
         config.providers = vec![
             ProviderConfig {
                 id: "yunshu".to_string(),
-                name: "浜戞灑".to_string(),
+                name: "yunshu".to_string(),
                 base_url: "https://yunshu.example/v1".to_string(),
                 models_url: None,
                 is_full_url: false,
@@ -17192,6 +17333,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn high_hit_aligned_large_tool_tail_advances_sent_bucket() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-large-aligned-tool-tail-waterline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            provider: "bizd".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 125_300,
+            output_tokens: 10,
+            cache_read_tokens: 123_392,
+            cache_creation_tokens: 0,
+        };
+        let aligned_tail = UsageRecord {
+            provider: "bizd".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 132_800,
+            output_tokens: 10,
+            cache_read_tokens: 123_392,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            tool_output_chars: 13_736,
+            largest_tool_output_chars: 13_705,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        assert_eq!(provider_cache_shortfall(&aligned_tail), 9_216);
+        assert!(provider_cache_ratio(&aligned_tail).unwrap() >= 0.92);
+        assert!(should_learn_sent_provider_bucket(
+            state.prefix_states.lock().await.get("main-prefix"),
+            &aligned_tail,
+            provider_cache_shortfall(&aligned_tail),
+            provider_cache_shortfall_128(&aligned_tail),
+            &tail,
+            false
+        ));
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&aligned_tail),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(
+            kept.seen_bucket_tokens,
+            provider_cache_bucket_max(aligned_tail.input_tokens)
+        );
+        drop(states);
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&aligned_tail),
+            Some(&tail),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gap.avoidable_tokens, 9_216);
+        assert_eq!(gap.new_tail_tokens, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+    #[tokio::test]
     async fn large_low_hit_tool_tail_does_not_advance_sent_bucket() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -18441,6 +18659,66 @@ mod tests {
         assert!(!should_retry_full_response_after_session_error(403, true));
     }
 
+    #[test]
+    fn response_session_rejection_classifies_stale_id_without_provider_cooldown() {
+        assert_eq!(
+            response_session_rejection_classification(
+                400,
+                "Previous response with id 'resp_old' not found. provider_code=previous_response_not_found"
+            ),
+            ResponseSessionRejectionClass::StaleReference
+        );
+        assert_eq!(
+            response_session_rejection_classification(
+                400,
+                "Unsupported parameter: previous_response_id"
+            ),
+            ResponseSessionRejectionClass::Unsupported
+        );
+        assert_eq!(
+            response_session_rejection_classification(422, "invalid request"),
+            ResponseSessionRejectionClass::TransientInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_response_session_rejection_does_not_disable_provider_delta() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-session-stale-id-no-provider-cooldown-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "responses:bizd:gpt-5.5";
+
+        note_response_session_error_cooldown_for_rejection(
+            &state,
+            Some(key),
+            400,
+            "provider_code=previous_response_not_found Previous response not found",
+        )
+        .await;
+        assert!(
+            !response_session_cooldown_active(&state, Some(key)).await,
+            "a stale response id should clear that session only, not disable provider/model session-delta"
+        );
+
+        note_response_session_error_cooldown_for_rejection(
+            &state,
+            Some(key),
+            400,
+            "Unsupported parameter: previous_response_id",
+        )
+        .await;
+        assert_eq!(
+            response_session_cooldown_skip_reason(&state, Some(key))
+                .await
+                .as_deref(),
+            Some("provider_session_delta_unsupported")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
     #[tokio::test]
     async fn response_session_error_cooldown_is_scoped_to_responses_provider_model() {
         let config = AppConfig::default();
@@ -18477,15 +18755,15 @@ mod tests {
         note_response_session_error_cooldown(&state, key.as_deref()).await;
         assert!(response_session_cooldown_active(&state, key.as_deref()).await);
         assert_eq!(
-            response_session_error_cooldown_secs(1),
+            response_session_error_cooldown_secs(1, false),
             RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS
         );
         assert_eq!(
-            response_session_error_cooldown_secs(2),
+            response_session_error_cooldown_secs(2, false),
             RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS
         );
         assert_eq!(
-            response_session_error_cooldown_secs(3),
+            response_session_error_cooldown_secs(3, false),
             RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS
         );
 

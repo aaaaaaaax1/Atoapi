@@ -1,4 +1,4 @@
-﻿use anyhow::{Context, Result};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -85,6 +85,7 @@ pub struct ResponseSessionState {
 pub struct ResponseSessionCooldownState {
     pub until: std::time::Instant,
     pub failures: u32,
+    pub unsupported: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -135,6 +136,8 @@ struct PersistedResponseSessionCooldownState {
     saved_at: chrono::DateTime<Utc>,
     until_at: chrono::DateTime<Utc>,
     failures: u32,
+    #[serde(default)]
+    unsupported: bool,
 }
 
 const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
@@ -432,6 +435,7 @@ impl PersistedRuntimeState {
                             saved_at: now,
                             until_at,
                             failures: state.failures,
+                            unsupported: state.unsupported,
                         },
                     )
                 })
@@ -515,6 +519,7 @@ impl PersistedRuntimeState {
                     ResponseSessionCooldownState {
                         until,
                         failures: state.failures,
+                        unsupported: state.unsupported,
                     },
                 ))
             })
@@ -659,6 +664,7 @@ mod tests {
             ResponseSessionCooldownState {
                 until: Instant::now() + StdDuration::from_secs(3600),
                 failures: 2,
+                unsupported: false,
             },
         );
 

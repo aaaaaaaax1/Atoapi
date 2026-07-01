@@ -121,9 +121,13 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.56";
+const appVersion = "v0.1.57";
 const appVersionNotes = [
-  "v0.1.56: Responses 主路新增严格同会话 session-delta 闸门，只有 exact session、流式请求、发送体确实变小时才使用 previous_response_id + delta，减少完整历史和工具尾巴进入上游",
+  "v0.1.57: Responses session-delta 拒绝改为按原因分类：previous_response_not_found 只清理旧会话，不再把整个上游模型打入长冷却；真正 unsupported parameter 才标记为 provider_session_delta_unsupported",
+  "v0.1.57: 工具输出尾巴水线扩展到高命中、512 对齐的 512-12288 区间，下一轮可进入 +3 秒内保护，目标压低 2048/4096/9216 这类新尾巴",
+  "v0.1.57: 保留成本和时延底线：不新增热补、不新增同步请求、不改工具输出、不把 Responses 前台保护从约 +3 秒拉长",
+  "v0.1.57: 请求记录和统计卡片 UI 继续使用更松散的条目布局，减少拥挤和错位",
+"v0.1.56: Responses 主路新增严格同会话 session-delta 闸门，只有 exact session、流式请求、发送体确实变小时才使用 previous_response_id + delta，减少完整历史和工具尾巴进入上游",
   "v0.1.56: 保留成本底线：不主动热补、不新增同步请求、不改工具输出、不拉长 Responses 前台约 +3 秒保护；delta 失败会清理旧 response_id、进入冷却并自动全量重试",
   "v0.1.56: 缓存统计卡片去掉右上角装饰符号，内部指标区改成更清晰的居中信息面板，提升数字和标签区分度",
   "v0.1.56: 补齐主路 session-delta 防回归测试：不使用 scope sibling、不接受无收益 delta、413 救援仍允许安全 fallback",
@@ -2819,21 +2823,29 @@ function CachePanel({
               ].join(" · ");
               return (
                 <div className="request-row" key={request.id}>
-                  <Activity size={14} />
-                  <time>{formatRequestTime(request.at)}</time>
-                  <span className="request-provider-text">{request.provider} · {request.model}</span>
-                  <span className={`request-call-badge ${requestCallKindClass(request.upstream_call_kind)}`}>
-                    {requestCallKindLabel(request.upstream_call_kind, request.upstream_call_source)}
-                  </span>
-                  <span className="request-channel-badge">
-                    {requestChannelLabel(request.client_channel, request.upstream_channel)}
-                  </span>
-                  <span className="request-metrics" title={metricTitle}>
+                  <div className="request-identity">
+                    <Activity size={14} />
+                    <div>
+                      <time>{formatRequestTime(request.at)}</time>
+                      <span className="request-provider-text">{request.provider} · {request.model}</span>
+                    </div>
+                  </div>
+                  <div className="request-badges">
+                    <span className={`request-call-badge ${requestCallKindClass(request.upstream_call_kind)}`}>
+                      {requestCallKindLabel(request.upstream_call_kind, request.upstream_call_source)}
+                    </span>
+                    <span className="request-channel-badge">
+                      {requestChannelLabel(request.client_channel, request.upstream_channel)}
+                    </span>
+                  </div>
+                  <div className="request-metrics" title={metricTitle}>
                     <strong>首字 {formatDurationMs(request.ttft_ms)} · 用时 {formatDurationMs(request.total_ms)}</strong>
                     <em>输入 {formatCompactTokens(inputTokens)} · 输出 {formatCompactTokens(outputTokens)} · 命中 {formatCompactTokens(cacheReadTokens)}</em>
-                  </span>
-                  <b>{request.cache_status}{cacheDisplay.primary ? ` · ${cacheDisplay.primary}` : ""}</b>
-                  {cacheDisplay.secondary ? <small title={cacheDisplay.secondary}>{cacheDisplay.secondary}</small> : null}
+                  </div>
+                  <div className="request-cache-result">
+                    <b>{request.cache_status}{cacheDisplay.primary ? ` · ${cacheDisplay.primary}` : ""}</b>
+                    {cacheDisplay.secondary ? <small title={cacheDisplay.secondary}>{cacheDisplay.secondary}</small> : null}
+                  </div>
                 </div>
               );
             })}
