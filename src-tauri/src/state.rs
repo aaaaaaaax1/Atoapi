@@ -419,6 +419,9 @@ impl PersistedRuntimeState {
         let response_session_error_cooldowns = response_session_error_cooldowns
             .iter()
             .filter_map(|(key, state)| {
+                if !state.unsupported {
+                    return None;
+                }
                 let remaining = state.until.checked_duration_since(Instant::now());
                 let until_at = remaining
                     .and_then(|duration| chrono::Duration::from_std(duration).ok())
@@ -506,6 +509,9 @@ impl PersistedRuntimeState {
             .into_iter()
             .filter_map(|(key, state)| {
                 let age = (now - state.saved_at).to_std().ok()?;
+                if !state.unsupported {
+                    return None;
+                }
                 let active = state.until_at > now;
                 if !active && age > RUNTIME_STATE_TTL {
                     return None;
@@ -664,7 +670,7 @@ mod tests {
             ResponseSessionCooldownState {
                 until: Instant::now() + StdDuration::from_secs(3600),
                 failures: 2,
-                unsupported: false,
+                unsupported: true,
             },
         );
 
@@ -682,7 +688,41 @@ mod tests {
             .get("responses:share:gpt-5.5")
             .unwrap();
         assert_eq!(cooldown.failures, 2);
+        assert!(cooldown.unsupported);
         assert!(cooldown.until > Instant::now());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_state_drops_transient_response_session_cooldowns() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-runtime-state-transient-cooldown-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        state.response_session_error_cooldowns.lock().await.insert(
+            "responses:share:gpt-5.5".to_string(),
+            ResponseSessionCooldownState {
+                until: Instant::now() + StdDuration::from_secs(3600),
+                failures: 2,
+                unsupported: false,
+            },
+        );
+
+        state.persist_runtime_state().await.unwrap();
+        let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
+
+        assert!(
+            loaded.response_session_error_cooldowns.is_empty(),
+            "transient session-delta failures must not survive restart and block exact session retry"
+        );
 
         fs::remove_dir_all(dir).ok();
     }

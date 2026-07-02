@@ -121,8 +121,12 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.57";
+const appVersion = "v0.1.58";
 const appVersionNotes = [
+  "v0.1.58: session-delta 临时失败冷却缩短为 30 秒/2 分钟/5 分钟，previous_response_not_found 等短故障不会把命中线路长时间打冷。",
+  "v0.1.58: 仅把真正 unsupported 的 Responses session-delta 冷却持久化；普通临时失败重启后不再污染可用会话。",
+  "v0.1.58: 请求记录列表改为自动换行条目布局，避免缩小窗口重叠和全屏横向滚动。",
+  "v0.1.58: 缓存统计卡片改为单列自适应布局，减少放大窗口中间空洞和视觉断层。",
   "v0.1.57: Responses session-delta 拒绝改为按原因分类：previous_response_not_found 只清理旧会话，不再把整个上游模型打入长冷却；真正 unsupported parameter 才标记为 provider_session_delta_unsupported",
   "v0.1.57: 工具输出尾巴水线扩展到高命中、512 对齐的 512-12288 区间，下一轮可进入 +3 秒内保护，目标压低 2048/4096/9216 这类新尾巴",
   "v0.1.57: 保留成本和时延底线：不新增热补、不新增同步请求、不改工具输出、不把 Responses 前台保护从约 +3 秒拉长",

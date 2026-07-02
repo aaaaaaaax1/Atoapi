@@ -32,9 +32,10 @@ const FOREGROUND_PREWARM_MAX_FULL_BODY_BYTES: usize = 1_500_000;
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
 const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
 const PREFIX_ERROR_COOLDOWN_SECS: u64 = 45;
-const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 2 * 60 * 60;
-const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 24 * 60 * 60;
-const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 24 * 60 * 60;
+const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 30;
+const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 2 * 60;
+const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 5 * 60;
+const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
@@ -2540,7 +2541,7 @@ fn response_session_rejection_classification(
 
 fn response_session_error_cooldown_secs(failures: u32, unsupported: bool) -> u64 {
     if unsupported {
-        return RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS;
+        return RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS;
     }
     match failures {
         0 | 1 => RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS,
@@ -18765,6 +18766,10 @@ mod tests {
         assert_eq!(
             response_session_error_cooldown_secs(3, false),
             RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS
+        );
+        assert_eq!(
+            response_session_error_cooldown_secs(1, true),
+            RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS
         );
 
         provider.channel = Channel::Chat;

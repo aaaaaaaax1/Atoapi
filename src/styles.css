@@ -568,9 +568,30 @@ button {
 }
 
 .provider-grid,
-.gateway-grid,
-.cache-grid {
+.gateway-grid {
   grid-template-columns: minmax(0, 1.2fr) minmax(360px, 0.8fr);
+}
+
+.cache-grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.cache-grid > .surface:first-child {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  align-items: stretch;
+  gap: 14px;
+}
+
+.cache-grid > .surface:first-child .panel-head,
+.cache-grid > .surface:first-child .smart-cache-card,
+.cache-grid > .surface:first-child .cold-start-control {
+  margin: 0;
+}
+
+.cache-grid > .surface:first-child .panel-head {
+  align-items: start;
+  padding-right: 6px;
 }
 
 .surface {
@@ -1238,6 +1259,7 @@ button:disabled {
 
 .request-log-panel {
   gap: 10px;
+  min-width: 0;
 }
 
 .request-log-head {
@@ -1260,7 +1282,8 @@ button:disabled {
 
 .request-feed {
   max-height: 760px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding-right: 2px;
 }
 
@@ -1722,9 +1745,10 @@ button:disabled {
 }
 
 .request-row {
-  display: grid;
-  grid-template-columns: minmax(180px, 1.05fr) minmax(170px, 0.78fr) minmax(230px, 1.05fr) minmax(210px, 0.98fr);
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-start;
   min-height: 66px;
   padding: 12px 14px;
   border: 1px solid rgba(150, 158, 148, 0.12);
@@ -1743,6 +1767,7 @@ button:disabled {
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr);
   align-items: center;
+  flex: 1 1 190px;
   gap: 12px;
   min-width: 0;
   color: #dce8df;
@@ -1774,6 +1799,8 @@ button:disabled {
 
 .request-badges {
   display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-width: 0;
@@ -1837,7 +1864,7 @@ button:disabled {
 
 .request-row .request-metrics {
   display: grid;
-  flex-direction: column;
+  flex: 1 1 230px;
   gap: 4px;
   min-width: 0;
   padding: 2px 0;
@@ -1870,6 +1897,7 @@ button:disabled {
 
 .request-cache-result {
   display: grid;
+  flex: 1 1 240px;
   justify-items: end;
   gap: 5px;
   min-width: 0;
@@ -1892,9 +1920,8 @@ button:disabled {
   color: #c7cac3;
   font-size: 12px;
   text-align: right;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
   line-height: 1.35;
   max-width: 100%;
 }
