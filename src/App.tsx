@@ -121,8 +121,13 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.59";
+const appVersion = "v0.1.61";
 const appVersionNotes = [
+  "v0.1.61: 长空闲 warm prefix 增加最多 +3 秒冷读保护；同一会话 64k+ warm 后空闲再发，不再因为 settle window 过期而裸发。",
+  "v0.1.61: 紧凑 512 对齐工具尾巴在 90%+ 命中时推进已发送桶水线；减少 9k-12k 新尾巴反复漂移，下一轮转入可守护缺口。",
+  "v0.1.61: 高命中紧凑工具尾巴可刷新同会话 sibling 水线；exact key 轻微变化时获得只读守护，不改统计口径。",
+  "v0.1.61: 保持 v0.1.56/v0.1.59 底线：不热补、不新增同步请求、不恢复无条件 session-delta、不超过 Responses 前台 +3 秒保护。",
+  "v0.1.60: 请求记录小窗口保持单行四列显示；放不下时压缩字体、徽标和间距，不再把命中结果拆到第二行。",
   "v0.1.59: 修复 Responses session-delta WebSocket v2 能力识别；上游提示 previous_response_id 仅支持 WebSocket v2 时，直接进入 unsupported 长冷却，不再反复短冷却重试。",
   "v0.1.59: 以 v0.1.56 严格 session-delta 为命中率基线，保留零额外请求、不热补、不长等待的成本底线。",
   "v0.1.59: 合并 v0.1.58 后续 UI 修复：缓存策略区不再被压成窄列，请求记录恢复稳定四列布局。",

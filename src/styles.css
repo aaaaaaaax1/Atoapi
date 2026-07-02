@@ -2059,20 +2059,75 @@ button:disabled {
   }
 
   .request-row {
-    grid-template-columns: minmax(170px, 1fr) minmax(160px, 0.8fr) minmax(220px, 1fr);
+    grid-template-columns:
+      minmax(132px, 0.78fr)
+      minmax(120px, 0.56fr)
+      minmax(164px, 0.82fr)
+      minmax(168px, 0.84fr);
+    gap: 8px 10px;
+    padding: 10px 12px;
+  }
+
+  .request-identity {
+    grid-template-columns: 18px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .request-row time {
+    font-size: 12px;
+  }
+
+  .request-provider-text {
+    font-size: 13px;
+  }
+
+  .request-badges {
+    gap: 6px;
+  }
+
+  .request-row .request-channel-badge {
+    min-width: 66px;
+    max-width: 96px;
+    padding: 3px 7px;
+    font-size: 10px;
+  }
+
+  .request-row .request-call-badge {
+    min-width: 48px;
+    padding: 3px 7px;
+    font-size: 10px;
+  }
+
+  .request-row .request-metrics {
+    font-size: 11px;
+  }
+
+  .request-row .request-metrics strong {
+    font-size: 12px;
+  }
+
+  .request-row .request-metrics em {
+    font-size: 11px;
   }
 
   .request-cache-result {
-    grid-column: 1 / -1;
-    justify-items: stretch;
-    text-align: left;
-    padding-top: 8px;
-    border-top: 1px solid rgba(150, 158, 148, 0.12);
+    grid-column: auto;
+    justify-items: end;
+    text-align: right;
+    padding-top: 0;
+    border-top: 0;
   }
 
-  .request-row b,
+  .request-row b {
+    font-size: 13px;
+  }
+
   .request-row small {
-    text-align: left;
+    font-size: 11px;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 }
 

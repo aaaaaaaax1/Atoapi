@@ -2887,6 +2887,9 @@ fn responses_stale_prefix_recovery_wait(
     if state.input_tokens < 4096 {
         return None;
     }
+    if responses_long_idle_warm_prefix_guard(state, current_tail, elapsed) {
+        return Some(responses_foreground_wait_cap());
+    }
     if elapsed > std::time::Duration::from_secs(20 * 60) {
         return None;
     }
@@ -2986,6 +2989,36 @@ fn responses_stale_prefix_recovery_wait(
     };
 
     Some(wait.min(responses_non_avoidable_wait_cap(state)))
+}
+
+fn responses_long_idle_warm_prefix_guard(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    elapsed: std::time::Duration,
+) -> bool {
+    if elapsed < std::time::Duration::from_secs(20 * 60)
+        || elapsed > std::time::Duration::from_secs(6 * 60 * 60)
+    {
+        return false;
+    }
+    if state.input_tokens < 64_000 || state.cache_read_tokens < 64_000 {
+        return false;
+    }
+    if state.seen_bucket_tokens_128.max(state.seen_bucket_tokens) < 64_000 {
+        return false;
+    }
+    if state.cache_read_tokens == 0 {
+        return false;
+    }
+    let has_new_tail = current_tail.input_items > 0
+        || current_tail.message_chars > 0
+        || current_tail.tool_output_chars > 0
+        || current_tail.tool_call_chars > 0;
+    if !has_new_tail {
+        return false;
+    }
+    let previous_gap = state.shortfall_tokens_128.max(state.shortfall_tokens);
+    previous_gap > 0 || state.cache_instability_score > 0 || state.small_gap_recovery_streak > 0
 }
 
 fn responses_stale_medium_tool_tail_probe(
@@ -3232,7 +3265,13 @@ fn provider_prefix_wait_reason_for_channel(
     let observed_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
     match channel {
         Channel::Responses => {
-            if responses_current_tool_output_cap_applies(state, current_tail) {
+            if responses_long_idle_warm_prefix_guard(
+                state,
+                current_tail,
+                state.finished_at.elapsed(),
+            ) {
+                Some("responses_long_idle_warm_prefix_guard".to_string())
+            } else if responses_current_tool_output_cap_applies(state, current_tail) {
                 Some("responses_current_tool_output_tail_cap".to_string())
             } else if avoidable > 0 {
                 Some("responses_avoidable_gap".to_string())
@@ -3977,14 +4016,19 @@ async fn update_provider_prefix_state_with_tail(
     let prefix_break_after_warm_state =
         provider_prefix_break_after_warm_state(previous.as_ref(), record)
             && (record.input_tokens >= 32_000 || responses_tool_tail_burst(tail_input_diagnostics));
-    let weak_full_retry_after_session_delta =
-        provider_prefix_weak_full_retry_after_session_delta(previous.as_ref(), record, retried_full_response);
+    let weak_full_retry_after_session_delta = provider_prefix_weak_full_retry_after_session_delta(
+        previous.as_ref(),
+        record,
+        retried_full_response,
+    );
     if prefix_break_after_warm_state || weak_full_retry_after_session_delta {
         let mut preserved = previous.clone().unwrap();
         preserved.finished_at = now;
         let instability_bump = if prefix_break_after_warm_state { 2 } else { 1 };
-        preserved.cache_instability_score =
-            preserved.cache_instability_score.saturating_add(instability_bump).min(8);
+        preserved.cache_instability_score = preserved
+            .cache_instability_score
+            .saturating_add(instability_bump)
+            .min(8);
         preserved.shortfall_tokens = provider_cache_shortfall(record);
         preserved.shortfall_tokens_128 = provider_cache_shortfall_128(record);
         preserved.avoidable_shortfall_tokens = 0;
@@ -4272,7 +4316,11 @@ fn responses_precise_tool_tail_required_ratio(
         } else if current_shortfall <= 8192 {
             0.92
         } else if current_shortfall <= 12_288 {
-            0.925
+            // A compact 512-aligned tool tail at ~9k-12k is still useful as a
+            // sent-bucket waterline: it does not claim the provider hit is good,
+            // it only lets the next same-prefix turn guard the gap instead of
+            // repeatedly classifying it as a fresh tail.
+            0.90
         } else {
             0.97
         }
@@ -4324,10 +4372,36 @@ fn should_learn_provider_prefix_family_state(
     if record.input_tokens < 1024 || record.cache_read_tokens == 0 {
         return false;
     }
+    if responses_family_can_learn_compact_tool_tail(record, tail_input_diagnostics) {
+        return true;
+    }
     if responses_tool_tail_burst(tail_input_diagnostics) {
         return false;
     }
     provider_cache_ratio(record).unwrap_or(0.0) >= 0.90
+}
+
+fn responses_family_can_learn_compact_tool_tail(
+    record: &UsageRecord,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if !matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("tool_output")
+    ) {
+        return false;
+    }
+    if tail_input_diagnostics.tool_output_chars == 0
+        || tail_input_diagnostics.tool_output_chars > 12_288
+        || tail_input_diagnostics.largest_tool_output_chars > 12_288
+    {
+        return false;
+    }
+    let shortfall = provider_cache_shortfall(record);
+    if shortfall == 0 || shortfall > 4096 || shortfall % 512 != 0 {
+        return false;
+    }
+    provider_cache_ratio(record).unwrap_or(0.0) >= 0.975
 }
 
 fn provider_prefix_calibrated_previous_seen_buckets(
@@ -16483,6 +16557,47 @@ mod tests {
     }
 
     #[test]
+    fn responses_long_idle_warm_prefix_gets_cold_read_guard() {
+        let mut state = prefix_state(126_139, 120_832, 3_584);
+        state.finished_at = Instant::now() - std::time::Duration::from_secs(44 * 60);
+        state.seen_bucket_tokens = 124_416;
+        state.seen_bucket_tokens_128 = 124_416;
+        state.cache_instability_score = 3;
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 1_682,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let wait = provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail);
+        let reason = provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &tail);
+
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
+        assert_eq!(
+            reason.as_deref(),
+            Some("responses_long_idle_warm_prefix_guard")
+        );
+    }
+
+    #[test]
+    fn responses_long_idle_warm_prefix_without_tail_does_not_wait() {
+        let mut state = prefix_state(126_139, 120_832, 3_584);
+        state.finished_at = Instant::now() - std::time::Duration::from_secs(44 * 60);
+        state.seen_bucket_tokens = 124_416;
+        state.seen_bucket_tokens_128 = 124_416;
+        state.cache_instability_score = 3;
+
+        let wait = provider_prefix_wait_duration_for_channel(
+            &Channel::Responses,
+            &state,
+            &TailInputDiagnostics::default(),
+        );
+
+        assert_eq!(wait, None);
+    }
+
+    #[test]
     fn responses_stale_small_tool_tail_does_not_get_large_tail_catchup() {
         let mut state = prefix_state(140_301, 139_264, 768);
         state.finished_at = Instant::now() - std::time::Duration::from_secs(45);
@@ -17443,6 +17558,94 @@ mod tests {
 
         fs::remove_dir_all(dir).ok();
     }
+
+    #[tokio::test]
+    async fn compact_aligned_10k_tool_tail_advances_sent_bucket_for_next_guard() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-10k-tool-tail-waterline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            provider: "bizd".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 118_701,
+            output_tokens: 10,
+            cache_read_tokens: 103_296,
+            cache_creation_tokens: 0,
+        };
+        let compact_tail = UsageRecord {
+            provider: "bizd".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 119_708,
+            output_tokens: 10,
+            cache_read_tokens: 109_056,
+            cache_creation_tokens: 0,
+        };
+        let next_same_waterline = UsageRecord {
+            provider: "bizd".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 120_433,
+            output_tokens: 10,
+            cache_read_tokens: 110_080,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            tool_output_chars: 2_873,
+            largest_tool_output_chars: 2_873,
+            tool_output_noise_hint: Some("path_like,hash_like".to_string()),
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        assert_eq!(provider_cache_shortfall(&compact_tail), 10_240);
+        assert!(provider_cache_ratio(&compact_tail).unwrap() >= 0.90);
+        assert!(should_learn_sent_provider_bucket(
+            state.prefix_states.lock().await.get("main-prefix"),
+            &compact_tail,
+            provider_cache_shortfall(&compact_tail),
+            provider_cache_shortfall_128(&compact_tail),
+            &tail,
+            false
+        ));
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&compact_tail),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(
+            kept.seen_bucket_tokens,
+            provider_cache_bucket_max(compact_tail.input_tokens)
+        );
+        drop(states);
+
+        let next_gap = provider_cache_gap_breakdown(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&next_same_waterline),
+            Some(&tail),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_gap.avoidable_tokens, 9_216);
+        assert_eq!(next_gap.new_tail_tokens, 1_024);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn large_low_hit_tool_tail_does_not_advance_sent_bucket() {
         let config = AppConfig::default();
@@ -17780,6 +17983,90 @@ mod tests {
         assert_eq!(
             gap.new_tail_tokens,
             provider_cache_bucket_max(sibling_cold.input_tokens)
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn compact_tool_tail_can_refresh_family_waterline_for_sibling_guard() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-compact-tool-tail-family-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let exact_key = "share\0gpt-5.5\0responses\0session-anchor-a";
+        let sibling_key = "share\0gpt-5.5\0responses\0session-anchor-b";
+        let family_key = "prefix-family\0share\0gpt-5.5\0responses\0scope-stable";
+        let warm = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 136_931,
+            output_tokens: 10,
+            cache_read_tokens: 135_680,
+            cache_creation_tokens: 0,
+        };
+        let compact_tail = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 140_175,
+            output_tokens: 10,
+            cache_read_tokens: 136_704,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            tool_output_chars: 10_839,
+            largest_tool_output_chars: 10_839,
+            tool_output_noise_hint: Some("path_like".to_string()),
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some(exact_key),
+            Some(family_key),
+            Some(&warm),
+            &TailInputDiagnostics::default(),
+            false,
+            false,
+        )
+        .await;
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some(exact_key),
+            Some(family_key),
+            Some(&compact_tail),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let family = states.get(family_key).unwrap();
+        assert_eq!(
+            family.seen_bucket_tokens,
+            provider_cache_bucket_max(compact_tail.input_tokens)
+        );
+        drop(states);
+
+        let wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(sibling_key),
+            Some(family_key),
+            &tail,
+            None,
+        )
+        .await;
+        assert_eq!(wait.source.as_deref(), Some("session-sibling"));
+        assert_eq!(
+            wait.wait_ms,
+            responses_foreground_wait_cap().as_millis() as u64
         );
 
         fs::remove_dir_all(dir).ok();
