@@ -1955,10 +1955,17 @@ async fn handle_generation(
                 &error_summary,
             )
             .await;
-            if let Some(compat) = strip_previous_response_id_for_compat(
+            if let Some(compat) = maybe_prepare_previous_response_compat_body(
+                &state,
                 &active_upstream_body,
-                "client_previous_response_id_unsupported_retry",
-            ) {
+            )
+            .await
+            .or_else(|| {
+                strip_previous_response_id_for_compat(
+                    &active_upstream_body,
+                    "client_previous_response_id_unsupported_retry",
+                )
+            }) {
                 if !error_summary.is_empty() {
                     state
                         .metrics
@@ -2952,7 +2959,7 @@ fn responses_medium_tool_tail_carryover_guard(
 fn responses_minimum_avoidable_request_wait(
     channel: &Channel,
     state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
+    _current_tail: &TailInputDiagnostics,
 ) -> TokioDuration {
     if !matches!(channel, Channel::Responses) {
         return TokioDuration::ZERO;
@@ -2964,28 +2971,8 @@ fn responses_minimum_avoidable_request_wait(
         return TokioDuration::ZERO;
     }
 
-    let mixed_tool_tail = current_tail.tool_call_chars >= 4096
-        || (current_tail.tool_output_chars > 0 && current_tail.message_chars >= 512);
-    if avoidable >= 8192 || (avoidable >= 4096 && mixed_tool_tail) {
+    if avoidable > 0 {
         return responses_foreground_wait_cap();
-    }
-    if avoidable >= 4096 {
-        return responses_foreground_wait_cap();
-    }
-    if avoidable >= 2048 || (avoidable >= 1024 && mixed_tool_tail) {
-        return responses_foreground_wait_cap();
-    }
-    if avoidable >= 1024 {
-        return TokioDuration::from_secs(3);
-    }
-    if avoidable >= 512 && state.avoidable_shortfall_streak >= 3 {
-        return responses_foreground_wait_cap();
-    }
-    if avoidable >= 512 && state.avoidable_shortfall_streak >= 2 {
-        return TokioDuration::from_secs(3);
-    }
-    if avoidable >= 512 {
-        return TokioDuration::from_secs(2);
     }
     TokioDuration::ZERO
 }
@@ -5288,6 +5275,13 @@ async fn maybe_prepare_previous_response_compat_body(
                 "client_previous_response_id_self_contained_session",
             );
         }
+        if let Some(expanded) = expand_previous_response_id_for_compat(
+            request,
+            &previous_input,
+            "client_previous_response_id_expanded_from_local_session",
+        ) {
+            return Some(expanded);
+        }
     }
 
     if response_input_looks_self_contained_without_previous_response_id(current_input) {
@@ -5322,6 +5316,37 @@ fn strip_previous_response_id_for_compat(
     let mut body = request.clone();
     let object = body.as_object_mut()?;
     object.remove("previous_response_id")?;
+    Some(PreviousResponseCompatBody { body, reason })
+}
+
+fn expand_previous_response_id_for_compat(
+    request: &Value,
+    previous_input: &Value,
+    reason: &'static str,
+) -> Option<PreviousResponseCompatBody> {
+    let mut body = request.clone();
+    let object = body.as_object_mut()?;
+    object.remove("previous_response_id")?;
+    let current_input = object.get("input")?;
+    let (Value::Array(previous_items), Value::Array(current_items)) =
+        (previous_input, current_input)
+    else {
+        return None;
+    };
+    if previous_items.is_empty() || current_items.is_empty() {
+        return None;
+    }
+    if current_items.len() >= previous_items.len()
+        && previous_items
+            .iter()
+            .zip(current_items.iter())
+            .all(|(previous, current)| previous == current)
+    {
+        return Some(PreviousResponseCompatBody { body, reason });
+    }
+    let mut expanded = previous_items.clone();
+    expanded.extend(current_items.iter().cloned());
+    object.insert("input".to_string(), Value::Array(expanded));
     Some(PreviousResponseCompatBody { body, reason })
 }
 
@@ -15585,7 +15610,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_current_small_tool_output_uses_light_avoidable_wait_floor() {
+    fn responses_current_small_tool_output_uses_full_avoidable_wait_floor() {
         let mut stable_gap = prefix_state(38_724, 37_888, 512);
         stable_gap.avoidable_shortfall_tokens = 512;
         stable_gap.avoidable_shortfall_tokens_128 = 512;
@@ -15601,7 +15626,7 @@ mod tests {
 
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            TokioDuration::from_secs(2)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -15819,14 +15844,14 @@ mod tests {
     }
 
     #[test]
-    fn responses_prefix_settle_delay_caps_small_avoidable_gaps_to_protect_ttft() {
+    fn responses_prefix_settle_delay_guards_all_avoidable_gaps_with_short_cap() {
         let mut tiny = prefix_state(124_609, 123_904, 512);
         tiny.avoidable_shortfall_tokens = 512;
         tiny.avoidable_shortfall_tokens_128 = 512;
         tiny.avoidable_shortfall_streak = 1;
         assert_eq!(
             responses_provider_prefix_settle_delay(&tiny),
-            TokioDuration::from_secs(2)
+            responses_foreground_wait_cap()
         );
 
         let mut one_k = prefix_state(124_609, 123_392, 1_024);
@@ -15851,10 +15876,10 @@ mod tests {
     #[test]
     fn responses_prefix_settle_delay_guards_avoidable_gap_sizes_without_unbounded_wait() {
         for (gap, expected) in [
-            (128, TokioDuration::from_millis(500)),
-            (512, TokioDuration::from_secs(2)),
-            (1024, TokioDuration::from_secs(3)),
-            (1536, TokioDuration::from_secs(3)),
+            (128, responses_foreground_wait_cap()),
+            (512, responses_foreground_wait_cap()),
+            (1024, responses_foreground_wait_cap()),
+            (1536, responses_foreground_wait_cap()),
             (2560, responses_foreground_wait_cap()),
             (4608, responses_foreground_wait_cap()),
             (9728, responses_foreground_wait_cap()),
@@ -19347,6 +19372,46 @@ mod tests {
             response_session_rejection_classification(422, "invalid request"),
             ResponseSessionRejectionClass::TransientInvalid
         );
+    }
+
+    #[test]
+    fn previous_response_unsupported_retry_body_can_expand_from_local_session() {
+        let request = json!({
+            "model": "gpt-test",
+            "previous_response_id": "resp_client_supplied",
+            "input": [
+                {
+                    "role": "user",
+                    "content": "continue"
+                }
+            ]
+        });
+        let previous_input = json!([
+            {
+                "role": "system",
+                "content": "stable instructions"
+            },
+            {
+                "role": "user",
+                "content": "original task"
+            }
+        ]);
+
+        let compat = expand_previous_response_id_for_compat(
+            &request,
+            &previous_input,
+            "client_previous_response_id_expanded_from_local_session",
+        )
+        .unwrap();
+
+        assert_eq!(
+            compat.reason,
+            "client_previous_response_id_expanded_from_local_session"
+        );
+        assert!(compat.body.get("previous_response_id").is_none());
+        assert_eq!(compat.body["input"].as_array().unwrap().len(), 3);
+        assert_eq!(compat.body["input"][0], previous_input[0]);
+        assert_eq!(compat.body["input"][2], request["input"][0]);
     }
 
     #[test]

@@ -1751,10 +1751,10 @@ button:disabled {
 .request-row {
   display: grid;
   grid-template-columns:
-    minmax(180px, 0.82fr)
-    minmax(150px, 0.55fr)
-    minmax(250px, 1fr)
-    minmax(280px, 1.08fr);
+    minmax(160px, 0.72fr)
+    minmax(142px, 0.48fr)
+    minmax(238px, 0.9fr)
+    minmax(360px, 1.24fr);
   align-items: center;
   justify-content: stretch;
   min-height: 66px;
@@ -1906,6 +1906,7 @@ button:disabled {
   gap: 5px;
   min-width: 0;
   text-align: right;
+  align-content: center;
 }
 
 .request-row b {
@@ -1925,7 +1926,9 @@ button:disabled {
   font-size: 12px;
   text-align: right;
   white-space: normal;
+  overflow: visible;
   overflow-wrap: anywhere;
+  word-break: keep-all;
   line-height: 1.35;
   max-width: 100%;
 }
@@ -2060,10 +2063,10 @@ button:disabled {
 
   .request-row {
     grid-template-columns:
-      minmax(132px, 0.78fr)
-      minmax(120px, 0.56fr)
-      minmax(164px, 0.82fr)
-      minmax(168px, 0.84fr);
+      minmax(118px, 0.62fr)
+      minmax(106px, 0.44fr)
+      minmax(150px, 0.68fr)
+      minmax(248px, 1.12fr);
     gap: 8px 10px;
     padding: 10px 12px;
   }
@@ -2125,9 +2128,10 @@ button:disabled {
   .request-row small {
     font-size: 11px;
     text-align: right;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    line-height: 1.32;
   }
 }
 
