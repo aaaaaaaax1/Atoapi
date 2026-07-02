@@ -121,8 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.58";
+const appVersion = "v0.1.59";
 const appVersionNotes = [
+  "v0.1.59: 修复 Responses session-delta WebSocket v2 能力识别；上游提示 previous_response_id 仅支持 WebSocket v2 时，直接进入 unsupported 长冷却，不再反复短冷却重试。",
+  "v0.1.59: 以 v0.1.56 严格 session-delta 为命中率基线，保留零额外请求、不热补、不长等待的成本底线。",
+  "v0.1.59: 合并 v0.1.58 后续 UI 修复：缓存策略区不再被压成窄列，请求记录恢复稳定四列布局。",
   "v0.1.58: session-delta 临时失败冷却缩短为 30 秒/2 分钟/5 分钟，previous_response_not_found 等短故障不会把命中线路长时间打冷。",
   "v0.1.58: 仅把真正 unsupported 的 Responses session-delta 冷却持久化；普通临时失败重启后不再污染可用会话。",
   "v0.1.58: 请求记录列表改为自动换行条目布局，避免缩小窗口重叠和全屏横向滚动。",

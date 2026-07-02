@@ -2528,6 +2528,8 @@ fn response_session_rejection_classification(
         || (summary.contains("previous_response_id")
             && (summary.contains("unsupported")
                 || summary.contains("not supported")
+                || summary.contains("only supported")
+                || summary.contains("websocket")
                 || summary.contains("invalid parameter")))
     {
         return ResponseSessionRejectionClass::Unsupported;
@@ -3975,11 +3977,14 @@ async fn update_provider_prefix_state_with_tail(
     let prefix_break_after_warm_state =
         provider_prefix_break_after_warm_state(previous.as_ref(), record)
             && (record.input_tokens >= 32_000 || responses_tool_tail_burst(tail_input_diagnostics));
-    if prefix_break_after_warm_state {
+    let weak_full_retry_after_session_delta =
+        provider_prefix_weak_full_retry_after_session_delta(previous.as_ref(), record, retried_full_response);
+    if prefix_break_after_warm_state || weak_full_retry_after_session_delta {
         let mut preserved = previous.clone().unwrap();
         preserved.finished_at = now;
+        let instability_bump = if prefix_break_after_warm_state { 2 } else { 1 };
         preserved.cache_instability_score =
-            preserved.cache_instability_score.saturating_add(2).min(8);
+            preserved.cache_instability_score.saturating_add(instability_bump).min(8);
         preserved.shortfall_tokens = provider_cache_shortfall(record);
         preserved.shortfall_tokens_128 = provider_cache_shortfall_128(record);
         preserved.avoidable_shortfall_tokens = 0;
@@ -4483,6 +4488,34 @@ fn provider_prefix_break_after_warm_state(
     }
     let ratio = provider_cache_ratio(record).unwrap_or_default();
     ratio < 0.50 && record.cache_read_tokens.saturating_mul(2) < previous_seen
+}
+
+fn provider_prefix_weak_full_retry_after_session_delta(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    retried_full_response: bool,
+) -> bool {
+    if !retried_full_response {
+        return false;
+    }
+    let Some(previous) = previous else {
+        return false;
+    };
+    if previous.cache_read_tokens < 32_000
+        || record.input_tokens < 32_000
+        || record.cache_read_tokens == 0
+    {
+        return false;
+    }
+    if record.cache_read_tokens.saturating_add(4096) >= previous.cache_read_tokens {
+        return false;
+    }
+    let current_bucket = provider_cache_bucket_max(record.input_tokens);
+    let previous_seen = provider_prefix_raw_seen_bucket(previous);
+    if current_bucket.saturating_add(16_384) < previous_seen {
+        return false;
+    }
+    provider_cache_ratio(record).unwrap_or_default() < 0.96
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18270,6 +18303,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weak_full_retry_after_session_delta_does_not_lower_warm_prefix_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-weak-full-retry-waterline-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let warm = UsageRecord {
+            input_tokens: 107_000,
+            cache_read_tokens: 95_360,
+            ..UsageRecord::default()
+        };
+        let weak_retry = UsageRecord {
+            input_tokens: 107_256,
+            cache_read_tokens: 86_400,
+            ..UsageRecord::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&weak_retry), false, true)
+            .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(kept.cache_read_tokens, warm.cache_read_tokens);
+        assert_eq!(kept.seen_bucket_tokens, warm.cache_read_tokens);
+        assert_eq!(kept.shortfall_tokens, provider_cache_shortfall(&weak_retry));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn response_session_delta_usage_does_not_lower_prefix_state() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -18677,6 +18747,13 @@ mod tests {
             ResponseSessionRejectionClass::Unsupported
         );
         assert_eq!(
+            response_session_rejection_classification(
+                400,
+                "previous_response_id is only supported on Responses WebSocket v2"
+            ),
+            ResponseSessionRejectionClass::Unsupported
+        );
+        assert_eq!(
             response_session_rejection_classification(422, "invalid request"),
             ResponseSessionRejectionClass::TransientInvalid
         );
@@ -18714,6 +18791,21 @@ mod tests {
         .await;
         assert_eq!(
             response_session_cooldown_skip_reason(&state, Some(key))
+                .await
+                .as_deref(),
+            Some("provider_session_delta_unsupported")
+        );
+
+        let websocket_only_key = "responses:bizd:gpt-5.5:websocket-only";
+        note_response_session_error_cooldown_for_rejection(
+            &state,
+            Some(websocket_only_key),
+            400,
+            "previous_response_id is only supported on Responses WebSocket v2",
+        )
+        .await;
+        assert_eq!(
+            response_session_cooldown_skip_reason(&state, Some(websocket_only_key))
                 .await
                 .as_deref(),
             Some("provider_session_delta_unsupported")
