@@ -2856,7 +2856,11 @@ function CachePanel({
                   </div>
                   <div className="request-cache-result">
                     <b>{request.cache_status}{cacheDisplay.primary ? ` · ${cacheDisplay.primary}` : ""}</b>
-                    {cacheDisplay.secondary ? <small title={cacheDisplay.secondary}>{cacheDisplay.secondary}</small> : null}
+                    {cacheDisplay.secondary ? (
+                      <small title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>
+                        {cacheDisplay.secondary}
+                      </small>
+                    ) : null}
                   </div>
                 </div>
               );
@@ -3166,9 +3170,11 @@ function providerBucketDisplay(
   if (!inputTokens) return { primary: "", secondary: "" };
   const tokenSummary = `${formatCompactTokens(cachedTokens)} / ${formatCompactTokens(inputTokens)}`;
   if (!cachedTokens) {
+    const gapText = shortfallTokens ? ` · 缺口 ${formatCompactTokens(shortfallTokens)}` : "";
     return {
       primary: "冷启动",
-      secondary: `${tokenSummary}${shortfallTokens ? ` · 缺口 ${formatCompactTokens(shortfallTokens)}` : ""}`
+      secondary: `${tokenSummary}${gapText}`,
+      secondaryTitle: `${tokenSummary}${gapText}`
     };
   }
   const bucketMax = Math.floor(inputTokens / 512) * 512;
@@ -3178,38 +3184,54 @@ function providerBucketDisplay(
   if (bucketMax > 0 && bucketGap === 0) {
     return {
       primary,
-      secondary: `${tokenSummary} · 满桶`
+      secondary: `${tokenSummary} · 满桶`,
+      secondaryTitle: `${tokenSummary} · 满桶`
     };
   }
+  const gapDisplay = providerGapDisplay(
+    tokenSummary,
+    shortfallTokens || bucketGap,
+    newTailGapTokens,
+    avoidableGapTokens
+  );
   return {
     primary,
-    secondary: providerGapLabel(
-      tokenSummary,
-      shortfallTokens || bucketGap,
-      newTailGapTokens,
-      avoidableGapTokens
-    )
+    secondary: gapDisplay.compact,
+    secondaryTitle: gapDisplay.full
   };
 }
 
-function providerGapLabel(
+function providerGapDisplay(
   tokenSummary: string,
   totalGapTokens: number,
   newTailGapTokens: number,
   avoidableGapTokens: number
 ) {
+  const total = formatCompactTokens(totalGapTokens);
+  const avoidable = formatCompactTokens(avoidableGapTokens);
+  const newTail = formatCompactTokens(newTailGapTokens);
   if (avoidableGapTokens > 0 && newTailGapTokens > 0) {
-    return `${tokenSummary} · 总缺口 ${formatCompactTokens(totalGapTokens)}（可避免 ${formatCompactTokens(
-      avoidableGapTokens
-    )} / 新尾巴 ${formatCompactTokens(newTailGapTokens)}）`;
+    return {
+      compact: `${tokenSummary} · 缺 ${total} · 可 ${avoidable} · 新 ${newTail}`,
+      full: `${tokenSummary} · 总缺口 ${total}（可避免 ${avoidable} / 新尾巴 ${newTail}）`
+    };
   }
   if (avoidableGapTokens > 0) {
-    return `${tokenSummary} · 可避免缺口 ${formatCompactTokens(avoidableGapTokens)}`;
+    return {
+      compact: `${tokenSummary} · 可 ${avoidable}`,
+      full: `${tokenSummary} · 可避免缺口 ${avoidable}`
+    };
   }
   if (newTailGapTokens > 0) {
-    return `${tokenSummary} · 新尾巴 ${formatCompactTokens(newTailGapTokens)}`;
+    return {
+      compact: `${tokenSummary} · 新 ${newTail}`,
+      full: `${tokenSummary} · 新尾巴 ${newTail}`
+    };
   }
-  return `${tokenSummary} · 缺口 ${formatCompactTokens(totalGapTokens)}`;
+  return {
+    compact: `${tokenSummary} · 缺 ${total}`,
+    full: `${tokenSummary} · 缺口 ${total}`
+  };
 }
 
 function channelLabel(channel: Channel) {

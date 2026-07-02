@@ -13,7 +13,13 @@ use flate2::{write::GzEncoder, Compression};
 use futures_util::StreamExt;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, convert::Infallible, io::Write, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    io::Write,
+    sync::Arc,
+    time::Instant,
+};
 use tokio::time::{sleep, Duration as TokioDuration};
 use uuid::Uuid;
 
@@ -270,6 +276,12 @@ struct SessionAnchorDiagnostics {
 struct ResponseSessionReuseOutcome {
     body: Value,
     diagnostics: ResponseSessionReuseDiagnostics,
+}
+
+#[derive(Debug, Clone)]
+struct PreviousResponseCompatBody {
+    body: Value,
+    reason: &'static str,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1248,8 +1260,20 @@ async fn handle_generation(
             .await
             {
                 diagnostics.cooldown_active = true;
-                diagnostics.skip_reason = Some(cooldown_skip_reason);
-                (upstream_body.clone(), diagnostics)
+                if cooldown_skip_reason == "provider_session_delta_unsupported" {
+                    if let Some(compat) =
+                        maybe_prepare_previous_response_compat_body(&state, &upstream_body).await
+                    {
+                        diagnostics.skip_reason = Some(compat.reason.to_string());
+                        (compat.body, diagnostics)
+                    } else {
+                        diagnostics.skip_reason = Some(cooldown_skip_reason);
+                        (upstream_body.clone(), diagnostics)
+                    }
+                } else {
+                    diagnostics.skip_reason = Some(cooldown_skip_reason);
+                    (upstream_body.clone(), diagnostics)
+                }
             } else if should_attempt_main_response_session_delta(
                 &config,
                 &decision,
@@ -1895,7 +1919,7 @@ async fn handle_generation(
         .await;
     }
 
-    let body_read = match read_upstream_body_with_diagnostics(
+    let mut body_read = match read_upstream_body_with_diagnostics(
         upstream,
         &content_type,
         started,
@@ -1915,7 +1939,106 @@ async fn handle_generation(
             );
         }
     };
-    let bytes = body_read.bytes;
+    let mut bytes = body_read.bytes;
+    if !is_success_status
+        && matches!(active_request_channel, Channel::Responses)
+        && active_upstream_body.get("previous_response_id").is_some()
+    {
+        let error_summary = upstream_error_summary(&bytes);
+        if response_session_rejection_classification(status, &error_summary)
+            == ResponseSessionRejectionClass::Unsupported
+        {
+            note_response_session_error_cooldown_for_rejection(
+                &state,
+                response_session_cooldown_key.as_deref(),
+                status,
+                &error_summary,
+            )
+            .await;
+            if let Some(compat) = strip_previous_response_id_for_compat(
+                &active_upstream_body,
+                "client_previous_response_id_unsupported_retry",
+            ) {
+                if !error_summary.is_empty() {
+                    state
+                        .metrics
+                        .record_error("client_previous_response_id_unsupported", &error_summary)
+                        .await;
+                }
+                state.metrics.record_retry().await;
+                response_session_reuse_diagnostics.rejected_status = Some(status);
+                response_session_reuse_diagnostics.skip_reason = Some(compat.reason.to_string());
+                active_upstream_body = compat.body;
+                apply_responses_non_stream_upstream_sse_compat(
+                    &mut active_upstream_body,
+                    responses_non_stream_upstream_sse_compat,
+                );
+                active_used_response_session = false;
+                diagnostics.send_body_bytes =
+                    serialized_body_len(&active_request_channel, &active_upstream_body);
+                diagnostics.send_body_is_delta = false;
+
+                let send_outcome = match send_main_upstream_request(
+                    &state,
+                    &active_url,
+                    &api_key,
+                    &active_request_channel,
+                    &active_upstream_body,
+                    skip_prefix_guard_for_sync_responses,
+                    decision.provider.request_body_gzip_enabled,
+                    !client_requested_stream,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        state
+                            .metrics
+                            .record_error("upstream_transport", &err.to_string())
+                            .await;
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("upstream request failed: {err}"),
+                        );
+                    }
+                };
+                upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+                upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+                status = send_outcome.response.status().as_u16();
+                content_type = send_outcome
+                    .response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                is_success_status = StatusCode::from_u16(status)
+                    .map(|status| status.is_success())
+                    .unwrap_or(false);
+                body_read = match read_upstream_body_with_diagnostics(
+                    send_outcome.response,
+                    &content_type,
+                    started,
+                    upstream_response_headers_at_ms,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        state
+                            .metrics
+                            .record_error("upstream_body", &err.to_string())
+                            .await;
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("failed to read upstream body: {err}"),
+                        );
+                    }
+                };
+                bytes = body_read.bytes;
+            }
+        }
+    }
     let bytes_for_client = if matches!(client_channel, Channel::Responses)
         && !client_requested_stream
         && is_text_event_stream(&content_type)
@@ -1965,7 +2088,7 @@ async fn handle_generation(
     } else {
         None
     };
-    if is_success_status && !sync_compact_diagnostic_only {
+    if is_success_status && matches!(active_request_channel, Channel::Responses) {
         update_response_session(
             &state,
             response_session_key.as_deref(),
@@ -2776,7 +2899,7 @@ fn responses_minimum_new_tail_request_wait(
     }
 
     let small_bucket_tail =
-        observed_bucket_shortfall <= 2048 && observed_bucket_shortfall % 512 == 0;
+        observed_bucket_shortfall <= 2048 && observed_bucket_shortfall % 128 == 0;
     let noisy_or_tool_tail = current_tail.message_chars > 0
         || current_tail.tool_output_chars >= 512
         || state.tail_tool_output_chars >= 512
@@ -2888,6 +3011,9 @@ fn responses_stale_prefix_recovery_wait(
         return None;
     }
     if responses_long_idle_warm_prefix_guard(state, current_tail, elapsed) {
+        return Some(responses_foreground_wait_cap());
+    }
+    if responses_idle_warm_tail_guard(state, current_tail, elapsed) {
         return Some(responses_foreground_wait_cap());
     }
     if elapsed > std::time::Duration::from_secs(20 * 60) {
@@ -3019,6 +3145,37 @@ fn responses_long_idle_warm_prefix_guard(
     }
     let previous_gap = state.shortfall_tokens_128.max(state.shortfall_tokens);
     previous_gap > 0 || state.cache_instability_score > 0 || state.small_gap_recovery_streak > 0
+}
+
+fn responses_idle_warm_tail_guard(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    elapsed: std::time::Duration,
+) -> bool {
+    if elapsed < std::time::Duration::from_secs(3 * 60)
+        || elapsed > std::time::Duration::from_secs(20 * 60)
+    {
+        return false;
+    }
+    if state.input_tokens < 64_000 || state.cache_read_tokens < 64_000 {
+        return false;
+    }
+    let seen_bucket = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
+    if seen_bucket < 64_000 {
+        return false;
+    }
+    let previous_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
+    if previous_shortfall > 1024 {
+        return false;
+    }
+    let previous_ratio = state.cache_read_tokens as f64 / state.input_tokens.max(1) as f64;
+    if previous_ratio < 0.98 {
+        return false;
+    }
+    current_tail.message_chars >= 128
+        || current_tail.tool_output_chars > 0
+        || current_tail.tool_call_chars > 0
+        || current_tail.input_items > 0
 }
 
 fn responses_stale_medium_tool_tail_probe(
@@ -3271,6 +3428,12 @@ fn provider_prefix_wait_reason_for_channel(
                 state.finished_at.elapsed(),
             ) {
                 Some("responses_long_idle_warm_prefix_guard".to_string())
+            } else if responses_idle_warm_tail_guard(
+                state,
+                current_tail,
+                state.finished_at.elapsed(),
+            ) {
+                Some("responses_idle_warm_tail_guard".to_string())
             } else if responses_current_tool_output_cap_applies(state, current_tail) {
                 Some("responses_current_tool_output_tail_cap".to_string())
             } else if avoidable > 0 {
@@ -4274,7 +4437,9 @@ fn responses_precise_tool_tail_can_learn_sent_bucket(
     {
         return false;
     }
-    if current_shortfall < 512 || current_shortfall > 12_288 || current_shortfall % 512 != 0 {
+    let aligned_tail_gap = current_shortfall % 512 == 0
+        || (current_shortfall <= 2048 && current_shortfall_128 % 128 == 0);
+    if current_shortfall < 128 || current_shortfall > 12_288 || !aligned_tail_gap {
         return false;
     }
     if current_shortfall_128 > current_shortfall.saturating_add(512) {
@@ -4302,13 +4467,16 @@ fn responses_precise_tool_tail_required_ratio(
     tail_input_diagnostics: &TailInputDiagnostics,
 ) -> f64 {
     let aligned_512 = current_shortfall >= 512 && current_shortfall % 512 == 0;
+    let aligned_128_small = current_shortfall < 2048 && current_shortfall % 128 == 0;
     let tool_only = matches!(
         tail_input_diagnostics.source.as_deref(),
         Some("tool_output")
     );
     let compact_tool_tail = tail_input_diagnostics.tool_output_chars <= 16_384
         && tail_input_diagnostics.largest_tool_output_chars <= 14_336;
-    if aligned_512 && tool_only && compact_tool_tail {
+    if aligned_128_small && tool_only && compact_tool_tail {
+        0.99
+    } else if aligned_512 && tool_only && compact_tool_tail {
         if current_shortfall <= 2048 {
             0.965
         } else if current_shortfall <= 4096 {
@@ -5097,6 +5265,141 @@ async fn clear_response_session_reference(
 fn previous_response_id_from_request(request: &Value) -> Option<String> {
     request
         .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+async fn maybe_prepare_previous_response_compat_body(
+    state: &AppState,
+    request: &Value,
+) -> Option<PreviousResponseCompatBody> {
+    let previous_response_id = previous_response_id_from_request(request)?;
+    let current_input = request.get("input")?;
+    if previous_response_id.trim().is_empty() {
+        return None;
+    }
+
+    if let Some(previous_input) =
+        response_session_input_for_response_id(state, &previous_response_id).await
+    {
+        if response_input_can_stand_alone_with_previous_session(&previous_input, current_input) {
+            return strip_previous_response_id_for_compat(
+                request,
+                "client_previous_response_id_self_contained_session",
+            );
+        }
+    }
+
+    if response_input_looks_self_contained_without_previous_response_id(current_input) {
+        return strip_previous_response_id_for_compat(
+            request,
+            "client_previous_response_id_self_contained_input",
+        );
+    }
+
+    None
+}
+
+async fn response_session_input_for_response_id(
+    state: &AppState,
+    response_id: &str,
+) -> Option<Value> {
+    let sessions = state.response_sessions.lock().await;
+    sessions
+        .values()
+        .filter(|session| {
+            session.response_id == response_id
+                && session.finished_at.elapsed() <= std::time::Duration::from_secs(1800)
+        })
+        .max_by_key(|session| response_input_item_count(&session.input))
+        .map(|session| session.input.clone())
+}
+
+fn strip_previous_response_id_for_compat(
+    request: &Value,
+    reason: &'static str,
+) -> Option<PreviousResponseCompatBody> {
+    let mut body = request.clone();
+    let object = body.as_object_mut()?;
+    object.remove("previous_response_id")?;
+    Some(PreviousResponseCompatBody { body, reason })
+}
+
+fn response_input_can_stand_alone_with_previous_session(
+    previous_input: &Value,
+    current_input: &Value,
+) -> bool {
+    let (Some(previous_items), Some(current_items)) =
+        (previous_input.as_array(), current_input.as_array())
+    else {
+        return false;
+    };
+    response_input_essential_prefix_matches(previous_items, current_items)
+        && response_input_items_have_self_contained_context(current_items)
+}
+
+fn response_input_looks_self_contained_without_previous_response_id(input: &Value) -> bool {
+    input
+        .as_array()
+        .is_some_and(|items| response_input_items_have_self_contained_context(items))
+}
+
+fn response_input_items_have_self_contained_context(items: &[Value]) -> bool {
+    if items.is_empty() {
+        return false;
+    }
+
+    let call_ids = items
+        .iter()
+        .filter(|item| response_input_item_is_call(item))
+        .filter_map(response_input_item_call_id)
+        .collect::<HashSet<_>>();
+    let mut has_prior_output_context = false;
+
+    for item in items {
+        if response_input_item_is_assistant_context(item) || response_input_item_is_call(item) {
+            has_prior_output_context = true;
+        }
+        if response_input_item_is_call_output(item) {
+            let Some(call_id) = response_input_item_call_id(item) else {
+                return false;
+            };
+            if !call_ids.contains(&call_id) {
+                return false;
+            }
+            has_prior_output_context = true;
+        }
+    }
+
+    has_prior_output_context
+}
+
+fn response_input_item_is_assistant_context(item: &Value) -> bool {
+    item.as_object()
+        .and_then(|object| object.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| matches!(role, "assistant" | "model"))
+}
+
+fn response_input_item_is_call(item: &Value) -> bool {
+    response_input_item_type(item).is_some_and(|item_type| {
+        item_type.ends_with("_call") && !item_type.ends_with("_call_output")
+    })
+}
+
+fn response_input_item_is_call_output(item: &Value) -> bool {
+    response_input_item_type(item).is_some_and(|item_type| item_type.ends_with("_call_output"))
+}
+
+fn response_input_item_type(item: &Value) -> Option<&str> {
+    item.as_object()
+        .and_then(|object| object.get("type"))
+        .and_then(Value::as_str)
+}
+
+fn response_input_item_call_id(item: &Value) -> Option<String> {
+    item.as_object()
+        .and_then(|object| object.get("call_id").or_else(|| object.get("id")))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -19043,6 +19346,37 @@ mod tests {
         assert_eq!(
             response_session_rejection_classification(422, "invalid request"),
             ResponseSessionRejectionClass::TransientInvalid
+        );
+    }
+
+    #[test]
+    fn previous_response_unsupported_retry_body_removes_previous_response_id() {
+        let request = json!({
+            "model": "gpt-test",
+            "previous_response_id": "resp_client_supplied",
+            "input": [
+                {
+                    "role": "user",
+                    "content": "continue"
+                }
+            ]
+        });
+
+        let compat = strip_previous_response_id_for_compat(
+            &request,
+            "client_previous_response_id_unsupported_retry",
+        )
+        .unwrap();
+
+        assert_eq!(
+            compat.reason,
+            "client_previous_response_id_unsupported_retry"
+        );
+        assert!(compat.body.get("previous_response_id").is_none());
+        assert_eq!(compat.body["input"], request["input"]);
+        assert_eq!(
+            request["previous_response_id"],
+            json!("resp_client_supplied")
         );
     }
 
