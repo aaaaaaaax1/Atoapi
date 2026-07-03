@@ -3030,9 +3030,6 @@ fn responses_stale_prefix_recovery_wait(
     if responses_idle_warm_tail_guard(state, current_tail, elapsed) {
         return Some(responses_foreground_wait_cap());
     }
-    if elapsed > std::time::Duration::from_secs(20 * 60) {
-        return None;
-    }
 
     let avoidable = state
         .avoidable_shortfall_tokens_128
@@ -3045,6 +3042,12 @@ fn responses_stale_prefix_recovery_wait(
             || observed_shortfall > 0
             || current_tail.tool_output_chars > 0
             || current_tail.message_chars > 0);
+    if avoidable == 0 && responses_stale_current_tail_guard(state, current_tail, elapsed) {
+        return Some(responses_foreground_wait_cap());
+    }
+    if elapsed > std::time::Duration::from_secs(20 * 60) {
+        return None;
+    }
 
     if state.input_tokens < 16_000 {
         let early_large_tool_tail = current_tail.tool_output_chars >= 8_000
@@ -3159,6 +3162,23 @@ fn responses_long_idle_warm_prefix_guard(
     }
     let previous_gap = state.shortfall_tokens_128.max(state.shortfall_tokens);
     previous_gap > 0 || state.cache_instability_score > 0 || state.small_gap_recovery_streak > 0
+}
+
+fn responses_stale_current_tail_guard(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    elapsed: std::time::Duration,
+) -> bool {
+    if state.input_tokens < 8_000 || state.cache_read_tokens == 0 {
+        return false;
+    }
+    if elapsed > std::time::Duration::from_secs(6 * 60 * 60) {
+        return false;
+    }
+    current_tail.message_chars >= 512
+        || current_tail.tool_output_chars > 0
+        || current_tail.tool_call_chars > 0
+        || (current_tail.input_items >= 2 && current_tail.message_chars >= 128)
 }
 
 fn responses_idle_warm_tail_guard(
@@ -3293,7 +3313,7 @@ fn should_fallback_responses_sync_main_to_chat_compat(
     sync_main: bool,
     already_chat_compat: bool,
 ) -> bool {
-    sync_main && !already_chat_compat && matches!(status, 400 | 401 | 405 | 501)
+    sync_main && !already_chat_compat && matches!(status, 400 | 401 | 405 | 501 | 520)
 }
 
 fn should_fallback_chat_compat_compact_to_responses(
@@ -3301,7 +3321,7 @@ fn should_fallback_chat_compat_compact_to_responses(
     sync_main: bool,
     active_chat_compat: bool,
 ) -> bool {
-    sync_main && active_chat_compat && matches!(status, 429 | 500 | 502 | 503 | 504 | 524)
+    sync_main && active_chat_compat && matches!(status, 429 | 500 | 502 | 503 | 504 | 520 | 524)
 }
 
 fn apply_responses_non_stream_upstream_sse_compat(body: &mut Value, enabled: bool) {
@@ -3478,6 +3498,12 @@ fn provider_prefix_wait_reason_for_channel(
                 observed_shortfall,
             ) {
                 Some("responses_all_stage_tail_guard".to_string())
+            } else if responses_stale_current_tail_guard(
+                state,
+                current_tail,
+                state.finished_at.elapsed(),
+            ) {
+                Some("responses_stale_current_tail_guard".to_string())
             } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
                 Some("responses_current_tail_guard".to_string())
             } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
@@ -4415,6 +4441,15 @@ fn should_learn_sent_provider_bucket(
     ) {
         return true;
     }
+    if responses_medium_message_tail_can_learn_sent_bucket(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+    ) {
+        return true;
+    }
     if responses_all_stage_tail_can_learn_sent_bucket(
         previous,
         record,
@@ -4446,6 +4481,48 @@ fn should_learn_sent_provider_bucket(
         return false;
     }
     true
+}
+
+fn responses_medium_message_tail_can_learn_sent_bucket(
+    previous: &PrefixWarmState,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if current_shortfall < 512 || current_shortfall > 8192 {
+        return false;
+    }
+    if current_shortfall % 512 != 0 || current_shortfall_128 > current_shortfall.saturating_add(512)
+    {
+        return false;
+    }
+    if record.input_tokens < 16_000 || record.cache_read_tokens == 0 {
+        return false;
+    }
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens);
+    if previous_seen < 8_000 || record.cache_read_tokens.saturating_add(512) < previous_seen {
+        return false;
+    }
+    let message_like_tail = matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("message") | Some("mixed")
+    ) && tail_input_diagnostics.message_chars >= 512;
+    if !message_like_tail {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or(0.0);
+    if current_shortfall <= 1024 {
+        ratio >= 0.975
+    } else if current_shortfall <= 2048 {
+        ratio >= 0.955
+    } else if current_shortfall <= 4096 {
+        ratio >= 0.93
+    } else {
+        ratio >= 0.90
+    }
 }
 
 fn responses_all_stage_tail_can_learn_sent_bucket(
@@ -17026,6 +17103,68 @@ mod tests {
             provider_cache_shortfall_128(&record),
             &tail,
             false,
+        ));
+    }
+
+    #[test]
+    fn responses_stale_current_message_tail_gets_guard_after_window_elapsed() {
+        let mut state = prefix_state(52_513, 49_152, 3_072);
+        state.finished_at = Instant::now() - std::time::Duration::from_secs(24 * 60);
+        state.seen_bucket_tokens = 49_152;
+        state.seen_bucket_tokens_128 = 49_152;
+        state.avoidable_shortfall_tokens = 0;
+        state.avoidable_shortfall_tokens_128 = 0;
+        state.shortfall_tokens = 128;
+        state.shortfall_tokens_128 = 128;
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 3_742,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(
+            provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail),
+            Some(responses_foreground_wait_cap())
+        );
+    }
+
+    #[test]
+    fn responses_medium_message_tail_learns_sent_bucket_with_high_ratio() {
+        let mut previous = prefix_state(53_806, 52_736, 1_024);
+        previous.seen_bucket_tokens = 52_736;
+        previous.seen_bucket_tokens_128 = 52_736;
+        previous.avoidable_shortfall_tokens = 0;
+        previous.avoidable_shortfall_tokens_128 = 0;
+        let record = UsageRecord {
+            input_tokens: 57_637,
+            cache_read_tokens: 54_784,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 4_330,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
+    }
+
+    #[test]
+    fn responses_sync_main_520_uses_compat_fallbacks() {
+        assert!(should_fallback_responses_sync_main_to_chat_compat(
+            520, true, false
+        ));
+        assert!(should_fallback_chat_compat_compact_to_responses(
+            520, true, true
         ));
     }
 

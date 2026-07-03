@@ -121,11 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.64";
+const appVersion = "v0.1.65";
 const appVersionNotes = [
-  "v0.1.64: Responses 新尾巴改为全阶段泛化保护，所有非零桶缺口都会进入统一短保护路径，不再只针对出现过的固定尺寸。",
-  "v0.1.64: 大尾巴水线学习覆盖 2048 到 131072 token 区间，并按尾巴大小提高学习门槛，防止未来未出现过的大尾巴裸奔或污染缓存判断。",
-  "v0.1.64: 修复请求记录小窗口布局，流式/同步和通道标签保持单行显示，长通道名自动省略。"
+  "v0.1.65: 修复 Responses 同步 520 兼容回退，压缩/同步遇到 520 时不再直接失败。",
+  "v0.1.65: 新增 stale current-tail 短保护，避免过期窗口后新尾巴被 settle_window_elapsed 跳过。",
+  "v0.1.65: 增强 512-8192 中等消息尾巴的水线学习，继续保持可避免缺口保护不回退。"
 ];
 
 const emptyDraft: ProviderDraft = {
