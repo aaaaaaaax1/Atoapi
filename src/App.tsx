@@ -121,11 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.65";
+const appVersion = "v0.1.66";
 const appVersionNotes = [
-  "v0.1.65: 修复 Responses 同步 520 兼容回退，压缩/同步遇到 520 时不再直接失败。",
-  "v0.1.65: 新增 stale current-tail 短保护，避免过期窗口后新尾巴被 settle_window_elapsed 跳过。",
-  "v0.1.65: 增强 512-8192 中等消息尾巴的水线学习，继续保持可避免缺口保护不回退。"
+  "v0.1.66: 针对大工具输出后的 512-4096 残余尾巴增加水线学习，减少 1536/2048/3072 继续滚动。",
+  "v0.1.66: 大工具输出首次缺口标记为真实工具尾巴，避免和普通消息新尾巴混淆。",
+  "v0.1.66: 保持零额外请求、不热补、不恢复普通 session-delta，继续守住可避免缺口底线。"
 ];
 
 const emptyDraft: ProviderDraft = {

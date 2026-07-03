@@ -3853,6 +3853,8 @@ async fn prefix_lag_diagnostics(
         } else {
             "cold_start"
         }
+    } else if responses_tool_tail_burst(current_tail) && real_provider_shortfall >= 4096 {
+        "tool_tail_burst_real_tail"
     } else if current_gap == 0 && real_provider_shortfall >= 4096 && ratio < 0.90 {
         "prefix_break_isolated"
     } else if current_gap == 0 {
@@ -4441,6 +4443,15 @@ fn should_learn_sent_provider_bucket(
     ) {
         return true;
     }
+    if responses_small_residual_after_tool_burst_can_learn_sent_bucket(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+    ) {
+        return true;
+    }
     if responses_medium_message_tail_can_learn_sent_bucket(
         previous,
         record,
@@ -4483,6 +4494,58 @@ fn should_learn_sent_provider_bucket(
     true
 }
 
+fn responses_small_residual_after_tool_burst_can_learn_sent_bucket(
+    previous: &PrefixWarmState,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    let previous_tool_burst = previous.tail_tool_output_chars >= 8_000
+        || previous.tail_largest_tool_output_chars >= 8_000
+        || (previous.tail_tool_output_chars >= 4_096
+            && previous.tail_tool_output_noise_hint.is_some());
+    if !previous_tool_burst {
+        return false;
+    }
+    if current_shortfall < 512 || current_shortfall > 4096 || current_shortfall % 512 != 0 {
+        return false;
+    }
+    if current_shortfall_128 > current_shortfall.saturating_add(512) {
+        return false;
+    }
+    if record.input_tokens < 16_000 || record.cache_read_tokens == 0 {
+        return false;
+    }
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens);
+    if previous_seen < 8_000 || record.cache_read_tokens.saturating_add(512) < previous_seen {
+        return false;
+    }
+    if responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics)
+        || responses_tool_tail_burst(tail_input_diagnostics)
+    {
+        return false;
+    }
+    let light_current_tail = matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("message") | Some("mixed") | Some("tool_output") | None
+    ) && tail_input_diagnostics.tool_output_chars < 4_096
+        && tail_input_diagnostics.largest_tool_output_chars < 4_096
+        && tail_input_diagnostics.tool_call_chars < 4_096;
+    if !light_current_tail {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or(0.0);
+    if current_shortfall <= 1024 {
+        ratio >= 0.985
+    } else if current_shortfall <= 2048 {
+        ratio >= 0.965
+    } else {
+        ratio >= 0.955
+    }
+}
 fn responses_medium_message_tail_can_learn_sent_bucket(
     previous: &PrefixWarmState,
     record: &UsageRecord,
@@ -17106,6 +17169,109 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn responses_small_residual_after_tool_burst_learns_sent_bucket() {
+        let mut previous = prefix_state(77_746, 77_312, 0);
+        previous.seen_bucket_tokens = 77_312;
+        previous.seen_bucket_tokens_128 = 77_312;
+        previous.tail_tool_output_chars = 28_869;
+        previous.tail_largest_tool_output_chars = 16_006;
+        previous.avoidable_shortfall_tokens = 0;
+        previous.avoidable_shortfall_tokens_128 = 0;
+        let record = UsageRecord {
+            input_tokens: 79_821,
+            cache_read_tokens: 77_312,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 6,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(provider_cache_shortfall(&record), 2_048);
+        assert!(should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
+    }
+
+    #[test]
+    fn responses_current_large_tool_tail_is_classified_as_real_tail() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-tool-tail-real-classification-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let warm = UsageRecord {
+                input_tokens: 85_732,
+                cache_read_tokens: 84_992,
+                ..UsageRecord::default()
+            };
+            let burst = UsageRecord {
+                input_tokens: 97_266,
+                cache_read_tokens: 85_504,
+                ..UsageRecord::default()
+            };
+            let tail = TailInputDiagnostics {
+                input_items: 1,
+                tool_output_chars: 60_164,
+                largest_tool_output_chars: 22_602,
+                source: Some("tool_output".to_string()),
+                ..TailInputDiagnostics::default()
+            };
+            update_provider_prefix_state_with_tail(
+                &state,
+                Some("main-prefix"),
+                None,
+                Some(&warm),
+                &TailInputDiagnostics::default(),
+                false,
+                false,
+            )
+            .await;
+            let gap = provider_cache_gap_breakdown(
+                &state,
+                Some("main-prefix"),
+                None,
+                Some(&burst),
+                Some(&tail),
+            )
+            .await;
+            let wait = PrefixGuardWaitDiagnostics {
+                wait_ms: 3_000,
+                reason: Some("responses_current_tool_output_tail_cap".to_string()),
+                source: Some("exact".to_string()),
+                skip_reason: None,
+                ..PrefixGuardWaitDiagnostics::default()
+            };
+            let diagnostics = prefix_lag_diagnostics(
+                &state,
+                Some("main-prefix"),
+                Some(&burst),
+                gap.as_ref(),
+                &wait,
+                &tail,
+            )
+            .await;
+
+            assert_eq!(provider_cache_shortfall(&burst), 11_264);
+            assert_eq!(
+                diagnostics.classification.as_deref(),
+                Some("tool_tail_burst_real_tail")
+            );
+        });
+        fs::remove_dir_all(dir).ok();
+    }
     #[test]
     fn responses_stale_current_message_tail_gets_guard_after_window_elapsed() {
         let mut state = prefix_state(52_513, 49_152, 3_072);
