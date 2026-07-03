@@ -1751,14 +1751,14 @@ button:disabled {
 .request-row {
   display: grid;
   grid-template-columns:
-    minmax(160px, 0.72fr)
-    minmax(142px, 0.48fr)
-    minmax(238px, 0.9fr)
-    minmax(360px, 1.24fr);
+    minmax(150px, 0.62fr)
+    minmax(214px, 0.72fr)
+    minmax(250px, 0.9fr)
+    minmax(320px, 1.12fr);
   align-items: center;
   justify-content: stretch;
-  min-height: 66px;
-  padding: 12px 14px;
+  min-height: 62px;
+  padding: 10px 14px;
   border: 1px solid rgba(150, 158, 148, 0.12);
   border-radius: 8px;
   background: linear-gradient(145deg, rgba(30, 33, 31, 0.62), rgba(24, 26, 24, 0.42));
@@ -1806,42 +1806,47 @@ button:disabled {
 
 .request-badges {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .request-row .request-channel-badge {
   display: inline-flex;
   align-items: center;
-  min-width: 76px;
-  max-width: 132px;
+  min-width: 0;
+  max-width: 124px;
   justify-content: center;
   border: 1px solid #3f5146;
   border-radius: 999px;
-  padding: 4px 9px;
+  padding: 3px 8px;
   color: #bdf2cb;
   background: rgba(46, 96, 66, 0.28);
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0;
   text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .request-row .request-call-badge {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 58px;
+  min-width: 46px;
   border: 1px solid #4d5360;
   border-radius: 999px;
-  padding: 4px 9px;
+  padding: 3px 8px;
   color: #e8ece8;
   background: rgba(76, 83, 96, 0.36);
   font-size: 11px;
   font-weight: 800;
   letter-spacing: 0;
+  white-space: nowrap;
 }
 
 .request-row .request-call-badge.stream {
@@ -2063,10 +2068,10 @@ button:disabled {
 
   .request-row {
     grid-template-columns:
-      minmax(118px, 0.62fr)
-      minmax(106px, 0.44fr)
-      minmax(150px, 0.68fr)
-      minmax(248px, 1.12fr);
+      minmax(112px, 0.56fr)
+      minmax(178px, 0.74fr)
+      minmax(150px, 0.62fr)
+      minmax(230px, 1fr);
     gap: 8px 10px;
     padding: 10px 12px;
   }
@@ -2089,15 +2094,14 @@ button:disabled {
   }
 
   .request-row .request-channel-badge {
-    min-width: 66px;
-    max-width: 96px;
-    padding: 3px 7px;
+    max-width: 104px;
+    padding: 2px 6px;
     font-size: 10px;
   }
 
   .request-row .request-call-badge {
-    min-width: 48px;
-    padding: 3px 7px;
+    min-width: 40px;
+    padding: 2px 6px;
     font-size: 10px;
   }
 

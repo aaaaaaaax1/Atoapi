@@ -1955,17 +1955,16 @@ async fn handle_generation(
                 &error_summary,
             )
             .await;
-            if let Some(compat) = maybe_prepare_previous_response_compat_body(
-                &state,
-                &active_upstream_body,
-            )
-            .await
-            .or_else(|| {
-                strip_previous_response_id_for_compat(
-                    &active_upstream_body,
-                    "client_previous_response_id_unsupported_retry",
-                )
-            }) {
+            if let Some(compat) =
+                maybe_prepare_previous_response_compat_body(&state, &active_upstream_body)
+                    .await
+                    .or_else(|| {
+                        strip_previous_response_id_for_compat(
+                            &active_upstream_body,
+                            "client_previous_response_id_unsupported_retry",
+                        )
+                    })
+            {
                 if !error_summary.is_empty() {
                     state
                         .metrics
@@ -2918,6 +2917,9 @@ fn responses_minimum_new_tail_request_wait(
     if responses_medium_tool_tail_carryover_guard(state, current_tail, observed_bucket_shortfall) {
         return responses_foreground_wait_cap();
     }
+    if responses_all_stage_tail_carryover_guard(state, current_tail, observed_bucket_shortfall) {
+        return responses_foreground_wait_cap();
+    }
     if small_bucket_tail
         && state.input_tokens >= 32_000
         && state.small_gap_recovery_streak > 0
@@ -2954,6 +2956,31 @@ fn responses_medium_tool_tail_carryover_guard(
         || state.tail_tool_output_noise_hint.is_some();
 
     current_tool_signal || previous_tool_signal
+}
+
+fn responses_all_stage_tail_carryover_guard(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+    observed_bucket_shortfall: u64,
+) -> bool {
+    if observed_bucket_shortfall == 0 || state.input_tokens < 8_000 {
+        return false;
+    }
+    if state.cache_read_tokens == 0 {
+        return false;
+    }
+    if state.finished_at.elapsed() > std::time::Duration::from_secs(20 * 60) {
+        return false;
+    }
+    let current_tail_signal = current_tail.message_chars >= 512
+        || current_tail.tool_output_chars >= 512
+        || current_tail.tool_call_chars >= 512
+        || current_tail.input_items > 0;
+    let previous_tail_signal = state.tail_tool_output_chars >= 512
+        || state.tail_largest_tool_output_chars >= 512
+        || state.tail_tool_output_noise_hint.is_some();
+
+    current_tail_signal || previous_tail_signal || state.cache_instability_score > 0
 }
 
 fn responses_minimum_avoidable_request_wait(
@@ -3445,6 +3472,12 @@ fn provider_prefix_wait_reason_for_channel(
                 observed_shortfall,
             ) {
                 Some("responses_medium_tool_tail_carryover_guard".to_string())
+            } else if responses_all_stage_tail_carryover_guard(
+                state,
+                current_tail,
+                observed_shortfall,
+            ) {
+                Some("responses_all_stage_tail_guard".to_string())
             } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
                 Some("responses_current_tail_guard".to_string())
             } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
@@ -4382,6 +4415,15 @@ fn should_learn_sent_provider_bucket(
     ) {
         return true;
     }
+    if responses_all_stage_tail_can_learn_sent_bucket(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+    ) {
+        return true;
+    }
     if current_shortfall_128 <= 2048 {
         return false;
     }
@@ -4404,6 +4446,53 @@ fn should_learn_sent_provider_bucket(
         return false;
     }
     true
+}
+
+fn responses_all_stage_tail_can_learn_sent_bucket(
+    previous: &PrefixWarmState,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if current_shortfall < 2048 || current_shortfall > 131_072 {
+        return false;
+    }
+    if current_shortfall % 512 != 0 || current_shortfall_128 > current_shortfall.saturating_add(512)
+    {
+        return false;
+    }
+    if record.input_tokens < 16_000 || record.cache_read_tokens == 0 {
+        return false;
+    }
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens);
+    if previous_seen < 8_000 {
+        return false;
+    }
+    if record.cache_read_tokens.saturating_add(512) < previous_seen {
+        return false;
+    }
+    let has_large_tail = tail_input_diagnostics.message_chars >= 8_192
+        || tail_input_diagnostics.tool_output_chars >= 8_192
+        || tail_input_diagnostics.largest_tool_output_chars >= 8_192
+        || tail_input_diagnostics.tool_call_chars >= 8_192;
+    if !has_large_tail {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or(0.0);
+    if current_shortfall > 65_536 {
+        ratio >= 0.86
+    } else if current_shortfall > 32_768 {
+        ratio >= 0.80
+    } else if matches!(tail_input_diagnostics.source.as_deref(), Some("message")) {
+        ratio >= 0.72
+    } else if responses_tool_tail_burst(tail_input_diagnostics) {
+        ratio >= 0.72
+    } else {
+        ratio >= 0.90
+    }
 }
 
 fn responses_precise_tool_tail_can_learn_sent_bucket(
@@ -16882,6 +16971,142 @@ mod tests {
         );
 
         assert_eq!(wait, Some(responses_foreground_wait_cap()));
+    }
+
+    #[test]
+    fn responses_all_stage_message_tail_gets_short_guard() {
+        let mut state = prefix_state(25_057, 8_704, 15_872);
+        state.seen_bucket_tokens = 8_704;
+        state.seen_bucket_tokens_128 = 8_704;
+        state.avoidable_shortfall_tokens = 0;
+        state.avoidable_shortfall_tokens_128 = 0;
+        state.avoidable_shortfall_streak = 0;
+        state.small_gap_recovery_streak = 0;
+        let current_tail = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 66_218,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(
+            responses_minimum_new_tail_request_wait(&Channel::Responses, &state, &current_tail),
+            responses_foreground_wait_cap()
+        );
+        assert_eq!(
+            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
+            Some("responses_all_stage_tail_guard".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_large_tool_tail_learns_sent_bucket_without_extra_request() {
+        let mut previous = prefix_state(32_080, 28_160, 3_584);
+        previous.seen_bucket_tokens = 28_160;
+        previous.seen_bucket_tokens_128 = 28_160;
+        previous.avoidable_shortfall_tokens = 0;
+        previous.avoidable_shortfall_tokens_128 = 0;
+        let record = UsageRecord {
+            input_tokens: 41_083,
+            cache_read_tokens: 31_744,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            tool_output_chars: 60_400,
+            largest_tool_output_chars: 40_592,
+            tool_output_lines: 830,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
+    }
+
+    #[test]
+    fn responses_shrunk_large_message_tail_does_not_overlearn_sent_bucket() {
+        let mut previous = prefix_state(88_054, 87_808, 0);
+        previous.seen_bucket_tokens = 87_808;
+        previous.seen_bucket_tokens_128 = 87_808;
+        let record = UsageRecord {
+            input_tokens: 25_057,
+            cache_read_tokens: 8_704,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 66_218,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(!should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
+    }
+
+    #[test]
+    fn responses_unseen_huge_tail_size_is_covered_by_general_guard() {
+        let mut state = prefix_state(140_000, 92_160, 47_616);
+        state.seen_bucket_tokens = 92_160;
+        state.seen_bucket_tokens_128 = 92_160;
+        state.avoidable_shortfall_tokens = 0;
+        state.avoidable_shortfall_tokens_128 = 0;
+        let current_tail = TailInputDiagnostics {
+            input_items: 6,
+            message_chars: 180_000,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(
+            responses_minimum_new_tail_request_wait(&Channel::Responses, &state, &current_tail),
+            responses_foreground_wait_cap()
+        );
+        assert_eq!(
+            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
+            Some("responses_all_stage_tail_guard".to_string())
+        );
+    }
+
+    #[test]
+    fn responses_unseen_huge_tail_can_learn_sent_bucket_with_high_hit_ratio() {
+        let mut previous = prefix_state(280_000, 260_096, 19_456);
+        previous.seen_bucket_tokens = 260_096;
+        previous.seen_bucket_tokens_128 = 260_096;
+        previous.avoidable_shortfall_tokens = 0;
+        previous.avoidable_shortfall_tokens_128 = 0;
+        let record = UsageRecord {
+            input_tokens: 300_000,
+            cache_read_tokens: 260_096,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 6,
+            message_chars: 180_000,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
     }
 
     #[test]

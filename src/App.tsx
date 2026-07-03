@@ -121,11 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.63";
+const appVersion = "v0.1.64";
 const appVersionNotes = [
-  "v0.1.63: 修复 Responses 非流式/同步请求遇到 provider_session_delta_unsupported 后的兼容重试，优先用本地 session 展开完整 input，再兜底移除 previous_response_id。",
-  "v0.1.63: 可避免缺口统一进入最多 +3 秒短保护，覆盖 128 到大缺口的 avoidable 场景；不新增热补、不新增额外同步请求、不拉长到几十秒。",
-  "v0.1.63: 保留请求记录右侧显示修复，小窗口下命中/尾巴/耗时信息尽量完整显示；本版继续以 v0.1.56 和 v0.1.62 作为命中率对照基线。"
+  "v0.1.64: Responses 新尾巴改为全阶段泛化保护，所有非零桶缺口都会进入统一短保护路径，不再只针对出现过的固定尺寸。",
+  "v0.1.64: 大尾巴水线学习覆盖 2048 到 131072 token 区间，并按尾巴大小提高学习门槛，防止未来未出现过的大尾巴裸奔或污染缓存判断。",
+  "v0.1.64: 修复请求记录小窗口布局，流式/同步和通道标签保持单行显示，长通道名自动省略。"
 ];
 
 const emptyDraft: ProviderDraft = {
