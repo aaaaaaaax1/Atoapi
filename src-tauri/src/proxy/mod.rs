@@ -480,6 +480,7 @@ async fn handle_responses_compact(
         &state,
         &decision.upstream_channel,
         None,
+        None,
         upstream_body.get("input"),
     )
     .await;
@@ -988,7 +989,16 @@ async fn handle_generation(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
     };
     let config = state.config.read().await.clone();
-    let decision = match decide_route(
+    let route_affinity_key = provider_route_affinity_key(&config, &client_request, &client_channel);
+    let route_affinity_provider_id =
+        lookup_provider_route_affinity(&state, &config, route_affinity_key.as_deref()).await;
+    let route_is_agent_bound = route_is_agent_provider_bound(
+        &config,
+        &client_request,
+        &client_channel,
+        authorized_agent.as_deref(),
+    );
+    let mut decision = match decide_route(
         &config,
         &client_request,
         &client_channel,
@@ -997,6 +1007,15 @@ async fn handle_generation(
         Ok(decision) => decision,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
+    if !route_is_agent_bound {
+        decision = apply_provider_route_affinity(
+            &config,
+            decision,
+            &client_request,
+            &client_channel,
+            route_affinity_provider_id.as_deref(),
+        );
+    }
     set_request_model(&mut client_request, &decision.model);
 
     let client_requested_stream = client_request
@@ -1218,6 +1237,7 @@ async fn handle_generation(
         &state,
         &decision.upstream_channel,
         response_session_key.as_deref(),
+        response_session_scope_key.as_deref(),
         full_response_input.as_ref(),
     )
     .await;
@@ -1895,6 +1915,7 @@ async fn handle_generation(
             provider_prefix_key.clone(),
             provider_prefix_fingerprint.clone(),
             provider_prefix_family_key.clone(),
+            route_affinity_key.clone(),
             config,
             prefix_guard,
             prefix_state_update_key.clone(),
@@ -2078,6 +2099,19 @@ async fn handle_generation(
         key_error_summary.as_deref(),
     )
     .await;
+    if is_success_status {
+        note_provider_route_affinity(&state, route_affinity_key.as_deref(), &decision.provider.id)
+            .await;
+    } else {
+        maybe_clear_provider_route_affinity_after_status(
+            &state,
+            route_affinity_key.as_deref(),
+            &decision.provider.id,
+            status,
+            key_error_summary.as_deref(),
+        )
+        .await;
+    }
     let sync_compact_diagnostic_only =
         skip_prefix_guard_for_sync_responses || active_responses_non_stream_chat_compat;
     let usage_record = if is_success_status && sync_compact_diagnostic_only {
@@ -2972,15 +3006,39 @@ fn responses_all_stage_tail_carryover_guard(
     if state.finished_at.elapsed() > std::time::Duration::from_secs(20 * 60) {
         return false;
     }
-    let current_tail_signal = current_tail.message_chars >= 512
-        || current_tail.tool_output_chars >= 512
-        || current_tail.tool_call_chars >= 512
-        || current_tail.input_items > 0;
-    let previous_tail_signal = state.tail_tool_output_chars >= 512
-        || state.tail_largest_tool_output_chars >= 512
-        || state.tail_tool_output_noise_hint.is_some();
+    let large_bucket_lag = observed_bucket_shortfall >= 4096;
+    let huge_bucket_lag = observed_bucket_shortfall >= 8192;
+    let huge_message_tail = huge_bucket_lag && current_tail.message_chars >= 32_000;
+    if matches!(
+        current_tail.source.as_deref(),
+        Some("message") | Some("tool_call")
+    ) && current_tail.tool_output_chars == 0
+        && !huge_message_tail
+    {
+        return false;
+    }
 
-    current_tail_signal || previous_tail_signal || state.cache_instability_score > 0
+    let current_tool_signal = current_tail.tool_output_chars >= 2048
+        || current_tail.largest_tool_output_chars >= 2048
+        || current_tail.tool_call_chars >= 2048
+        || (current_tail.tool_output_noise_hint.is_some() && current_tail.tool_output_chars >= 512);
+    let current_mixed_signal = matches!(current_tail.source.as_deref(), Some("mixed"))
+        && (current_tail.tool_output_chars >= 1024
+            || current_tail
+                .message_chars
+                .saturating_add(current_tail.tool_output_chars)
+                >= 8192);
+    let current_tail_signal = current_tool_signal || current_mixed_signal || huge_message_tail;
+    let previous_tool_signal = state.tail_tool_output_chars >= 4096
+        || state.tail_largest_tool_output_chars >= 4096
+        || (state.tail_tool_output_noise_hint.is_some() && state.tail_tool_output_chars >= 2048);
+    let unstable_large_lag = state.cache_instability_score >= 2 && large_bucket_lag;
+
+    (huge_bucket_lag && (current_tail_signal || previous_tool_signal))
+        || (large_bucket_lag
+            && (current_tail_signal
+                || (previous_tool_signal && current_tail.tool_output_chars > 0)))
+        || unstable_large_lag
 }
 
 fn responses_minimum_avoidable_request_wait(
@@ -2998,10 +3056,10 @@ fn responses_minimum_avoidable_request_wait(
         return TokioDuration::ZERO;
     }
 
-    if avoidable > 0 {
-        return responses_foreground_wait_cap();
+    if state.input_tokens < 16_000 && avoidable <= 512 {
+        return TokioDuration::from_secs(2);
     }
-    TokioDuration::ZERO
+    responses_foreground_wait_cap()
 }
 
 fn provider_prefix_stale_recovery_wait_for_channel(
@@ -3176,8 +3234,11 @@ fn responses_stale_current_tail_guard(
         return false;
     }
     current_tail.message_chars >= 512
-        || current_tail.tool_output_chars > 0
         || current_tail.tool_call_chars > 0
+        || (current_tail.tool_output_chars > 0
+            && (elapsed <= std::time::Duration::from_secs(10)
+                || current_tail.tool_output_chars >= 512
+                || current_tail.largest_tool_output_chars >= 512))
         || (current_tail.input_items >= 2 && current_tail.message_chars >= 128)
 }
 
@@ -3498,14 +3559,14 @@ fn provider_prefix_wait_reason_for_channel(
                 observed_shortfall,
             ) {
                 Some("responses_all_stage_tail_guard".to_string())
+            } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
+                Some("responses_current_tail_guard".to_string())
             } else if responses_stale_current_tail_guard(
                 state,
                 current_tail,
                 state.finished_at.elapsed(),
             ) {
                 Some("responses_stale_current_tail_guard".to_string())
-            } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
-                Some("responses_current_tail_guard".to_string())
             } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
                 Some("responses_small_tail_guard".to_string())
             } else {
@@ -3636,7 +3697,7 @@ fn responses_bucket_tail_floor(tokens: u64, streak: u32, input_tokens: u64) -> T
         } else if mid_context {
             45
         } else {
-            24
+            2
         }
     } else if tokens > 0 {
         if high_context {
@@ -3644,7 +3705,7 @@ fn responses_bucket_tail_floor(tokens: u64, streak: u32, input_tokens: u64) -> T
         } else if mid_context {
             30
         } else {
-            12
+            2
         }
     } else {
         0
@@ -3823,6 +3884,12 @@ async fn prefix_lag_diagnostics(
         lookup_provider_prefix_state(&states, key).cloned()
     };
     let Some(previous) = previous else {
+        if responses_huge_dynamic_history_cold_read(record, current_tail) {
+            return PrefixLagDiagnostics {
+                classification: Some("first_prefix_huge_dynamic_history".to_string()),
+                ..PrefixLagDiagnostics::default()
+            };
+        }
         return PrefixLagDiagnostics {
             classification: Some("first_prefix_state".to_string()),
             ..PrefixLagDiagnostics::default()
@@ -4986,7 +5053,7 @@ struct ProviderCacheGapBreakdown {
 async fn provider_cache_gap_breakdown(
     state: &AppState,
     provider_prefix_key: Option<&str>,
-    _provider_prefix_family_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
     usage_record: Option<&UsageRecord>,
     tail_input_diagnostics: Option<&TailInputDiagnostics>,
 ) -> Option<ProviderCacheGapBreakdown> {
@@ -5000,14 +5067,15 @@ async fn provider_cache_gap_breakdown(
     }
     let bucket = provider_cache_bucket_max(record.input_tokens);
     let total = bucket.saturating_sub(record.cache_read_tokens);
-    let (previous_exact, previous_any) = if let Some(key) = provider_prefix_key {
+    let (previous_exact, previous_any, previous_family) = if let Some(key) = provider_prefix_key {
         let states = state.prefix_states.lock().await;
         (
             states.get(key).cloned(),
             lookup_provider_prefix_state(&states, key).cloned(),
+            provider_prefix_family_key.and_then(|key| states.get(key).cloned()),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let cold_read_has_unreliable_dynamic_tail = tail_input_diagnostics
         .map(|tail| {
@@ -5020,6 +5088,16 @@ async fn provider_cache_gap_breakdown(
     if provider_prefix_break_after_warm_state(previous_exact.as_ref(), record)
         || (provider_prefix_break_after_warm_state(previous_any.as_ref(), record)
             && cold_read_has_unreliable_dynamic_tail)
+        || (previous_exact.is_none()
+            && previous_any.is_none()
+            && provider_prefix_break_after_warm_state(previous_family.as_ref(), record)
+            && cold_read_has_unreliable_dynamic_tail)
+        || (previous_exact.is_none()
+            && previous_any.is_none()
+            && responses_huge_dynamic_history_cold_read(
+                record,
+                tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
+            ))
     {
         return Some(ProviderCacheGapBreakdown {
             total_tokens: 0,
@@ -6098,6 +6176,7 @@ async fn tail_input_diagnostics_for_session(
     state: &AppState,
     channel: &Channel,
     session_key: Option<&str>,
+    session_scope_key: Option<&str>,
     current_input: Option<&Value>,
 ) -> TailInputDiagnostics {
     if !matches!(channel, Channel::Responses) {
@@ -6115,7 +6194,15 @@ async fn tail_input_diagnostics_for_session(
 
     let previous_input = if let Some(key) = session_key {
         let sessions = state.response_sessions.lock().await;
-        sessions.get(key).map(|session| session.input.clone())
+        sessions
+            .get(key)
+            .map(|session| session.input.clone())
+            .or_else(|| {
+                fallback_response_sessions(&sessions, key, session_scope_key, current_input)
+                    .into_iter()
+                    .next()
+                    .map(|session| session.input)
+            })
     } else {
         None
     };
@@ -7976,6 +8063,7 @@ async fn stream_upstream(
     provider_prefix_key: Option<String>,
     provider_prefix_fingerprint: Option<String>,
     provider_prefix_family_key: Option<String>,
+    route_affinity_key: Option<String>,
     config: AppConfig,
     _prefix_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     prefix_state_key: Option<String>,
@@ -8106,6 +8194,12 @@ async fn stream_upstream(
             .await;
         }
         if stream_success_for_cache {
+            note_provider_route_affinity(
+                &state_for_stream,
+                route_affinity_key.as_deref(),
+                &decision.provider.id,
+            )
+            .await;
             clear_prefix_error_cooldown(&state_for_stream, prefix_state_key.as_deref()).await;
         }
         let ttft_ms = first_chunk_at.unwrap_or(total_ms);
@@ -8300,6 +8394,193 @@ fn agent_for_local_key<'a>(config: &'a AppConfig, key: &str) -> Option<&'a Agent
     config.agent_injections.iter().find(|agent| {
         agent.enabled && agent_injection::agent_local_key(&config.local_key, &agent.id) == key
     })
+}
+
+fn route_is_agent_provider_bound(
+    config: &AppConfig,
+    request: &Value,
+    client_channel: &Channel,
+    authorized_agent_id: Option<&str>,
+) -> bool {
+    let authorized_agent_bound = authorized_agent_id
+        .and_then(|agent_id| {
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == agent_id && agent.enabled)
+        })
+        .and_then(|agent| agent.provider_id.as_deref())
+        .is_some();
+    authorized_agent_bound
+        || infer_agent_for_global_key(config, request, client_channel)
+            .and_then(|agent| agent.provider_id.as_deref())
+            .is_some()
+}
+
+fn provider_route_affinity_key(
+    config: &AppConfig,
+    request: &Value,
+    client_channel: &Channel,
+) -> Option<String> {
+    if !matches!(client_channel, Channel::Responses) {
+        return None;
+    }
+
+    let mut material = request.clone();
+    strip_provider_cache_key_fields(&mut material);
+    canonicalize_responses_instruction_shape(&mut material);
+    strip_response_session_volatile_fields(&mut material);
+    trim_response_session_input_to_anchor(&mut material);
+    stabilize_responses_provider_prefix(&mut material);
+    canonicalize_object_keys(&mut material, "$.provider_route_affinity_key");
+
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or("*");
+    let mut hasher = Sha256::new();
+    hasher.update(config.workspace_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(client_channel.label().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+async fn lookup_provider_route_affinity(
+    state: &AppState,
+    config: &AppConfig,
+    affinity_key: Option<&str>,
+) -> Option<String> {
+    let key = affinity_key?;
+    let provider_id = state
+        .provider_route_affinity
+        .lock()
+        .await
+        .get(key)
+        .cloned()?;
+    if config
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id && provider.enabled)
+    {
+        return Some(provider_id);
+    }
+    state.provider_route_affinity.lock().await.remove(key);
+    None
+}
+
+async fn note_provider_route_affinity(
+    state: &AppState,
+    affinity_key: Option<&str>,
+    provider_id: &str,
+) {
+    let Some(key) = affinity_key else {
+        return;
+    };
+    if provider_id.trim().is_empty() {
+        return;
+    }
+    state
+        .provider_route_affinity
+        .lock()
+        .await
+        .insert(key.to_string(), provider_id.to_string());
+}
+
+async fn maybe_clear_provider_route_affinity_after_status(
+    state: &AppState,
+    affinity_key: Option<&str>,
+    provider_id: &str,
+    status: u16,
+    error_summary: Option<&str>,
+) {
+    let Ok(status_code) = StatusCode::from_u16(status) else {
+        return;
+    };
+    if is_provider_key_failure_status(status_code)
+        || error_summary
+            .map(is_provider_key_failure_message)
+            .unwrap_or(false)
+    {
+        clear_provider_route_affinity(state, affinity_key, provider_id).await;
+    }
+}
+
+async fn clear_provider_route_affinity(
+    state: &AppState,
+    affinity_key: Option<&str>,
+    provider_id: &str,
+) {
+    let Some(key) = affinity_key else {
+        return;
+    };
+    let mut affinities = state.provider_route_affinity.lock().await;
+    if affinities
+        .get(key)
+        .map(|current| current == provider_id)
+        .unwrap_or(false)
+    {
+        affinities.remove(key);
+    }
+}
+
+fn apply_provider_route_affinity(
+    config: &AppConfig,
+    decision: RouteDecision,
+    request: &Value,
+    client_channel: &Channel,
+    preferred_provider_id: Option<&str>,
+) -> RouteDecision {
+    if !matches!(client_channel, Channel::Responses) {
+        return decision;
+    }
+    let Some(preferred_provider_id) = preferred_provider_id else {
+        return decision;
+    };
+    if preferred_provider_id == decision.provider.id {
+        return decision;
+    }
+    let Some(provider) = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == preferred_provider_id && provider.enabled)
+    else {
+        return decision;
+    };
+
+    let requested_model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let model = if let Some(requested_model) = requested_model {
+        if !provider_supports_requested_model(provider, Some(requested_model)) {
+            return decision;
+        }
+        requested_model.to_string()
+    } else if provider_supports_requested_model(provider, Some(&decision.model)) {
+        decision.model.clone()
+    } else if let Some(model) = provider
+        .models
+        .iter()
+        .find(|model| model.enabled)
+        .map(|model| model.id.clone())
+    {
+        model
+    } else {
+        return decision;
+    };
+
+    RouteDecision {
+        upstream_channel: effective_upstream_channel_for_provider(config, provider, client_channel),
+        provider: provider.clone(),
+        model,
+    }
 }
 
 fn decide_route(
@@ -11262,6 +11543,30 @@ fn provider_usage_effective_for_prefix_metrics(
             .max(provider_cache_bucket_max(effective.input_tokens));
     }
     effective
+}
+
+fn responses_huge_dynamic_history_cold_read(
+    record: &UsageRecord,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if record.input_tokens < 32_000 || provider_cache_shortfall(record) < 8192 {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or_default();
+    if ratio >= 0.50 || record.cache_read_tokens >= 32_768 {
+        return false;
+    }
+    let huge_history_tail = tail_input_diagnostics.input_items >= 32
+        && (tail_input_diagnostics.message_chars >= 50_000
+            || tail_input_diagnostics.tool_output_chars >= 80_000
+            || tail_input_diagnostics.largest_tool_output_chars >= 32_000);
+    if !huge_history_tail {
+        return false;
+    }
+    matches!(
+        tail_input_diagnostics.source.as_deref(),
+        Some("mixed") | Some("tool_output") | None
+    )
 }
 
 fn provider_cache_shortfall(record: &UsageRecord) -> u64 {
@@ -14395,6 +14700,200 @@ mod tests {
         assert_eq!(decision.model, "gpt-5.5");
     }
 
+    #[tokio::test]
+    async fn route_affinity_reuses_previous_responses_provider_for_same_anchor() {
+        let mut config = AppConfig::default();
+        config.workspace_fingerprint = "workspace-route-affinity".to_string();
+        config.providers = vec![
+            ProviderConfig {
+                id: "bizd".to_string(),
+                name: "bizd".to_string(),
+                base_url: "https://bizd.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: vec![crate::config::ModelConfig {
+                    id: "gpt-5.5".to_string(),
+                    display_name: "gpt-5.5".to_string(),
+                    context_window: Some(128000),
+                    output_window: None,
+                    supports_tools: true,
+                    supports_streaming: true,
+                    enabled: true,
+                }],
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            ProviderConfig {
+                id: "ls".to_string(),
+                name: "ls".to_string(),
+                base_url: "https://ls.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: vec![crate::config::ModelConfig {
+                    id: "gpt-5.5".to_string(),
+                    display_name: "gpt-5.5".to_string(),
+                    context_window: Some(128000),
+                    output_window: None,
+                    supports_tools: true,
+                    supports_streaming: true,
+                    enabled: true,
+                }],
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+        config.active_provider_id = Some("bizd".to_string());
+        let request = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "message", "role": "user", "content": "stable conversation anchor" },
+                { "type": "message", "role": "assistant", "content": "dynamic tail" }
+            ]
+        });
+        let appended = json!({
+            "model": "gpt-5.5",
+            "input": [
+                { "type": "message", "role": "user", "content": "stable conversation anchor" },
+                { "type": "message", "role": "assistant", "content": "dynamic tail" },
+                { "type": "message", "role": "user", "content": "next turn" }
+            ]
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-route-affinity-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config.clone(), dir.join("config.toml"), cache).unwrap();
+        let affinity_key = provider_route_affinity_key(&config, &request, &Channel::Responses)
+            .expect("responses request should have route affinity key");
+        assert_eq!(
+            provider_route_affinity_key(&config, &appended, &Channel::Responses).as_deref(),
+            Some(affinity_key.as_str())
+        );
+        note_provider_route_affinity(&state, Some(&affinity_key), "ls").await;
+
+        let initial_decision = decide_route(&config, &request, &Channel::Responses, None).unwrap();
+        assert_eq!(initial_decision.provider.id, "bizd");
+        let preferred_provider =
+            lookup_provider_route_affinity(&state, &config, Some(&affinity_key)).await;
+        let affinity_decision = apply_provider_route_affinity(
+            &config,
+            initial_decision,
+            &request,
+            &Channel::Responses,
+            preferred_provider.as_deref(),
+        );
+
+        assert_eq!(affinity_decision.provider.id, "ls");
+        assert_eq!(affinity_decision.model, "gpt-5.5");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn route_affinity_does_not_override_agent_bound_provider() {
+        let mut config = AppConfig::default();
+        config.providers = vec![
+            ProviderConfig {
+                id: "bizd".to_string(),
+                name: "bizd".to_string(),
+                base_url: "https://bizd.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: vec![crate::config::ModelConfig {
+                    id: "gpt-5.5".to_string(),
+                    display_name: "gpt-5.5".to_string(),
+                    context_window: Some(128000),
+                    output_window: None,
+                    supports_tools: true,
+                    supports_streaming: true,
+                    enabled: true,
+                }],
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            ProviderConfig {
+                id: "ls".to_string(),
+                name: "ls".to_string(),
+                base_url: "https://ls.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: false,
+                request_body_gzip_enabled: false,
+                api_key_encrypted: None,
+                models: vec![crate::config::ModelConfig {
+                    id: "gpt-5.5".to_string(),
+                    display_name: "gpt-5.5".to_string(),
+                    context_window: Some(128000),
+                    output_window: None,
+                    supports_tools: true,
+                    supports_streaming: true,
+                    enabled: true,
+                }],
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+        ];
+        let proxy_mode = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "proxy-mode")
+            .unwrap();
+        proxy_mode.enabled = true;
+        proxy_mode.provider_id = Some("bizd".to_string());
+        proxy_mode.model_id = Some("gpt-5.5".to_string());
+        let request = json!({
+            "model": "gpt-5.5",
+            "input": [{ "type": "message", "role": "user", "content": "stable anchor" }]
+        });
+
+        let decision =
+            decide_route(&config, &request, &Channel::Responses, Some("proxy-mode")).unwrap();
+        assert!(route_is_agent_provider_bound(
+            &config,
+            &request,
+            &Channel::Responses,
+            Some("proxy-mode")
+        ));
+        let final_decision = if route_is_agent_provider_bound(
+            &config,
+            &request,
+            &Channel::Responses,
+            Some("proxy-mode"),
+        ) {
+            decision
+        } else {
+            apply_provider_route_affinity(
+                &config,
+                decision,
+                &request,
+                &Channel::Responses,
+                Some("ls"),
+            )
+        };
+
+        assert_eq!(final_decision.provider.id, "bizd");
+    }
     #[test]
     fn requested_model_provider_wins_when_active_provider_lacks_model() {
         let mut config = AppConfig::default();
@@ -15243,6 +15742,7 @@ mod tests {
             true,
             vec!["cache-key".to_string()],
             "cache-key".to_string(),
+            None,
             None,
             None,
             None,
@@ -17905,6 +18405,158 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[tokio::test]
+    async fn responses_new_anchor_scope_sibling_tail_diagnostics_use_delta_only() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-scope-sibling-tail-diagnostics-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        state.response_sessions.lock().await.insert(
+            "old-anchor".to_string(),
+            ResponseSessionState {
+                response_id: "resp_old".to_string(),
+                input: json!([
+                    { "type": "message", "role": "user", "content": "anchor" },
+                    { "type": "message", "role": "assistant", "content": "covered" }
+                ]),
+                scope_key: Some("scope-a".to_string()),
+                finished_at: Instant::now(),
+            },
+        );
+        let current_input = json!([
+            { "type": "message", "role": "user", "content": "anchor" },
+            { "type": "message", "role": "assistant", "content": "covered" },
+            { "type": "message", "role": "user", "content": "continue" }
+        ]);
+
+        let diagnostics = tail_input_diagnostics_for_session(
+            &state,
+            &Channel::Responses,
+            Some("new-anchor"),
+            Some("scope-a"),
+            Some(&current_input),
+        )
+        .await;
+
+        assert!(diagnostics.delta_from_session);
+        assert_eq!(diagnostics.input_items, 1);
+        assert_eq!(diagnostics.message_chars, "continue".chars().count() as u64);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn first_huge_dynamic_history_cold_read_is_not_plain_new_tail() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-first-huge-history-tail-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let cold_history = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 110_448,
+            output_tokens: 196,
+            cache_read_tokens: 9_216,
+            cache_creation_tokens: 0,
+        };
+        let huge_mixed_tail = TailInputDiagnostics {
+            input_items: 143,
+            message_chars: 160_047,
+            tool_call_chars: 15_310,
+            tool_output_chars: 193_487,
+            largest_tool_output_chars: 40_592,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("ls\0gpt-5.5\0responses\0new-fingerprint"),
+            None,
+            Some(&cold_history),
+            Some(&huge_mixed_tail),
+        )
+        .await
+        .unwrap();
+        let lag = prefix_lag_diagnostics(
+            &state,
+            Some("ls\0gpt-5.5\0responses\0new-fingerprint"),
+            Some(&cold_history),
+            Some(&gap),
+            &PrefixGuardWaitDiagnostics::default(),
+            &huge_mixed_tail,
+        )
+        .await;
+
+        assert_eq!(gap.total_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(
+            lag.classification.as_deref(),
+            Some("first_prefix_huge_dynamic_history")
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn family_waterline_only_isolates_huge_dynamic_cold_read_without_avoidable() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-family-huge-history-isolation-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let family_key = "prefix-family\0ls\0gpt-5.5\0responses\0scope-a";
+        let warm = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 115_485,
+            output_tokens: 10,
+            cache_read_tokens: 110_080,
+            cache_creation_tokens: 0,
+        };
+        let cold_history = UsageRecord {
+            provider: "ls".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 117_557,
+            output_tokens: 297,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        let huge_mixed_tail = TailInputDiagnostics {
+            input_items: 154,
+            message_chars: 165_395,
+            tool_output_chars: 219_234,
+            largest_tool_output_chars: 40_592,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some(family_key), Some(&warm), false, false).await;
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("ls\0gpt-5.5\0responses\0new-exact-fingerprint"),
+            Some(family_key),
+            Some(&cold_history),
+            Some(&huge_mixed_tail),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gap.total_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
     #[tokio::test]
     async fn responses_same_prefix_cold_read_does_not_become_avoidable_gap() {
         let config = AppConfig::default();

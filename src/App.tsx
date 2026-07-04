@@ -121,11 +121,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.66";
+const appVersion = "v0.1.67";
 const appVersionNotes = [
-  "v0.1.66: 针对大工具输出后的 512-4096 残余尾巴增加水线学习，减少 1536/2048/3072 继续滚动。",
-  "v0.1.66: 大工具输出首次缺口标记为真实工具尾巴，避免和普通消息新尾巴混淆。",
-  "v0.1.66: 保持零额外请求、不热补、不恢复普通 session-delta，继续守住可避免缺口底线。"
+  "v0.1.67: 增加 Responses 会话级上游亲和，减少同一会话在不同上游之间跳转造成的冷读和大尾巴。",
+  "v0.1.67: 收窄全阶段尾巴保护，只抓超大消息/工具/混合动态尾巴，避免普通短消息和过期小工具尾巴误触发。",
+  "v0.1.67: 保留可避免缺口为 0、最多 +3 秒本地保护、零额外请求、不热补、不恢复普通 main session-delta。"
 ];
 
 const emptyDraft: ProviderDraft = {
