@@ -206,7 +206,7 @@ export default function App() {
   }, [config, selectedProviderId]);
 
   useEffect(() => {
-    const items = config?.agent_injections ?? [];
+    const items = visibleAgentInjections(config?.agent_injections ?? []);
     if (!items.length) return;
     if (selectedAgentId && !items.some((item) => item.id === selectedAgentId)) {
       setSelectedAgentId("");
@@ -220,13 +220,14 @@ export default function App() {
 
   const activeProvider = useMemo(
     () => {
-      const selectedAgent = config?.agent_injections.find((item) => item.id === selectedAgentId);
+      const selectedAgent = visibleAgentInjections(config?.agent_injections ?? []).find((item) => item.id === selectedAgentId);
       const agentProvider = selectedAgent?.provider_id
-        ? config?.providers.find((item) => item.id === selectedAgent.provider_id)
+        ? config?.providers.find((item) => item.id === selectedAgent.provider_id) ?? null
         : null;
-      return agentProvider ?? config?.providers.find((item) => item.id === config.active_provider_id) ?? null;
+      if (activeView === "agent") return agentProvider;
+      return config?.providers.find((item) => item.id === config.active_provider_id) ?? null;
     },
-    [config, selectedAgentId]
+    [activeView, config, selectedAgentId]
   );
 
   async function refreshAll() {
@@ -244,8 +245,8 @@ export default function App() {
     }
     if (!selectedAgentId) {
       const preferredAgent =
-        nextConfig.agent_injections.find((item) => item.enabled) ??
-        nextConfig.agent_injections[0];
+        visibleAgentInjections(nextConfig.agent_injections).find((item) => item.enabled) ??
+        visibleAgentInjections(nextConfig.agent_injections)[0];
       if (preferredAgent) {
         setSelectedAgentId(preferredAgent.id);
         setActiveView("agent");
@@ -692,7 +693,7 @@ export default function App() {
   }
 
   const providers = config?.providers ?? [];
-  const injections = config?.agent_injections ?? [];
+  const injections = visibleAgentInjections(config?.agent_injections ?? []);
   const selectedAgent = injections.find((item) => item.id === selectedAgentId) ?? null;
   const selectedAgentProvider =
     selectedAgent?.provider_id
@@ -2573,6 +2574,9 @@ function agentIcon(kind: AgentInjectionConfig["kind"]) {
   return <Workflow size={18} />;
 }
 
+function visibleAgentInjections(items: AgentInjectionConfig[]): AgentInjectionConfig[] {
+  return items.filter((item) => item.id !== "proxy-mode");
+}
 function providerToDraft(provider: ProviderConfig): ProviderDraft {
   return {
     id: provider.id,

@@ -27,8 +27,8 @@ use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
     config::{
-        AgentInjectionConfig, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
-        SelectedProviderKey,
+        AgentInjectionConfig, AgentInjectionKind, AppConfig, CacheMode, Channel,
+        ProviderChannelMode, ProviderConfig, SelectedProviderKey,
     },
     metrics::{RequestLog, UsageRecord},
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
@@ -45,6 +45,7 @@ const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
+const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 
 #[derive(Debug, Clone)]
 struct RouteDecision {
@@ -304,9 +305,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
         .route("/v1/responses/compact", post(responses_compact_legacy))
+        .route("/codex/v1/models", get(codex_list_models))
+        .route("/codex/v1/chat/completions", post(codex_chat_completions))
+        .route("/codex/v1/responses", post(codex_responses))
+        .route(
+            "/codex/v1/responses/compact",
+            post(codex_responses_compact_legacy),
+        )
         .route(
             "/v1/responses/:response_id/compact",
             post(responses_compact),
+        )
+        .route(
+            "/codex/v1/responses/:response_id/compact",
+            post(codex_responses_compact),
         )
         .route("/v1/messages", post(messages))
         .with_state(state)
@@ -325,7 +337,22 @@ async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoR
 }
 
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let authorized_agent = match authorize(&state, &headers).await {
+    list_models_for_agent(state, headers, None).await
+}
+
+async fn codex_list_models(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    list_models_for_agent(state, headers, Some("codex")).await
+}
+
+async fn list_models_for_agent(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    forced_agent_id: Option<&'static str>,
+) -> Response {
+    let authorized_agent = match authorize_for_agent(&state, &headers, forced_agent_id).await {
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
@@ -400,6 +427,39 @@ async fn responses_compact(
     handle_responses_compact(state, headers, body, Some(response_id)).await
 }
 
+async fn codex_chat_completions(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_generation_for_agent(state, headers, body, Channel::Chat, Some("codex")).await
+}
+
+async fn codex_responses(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_generation_for_agent(state, headers, body, Channel::Responses, Some("codex")).await
+}
+
+async fn codex_responses_compact_legacy(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_responses_compact_for_agent(state, headers, body, None, Some("codex")).await
+}
+
+async fn codex_responses_compact(
+    AxumState(state): AxumState<Arc<AppState>>,
+    Path(response_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_responses_compact_for_agent(state, headers, body, Some(response_id), Some("codex")).await
+}
+
 async fn messages(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -414,10 +474,20 @@ async fn handle_responses_compact(
     body: Bytes,
     response_id: Option<String>,
 ) -> Response {
+    handle_responses_compact_for_agent(state, headers, body, response_id, None).await
+}
+
+async fn handle_responses_compact_for_agent(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    response_id: Option<String>,
+    forced_agent_id: Option<&'static str>,
+) -> Response {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    let authorized_agent = match authorize(&state, &headers).await {
+    let authorized_agent = match authorize_for_agent(&state, &headers, forced_agent_id).await {
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
@@ -976,10 +1046,20 @@ async fn handle_generation(
     body: Bytes,
     client_channel: Channel,
 ) -> Response {
+    handle_generation_for_agent(state, headers, body, client_channel, None).await
+}
+
+async fn handle_generation_for_agent(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    client_channel: Channel,
+    forced_agent_id: Option<&'static str>,
+) -> Response {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
 
-    let authorized_agent = match authorize(&state, &headers).await {
+    let authorized_agent = match authorize_for_agent(&state, &headers, forced_agent_id).await {
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
@@ -8363,11 +8443,12 @@ async fn stream_upstream(
         })
 }
 
-async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, Response> {
+async fn authorize_for_agent(
+    state: &AppState,
+    headers: &HeaderMap,
+    forced_agent_id: Option<&'static str>,
+) -> Result<Option<String>, Response> {
     let config = state.config.read().await;
-    if config.local_key.trim().is_empty() {
-        return Ok(None);
-    }
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -8378,6 +8459,35 @@ async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Option<Strin
         .and_then(|value| value.to_str().ok())
         .map(str::trim);
     let presented_key = bearer.or(x_key);
+
+    if let Some(agent_id) = forced_agent_id {
+        let Some(agent) = config.agent_injections.iter().find(|agent| {
+            agent.id == agent_id && agent.enabled && agent.kind != AgentInjectionKind::ProxyMode
+        }) else {
+            return Err(json_error(
+                StatusCode::UNAUTHORIZED,
+                "agent injection is not enabled",
+            ));
+        };
+        if config.local_key.trim().is_empty() {
+            return Ok(Some(agent.id.clone()));
+        }
+        let scoped_key = agent_injection::agent_local_key(&config.local_key, &agent.id);
+        let accepted = presented_key == Some(PROXY_TOKEN_PLACEHOLDER)
+            || presented_key == Some(config.local_key.as_str())
+            || presented_key == Some(scoped_key.as_str());
+        if accepted {
+            return Ok(Some(agent.id.clone()));
+        }
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid local proxy key",
+        ));
+    }
+
+    if config.local_key.trim().is_empty() {
+        return Ok(None);
+    }
     if presented_key == Some(config.local_key.as_str()) {
         Ok(None)
     } else if let Some(agent) = presented_key.and_then(|key| agent_for_local_key(&config, key)) {
@@ -8392,17 +8502,19 @@ async fn authorize(state: &AppState, headers: &HeaderMap) -> Result<Option<Strin
 
 fn agent_for_local_key<'a>(config: &'a AppConfig, key: &str) -> Option<&'a AgentInjectionConfig> {
     config.agent_injections.iter().find(|agent| {
-        agent.enabled && agent_injection::agent_local_key(&config.local_key, &agent.id) == key
+        agent.enabled
+            && agent.kind != AgentInjectionKind::ProxyMode
+            && agent_injection::agent_local_key(&config.local_key, &agent.id) == key
     })
 }
 
 fn route_is_agent_provider_bound(
     config: &AppConfig,
-    request: &Value,
-    client_channel: &Channel,
+    _request: &Value,
+    _client_channel: &Channel,
     authorized_agent_id: Option<&str>,
 ) -> bool {
-    let authorized_agent_bound = authorized_agent_id
+    authorized_agent_id
         .and_then(|agent_id| {
             config
                 .agent_injections
@@ -8410,13 +8522,8 @@ fn route_is_agent_provider_bound(
                 .find(|agent| agent.id == agent_id && agent.enabled)
         })
         .and_then(|agent| agent.provider_id.as_deref())
-        .is_some();
-    authorized_agent_bound
-        || infer_agent_for_global_key(config, request, client_channel)
-            .and_then(|agent| agent.provider_id.as_deref())
-            .is_some()
+        .is_some()
 }
-
 fn provider_route_affinity_key(
     config: &AppConfig,
     request: &Value,
@@ -8593,14 +8700,12 @@ fn decide_route(
         .get("model")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let authorized_agent = authorized_agent_id
-        .and_then(|agent_id| {
-            config
-                .agent_injections
-                .iter()
-                .find(|agent| agent.id == agent_id)
-        })
-        .or_else(|| infer_agent_for_global_key(config, request, client_channel));
+    let authorized_agent = authorized_agent_id.and_then(|agent_id| {
+        config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == agent_id && agent.enabled)
+    });
 
     let profile = config
         .route_profiles
@@ -8725,54 +8830,6 @@ fn auto_upstream_channel_for_provider(
     // Responses compact/non-stream fast paths may switch to Chat later in the
     // pipeline, where payload shape and fallback diagnostics are available.
     provider.channel.clone()
-}
-
-fn infer_agent_for_global_key<'a>(
-    config: &'a AppConfig,
-    request: &Value,
-    client_channel: &Channel,
-) -> Option<&'a AgentInjectionConfig> {
-    let requested_model = request.get("model").and_then(Value::as_str);
-    let mut candidates = config
-        .agent_injections
-        .iter()
-        .filter(|agent| agent.enabled && agent.provider_id.is_some())
-        .filter(|agent| agent_channel_matches_global_request(agent, client_channel))
-        .filter(|agent| agent_model_matches_request(agent, requested_model))
-        .collect::<Vec<_>>();
-
-    if candidates.len() == 1 {
-        return candidates.pop();
-    }
-
-    candidates
-        .into_iter()
-        .find(|agent| agent.kind == crate::config::AgentInjectionKind::ProxyMode)
-}
-
-fn agent_channel_matches_global_request(
-    agent: &AgentInjectionConfig,
-    client_channel: &Channel,
-) -> bool {
-    match agent.kind {
-        crate::config::AgentInjectionKind::ClaudeCode
-        | crate::config::AgentInjectionKind::ClaudeDesktop => {
-            matches!(client_channel, Channel::Anthropic)
-        }
-        crate::config::AgentInjectionKind::Codex | crate::config::AgentInjectionKind::ProxyMode => {
-            matches!(client_channel, Channel::Responses | Channel::Chat)
-        }
-    }
-}
-
-fn agent_model_matches_request(
-    agent: &AgentInjectionConfig,
-    requested_model: Option<&str>,
-) -> bool {
-    match (requested_model, agent.model_id.as_deref()) {
-        (Some(requested), Some(agent_model)) => requested == agent_model,
-        _ => true,
-    }
 }
 
 fn provider_supports_requested_model(
@@ -14854,43 +14911,39 @@ mod tests {
                 updated_at: Utc::now(),
             },
         ];
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter_mut()
-            .find(|agent| agent.id == "proxy-mode")
+            .find(|agent| agent.id == "codex")
             .unwrap();
-        proxy_mode.enabled = true;
-        proxy_mode.provider_id = Some("bizd".to_string());
-        proxy_mode.model_id = Some("gpt-5.5".to_string());
+        codex.enabled = true;
+        codex.provider_id = Some("bizd".to_string());
+        codex.model_id = Some("gpt-5.5".to_string());
         let request = json!({
             "model": "gpt-5.5",
             "input": [{ "type": "message", "role": "user", "content": "stable anchor" }]
         });
 
-        let decision =
-            decide_route(&config, &request, &Channel::Responses, Some("proxy-mode")).unwrap();
+        let decision = decide_route(&config, &request, &Channel::Responses, Some("codex")).unwrap();
         assert!(route_is_agent_provider_bound(
             &config,
             &request,
             &Channel::Responses,
-            Some("proxy-mode")
+            Some("codex")
         ));
-        let final_decision = if route_is_agent_provider_bound(
-            &config,
-            &request,
-            &Channel::Responses,
-            Some("proxy-mode"),
-        ) {
-            decision
-        } else {
-            apply_provider_route_affinity(
-                &config,
-                decision,
-                &request,
-                &Channel::Responses,
-                Some("ls"),
-            )
-        };
+        let final_decision =
+            if route_is_agent_provider_bound(&config, &request, &Channel::Responses, Some("codex"))
+            {
+                decision
+            } else {
+                apply_provider_route_affinity(
+                    &config,
+                    decision,
+                    &request,
+                    &Channel::Responses,
+                    Some("ls"),
+                )
+            };
 
         assert_eq!(final_decision.provider.id, "bizd");
     }
@@ -15015,20 +15068,20 @@ mod tests {
             },
         ];
         config.active_provider_id = Some("yunshu".to_string());
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter_mut()
-            .find(|agent| agent.id == "proxy-mode")
+            .find(|agent| agent.id == "codex")
             .unwrap();
-        proxy_mode.enabled = true;
-        proxy_mode.provider_id = Some("share".to_string());
-        proxy_mode.model_id = Some("gpt-5.5".to_string());
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("gpt-5.5".to_string());
 
         let decision = decide_route(
             &config,
             &json!({ "model": "orc", "input": "ping" }),
             &Channel::Responses,
-            Some("proxy-mode"),
+            Some("codex"),
         )
         .unwrap();
 
@@ -15037,7 +15090,7 @@ mod tests {
     }
 
     #[test]
-    fn global_local_key_uses_enabled_proxy_mode_route_before_active_provider() {
+    fn global_local_key_uses_active_provider_without_agent_inference() {
         let mut config = AppConfig::default();
         config.providers = vec![
             ProviderConfig {
@@ -15090,14 +15143,14 @@ mod tests {
             },
         ];
         config.active_provider_id = Some("yunshu".to_string());
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter_mut()
-            .find(|agent| agent.id == "proxy-mode")
+            .find(|agent| agent.id == "codex")
             .unwrap();
-        proxy_mode.enabled = true;
-        proxy_mode.provider_id = Some("share".to_string());
-        proxy_mode.model_id = Some("gpt-5.5".to_string());
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("gpt-5.5".to_string());
 
         let decision = decide_route(
             &config,
@@ -15107,12 +15160,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.provider.id, "yunshu");
         assert_eq!(decision.model, "gpt-5.5");
     }
 
     #[test]
-    fn global_local_key_infers_unique_agent_by_channel_and_model() {
+    fn global_local_key_routes_by_active_or_requested_model_without_agent_inference() {
         let mut config = AppConfig::default();
         config.providers = vec![
             ProviderConfig {
@@ -15173,14 +15226,14 @@ mod tests {
         claude_code.enabled = true;
         claude_code.provider_id = Some("anthropic-upstream".to_string());
         claude_code.model_id = Some("claude-opus-4.7".to_string());
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter_mut()
-            .find(|agent| agent.id == "proxy-mode")
+            .find(|agent| agent.id == "codex")
             .unwrap();
-        proxy_mode.enabled = true;
-        proxy_mode.provider_id = Some("share".to_string());
-        proxy_mode.model_id = Some("gpt-5.5".to_string());
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("gpt-5.5".to_string());
 
         let anthropic_decision = decide_route(
             &config,

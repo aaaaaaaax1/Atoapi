@@ -15,6 +15,7 @@ use crate::config::{
 };
 
 const CODEX_PROVIDER_ID: &str = "atoapi";
+const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000345600";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "Atoapi";
 
@@ -46,6 +47,7 @@ pub struct AgentInjectionResult {
 struct InjectionContext {
     anthropic_base_url: String,
     openai_base_url: String,
+    codex_base_url: String,
     local_key: String,
     default_channel: String,
     default_model: String,
@@ -54,21 +56,6 @@ struct InjectionContext {
 pub fn ensure_defaults(config: &mut AppConfig) {
     normalize_agent_injections(&mut config.agent_injections);
     ensure_enabled_agents_have_provider(config);
-    if let Some(provider_id) = config
-        .agent_injections
-        .iter()
-        .find(|item| item.kind == AgentInjectionKind::ProxyMode && item.enabled)
-        .and_then(|item| item.provider_id.as_deref())
-    {
-        if let Some(provider) = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-            .cloned()
-        {
-            sync_proxy_mode_provider(config, &provider);
-        }
-    }
 }
 
 fn ensure_enabled_agents_have_provider(config: &mut AppConfig) {
@@ -163,18 +150,6 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
         item.last_injected_at = Some(Utc::now());
         item.last_status = Some(result.status.clone());
     }
-    if config.agent_injections[index].kind == AgentInjectionKind::ProxyMode {
-        if let Some(provider_id) = config.agent_injections[index].provider_id.as_deref() {
-            if let Some(provider) = config
-                .providers
-                .iter()
-                .find(|provider| provider.id == provider_id)
-                .cloned()
-            {
-                sync_proxy_mode_provider(config, &provider);
-            }
-        }
-    }
     Ok(vec![result])
 }
 
@@ -221,7 +196,7 @@ pub fn update_route(
 
     let provider_id = clean_optional(input.provider_id);
     let model_id = clean_optional(input.model_id);
-    let selected_provider = if let Some(provider_id) = provider_id.as_deref() {
+    if let Some(provider_id) = provider_id.as_deref() {
         let Some(provider) = config
             .providers
             .iter()
@@ -238,31 +213,15 @@ pub fn update_route(
                 ));
             }
         }
-        Some(provider)
-    } else {
-        None
-    };
+    }
 
     config.agent_injections[index].provider_id = provider_id;
     config.agent_injections[index].model_id = model_id;
-    if config.agent_injections[index].kind == AgentInjectionKind::ProxyMode {
-        if let Some(provider) = selected_provider.as_ref() {
-            sync_proxy_mode_provider(config, provider);
-        }
-    }
 
     if config.agent_injections[index].enabled {
         apply_one_by_id(config, &input.id)
     } else {
         Ok(Vec::new())
-    }
-}
-
-fn sync_proxy_mode_provider(config: &mut AppConfig, provider: &ProviderConfig) {
-    config.active_provider_id = Some(provider.id.clone());
-    for profile in config.route_profiles.iter_mut() {
-        profile.provider_id = Some(provider.id.clone());
-        profile.upstream_channel = provider.channel.clone();
     }
 }
 
@@ -371,8 +330,15 @@ impl InjectionContext {
         Self {
             anthropic_base_url: base.clone(),
             openai_base_url: format!("{base}/v1"),
+            codex_base_url: format!("{base}/codex/v1"),
             local_key: item
-                .map(|item| agent_local_key(&config.local_key, &item.id))
+                .map(|item| {
+                    if item.kind == AgentInjectionKind::Codex {
+                        PROXY_TOKEN_PLACEHOLDER.to_string()
+                    } else {
+                        agent_local_key(&config.local_key, &item.id)
+                    }
+                })
                 .unwrap_or_else(|| config.local_key.clone()),
             default_channel: config.default_channel.label().to_string(),
             default_model: model,
@@ -450,7 +416,7 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
             .as_table_mut()
             .ok_or_else(|| anyhow!("model_providers.atoapi must be a table"))?;
         provider["name"] = value("Atoapi");
-        provider["base_url"] = value(context.openai_base_url.as_str());
+        provider["base_url"] = value(context.codex_base_url.as_str());
         provider["wire_api"] = value("responses");
         provider["requires_openai_auth"] = value(true);
         provider["experimental_bearer_token"] = value(context.local_key.as_str());
@@ -696,6 +662,7 @@ command = "npx"
         let context = InjectionContext {
             anthropic_base_url: "http://127.0.0.1:18883".to_string(),
             openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
@@ -715,7 +682,7 @@ command = "npx"
                 .and_then(|value| value.get(CODEX_PROVIDER_ID))
                 .and_then(|value| value.get("base_url"))
                 .and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:18883/v1")
+            Some("http://127.0.0.1:18883/codex/v1")
         );
         assert!(parsed.get("mcp_servers").is_some());
         fs::remove_dir_all(dir).ok();
@@ -731,6 +698,7 @@ command = "npx"
         let context = InjectionContext {
             anthropic_base_url: "http://127.0.0.1:18883".to_string(),
             openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
@@ -750,51 +718,16 @@ command = "npx"
     }
 
     #[test]
-    fn proxy_mode_route_syncs_real_proxy_provider() {
+    fn ensure_defaults_removes_proxy_mode_from_agent_injections() {
         let mut config = AppConfig::default();
-        config.providers.push(ProviderConfig {
-            id: "share".to_string(),
-            name: "share".to_string(),
-            base_url: "https://share.example/v1".to_string(),
-            models_url: None,
-            is_full_url: false,
-            custom_user_agent: None,
-            channel: crate::config::Channel::Responses,
-            prompt_cache_retention_enabled: false,
-            request_body_gzip_enabled: false,
-            api_key_encrypted: None,
-            models: vec![crate::config::ModelConfig {
-                id: "gpt-5.5".to_string(),
-                display_name: "gpt-5.5".to_string(),
-                context_window: Some(128000),
-                output_window: None,
-                supports_tools: true,
-                supports_streaming: true,
-                enabled: true,
-            }],
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        });
 
-        update_route(
-            &mut config,
-            AgentInjectionRouteUpdate {
-                id: "proxy-mode".to_string(),
-                provider_id: Some("share".to_string()),
-                model_id: Some("gpt-5.5".to_string()),
-            },
-        )
-        .unwrap();
+        ensure_defaults(&mut config);
 
-        assert_eq!(config.active_provider_id.as_deref(), Some("share"));
         assert!(config
-            .route_profiles
+            .agent_injections
             .iter()
-            .all(|profile| profile.provider_id.as_deref() == Some("share")
-                && profile.upstream_channel == crate::config::Channel::Responses));
+            .all(|item| item.id != "proxy-mode" && item.kind != AgentInjectionKind::ProxyMode));
     }
-
     #[test]
     fn injection_context_uses_agent_scoped_local_key() {
         let mut config = AppConfig::default();
@@ -827,7 +760,7 @@ command = "npx"
             let item = config
                 .agent_injections
                 .iter_mut()
-                .find(|item| item.id == "proxy-mode")
+                .find(|item| item.id == "claude-code")
                 .unwrap();
             item.provider_id = Some("share".to_string());
             item.model_id = Some("gpt-5.5".to_string());
@@ -835,7 +768,7 @@ command = "npx"
         let item = config
             .agent_injections
             .iter()
-            .find(|item| item.id == "proxy-mode")
+            .find(|item| item.id == "claude-code")
             .unwrap();
 
         let context = InjectionContext::from_config(&config, Some(item));
@@ -843,7 +776,7 @@ command = "npx"
         assert_ne!(context.local_key, "ato-root-key");
         assert_eq!(
             context.local_key,
-            agent_local_key("ato-root-key", "proxy-mode")
+            agent_local_key("ato-root-key", "claude-code")
         );
     }
 
@@ -936,7 +869,7 @@ command = "npx"
         update_route(
             &mut config,
             AgentInjectionRouteUpdate {
-                id: "proxy-mode".to_string(),
+                id: "codex".to_string(),
                 provider_id: Some("torch".to_string()),
                 model_id: Some("gpt-5.5".to_string()),
             },
@@ -948,13 +881,13 @@ command = "npx"
             .iter()
             .find(|item| item.id == "claude-code")
             .unwrap();
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter()
-            .find(|item| item.id == "proxy-mode")
+            .find(|item| item.id == "codex")
             .unwrap();
         assert_eq!(claude_code.provider_id.as_deref(), Some("share"));
-        assert_eq!(proxy_mode.provider_id.as_deref(), Some("torch"));
+        assert_eq!(codex.provider_id.as_deref(), Some("torch"));
     }
 
     #[test]
@@ -967,6 +900,7 @@ command = "npx"
         let context = InjectionContext {
             anthropic_base_url: "http://127.0.0.1:18883".to_string(),
             openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
             local_key: "ato-test".to_string(),
             default_channel: "anthropic".to_string(),
             default_model: "gpt-test".to_string(),

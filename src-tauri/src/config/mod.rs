@@ -1191,7 +1191,11 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
 }
 
 pub fn normalize_agent_injections(items: &mut Vec<AgentInjectionConfig>) {
+    items.retain(|item| item.kind != AgentInjectionKind::ProxyMode && item.id != "proxy-mode");
     for default_item in default_agent_injections() {
+        if default_item.kind == AgentInjectionKind::ProxyMode || default_item.id == "proxy-mode" {
+            continue;
+        }
         if !items.iter().any(|item| item.id == default_item.id) {
             items.push(default_item);
         }

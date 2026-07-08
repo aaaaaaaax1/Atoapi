@@ -545,7 +545,7 @@ impl PersistedRuntimeState {
 mod tests {
     use super::*;
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
-    use serde_json::{json, Value};
+    use serde_json::json;
     use std::fs;
     use uuid::Uuid;
 
@@ -556,7 +556,7 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         fs::create_dir_all(&dir).unwrap();
-        let target_path = dir.join("agent-proxy-mode.json");
+        let target_path = dir.join("codex-config.toml");
         let mut config = AppConfig::default();
         config.host = "127.0.0.1".to_string();
         config.port = 18883;
@@ -587,15 +587,15 @@ mod tests {
             updated_at: Utc::now(),
         });
         config.active_provider_id = Some("share".to_string());
-        let proxy_mode = config
+        let codex = config
             .agent_injections
             .iter_mut()
-            .find(|item| item.kind == AgentInjectionKind::ProxyMode)
+            .find(|item| item.kind == AgentInjectionKind::Codex)
             .unwrap();
-        proxy_mode.enabled = true;
-        proxy_mode.provider_id = Some("share".to_string());
-        proxy_mode.model_id = Some("gpt-5.5".to_string());
-        proxy_mode.target_path = Some(target_path.clone());
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("gpt-5.5".to_string());
+        codex.target_path = Some(target_path.clone());
 
         let state = AppState::for_test(
             config,
@@ -609,16 +609,29 @@ mod tests {
             .await
             .unwrap();
 
-        let value: Value =
-            serde_json::from_str(&fs::read_to_string(&target_path).unwrap()).unwrap();
-        assert_eq!(value["defaultModel"], "gpt-5.5");
-        assert_eq!(value["env"]["OPENAI_BASE_URL"], "http://127.0.0.1:18883/v1");
-        assert_eq!(value["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18883");
+        let value: toml::Value =
+            toml::from_str(&fs::read_to_string(&target_path).unwrap()).unwrap();
+        assert_eq!(
+            value.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            value.get("model_provider").and_then(toml::Value::as_str),
+            Some("atoapi")
+        );
+        assert_eq!(
+            value
+                .get("model_providers")
+                .and_then(|providers| providers.get("atoapi"))
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:18883/codex/v1")
+        );
         let config = state.config.read().await;
         let item = config
             .agent_injections
             .iter()
-            .find(|item| item.id == "proxy-mode")
+            .find(|item| item.id == "codex")
             .unwrap();
         assert!(item.enabled);
         assert_eq!(item.provider_id.as_deref(), Some("share"));
