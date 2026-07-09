@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
-    extract::{Path, State as AxumState},
+    extract::{DefaultBodyLimit, Path, State as AxumState},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -330,6 +330,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(codex_responses_compact),
         )
         .route("/v1/messages", post(messages))
+        .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(state)
 }
 
@@ -11694,6 +11695,50 @@ mod tests {
 
         assert!(!stream);
         assert!(request.get("stream").is_none());
+    }
+
+    #[tokio::test]
+    async fn codex_responses_accepts_large_request_bodies() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-large-body-limit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let body = serde_json::to_vec(&json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": "x".repeat(3 * 1024 * 1024)
+        }))
+        .unwrap();
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/codex/v1/responses"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_ne!(
+            response.status().as_u16(),
+            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            "large local Codex requests must reach the handler instead of Axum's default body limit"
+        );
+
+        fs::remove_dir_all(config_dir).ok();
     }
 
     #[test]

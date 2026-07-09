@@ -125,11 +125,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.75";
+const appVersion = "v0.1.76";
 const appVersionNotes = [
-  "v0.1.75: Codex 普通聊天保持原生 Responses 流式，真实发送体不再携带不兼容缓存字段。",
-  "v0.1.75: Agent 请求自带 model 优先，软件选择的模型只作为兜底。",
-  "v0.1.75: 请求记录新增 agent 标签，便于区分 codex、proxy-mode 和其他注入来源。"
+  "v0.1.76: 本地代理入口支持大 Codex Responses 请求体，避免长历史被本地 413 拦截。",
+  "v0.1.76: 修复大请求未进入 handler 导致请求记录缺失的问题。",
+  "v0.1.76: 普通聊天仍保持原生 Responses 流式，不改变高命中发送边界。"
 ];
 
 const emptyDraft: ProviderDraft = {
