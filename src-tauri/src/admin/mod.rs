@@ -9,7 +9,7 @@ use crate::{
     agent_injection::{
         self, AgentInjectionResult, AgentInjectionRouteUpdate, AgentInjectionUpdate,
     },
-    config::{CacheConfig, Channel, ModelConfig, ProviderInput, PublicConfig},
+    config::{AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput, PublicConfig},
     metrics::MetricsSnapshot,
     state::{AppState, ProxyStatus},
 };
@@ -77,6 +77,12 @@ pub struct ProviderKeyTestResult {
     pub ok: bool,
     pub message: String,
     pub models_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProviderCloneInput {
+    pub agent_id: String,
+    pub provider_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,14 +163,169 @@ pub async fn select_provider(
         .clone();
     config.active_provider_id = Some(provider.id.clone());
     config.default_channel = provider.channel.clone();
-    for profile in config.route_profiles.iter_mut() {
-        profile.provider_id = Some(provider.id.clone());
-        profile.upstream_channel = provider.channel.clone();
-    }
     config.updated_at = Utc::now();
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);
     Ok(state.public_config().await)
+}
+
+#[tauri::command]
+pub async fn clone_provider_for_agent(
+    state: State<'_, Arc<AppState>>,
+    input: AgentProviderCloneInput,
+) -> CommandResult<PublicConfig> {
+    let agent_id = input.agent_id.trim().to_string();
+    let source_provider_id = input.provider_id.trim().to_string();
+    let should_start_proxy = {
+        let mut config = state.config.write().await;
+        let source_provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == source_provider_id)
+            .cloned()
+            .ok_or_else(|| format!("provider {source_provider_id} was not found"))?;
+        let agent_index = config
+            .agent_injections
+            .iter()
+            .position(|agent| agent.id == agent_id)
+            .ok_or_else(|| format!("agent injection {agent_id} was not found"))?;
+        let cloned_id = unique_agent_provider_id(&config, &source_provider.id, &agent_id);
+        let cloned_name = unique_agent_provider_name(
+            &config,
+            &format!(
+                "{} / {}",
+                source_provider.name, config.agent_injections[agent_index].label
+            ),
+        );
+        let now = Utc::now();
+
+        let mut cloned_provider = source_provider.clone();
+        cloned_provider.id = cloned_id.clone();
+        cloned_provider.name = cloned_name;
+        cloned_provider.created_at = now;
+        cloned_provider.updated_at = now;
+        config.providers.push(cloned_provider);
+
+        if let Some(mut pool) = config
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == source_provider.id)
+            .cloned()
+        {
+            pool.provider_id = cloned_id.clone();
+            pool.updated_at = now;
+            config.provider_key_pools.push(pool);
+        }
+        if let Some(mut compact_mode) = config
+            .provider_compact_modes
+            .iter()
+            .find(|item| item.provider_id == source_provider.id)
+            .cloned()
+        {
+            compact_mode.provider_id = cloned_id.clone();
+            compact_mode.updated_at = now;
+            config.provider_compact_modes.push(compact_mode);
+        }
+        if let Some(mut channel_mode) = config
+            .provider_channel_modes
+            .iter()
+            .find(|item| item.provider_id == source_provider.id)
+            .cloned()
+        {
+            channel_mode.provider_id = cloned_id.clone();
+            channel_mode.updated_at = now;
+            config.provider_channel_modes.push(channel_mode);
+        }
+
+        let agent = &mut config.agent_injections[agent_index];
+        agent.provider_id = Some(cloned_id);
+        if agent.model_id.is_none()
+            || !source_provider
+                .models
+                .iter()
+                .any(|model| Some(model.id.as_str()) == agent.model_id.as_deref())
+        {
+            agent.model_id = source_provider
+                .models
+                .iter()
+                .find(|model| model.enabled)
+                .or_else(|| source_provider.models.first())
+                .map(|model| model.id.clone());
+        }
+        agent.last_status = Some("已复制为当前 Agent 独立上游".to_string());
+        config.updated_at = now;
+        config.save(&state.config_path).map_err(to_command_error)?;
+        config.agent_injections[agent_index].enabled
+    };
+
+    if should_start_proxy {
+        if agent_id == "proxy-mode" {
+            state
+                .start_proxy_mode_proxy()
+                .await
+                .map_err(to_command_error)?;
+        } else {
+            state.start_proxy().await.map_err(to_command_error)?;
+        }
+    }
+    Ok(state.public_config().await)
+}
+
+fn unique_agent_provider_id(config: &AppConfig, source_id: &str, agent_id: &str) -> String {
+    let base = format!(
+        "agent-{}-{}",
+        sanitize_provider_id_part(agent_id),
+        sanitize_provider_id_part(source_id)
+    );
+    let mut candidate = base.clone();
+    let mut index = 2;
+    while config
+        .providers
+        .iter()
+        .any(|provider| provider.id == candidate)
+    {
+        candidate = format!("{base}-{index}");
+        index += 1;
+    }
+    candidate
+}
+
+fn unique_agent_provider_name(config: &AppConfig, desired: &str) -> String {
+    let base = desired.trim();
+    let base = if base.is_empty() {
+        "Agent provider"
+    } else {
+        base
+    };
+    let mut candidate = base.to_string();
+    let mut index = 2;
+    while config
+        .providers
+        .iter()
+        .any(|provider| provider.name == candidate)
+    {
+        candidate = format!("{base} ({index})");
+        index += 1;
+    }
+    candidate
+}
+
+fn sanitize_provider_id_part(value: &str) -> String {
+    let mut out = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "provider".to_string()
+    } else {
+        out
+    }
 }
 
 #[tauri::command]

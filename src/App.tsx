@@ -125,11 +125,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.76";
+const appVersion = "v0.1.77";
 const appVersionNotes = [
-  "v0.1.76: 本地代理入口支持大 Codex Responses 请求体，避免长历史被本地 413 拦截。",
-  "v0.1.76: 修复大请求未进入 handler 导致请求记录缺失的问题。",
-  "v0.1.76: 普通聊天仍保持原生 Responses 流式，不改变高命中发送边界。"
+  "v0.1.77: Request records now show inbound/upstream IDs and upstream attempt counts.",
+  "v0.1.77: Editing a shared provider from an Agent page clones it into an isolated Agent provider first.",
+  "v0.1.77: Turning Smart Hit off now returns to transparent forwarding without prefix waits or normal session-delta."
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -320,6 +320,32 @@ export default function App() {
     setProviderEditorOpen(true);
     setNotice("");
     setError("");
+  }
+
+  async function editAgentProvider(item: AgentInjectionConfig, provider: ProviderConfig) {
+    if (!config || !providerIsSharedForAgent(config, provider.id, item.id)) {
+      editProvider(provider);
+      return;
+    }
+    setInjectingId(`${item.id}:route`);
+    setError("");
+    setNotice("");
+    try {
+      const nextConfig = await command<AppConfig>("clone_provider_for_agent", {
+        input: { agent_id: item.id, provider_id: provider.id }
+      });
+      setConfig(nextConfig);
+      const updatedAgent = nextConfig.agent_injections.find((candidate) => candidate.id === item.id);
+      const clonedProvider = nextConfig.providers.find(
+        (candidate) => candidate.id === updatedAgent?.provider_id
+      );
+      editProvider(clonedProvider ?? provider);
+      setNotice(`${item.label} 已复制为独立上游，当前编辑不会影响其他 Agent`);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setInjectingId("");
+    }
   }
 
   async function selectProvider(provider: ProviderConfig) {
@@ -840,7 +866,7 @@ export default function App() {
               onCreateProvider={createProvider}
               onProxyModeDraftChange={setProxyModeDraft}
               onSaveProxyModeConfig={() => void saveProxyModeConfig()}
-              onEditProvider={editProvider}
+              onEditProvider={(provider) => void editAgentProvider(selectedAgent, provider)}
               onDeleteProvider={(provider) => void removeProvider(provider)}
             />
           )}
@@ -2291,8 +2317,11 @@ function CachePanel({
                 `用时 ${formatDurationMs(request.total_ms)}`,
                 `输入 ${formatNumber(inputTokens)}`,
                 `输出 ${formatNumber(outputTokens)}`,
-                `缓存命中 ${formatNumber(cacheReadTokens)}`
-              ].join(" · ");
+                `缓存命中 ${formatNumber(cacheReadTokens)}`,
+                request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
+                request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
+                request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
+              ].filter(Boolean).join(" · ");
               return (
                 <div className="request-row" key={request.id}>
                   <div className="request-identity">
@@ -2312,6 +2341,18 @@ function CachePanel({
                     {request.agent_id ? (
                       <span className="request-agent-badge" title={request.agent_label ?? request.agent_id}>
                         {request.agent_id}
+                      </span>
+                    ) : null}
+                    {request.upstream_call_kind && request.upstream_call_kind !== "cache" ? (
+                      <span
+                        className="request-channel-badge"
+                        title={[
+                          request.inbound_request_id ? `入站 ${request.inbound_request_id}` : "",
+                          request.upstream_request_id ? `上游 ${request.upstream_request_id}` : "",
+                          request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
+                        ].filter(Boolean).join(" · ")}
+                      >
+                        调用 {request.upstream_attempt_index ?? 1}/{request.upstream_attempt_total ?? request.upstream_attempts ?? 1}
                       </span>
                     ) : null}
                   </div>
@@ -2498,6 +2539,20 @@ function proxyAddressConflicts(leftHost: string, leftPort: number, rightHost: st
 function normalizeProxyHost(host: string): string {
   const normalized = host.trim().toLowerCase();
   return normalized === "localhost" ? "127.0.0.1" : normalized;
+}
+
+function shortTraceId(id: string): string {
+  return id.length > 8 ? id.slice(0, 8) : id;
+}
+
+function providerIsSharedForAgent(config: AppConfig, providerId: string, agentId: string): boolean {
+  const usedByOtherAgent = config.agent_injections.some(
+    (item) => item.id !== agentId && item.provider_id === providerId
+  );
+  const usedByGlobalRoute =
+    config.active_provider_id === providerId ||
+    Boolean(config.route_profiles?.some((profile) => profile.provider_id === providerId));
+  return usedByOtherAgent || usedByGlobalRoute;
 }
 
 function providerToDraft(provider: ProviderConfig): ProviderDraft {

@@ -915,8 +915,12 @@ async fn handle_responses_compact_for_agent(
 
     let elapsed = started.elapsed().as_millis() as u64;
     let mut request_log = RequestLog {
-        id: request_id,
+        id: request_id.clone(),
         at: Utc::now(),
+        inbound_request_id: Some(request_id.clone()),
+        upstream_request_id: Some(Uuid::new_v4().to_string()),
+        upstream_attempt_index: Some(1),
+        upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
         client_channel: "responses".to_string(),
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
@@ -1202,7 +1206,7 @@ async fn handle_generation_for_agent(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("no-store"))
         .unwrap_or(false);
-    let eligible = !no_store && cache::is_cache_eligible(&client_request);
+    let eligible = config.cache.enabled && !no_store && cache::is_cache_eligible(&client_request);
     let key_material = json!({
         "client_channel": client_channel.label(),
         "upstream_channel": decision.upstream_channel.label(),
@@ -1360,7 +1364,7 @@ async fn handle_generation_for_agent(
             "upstream is cooling down after recent sync failure; retry shortly",
         );
     }
-    let prefix_guard = if skip_prefix_guard_for_sync_responses {
+    let prefix_guard = if skip_prefix_guard_for_sync_responses || !smart_hit_enabled(&config) {
         None
     } else {
         acquire_provider_prefix_guard(
@@ -1420,15 +1424,8 @@ async fn handle_generation_for_agent(
             {
                 diagnostics.cooldown_active = true;
                 if cooldown_skip_reason == "provider_session_delta_unsupported" {
-                    if let Some(compat) =
-                        maybe_prepare_previous_response_compat_body(&state, &upstream_body).await
-                    {
-                        diagnostics.skip_reason = Some(compat.reason.to_string());
-                        (compat.body, diagnostics)
-                    } else {
-                        diagnostics.skip_reason = Some(cooldown_skip_reason);
-                        (upstream_body.clone(), diagnostics)
-                    }
+                    diagnostics.skip_reason = Some(cooldown_skip_reason);
+                    (upstream_body.clone(), diagnostics)
                 } else {
                     diagnostics.skip_reason = Some(cooldown_skip_reason);
                     (upstream_body.clone(), diagnostics)
@@ -2479,8 +2476,12 @@ async fn handle_generation_for_agent(
     }
     let elapsed = started.elapsed().as_millis() as u64;
     let mut request_log = RequestLog {
-        id: request_id,
+        id: request_id.clone(),
         at: Utc::now(),
+        inbound_request_id: Some(request_id.clone()),
+        upstream_request_id: Some(Uuid::new_v4().to_string()),
+        upstream_attempt_index: Some(1),
+        upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
         client_channel: client_channel.label().to_string(),
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
@@ -6366,15 +6367,16 @@ fn truncate_log_message(message: &str) -> String {
 }
 
 fn local_session_keys_enabled(config: &AppConfig) -> bool {
-    config.cache.enabled
-        && matches!(
-            config.cache.mode,
-            CacheMode::SessionPrewarm | CacheMode::PrefixPrewarm
-        )
+    smart_hit_enabled(config)
 }
 
 fn responses_session_reuse_enabled(config: &AppConfig) -> bool {
+    smart_hit_enabled(config)
+}
+
+fn smart_hit_enabled(config: &AppConfig) -> bool {
     config.cache.enabled
+        && config.cache.prewarm_enabled
         && matches!(
             config.cache.mode,
             CacheMode::SessionPrewarm | CacheMode::PrefixPrewarm
@@ -6845,6 +6847,10 @@ async fn record_upstream_transport_failure(
             RequestLog {
                 id: request_id.to_string(),
                 at: Utc::now(),
+                inbound_request_id: Some(request_id.to_string()),
+                upstream_request_id: Some(Uuid::new_v4().to_string()),
+                upstream_attempt_index: Some(1),
+                upstream_attempt_total: Some(1),
                 client_channel: client_channel.label().to_string(),
                 upstream_channel: upstream_channel.label().to_string(),
                 provider: decision.provider.name.clone(),
@@ -7010,6 +7016,10 @@ async fn cache_hit_response(
             RequestLog {
                 id: request_id,
                 at: Utc::now(),
+                inbound_request_id: None,
+                upstream_request_id: None,
+                upstream_attempt_index: None,
+                upstream_attempt_total: None,
                 client_channel: client_channel.label().to_string(),
                 upstream_channel: decision.upstream_channel.label().to_string(),
                 provider: decision.provider.name.clone(),
@@ -8031,8 +8041,12 @@ async fn stream_upstream(
         let ttft_ms = first_chunk_at.unwrap_or(total_ms);
         let upstream_first_chunk_ms = ttft_ms.saturating_sub(upstream_response_headers_at_ms);
         let mut request_log = RequestLog {
-                id: request_id,
+                id: request_id.clone(),
                 at: Utc::now(),
+                inbound_request_id: Some(request_id.clone()),
+                upstream_request_id: Some(Uuid::new_v4().to_string()),
+                upstream_attempt_index: Some(1),
+                upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
                 client_channel: client_channel.label().to_string(),
                 upstream_channel: decision.upstream_channel.label().to_string(),
                 provider: decision.provider.name.clone(),
@@ -8615,7 +8629,8 @@ fn request_agent_log_fields(
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
-    if !config.cache.enabled || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+        strip_provider_cache_key_fields(request);
         return;
     }
 
@@ -12304,6 +12319,48 @@ mod tests {
             key,
             provider_prompt_cache_key(&config, &decision, &request, &Channel::Responses)
         );
+    }
+
+    #[test]
+    fn smart_hit_disabled_strips_provider_cache_fields_and_session_features() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = false;
+        config.cache.prewarm_enabled = false;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let provider = ProviderConfig {
+            id: "share".to_string(),
+            name: "Share".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let mut request = json!({
+            "model": "gpt-5.5",
+            "prompt_cache_key": "client-key",
+            "prompt_cache_retention": "24h",
+            "input": [{ "role": "user", "content": "hello" }]
+        });
+
+        optimize_provider_prefix(&mut request, &config, &decision);
+
+        assert!(request.get("prompt_cache_key").is_none());
+        assert!(request.get("prompt_cache_retention").is_none());
+        assert!(!responses_session_reuse_enabled(&config));
+        assert!(!local_session_keys_enabled(&config));
     }
 
     #[test]
@@ -20211,6 +20268,9 @@ mod tests {
 
         config.cache.mode = CacheMode::SessionPrewarm;
         assert!(responses_session_reuse_enabled(&config));
+
+        config.cache.prewarm_enabled = false;
+        assert!(!responses_session_reuse_enabled(&config));
     }
 
     #[tokio::test]

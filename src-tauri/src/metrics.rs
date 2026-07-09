@@ -194,6 +194,14 @@ pub struct BackgroundPrewarmStats {
 pub struct RequestLog {
     pub id: String,
     pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_attempt_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_attempt_total: Option<u64>,
     pub client_channel: String,
     pub upstream_channel: String,
     pub provider: String,
@@ -1156,6 +1164,10 @@ mod tests {
         RequestLog {
             id: format!("request-{cache_status}"),
             at: Utc::now(),
+            inbound_request_id: None,
+            upstream_request_id: None,
+            upstream_attempt_index: None,
+            upstream_attempt_total: None,
             client_channel: "chat".to_string(),
             upstream_channel: "chat".to_string(),
             provider: "provider".to_string(),

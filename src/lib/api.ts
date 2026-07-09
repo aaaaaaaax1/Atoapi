@@ -200,6 +200,10 @@ export interface MetricsSnapshot {
   recent_requests: Array<{
     id: string;
     at: string;
+    inbound_request_id?: string | null;
+    upstream_request_id?: string | null;
+    upstream_attempt_index?: number | null;
+    upstream_attempt_total?: number | null;
     client_channel: string;
     upstream_channel: string;
     provider: string;
@@ -654,12 +658,48 @@ function fallback(name: string, args?: Record<string, unknown>) {
       ...fallbackConfig,
       active_provider_id: providerId,
       default_channel: provider.channel,
-      route_profiles: fallbackConfig.route_profiles?.map((profile) => ({
-        ...profile,
-        upstream_channel: provider.channel,
-        provider_id: providerId
-      })),
       updated_at: new Date().toISOString()
+    };
+    return fallbackConfig;
+  }
+  if (name === "clone_provider_for_agent") {
+    const input = args?.input as { agent_id?: string; provider_id?: string } | undefined;
+    const agentId = input?.agent_id ?? "";
+    const providerId = input?.provider_id ?? "";
+    const source = fallbackConfig.providers.find((item) => item.id === providerId);
+    if (!agentId || !source) return fallbackConfig;
+    const now = new Date().toISOString();
+    const id = uniquePreviewProviderId(`agent-${agentId}-${providerId}`);
+    const name = uniquePreviewProviderName(`${source.name} / ${agentId}`);
+    const clonedKeyPool = source.key_pool
+      ? { ...source.key_pool, keys: source.key_pool.keys.map((key) => ({ ...key })) }
+      : null;
+    const cloned: ProviderConfig = {
+      ...source,
+      id,
+      name,
+      key_pool: clonedKeyPool,
+      created_at: now,
+      updated_at: now
+    };
+    const secret = fallbackProviderSecrets.get(providerId);
+    if (secret) fallbackProviderSecrets.set(id, secret);
+    for (const item of source.key_pool?.keys ?? []) {
+      const keySecret = fallbackProviderKeySecrets.get(providerKeySecretId(providerId, item.id));
+      if (keySecret) fallbackProviderKeySecrets.set(providerKeySecretId(id, item.id), keySecret);
+    }
+    fallbackConfig = {
+      ...fallbackConfig,
+      providers: [...fallbackConfig.providers, cloned],
+      provider_key_pools: clonedKeyPool
+        ? [...(fallbackConfig.provider_key_pools ?? []), { provider_id: id, pool: clonedKeyPool }]
+        : fallbackConfig.provider_key_pools,
+      agent_injections: fallbackConfig.agent_injections.map((item) =>
+        item.id === agentId
+          ? { ...item, provider_id: id, model_id: item.model_id ?? source.models.find((model) => model.enabled)?.id ?? source.models[0]?.id ?? null }
+          : item
+      ),
+      updated_at: now
     };
     return fallbackConfig;
   }
@@ -928,6 +968,28 @@ function inferPreviewModels(baseUrl: string, channel: Channel): ModelConfig[] {
     return [model("gpt-5.2", 400_000), model("gpt-5.2-mini", 400_000)];
   }
   return [model("gpt-5.2", 400_000), model("gpt-5.2-mini", 400_000), model("o4-mini", 200_000)];
+}
+
+function uniquePreviewProviderId(base: string) {
+  const cleanBase = slugify(base);
+  let candidate = cleanBase;
+  let index = 2;
+  while (fallbackConfig.providers.some((provider) => provider.id === candidate)) {
+    candidate = `${cleanBase}-${index}`;
+    index += 1;
+  }
+  return candidate;
+}
+
+function uniquePreviewProviderName(base: string) {
+  const cleanBase = base.trim() || "Agent provider";
+  let candidate = cleanBase;
+  let index = 2;
+  while (fallbackConfig.providers.some((provider) => provider.name === candidate)) {
+    candidate = `${cleanBase} (${index})`;
+    index += 1;
+  }
+  return candidate;
 }
 
 function slugify(value: string) {
