@@ -391,7 +391,15 @@ pub enum AgentInjectionKind {
     ClaudeCode,
     Codex,
     ClaudeDesktop,
+    Gemini,
+    #[serde(alias = "opencode")]
+    OpenCode,
+    #[serde(alias = "openclaw")]
+    OpenClaw,
+    Hermes,
     ProxyMode,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1155,17 +1163,6 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_status: None,
         },
         AgentInjectionConfig {
-            id: "codex".to_string(),
-            label: "Codex".to_string(),
-            kind: AgentInjectionKind::Codex,
-            enabled: false,
-            provider_id: None,
-            model_id: None,
-            target_path: None,
-            last_injected_at: None,
-            last_status: None,
-        },
-        AgentInjectionConfig {
             id: "claude-desktop".to_string(),
             label: "Claude Desktop".to_string(),
             kind: AgentInjectionKind::ClaudeDesktop,
@@ -1177,8 +1174,63 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_status: None,
         },
         AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+        },
+        AgentInjectionConfig {
+            id: "gemini".to_string(),
+            label: "Gemini".to_string(),
+            kind: AgentInjectionKind::Gemini,
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+        },
+        AgentInjectionConfig {
+            id: "opencode".to_string(),
+            label: "OpenCode".to_string(),
+            kind: AgentInjectionKind::OpenCode,
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+        },
+        AgentInjectionConfig {
+            id: "openclaw".to_string(),
+            label: "OpenClaw".to_string(),
+            kind: AgentInjectionKind::OpenClaw,
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+        },
+        AgentInjectionConfig {
+            id: "hermes".to_string(),
+            label: "Hermes".to_string(),
+            kind: AgentInjectionKind::Hermes,
+            enabled: false,
+            provider_id: None,
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+        },
+        AgentInjectionConfig {
             id: "proxy-mode".to_string(),
-            label: "代理模式".to_string(),
+            label: "本地代理模式".to_string(),
             kind: AgentInjectionKind::ProxyMode,
             enabled: false,
             provider_id: None,
@@ -1191,15 +1243,19 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
 }
 
 pub fn normalize_agent_injections(items: &mut Vec<AgentInjectionConfig>) {
-    items.retain(|item| item.kind != AgentInjectionKind::ProxyMode && item.id != "proxy-mode");
-    for default_item in default_agent_injections() {
-        if default_item.kind == AgentInjectionKind::ProxyMode || default_item.id == "proxy-mode" {
-            continue;
-        }
+    let defaults = default_agent_injections();
+    items.retain(|item| item.kind != AgentInjectionKind::Unknown);
+    for default_item in defaults.iter().cloned() {
         if !items.iter().any(|item| item.id == default_item.id) {
             items.push(default_item);
         }
     }
+    items.sort_by_key(|item| {
+        defaults
+            .iter()
+            .position(|default_item| default_item.id == item.id)
+            .unwrap_or(usize::MAX)
+    });
 }
 
 pub fn app_config_dir() -> Result<PathBuf> {
@@ -1319,6 +1375,29 @@ prewarm_enabled = true
         let config: AppConfig = toml::from_str(raw).expect("legacy config should parse");
         assert!(config.proxy_auto_start);
         assert!(!config.cache.background_prewarm_enabled);
+    }
+
+    #[test]
+    fn unknown_legacy_agent_injection_kind_is_ignored() {
+        let raw = r#"
+id = "legacy-unknown"
+label = "Legacy Unknown"
+kind = "legacy-unknown"
+enabled = true
+"#;
+        let item: AgentInjectionConfig =
+            toml::from_str(raw).expect("legacy agent kind should parse");
+        assert_eq!(item.kind, AgentInjectionKind::Unknown);
+
+        let mut items = vec![item];
+        normalize_agent_injections(&mut items);
+
+        assert!(items
+            .iter()
+            .all(|item| item.kind != AgentInjectionKind::Unknown));
+        assert!(items.iter().all(|item| item.id != "legacy-unknown"));
+        assert!(items.iter().any(|item| item.id == "gemini"));
+        assert!(items.iter().any(|item| item.id == "codex"));
     }
 
     #[test]

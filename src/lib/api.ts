@@ -3,7 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 export type Channel = "chat" | "responses" | "anthropic";
 export type ProviderChannelMode = "auto" | "manual";
 export type CacheMode = "passive-warm" | "session-prewarm" | "prefix-prewarm";
-export type AgentInjectionKind = "claude-code" | "codex" | "claude-desktop";
+export type AgentInjectionKind =
+  | "claude-code"
+  | "claude-desktop"
+  | "codex"
+  | "gemini"
+  | "open-code"
+  | "open-claw"
+  | "hermes"
+  | "proxy-mode";
 export type KeyLoadBalanceStrategy = "round-robin" | "priority" | "least-used" | "random" | "sequential";
 export type ProviderKeyStatus = "unknown" | "healthy" | "unhealthy";
 
@@ -405,8 +413,13 @@ let fallbackConfig: AppConfig = {
   },
   agent_injections: [
     injection("claude-code", "Claude Code", "claude-code"),
+    injection("claude-desktop", "Claude Desktop", "claude-desktop"),
     injection("codex", "Codex", "codex"),
-    injection("claude-desktop", "Claude Desktop", "claude-desktop")
+    injection("gemini", "Gemini", "gemini"),
+    injection("opencode", "OpenCode", "open-code"),
+    injection("openclaw", "OpenClaw", "open-claw"),
+    injection("hermes", "Hermes", "hermes"),
+    injection("proxy-mode", "本地代理模式", "proxy-mode")
   ],
   provider_key_pools: [],
   updated_at: new Date().toISOString(),

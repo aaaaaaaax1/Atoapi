@@ -110,28 +110,37 @@ pub fn set_enabled(
     } else {
         None
     };
-    let Some(item) = config
+    let Some(index) = config
         .agent_injections
-        .iter_mut()
-        .find(|item| item.id == id)
+        .iter()
+        .position(|item| item.id == id)
     else {
         return Err(anyhow!("agent injection {id} was not found"));
     };
-    item.enabled = enabled;
-    if enabled && item.provider_id.is_none() {
-        if let Some(provider) = default_provider.as_ref() {
-            item.provider_id = Some(provider.id.clone());
-            item.model_id = default_agent_model(provider).map(ToOwned::to_owned);
+    let previous = config.agent_injections[index].clone();
+    {
+        let item = &mut config.agent_injections[index];
+        item.enabled = enabled;
+        if enabled && item.provider_id.is_none() {
+            if let Some(provider) = default_provider.as_ref() {
+                item.provider_id = Some(provider.id.clone());
+                item.model_id = default_agent_model(provider).map(ToOwned::to_owned);
+            }
+        }
+        if !enabled {
+            item.last_status = Some("已关闭自动注入".to_string());
+            item.last_injected_at = Some(Utc::now());
+            return Ok(Vec::new());
         }
     }
-    if !enabled {
-        item.last_status = Some("已关闭自动注入".to_string());
-        item.last_injected_at = Some(Utc::now());
-        return Ok(Vec::new());
+    match apply_one_by_id(config, id) {
+        Ok(results) => Ok(results),
+        Err(err) => {
+            config.agent_injections[index] = previous;
+            Err(err)
+        }
     }
-    apply_one_by_id(config, id)
 }
-
 pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
     let Some(index) = config
@@ -215,11 +224,18 @@ pub fn update_route(
         }
     }
 
+    let previous = config.agent_injections[index].clone();
     config.agent_injections[index].provider_id = provider_id;
     config.agent_injections[index].model_id = model_id;
 
     if config.agent_injections[index].enabled {
-        apply_one_by_id(config, &input.id)
+        match apply_one_by_id(config, &input.id) {
+            Ok(results) => Ok(results),
+            Err(err) => {
+                config.agent_injections[index] = previous;
+                Err(err)
+            }
+        }
     } else {
         Ok(Vec::new())
     }
@@ -279,6 +295,47 @@ fn apply_item(
                 "Claude Desktop 3P Profile 已注入本地网关".to_string(),
             )
         }
+        AgentInjectionKind::Gemini => {
+            return Err(anyhow!(
+                "Gemini injection requires a native Gemini generateContent endpoint; Atoapi currently exposes OpenAI/Anthropic/Responses proxy endpoints only"
+            ));
+        }
+        AgentInjectionKind::OpenCode => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(opencode_config_path);
+            let backup = backup_file(&target)?;
+            write_opencode_config(&target, context)?;
+            (
+                Some(target),
+                backup,
+                "OpenCode injected with local OpenAI-compatible proxy".to_string(),
+            )
+        }
+        AgentInjectionKind::OpenClaw => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(openclaw_config_path);
+            let backup = backup_file(&target)?;
+            write_openclaw_config(&target, context)?;
+            (
+                Some(target),
+                backup,
+                "OpenClaw injected with local OpenAI-compatible proxy".to_string(),
+            )
+        }
+        AgentInjectionKind::Hermes => {
+            let target = item.target_path.clone().unwrap_or_else(hermes_config_path);
+            let backup = backup_file(&target)?;
+            write_hermes_config(&target, context)?;
+            (
+                Some(target),
+                backup,
+                "Hermes injected with local OpenAI-compatible proxy".to_string(),
+            )
+        }
         AgentInjectionKind::ProxyMode => {
             let target = item.target_path.clone().unwrap_or_else(|| {
                 app_config_dir()
@@ -287,7 +344,13 @@ fn apply_item(
             });
             let backup = backup_file(&target)?;
             write_proxy_mode_profile(&target, context)?;
-            (Some(target), backup, "代理模式配置已生成".to_string())
+            (Some(target), backup, "本地代理模式配置已生成".to_string())
+        }
+        AgentInjectionKind::Unknown => {
+            return Err(anyhow!(
+                "unsupported agent injection kind for {}",
+                item.label
+            ));
         }
     };
 
@@ -423,6 +486,195 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     }
 
     write_text(path, &doc.to_string())
+}
+
+fn write_opencode_config(path: &Path, context: &InjectionContext) -> Result<()> {
+    let mut value = read_json5_or_empty(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenCode config must be a JSON object"))?;
+    object
+        .entry("$schema".to_string())
+        .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
+    let provider = object
+        .entry("provider".to_string())
+        .or_insert_with(|| json!({}));
+    if !provider.is_object() {
+        *provider = json!({});
+    }
+    provider
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenCode provider must be a JSON object"))?
+        .insert(
+            CODEX_PROVIDER_ID.to_string(),
+            opencode_provider_value(context),
+        );
+    write_json_pretty(path, &value)
+}
+
+fn opencode_provider_value(context: &InjectionContext) -> Value {
+    json!({
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "Atoapi",
+        "options": {
+            "baseURL": context.openai_base_url.clone(),
+            "apiKey": context.local_key.clone()
+        },
+        "models": {
+            context.default_model.clone(): {
+                "name": context.default_model.clone()
+            }
+        }
+    })
+}
+
+fn write_openclaw_config(path: &Path, context: &InjectionContext) -> Result<()> {
+    let mut value = read_json5_or_empty(path)?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw config must be a JSON object"))?;
+
+    let models = object
+        .entry("models".to_string())
+        .or_insert_with(|| json!({}));
+    if !models.is_object() {
+        *models = json!({});
+    }
+    let models = models
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw models must be a JSON object"))?;
+    models.insert("mode".to_string(), Value::String("merge".to_string()));
+    let providers = models
+        .entry("providers".to_string())
+        .or_insert_with(|| json!({}));
+    if !providers.is_object() {
+        *providers = json!({});
+    }
+    providers
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw models.providers must be a JSON object"))?
+        .insert(
+            CODEX_PROVIDER_ID.to_string(),
+            openclaw_provider_value(context),
+        );
+
+    let agents = object
+        .entry("agents".to_string())
+        .or_insert_with(|| json!({}));
+    if !agents.is_object() {
+        *agents = json!({});
+    }
+    let defaults = agents
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw agents must be a JSON object"))?
+        .entry("defaults".to_string())
+        .or_insert_with(|| json!({}));
+    if !defaults.is_object() {
+        *defaults = json!({});
+    }
+    let model = defaults
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw agents.defaults must be a JSON object"))?
+        .entry("model".to_string())
+        .or_insert_with(|| json!({}));
+    if !model.is_object() {
+        *model = json!({});
+    }
+    model
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("OpenClaw agents.defaults.model must be a JSON object"))?
+        .insert(
+            "primary".to_string(),
+            Value::String(format!("{}/{}", CODEX_PROVIDER_ID, context.default_model)),
+        );
+
+    write_json_pretty(path, &value)
+}
+
+fn openclaw_provider_value(context: &InjectionContext) -> Value {
+    json!({
+        "baseUrl": context.openai_base_url.clone(),
+        "apiKey": context.local_key.clone(),
+        "api": "openai-compatible",
+        "models": [
+            {
+                "id": context.default_model.clone(),
+                "name": context.default_model.clone()
+            }
+        ]
+    })
+}
+
+fn write_hermes_config(path: &Path, context: &InjectionContext) -> Result<()> {
+    let mut value = read_hermes_yaml_or_empty(path)?;
+    let root = value
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("Hermes config must be a YAML mapping"))?;
+
+    let mut provider = hermes_provider_value(context);
+    let providers_key = yaml_string("custom_providers");
+    let providers = root
+        .entry(providers_key)
+        .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()));
+    if !providers.is_sequence() {
+        *providers = serde_yaml::Value::Sequence(Vec::new());
+    }
+    let providers = providers
+        .as_sequence_mut()
+        .ok_or_else(|| anyhow!("Hermes custom_providers must be a YAML sequence"))?;
+    if let Some(existing) = providers
+        .iter_mut()
+        .find(|item| item.get("name").and_then(|name| name.as_str()) == Some(CODEX_PROVIDER_ID))
+    {
+        merge_missing_yaml_fields(&mut provider, existing);
+        *existing = provider;
+    } else {
+        providers.push(provider);
+    }
+
+    let model_key = yaml_string("model");
+    let model = root
+        .entry(model_key)
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if !model.is_mapping() {
+        *model = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let model = model
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow!("Hermes model must be a YAML mapping"))?;
+    model.insert(yaml_string("provider"), yaml_string(CODEX_PROVIDER_ID));
+    model.insert(yaml_string("default"), yaml_string(&context.default_model));
+
+    write_hermes_yaml(path, &value)
+}
+
+fn hermes_provider_value(context: &InjectionContext) -> serde_yaml::Value {
+    let mut models = serde_yaml::Mapping::new();
+    models.insert(
+        yaml_string(&context.default_model),
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new()),
+    );
+
+    let mut provider = serde_yaml::Mapping::new();
+    provider.insert(yaml_string("name"), yaml_string(CODEX_PROVIDER_ID));
+    provider.insert(
+        yaml_string("base_url"),
+        yaml_string(&context.openai_base_url),
+    );
+    provider.insert(yaml_string("api_key"), yaml_string(&context.local_key));
+    provider.insert(yaml_string("api_mode"), yaml_string("chat_completions"));
+    provider.insert(yaml_string("model"), yaml_string(&context.default_model));
+    provider.insert(yaml_string("models"), serde_yaml::Value::Mapping(models));
+    serde_yaml::Value::Mapping(provider)
+}
+
+fn merge_missing_yaml_fields(next: &mut serde_yaml::Value, existing: &serde_yaml::Value) {
+    let (Some(next), Some(existing)) = (next.as_mapping_mut(), existing.as_mapping()) else {
+        return;
+    };
+    for (key, value) in existing {
+        next.entry(key.clone()).or_insert_with(|| value.clone());
+    }
 }
 
 fn write_proxy_mode_profile(path: &Path, context: &InjectionContext) -> Result<()> {
@@ -614,8 +866,47 @@ fn read_json_or_empty(path: &Path) -> Result<Value> {
     }
 }
 
+fn read_json5_or_empty(path: &Path) -> Result<Value> {
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    let value = json5::from_str::<Value>(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if value.is_object() {
+        Ok(value)
+    } else {
+        Ok(json!({}))
+    }
+}
+
+fn read_hermes_yaml_or_empty(path: &Path) -> Result<serde_yaml::Value> {
+    if !path.exists() {
+        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    }
+    serde_yaml::from_str::<serde_yaml::Value>(&text)
+        .with_context(|| format!("failed to parse {}", path.display()))
+}
+
 fn write_json_pretty(path: &Path, value: &Value) -> Result<()> {
     write_text(path, &format!("{}\n", serde_json::to_string_pretty(value)?))
+}
+
+fn write_hermes_yaml(path: &Path, value: &serde_yaml::Value) -> Result<()> {
+    write_text(path, &serde_yaml::to_string(value)?)
+}
+
+fn yaml_string(value: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(value.to_string())
 }
 
 fn write_text(path: &Path, text: &str) -> Result<()> {
@@ -631,6 +922,43 @@ fn write_text(path: &Path, text: &str) -> Result<()> {
         })
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn opencode_config_path() -> PathBuf {
+    home_dir()
+        .join(".config")
+        .join("opencode")
+        .join("opencode.json")
+}
+
+fn openclaw_config_path() -> PathBuf {
+    home_dir().join(".openclaw").join("openclaw.json")
+}
+
+fn hermes_config_path() -> PathBuf {
+    hermes_config_dir().join("config.yaml")
+}
+
+fn hermes_config_dir() -> PathBuf {
+    if let Some(raw) = std::env::var_os("HERMES_HOME") {
+        let value = raw.to_string_lossy().trim().to_string();
+        if !value.is_empty() {
+            return PathBuf::from(value);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("hermes")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        home_dir().join(".hermes")
+    }
 }
 
 fn home_dir() -> PathBuf {
@@ -718,7 +1046,7 @@ command = "npx"
     }
 
     #[test]
-    fn ensure_defaults_removes_proxy_mode_from_agent_injections() {
+    fn ensure_defaults_keeps_proxy_mode_as_visible_injection() {
         let mut config = AppConfig::default();
 
         ensure_defaults(&mut config);
@@ -726,7 +1054,7 @@ command = "npx"
         assert!(config
             .agent_injections
             .iter()
-            .all(|item| item.id != "proxy-mode" && item.kind != AgentInjectionKind::ProxyMode));
+            .any(|item| item.id == "proxy-mode" && item.kind == AgentInjectionKind::ProxyMode));
     }
     #[test]
     fn injection_context_uses_agent_scoped_local_key() {
@@ -891,6 +1219,60 @@ command = "npx"
     }
 
     #[test]
+    fn enabled_route_update_rolls_back_when_apply_fails() {
+        let mut config = AppConfig::default();
+        config.providers.push(ProviderConfig {
+            id: "new".to_string(),
+            name: "new".to_string(),
+            base_url: "https://new.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: crate::config::Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-new".to_string(),
+                display_name: "gpt-new".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let gemini = config
+            .agent_injections
+            .iter_mut()
+            .find(|item| item.id == "gemini")
+            .unwrap();
+        gemini.enabled = true;
+        gemini.provider_id = Some("old".to_string());
+        gemini.model_id = Some("gpt-old".to_string());
+
+        let result = update_route(
+            &mut config,
+            AgentInjectionRouteUpdate {
+                id: "gemini".to_string(),
+                provider_id: Some("new".to_string()),
+                model_id: Some("gpt-new".to_string()),
+            },
+        );
+
+        assert!(result.is_err());
+        let gemini = config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == "gemini")
+            .unwrap();
+        assert_eq!(gemini.provider_id.as_deref(), Some("old"));
+        assert_eq!(gemini.model_id.as_deref(), Some("gpt-old"));
+    }
+    #[test]
     fn claude_code_injection_writes_selected_model() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-claude-code-inject-{}",
@@ -914,5 +1296,127 @@ command = "npx"
             json!("http://127.0.0.1:18883")
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn opencode_injection_writes_provider() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-opencode-inject-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("opencode.json");
+        let context = test_context();
+
+        write_opencode_config(&path, &context).unwrap();
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["provider"][CODEX_PROVIDER_ID]["options"]["baseURL"],
+            json!("http://127.0.0.1:18883/v1")
+        );
+        assert_eq!(
+            value["provider"][CODEX_PROVIDER_ID]["options"]["apiKey"],
+            json!("ato-test")
+        );
+        assert!(value["provider"][CODEX_PROVIDER_ID]["models"]["gpt-test"].is_object());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn openclaw_injection_writes_provider_and_default_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-openclaw-inject-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("openclaw.json");
+        let context = test_context();
+
+        write_openclaw_config(&path, &context).unwrap();
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            value["models"]["providers"][CODEX_PROVIDER_ID]["baseUrl"],
+            json!("http://127.0.0.1:18883/v1")
+        );
+        assert_eq!(
+            value["models"]["providers"][CODEX_PROVIDER_ID]["apiKey"],
+            json!("ato-test")
+        );
+        assert_eq!(
+            value["agents"]["defaults"]["model"]["primary"],
+            json!("atoapi/gpt-test")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn hermes_injection_writes_provider_and_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-hermes-inject-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.yaml");
+        let context = test_context();
+
+        write_hermes_config(&path, &context).unwrap();
+
+        let value: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let providers = value
+            .get("custom_providers")
+            .and_then(serde_yaml::Value::as_sequence)
+            .unwrap();
+        let provider = providers
+            .iter()
+            .find(|item| item.get("name").and_then(serde_yaml::Value::as_str) == Some("atoapi"))
+            .unwrap();
+        assert_eq!(
+            provider.get("base_url").and_then(serde_yaml::Value::as_str),
+            Some("http://127.0.0.1:18883/v1")
+        );
+        assert_eq!(
+            provider.get("api_key").and_then(serde_yaml::Value::as_str),
+            Some("ato-test")
+        );
+        assert_eq!(
+            value
+                .get("model")
+                .and_then(|model| model.get("provider"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("atoapi")
+        );
+        assert_eq!(
+            value
+                .get("model")
+                .and_then(|model| model.get("default"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("gpt-test")
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gemini_enable_rolls_back_until_native_endpoint_exists() {
+        let mut config = AppConfig::default();
+        let result = set_enabled(&mut config, "gemini", true);
+
+        assert!(result.is_err());
+        let gemini = config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == "gemini")
+            .unwrap();
+        assert!(!gemini.enabled);
+    }
+
+    fn test_context() -> InjectionContext {
+        InjectionContext {
+            anthropic_base_url: "http://127.0.0.1:18883".to_string(),
+            openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
+            local_key: "ato-test".to_string(),
+            default_channel: "responses".to_string(),
+            default_model: "gpt-test".to_string(),
+        }
     }
 }

@@ -5,6 +5,7 @@ import {
   Bot,
   BrainCircuit,
   Check,
+  Code2,
   ChevronDown,
   Copy,
   DatabaseZap,
@@ -14,12 +15,14 @@ import {
   KeyRound,
   Link2,
   Loader2,
+  Network,
   Play,
   Plus,
   RefreshCw,
   Save,
   Settings2,
   ShieldCheck,
+  Sparkles,
   Square,
   TerminalSquare,
   Trash2,
@@ -121,11 +124,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.67";
+const appVersion = "v0.1.68";
 const appVersionNotes = [
-  "v0.1.67: 增加 Responses 会话级上游亲和，减少同一会话在不同上游之间跳转造成的冷读和大尾巴。",
-  "v0.1.67: 收窄全阶段尾巴保护，只抓超大消息/工具/混合动态尾巴，避免普通短消息和过期小工具尾巴误触发。",
-  "v0.1.67: 保留可避免缺口为 0、最多 +3 秒本地保护、零额外请求、不热补、不恢复普通 main session-delta。"
+  "v0.1.68: 扩展 Agent 注入列表，补齐 OpenCode、OpenClaw、Hermes 的本地代理配置写入。",
+  "v0.1.68: Gemini 暂不伪支持，缺少原生 generateContent 端点时会明确提示并回滚开关。",
+  "v0.1.68: 绑定上游不再自动开启注入，已启用 Agent 切换上游失败会回滚原绑定，避免运行态污染。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -440,11 +443,6 @@ export default function App() {
               model_id: selectedModel ?? null
             }
           });
-          if (!selectedAgent.enabled) {
-            await command<AgentInjectionResult[]>("set_agent_injection_enabled", {
-              input: { id: selectedAgent.id, enabled: true }
-            });
-          }
           nextConfig = await command<AppConfig>("get_config");
         }
       }
@@ -548,7 +546,7 @@ export default function App() {
         setError("请先添加一个上游，然后再开启这个 Agent。");
         return;
       }
-      await activateAgentProvider(item, defaultProvider);
+      await activateAgentProvider(item, defaultProvider, undefined, true);
       return;
     }
     setInjectingId(item.id);
@@ -632,7 +630,8 @@ export default function App() {
   async function activateAgentProvider(
     item: AgentInjectionConfig,
     provider: ProviderConfig,
-    modelId?: string
+    modelId?: string,
+    enableAfterBind = false
   ) {
     const selectedModel =
       modelId ||
@@ -651,14 +650,14 @@ export default function App() {
       });
       let latestConfig = await command<AppConfig>("get_config");
       const latestItem = latestConfig.agent_injections.find((candidate) => candidate.id === item.id);
-      if (!latestItem?.enabled) {
+      if (enableAfterBind && !latestItem?.enabled) {
         await command<AgentInjectionResult[]>("set_agent_injection_enabled", {
           input: { id: item.id, enabled: true }
         });
         latestConfig = await command<AppConfig>("get_config");
       }
       setConfig(latestConfig);
-      setNotice(`${item.label} 已启用并绑定 ${provider.name}`);
+      setNotice(enableAfterBind ? `${item.label} 已启用并绑定 ${provider.name}` : `${item.label} 已绑定 ${provider.name}，未打开开关时不会注入`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -2569,13 +2568,18 @@ function MetricTile({ label, value }: { label: string; value: string }) {
 
 function agentIcon(kind: AgentInjectionConfig["kind"]) {
   if (kind === "claude-code") return <TerminalSquare size={18} />;
-  if (kind === "codex") return <BrainCircuit size={18} />;
   if (kind === "claude-desktop") return <Bot size={18} />;
+  if (kind === "codex") return <BrainCircuit size={18} />;
+  if (kind === "gemini") return <Sparkles size={18} />;
+  if (kind === "open-code") return <Code2 size={18} />;
+  if (kind === "open-claw") return <Workflow size={18} />;
+  if (kind === "hermes") return <Zap size={18} />;
+  if (kind === "proxy-mode") return <Network size={18} />;
   return <Workflow size={18} />;
 }
 
 function visibleAgentInjections(items: AgentInjectionConfig[]): AgentInjectionConfig[] {
-  return items.filter((item) => item.id !== "proxy-mode");
+  return items;
 }
 function providerToDraft(provider: ProviderConfig): ProviderDraft {
   return {
