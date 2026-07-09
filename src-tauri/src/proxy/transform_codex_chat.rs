@@ -42,7 +42,6 @@ pub(crate) struct CodexChatReasoningConfig {
     pub(crate) thinking_param: Option<String>,
     pub(crate) effort_param: Option<String>,
     pub(crate) effort_value_mode: Option<String>,
-    pub(crate) output_format: Option<String>,
 }
 
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -733,40 +732,6 @@ fn ensure_tool_call_reasoning_content(message: &mut Value) {
             Value::String("tool call".to_string()),
         );
     }
-}
-
-fn attach_reasoning_to_last_assistant(
-    messages: &mut [Value],
-    last_assistant_index: Option<usize>,
-    reasoning: &Option<String>,
-) -> bool {
-    let Some(reasoning) = reasoning
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    else {
-        return true;
-    };
-    let Some(index) = last_assistant_index else {
-        return false;
-    };
-    let Some(message) = messages.get_mut(index) else {
-        return false;
-    };
-    if message.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-        return false;
-    }
-
-    if let Some(obj) = message.as_object_mut() {
-        append_reasoning_content(obj, reasoning);
-        return true;
-    }
-
-    false
-}
-
-fn responses_message_reasoning_text(item: &Value) -> Option<String> {
-    responses_item_reasoning_text(item)
 }
 
 fn responses_item_reasoning_text(item: &Value) -> Option<String> {
@@ -1522,68 +1487,4 @@ pub(crate) fn response_status_from_finish_reason(finish_reason: Option<&str>) ->
         Some("length") => "incomplete",
         _ => "completed",
     }
-}
-
-pub fn chat_error_to_response_error(body: Option<&Value>) -> Value {
-    let Some(value) = body else {
-        return json!({
-            "error": {
-                "message": "Upstream returned an empty error response",
-                "type": "upstream_error",
-                "code": serde_json::Value::Null,
-                "param": serde_json::Value::Null,
-            }
-        });
-    };
-
-    if let Some(text) = value.as_str() {
-        return json!({
-            "error": {
-                "message": text,
-                "type": "upstream_error",
-                "code": serde_json::Value::Null,
-                "param": serde_json::Value::Null,
-            }
-        });
-    }
-
-    let source = value.get("error").unwrap_or(value);
-
-    let message = source
-        .get("message")
-        .or_else(|| source.get("detail"))
-        .or_else(|| source.get("status_msg"))
-        .or_else(|| source.pointer("/base_resp/status_msg"))
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .or_else(|| source.as_str().map(ToString::to_string))
-        .unwrap_or_else(|| {
-            serde_json::to_string(source).unwrap_or_else(|_| "Upstream error".to_string())
-        });
-
-    let error_type = source
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| "upstream_error".to_string());
-
-    let code = source
-        .get("code")
-        .cloned()
-        .or_else(|| source.pointer("/base_resp/status_code").cloned())
-        .unwrap_or(serde_json::Value::Null);
-
-    let param = source
-        .get("param")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-
-    json!({
-        "error": {
-            "message": message,
-            "type": error_type,
-            "code": code,
-            "param": param,
-        }
-    })
 }

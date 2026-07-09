@@ -45,6 +45,7 @@ pub struct AppState {
     pub prefix_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub prefix_states: Mutex<HashMap<String, PrefixWarmState>>,
     pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -167,6 +168,7 @@ impl AppState {
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(runtime_state.prefix_states),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
@@ -196,6 +198,7 @@ impl AppState {
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(HashMap::new()),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
+            #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),

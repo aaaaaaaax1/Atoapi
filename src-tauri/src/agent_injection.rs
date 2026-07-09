@@ -14,8 +14,7 @@ use crate::config::{
     AppConfig, ProviderConfig,
 };
 
-const CODEX_PROVIDER_ID: &str = "atoapi";
-const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
+const CODEX_PROVIDER_ID: &str = "custom";
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000345600";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "Atoapi";
 
@@ -408,13 +407,7 @@ impl InjectionContext {
             openai_base_url: format!("{base}/v1"),
             codex_base_url: format!("{base}/codex/v1"),
             local_key: item
-                .map(|item| {
-                    if item.kind == AgentInjectionKind::Codex {
-                        PROXY_TOKEN_PLACEHOLDER.to_string()
-                    } else {
-                        agent_local_key(&config.local_key, &item.id)
-                    }
-                })
+                .map(|item| agent_local_key(&config.local_key, &item.id))
                 .unwrap_or_else(|| config.local_key.clone()),
             default_channel: config.default_channel.label().to_string(),
             default_model: model,
@@ -1119,6 +1112,22 @@ command = "npx"
             context.local_key,
             agent_local_key("ato-root-key", "claude-code")
         );
+    }
+
+    #[test]
+    fn codex_injection_context_uses_agent_scoped_local_key() {
+        let mut config = AppConfig::default();
+        config.local_key = "ato-root-key".to_string();
+        let item = config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == "codex")
+            .unwrap();
+
+        let context = InjectionContext::from_config(&config, Some(item));
+
+        assert_ne!(context.local_key, "PROXY_MANAGED");
+        assert_eq!(context.local_key, agent_local_key("ato-root-key", "codex"));
     }
 
     #[test]

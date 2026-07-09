@@ -125,11 +125,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.72";
+const appVersion = "v0.1.73";
 const appVersionNotes = [
-  "v0.1.72: Codex Responses 自动前置走 Chat 兼容上游，再真流式回转为 Responses SSE。",
-  "v0.1.72: 迁入 ccswitch 的 Codex Chat/Responses 工具与流式事件映射，避免原生 /responses 400。",
-  "v0.1.72: 新增回归测试，确保 Codex 请求只打 /chat/completions，不再碰不兼容的 /responses。"
+  "v0.1.73: Codex Responses 上游恢复原生 /responses 转发，只有 Chat 上游才走兼容转换。",
+  "v0.1.73: 移除成功请求后的后台补热入口，避免流式后一条额外同步请求。",
+  "v0.1.73: 上游 transport 失败也写入请求记录，便于排查同步/流式错误。"
 ];
 
 const emptyDraft: ProviderDraft = {

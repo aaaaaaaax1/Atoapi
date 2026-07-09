@@ -41,14 +41,16 @@ mod sse;
 mod streaming_codex_chat;
 mod transform_codex_chat;
 
-const FOREGROUND_PREWARM_MAX_FULL_BODY_BYTES: usize = 1_500_000;
+#[cfg(test)]
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
+#[cfg(test)]
 const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
 const PREFIX_ERROR_COOLDOWN_SECS: u64 = 45;
 const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 30;
 const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 2 * 60;
 const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 5 * 60;
 const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+#[cfg(test)]
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
@@ -1535,6 +1537,25 @@ async fn handle_generation_for_agent(
     {
         Ok(response) => response,
         Err(err) => {
+            record_upstream_transport_failure(
+                &state,
+                &request_id,
+                &started,
+                &client_channel,
+                &active_request_channel,
+                &decision,
+                eligible.then_some(metrics_cache_key.as_str()),
+                provider_prefix_key.as_deref(),
+                provider_prefix_fingerprint.as_deref(),
+                &prefix_guard_wait,
+                local_prepare_ms,
+                &diagnostics,
+                &active_upstream_body,
+                active_used_response_session,
+                &response_session_reuse_diagnostics,
+                "main-transport",
+            )
+            .await;
             state
                 .metrics
                 .record_error("upstream_transport", &err.to_string())
@@ -1586,6 +1607,25 @@ async fn handle_generation_for_agent(
         {
             Ok(response) => response,
             Err(err) => {
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &active_request_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &active_upstream_body,
+                    active_used_response_session,
+                    &response_session_reuse_diagnostics,
+                    "provider-key-failover-transport",
+                )
+                .await;
                 state
                     .metrics
                     .record_error("upstream_transport", &err.to_string())
@@ -1682,6 +1722,25 @@ async fn handle_generation_for_agent(
         {
             Ok(response) => response,
             Err(err) => {
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &active_request_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &active_upstream_body,
+                    active_used_response_session,
+                    &response_session_reuse_diagnostics,
+                    "session-delta-full-retry-transport",
+                )
+                .await;
                 state
                     .metrics
                     .record_error("upstream_transport", &err.to_string())
@@ -1904,6 +1963,25 @@ async fn handle_generation_for_agent(
             {
                 Ok(response) => response,
                 Err(err) => {
+                    record_upstream_transport_failure(
+                        &state,
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &decision.upstream_channel,
+                        &decision,
+                        eligible.then_some(metrics_cache_key.as_str()),
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        "payload-too-large-rescue-transport",
+                    )
+                    .await;
                     state
                         .metrics
                         .record_error("upstream_transport", &err.to_string())
@@ -1972,6 +2050,25 @@ async fn handle_generation_for_agent(
                 {
                     Ok(response) => response,
                     Err(err) => {
+                        record_upstream_transport_failure(
+                            &state,
+                            &request_id,
+                            &started,
+                            &client_channel,
+                            &decision.upstream_channel,
+                            &decision,
+                            eligible.then_some(metrics_cache_key.as_str()),
+                            provider_prefix_key.as_deref(),
+                            provider_prefix_fingerprint.as_deref(),
+                            &prefix_guard_wait,
+                            local_prepare_ms,
+                            &diagnostics,
+                            &active_upstream_body,
+                            active_used_response_session,
+                            &response_session_reuse_diagnostics,
+                            "payload-too-large-full-retry-transport",
+                        )
+                        .await;
                         state
                             .metrics
                             .record_error("upstream_transport", &err.to_string())
@@ -2042,8 +2139,6 @@ async fn handle_generation_for_agent(
             full_response_input.clone(),
             active_used_response_session,
             retried_full_response,
-            active_url.clone(),
-            api_key.clone(),
             active_upstream_body.clone(),
             diagnostics.clone(),
             tail_input_diagnostics.clone(),
@@ -2483,22 +2578,6 @@ async fn handle_generation_for_agent(
     apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
     state.metrics.record_request(request_log, true).await;
 
-    if is_success_status {
-        maybe_spawn_background_prewarm(
-            state.clone(),
-            &config,
-            &decision,
-            &url,
-            &api_key,
-            &decision.upstream_channel,
-            &active_upstream_body,
-            prefix_state_update_key.as_deref(),
-            usage_record.as_ref(),
-            gap_breakdown.as_ref(),
-        )
-        .await;
-    }
-
     if eligible && is_success_status {
         insert_cache_entries(
             &state,
@@ -2759,6 +2838,7 @@ async fn response_session_cooldown_skip_reason(
     }
 }
 
+#[cfg(test)]
 async fn note_response_session_error_cooldown(state: &AppState, key: Option<&str>) {
     note_response_session_error_cooldown_internal(state, key, false).await;
 }
@@ -2859,6 +2939,7 @@ fn response_session_error_cooldown_secs(failures: u32, unsupported: bool) -> u64
     }
 }
 
+#[cfg(test)]
 async fn is_prefix_prewarm_cooled_down(state: &AppState, provider_prefix_key: &str) -> bool {
     let mut cooldowns = state.prefix_prewarm_cooldowns.lock().await;
     match cooldowns.get(provider_prefix_key).copied() {
@@ -2871,6 +2952,7 @@ async fn is_prefix_prewarm_cooled_down(state: &AppState, provider_prefix_key: &s
     }
 }
 
+#[cfg(test)]
 async fn note_prefix_prewarm_cooldown(
     state: &AppState,
     provider_prefix_key: &str,
@@ -2893,6 +2975,7 @@ fn should_cooldown_responses_sync_main_after_status(status: u16) -> bool {
     matches!(status, 400 | 408 | 413 | 429 | 500..=599)
 }
 
+#[cfg(test)]
 fn should_cooldown_prefix_after_prewarm_status(status: u16) -> bool {
     status == 429
 }
@@ -3738,6 +3821,7 @@ fn provider_prefix_wait_reason_for_channel(
     }
 }
 
+#[cfg(test)]
 fn responses_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDuration {
     responses_provider_prefix_settle_delay_with_tail(state, &TailInputDiagnostics::default())
 }
@@ -4396,6 +4480,7 @@ fn responses_current_tail_makes_avoidable_unreliable(current_tail: &TailInputDia
     false
 }
 
+#[cfg(test)]
 async fn update_provider_prefix_state(
     state: &AppState,
     provider_prefix_key: Option<&str>,
@@ -6692,120 +6777,154 @@ fn apply_tail_input_diagnostics(log: &mut RequestLog, diagnostics: &TailInputDia
     log.tail_source = diagnostics.source.clone();
 }
 
-async fn record_prewarm_upstream_observation(
+fn request_body_stream_flag(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_upstream_transport_failure(
     state: &AppState,
+    request_id: &str,
+    started: &Instant,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
     decision: &RouteDecision,
-    channel: &Channel,
-    source: &str,
-    status: u16,
-    total_ms: u64,
+    cache_key: Option<&str>,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_fingerprint: Option<&str>,
+    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
+    local_prepare_ms: u64,
+    body_diagnostics: &BodyDiagnostics,
     body: &Value,
-    prefix_state_key: Option<&str>,
-    bytes: Option<&[u8]>,
+    used_response_session: bool,
+    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    source: &str,
 ) {
-    let usage_record = bytes.map(provider_usage_from_bytes);
-    let gap_breakdown =
-        provider_cache_gap_breakdown(state, prefix_state_key, None, usage_record.as_ref(), None)
-            .await;
-    let body_bytes = serialized_body_len(channel, body);
-    let send_body_is_delta =
-        matches!(channel, Channel::Responses) && body.get("previous_response_id").is_some();
+    let elapsed = started.elapsed().as_millis() as u64;
+    let body_bytes = serialized_body_len(upstream_channel, body);
+    let original_body_bytes = if body_diagnostics.original_body_bytes > 0 {
+        body_diagnostics.original_body_bytes
+    } else {
+        body_bytes
+    };
+    let send_body_bytes = if body_diagnostics.send_body_bytes > 0 {
+        body_diagnostics.send_body_bytes
+    } else {
+        body_bytes
+    };
+
     state
         .metrics
-        .record_upstream_observation(RequestLog {
-            id: Uuid::new_v4().to_string(),
-            at: Utc::now(),
-            client_channel: "prewarm".to_string(),
-            upstream_channel: channel.label().to_string(),
-            provider: decision.provider.name.clone(),
-            model: usage_record
-                .as_ref()
-                .map(|record| {
-                    if record.model == "unknown" {
-                        decision.model.clone()
+        .record_request(
+            RequestLog {
+                id: request_id.to_string(),
+                at: Utc::now(),
+                client_channel: client_channel.label().to_string(),
+                upstream_channel: upstream_channel.label().to_string(),
+                provider: decision.provider.name.clone(),
+                model: decision.model.clone(),
+                cache_status: "error".to_string(),
+                upstream_call_kind: Some(
+                    if request_body_stream_flag(body) {
+                        "stream"
                     } else {
-                        record.model.clone()
+                        "sync"
                     }
-                })
-                .unwrap_or_else(|| decision.model.clone()),
-            cache_status: "prewarm".to_string(),
-            upstream_call_kind: Some("prewarm-sync".to_string()),
-            upstream_call_source: Some(source.to_string()),
-            cache_key: None,
-            provider_prefix_key: None,
-            provider_prefix_fingerprint: prefix_state_key.map(ToOwned::to_owned),
-            provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
-            prefix_guard_wait_ms: None,
-            prefix_guard_wait_reason: None,
-            prefix_guard_wait_source: None,
-            prefix_guard_skip_reason: None,
-            prefix_guard_wait_effect: None,
-            prefix_lag_classification: None,
-            prefix_lag_input_delta_tokens: None,
-            prefix_lag_cache_delta_tokens: None,
-            prefix_lag_previous_gap_tokens: None,
-            prefix_cache_instability_score: None,
-            prefix_seen_bucket_tokens: None,
-            prefix_state_cache_read_tokens: None,
-            status,
-            ttft_ms: total_ms,
-            upstream_ttft_ms: Some(upstream_ttft_ms(total_ms, None)),
-            local_prepare_ms: None,
-            upstream_headers_ms: None,
-            upstream_first_chunk_ms: None,
-            aggregate_done_ms: None,
-            upstream_retry_wait_ms: None,
-            upstream_attempts: None,
-            request_body_bytes: Some(body_bytes),
-            sent_body_bytes: Some(body_bytes),
-            gzip_attempted: Some(false),
-            gzip_fallback_used: Some(false),
-            upstream_header_wait_class: None,
-            total_ms,
-            input_tokens: usage_record.as_ref().map(|record| record.input_tokens),
-            output_tokens: usage_record.as_ref().map(|record| record.output_tokens),
-            cache_read_tokens: usage_record.as_ref().map(|record| record.cache_read_tokens),
-            cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
-            cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
-            cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
-            provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
-            tail_input_items: None,
-            tail_message_chars: None,
-            tail_tool_call_chars: None,
-            tail_tool_output_chars: None,
-            tail_largest_tool_output_chars: None,
-            tail_tool_output_lines: None,
-            tail_tool_output_repeated_line_chars: None,
-            tail_tool_output_timestamp_like_count: None,
-            tail_tool_output_path_like_count: None,
-            tail_tool_output_url_like_count: None,
-            tail_tool_output_hash_like_count: None,
-            tail_tool_output_json_like_chars: None,
-            tail_tool_output_noise_hint: None,
-            tail_source: None,
-            response_session_reused: Some(send_body_is_delta),
-            response_session_candidate_count: None,
-            response_session_skip_reason: None,
-            response_session_exact_key_hit: None,
-            response_session_scope_match_count: None,
-            response_session_append_delta_match: None,
-            response_session_delta_items: None,
-            response_session_cooldown_active: None,
-            response_session_rejected_status: None,
-            session_anchor_hash: None,
-            session_anchor_source: None,
-            session_anchor_changed: None,
-            session_anchor_peer_count: None,
-            original_body_bytes: Some(body_bytes),
-            send_body_bytes: Some(body_bytes),
-            send_body_is_delta: Some(send_body_is_delta),
-            payload_too_large_rescue_attempted: Some(false),
-            payload_too_large_rescue_used: Some(false),
-            sse_end_reason: None,
-            sse_completed_event_seen: None,
-            sse_done_marker_seen: None,
-            sse_chunks: None,
-        })
+                    .to_string(),
+                ),
+                upstream_call_source: Some(source.to_string()),
+                cache_key: cache_key.map(ToOwned::to_owned),
+                provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
+                provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
+                provider_cache_diagnostic: None,
+                prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
+                prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
+                prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+                prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
+                prefix_guard_wait_effect: None,
+                prefix_lag_classification: None,
+                prefix_lag_input_delta_tokens: None,
+                prefix_lag_cache_delta_tokens: None,
+                prefix_lag_previous_gap_tokens: None,
+                prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
+                prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
+                prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
+                status: 0,
+                ttft_ms: elapsed,
+                upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
+                local_prepare_ms: Some(local_prepare_ms),
+                upstream_headers_ms: Some(0),
+                upstream_first_chunk_ms: None,
+                aggregate_done_ms: None,
+                upstream_retry_wait_ms: Some(0),
+                upstream_attempts: Some(1),
+                request_body_bytes: Some(body_bytes),
+                sent_body_bytes: Some(body_bytes),
+                gzip_attempted: Some(false),
+                gzip_fallback_used: Some(false),
+                upstream_header_wait_class: Some("transport_error".to_string()),
+                total_ms: elapsed,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_shortfall_tokens: None,
+                cache_new_tail_gap_tokens: None,
+                cache_avoidable_gap_tokens: None,
+                provider_cache_token_ratio: None,
+                tail_input_items: None,
+                tail_message_chars: None,
+                tail_tool_call_chars: None,
+                tail_tool_output_chars: None,
+                tail_largest_tool_output_chars: None,
+                tail_tool_output_lines: None,
+                tail_tool_output_repeated_line_chars: None,
+                tail_tool_output_timestamp_like_count: None,
+                tail_tool_output_path_like_count: None,
+                tail_tool_output_url_like_count: None,
+                tail_tool_output_hash_like_count: None,
+                tail_tool_output_json_like_chars: None,
+                tail_tool_output_noise_hint: None,
+                tail_source: None,
+                response_session_reused: Some(used_response_session),
+                response_session_candidate_count: Some(
+                    response_session_reuse_diagnostics.candidate_count,
+                ),
+                response_session_skip_reason: response_session_reuse_diagnostics
+                    .skip_reason
+                    .clone(),
+                response_session_exact_key_hit: Some(
+                    response_session_reuse_diagnostics.exact_key_hit,
+                ),
+                response_session_scope_match_count: Some(
+                    response_session_reuse_diagnostics.scope_match_count,
+                ),
+                response_session_append_delta_match: Some(
+                    response_session_reuse_diagnostics.append_delta_match,
+                ),
+                response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+                response_session_cooldown_active: Some(
+                    response_session_reuse_diagnostics.cooldown_active,
+                ),
+                response_session_rejected_status: response_session_reuse_diagnostics
+                    .rejected_status,
+                session_anchor_hash: None,
+                session_anchor_source: None,
+                session_anchor_changed: None,
+                session_anchor_peer_count: None,
+                original_body_bytes: Some(original_body_bytes),
+                send_body_bytes: Some(send_body_bytes),
+                send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
+                payload_too_large_rescue_attempted: Some(
+                    body_diagnostics.payload_too_large_rescue_attempted,
+                ),
+                payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
+                sse_end_reason: Some("transport_error".to_string()),
+                sse_completed_event_seen: None,
+                sse_done_marker_seen: None,
+                sse_chunks: None,
+            },
+            true,
+        )
         .await;
 }
 
@@ -7000,316 +7119,7 @@ async fn insert_cache_entries(
     }
 }
 
-async fn maybe_spawn_background_prewarm(
-    state: Arc<AppState>,
-    config: &AppConfig,
-    decision: &RouteDecision,
-    url: &str,
-    upstream_auth: &str,
-    channel: &Channel,
-    body: &Value,
-    provider_prefix_control_key: Option<&str>,
-    usage_record: Option<&UsageRecord>,
-    gap_breakdown: Option<&ProviderCacheGapBreakdown>,
-) {
-    if !should_background_prewarm(config, channel, usage_record, gap_breakdown) {
-        return;
-    }
-    let Some(prefix_key) = provider_prefix_control_key else {
-        return;
-    };
-    if is_prefix_error_cooled_down(&state, prefix_key).await {
-        state
-            .metrics
-            .record_error(
-                "background_prewarm_skip",
-                "responses skip_reason=prefix_error_cooldown",
-            )
-            .await;
-        return;
-    }
-    if is_prefix_prewarm_cooled_down(&state, prefix_key).await {
-        state
-            .metrics
-            .record_error(
-                "background_prewarm_skip",
-                "responses skip_reason=prewarm_cooldown",
-            )
-            .await;
-        return;
-    }
-    note_prefix_prewarm_cooldown(
-        &state,
-        prefix_key,
-        std::time::Duration::from_secs(PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS),
-    )
-    .await;
-
-    let state_for_task = state.clone();
-    let decision_for_task = decision.clone();
-    let url = url.to_string();
-    let auth_header_value = upstream_auth.to_owned();
-    let channel = channel.clone();
-    let channel_label = channel.label().to_string();
-    let mut prewarm_body = body.clone();
-    prepare_background_prewarm_body(&channel, &mut prewarm_body);
-    if !prewarm_body
-        .get("previous_response_id")
-        .is_some_and(|value| value.is_string())
-        && matches!(channel, Channel::Responses)
-        && serde_json::to_vec(&prewarm_body)
-            .map(|bytes| bytes.len() > FOREGROUND_PREWARM_MAX_FULL_BODY_BYTES)
-            .unwrap_or(false)
-    {
-        state
-            .metrics
-            .record_error(
-                "background_prewarm_skipped_payload_guard",
-                "skip full-body background prewarm to avoid upstream 413",
-            )
-            .await;
-        return;
-    }
-    let lock_key = format!("background-prewarm:{prefix_key}");
-    let prefix_state_key = prefix_key.to_string();
-    let trigger_new_tail_tokens = gap_breakdown
-        .map(|gap| gap.new_tail_tokens)
-        .unwrap_or_default();
-    let trigger_avoidable_tokens = gap_breakdown
-        .map(|gap| gap.avoidable_tokens)
-        .unwrap_or_default();
-    let second_stage_prewarm_count =
-        responses_prewarm_bucket_count(&channel, usage_record, gap_breakdown);
-    state
-        .metrics
-        .record_background_prewarm_attempt(
-            &channel_label,
-            trigger_new_tail_tokens,
-            trigger_avoidable_tokens,
-        )
-        .await;
-
-    tokio::spawn(async move {
-        let _guard = acquire_named_prefix_guard(&state_for_task, &lock_key).await;
-        sleep(TokioDuration::from_millis(150)).await;
-        let prewarm_started = Instant::now();
-        match send_upstream_request(
-            &state_for_task,
-            &url,
-            &auth_header_value,
-            &channel,
-            &prewarm_body,
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let bytes = match response.bytes().await {
-                    Ok(bytes) => bytes.to_vec(),
-                    Err(err) => {
-                        state_for_task
-                            .metrics
-                            .record_error("background_prewarm_body", &err.to_string())
-                            .await;
-                        return;
-                    }
-                };
-                record_prewarm_upstream_observation(
-                    &state_for_task,
-                    &decision_for_task,
-                    &channel,
-                    "background_prewarm",
-                    status.as_u16(),
-                    prewarm_started.elapsed().as_millis() as u64,
-                    &prewarm_body,
-                    Some(&prefix_state_key),
-                    Some(&bytes),
-                )
-                .await;
-                if !status.is_success() {
-                    let summary = upstream_error_summary(&bytes);
-                    if should_cooldown_prefix_after_prewarm_status(status.as_u16()) {
-                        note_prefix_error_cooldown(&state_for_task, Some(&prefix_state_key)).await;
-                    }
-                    state_for_task
-                        .metrics
-                        .record_error("background_prewarm_status", &summary)
-                        .await;
-                    return;
-                }
-                clear_prefix_error_cooldown(&state_for_task, Some(&prefix_state_key)).await;
-                let record = provider_usage_from_bytes(&bytes);
-                if record.has_usage() {
-                    let record = UsageRecord {
-                        provider: decision_for_task.provider.name.clone(),
-                        model: if record.model == "unknown" {
-                            decision_for_task.model.clone()
-                        } else {
-                            record.model
-                        },
-                        ..record
-                    };
-                    state_for_task
-                        .metrics
-                        .record_background_prewarm_success(&channel_label, &record)
-                        .await;
-                    update_provider_prefix_state(
-                        &state_for_task,
-                        Some(&prefix_state_key),
-                        Some(&record),
-                        false,
-                        false,
-                    )
-                    .await;
-                    for _ in 0..second_stage_prewarm_count {
-                        sleep(TokioDuration::from_millis(650)).await;
-                        if !run_background_bucket_prewarm_once(
-                            &state_for_task,
-                            &decision_for_task,
-                            &url,
-                            &auth_header_value,
-                            &channel,
-                            &channel_label,
-                            &prewarm_body,
-                            &prefix_state_key,
-                            trigger_new_tail_tokens,
-                            trigger_avoidable_tokens,
-                        )
-                        .await
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                record_prewarm_upstream_observation(
-                    &state_for_task,
-                    &decision_for_task,
-                    &channel,
-                    "background_prewarm",
-                    0,
-                    prewarm_started.elapsed().as_millis() as u64,
-                    &prewarm_body,
-                    Some(&prefix_state_key),
-                    None,
-                )
-                .await;
-                state_for_task
-                    .metrics
-                    .record_error("background_prewarm_transport", &err.to_string())
-                    .await;
-            }
-        }
-    });
-}
-
-async fn run_background_bucket_prewarm_once(
-    state: &AppState,
-    decision: &RouteDecision,
-    url: &str,
-    auth_header_value: &str,
-    channel: &Channel,
-    channel_label: &str,
-    prewarm_body: &Value,
-    prefix_state_key: &str,
-    trigger_new_tail_tokens: u64,
-    trigger_avoidable_tokens: u64,
-) -> bool {
-    state
-        .metrics
-        .record_background_prewarm_attempt(
-            channel_label,
-            trigger_new_tail_tokens,
-            trigger_avoidable_tokens,
-        )
-        .await;
-    let prewarm_started = Instant::now();
-    match send_upstream_request(state, url, auth_header_value, channel, prewarm_body).await {
-        Ok(response) => {
-            let status = response.status();
-            let bytes = match response.bytes().await {
-                Ok(bytes) => bytes.to_vec(),
-                Err(err) => {
-                    state
-                        .metrics
-                        .record_error("background_prewarm_bucket_body", &err.to_string())
-                        .await;
-                    return false;
-                }
-            };
-            record_prewarm_upstream_observation(
-                state,
-                decision,
-                channel,
-                "background_bucket_prewarm",
-                status.as_u16(),
-                prewarm_started.elapsed().as_millis() as u64,
-                prewarm_body,
-                Some(prefix_state_key),
-                Some(&bytes),
-            )
-            .await;
-            if !status.is_success() {
-                let summary = upstream_error_summary(&bytes);
-                if should_cooldown_prefix_after_prewarm_status(status.as_u16()) {
-                    note_prefix_error_cooldown(state, Some(prefix_state_key)).await;
-                }
-                state
-                    .metrics
-                    .record_error("background_prewarm_bucket_status", &summary)
-                    .await;
-                return false;
-            }
-            clear_prefix_error_cooldown(state, Some(prefix_state_key)).await;
-            let record = provider_usage_from_bytes(&bytes);
-            if record.has_usage() {
-                let record = UsageRecord {
-                    provider: decision.provider.name.clone(),
-                    model: if record.model == "unknown" {
-                        decision.model.clone()
-                    } else {
-                        record.model
-                    },
-                    ..record
-                };
-                state
-                    .metrics
-                    .record_background_prewarm_success(channel_label, &record)
-                    .await;
-                update_provider_prefix_state(
-                    state,
-                    Some(prefix_state_key),
-                    Some(&record),
-                    false,
-                    false,
-                )
-                .await;
-            }
-            true
-        }
-        Err(err) => {
-            record_prewarm_upstream_observation(
-                state,
-                decision,
-                channel,
-                "background_bucket_prewarm",
-                0,
-                prewarm_started.elapsed().as_millis() as u64,
-                prewarm_body,
-                Some(prefix_state_key),
-                None,
-            )
-            .await;
-            state
-                .metrics
-                .record_error("background_prewarm_bucket_transport", &err.to_string())
-                .await;
-            false
-        }
-    }
-}
-
+#[cfg(test)]
 fn responses_prewarm_bucket_count(
     channel: &Channel,
     usage_record: Option<&UsageRecord>,
@@ -7359,6 +7169,7 @@ fn responses_prewarm_bucket_count(
     0
 }
 
+#[cfg(test)]
 fn responses_foreground_prewarm_settle_delay(
     trigger_tokens: u64,
     record: &UsageRecord,
@@ -7380,6 +7191,7 @@ fn responses_foreground_prewarm_settle_delay(
     }
 }
 
+#[cfg(test)]
 fn foreground_prewarm_responses_missing_state_decision(body: &Value) -> ForegroundPrewarmDecision {
     let _ = body;
     // Cost-first rule from v0.0.52: do not send a companion sync request before
@@ -7387,38 +7199,14 @@ fn foreground_prewarm_responses_missing_state_decision(body: &Value) -> Foregrou
     ForegroundPrewarmDecision::Skip("missing_prefix_state_cost_first")
 }
 
-fn estimated_request_tokens(value: &Value) -> u64 {
-    match value {
-        Value::String(text) => estimated_text_tokens(text) as u64,
-        Value::Array(items) => items.iter().map(estimated_request_tokens).sum(),
-        Value::Object(map) => map
-            .iter()
-            .filter(|(key, _)| {
-                !matches!(
-                    key.as_str(),
-                    "metadata"
-                        | "request_id"
-                        | "id"
-                        | "trace_id"
-                        | "stream"
-                        | "store"
-                        | "temperature"
-                        | "top_p"
-                        | "max_output_tokens"
-                )
-            })
-            .map(|(key, value)| estimated_text_tokens(key) as u64 + estimated_request_tokens(value))
-            .sum(),
-        _ => 0,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum ForegroundPrewarmDecision {
     Run(u64),
     Skip(&'static str),
 }
 
+#[cfg(test)]
 fn foreground_prewarm_responses_decision(
     state: &PrefixWarmState,
     estimated_current_bucket: Option<u64>,
@@ -7431,6 +7219,7 @@ fn foreground_prewarm_responses_decision(
     avoidable_decision
 }
 
+#[cfg(test)]
 fn foreground_prewarm_responses_avoidable_tokens(
     state: &PrefixWarmState,
 ) -> ForegroundPrewarmDecision {
@@ -7525,6 +7314,7 @@ fn foreground_prewarm_responses_avoidable_tokens(
     }
 }
 
+#[cfg(test)]
 fn should_background_prewarm(
     config: &AppConfig,
     channel: &Channel,
@@ -7533,106 +7323,6 @@ fn should_background_prewarm(
 ) -> bool {
     let _ = (config, channel, usage_record, gap_breakdown);
     false
-}
-
-fn should_background_prewarm_responses(
-    record: &UsageRecord,
-    gap_breakdown: Option<&ProviderCacheGapBreakdown>,
-    _observed_shortfall: u64,
-) -> bool {
-    if record.cache_read_tokens == 0 {
-        return record.input_tokens >= 4096;
-    }
-
-    let Some(gap) = gap_breakdown else {
-        return false;
-    };
-    let cache_ratio = provider_cache_ratio(record).unwrap_or(0.0);
-    let recover_regression_gap = gap.avoidable_tokens > 2048
-        && gap.avoidable_tokens <= 16_384
-        && gap.new_tail_tokens <= 131_072
-        && (cache_ratio >= 0.90 || (cache_ratio >= 0.85 && record.cache_read_tokens >= 128_000))
-        && record.input_tokens >= 32_000;
-    let recover_large_avoidable_gap = gap.avoidable_tokens > 16_384
-        && gap.avoidable_tokens <= 90_000
-        && gap.new_tail_tokens <= 32_768
-        && record.cache_read_tokens >= 90_000
-        && record.input_tokens >= 128_000;
-
-    recover_regression_gap || recover_large_avoidable_gap
-}
-
-fn should_background_prewarm_chat(
-    record: &UsageRecord,
-    gap_breakdown: Option<&ProviderCacheGapBreakdown>,
-) -> bool {
-    let Some(gap) = gap_breakdown else {
-        return false;
-    };
-    let cache_ratio = provider_cache_ratio(record).unwrap_or(0.0);
-    let avoidable_recovery_candidate = gap.avoidable_tokens > 0
-        && cache_ratio >= 0.50
-        && gap.avoidable_tokens <= 131_072
-        && gap.new_tail_tokens <= 16_384;
-
-    record.input_tokens >= 32_000 && avoidable_recovery_candidate
-}
-
-fn should_background_prewarm_anthropic(
-    record: &UsageRecord,
-    gap_breakdown: Option<&ProviderCacheGapBreakdown>,
-) -> bool {
-    let Some(gap) = gap_breakdown else {
-        return false;
-    };
-    let cache_ratio = provider_cache_ratio(record).unwrap_or(0.0);
-    let small_avoidable_gap = gap.avoidable_tokens > 0
-        && gap.avoidable_tokens <= 8192
-        && gap.new_tail_tokens <= 32_768
-        && cache_ratio >= 0.60;
-
-    record.input_tokens >= 8192 && small_avoidable_gap
-}
-
-fn prepare_background_prewarm_body(channel: &Channel, body: &mut Value) {
-    set_stream_flag(body, false);
-    if let Some(object) = body.as_object_mut() {
-        match channel {
-            Channel::Responses => {
-                object.insert("max_output_tokens".to_string(), Value::Number(1u64.into()));
-            }
-            Channel::Chat => {
-                object.insert("max_tokens".to_string(), Value::Number(1u64.into()));
-            }
-            Channel::Anthropic => {
-                object.insert("max_tokens".to_string(), Value::Number(1u64.into()));
-            }
-        }
-    }
-}
-
-async fn acquire_named_prefix_guard(
-    state: &AppState,
-    key: &str,
-) -> tokio::sync::OwnedMutexGuard<()> {
-    let lock = {
-        let mut locks = state.prefix_locks.lock().await;
-        locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
-    lock.lock_owned().await
-}
-
-async fn send_upstream_request(
-    state: &AppState,
-    url: &str,
-    api_key: &str,
-    channel: &Channel,
-    body: &Value,
-) -> reqwest::Result<reqwest::Response> {
-    send_upstream_request_to_url(state, url, api_key, channel, body, None).await
 }
 
 async fn select_provider_api_key(
@@ -7979,70 +7669,6 @@ async fn read_upstream_body_with_diagnostics(
     }
 }
 
-async fn send_upstream_request_to_url(
-    state: &AppState,
-    url: &str,
-    api_key: &str,
-    channel: &Channel,
-    body: &Value,
-    max_attempts_override: Option<usize>,
-) -> reqwest::Result<reqwest::Response> {
-    const MAX_ATTEMPTS: usize = 3;
-    let max_attempts = max_attempts_override
-        .unwrap_or(MAX_ATTEMPTS)
-        .clamp(1, MAX_ATTEMPTS);
-
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            state.metrics.record_retry().await;
-        }
-
-        let mut request = state
-            .client
-            .post(url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .bearer_auth(api_key)
-            .header("x-api-key", api_key);
-        if matches!(channel, Channel::Anthropic) {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-
-        let request = if matches!(channel, Channel::Responses) {
-            request.body(serialize_responses_body_for_provider_prefix(body))
-        } else {
-            request.json(body)
-        };
-
-        match request.send().await {
-            Ok(response) => {
-                if should_retry_status(response.status())
-                    && attempt + 1 < max_attempts_for_status(response.status()).min(max_attempts)
-                {
-                    sleep(upstream_retry_delay(
-                        response.status(),
-                        response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|value| value.to_str().ok()),
-                        attempt,
-                    ))
-                    .await;
-                    continue;
-                }
-                return Ok(response);
-            }
-            Err(err) => {
-                if attempt + 1 >= max_attempts {
-                    return Err(err);
-                }
-                sleep(network_retry_delay(attempt)).await;
-            }
-        }
-    }
-
-    unreachable!("retry loop always returns on the final attempt")
-}
-
 fn should_retry_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
 }
@@ -8217,8 +7843,6 @@ async fn stream_upstream(
     full_response_input: Option<Value>,
     used_response_session: bool,
     retried_full_response: bool,
-    upstream_url: String,
-    upstream_auth: String,
     active_upstream_body: Value,
     diagnostics: BodyDiagnostics,
     tail_input_diagnostics: TailInputDiagnostics,
@@ -8487,20 +8111,6 @@ async fn stream_upstream(
         apply_body_diagnostics(&mut request_log, &diagnostics);
         apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
         state_for_stream.metrics.record_request(request_log, true).await;
-        if stream_success_for_cache {
-            maybe_spawn_background_prewarm(
-                state_for_stream.clone(),
-                &config,
-                &decision,
-                &upstream_url,
-                &upstream_auth,
-                &decision.upstream_channel,
-                &active_upstream_body,
-                prefix_state_key.as_deref(),
-                usage_record.as_ref(),
-                gap_breakdown.as_ref(),
-            ).await;
-        }
         if eligible && stream_success_for_cache {
             insert_cache_entries(
                 &state_for_stream,
@@ -8916,16 +8526,14 @@ fn auto_upstream_channel_for_provider(
 }
 
 fn should_preempt_codex_responses_via_chat(
-    config: &AppConfig,
+    _config: &AppConfig,
     forced_agent_id: Option<&str>,
     client_channel: &Channel,
     decision: &RouteDecision,
 ) -> bool {
     forced_agent_id == Some("codex")
         && matches!(client_channel, Channel::Responses)
-        && matches!(decision.upstream_channel, Channel::Responses)
-        && config.provider_channel_mode_for_provider(&decision.provider.id)
-            == ProviderChannelMode::Auto
+        && matches!(decision.upstream_channel, Channel::Chat)
 }
 
 fn provider_supports_requested_model(
@@ -15971,8 +15579,6 @@ mod tests {
             None,
             false,
             false,
-            format!("http://{upstream_addr}/stream"),
-            "key".to_string(),
             json!({ "stream": true, "input": [] }),
             BodyDiagnostics::default(),
             TailInputDiagnostics::default(),
@@ -21347,6 +20953,7 @@ mod tests {
         config.workspace_fingerprint = "workspace-test".to_string();
         config.active_provider_id = Some("mock-responses".to_string());
         config.default_channel = Channel::Responses;
+        config.cache.background_prewarm_enabled = true;
         config.providers = vec![ProviderConfig {
             id: "mock-responses".to_string(),
             name: "Mock Responses".to_string(),
@@ -21434,7 +21041,163 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_responses_auto_provider_preempts_to_chat_and_streams_back_responses_sse() {
+    async fn codex_responses_provider_uses_native_responses_path() {
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let responses_hits_for_route = responses_hits.clone();
+        let chat_hits_for_route = chat_hits.clone();
+        let captured_body_for_route = captured_responses_body.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let hits = responses_hits_for_route.clone();
+                    let captured = captured_body_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        *captured.lock().await = body;
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_native\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let hits = chat_hits_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{"message":"chat should not be used"}})),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("mock-responses".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "mock-responses".to_string(),
+            name: "Mock Responses".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.5".to_string(),
+                display_name: "gpt-5.5".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("mock-responses".to_string()),
+            model_id: Some("gpt-5.5".to_string()),
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+        }];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-native-responses-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "type": "message", "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(response_text.contains("event: response.output_text.delta"));
+        assert!(response_text.contains("event: response.completed"));
+
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        let captured = captured_responses_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert!(captured.get("input").is_some());
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(
+            metrics.recent_requests[0].upstream_call_kind.as_deref(),
+            Some("stream")
+        );
+        assert_eq!(metrics.recent_requests[0].client_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "responses");
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_responses_chat_provider_uses_chat_compat_stream() {
         let responses_hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
         let captured_chat_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
@@ -21487,16 +21250,16 @@ mod tests {
         let mut config = AppConfig::default();
         config.local_key = "local-test-key".to_string();
         config.workspace_fingerprint = "workspace-test".to_string();
-        config.active_provider_id = Some("mock-responses".to_string());
+        config.active_provider_id = Some("mock-chat".to_string());
         config.default_channel = Channel::Responses;
         config.providers = vec![ProviderConfig {
-            id: "mock-responses".to_string(),
-            name: "Mock Responses".to_string(),
+            id: "mock-chat".to_string(),
+            name: "Mock Chat".to_string(),
             base_url: format!("http://{upstream_addr}/v1"),
             models_url: None,
             is_full_url: false,
             custom_user_agent: None,
-            channel: Channel::Responses,
+            channel: Channel::Chat,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
             api_key_encrypted: Some("upstream-key".to_string()),
@@ -21518,7 +21281,7 @@ mod tests {
             label: "Codex".to_string(),
             kind: AgentInjectionKind::Codex,
             enabled: true,
-            provider_id: Some("mock-responses".to_string()),
+            provider_id: Some("mock-chat".to_string()),
             model_id: Some("gpt-5.5".to_string()),
             target_path: None,
             last_injected_at: None,

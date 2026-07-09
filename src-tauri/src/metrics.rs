@@ -611,27 +611,6 @@ impl MetricsStore {
         );
     }
 
-    pub async fn record_background_prewarm_attempt(
-        &self,
-        channel: &str,
-        new_tail_tokens: u64,
-        avoidable_tokens: u64,
-    ) {
-        let mut inner = self.inner.write().await;
-        let item = upsert_background_prewarm(&mut inner.background_prewarm, channel);
-        item.attempts += 1;
-        item.trigger_new_tail_tokens += new_tail_tokens;
-        item.trigger_avoidable_tokens += avoidable_tokens;
-    }
-
-    pub async fn record_background_prewarm_success(&self, channel: &str, record: &UsageRecord) {
-        let mut inner = self.inner.write().await;
-        let item = upsert_background_prewarm(&mut inner.background_prewarm, channel);
-        item.successes += 1;
-        item.input_tokens += record.input_tokens;
-        item.cache_read_tokens += record.cache_read_tokens;
-    }
-
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let inner = self.inner.read().await;
         let hits = inner.response_cache_hits + inner.semantic_cache_hits;
@@ -1036,28 +1015,6 @@ fn sorted_request_body_buckets(
             .unwrap_or(order.len())
     });
     stats
-}
-
-fn upsert_background_prewarm<'a>(
-    items: &'a mut Vec<BackgroundPrewarmAccumulator>,
-    channel: &str,
-) -> &'a mut BackgroundPrewarmAccumulator {
-    let channel = if channel.trim().is_empty() {
-        "unknown"
-    } else {
-        channel
-    };
-    let index = items
-        .iter()
-        .position(|item| item.channel == channel)
-        .unwrap_or_else(|| {
-            items.push(BackgroundPrewarmAccumulator {
-                channel: channel.to_string(),
-                ..BackgroundPrewarmAccumulator::default()
-            });
-            items.len() - 1
-        });
-    &mut items[index]
 }
 
 fn sorted_background_prewarm(

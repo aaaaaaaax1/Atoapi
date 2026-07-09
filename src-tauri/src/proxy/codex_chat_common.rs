@@ -189,25 +189,6 @@ pub(crate) fn response_function_call_item_with_namespace(
     item
 }
 
-pub(crate) fn response_item_call_id(item: &Value) -> Option<String> {
-    item.get("call_id")
-        .or_else(|| item.get("id"))
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-pub(crate) fn is_empty_value(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(value) => value.trim().is_empty(),
-        Value::Array(value) => value.is_empty(),
-        Value::Object(value) => value.is_empty(),
-        _ => false,
-    }
-}
-
 pub(crate) fn split_leading_think_block(text: &str) -> Option<(String, String)> {
     let leading_ws_len = text.len() - text.trim_start().len();
     let after_ws = &text[leading_ws_len..];
