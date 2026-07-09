@@ -125,11 +125,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.73";
+const appVersion = "v0.1.75";
 const appVersionNotes = [
-  "v0.1.73: Codex Responses 上游恢复原生 /responses 转发，只有 Chat 上游才走兼容转换。",
-  "v0.1.73: 移除成功请求后的后台补热入口，避免流式后一条额外同步请求。",
-  "v0.1.73: 上游 transport 失败也写入请求记录，便于排查同步/流式错误。"
+  "v0.1.75: Codex 普通聊天保持原生 Responses 流式，真实发送体不再携带不兼容缓存字段。",
+  "v0.1.75: Agent 请求自带 model 优先，软件选择的模型只作为兜底。",
+  "v0.1.75: 请求记录新增 agent 标签，便于区分 codex、proxy-mode 和其他注入来源。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -2309,6 +2309,11 @@ function CachePanel({
                     <span className="request-channel-badge">
                       {requestChannelLabel(request.client_channel, request.upstream_channel)}
                     </span>
+                    {request.agent_id ? (
+                      <span className="request-agent-badge" title={request.agent_label ?? request.agent_id}>
+                        {request.agent_id}
+                      </span>
+                    ) : null}
                   </div>
                   <div className="request-metrics" title={metricTitle}>
                     <strong>首字 {formatDurationMs(request.ttft_ms)} · 用时 {formatDurationMs(request.total_ms)}</strong>

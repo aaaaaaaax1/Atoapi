@@ -205,6 +205,8 @@ export interface MetricsSnapshot {
     provider: string;
     model: string;
     cache_status: string;
+    agent_id?: string | null;
+    agent_label?: string | null;
     upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
     upstream_call_source?: string | null;
     status: number;

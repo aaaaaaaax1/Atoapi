@@ -926,6 +926,10 @@ async fn handle_responses_compact_for_agent(
             "error"
         }
         .to_string(),
+        agent_id: authorized_agent.clone(),
+        agent_label: authorized_agent
+            .as_deref()
+            .map(|agent_id| agent_id.to_string()),
         upstream_call_kind: Some("sync".to_string()),
         upstream_call_source: Some(
             if used_fallback && matches!(active_request_channel, Channel::Chat) {
@@ -1123,6 +1127,13 @@ async fn handle_generation_for_agent(
         && matches!(client_channel, Channel::Responses)
         && !request_had_stream_field
         && client_requested_stream;
+    let codex_native_responses_stream = forced_agent_id == Some("codex")
+        && matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Responses)
+        && client_requested_stream
+        && !codex_responses_chat_compat;
+    let (agent_log_id, agent_log_label) =
+        request_agent_log_fields(&config, authorized_agent.as_deref());
     let codex_chat_tool_context = codex_responses_chat_compat
         .then(|| transform_codex_chat::build_codex_tool_context_from_request(&client_request));
     let mut upstream_body = if codex_responses_chat_compat {
@@ -1138,10 +1149,20 @@ async fn handle_generation_for_agent(
     } else {
         transform_request_for_channel(&client_request, &client_channel, &decision.upstream_channel)
     };
-    if matches!(decision.upstream_channel, Channel::Responses) {
+    if matches!(decision.upstream_channel, Channel::Responses) && !codex_native_responses_stream {
         normalize_responses_request(&mut upstream_body);
     }
-    optimize_provider_prefix(&mut upstream_body, &config, &decision);
+    if codex_native_responses_stream {
+        strip_provider_cache_key_fields(&mut upstream_body);
+    } else {
+        optimize_provider_prefix(&mut upstream_body, &config, &decision);
+    }
+
+    let mut provider_prefix_body = upstream_body.clone();
+    if codex_native_responses_stream {
+        normalize_responses_request(&mut provider_prefix_body);
+        optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
+    }
 
     let cross_protocol_stream = client_requested_stream
         && client_channel != decision.upstream_channel
@@ -1149,9 +1170,9 @@ async fn handle_generation_for_agent(
     if cross_protocol_stream {
         set_stream_flag(&mut upstream_body, false);
     }
-    let provider_prefix_key = openai_prompt_cache_key(&upstream_body);
+    let provider_prefix_key = openai_prompt_cache_key(&provider_prefix_body);
     let provider_prefix_fingerprint = Some(provider_prefix_fingerprint(
-        &upstream_body,
+        &provider_prefix_body,
         &decision.upstream_channel,
     ));
     let provider_prefix_control_key = provider_prefix_control_key(
@@ -2145,6 +2166,8 @@ async fn handle_generation_for_agent(
             session_anchor_diagnostics.clone(),
             response_session_reuse_diagnostics.clone(),
             codex_chat_tool_context.clone(),
+            agent_log_id.clone(),
+            agent_log_label.clone(),
             prefix_guard_wait.clone(),
             local_prepare_ms,
             upstream_request_diagnostics.clone(),
@@ -2473,6 +2496,8 @@ async fn handle_generation_for_agent(
             "error"
         }
         .to_string(),
+        agent_id: agent_log_id.clone(),
+        agent_label: agent_log_label.clone(),
         upstream_call_kind: Some("sync".to_string()),
         upstream_call_source: Some(
             if active_responses_non_stream_chat_compat {
@@ -6824,6 +6849,8 @@ async fn record_upstream_transport_failure(
                 provider: decision.provider.name.clone(),
                 model: decision.model.clone(),
                 cache_status: "error".to_string(),
+                agent_id: None,
+                agent_label: None,
                 upstream_call_kind: Some(
                     if request_body_stream_flag(body) {
                         "stream"
@@ -6987,6 +7014,8 @@ async fn cache_hit_response(
                 provider: decision.provider.name.clone(),
                 model: decision.model.clone(),
                 cache_status: cache_status.to_string(),
+                agent_id: None,
+                agent_label: None,
                 upstream_call_kind: Some("cache".to_string()),
                 upstream_call_source: Some("local_cache".to_string()),
                 cache_key: Some(cache_key),
@@ -7567,6 +7596,11 @@ async fn send_upstream_request_to_url_with_diagnostics(
             .header(header::CONTENT_TYPE, "application/json")
             .bearer_auth(api_key)
             .header("x-api-key", api_key);
+        if request_body_stream_flag(body) {
+            request = request
+                .header(header::ACCEPT, "text/event-stream")
+                .header(header::ACCEPT_ENCODING, "identity");
+        }
         if matches!(channel, Channel::Anthropic) {
             request = request.header("anthropic-version", "2023-06-01");
         }
@@ -7849,6 +7883,8 @@ async fn stream_upstream(
     session_anchor_diagnostics: SessionAnchorDiagnostics,
     response_session_reuse_diagnostics: ResponseSessionReuseDiagnostics,
     codex_chat_tool_context: Option<transform_codex_chat::CodexToolContext>,
+    agent_log_id: Option<String>,
+    agent_log_label: Option<String>,
     prefix_guard_wait: PrefixGuardWaitDiagnostics,
     local_prepare_ms: u64,
     upstream_request_diagnostics: UpstreamRequestDiagnostics,
@@ -8005,6 +8041,8 @@ async fn stream_upstream(
                 } else {
                     "error"
                 }.to_string(),
+                agent_id: agent_log_id.clone(),
+                agent_label: agent_log_label.clone(),
                 upstream_call_kind: Some("stream".to_string()),
                 upstream_call_source: Some("main".to_string()),
                 cache_key: if eligible && stream_success_for_cache { Some(metrics_cache_key.clone()) } else { None },
@@ -8478,11 +8516,14 @@ fn decide_route(
     let agent_model = authorized_agent
         .and_then(|agent| agent.model_id.clone())
         .filter(|model| provider_supports_requested_model(provider, Some(model)));
-    let requested_model_for_provider =
-        requested_model.filter(|model| provider_supports_requested_model(provider, Some(model)));
+    let requested_model_for_provider = if agent_provider.is_some() {
+        requested_model
+    } else {
+        requested_model.filter(|model| provider_supports_requested_model(provider, Some(model)))
+    };
 
-    let model = agent_model
-        .or(requested_model_for_provider)
+    let model = requested_model_for_provider
+        .or(agent_model)
         .or_else(|| {
             profile
                 .and_then(|profile| profile.model_alias.as_ref())
@@ -8554,6 +8595,22 @@ fn set_request_model(request: &mut Value, model: &str) {
     if let Some(object) = request.as_object_mut() {
         object.insert("model".to_string(), Value::String(model.to_string()));
     }
+}
+
+fn request_agent_log_fields(
+    config: &AppConfig,
+    authorized_agent_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(agent_id) = authorized_agent_id else {
+        return (None, None);
+    };
+    let agent_label = config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .map(|agent| agent.label.clone())
+        .unwrap_or_else(|| agent_id.to_string());
+    (Some(agent_id.to_string()), Some(agent_label))
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
@@ -9944,12 +10001,12 @@ fn infer_client_requested_stream(
     client_channel: &Channel,
     forced_agent_id: Option<&str>,
 ) -> bool {
-    if let Some(stream) = request.get("stream").and_then(Value::as_bool) {
-        return stream;
-    }
     if forced_agent_id == Some("codex") && matches!(client_channel, Channel::Responses) {
         set_stream_flag(request, true);
         return true;
+    }
+    if let Some(stream) = request.get("stream").and_then(Value::as_bool) {
+        return stream;
     }
     false
 }
@@ -11619,14 +11676,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_responses_respects_explicit_non_stream() {
+    fn codex_responses_generation_forces_stream_even_when_false() {
         let mut request = json!({ "model": "gpt-5.5", "input": "hello", "stream": false });
 
         let stream =
             infer_client_requested_stream(&mut request, &Channel::Responses, Some("codex"));
 
-        assert!(!stream);
-        assert_eq!(request["stream"], json!(false));
+        assert!(stream);
+        assert_eq!(request["stream"], json!(true));
     }
 
     #[test]
@@ -12135,7 +12192,7 @@ mod tests {
             is_full_url: false,
             custom_user_agent: None,
             channel: Channel::Responses,
-            prompt_cache_retention_enabled: false,
+            prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
             api_key_encrypted: None,
             models: Vec::new(),
@@ -14766,6 +14823,54 @@ mod tests {
     }
 
     #[test]
+    fn authorized_agent_bound_provider_preserves_client_requested_model() {
+        let mut config = AppConfig::default();
+        config.providers = vec![ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "ui-fallback-model".to_string(),
+                display_name: "ui-fallback-model".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("ui-fallback-model".to_string());
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "client-requested-model", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.model, "client-requested-model");
+    }
+
+    #[test]
     fn authorized_agent_route_wins_over_global_active_provider_and_requested_model() {
         let mut config = AppConfig::default();
         config.providers = vec![
@@ -14837,7 +14942,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.provider.id, "share");
-        assert_eq!(decision.model, "gpt-5.5");
+        assert_eq!(decision.model, "orc");
     }
 
     #[test]
@@ -15584,6 +15689,8 @@ mod tests {
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
             ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
             None,
             PrefixGuardWaitDiagnostics::default(),
             0,
@@ -21045,21 +21152,35 @@ mod tests {
         let responses_hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
         let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let captured_responses_accept = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let captured_responses_encoding = Arc::new(tokio::sync::Mutex::new(None::<String>));
         let responses_hits_for_route = responses_hits.clone();
         let chat_hits_for_route = chat_hits.clone();
         let captured_body_for_route = captured_responses_body.clone();
+        let captured_accept_for_route = captured_responses_accept.clone();
+        let captured_encoding_for_route = captured_responses_encoding.clone();
 
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = Router::new()
             .route(
                 "/v1/responses",
-                post(move |Json(body): Json<Value>| {
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
                     let hits = responses_hits_for_route.clone();
                     let captured = captured_body_for_route.clone();
+                    let captured_accept = captured_accept_for_route.clone();
+                    let captured_encoding = captured_encoding_for_route.clone();
                     async move {
                         hits.fetch_add(1, Ordering::SeqCst);
                         *captured.lock().await = body;
+                        *captured_accept.lock().await = headers
+                            .get(header::ACCEPT)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned);
+                        *captured_encoding.lock().await = headers
+                            .get(header::ACCEPT_ENCODING)
+                            .and_then(|value| value.to_str().ok())
+                            .map(ToOwned::to_owned);
                         raw_response(
                             200,
                             "text/event-stream",
@@ -21155,6 +21276,9 @@ mod tests {
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",
+                "stream": false,
+                "prompt_cache_key": "client-key-must-not-be-forwarded",
+                "prompt_cache_retention": "24h",
                 "input": [{ "type": "message", "role": "user", "content": "hi" }]
             }))
             .unwrap(),
@@ -21184,6 +21308,16 @@ mod tests {
         let captured = captured_responses_body.lock().await.clone();
         assert_eq!(captured["stream"], true);
         assert!(captured.get("input").is_some());
+        assert!(captured.get("prompt_cache_key").is_none());
+        assert!(captured.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            captured_responses_accept.lock().await.as_deref(),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            captured_responses_encoding.lock().await.as_deref(),
+            Some("identity")
+        );
 
         let metrics = state.metrics.snapshot().await;
         assert_eq!(

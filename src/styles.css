@@ -1819,7 +1819,8 @@ button:disabled {
   overflow: hidden;
 }
 
-.request-row .request-channel-badge {
+.request-row .request-channel-badge,
+.request-row .request-agent-badge {
   display: inline-flex;
   align-items: center;
   min-width: 0;
@@ -1837,6 +1838,12 @@ button:disabled {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.request-row .request-agent-badge {
+  border-color: rgba(126, 236, 176, 0.3);
+  color: #d4f7dc;
+  background: rgba(47, 96, 66, 0.42);
 }
 
 .request-row .request-call-badge {

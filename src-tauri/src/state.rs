@@ -682,12 +682,12 @@ mod tests {
         );
         assert_eq!(
             value.get("model_provider").and_then(toml::Value::as_str),
-            Some("atoapi")
+            Some("custom")
         );
         assert_eq!(
             value
                 .get("model_providers")
-                .and_then(|providers| providers.get("atoapi"))
+                .and_then(|providers| providers.get("custom"))
                 .and_then(|provider| provider.get("base_url"))
                 .and_then(toml::Value::as_str),
             Some("http://127.0.0.1:18883/codex/v1")

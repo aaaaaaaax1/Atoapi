@@ -200,6 +200,10 @@ pub struct RequestLog {
     pub model: String,
     pub cache_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_call_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_call_source: Option<String>,
@@ -1157,6 +1161,8 @@ mod tests {
             provider: "provider".to_string(),
             model: "model".to_string(),
             cache_status: cache_status.to_string(),
+            agent_id: None,
+            agent_label: None,
             upstream_call_kind: None,
             upstream_call_source: None,
             cache_key: cache_key.map(ToOwned::to_owned),

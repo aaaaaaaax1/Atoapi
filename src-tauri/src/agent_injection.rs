@@ -1366,7 +1366,7 @@ command = "npx"
         );
         assert_eq!(
             value["agents"]["defaults"]["model"]["primary"],
-            json!("atoapi/gpt-test")
+            json!(format!("{}/{}", CODEX_PROVIDER_ID, "gpt-test"))
         );
         fs::remove_dir_all(dir).ok();
     }
@@ -1390,7 +1390,9 @@ command = "npx"
             .unwrap();
         let provider = providers
             .iter()
-            .find(|item| item.get("name").and_then(serde_yaml::Value::as_str) == Some("atoapi"))
+            .find(|item| {
+                item.get("name").and_then(serde_yaml::Value::as_str) == Some(CODEX_PROVIDER_ID)
+            })
             .unwrap();
         assert_eq!(
             provider.get("base_url").and_then(serde_yaml::Value::as_str),
@@ -1405,7 +1407,7 @@ command = "npx"
                 .get("model")
                 .and_then(|model| model.get("provider"))
                 .and_then(serde_yaml::Value::as_str),
-            Some("atoapi")
+            Some(CODEX_PROVIDER_ID)
         );
         assert_eq!(
             value
