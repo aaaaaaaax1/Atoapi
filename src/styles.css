@@ -86,7 +86,6 @@ button {
 }
 
 .brand-lockup,
-.proxy-card,
 .side-section-head,
 .provider-tab,
 .topbar,
@@ -225,24 +224,6 @@ button {
   word-break: break-word;
 }
 
-.proxy-card {
-  justify-content: space-between;
-  gap: 10px;
-  border: 1px solid #3b3d38;
-  background: #2b2c29;
-  border-radius: 10px;
-  padding: 13px;
-}
-
-.proxy-card code {
-  display: block;
-  margin-top: 9px;
-  color: #d9dbd4;
-  font-size: 12px;
-  word-break: break-all;
-}
-
-.proxy-actions,
 .chip-row,
 .action-row,
 .agent-actions {
@@ -1017,6 +998,31 @@ button:disabled {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 16px;
   align-items: center;
+}
+
+.agent-hero > .agent-endpoint-card {
+  grid-column: 1 / -1;
+  padding: 12px;
+  gap: 10px;
+  background: rgba(31, 33, 29, 0.82);
+}
+
+.agent-hero > .agent-endpoint-card .agent-endpoint-head {
+  align-items: center;
+}
+
+.agent-hero > .agent-endpoint-card .agent-endpoint-head h3 {
+  font-size: 13px;
+}
+
+.agent-hero > .agent-endpoint-card .agent-endpoint-head p {
+  display: none;
+}
+
+.agent-hero > .agent-endpoint-card .endpoint-row {
+  min-height: 46px;
+  padding: 8px 10px;
+  grid-template-columns: 148px minmax(0, 1fr) 34px;
 }
 
 .agent-hero-main {
@@ -2565,5 +2571,183 @@ button:disabled {
   .request-cache-result {
     justify-items: start;
     text-align: left;
+  }
+}
+
+.agent-hero-actions.compact {
+  justify-content: flex-end;
+}
+
+.proxy-mode-settings {
+  border: 1px solid #3b3d38;
+  background: rgba(43, 44, 41, 0.96);
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.proxy-mode-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.proxy-mode-head h3 {
+  margin: 0;
+  color: #f4f6f0;
+  font-size: 18px;
+}
+
+.proxy-mode-head p {
+  margin: 6px 0 0;
+  color: #a5a8a1;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.proxy-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.proxy-mode-grid .wide {
+  grid-column: 1 / -1;
+}
+
+.compact-code {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 10px;
+  margin-top: 0;
+  padding: 10px 11px;
+}
+
+.compact-code span {
+  margin: 0;
+  color: #a5a8a1;
+  font-weight: 760;
+}
+
+.compact-code code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 1220px) {
+  .proxy-mode-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .proxy-mode-grid .wide {
+    grid-column: auto;
+  }
+}
+.agent-endpoint-card {
+  border: 1px solid #3b3d38;
+  background: rgba(43, 44, 41, 0.96);
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.agent-endpoint-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.agent-endpoint-head h3 {
+  margin: 0;
+  color: #f4f6f0;
+  font-size: 18px;
+}
+
+.agent-endpoint-head p {
+  margin: 6px 0 0;
+  color: #a5a8a1;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.endpoint-pill {
+  flex: 0 0 auto;
+  border: 1px solid rgba(88, 217, 138, 0.45);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: #91edb3;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.endpoint-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.endpoint-row {
+  min-width: 0;
+  min-height: 64px;
+  border: 1px solid #3d403a;
+  background: #242622;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 150px minmax(0, 1fr) 36px;
+  align-items: center;
+  gap: 10px;
+}
+
+.endpoint-row.wide {
+  grid-column: 1 / -1;
+}
+
+.endpoint-row span {
+  color: #a5a8a1;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.endpoint-row code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #dfe2dc;
+  font-size: 12px;
+}
+
+.proxy-mode-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 120px auto;
+  align-items: end;
+  gap: 12px;
+}
+
+.endpoint-warning {
+  border: 1px solid rgba(255, 91, 91, 0.45);
+  border-radius: 10px;
+  padding: 10px 12px;
+  color: #ffaaaa;
+  background: rgba(255, 91, 91, 0.08);
+  font-size: 13px;
+}
+
+@media (max-width: 1220px) {
+  .endpoint-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .endpoint-row.wide {
+    grid-column: auto;
+  }
+  .proxy-mode-form {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

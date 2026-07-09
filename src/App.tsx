@@ -23,7 +23,6 @@ import {
   Settings2,
   ShieldCheck,
   Sparkles,
-  Square,
   TerminalSquare,
   Trash2,
   Workflow,
@@ -39,7 +38,6 @@ import {
   Channel,
   command,
   FetchModelsInput,
-  GeneralConfigInput,
   KeyLoadBalanceStrategy,
   MetricsSnapshot,
   model,
@@ -49,10 +47,10 @@ import {
   ProviderInput,
   ProviderKeyStatus,
   ProviderKeyTestResult,
-  ProxyStatus
+  ProxyModeConfigInput
 } from "./lib/api";
 
-type ViewId = "agent" | "gateway" | "cache";
+type ViewId = "agent" | "cache";
 
 interface ProviderDraft {
   id?: string;
@@ -96,6 +94,10 @@ interface ProviderKeyDraft {
   disabled_until?: string | null;
 }
 
+interface ProxyModeDraft {
+  host: string;
+  port: string;
+}
 const channelOptions: Array<{ value: Channel; label: string; endpoint: string }> = [
   { value: "anthropic", label: "Anthropic", endpoint: "/v1/messages" },
   { value: "chat", label: "OpenAI Chat", endpoint: "/v1/chat/completions" },
@@ -118,17 +120,16 @@ const keyStrategyOptions: Array<{ value: KeyLoadBalanceStrategy; label: string; 
 ];
 
 const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
-  { id: "gateway", label: "本地代理设置", icon: <Settings2 size={16} /> },
   { id: "cache", label: "缓存统计", icon: <Gauge size={16} /> }
 ];
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.68";
+const appVersion = "v0.1.72";
 const appVersionNotes = [
-  "v0.1.68: 扩展 Agent 注入列表，补齐 OpenCode、OpenClaw、Hermes 的本地代理配置写入。",
-  "v0.1.68: Gemini 暂不伪支持，缺少原生 generateContent 端点时会明确提示并回滚开关。",
-  "v0.1.68: 绑定上游不再自动开启注入，已启用 Agent 切换上游失败会回滚原绑定，避免运行态污染。"
+  "v0.1.72: Codex Responses 自动前置走 Chat 兼容上游，再真流式回转为 Responses SSE。",
+  "v0.1.72: 迁入 ccswitch 的 Codex Chat/Responses 工具与流式事件映射，避免原生 /responses 400。",
+  "v0.1.72: 新增回归测试，确保 Codex 请求只打 /chat/completions，不再碰不兼容的 /responses。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -156,7 +157,6 @@ const emptyDraft: ProviderDraft = {
 
 export default function App() {
   const [config, setConfig] = useState<AppConfig | null>(null);
-  const [status, setStatus] = useState<ProxyStatus | null>(null);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [activeView, setActiveView] = useState<ViewId>("agent");
   const [selectedAgentId, setSelectedAgentId] = useState("");
@@ -168,8 +168,9 @@ export default function App() {
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [savingProvider, setSavingProvider] = useState(false);
-  const [savingGateway, setSavingGateway] = useState(false);
   const [savingCachePolicy, setSavingCachePolicy] = useState(false);
+  const [savingProxyModeConfig, setSavingProxyModeConfig] = useState(false);
+  const [proxyModeDraft, setProxyModeDraft] = useState<ProxyModeDraft>({ host: "127.0.0.1", port: "18884" });
   const [injectingId, setInjectingId] = useState("");
   const [cacheProviderFilter, setCacheProviderFilter] = useState("all");
   const [includeColdStarts, setIncludeColdStarts] = useState(true);
@@ -209,6 +210,13 @@ export default function App() {
   }, [config, selectedProviderId]);
 
   useEffect(() => {
+    if (!config) return;
+    setProxyModeDraft({
+      host: config.proxy_mode_host,
+      port: String(config.proxy_mode_port)
+    });
+  }, [config?.proxy_mode_host, config?.proxy_mode_port]);
+  useEffect(() => {
     const items = visibleAgentInjections(config?.agent_injections ?? []);
     if (!items.length) return;
     if (selectedAgentId && !items.some((item) => item.id === selectedAgentId)) {
@@ -235,13 +243,11 @@ export default function App() {
 
   async function refreshAll() {
     setError("");
-    const [nextConfig, nextStatus, nextMetrics] = await Promise.all([
+    const [nextConfig, nextMetrics] = await Promise.all([
       command<AppConfig>("reload_config"),
-      command<ProxyStatus>("get_proxy_status"),
       command<MetricsSnapshot>("get_metrics")
     ]);
     setConfig(nextConfig);
-    setStatus(nextStatus);
     setMetrics(nextMetrics);
     if (selectedProviderId === "new" && nextConfig.providers.length > 0 && !draftHasInput(draft)) {
       setSelectedProviderId(nextConfig.active_provider_id ?? nextConfig.providers[0].id);
@@ -260,12 +266,37 @@ export default function App() {
   async function refreshMetrics() {
     try {
       setMetrics(await command<MetricsSnapshot>("get_metrics"));
-      setStatus(await command<ProxyStatus>("get_proxy_status"));
     } catch {
       // Keep the last known state in the UI.
     }
   }
 
+  async function saveProxyModeConfig() {
+    if (!config) return;
+    const host = proxyModeDraft.host.trim();
+    const port = Number(proxyModeDraft.port);
+    if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
+      setError("本地代理模式 IP 或端口不合法");
+      return;
+    }
+    if (proxyAddressConflicts(host, port, config.host, config.port)) {
+      setError("本地代理模式地址不能和其他 Agent 注入地址相同");
+      return;
+    }
+    setSavingProxyModeConfig(true);
+    setError("");
+    setNotice("");
+    try {
+      const input: ProxyModeConfigInput = { host, port };
+      const nextConfig = await command<AppConfig>("save_proxy_mode_config", { input });
+      setConfig(nextConfig);
+      setNotice("本地代理模式地址已保存");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSavingProxyModeConfig(false);
+    }
+  }
   function resetModelPicker() {
     setModelCandidates([]);
     setSelectedFetchedModelId("");
@@ -470,10 +501,6 @@ export default function App() {
     }
   }
 
-  async function toggleProxy() {
-    const next = await command<ProxyStatus>(status?.running ? "stop_proxy" : "start_proxy");
-    setStatus(next);
-  }
 
   async function toggleApiKeyVisibility(visible: boolean) {
     if (visible && draft.id && !draft.api_key) {
@@ -492,45 +519,6 @@ export default function App() {
       }
     }
     setApiKeyVisible(visible);
-  }
-
-  async function saveGatewayConfig() {
-    if (!config) return;
-    const port = Number(config.port);
-    if (!config.host.trim() || !Number.isInteger(port) || port <= 0 || port > 65535) {
-      setError("Host 或端口不合法");
-      return;
-    }
-    setSavingGateway(true);
-    setError("");
-    setNotice("");
-    try {
-      const savedConfig = await command<AppConfig>("get_config");
-      const networkChanged =
-        savedConfig.host !== config.host.trim() || Number(savedConfig.port) !== port;
-      const wasRunning = Boolean(status?.running);
-      if (wasRunning && networkChanged) {
-        setStatus(await command<ProxyStatus>("stop_proxy"));
-      }
-      const input: GeneralConfigInput = {
-        host: config.host.trim(),
-        port,
-        local_key: config.local_key,
-        default_channel: config.default_channel,
-        workspace_fingerprint: config.workspace_fingerprint.trim() || "default-workspace",
-        cache: config.cache
-      };
-      const nextConfig = await command<AppConfig>("save_config", { input });
-      setConfig(nextConfig);
-      if (wasRunning && networkChanged) {
-        setStatus(await command<ProxyStatus>("start_proxy"));
-      }
-      setNotice(networkChanged ? "本地代理已保存并重启" : "本地代理配置已保存");
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setSavingGateway(false);
-    }
   }
 
   async function toggleAgentInjection(item: AgentInjectionConfig) {
@@ -776,23 +764,6 @@ export default function App() {
           </div>
         </div>
 
-        <div className="proxy-card">
-          <div>
-            <span className={status?.running ? "status-pill online" : "status-pill"}>
-              {status?.running ? "运行中" : "已停止"}
-            </span>
-            <code>{baseUrl}</code>
-          </div>
-          <div className="proxy-actions">
-            <button className="icon-button" onClick={toggleProxy} title={status?.running ? "停止代理" : "启动代理"}>
-              {status?.running ? <Square size={16} /> : <Play size={16} />}
-            </button>
-            <button className="icon-button" onClick={() => void navigator.clipboard.writeText(baseUrl)} title="复制地址">
-              <Copy size={16} />
-            </button>
-          </div>
-        </div>
-
         <div className="side-section-head">
           <span>Agent 注入</span>
           <button className="tiny-button" onClick={() => void applyEnabledInjections()} disabled={injectingId === "all"}>
@@ -837,7 +808,7 @@ export default function App() {
         <header className="topbar">
           <div>
             <p className="overline">Control desk</p>
-            <h2>{activeView === "agent" ? selectedAgent?.label ?? "Agent 注入" : activeView === "gateway" ? "本地代理设置" : "缓存统计"}</h2>
+            <h2>{activeView === "agent" ? selectedAgent?.label ?? "Agent 注入" : "缓存统计"}</h2>
           </div>
           <div className="summary-strip">
             <Summary tone="red" label="累计真实 token" value={formatCompactTokens(currentProviderTotalTokens)} />
@@ -854,27 +825,21 @@ export default function App() {
         )}
 
         <section className="workspace">
-          {activeView === "gateway" && (
-            <GatewayPanel
-              config={config}
-              status={status}
-              baseUrl={baseUrl}
-              savingGateway={savingGateway}
-              onConfigChange={updateConfig}
-              onSave={() => void saveGatewayConfig()}
-              onToggleProxy={() => void toggleProxy()}
-            />
-          )}
-
           {activeView === "agent" && selectedAgent && (
             <AgentWorkspace
               item={selectedAgent}
+              config={config}
+              baseUrl={baseUrl}
+              proxyModeDraft={proxyModeDraft}
+              savingProxyModeConfig={savingProxyModeConfig}
               providers={providers}
               injectingId={injectingId}
               onToggle={toggleAgentInjection}
               onProviderSelect={(provider, modelId) => void activateAgentProvider(selectedAgent, provider, modelId)}
               onModelSelect={(provider, modelId) => void activateAgentProvider(selectedAgent, provider, modelId)}
               onCreateProvider={createProvider}
+              onProxyModeDraftChange={setProxyModeDraft}
+              onSaveProxyModeConfig={() => void saveProxyModeConfig()}
               onEditProvider={editProvider}
               onDeleteProvider={(provider) => void removeProvider(provider)}
             />
@@ -1040,22 +1005,34 @@ function AgentEmptySelection({
 
 function AgentWorkspace({
   item,
+  config,
+  baseUrl,
+  proxyModeDraft,
+  savingProxyModeConfig,
   providers,
   injectingId,
   onToggle,
   onProviderSelect,
   onModelSelect,
   onCreateProvider,
+  onProxyModeDraftChange,
+  onSaveProxyModeConfig,
   onEditProvider,
   onDeleteProvider
 }: {
   item: AgentInjectionConfig;
+  config: AppConfig | null;
+  baseUrl: string;
+  proxyModeDraft: ProxyModeDraft;
+  savingProxyModeConfig: boolean;
   providers: ProviderConfig[];
   injectingId: string;
   onToggle: (item: AgentInjectionConfig) => void;
   onProviderSelect: (provider: ProviderConfig, modelId?: string) => void;
   onModelSelect: (provider: ProviderConfig, modelId: string) => void;
   onCreateProvider: () => void;
+  onProxyModeDraftChange: Dispatch<SetStateAction<ProxyModeDraft>>;
+  onSaveProxyModeConfig: () => void;
   onEditProvider: (provider: ProviderConfig) => void;
   onDeleteProvider: (provider: ProviderConfig) => void;
 }) {
@@ -1085,22 +1062,28 @@ function AgentWorkspace({
             {item.target_path && <code>{item.target_path}</code>}
           </div>
         </div>
-        <div className="agent-hero-actions">
-          <button
-            className={item.enabled ? "agent-switch on" : "agent-switch"}
-            onClick={() => onToggle(item)}
-            disabled={itemBusy || routeBusy}
-          >
-            <span />
-            {item.enabled ? "已启用" : "未启用"}
-          </button>
+        <div className="agent-hero-actions compact">
           <button className="primary-button" onClick={onCreateProvider}>
             <Plus size={16} />
             新增上游
           </button>
         </div>
+        {item.kind !== "proxy-mode" && (
+          <AgentEndpointPanel item={item} config={config} baseUrl={baseUrl} />
+        )}
       </div>
 
+      {item.kind === "proxy-mode" ? (
+        <ProxyModeSettings
+          item={item}
+          config={config}
+          mainBaseUrl={baseUrl}
+          draft={proxyModeDraft}
+          saving={savingProxyModeConfig}
+          onDraftChange={onProxyModeDraftChange}
+          onSave={onSaveProxyModeConfig}
+        />
+      ) : null}
       {item.last_status && <div className="agent-last-status">{item.last_status}</div>}
 
       <div className="agent-provider-head">
@@ -1205,6 +1188,135 @@ function AgentWorkspace({
   );
 }
 
+function AgentEndpointPanel({
+  item,
+  config,
+  baseUrl
+}: {
+  item: AgentInjectionConfig;
+  config: AppConfig | null;
+  baseUrl: string;
+}) {
+  const key = item.kind === "codex" ? "PROXY_MANAGED" : item.local_key ?? config?.local_key ?? "";
+  const rows = agentEndpointRows(item, baseUrl, key);
+  if (!rows.length) return null;
+  return (
+    <section className="agent-endpoint-card">
+      <div className="agent-endpoint-head">
+        <div>
+          <h3>当前 Agent 注入地址</h3>
+          <p>这个地址只给当前 Agent 使用。其他 Agent 即使选择同一个上游，也会使用自己的注入配置。</p>
+        </div>
+        <span className="endpoint-pill">主代理</span>
+      </div>
+      <div className="endpoint-grid">
+        {rows.map((row) => (
+          <EndpointRow key={row.label} label={row.label} value={row.value} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ProxyModeSettings({
+  item,
+  config,
+  mainBaseUrl,
+  draft,
+  saving,
+  onDraftChange,
+  onSave
+}: {
+  item: AgentInjectionConfig;
+  config: AppConfig | null;
+  mainBaseUrl: string;
+  draft: ProxyModeDraft;
+  saving: boolean;
+  onDraftChange: Dispatch<SetStateAction<ProxyModeDraft>>;
+  onSave: () => void;
+}) {
+  const port = Number(draft.port);
+  const previewBaseUrl = `http://${draft.host.trim() || "127.0.0.1"}:${draft.port || "18884"}`;
+  const conflictsWithMain = Boolean(config && proxyAddressConflicts(draft.host, port, config.host, config.port));
+  return (
+    <section className="proxy-mode-settings">
+      <div className="proxy-mode-head">
+        <div>
+          <h3>本地代理设置</h3>
+          <p>手动填写代理地址的客户端走这里。它使用独立监听地址和代理模式 key，不和其他 Agent 注入入口混用。</p>
+        </div>
+        <span className={item.enabled ? "status-pill online" : "status-pill"}>
+          {item.enabled ? "已启用" : "未启用"}
+        </span>
+      </div>
+      <div className="proxy-mode-form">
+        <Field label="代理 IP">
+          <input
+            value={draft.host}
+            onChange={(event) => onDraftChange((current) => ({ ...current, host: event.target.value }))}
+            placeholder="127.0.0.1"
+          />
+        </Field>
+        <Field label="端口">
+          <input
+            value={draft.port}
+            onChange={(event) => onDraftChange((current) => ({ ...current, port: event.target.value }))}
+            placeholder="18884"
+          />
+        </Field>
+        <button className="primary-button" onClick={onSave} disabled={saving || conflictsWithMain}>
+          {saving ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
+          保存地址
+        </button>
+      </div>
+      {conflictsWithMain ? (
+        <div className="endpoint-warning">本地代理模式不能和其他 Agent 注入地址相同：{mainBaseUrl}</div>
+      ) : null}
+      <div className="proxy-mode-grid">
+        <EndpointRow label="OpenAI Base URL" value={`${previewBaseUrl}/v1`} />
+        <EndpointRow label="Anthropic Base URL" value={previewBaseUrl} />
+        <EndpointRow label="代理模式 Key" value={item.local_key ?? config?.local_key ?? ""} wide />
+      </div>
+    </section>
+  );
+}
+
+function EndpointRow({ label, value, wide = false }: { label: string; value: string; wide?: boolean }) {
+  return (
+    <div className={wide ? "endpoint-row wide" : "endpoint-row"}>
+      <span>{label}</span>
+      <code>{value}</code>
+      <button className="icon-button" onClick={() => void navigator.clipboard.writeText(value)} title={`复制 ${label}`}>
+        <Copy size={16} />
+      </button>
+    </div>
+  );
+}
+
+function agentEndpointRows(item: AgentInjectionConfig, baseUrl: string, key: string) {
+  if (item.kind === "codex") {
+    return [
+      { label: "Codex Responses Base URL", value: `${baseUrl}/codex/v1` },
+      { label: "Codex Token", value: key }
+    ];
+  }
+  if (item.kind === "claude-code" || item.kind === "claude-desktop") {
+    return [
+      { label: "Anthropic Base URL", value: baseUrl },
+      { label: "Agent Key", value: key }
+    ];
+  }
+  if (item.kind === "open-code" || item.kind === "open-claw" || item.kind === "hermes") {
+    return [
+      { label: "OpenAI Base URL", value: `${baseUrl}/v1` },
+      { label: "Agent Key", value: key }
+    ];
+  }
+  if (item.kind === "gemini") {
+    return [{ label: "状态", value: "暂未启用原生 Gemini generateContent 代理入口" }];
+  }
+  return [];
+}
 function ProviderEditorModal({
   draft,
   config,
@@ -1908,217 +2020,6 @@ function MultiKeyManager({
   );
 }
 
-function GatewayPanel({
-  config,
-  status,
-  baseUrl,
-  savingGateway,
-  onConfigChange,
-  onSave,
-  onToggleProxy
-}: {
-  config: AppConfig | null;
-  status: ProxyStatus | null;
-  baseUrl: string;
-  savingGateway: boolean;
-  onConfigChange: (patch: Partial<AppConfig>) => void;
-  onSave: () => void;
-  onToggleProxy: () => void;
-}) {
-  return (
-    <div className="panel-grid gateway-grid">
-      <section className="surface">
-        <div className="panel-head">
-          <div>
-            <h3>本地入口</h3>
-            <p>Agent 只需要连这里，上游和缓存都由本地代理处理。</p>
-          </div>
-          <button className="primary-button" onClick={onToggleProxy}>
-            {status?.running ? <Square size={16} /> : <Play size={16} />}
-            {status?.running ? "停止" : "启动"}
-          </button>
-        </div>
-
-        <div className="connection-card">
-          <span>Base URL</span>
-          <code>{baseUrl}</code>
-          <button className="icon-button" onClick={() => void navigator.clipboard.writeText(baseUrl)} title="复制 Base URL">
-            <Copy size={16} />
-          </button>
-        </div>
-
-        <div className="form-grid">
-          <Field label="Host">
-            <input
-              value={config?.host ?? ""}
-              onChange={(event) => onConfigChange({ host: event.target.value })}
-            />
-          </Field>
-          <Field label="Port">
-            <input
-              value={String(config?.port ?? "")}
-              onChange={(event) => onConfigChange({ port: Number(event.target.value) || 0 })}
-            />
-          </Field>
-          <Field label="Local Key" wide>
-            <div className="input-with-icon">
-              <KeyRound size={17} />
-              <input
-                value={config?.local_key ?? ""}
-                onChange={(event) => onConfigChange({ local_key: event.target.value })}
-              />
-              <button className="inline-icon" onClick={() => void navigator.clipboard.writeText(config?.local_key ?? "")}>
-                <Copy size={16} />
-              </button>
-            </div>
-          </Field>
-        </div>
-
-        <button className="primary-button full" onClick={onSave} disabled={savingGateway}>
-          {savingGateway ? <Loader2 className="spin" size={16} /> : <Save size={16} />}
-          保存本地代理配置
-        </button>
-      </section>
-
-      <section className="surface setup-surface">
-        <h3>Agent 填写方式</h3>
-        <div className="code-tile">
-          <span>Anthropic / Claude</span>
-          <code>ANTHROPIC_BASE_URL={baseUrl}</code>
-        </div>
-        <div className="code-tile">
-          <span>OpenAI Compatible</span>
-          <code>OPENAI_BASE_URL={baseUrl}/v1</code>
-        </div>
-        <div className="code-tile">
-          <span>API Key</span>
-          <code>{config?.local_key ?? ""}</code>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function AgentsPanel({
-  injections,
-  providers,
-  activeProviderId,
-  injectingId,
-  onToggle,
-  onApply,
-  onRouteChange,
-  onApplyAll
-}: {
-  injections: AgentInjectionConfig[];
-  providers: ProviderConfig[];
-  activeProviderId?: string | null;
-  injectingId: string;
-  onToggle: (item: AgentInjectionConfig) => void;
-  onApply: (item: AgentInjectionConfig) => void;
-  onRouteChange: (item: AgentInjectionConfig, providerId: string, modelId?: string) => void;
-  onApplyAll: () => void;
-}) {
-  const fallbackProvider = providers.find((provider) => provider.id === activeProviderId) ?? providers[0];
-
-  return (
-    <section className="surface">
-      <div className="panel-head">
-        <div>
-          <h3>Agent 注入</h3>
-          <p>每个 Agent 独立绑定上游和模型，可以同时启用。</p>
-        </div>
-        <button className="primary-button" onClick={onApplyAll} disabled={injectingId === "all"}>
-          {injectingId === "all" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
-          刷新已启用
-        </button>
-      </div>
-
-      <div className="agent-grid">
-        {injections.map((item) => {
-          const selectedProvider =
-            providers.find((provider) => provider.id === item.provider_id) ?? fallbackProvider;
-          const models = selectedProvider?.models ?? [];
-          const selectedModel =
-            models.find((model) => model.id === item.model_id) ??
-            models.find((model) => model.enabled) ??
-            models[0];
-          const routeBusy = injectingId === `${item.id}:route`;
-          const itemBusy = injectingId === item.id;
-
-          return (
-            <div className={item.enabled ? "agent-card active" : "agent-card"} key={item.id}>
-              <div className="agent-card-main">
-                <div className="agent-icon">{agentIcon(item.kind)}</div>
-                <div>
-                  <h4>{item.label}</h4>
-                  <p>{item.last_status ?? "还没有同步配置"}</p>
-                  {item.target_path && <code>{item.target_path}</code>}
-                </div>
-              </div>
-
-              <div className="agent-route-grid">
-                <Field label="上游">
-                  <SelectShell disabled={!providers.length || routeBusy}>
-                    <select
-                      value={selectedProvider?.id ?? ""}
-                      disabled={!providers.length || routeBusy}
-                      onChange={(event) => {
-                        const provider = providers.find((item) => item.id === event.target.value);
-                        const model =
-                          provider?.models.find((item) => item.enabled)?.id ??
-                          provider?.models[0]?.id;
-                        onRouteChange(item, event.target.value, model);
-                      }}
-                    >
-                      {!providers.length && <option value="">暂无上游</option>}
-                      {providers.map((provider) => (
-                        <option key={provider.id} value={provider.id}>
-                          {provider.name}
-                        </option>
-                      ))}
-                    </select>
-                  </SelectShell>
-                </Field>
-                <Field label="模型">
-                  <SelectShell disabled={!selectedProvider || !models.length || routeBusy}>
-                    <select
-                      value={selectedModel?.id ?? ""}
-                      disabled={!selectedProvider || !models.length || routeBusy}
-                      onChange={(event) => onRouteChange(item, selectedProvider?.id ?? "", event.target.value)}
-                    >
-                      {!models.length && <option value="">暂无模型</option>}
-                      {models.map((model) => (
-                        <option key={model.id} value={model.id}>
-                          {model.id}
-                        </option>
-                      ))}
-                    </select>
-                  </SelectShell>
-                </Field>
-              </div>
-
-              <div className="agent-actions">
-                <button
-                  className={item.enabled ? "mini-toggle on" : "mini-toggle"}
-                  onClick={() => onToggle(item)}
-                  title={item.enabled ? "关闭自动注入" : "开启自动注入"}
-                >
-                  <span />
-                </button>
-                <button className="soft-button" onClick={() => onApply(item)} disabled={itemBusy || !selectedProvider}>
-                  {itemBusy ? <Loader2 className="spin" size={16} /> : <Workflow size={16} />}
-                  注入
-                </button>
-                {routeBusy && <Loader2 className="spin route-spinner" size={16} />}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
 function CachePanel({
   config,
   metrics,
@@ -2581,6 +2482,19 @@ function agentIcon(kind: AgentInjectionConfig["kind"]) {
 function visibleAgentInjections(items: AgentInjectionConfig[]): AgentInjectionConfig[] {
   return items;
 }
+
+function proxyAddressConflicts(leftHost: string, leftPort: number, rightHost: string, rightPort: number): boolean {
+  if (!Number.isInteger(leftPort) || leftPort !== rightPort) return false;
+  const left = normalizeProxyHost(leftHost);
+  const right = normalizeProxyHost(rightHost);
+  return left === right || left === "0.0.0.0" || right === "0.0.0.0";
+}
+
+function normalizeProxyHost(host: string): string {
+  const normalized = host.trim().toLowerCase();
+  return normalized === "localhost" ? "127.0.0.1" : normalized;
+}
+
 function providerToDraft(provider: ProviderConfig): ProviderDraft {
   return {
     id: provider.id,

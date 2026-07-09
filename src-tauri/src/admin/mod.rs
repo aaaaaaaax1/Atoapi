@@ -40,6 +40,11 @@ pub struct GeneralConfigInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyModeConfigInput {
+    pub host: String,
+    pub port: u16,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderModelFetchInput {
     pub provider_id: Option<String>,
     pub name: Option<String>,
@@ -106,6 +111,38 @@ pub async fn save_config(
     Ok(state.public_config().await)
 }
 
+#[tauri::command]
+pub async fn save_proxy_mode_config(
+    state: State<'_, Arc<AppState>>,
+    input: ProxyModeConfigInput,
+) -> CommandResult<PublicConfig> {
+    let was_running = state.proxy_mode_status().await.running;
+    if was_running {
+        state
+            .stop_proxy_mode_proxy()
+            .await
+            .map_err(to_command_error)?;
+    }
+    {
+        let mut config = state.config.write().await;
+        config.proxy_mode_host = input.host.trim().to_string();
+        config.proxy_mode_port = input.port;
+        config.updated_at = Utc::now();
+        config.save(&state.config_path).map_err(to_command_error)?;
+    }
+    if was_running {
+        state
+            .start_proxy_mode_proxy()
+            .await
+            .map_err(to_command_error)?;
+    }
+    Ok(state.public_config().await)
+}
+
+#[tauri::command]
+pub async fn get_proxy_mode_status(state: State<'_, Arc<AppState>>) -> CommandResult<ProxyStatus> {
+    Ok(state.proxy_mode_status().await)
+}
 #[tauri::command]
 pub async fn select_provider(
     state: State<'_, Arc<AppState>>,
@@ -519,11 +556,31 @@ pub async fn set_agent_injection_enabled(
     state: State<'_, Arc<AppState>>,
     input: AgentInjectionUpdate,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let mut config = state.config.write().await;
-    let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
-        .map_err(to_command_error)?;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
+    let enabled = input.enabled;
+    let agent_id = input.id.clone();
+    let results = {
+        let mut config = state.config.write().await;
+        let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
+            .map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        config.save(&state.config_path).map_err(to_command_error)?;
+        results
+    };
+    if agent_id == "proxy-mode" {
+        if enabled {
+            state
+                .start_proxy_mode_proxy()
+                .await
+                .map_err(to_command_error)?;
+        } else {
+            state
+                .stop_proxy_mode_proxy()
+                .await
+                .map_err(to_command_error)?;
+        }
+    } else if enabled {
+        state.start_proxy().await.map_err(to_command_error)?;
+    }
     Ok(results)
 }
 
@@ -532,10 +589,22 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let mut config = state.config.write().await;
-    let results = agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
+    let results = {
+        let mut config = state.config.write().await;
+        let results =
+            agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        config.save(&state.config_path).map_err(to_command_error)?;
+        results
+    };
+    if id == "proxy-mode" {
+        state
+            .start_proxy_mode_proxy()
+            .await
+            .map_err(to_command_error)?;
+    } else {
+        state.start_proxy().await.map_err(to_command_error)?;
+    }
     Ok(results)
 }
 
@@ -543,10 +612,22 @@ pub async fn apply_agent_injection(
 pub async fn apply_enabled_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let mut config = state.config.write().await;
-    let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
+    let results = {
+        let mut config = state.config.write().await;
+        let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        config.save(&state.config_path).map_err(to_command_error)?;
+        results
+    };
+    if results.iter().any(|item| item.id == "proxy-mode") {
+        state
+            .start_proxy_mode_proxy()
+            .await
+            .map_err(to_command_error)?;
+    }
+    if results.iter().any(|item| item.id != "proxy-mode") {
+        state.start_proxy().await.map_err(to_command_error)?;
+    }
     Ok(results)
 }
 
@@ -555,10 +636,32 @@ pub async fn update_agent_injection_route(
     state: State<'_, Arc<AppState>>,
     input: AgentInjectionRouteUpdate,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let mut config = state.config.write().await;
-    let results = agent_injection::update_route(&mut config, input).map_err(to_command_error)?;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
+    let agent_id = input.id.clone();
+    let should_start_proxy = {
+        let config = state.config.read().await;
+        config
+            .agent_injections
+            .iter()
+            .any(|item| item.id == input.id && item.enabled)
+    };
+    let results = {
+        let mut config = state.config.write().await;
+        let results =
+            agent_injection::update_route(&mut config, input).map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        config.save(&state.config_path).map_err(to_command_error)?;
+        results
+    };
+    if should_start_proxy && !results.is_empty() {
+        if agent_id == "proxy-mode" {
+            state
+                .start_proxy_mode_proxy()
+                .await
+                .map_err(to_command_error)?;
+        } else {
+            state.start_proxy().await.map_err(to_command_error)?;
+        }
+    }
     Ok(results)
 }
 

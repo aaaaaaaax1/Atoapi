@@ -10,9 +10,10 @@ mod state;
 use admin::{
     add_or_update_model, add_or_update_provider, apply_agent_injection,
     apply_enabled_agent_injections, clear_cache, delete_model, delete_provider,
-    fetch_provider_models, get_agent_injections, get_config, get_metrics, get_proxy_status,
-    reload_config, reveal_provider_api_key, reveal_provider_key, save_cache_policy, save_config,
-    select_provider, set_agent_injection_enabled, start_proxy, stop_proxy, test_provider_key,
+    fetch_provider_models, get_agent_injections, get_config, get_metrics, get_proxy_mode_status,
+    get_proxy_status, reload_config, reveal_provider_api_key, reveal_provider_key,
+    save_cache_policy, save_config, save_proxy_mode_config, select_provider,
+    set_agent_injection_enabled, start_proxy, stop_proxy, test_provider_key,
     test_provider_key_pool, update_agent_injection_route,
 };
 use state::AppState;
@@ -52,6 +53,8 @@ pub fn run() {
             update_agent_injection_route,
             apply_agent_injection,
             apply_enabled_agent_injections,
+            get_proxy_mode_status,
+            save_proxy_mode_config,
             clear_cache
         ])
         .setup(|app| {
@@ -69,15 +72,36 @@ pub fn run() {
                         .record_error("startup_agent_injection", &err.to_string())
                         .await;
                 }
-                let should_auto_start = state.config.read().await.proxy_auto_start;
-                if !should_auto_start {
-                    return;
+                let (should_start_main_proxy, should_start_proxy_mode) = {
+                    let config = state.config.read().await;
+                    let proxy_mode_enabled = config
+                        .agent_injections
+                        .iter()
+                        .any(|item| item.enabled && item.id == "proxy-mode");
+                    let non_proxy_agent_enabled = config
+                        .agent_injections
+                        .iter()
+                        .any(|item| item.enabled && item.id != "proxy-mode");
+                    (
+                        config.proxy_auto_start || non_proxy_agent_enabled,
+                        proxy_mode_enabled,
+                    )
+                };
+                if should_start_main_proxy {
+                    if let Err(err) = state.start_proxy().await {
+                        state
+                            .metrics
+                            .record_error("startup", &err.to_string())
+                            .await;
+                    }
                 }
-                if let Err(err) = state.start_proxy().await {
-                    state
-                        .metrics
-                        .record_error("startup", &err.to_string())
-                        .await;
+                if should_start_proxy_mode {
+                    if let Err(err) = state.start_proxy_mode_proxy().await {
+                        state
+                            .metrics
+                            .record_error("startup_proxy_mode", &err.to_string())
+                            .await;
+                    }
                 }
             });
             Ok(())

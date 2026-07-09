@@ -10,13 +10,14 @@ use axum::{
 use bytes::Bytes;
 use chrono::{Duration, Utc};
 use flate2::{write::GzEncoder, Compression};
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     io::Write,
+    pin::Pin,
     sync::Arc,
     time::Instant,
 };
@@ -33,6 +34,12 @@ use crate::{
     metrics::{RequestLog, UsageRecord},
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
 };
+
+mod codex_chat_common;
+mod json_canonical;
+mod sse;
+mod streaming_codex_chat;
+mod transform_codex_chat;
 
 const FOREGROUND_PREWARM_MAX_FULL_BODY_BYTES: usize = 1_500_000;
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
@@ -1096,21 +1103,47 @@ async fn handle_generation_for_agent(
             route_affinity_provider_id.as_deref(),
         );
     }
+    let codex_responses_chat_compat = should_preempt_codex_responses_via_chat(
+        &config,
+        forced_agent_id,
+        &client_channel,
+        &decision,
+    );
+    if codex_responses_chat_compat {
+        decision.upstream_channel = Channel::Chat;
+    }
     set_request_model(&mut client_request, &decision.model);
 
-    let client_requested_stream = client_request
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let mut upstream_body =
-        transform_request_for_channel(&client_request, &client_channel, &decision.upstream_channel);
+    let request_had_stream_field = client_request.get("stream").is_some();
+    let client_requested_stream =
+        infer_client_requested_stream(&mut client_request, &client_channel, forced_agent_id);
+    let codex_defaulted_responses_stream = forced_agent_id == Some("codex")
+        && matches!(client_channel, Channel::Responses)
+        && !request_had_stream_field
+        && client_requested_stream;
+    let codex_chat_tool_context = codex_responses_chat_compat
+        .then(|| transform_codex_chat::build_codex_tool_context_from_request(&client_request));
+    let mut upstream_body = if codex_responses_chat_compat {
+        match transform_codex_chat::responses_to_chat_completions(client_request.clone()) {
+            Ok(body) => body,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("failed to convert Codex Responses request for Chat upstream: {err}"),
+                )
+            }
+        }
+    } else {
+        transform_request_for_channel(&client_request, &client_channel, &decision.upstream_channel)
+    };
     if matches!(decision.upstream_channel, Channel::Responses) {
         normalize_responses_request(&mut upstream_body);
     }
     optimize_provider_prefix(&mut upstream_body, &config, &decision);
 
-    let cross_protocol_stream =
-        client_requested_stream && client_channel != decision.upstream_channel;
+    let cross_protocol_stream = client_requested_stream
+        && client_channel != decision.upstream_channel
+        && !codex_responses_chat_compat;
     if cross_protocol_stream {
         set_stream_flag(&mut upstream_body, false);
     }
@@ -1282,9 +1315,11 @@ async fn handle_generation_for_agent(
         &decision.upstream_channel,
         client_requested_stream,
     );
+    let responses_main_retry_guard =
+        skip_prefix_guard_for_sync_responses || codex_defaulted_responses_stream;
     if responses_sync_main_prefix_error_cooled_down(
         &state,
-        skip_prefix_guard_for_sync_responses,
+        responses_main_retry_guard,
         provider_prefix_control_key.as_deref(),
     )
     .await
@@ -1673,7 +1708,7 @@ async fn handle_generation_for_agent(
     }
     if should_fallback_responses_sync_main_to_chat_compat(
         status,
-        skip_prefix_guard_for_sync_responses,
+        responses_main_retry_guard,
         responses_non_stream_chat_compat,
     ) {
         state.metrics.record_retry().await;
@@ -1738,11 +1773,13 @@ async fn handle_generation_for_agent(
             .map(|status| status.is_success())
             .unwrap_or(false);
     }
-    if should_fallback_chat_compat_compact_to_responses(
-        status,
-        skip_prefix_guard_for_sync_responses,
-        active_responses_non_stream_chat_compat,
-    ) {
+    if !responses_sync_main_chat_compat_fallback
+        && should_fallback_chat_compat_compact_to_responses(
+            status,
+            skip_prefix_guard_for_sync_responses,
+            active_responses_non_stream_chat_compat,
+        )
+    {
         let chat_error_body = match read_upstream_body_with_diagnostics(
             upstream,
             &content_type,
@@ -2012,6 +2049,7 @@ async fn handle_generation_for_agent(
             tail_input_diagnostics.clone(),
             session_anchor_diagnostics.clone(),
             response_session_reuse_diagnostics.clone(),
+            codex_chat_tool_context.clone(),
             prefix_guard_wait.clone(),
             local_prepare_ms,
             upstream_request_diagnostics.clone(),
@@ -2261,7 +2299,7 @@ async fn handle_generation_for_agent(
     if !is_success_status {
         let error_summary = upstream_error_summary(&bytes);
         if should_cooldown_prefix_after_status(status)
-            || (skip_prefix_guard_for_sync_responses
+            || (responses_main_retry_guard
                 && should_cooldown_responses_sync_main_after_status(status))
         {
             note_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
@@ -2279,12 +2317,38 @@ async fn handle_generation_for_agent(
         } else {
             content_type.clone()
         };
-    let mut response_bytes = transform_response_bytes(
-        &client_channel,
-        &active_request_channel,
-        &decision.model,
-        &bytes_for_client,
-    );
+    let mut response_bytes = if matches!(client_channel, Channel::Responses)
+        && matches!(active_request_channel, Channel::Chat)
+        && codex_responses_chat_compat
+    {
+        serde_json::from_slice::<Value>(&bytes_for_client)
+            .ok()
+            .and_then(|value| {
+                codex_chat_tool_context.as_ref().and_then(|tool_context| {
+                    transform_codex_chat::chat_completion_to_response_with_context(
+                        value,
+                        tool_context,
+                    )
+                    .ok()
+                })
+            })
+            .and_then(|value| serde_json::to_vec(&value).ok())
+            .unwrap_or_else(|| {
+                transform_response_bytes(
+                    &client_channel,
+                    &active_request_channel,
+                    &decision.model,
+                    &bytes_for_client,
+                )
+            })
+    } else {
+        transform_response_bytes(
+            &client_channel,
+            &active_request_channel,
+            &decision.model,
+            &bytes_for_client,
+        )
+    };
     if non_sse_compact_compat_for_decision(&config, &decision)
         && matches!(client_channel, Channel::Responses)
     {
@@ -3454,7 +3518,7 @@ fn should_fallback_responses_sync_main_to_chat_compat(
     sync_main: bool,
     already_chat_compat: bool,
 ) -> bool {
-    sync_main && !already_chat_compat && matches!(status, 400 | 401 | 405 | 501 | 520)
+    sync_main && !already_chat_compat && matches!(status, 400 | 401 | 405 | 500..=504 | 520 | 524)
 }
 
 fn should_fallback_chat_compat_compact_to_responses(
@@ -8160,6 +8224,7 @@ async fn stream_upstream(
     tail_input_diagnostics: TailInputDiagnostics,
     session_anchor_diagnostics: SessionAnchorDiagnostics,
     response_session_reuse_diagnostics: ResponseSessionReuseDiagnostics,
+    codex_chat_tool_context: Option<transform_codex_chat::CodexToolContext>,
     prefix_guard_wait: PrefixGuardWaitDiagnostics,
     local_prepare_ms: u64,
     upstream_request_diagnostics: UpstreamRequestDiagnostics,
@@ -8172,14 +8237,34 @@ async fn stream_upstream(
     drop(_prefix_guard);
     drop(_response_session_guard);
 
-    let mut stream = upstream.bytes_stream();
+    let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Chat);
+    let raw_stream = upstream.bytes_stream();
+    let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+        if convert_codex_chat_sse_to_responses_sse {
+            let tool_context = codex_chat_tool_context.unwrap_or_default();
+            Box::pin(
+                streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
+                    raw_stream,
+                    tool_context,
+                )
+                .map(|item| item.map_err(|err| err.to_string())),
+            )
+        } else {
+            Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
+        };
     let mut first_chunk_at: Option<u64> = None;
     let mut cache_body = Vec::new();
     let mut stream_metadata = SseStreamMetadataCollector::default();
     let mut sse_chunks = 0u64;
     let mut sse_end_reason = "upstream_eof".to_string();
     let state_for_stream = state.clone();
-    let content_type_for_cache = content_type.clone();
+    let response_content_type = if convert_codex_chat_sse_to_responses_sse {
+        "text/event-stream".to_string()
+    } else {
+        content_type.clone()
+    };
+    let content_type_for_cache = response_content_type.clone();
     let stream_body = async_stream::stream! {
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -8187,7 +8272,7 @@ async fn stream_upstream(
                 Err(err) => {
                     state_for_stream
                         .metrics
-                        .record_error("upstream_stream", &err.to_string())
+                        .record_error("upstream_stream", &err)
                         .await;
                     sse_end_reason = "upstream_stream_error".to_string();
                     break;
@@ -8433,7 +8518,7 @@ async fn stream_upstream(
 
     Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_TYPE, response_content_type)
         .body(Body::from_stream(stream_body))
         .unwrap_or_else(|_| {
             json_error(
@@ -8502,9 +8587,7 @@ async fn authorize_for_agent(
 
 fn agent_for_local_key<'a>(config: &'a AppConfig, key: &str) -> Option<&'a AgentInjectionConfig> {
     config.agent_injections.iter().find(|agent| {
-        agent.enabled
-            && agent.kind != AgentInjectionKind::ProxyMode
-            && agent_injection::agent_local_key(&config.local_key, &agent.id) == key
+        agent.enabled && agent_injection::agent_local_key(&config.local_key, &agent.id) == key
     })
 }
 
@@ -8830,6 +8913,19 @@ fn auto_upstream_channel_for_provider(
     // Responses compact/non-stream fast paths may switch to Chat later in the
     // pipeline, where payload shape and fallback diagnostics are available.
     provider.channel.clone()
+}
+
+fn should_preempt_codex_responses_via_chat(
+    config: &AppConfig,
+    forced_agent_id: Option<&str>,
+    client_channel: &Channel,
+    decision: &RouteDecision,
+) -> bool {
+    forced_agent_id == Some("codex")
+        && matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Responses)
+        && config.provider_channel_mode_for_provider(&decision.provider.id)
+            == ProviderChannelMode::Auto
 }
 
 fn provider_supports_requested_model(
@@ -10233,6 +10329,21 @@ fn set_stream_flag(request: &mut Value, stream: bool) {
     if let Some(object) = request.as_object_mut() {
         object.insert("stream".to_string(), Value::Bool(stream));
     }
+}
+
+fn infer_client_requested_stream(
+    request: &mut Value,
+    client_channel: &Channel,
+    forced_agent_id: Option<&str>,
+) -> bool {
+    if let Some(stream) = request.get("stream").and_then(Value::as_bool) {
+        return stream;
+    }
+    if forced_agent_id == Some("codex") && matches!(client_channel, Channel::Responses) {
+        set_stream_flag(request, true);
+        return true;
+    }
+    false
 }
 
 fn chat_to_responses_request(request: &Value) -> Value {
@@ -11887,6 +11998,38 @@ mod tests {
         },
     };
     use tokio::net::TcpListener;
+
+    #[test]
+    fn codex_responses_defaults_to_stream_when_stream_is_absent() {
+        let mut request = json!({ "model": "gpt-5.5", "input": "hello" });
+
+        let stream =
+            infer_client_requested_stream(&mut request, &Channel::Responses, Some("codex"));
+
+        assert!(stream);
+        assert_eq!(request["stream"], json!(true));
+    }
+
+    #[test]
+    fn codex_responses_respects_explicit_non_stream() {
+        let mut request = json!({ "model": "gpt-5.5", "input": "hello", "stream": false });
+
+        let stream =
+            infer_client_requested_stream(&mut request, &Channel::Responses, Some("codex"));
+
+        assert!(!stream);
+        assert_eq!(request["stream"], json!(false));
+    }
+
+    #[test]
+    fn normal_responses_still_defaults_to_non_stream() {
+        let mut request = json!({ "model": "gpt-5.5", "input": "hello" });
+
+        let stream = infer_client_requested_stream(&mut request, &Channel::Responses, None);
+
+        assert!(!stream);
+        assert!(request.get("stream").is_none());
+    }
 
     #[test]
     fn upstream_ttft_subtracts_only_local_prefix_guard_wait() {
@@ -15090,6 +15233,24 @@ mod tests {
     }
 
     #[test]
+    fn proxy_mode_scoped_key_routes_to_proxy_mode_agent() {
+        let mut config = AppConfig::default();
+        config.local_key = "ato-root-key".to_string();
+        let proxy_mode = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "proxy-mode")
+            .unwrap();
+        proxy_mode.enabled = true;
+
+        let key = agent_injection::agent_local_key(&config.local_key, "proxy-mode");
+        let agent = agent_for_local_key(&config, &key).unwrap();
+
+        assert_eq!(agent.id, "proxy-mode");
+        assert_eq!(agent.kind, AgentInjectionKind::ProxyMode);
+    }
+
+    #[test]
     fn global_local_key_uses_active_provider_without_agent_inference() {
         let mut config = AppConfig::default();
         config.providers = vec![
@@ -15817,6 +15978,7 @@ mod tests {
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
             ResponseSessionReuseDiagnostics::default(),
+            None,
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
@@ -21086,6 +21248,12 @@ mod tests {
         assert!(should_fallback_responses_sync_main_to_chat_compat(
             401, true, false
         ));
+        assert!(should_fallback_responses_sync_main_to_chat_compat(
+            502, true, false
+        ));
+        assert!(should_fallback_responses_sync_main_to_chat_compat(
+            503, true, false
+        ));
         assert!(!should_fallback_responses_sync_main_to_chat_compat(
             401, true, true
         ));
@@ -21263,6 +21431,161 @@ mod tests {
             metrics.recent_requests[0].upstream_call_kind.as_deref(),
             Some("sync")
         );
+    }
+
+    #[tokio::test]
+    async fn codex_responses_auto_provider_preempts_to_chat_and_streams_back_responses_sse() {
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let captured_chat_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let responses_hits_for_route = responses_hits.clone();
+        let chat_hits_for_route = chat_hits.clone();
+        let captured_body_for_route = captured_chat_body.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = responses_hits_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({"error":{"message":"responses should not be used"}})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let hits = chat_hits_for_route.clone();
+                    let captured = captured_body_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        *captured.lock().await = body;
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "data: {\"id\":\"chatcmpl_codex\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+                                "data: {\"id\":\"chatcmpl_codex\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("mock-responses".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "mock-responses".to_string(),
+            name: "Mock Responses".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.5".to_string(),
+                display_name: "gpt-5.5".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("mock-responses".to_string()),
+            model_id: Some("gpt-5.5".to_string()),
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+        }];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-chat-compat-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "type": "message", "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(response_text.contains("event: response.output_text.delta"));
+        assert!(response_text.contains("event: response.completed"));
+        assert!(response_text.contains("\"text\":\"hello\""));
+
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 1);
+        let captured = captured_chat_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert_eq!(captured["stream_options"]["include_usage"], true);
+        assert!(captured.get("messages").is_some());
+        assert!(captured.get("input").is_none());
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(
+            metrics.recent_requests[0].upstream_call_kind.as_deref(),
+            Some("stream")
+        );
+        assert_eq!(metrics.recent_requests[0].client_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "chat");
+
+        fs::remove_dir_all(config_dir).ok();
     }
 
     #[tokio::test]

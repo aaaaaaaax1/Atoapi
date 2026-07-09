@@ -53,6 +53,7 @@ pub struct AppState {
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
     server: Mutex<Option<ProxyServer>>,
+    proxy_mode_server: Mutex<Option<ProxyServer>>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +177,7 @@ impl AppState {
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
+            proxy_mode_server: Mutex::new(None),
         })
     }
 
@@ -202,6 +204,7 @@ impl AppState {
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
+            proxy_mode_server: Mutex::new(None),
         })
     }
 
@@ -279,6 +282,48 @@ impl AppState {
         })
     }
 
+    pub async fn start_proxy_mode_proxy(self: &Arc<Self>) -> Result<ProxyStatus> {
+        let mut server_guard = self.proxy_mode_server.lock().await;
+        if let Some(server) = server_guard.as_ref() {
+            return Ok(ProxyStatus {
+                running: true,
+                address: Some(server.address.clone()),
+            });
+        }
+
+        let config = self.config.read().await.clone();
+        let bind = format!("{}:{}", config.proxy_mode_host, config.proxy_mode_port);
+        let listener = TcpListener::bind(&bind)
+            .await
+            .with_context(|| format!("failed to bind proxy mode at {bind}"))?;
+        let address = listener.local_addr()?.to_string();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let router = proxy::router(self.clone());
+
+        tokio::spawn(async move {
+            let result = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
+            .await;
+
+            if let Err(err) = result {
+                eprintln!("proxy mode server stopped with error: {err}");
+            }
+        });
+
+        *server_guard = Some(ProxyServer {
+            address: address.clone(),
+            shutdown: shutdown_tx,
+        });
+        Ok(ProxyStatus {
+            running: true,
+            address: Some(address),
+        })
+    }
     pub async fn stop_proxy(&self) -> Result<ProxyStatus> {
         let mut server_guard = self.server.lock().await;
         if let Some(server) = server_guard.take() {
@@ -291,6 +336,16 @@ impl AppState {
         })
     }
 
+    pub async fn stop_proxy_mode_proxy(&self) -> Result<ProxyStatus> {
+        let mut server_guard = self.proxy_mode_server.lock().await;
+        if let Some(server) = server_guard.take() {
+            let _ = server.shutdown.send(());
+        }
+        Ok(ProxyStatus {
+            running: false,
+            address: None,
+        })
+    }
     pub async fn proxy_status(&self) -> ProxyStatus {
         let server_guard = self.server.lock().await;
         ProxyStatus {
@@ -299,6 +354,13 @@ impl AppState {
         }
     }
 
+    pub async fn proxy_mode_status(&self) -> ProxyStatus {
+        let server_guard = self.proxy_mode_server.lock().await;
+        ProxyStatus {
+            running: server_guard.is_some(),
+            address: server_guard.as_ref().map(|server| server.address.clone()),
+        }
+    }
     async fn set_proxy_auto_start(&self, enabled: bool) -> Result<()> {
         let mut config = self.config.write().await;
         if config.proxy_auto_start != enabled {

@@ -104,6 +104,8 @@ export interface AppConfig {
   host: string;
   port: number;
   proxy_auto_start: boolean;
+  proxy_mode_host: string;
+  proxy_mode_port: number;
   local_key: string;
   default_channel: Channel;
   active_provider_id?: string | null;
@@ -145,6 +147,7 @@ export interface AgentInjectionConfig {
   target_path?: string | null;
   last_injected_at?: string | null;
   last_status?: string | null;
+  local_key?: string | null;
 }
 
 export interface AgentInjectionResult {
@@ -376,6 +379,11 @@ export interface FetchModelsInput {
   api_key?: string;
 }
 
+export interface ProxyModeConfigInput {
+  host: string;
+  port: number;
+}
+
 export interface GeneralConfigInput {
   host: string;
   port: number;
@@ -389,6 +397,8 @@ let fallbackConfig: AppConfig = {
   host: "127.0.0.1",
   port: 18883,
   proxy_auto_start: true,
+  proxy_mode_host: "127.0.0.1",
+  proxy_mode_port: 18884,
   local_key: "ato-local-preview",
   default_channel: "anthropic",
   active_provider_id: null,
@@ -767,7 +777,17 @@ function fallback(name: string, args?: Record<string, unknown>) {
     };
     return fallbackConfig;
   }
-  if (name === "save_cache_policy") {
+  if (name === "save_proxy_mode_config") {
+    const input = args?.input as ProxyModeConfigInput | undefined;
+    if (!input) return fallbackConfig;
+    fallbackConfig = {
+      ...fallbackConfig,
+      proxy_mode_host: input.host,
+      proxy_mode_port: input.port,
+      updated_at: new Date().toISOString()
+    };
+    return fallbackConfig;
+  }  if (name === "save_cache_policy") {
     const input = args?.input as AppConfig["cache"] | undefined;
     if (!input) return fallbackConfig;
     fallbackConfig = {

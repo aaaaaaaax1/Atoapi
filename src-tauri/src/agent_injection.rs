@@ -367,12 +367,25 @@ fn apply_item(
 
 impl InjectionContext {
     fn from_config(config: &AppConfig, item: Option<&AgentInjectionConfig>) -> Self {
-        let host = if config.host == "0.0.0.0" {
-            "127.0.0.1"
+        let use_proxy_mode_address = item
+            .map(|item| item.kind == AgentInjectionKind::ProxyMode)
+            .unwrap_or(false);
+        let source_host = if use_proxy_mode_address {
+            config.proxy_mode_host.as_str()
         } else {
             config.host.as_str()
         };
-        let base = format!("http://{}:{}", host, config.port);
+        let source_port = if use_proxy_mode_address {
+            config.proxy_mode_port
+        } else {
+            config.port
+        };
+        let host = if source_host == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            source_host
+        };
+        let base = format!("http://{}:{}", host, source_port);
         let configured_provider_id = item
             .and_then(|item| item.provider_id.as_deref())
             .or(config.active_provider_id.as_deref());

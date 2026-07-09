@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs,
     net::IpAddr,
@@ -12,6 +13,14 @@ use crate::crypto::{decrypt_secret, encrypt_secret};
 
 fn default_proxy_auto_start() -> bool {
     true
+}
+
+fn default_proxy_mode_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_proxy_mode_port() -> u16 {
+    18884
 }
 
 fn default_prompt_cache_retention_enabled() -> bool {
@@ -74,6 +83,10 @@ pub struct AppConfig {
     pub port: u16,
     #[serde(default = "default_proxy_auto_start")]
     pub proxy_auto_start: bool,
+    #[serde(default = "default_proxy_mode_host")]
+    pub proxy_mode_host: String,
+    #[serde(default = "default_proxy_mode_port")]
+    pub proxy_mode_port: u16,
     pub local_key: String,
     pub default_channel: Channel,
     #[serde(default)]
@@ -418,6 +431,8 @@ pub struct AgentInjectionConfig {
     pub last_injected_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +493,8 @@ pub struct PublicConfig {
     pub host: String,
     pub port: u16,
     pub proxy_auto_start: bool,
+    pub proxy_mode_host: String,
+    pub proxy_mode_port: u16,
     pub local_key: String,
     pub default_channel: Channel,
     pub active_provider_id: Option<String>,
@@ -506,6 +523,8 @@ impl Default for AppConfig {
             host: "127.0.0.1".to_string(),
             port: 18883,
             proxy_auto_start: default_proxy_auto_start(),
+            proxy_mode_host: default_proxy_mode_host(),
+            proxy_mode_port: default_proxy_mode_port(),
             local_key,
             default_channel: Channel::Anthropic,
             active_provider_id: None,
@@ -547,6 +566,14 @@ impl Default for AppConfig {
     }
 }
 
+fn proxy_bind_conflicts(host: &str, port: u16, other_host: &str, other_port: u16) -> Result<bool> {
+    if port != other_port {
+        return Ok(false);
+    }
+    let ip = host.parse::<IpAddr>()?;
+    let other_ip = other_host.parse::<IpAddr>()?;
+    Ok(ip == other_ip || ip.is_unspecified() || other_ip.is_unspecified())
+}
 impl AppConfig {
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
@@ -558,6 +585,14 @@ impl AppConfig {
             config.cache.normalize_smart_max_hit();
             if !raw.contains("proxy_auto_start") {
                 config.proxy_auto_start = default_proxy_auto_start();
+                changed = true;
+            }
+            if !raw.contains("proxy_mode_host") {
+                config.proxy_mode_host = default_proxy_mode_host();
+                changed = true;
+            }
+            if !raw.contains("proxy_mode_port") {
+                config.proxy_mode_port = default_proxy_mode_port();
                 changed = true;
             }
             if strip_builtin_demo_provider(&mut config) {
@@ -575,9 +610,27 @@ impl AppConfig {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if self.host.parse::<IpAddr>()?.is_unspecified() && self.local_key.trim().is_empty() {
+        let host_ip = self.host.parse::<IpAddr>()?;
+        let proxy_mode_ip = self.proxy_mode_host.parse::<IpAddr>()?;
+        if host_ip.is_unspecified() && self.local_key.trim().is_empty() {
             return Err(anyhow!(
                 "binding to 0.0.0.0 requires a non-empty local authentication key"
+            ));
+        }
+        if proxy_mode_ip.is_unspecified() && self.local_key.trim().is_empty() {
+            return Err(anyhow!(
+                "binding proxy mode to 0.0.0.0 requires a non-empty local authentication key"
+            ));
+        }
+        let proxy_mode_conflicts_with_main = proxy_bind_conflicts(
+            &self.host,
+            self.port,
+            &self.proxy_mode_host,
+            self.proxy_mode_port,
+        )?;
+        if proxy_mode_conflicts_with_main {
+            return Err(anyhow!(
+                "proxy mode address must be different from the main agent proxy address"
             ));
         }
         if let Some(parent) = path.parent() {
@@ -593,6 +646,8 @@ impl AppConfig {
             host: self.host.clone(),
             port: self.port,
             proxy_auto_start: self.proxy_auto_start,
+            proxy_mode_host: self.proxy_mode_host.clone(),
+            proxy_mode_port: self.proxy_mode_port,
             local_key: self.local_key.clone(),
             default_channel: self.default_channel.clone(),
             active_provider_id: self.active_provider_id.clone(),
@@ -623,7 +678,15 @@ impl AppConfig {
                 .collect(),
             route_profiles: self.route_profiles.clone(),
             cache: self.cache.clone(),
-            agent_injections: self.agent_injections.clone(),
+            agent_injections: self
+                .agent_injections
+                .iter()
+                .cloned()
+                .map(|mut item| {
+                    item.local_key = public_agent_local_key(&self.local_key, &item.id);
+                    item
+                })
+                .collect(),
             provider_key_pools: self
                 .provider_key_pools
                 .iter()
@@ -1149,6 +1212,17 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+fn public_agent_local_key(local_key: &str, agent_id: &str) -> Option<String> {
+    if local_key.trim().is_empty() {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(local_key.as_bytes());
+    hasher.update(b"\0atoapi-agent\0");
+    hasher.update(agent_id.as_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    Some(format!("ato-agent-{}", &digest[..32]))
+}
 pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
     vec![
         AgentInjectionConfig {
@@ -1161,6 +1235,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "claude-desktop".to_string(),
@@ -1172,6 +1247,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "codex".to_string(),
@@ -1183,6 +1259,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "gemini".to_string(),
@@ -1194,6 +1271,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "opencode".to_string(),
@@ -1205,6 +1283,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "openclaw".to_string(),
@@ -1216,6 +1295,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "hermes".to_string(),
@@ -1227,6 +1307,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
         AgentInjectionConfig {
             id: "proxy-mode".to_string(),
@@ -1238,6 +1319,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             target_path: None,
             last_injected_at: None,
             last_status: None,
+            local_key: None,
         },
     ]
 }
@@ -1377,6 +1459,26 @@ prewarm_enabled = true
         assert!(!config.cache.background_prewarm_enabled);
     }
 
+    #[test]
+    fn proxy_mode_address_must_not_conflict_with_main_proxy() {
+        let mut config = AppConfig::default();
+        config.host = "127.0.0.1".to_string();
+        config.port = 18883;
+        config.proxy_mode_host = "127.0.0.1".to_string();
+        config.proxy_mode_port = 18883;
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-proxy-mode-conflict-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = config.save(&dir.join("config.toml")).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("proxy mode address must be different"));
+        std::fs::remove_dir_all(dir).ok();
+    }
     #[test]
     fn unknown_legacy_agent_injection_kind_is_ignored() {
         let raw = r#"
