@@ -39,9 +39,12 @@ use crate::{
 
 mod codex_chat_common;
 mod json_canonical;
+mod prefix_guard;
 mod sse;
 mod streaming_codex_chat;
 mod transform_codex_chat;
+
+use prefix_guard::{decide_responses_guard, ResponsesGuardInput};
 
 #[cfg(test)]
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
@@ -89,6 +92,7 @@ struct ReasoningEffortDiagnostics {
 struct UpstreamRequestDiagnostics {
     network_path: &'static str,
     request_body_bytes: u64,
+    request_body_encode_ms: u64,
     attempts: u64,
     retry_wait_ms: u64,
     headers_ms: u64,
@@ -96,10 +100,13 @@ struct UpstreamRequestDiagnostics {
     http_version: Option<String>,
     remote_addr: Option<String>,
     pool_diagnostic: Option<String>,
+    upstream_trace_id: Option<String>,
+    upstream_trace_source: Option<String>,
     server_timing: Option<String>,
     timing_source: Option<String>,
     reported_processing_ms: Option<u64>,
     non_processing_ms: Option<u64>,
+    gzip_encode_ms: u64,
     gzip_attempted: bool,
     gzip_fallback_used: bool,
     gzip_skipped_cold_stream: bool,
@@ -112,6 +119,7 @@ impl UpstreamRequestDiagnostics {
             self.network_path = next.network_path;
         }
         self.request_body_bytes = next.request_body_bytes;
+        self.request_body_encode_ms += next.request_body_encode_ms;
         self.attempts += next.attempts;
         self.retry_wait_ms += next.retry_wait_ms;
         self.headers_ms += next.headers_ms;
@@ -120,12 +128,15 @@ impl UpstreamRequestDiagnostics {
             self.http_version = next.http_version.clone();
             self.remote_addr = next.remote_addr.clone();
             self.pool_diagnostic = next.pool_diagnostic.clone();
+            self.upstream_trace_id = next.upstream_trace_id.clone();
+            self.upstream_trace_source = next.upstream_trace_source.clone();
             self.server_timing = next.server_timing.clone();
             self.timing_source = next.timing_source.clone();
             self.reported_processing_ms = next.reported_processing_ms;
             self.non_processing_ms = next.non_processing_ms;
         }
         self.gzip_attempted |= next.gzip_attempted;
+        self.gzip_encode_ms += next.gzip_encode_ms;
         self.gzip_fallback_used |= next.gzip_fallback_used;
         self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
         self.sent_body_bytes = next.sent_body_bytes;
@@ -1068,6 +1079,8 @@ async fn handle_responses_compact_for_agent(
         upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
         upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
         upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
+        upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
+        upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
         upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
         upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
         upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -1080,6 +1093,8 @@ async fn handle_responses_compact_for_agent(
         upstream_attempts: Some(upstream_request_diagnostics.attempts),
         request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
         sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
+        request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
+        gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
         gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
         gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
         upstream_header_wait_class: Some(upstream_header_wait_class(&upstream_request_diagnostics)),
@@ -2952,6 +2967,8 @@ async fn handle_generation_for_agent(
         upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
         upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
         upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
+        upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
+        upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
         upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
         upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
         upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -2964,6 +2981,8 @@ async fn handle_generation_for_agent(
         upstream_attempts: Some(upstream_request_diagnostics.attempts),
         request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
         sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
+        request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
+        gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
         gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
         gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
         upstream_header_wait_class: Some(upstream_header_wait_class(&upstream_request_diagnostics)),
@@ -3105,37 +3124,60 @@ async fn wait_for_provider_prefix_settle(
             ..PrefixGuardWaitDiagnostics::default()
         };
     }
-    let decision = {
+    let state_snapshot = {
         let states = state.prefix_states.lock().await;
         lookup_provider_prefix_state_with_source(
             &states,
             provider_prefix_key,
             provider_prefix_family_key,
         )
-        .map(|(source, state)| {
-            let wait = provider_prefix_wait_duration_for_channel(channel, state, current_tail);
-            let reason = provider_prefix_wait_reason_for_channel(channel, state, current_tail);
-            (
-                wait,
-                reason,
-                source.to_string(),
-                state.finished_at.elapsed().as_millis() as u64,
-                state.cache_instability_score as u64,
-                state.seen_bucket_tokens_128.max(state.seen_bucket_tokens),
-                state.cache_read_tokens,
-            )
-        })
+        .map(|(source, state)| (source.to_string(), state.clone()))
     };
-    if let Some((
-        wait,
-        reason,
-        source,
-        state_age_ms,
-        cache_instability_score,
-        seen_bucket_tokens,
-        state_cache_read_tokens,
-    )) = decision
-    {
+    if let Some((source, state)) = state_snapshot {
+        let state_age = state.finished_at.elapsed();
+        let state_age_ms = state_age.as_millis() as u64;
+        let cache_instability_score = state.cache_instability_score as u64;
+        let seen_bucket_tokens = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
+        let state_cache_read_tokens = state.cache_read_tokens;
+
+        if matches!(channel, Channel::Responses) {
+            let avoidable_tokens = state
+                .avoidable_shortfall_tokens_128
+                .max(state.avoidable_shortfall_tokens);
+            let policy = decide_responses_guard(ResponsesGuardInput {
+                source_is_exact: source == "exact",
+                avoidable_tokens,
+                state_age,
+                request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
+            });
+            if policy.wait.is_zero() {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: policy.skip_reason.map(str::to_string),
+                    budget_exhausted: policy.budget_exhausted,
+                    source: Some(source),
+                    state_age_ms: Some(state_age_ms),
+                    cache_instability_score: Some(cache_instability_score),
+                    seen_bucket_tokens: Some(seen_bucket_tokens),
+                    state_cache_read_tokens: Some(state_cache_read_tokens),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            }
+            sleep(policy.wait).await;
+            return PrefixGuardWaitDiagnostics {
+                wait_ms: policy.wait.as_millis() as u64,
+                reason: policy.reason.map(str::to_string),
+                source: Some(source),
+                state_age_ms: Some(state_age_ms),
+                skip_reason: None,
+                budget_exhausted: policy.budget_exhausted,
+                cache_instability_score: Some(cache_instability_score),
+                seen_bucket_tokens: Some(seen_bucket_tokens),
+                state_cache_read_tokens: Some(state_cache_read_tokens),
+            };
+        }
+
+        let wait = provider_prefix_wait_duration_for_channel(channel, &state, current_tail);
+        let reason = provider_prefix_wait_reason_for_channel(channel, &state, current_tail);
         if let Some(wait) = wait {
             let requested_wait = wait;
             let wait = max_wait
@@ -4826,6 +4868,13 @@ fn observe_upstream_response_timing(
     );
     diagnostics.http_version = Some(http_version);
     diagnostics.remote_addr = response.remote_addr().map(|address| address.to_string());
+    if let Some((source, trace_id)) = upstream_response_trace_id(response.headers()) {
+        diagnostics.upstream_trace_source = Some(source.to_string());
+        diagnostics.upstream_trace_id = Some(trace_id);
+    } else {
+        diagnostics.upstream_trace_source = None;
+        diagnostics.upstream_trace_id = None;
+    }
     diagnostics.server_timing = response_header_values(response.headers(), "server-timing");
     if let Some((source, processing_ms)) = reported_upstream_processing_ms(response.headers()) {
         diagnostics.timing_source = Some(source.to_string());
@@ -4836,6 +4885,28 @@ fn observe_upstream_response_timing(
         diagnostics.reported_processing_ms = None;
         diagnostics.non_processing_ms = None;
     }
+}
+
+fn upstream_response_trace_id(headers: &HeaderMap) -> Option<(&'static str, String)> {
+    for name in [
+        "x-request-id",
+        "request-id",
+        "x-trace-id",
+        "traceparent",
+        "cf-ray",
+        "x-amzn-trace-id",
+    ] {
+        let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        return Some((name, value.chars().take(256).collect()));
+    }
+    None
 }
 
 fn response_header_values(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -7885,6 +7956,8 @@ async fn record_upstream_response_observation(
             upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
             upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
             upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
+            upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
+            upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
             upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
             upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
             upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -7897,6 +7970,8 @@ async fn record_upstream_response_observation(
             upstream_attempts: Some(upstream_request_diagnostics.attempts),
             request_body_bytes: Some(body_bytes),
             sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes.max(body_bytes)),
+            request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
+            gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
             gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
             gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
             upstream_header_wait_class: Some(upstream_header_wait_class(
@@ -8049,6 +8124,8 @@ async fn record_upstream_transport_failure(
         upstream_network_path: None,
         upstream_remote_addr: None,
         upstream_pool_diagnostic: None,
+        upstream_trace_id: None,
+        upstream_trace_source: None,
         upstream_server_timing: None,
         upstream_timing_source: None,
         upstream_reported_processing_ms: None,
@@ -8061,6 +8138,8 @@ async fn record_upstream_transport_failure(
         upstream_attempts: Some(1),
         request_body_bytes: Some(body_bytes),
         sent_body_bytes: Some(body_bytes),
+        request_body_encode_ms: Some(0),
+        gzip_encode_ms: Some(0),
         gzip_attempted: Some(false),
         gzip_fallback_used: Some(false),
         upstream_header_wait_class: Some(format!(
@@ -8227,6 +8306,8 @@ async fn cache_hit_response(
                 upstream_network_path: None,
                 upstream_remote_addr: None,
                 upstream_pool_diagnostic: None,
+                upstream_trace_id: None,
+                upstream_trace_source: None,
                 upstream_server_timing: None,
                 upstream_timing_source: None,
                 upstream_reported_processing_ms: None,
@@ -8239,6 +8320,8 @@ async fn cache_hit_response(
                 upstream_attempts: None,
                 request_body_bytes: None,
                 sent_body_bytes: None,
+                request_body_encode_ms: None,
+                gzip_encode_ms: None,
                 gzip_attempted: None,
                 gzip_fallback_used: None,
                 upstream_header_wait_class: None,
@@ -8871,7 +8954,9 @@ async fn send_upstream_request_to_url_with_diagnostics(
     let max_attempts = max_attempts_override
         .unwrap_or(MAX_ATTEMPTS)
         .clamp(1, MAX_ATTEMPTS);
+    let body_encode_started = Instant::now();
     let original_body = upstream_request_body_bytes(channel, body);
+    let request_body_encode_ms = body_encode_started.elapsed().as_millis() as u64;
     let original_body_len = original_body.len() as u64;
     let gzip_cooldown_key = request_body_gzip_cooldown_key(url, channel);
     let gzip_cooldown_active = request_body_gzip_enabled
@@ -8879,10 +8964,16 @@ async fn send_upstream_request_to_url_with_diagnostics(
     let gzip_threshold = request_body_gzip_threshold_bytes(channel);
     let use_gzip =
         request_body_gzip_enabled && !gzip_cooldown_active && original_body.len() >= gzip_threshold;
+    let gzip_encode_started = Instant::now();
     let compressed_body = if use_gzip {
         gzip_request_body(&original_body).ok()
     } else {
         None
+    };
+    let gzip_encode_ms = if use_gzip {
+        gzip_encode_started.elapsed().as_millis() as u64
+    } else {
+        0
     };
     let mut diagnostics = UpstreamRequestDiagnostics {
         network_path: if use_system_proxy {
@@ -8891,6 +8982,8 @@ async fn send_upstream_request_to_url_with_diagnostics(
             "direct"
         },
         request_body_bytes: original_body_len,
+        request_body_encode_ms,
+        gzip_encode_ms,
         gzip_attempted: compressed_body.is_some(),
         sent_body_bytes: compressed_body
             .as_ref()
@@ -9433,6 +9526,8 @@ async fn stream_upstream(
                 upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
                 upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
                 upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
+                upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
+                upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
                 upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
                 upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
                 upstream_reported_processing_ms: upstream_request_diagnostics
@@ -9446,6 +9541,10 @@ async fn stream_upstream(
                 upstream_attempts: Some(upstream_request_diagnostics.attempts),
                 request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
                 sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
+                request_body_encode_ms: Some(
+                    upstream_request_diagnostics.request_body_encode_ms,
+                ),
+                gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
                 gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
                 gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
                 upstream_header_wait_class: Some(upstream_header_wait_class(
@@ -14721,6 +14820,19 @@ mod tests {
         );
         assert_eq!(parse_duration_ms("1.5s", 1.0), Some(1500));
         assert_eq!(parse_duration_ms("32ms", 1000.0), Some(32));
+    }
+
+    #[test]
+    fn upstream_trace_id_reads_response_headers_without_injecting_a_request_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", HeaderValue::from_static("fallback-ray"));
+        headers.insert("x-request-id", HeaderValue::from_static("upstream-request"));
+
+        assert_eq!(
+            upstream_response_trace_id(&headers),
+            Some(("x-request-id", "upstream-request".to_string()))
+        );
+        assert_eq!(upstream_response_trace_id(&HeaderMap::new()), None);
     }
 
     #[test]
@@ -22157,7 +22269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_tool_tail_can_refresh_family_waterline_for_sibling_guard() {
+    async fn compact_tool_tail_family_waterline_does_not_delay_sibling_session() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-compact-tool-tail-family-{}",
@@ -22232,10 +22344,67 @@ mod tests {
         )
         .await;
         assert_eq!(wait.source.as_deref(), Some("session-sibling"));
+        assert_eq!(wait.wait_ms, 0);
+        assert_eq!(wait.skip_reason.as_deref(), Some("non_exact_prefix_state"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_runtime_guard_waits_only_for_fresh_exact_avoidable_state() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-exact-avoidable-runtime-guard-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0session-anchor-exact";
+        let mut prefix = prefix_state(64_512, 63_872, 512);
+        prefix.seen_bucket_tokens = 64_384;
+        prefix.seen_bucket_tokens_128 = 64_384;
+        prefix.avoidable_shortfall_tokens = 512;
+        prefix.avoidable_shortfall_tokens_128 = 512;
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), prefix);
+
+        let guarded = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert!(guarded.wait_ms >= 500);
+        assert!(guarded.wait_ms <= 1_000);
         assert_eq!(
-            wait.wait_ms,
-            responses_foreground_wait_cap().as_millis() as u64
+            guarded.reason.as_deref(),
+            Some("responses_exact_avoidable_gap")
         );
+
+        {
+            let mut states = state.prefix_states.lock().await;
+            let prefix = states.get_mut(key).unwrap();
+            prefix.finished_at = Instant::now();
+            prefix.avoidable_shortfall_tokens = 0;
+            prefix.avoidable_shortfall_tokens_128 = 0;
+        }
+        let unguarded = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert_eq!(unguarded.wait_ms, 0);
+        assert_eq!(unguarded.skip_reason.as_deref(), Some("no_avoidable_gap"));
 
         fs::remove_dir_all(dir).ok();
     }

@@ -234,6 +234,8 @@ export interface MetricsSnapshot {
     upstream_network_path?: string | null;
     upstream_remote_addr?: string | null;
     upstream_pool_diagnostic?: string | null;
+    upstream_trace_id?: string | null;
+    upstream_trace_source?: string | null;
     upstream_server_timing?: string | null;
     upstream_timing_source?: string | null;
     upstream_reported_processing_ms?: number | null;
@@ -245,6 +247,8 @@ export interface MetricsSnapshot {
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
     sent_body_bytes?: number | null;
+    request_body_encode_ms?: number | null;
+    gzip_encode_ms?: number | null;
     gzip_attempted?: boolean | null;
     gzip_fallback_used?: boolean | null;
     upstream_header_wait_class?: string | null;
@@ -297,6 +301,8 @@ export interface MetricsSnapshot {
     upstream_network_path?: string | null;
     upstream_remote_addr?: string | null;
     upstream_pool_diagnostic?: string | null;
+    upstream_trace_id?: string | null;
+    upstream_trace_source?: string | null;
     upstream_server_timing?: string | null;
     upstream_timing_source?: string | null;
     upstream_reported_processing_ms?: number | null;
@@ -308,6 +314,8 @@ export interface MetricsSnapshot {
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
     sent_body_bytes?: number | null;
+    request_body_encode_ms?: number | null;
+    gzip_encode_ms?: number | null;
     gzip_attempted?: boolean | null;
     gzip_fallback_used?: boolean | null;
     upstream_header_wait_class?: string | null;

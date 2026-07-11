@@ -280,6 +280,10 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_pool_diagnostic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_trace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_trace_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_server_timing: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_timing_source: Option<String>,
@@ -303,6 +307,10 @@ pub struct RequestLog {
     pub request_body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sent_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body_encode_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gzip_encode_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gzip_attempted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1244,6 +1252,8 @@ mod tests {
             upstream_network_path: None,
             upstream_remote_addr: None,
             upstream_pool_diagnostic: None,
+            upstream_trace_id: None,
+            upstream_trace_source: None,
             upstream_server_timing: None,
             upstream_timing_source: None,
             upstream_reported_processing_ms: None,
@@ -1256,6 +1266,8 @@ mod tests {
             upstream_attempts: None,
             request_body_bytes: None,
             sent_body_bytes: None,
+            request_body_encode_ms: None,
+            gzip_encode_ms: None,
             gzip_attempted: None,
             gzip_fallback_used: None,
             upstream_header_wait_class: None,

@@ -29,6 +29,8 @@ const rows = requests
       status: item.cache_status,
       providerPrefixKey: item.provider_prefix_key ?? null,
       providerPrefixFingerprint: item.provider_prefix_fingerprint ?? null,
+      sessionAnchorHash: item.session_anchor_hash ?? null,
+      sessionAnchorSource: item.session_anchor_source ?? null,
       diagnostic: item.provider_cache_diagnostic ?? inferDiagnostic(input, cached, bucketGap),
       input,
       cached,
@@ -71,9 +73,17 @@ const summary = {
     sum(warm, "cached") + sum(warm, "newTailShortfallTokens"),
     sum(warm, "bucketMax")
   ),
+  warmStablePrefixHitRate: ratio(
+    sum(warm, "cached") +
+      sum(warm, "newTailShortfallTokens") +
+      sum(warm, "providerUnstableShortfallTokens"),
+    sum(warm, "bucketMax")
+  ),
   warmProviderGapTokens: sum(warm, "bucketGap"),
   warmNewTailShortfallTokens: sum(warm, "newTailShortfallTokens"),
   warmAvoidableShortfallTokens: sum(warm, "avoidableShortfallTokens"),
+  warmProviderUnstableShortfallTokens: sum(warm, "providerUnstableShortfallTokens"),
+  warmUnclassifiedShortfallTokens: sum(warm, "unclassifiedShortfallTokens"),
   coldStartRate: ratio(cold.length, rows.length),
   byProvider: groupByProvider(rows),
   byDiagnostic: groupBy(rows, "diagnostic"),
@@ -106,6 +116,8 @@ function summarizeRequests(sourceFile, sourceRequests) {
         model: item.model,
         providerPrefixKey: item.provider_prefix_key ?? null,
         providerPrefixFingerprint: item.provider_prefix_fingerprint ?? null,
+        sessionAnchorHash: item.session_anchor_hash ?? null,
+        sessionAnchorSource: item.session_anchor_source ?? null,
         diagnostic: item.provider_cache_diagnostic ?? inferDiagnostic(input, cached, bucketGap),
         input,
         cached,
@@ -114,7 +126,11 @@ function summarizeRequests(sourceFile, sourceRequests) {
         loggedNewTailShortfallTokens:
           item.cache_new_tail_gap_tokens == null ? null : Number(item.cache_new_tail_gap_tokens),
         loggedAvoidableShortfallTokens:
-          item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens)
+          item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens),
+        loggedProviderUnstableShortfallTokens:
+          item.cache_provider_unstable_gap_tokens == null
+            ? null
+            : Number(item.cache_provider_unstable_gap_tokens)
       };
     });
   annotateGapCausality(sourceRows);
@@ -134,9 +150,20 @@ function summarizeRequests(sourceFile, sourceRequests) {
       sum(sourceWarm, "cached") + sum(sourceWarm, "newTailShortfallTokens"),
       sum(sourceWarm, "bucketMax")
     ),
+    warmStablePrefixHitRate: ratio(
+      sum(sourceWarm, "cached") +
+        sum(sourceWarm, "newTailShortfallTokens") +
+        sum(sourceWarm, "providerUnstableShortfallTokens"),
+      sum(sourceWarm, "bucketMax")
+    ),
     warmProviderGapTokens: sum(sourceWarm, "bucketGap"),
     warmNewTailShortfallTokens: sum(sourceWarm, "newTailShortfallTokens"),
     warmAvoidableShortfallTokens: sum(sourceWarm, "avoidableShortfallTokens"),
+    warmProviderUnstableShortfallTokens: sum(
+      sourceWarm,
+      "providerUnstableShortfallTokens"
+    ),
+    warmUnclassifiedShortfallTokens: sum(sourceWarm, "unclassifiedShortfallTokens"),
     byProvider: groupByProvider(sourceRows),
     byDiagnostic: groupBy(sourceRows, "diagnostic"),
     byPrefixKey: groupBy(sourceRows, "providerPrefixKey"),
@@ -146,11 +173,42 @@ function summarizeRequests(sourceFile, sourceRequests) {
 
 function summarizeNetwork(sourceRequests) {
   const upstream = sourceRequests.filter((item) => item.upstream_call_kind !== "cache");
+  const localExtraTtft = upstream
+    .filter((item) => item.ttft_ms != null && item.upstream_ttft_ms != null)
+    .map((item) => Math.max(0, Number(item.ttft_ms) - Number(item.upstream_ttft_ms)));
+  const guarded = upstream.filter((item) => Number(item.prefix_guard_wait_ms ?? 0) > 0);
+  const serverTimed = upstream.filter(
+    (item) => item.upstream_reported_processing_ms != null
+  );
+  const originalBytes = sumNumeric(upstream, "request_body_bytes");
+  const sentBytes = sumNumeric(upstream, "sent_body_bytes");
   return {
     requests: upstream.length,
-    averageHeadersMs: average(upstream, "upstream_headers_ms"),
-    averageGuardMs: average(upstream, "prefix_guard_wait_ms"),
+    ttftMs: numericStats(upstream, "ttft_ms"),
+    upstreamHeadersMs: numericStats(upstream, "upstream_headers_ms"),
+    totalMs: numericStats(upstream, "total_ms"),
+    localPrepareMs: numericStats(upstream, "local_prepare_ms"),
+    requestBodyEncodeMs: numericStats(upstream, "request_body_encode_ms"),
+    gzipEncodeMs: numericStats(upstream, "gzip_encode_ms"),
+    localExtraTtftMs: stats(localExtraTtft),
+    guardWaitMs: numericStats(upstream, "prefix_guard_wait_ms"),
+    guardedRequests: guarded.length,
+    zeroWaitRequests: upstream.length - guarded.length,
+    guardTriggerRate: ratio(guarded.length, upstream.length),
     averageGuardStateAgeMs: average(upstream, "prefix_guard_state_age_ms"),
+    serverTimingRequests: serverTimed.length,
+    upstreamTraceRequests: upstream.filter((item) => item.upstream_trace_id != null).length,
+    byUpstreamTraceSource: groupCount(upstream, "upstream_trace_source"),
+    upstreamReportedProcessingMs: numericStats(
+      serverTimed,
+      "upstream_reported_processing_ms"
+    ),
+    upstreamNonProcessingMs: numericStats(serverTimed, "upstream_non_processing_ms"),
+    gzipRequests: upstream.filter((item) => item.gzip_attempted === true).length,
+    gzipFallbacks: upstream.filter((item) => item.gzip_fallback_used === true).length,
+    originalBodyBytes: originalBytes,
+    sentBodyBytes: sentBytes,
+    compressionRatio: ratio(sentBytes, originalBytes),
     byPath: groupCount(upstream, "upstream_network_path"),
     byHttpVersion: groupCount(upstream, "upstream_http_version"),
     byPoolDiagnostic: groupCount(upstream, "upstream_pool_diagnostic"),
@@ -165,9 +223,46 @@ function summarizeNetwork(sourceRequests) {
 
 function average(items, key) {
   const values = items
+    .filter((item) => item[key] != null && item[key] !== "")
     .map((item) => Number(item[key]))
     .filter((value) => Number.isFinite(value));
   return values.length ? values.reduce((total, value) => total + value, 0) / values.length : 0;
+}
+
+function numericStats(items, key) {
+  return stats(
+    items
+      .filter((item) => item[key] != null && item[key] !== "")
+      .map((item) => Number(item[key]))
+      .filter((value) => Number.isFinite(value))
+  );
+}
+
+function stats(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  if (sorted.length === 0) {
+    return { count: 0, average: 0, p50: 0, p95: 0, max: 0 };
+  }
+  return {
+    count: sorted.length,
+    average: sorted.reduce((total, value) => total + value, 0) / sorted.length,
+    p50: percentile(sorted, 0.5),
+    p95: percentile(sorted, 0.95),
+    max: sorted[sorted.length - 1]
+  };
+}
+
+function percentile(sorted, quantile) {
+  const index = Math.max(0, Math.ceil(sorted.length * quantile) - 1);
+  return sorted[Math.min(sorted.length - 1, index)];
+}
+
+function sumNumeric(items, key) {
+  return items.reduce((total, item) => {
+    if (item[key] == null || item[key] === "") return total;
+    const value = Number(item[key]);
+    return Number.isFinite(value) ? total + value : total;
+  }, 0);
 }
 
 function groupCount(items, key) {
@@ -192,6 +287,7 @@ function compareToBaseline(current, base) {
   const cumulativeDelta = current.rawTokenHitRate - base.rawTokenHitRate;
   const warmDelta = current.warmRawTokenHitRate - base.warmRawTokenHitRate;
   const bucketDelta = current.warmEffectiveBucketHitRate - base.warmEffectiveBucketHitRate;
+  const stablePrefixDelta = current.warmStablePrefixHitRate - base.warmStablePrefixHitRate;
   const coldDelta = current.coldStartRate - base.coldStartRate;
   return {
     targetCumulativeRawTokenHitRate: TARGET_CUMULATIVE_RAW_TOKEN_HIT_RATE,
@@ -204,6 +300,9 @@ function compareToBaseline(current, base) {
     baselineWarmEffectiveBucketHitRate: base.warmEffectiveBucketHitRate,
     currentWarmEffectiveBucketHitRate: current.warmEffectiveBucketHitRate,
     warmEffectiveBucketDelta: bucketDelta,
+    baselineWarmStablePrefixHitRate: base.warmStablePrefixHitRate,
+    currentWarmStablePrefixHitRate: current.warmStablePrefixHitRate,
+    warmStablePrefixDelta: stablePrefixDelta,
     baselineColdStartRate: base.coldStartRate,
     currentColdStartRate: current.coldStartRate,
     coldStartRateDelta: coldDelta,
@@ -255,7 +354,7 @@ function diagnoseRows(items, current) {
         : prefixKeyCollisions.length > 0
         ? "multiple provider_prefix_fingerprints share one provider_prefix_key; scope prompt_cache_key by stable prefix"
         : prefixKeySplits.length > 0
-        ? "one provider_prefix_fingerprint is split across multiple provider_prefix_keys; keep prompt_cache_key independent from volatile provider identity"
+        ? "one session anchor is split across multiple provider_prefix_keys; keep prompt_cache_key independent from volatile provider identity"
         : current.warmAvoidableShortfallTokens > 0
         ? "known prefix buckets are not always ready; inspect avoidableShortfalls and prefix settle timing"
         : (current.byDiagnostic ?? []).some((item) => item.key === "provider-prefix-break" && item.rows > 0)
@@ -333,6 +432,13 @@ function annotateGapCausality(items) {
         item.newTailShortfallTokens -
         item.providerUnstableShortfallTokens;
     }
+    item.unclassifiedShortfallTokens = Math.max(
+      0,
+      item.bucketGap -
+        item.avoidableShortfallTokens -
+        item.providerUnstableShortfallTokens -
+        item.newTailShortfallTokens
+    );
     item.gapCause =
       item.cached === 0
         ? "cold"
@@ -342,6 +448,8 @@ function annotateGapCausality(items) {
         ? "provider-waterline-rollback"
         : item.newTailShortfallTokens > 0
         ? "new-tail-gap"
+        : item.unclassifiedShortfallTokens > 0
+        ? "unclassified-provider-gap"
         : "full-bucket";
 
     state.seenBucketMax = Math.max(state.seenBucketMax, item.bucketMax, item.cached);
@@ -388,10 +496,13 @@ function findPrefixKeySplits(items) {
   const groups = new Map();
   for (const item of items) {
     if (!item.providerPrefixFingerprint) continue;
+    const anchor = item.sessionAnchorHash ?? "missing-anchor";
+    const groupKey = `${item.providerPrefixFingerprint}\0${anchor}`;
     const group =
-      groups.get(item.providerPrefixFingerprint) ??
+      groups.get(groupKey) ??
       {
         providerPrefixFingerprint: item.providerPrefixFingerprint,
+        sessionAnchorHash: item.sessionAnchorHash,
         rows: 0,
         keys: new Set(),
         input: 0,
@@ -403,12 +514,13 @@ function findPrefixKeySplits(items) {
     group.input += item.input;
     group.cached += item.cached;
     group.maxBucketGap = Math.max(group.maxBucketGap, item.bucketGap);
-    groups.set(item.providerPrefixFingerprint, group);
+    groups.set(groupKey, group);
   }
   return [...groups.values()]
     .filter((group) => group.keys.size > 1)
     .map((group) => ({
       providerPrefixFingerprint: group.providerPrefixFingerprint,
+      sessionAnchorHash: group.sessionAnchorHash,
       rows: group.rows,
       keyCount: group.keys.size,
       input: group.input,
@@ -447,7 +559,9 @@ function groupByProvider(items) {
         cached: 0,
         bucketMax: 0,
         newTailShortfallTokens: 0,
-        avoidableShortfallTokens: 0
+        avoidableShortfallTokens: 0,
+        providerUnstableShortfallTokens: 0,
+        unclassifiedShortfallTokens: 0
       };
     group.rows += 1;
     group.input += item.input;
@@ -455,6 +569,10 @@ function groupByProvider(items) {
     group.bucketMax += item.bucketMax;
     group.newTailShortfallTokens += Number(item.newTailShortfallTokens ?? 0);
     group.avoidableShortfallTokens += Number(item.avoidableShortfallTokens ?? 0);
+    group.providerUnstableShortfallTokens += Number(
+      item.providerUnstableShortfallTokens ?? 0
+    );
+    group.unclassifiedShortfallTokens += Number(item.unclassifiedShortfallTokens ?? 0);
     if (item.cached === 0) group.coldStarts += 1;
     else group.warmRows += 1;
     if (item.cached > 0 && item.bucketGap === 0) group.fullBucket += 1;
@@ -466,7 +584,11 @@ function groupByProvider(items) {
     ...group,
     rawTokenHitRate: ratio(group.cached, group.input),
     effectiveBucketHitRate: ratio(group.cached, group.bucketMax),
-    adjustedBucketHitRate: ratio(group.cached + group.newTailShortfallTokens, group.bucketMax)
+    adjustedBucketHitRate: ratio(group.cached + group.newTailShortfallTokens, group.bucketMax),
+    stablePrefixHitRate: ratio(
+      group.cached + group.newTailShortfallTokens + group.providerUnstableShortfallTokens,
+      group.bucketMax
+    )
   }));
 }
 
@@ -486,7 +608,9 @@ function groupBy(items, keyName) {
         bucketMax: 0,
         maxBucketGap: 0,
         newTailShortfallTokens: 0,
-        avoidableShortfallTokens: 0
+        avoidableShortfallTokens: 0,
+        providerUnstableShortfallTokens: 0,
+        unclassifiedShortfallTokens: 0
       };
     group.rows += 1;
     group.input += item.input;
@@ -494,6 +618,10 @@ function groupBy(items, keyName) {
     group.bucketMax += item.bucketMax;
     group.newTailShortfallTokens += Number(item.newTailShortfallTokens ?? 0);
     group.avoidableShortfallTokens += Number(item.avoidableShortfallTokens ?? 0);
+    group.providerUnstableShortfallTokens += Number(
+      item.providerUnstableShortfallTokens ?? 0
+    );
+    group.unclassifiedShortfallTokens += Number(item.unclassifiedShortfallTokens ?? 0);
     group.maxBucketGap = Math.max(group.maxBucketGap, item.bucketGap);
     if (item.cached === 0) group.coldStarts += 1;
     else group.warmRows += 1;
@@ -504,7 +632,11 @@ function groupBy(items, keyName) {
       ...group,
       rawTokenHitRate: ratio(group.cached, group.input),
       effectiveBucketHitRate: ratio(group.cached, group.bucketMax),
-      adjustedBucketHitRate: ratio(group.cached + group.newTailShortfallTokens, group.bucketMax)
+      adjustedBucketHitRate: ratio(group.cached + group.newTailShortfallTokens, group.bucketMax),
+      stablePrefixHitRate: ratio(
+        group.cached + group.newTailShortfallTokens + group.providerUnstableShortfallTokens,
+        group.bucketMax
+      )
     }))
     .sort((left, right) => right.input - left.input)
     .slice(0, 20);
