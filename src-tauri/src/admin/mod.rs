@@ -938,28 +938,13 @@ pub async fn set_agent_injection_enabled(
             .map(|item| item.enabled)
             .unwrap_or(false)
     };
-    let patch_status = if agent_id == "codex" && previous_enabled != enabled {
-        Some(codex_ui_patch::set_enabled(enabled).map_err(to_command_error)?)
-    } else {
-        None
-    };
-    let results = match async {
+    let mut results = {
         let mut config = state.config.write().await;
         let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
             .map_err(to_command_error)?;
         config.updated_at = Utc::now();
         config.save(&state.config_path).map_err(to_command_error)?;
-        Ok::<_, String>(results)
-    }
-    .await
-    {
-        Ok(results) => results,
-        Err(err) => {
-            if agent_id == "codex" && previous_enabled != enabled {
-                let _ = codex_ui_patch::set_enabled(previous_enabled);
-            }
-            return Err(err);
-        }
+        results
     };
     if agent_id == "proxy-mode" {
         if enabled {
@@ -976,9 +961,9 @@ pub async fn set_agent_injection_enabled(
     } else if enabled {
         state.start_proxy().await.map_err(to_command_error)?;
     }
-    let mut results = results;
-    if let (Some(status), Some(result)) = (patch_status, results.first_mut()) {
-        result.status = format!("{}；{}", result.status, status);
+    if agent_id == "codex" && previous_enabled != enabled {
+        let patch_status = codex_ui_patch_notice(enabled, codex_ui_patch::set_enabled(enabled));
+        attach_codex_ui_patch_status(&mut results, enabled, patch_status);
     }
     Ok(results)
 }
@@ -988,37 +973,13 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let previous_enabled = {
-        let config = state.config.read().await;
-        config
-            .agent_injections
-            .iter()
-            .find(|item| item.id == id)
-            .map(|item| item.enabled)
-            .unwrap_or(false)
-    };
-    let patch_status = if id == "codex" {
-        Some(codex_ui_patch::set_enabled(true).map_err(to_command_error)?)
-    } else {
-        None
-    };
-    let results = match async {
+    let mut results = {
         let mut config = state.config.write().await;
         let results =
             agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
         config.updated_at = Utc::now();
         config.save(&state.config_path).map_err(to_command_error)?;
-        Ok::<_, String>(results)
-    }
-    .await
-    {
-        Ok(results) => results,
-        Err(err) => {
-            if id == "codex" && !previous_enabled {
-                let _ = codex_ui_patch::set_enabled(false);
-            }
-            return Err(err);
-        }
+        results
     };
     if id == "proxy-mode" {
         state
@@ -1028,9 +989,9 @@ pub async fn apply_agent_injection(
     } else {
         state.start_proxy().await.map_err(to_command_error)?;
     }
-    let mut results = results;
-    if let (Some(status), Some(result)) = (patch_status, results.first_mut()) {
-        result.status = format!("{}；{}", result.status, status);
+    if id == "codex" {
+        let patch_status = codex_ui_patch_notice(true, codex_ui_patch::set_enabled(true));
+        attach_codex_ui_patch_status(&mut results, true, patch_status);
     }
     Ok(results)
 }
@@ -1039,19 +1000,15 @@ pub async fn apply_agent_injection(
 pub async fn apply_enabled_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let codex_enabled = {
+    let (codex_enabled, reconcile_codex_ui) = {
         let config = state.config.read().await;
-        config
+        let enabled = config
             .agent_injections
             .iter()
-            .any(|item| item.id == "codex" && item.enabled)
+            .any(|item| item.id == "codex" && item.enabled);
+        (enabled, enabled || codex_ui_patch::has_managed_patch())
     };
-    let patch_status = if codex_enabled {
-        Some(codex_ui_patch::set_enabled(true).map_err(to_command_error)?)
-    } else {
-        None
-    };
-    let results = {
+    let mut results = {
         let mut config = state.config.write().await;
         let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
         config.updated_at = Utc::now();
@@ -1067,13 +1024,49 @@ pub async fn apply_enabled_agent_injections(
     if results.iter().any(|item| item.id != "proxy-mode") {
         state.start_proxy().await.map_err(to_command_error)?;
     }
-    let mut results = results;
-    if let Some(status) = patch_status {
-        if let Some(result) = results.iter_mut().find(|item| item.id == "codex") {
-            result.status = format!("{}；{}", result.status, status);
-        }
+    if reconcile_codex_ui {
+        let patch_status =
+            codex_ui_patch_notice(codex_enabled, codex_ui_patch::set_enabled(codex_enabled));
+        attach_codex_ui_patch_status(&mut results, codex_enabled, patch_status);
     }
     Ok(results)
+}
+
+fn codex_ui_patch_notice(enabled: bool, result: anyhow::Result<String>) -> String {
+    match result {
+        Ok(status) => status,
+        Err(error) => {
+            let action = if enabled { "显示" } else { "恢复" };
+            format!(
+                "代理注入已热更新；Codex UI {action}补丁未完成：{error}。这不会影响 Responses 代理注入"
+            )
+        }
+    }
+}
+
+fn attach_codex_ui_patch_status(
+    results: &mut Vec<AgentInjectionResult>,
+    enabled: bool,
+    patch_status: String,
+) {
+    if let Some(result) = results.iter_mut().find(|item| item.id == "codex") {
+        result.status = format!("{}；{}", result.status, patch_status);
+        return;
+    }
+
+    results.push(AgentInjectionResult {
+        id: "codex".to_string(),
+        label: "Codex".to_string(),
+        enabled,
+        target_path: None,
+        backup_path: None,
+        status: format!(
+            "Codex 自动注入已{}；{}",
+            if enabled { "启用" } else { "关闭" },
+            patch_status
+        ),
+        injected_at: Utc::now().to_rfc3339(),
+    });
 }
 
 #[tauri::command]
@@ -1432,6 +1425,31 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn codex_ui_patch_failure_becomes_a_non_blocking_notice() {
+        let notice = codex_ui_patch_notice(true, Err(anyhow!("node unavailable")));
+
+        assert!(notice.contains("代理注入已热更新"));
+        assert!(notice.contains("不会影响 Responses 代理注入"));
+        assert!(notice.contains("node unavailable"));
+    }
+
+    #[test]
+    fn disabled_codex_injection_still_returns_the_ui_restart_notice() {
+        let mut results = Vec::new();
+
+        attach_codex_ui_patch_status(
+            &mut results,
+            false,
+            "Codex UI 恢复补丁需要重启 Codex 后生效".to_string(),
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].enabled);
+        assert!(results[0].status.contains("自动注入已关闭"));
+        assert!(results[0].status.contains("需要重启 Codex"));
     }
 
     #[test]

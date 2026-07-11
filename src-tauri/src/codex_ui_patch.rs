@@ -2,7 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
+    error::Error as StdError,
+    fmt, fs,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -21,7 +22,41 @@ struct PatchManifest {
     patched_sha256: String,
 }
 
+#[derive(Debug)]
+struct CodexProcessRunning;
+
+impl fmt::Display for CodexProcessRunning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Codex is still running")
+    }
+}
+
+impl StdError for CodexProcessRunning {}
+
 pub fn set_enabled(enabled: bool) -> Result<String> {
+    finish_patch_transition(enabled, set_enabled_strict(enabled))
+}
+
+fn finish_patch_transition(enabled: bool, result: Result<String>) -> Result<String> {
+    match result {
+        Ok(status) => Ok(status),
+        Err(error) if error.downcast_ref::<CodexProcessRunning>().is_some() => {
+            let action = if enabled { "显示" } else { "恢复" };
+            Ok(format!(
+                "代理注入可立即热更新；Codex UI {action}补丁已延后。请完全退出 Codex 后在 Atoapi 点击“刷新 Agent 配置”，再启动 Codex；当前不会阻止注入开关"
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn has_managed_patch() -> bool {
+    patch_root()
+        .map(|root| root.join("manifest.json").exists())
+        .unwrap_or(false)
+}
+
+fn set_enabled_strict(enabled: bool) -> Result<String> {
     #[cfg(target_os = "windows")]
     {
         if enabled {
@@ -230,7 +265,7 @@ fn ensure_codex_closed() -> Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(anyhow!("请先完全关闭 Codex，再切换 Codex Agent 注入开关"))
+        Err(CodexProcessRunning.into())
     }
 }
 
@@ -482,5 +517,15 @@ mod tests {
         assert!(node_version_is_supported("v22.12.0"));
         assert!(node_version_is_supported("v23.0.0"));
         assert!(!node_version_is_supported("not-a-version"));
+    }
+
+    #[test]
+    fn running_codex_defers_ui_patch_without_blocking_injection() {
+        let result = finish_patch_transition(true, Err(CodexProcessRunning.into()))
+            .expect("a running Codex process should defer only the UI patch");
+
+        assert!(result.contains("注入"));
+        assert!(result.contains("刷新 Agent 配置"));
+        assert!(result.contains("再启动 Codex"));
     }
 }

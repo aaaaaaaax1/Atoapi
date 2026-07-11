@@ -137,12 +137,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.86";
+const appVersion = "v0.1.87";
 const appVersionNotes = [
-  "v0.1.86: 新增 HTTP 版本、Server-Timing、上游处理时间和非处理等待时间诊断，定位首字额外延迟。",
-  "v0.1.86: 模型别名与真实上游模型统一缓存键，同时保持不同会话锚点隔离。",
-  "v0.1.86: 巨型冷读保留真实总缺口并归类为上游不稳定，不再误算为新尾巴或可避免缺口。",
-  "v0.1.86: 保持按需最多 1 秒智能等待、零额外请求和稳定前缀零等待规则。"
+  "v0.1.87: Codex 注入与 UI 补丁彻底解耦，后台进程不再阻止注入开关。",
+  "v0.1.87: 注入配置和本地代理优先热更新，UI 模型列表补丁需要重启时只提示、不回滚。",
+  "v0.1.87: 修复 Codex 注入连续开、关、再开时误报必须关闭 Codex 的状态问题。"
 ];
 
 const emptyDraft: ProviderDraft = {
