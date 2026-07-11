@@ -1,6 +1,7 @@
 import fs from "node:fs";
 
 const TARGET_CUMULATIVE_RAW_TOKEN_HIT_RATE = 0.995;
+const PROVIDER_CACHE_BUCKET_TOKENS = 128;
 
 const file = process.argv[2];
 if (!file) {
@@ -19,7 +20,7 @@ const rows = requests
   .map((item) => {
     const input = Number(item.input_tokens ?? 0);
     const cached = Number(item.cache_read_tokens ?? 0);
-    const bucketMax = Math.floor(input / 512) * 512;
+    const bucketMax = Math.floor(input / PROVIDER_CACHE_BUCKET_TOKENS) * PROVIDER_CACHE_BUCKET_TOKENS;
     const bucketGap = Math.max(0, bucketMax - cached);
     return {
       at: item.at,
@@ -33,7 +34,7 @@ const rows = requests
       cached,
       bucketMax,
       bucketGap,
-      blocksShort: Math.floor(bucketGap / 512),
+      blocksShort: Math.floor(bucketGap / PROVIDER_CACHE_BUCKET_TOKENS),
       rawPct: ratio(cached, input),
       effectivePct: ratio(cached, bucketMax),
       loggedNewTailShortfallTokens:
@@ -51,8 +52,8 @@ annotateGapCausality(rows);
 const warm = rows.filter((item) => item.cached > 0);
 const cold = rows.filter((item) => item.cached === 0);
 const fullBucket = warm.filter((item) => item.bucketGap === 0);
-const oneBlock = warm.filter((item) => item.bucketGap === 512);
-const manyBlocks = warm.filter((item) => item.bucketGap > 512);
+const oneBlock = warm.filter((item) => item.bucketGap === PROVIDER_CACHE_BUCKET_TOKENS);
+const manyBlocks = warm.filter((item) => item.bucketGap > PROVIDER_CACHE_BUCKET_TOKENS);
 
 const summary = {
   file,
@@ -77,7 +78,8 @@ const summary = {
   byProvider: groupByProvider(rows),
   byDiagnostic: groupBy(rows, "diagnostic"),
   byPrefixKey: groupBy(rows, "providerPrefixKey"),
-  byPrefixFingerprint: groupBy(rows, "providerPrefixFingerprint")
+  byPrefixFingerprint: groupBy(rows, "providerPrefixFingerprint"),
+  network: summarizeNetwork(requests)
 };
 
 const baseline = baselineMetrics
@@ -97,7 +99,7 @@ function summarizeRequests(sourceFile, sourceRequests) {
     .map((item) => {
       const input = Number(item.input_tokens ?? 0);
       const cached = Number(item.cache_read_tokens ?? 0);
-      const bucketMax = Math.floor(input / 512) * 512;
+      const bucketMax = Math.floor(input / PROVIDER_CACHE_BUCKET_TOKENS) * PROVIDER_CACHE_BUCKET_TOKENS;
       const bucketGap = Math.max(0, bucketMax - cached);
       return {
         provider: item.provider,
@@ -140,6 +142,43 @@ function summarizeRequests(sourceFile, sourceRequests) {
     byPrefixKey: groupBy(sourceRows, "providerPrefixKey"),
     byPrefixFingerprint: groupBy(sourceRows, "providerPrefixFingerprint")
   };
+}
+
+function summarizeNetwork(sourceRequests) {
+  const upstream = sourceRequests.filter((item) => item.upstream_call_kind !== "cache");
+  return {
+    requests: upstream.length,
+    averageHeadersMs: average(upstream, "upstream_headers_ms"),
+    averageGuardMs: average(upstream, "prefix_guard_wait_ms"),
+    averageGuardStateAgeMs: average(upstream, "prefix_guard_state_age_ms"),
+    byPath: groupCount(upstream, "upstream_network_path"),
+    byHttpVersion: groupCount(upstream, "upstream_http_version"),
+    byPoolDiagnostic: groupCount(upstream, "upstream_pool_diagnostic"),
+    byCallKindAndStatus: groupCount(
+      upstream.map((item) => ({
+        key: `${item.upstream_call_kind ?? "unknown"}:${item.status ?? "unknown"}`
+      })),
+      "key"
+    )
+  };
+}
+
+function average(items, key) {
+  const values = items
+    .map((item) => Number(item[key]))
+    .filter((value) => Number.isFinite(value));
+  return values.length ? values.reduce((total, value) => total + value, 0) / values.length : 0;
+}
+
+function groupCount(items, key) {
+  const counts = new Map();
+  for (const item of items) {
+    const value = item[key] ?? "unknown";
+    counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((left, right) => right.count - left.count || String(left.value).localeCompare(String(right.value)));
 }
 
 function compareToBaseline(current, base) {
@@ -381,11 +420,11 @@ function findPrefixKeySplits(items) {
 }
 
 function inferDiagnostic(input, cached, bucketGap) {
-  const bucketMax = Math.floor(input / 512) * 512;
+  const bucketMax = Math.floor(input / PROVIDER_CACHE_BUCKET_TOKENS) * PROVIDER_CACHE_BUCKET_TOKENS;
   if (bucketMax < 1024) return "provider-prefix-ineligible-small";
   if (cached === 0) return "provider-cold-start";
   if (bucketGap === 0) return "provider-warm-full";
-  if (bucketGap <= 512) return "provider-small-gap";
+  if (bucketGap <= PROVIDER_CACHE_BUCKET_TOKENS) return "provider-small-gap";
   if (ratio(cached, bucketMax) >= 0.99) return "provider-warm-99";
   return "provider-prefix-break";
 }
@@ -419,8 +458,8 @@ function groupByProvider(items) {
     if (item.cached === 0) group.coldStarts += 1;
     else group.warmRows += 1;
     if (item.cached > 0 && item.bucketGap === 0) group.fullBucket += 1;
-    if (item.cached > 0 && item.bucketGap === 512) group.oneBlockShort += 1;
-    if (item.cached > 0 && item.bucketGap > 512) group.manyBlocksShort += 1;
+    if (item.cached > 0 && item.bucketGap === PROVIDER_CACHE_BUCKET_TOKENS) group.oneBlockShort += 1;
+    if (item.cached > 0 && item.bucketGap > PROVIDER_CACHE_BUCKET_TOKENS) group.manyBlocksShort += 1;
     groups.set(key, group);
   }
   return [...groups.values()].map((group) => ({

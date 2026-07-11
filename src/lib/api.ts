@@ -153,6 +153,7 @@ export interface AgentInjectionConfig {
   last_injected_at?: string | null;
   last_status?: string | null;
   local_key?: string | null;
+  hidden_provider_ids?: string[];
 }
 
 export interface AgentInjectionResult {
@@ -230,6 +231,9 @@ export interface MetricsSnapshot {
     upstream_headers_ms?: number | null;
     upstream_last_attempt_headers_ms?: number | null;
     upstream_http_version?: string | null;
+    upstream_network_path?: string | null;
+    upstream_remote_addr?: string | null;
+    upstream_pool_diagnostic?: string | null;
     upstream_server_timing?: string | null;
     upstream_timing_source?: string | null;
     upstream_reported_processing_ms?: number | null;
@@ -290,6 +294,9 @@ export interface MetricsSnapshot {
     upstream_headers_ms?: number | null;
     upstream_last_attempt_headers_ms?: number | null;
     upstream_http_version?: string | null;
+    upstream_network_path?: string | null;
+    upstream_remote_addr?: string | null;
+    upstream_pool_diagnostic?: string | null;
     upstream_server_timing?: string | null;
     upstream_timing_source?: string | null;
     upstream_reported_processing_ms?: number | null;
@@ -763,6 +770,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
             ? {
                 ...item,
                 provider_id: target.id,
+                hidden_provider_ids: (item.hidden_provider_ids ?? []).filter(
+                  (hiddenId) => hiddenId !== providerId
+                ),
                 model_id:
                   input?.model_id ??
                   target.models.find((model) => model.enabled)?.id ??
@@ -805,6 +815,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
           ? {
               ...item,
               provider_id: id,
+              hidden_provider_ids: (item.hidden_provider_ids ?? []).filter(
+                (hiddenId) => hiddenId !== providerId
+              ),
               model_id:
                 input?.model_id ??
                 source.models.find((model) => model.enabled)?.id ??
@@ -901,14 +914,29 @@ function fallback(name: string, args?: Record<string, unknown>) {
       fallbackConfig = {
         ...fallbackConfig,
         agent_injections: fallbackConfig.agent_injections.map((item) =>
-          item.id === agentId && item.provider_id === providerId
-            ? { ...item, enabled: false, provider_id: null, model_id: null }
+          item.id === agentId
+            ? {
+                ...item,
+                ...(item.provider_id === providerId
+                  ? { enabled: false, provider_id: null, model_id: null }
+                  : {}),
+                hidden_provider_ids: Array.from(
+                  new Set([...(item.hidden_provider_ids ?? []), providerId])
+                )
+              }
             : item
         ),
         updated_at: new Date().toISOString()
       };
       return fallbackConfig;
     }
+    const sourceProviderId = agentId
+      ? fallbackConfig.providers.find(
+          (item) =>
+            !item.id.startsWith("agent-") &&
+            providerCloneMatchesSourcePreview(providerId, item.id, agentId)
+        )?.id
+      : undefined;
     fallbackProviderSecrets.delete(providerId);
     for (const secretId of Array.from(fallbackProviderKeySecrets.keys())) {
       if (secretId.startsWith(providerId + ":")) fallbackProviderKeySecrets.delete(secretId);
@@ -925,7 +953,14 @@ function fallback(name: string, args?: Record<string, unknown>) {
       active_provider_id: activeProviderId,
       agent_injections: fallbackConfig.agent_injections.map((item) =>
         item.provider_id === providerId && (!agentId || item.id === agentId)
-          ? { ...item, provider_id: null, model_id: null }
+          ? {
+              ...item,
+              provider_id: null,
+              model_id: null,
+              hidden_provider_ids: sourceProviderId
+                ? Array.from(new Set([...(item.hidden_provider_ids ?? []), sourceProviderId]))
+                : item.hidden_provider_ids
+            }
           : item
       ),
       updated_at: new Date().toISOString()
@@ -1017,7 +1052,8 @@ function injection(id: string, label: string, kind: AgentInjectionKind): AgentIn
     model_id: null,
     target_path: null,
     last_injected_at: null,
-    last_status: null
+    last_status: null,
+    hidden_provider_ids: []
   };
 }
 

@@ -10,7 +10,10 @@ use crate::{
         self, AgentInjectionResult, AgentInjectionRouteUpdate, AgentInjectionUpdate,
     },
     codex_ui_patch,
-    config::{AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput, PublicConfig},
+    config::{
+        AgentInjectionConfig, AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput,
+        PublicConfig,
+    },
     metrics::MetricsSnapshot,
     state::{AppState, ProxyStatus},
 };
@@ -315,6 +318,9 @@ fn clone_provider_for_agent_config(
         });
 
     let agent = &mut config.agent_injections[agent_index];
+    agent
+        .hidden_provider_ids
+        .retain(|provider_id| provider_id != source_provider_id);
     agent.provider_id = Some(target_provider_id.clone());
     agent.model_id = selected_model;
     agent.last_status = Some("已绑定当前 Agent 独立上游".to_string());
@@ -450,18 +456,16 @@ fn delete_provider_config(
             .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
 
         if !provider_belongs_to_agent(provider_id, agent_id) {
-            if config.agent_injections[agent_index].provider_id.as_deref() == Some(provider_id) {
-                let agent = &mut config.agent_injections[agent_index];
+            let agent = &mut config.agent_injections[agent_index];
+            hide_provider_for_agent(agent, provider_id);
+            if agent.provider_id.as_deref() == Some(provider_id) {
                 agent.provider_id = None;
                 agent.model_id = None;
                 agent.enabled = false;
-                agent.last_status =
-                    Some("已从当前 Agent 移除共享上游，其他 Agent 不受影响".to_string());
-                return Ok(());
             }
-            return Err(anyhow::anyhow!(
-                "shared provider {provider_id} is only a template in this Agent; select or edit it to create an independent copy"
-            ));
+            agent.last_status =
+                Some("已从当前 Agent 移除共享上游，其他 Agent 不受影响".to_string());
+            return Ok(());
         }
 
         if config.active_provider_id.as_deref() == Some(provider_id)
@@ -497,8 +501,17 @@ fn delete_provider_config(
             )?;
         }
 
+        let source_provider_id = config
+            .providers
+            .iter()
+            .filter(|provider| !provider.id.starts_with("agent-"))
+            .find(|provider| provider_clone_matches_source(provider_id, &provider.id, agent_id))
+            .map(|provider| provider.id.clone());
         remove_provider_records(config, provider_id);
         let agent = &mut config.agent_injections[agent_index];
+        if let Some(source_provider_id) = source_provider_id.as_deref() {
+            hide_provider_for_agent(agent, source_provider_id);
+        }
         if agent.provider_id.as_deref() == Some(provider_id) {
             agent.provider_id = None;
             agent.model_id = None;
@@ -540,6 +553,21 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
     config
         .provider_channel_modes
         .retain(|item| item.provider_id != provider_id);
+    for agent in &mut config.agent_injections {
+        agent
+            .hidden_provider_ids
+            .retain(|hidden_id| hidden_id != provider_id);
+    }
+}
+
+fn hide_provider_for_agent(agent: &mut AgentInjectionConfig, provider_id: &str) {
+    if !agent
+        .hidden_provider_ids
+        .iter()
+        .any(|hidden_id| hidden_id == provider_id)
+    {
+        agent.hidden_provider_ids.push(provider_id.to_string());
+    }
 }
 
 #[tauri::command]
@@ -1609,6 +1637,12 @@ mod tests {
                 .and_then(|agent| agent.provider_id.as_deref()),
             Some(opencode_provider.as_str())
         );
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        assert_eq!(codex.hidden_provider_ids, vec!["shared"]);
     }
 
     #[test]
@@ -1643,6 +1677,70 @@ mod tests {
             .unwrap();
         assert!(!codex.enabled);
         assert!(codex.provider_id.is_none());
+        assert_eq!(codex.hidden_provider_ids, vec!["shared"]);
         assert_eq!(opencode.provider_id.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn deleting_unbound_shared_provider_from_agent_does_not_touch_other_agents() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("daoge"));
+        let opencode = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "opencode")
+            .unwrap();
+        opencode.enabled = true;
+        opencode.provider_id = Some("daoge".to_string());
+
+        delete_provider_config(&mut config, "daoge", Some("codex")).unwrap();
+
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "daoge"));
+        assert_eq!(
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "opencode")
+                .and_then(|agent| agent.provider_id.as_deref()),
+            Some("daoge")
+        );
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        assert_eq!(codex.hidden_provider_ids, vec!["daoge"]);
+        let opencode = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "opencode")
+            .unwrap();
+        assert!(opencode.hidden_provider_ids.is_empty());
+    }
+
+    #[test]
+    fn selecting_hidden_shared_provider_restores_it_only_for_that_agent() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.hidden_provider_ids.push("shared".to_string());
+
+        let provider_id =
+            clone_provider_for_agent_config(&mut config, "codex", "shared", None).unwrap();
+
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        assert!(codex.hidden_provider_ids.is_empty());
+        assert_eq!(codex.provider_id.as_deref(), Some(provider_id.as_str()));
     }
 }

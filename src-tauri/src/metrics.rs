@@ -242,6 +242,8 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_guard_wait_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_guard_state_age_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_guard_skip_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_guard_wait_effect: Option<String>,
@@ -271,6 +273,12 @@ pub struct RequestLog {
     pub upstream_last_attempt_headers_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_network_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_remote_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_pool_diagnostic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_server_timing: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1216,6 +1224,7 @@ mod tests {
             prefix_guard_wait_ms: None,
             prefix_guard_wait_reason: None,
             prefix_guard_wait_source: None,
+            prefix_guard_state_age_ms: None,
             prefix_guard_skip_reason: None,
             prefix_guard_wait_effect: None,
             prefix_lag_classification: None,
@@ -1232,6 +1241,9 @@ mod tests {
             upstream_headers_ms: None,
             upstream_last_attempt_headers_ms: None,
             upstream_http_version: None,
+            upstream_network_path: None,
+            upstream_remote_addr: None,
+            upstream_pool_diagnostic: None,
             upstream_server_timing: None,
             upstream_timing_source: None,
             upstream_reported_processing_ms: None,

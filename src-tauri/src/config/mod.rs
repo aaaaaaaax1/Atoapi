@@ -545,6 +545,8 @@ pub struct AgentInjectionConfig {
     pub last_status: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1352,6 +1354,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "claude-desktop".to_string(),
@@ -1364,6 +1367,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "codex".to_string(),
@@ -1376,6 +1380,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "gemini".to_string(),
@@ -1388,6 +1393,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "opencode".to_string(),
@@ -1400,6 +1406,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "openclaw".to_string(),
@@ -1412,6 +1419,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "hermes".to_string(),
@@ -1424,6 +1432,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
         AgentInjectionConfig {
             id: "proxy-mode".to_string(),
@@ -1436,6 +1445,7 @@ pub fn default_agent_injections() -> Vec<AgentInjectionConfig> {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         },
     ]
 }

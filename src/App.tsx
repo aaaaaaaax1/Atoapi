@@ -2470,6 +2470,10 @@ function CachePanel({
                 request.cache_avoidable_gap_tokens ?? 0,
                 request.cache_provider_unstable_gap_tokens ?? 0
               );
+              const cacheStatusLabel = request.cache_status === "miss" ? "" : request.cache_status;
+              const cacheResultLabel = [cacheStatusLabel, cacheDisplay.primary]
+                .filter(Boolean)
+                .join(" · ");
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
               const cacheReadTokens = request.cache_read_tokens ?? 0;
@@ -2518,7 +2522,7 @@ function CachePanel({
                     <em>输入 {formatCompactTokens(inputTokens)} · 输出 {formatCompactTokens(outputTokens)} · 命中 {formatCompactTokens(cacheReadTokens)}</em>
                   </div>
                   <div className="request-cache-result">
-                    <b>{request.cache_status}{cacheDisplay.primary ? ` · ${cacheDisplay.primary}` : ""}</b>
+                    {cacheResultLabel ? <b>{cacheResultLabel}</b> : null}
                     {cacheDisplay.secondary ? (
                       <small title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>
                         {cacheDisplay.secondary}
@@ -2706,6 +2710,7 @@ function providersForAgentEditor(
   providers: ProviderConfig[],
   agent: AgentInjectionConfig
 ): ProviderConfig[] {
+  const hiddenProviderIds = new Set(agent.hidden_provider_ids ?? []);
   const ownedProviders = providers.filter((provider) =>
     providerBelongsToAgent(provider.id, agent.id)
   );
@@ -2726,7 +2731,7 @@ function providersForAgentEditor(
     if (provider.id.startsWith("agent-")) {
       return providerBelongsToAgent(provider.id, agent.id);
     }
-    return !clonedSourceIds.has(provider.id);
+    return !clonedSourceIds.has(provider.id) && !hiddenProviderIds.has(provider.id);
   });
 }
 
@@ -2914,23 +2919,23 @@ function providerBucketDisplay(
   inputTokens: number,
   cachedTokens: number,
   rawRatio: number,
-  shortfallTokens: number,
+  _shortfallTokens: number,
   newTailGapTokens = 0,
   avoidableGapTokens = 0,
   providerUnstableGapTokens = 0
 ) {
   if (!inputTokens) return { primary: "", secondary: "" };
   const tokenSummary = `${formatCompactTokens(cachedTokens)} / ${formatCompactTokens(inputTokens)}`;
+  const bucketMax = Math.floor(inputTokens / 128) * 128;
+  const bucketGap = Math.max(bucketMax - cachedTokens, 0);
   if (!cachedTokens) {
-    const gapText = shortfallTokens ? ` · 缺口 ${formatCompactTokens(shortfallTokens)}` : "";
+    const gapText = bucketGap ? ` · 缺口 ${formatCompactTokens(bucketGap)}` : "";
     return {
       primary: "冷启动",
       secondary: `${tokenSummary}${gapText}`,
       secondaryTitle: `${tokenSummary}${gapText}`
     };
   }
-  const bucketMax = Math.floor(inputTokens / 512) * 512;
-  const bucketGap = Math.max(bucketMax - cachedTokens, 0);
   const realRatio = inputTokens > 0 ? cachedTokens / inputTokens : rawRatio;
   const primary = percent(realRatio);
   if (bucketMax > 0 && bucketGap === 0) {
@@ -2942,7 +2947,7 @@ function providerBucketDisplay(
   }
   const gapDisplay = providerGapDisplay(
     tokenSummary,
-    shortfallTokens || bucketGap,
+    bucketGap,
     newTailGapTokens,
     avoidableGapTokens,
     providerUnstableGapTokens
@@ -2968,11 +2973,11 @@ function providerGapDisplay(
   if (providerUnstableGapTokens > 0) {
     const details = [
       avoidableGapTokens > 0 ? `可避免 ${avoidable}` : "",
-      providerUnstableGapTokens > 0 ? `上游回退 ${unstable}` : "",
+      providerUnstableGapTokens > 0 ? `上游缓存水线下降 ${unstable}` : "",
       newTailGapTokens > 0 ? `新尾巴 ${newTail}` : ""
     ].filter(Boolean);
     return {
-      compact: `${tokenSummary} · 缺 ${total} · 回退 ${unstable}${newTailGapTokens > 0 ? ` · 新 ${newTail}` : ""}`,
+      compact: `${tokenSummary} · 缺 ${total} · 水线下降 ${unstable}${newTailGapTokens > 0 ? ` · 新 ${newTail}` : ""}`,
       full: `${tokenSummary} · 总缺口 ${total}（${details.join(" / ")}）`
     };
   }

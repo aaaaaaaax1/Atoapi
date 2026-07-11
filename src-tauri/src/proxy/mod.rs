@@ -94,6 +94,8 @@ struct UpstreamRequestDiagnostics {
     headers_ms: u64,
     last_attempt_headers_ms: u64,
     http_version: Option<String>,
+    remote_addr: Option<String>,
+    pool_diagnostic: Option<String>,
     server_timing: Option<String>,
     timing_source: Option<String>,
     reported_processing_ms: Option<u64>,
@@ -116,6 +118,8 @@ impl UpstreamRequestDiagnostics {
         if next.last_attempt_headers_ms > 0 || next.http_version.is_some() {
             self.last_attempt_headers_ms = next.last_attempt_headers_ms;
             self.http_version = next.http_version.clone();
+            self.remote_addr = next.remote_addr.clone();
+            self.pool_diagnostic = next.pool_diagnostic.clone();
             self.server_timing = next.server_timing.clone();
             self.timing_source = next.timing_source.clone();
             self.reported_processing_ms = next.reported_processing_ms;
@@ -291,6 +295,7 @@ struct PrefixGuardWaitDiagnostics {
     wait_ms: u64,
     reason: Option<String>,
     source: Option<String>,
+    state_age_ms: Option<u64>,
     skip_reason: Option<String>,
     budget_exhausted: bool,
     cache_instability_score: Option<u64>,
@@ -1041,6 +1046,7 @@ async fn handle_responses_compact_for_agent(
         prefix_guard_wait_ms: None,
         prefix_guard_wait_reason: None,
         prefix_guard_wait_source: None,
+        prefix_guard_state_age_ms: None,
         prefix_guard_skip_reason: None,
         prefix_guard_wait_effect: None,
         prefix_lag_classification: None,
@@ -1059,6 +1065,9 @@ async fn handle_responses_compact_for_agent(
             upstream_request_diagnostics.last_attempt_headers_ms,
         ),
         upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+        upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
+        upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
+        upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
         upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
         upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
         upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -2887,7 +2896,14 @@ async fn handle_generation_for_agent(
         .to_string(),
         agent_id: agent_log_id.clone(),
         agent_label: agent_log_label.clone(),
-        upstream_call_kind: Some("sync".to_string()),
+        upstream_call_kind: Some(
+            if request_body_stream_flag(&active_upstream_body) {
+                "stream"
+            } else {
+                "sync"
+            }
+            .to_string(),
+        ),
         upstream_call_source: Some(
             if active_responses_non_stream_chat_compat {
                 if responses_sync_main_chat_compat_fallback {
@@ -2910,6 +2926,7 @@ async fn handle_generation_for_agent(
         prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
         prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
         prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+        prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
         prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
         prefix_guard_wait_effect: prefix_guard_wait_effect(
             &prefix_guard_wait,
@@ -2932,6 +2949,9 @@ async fn handle_generation_for_agent(
             upstream_request_diagnostics.last_attempt_headers_ms,
         ),
         upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+        upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
+        upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
+        upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
         upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
         upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
         upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -3099,6 +3119,7 @@ async fn wait_for_provider_prefix_settle(
                 wait,
                 reason,
                 source.to_string(),
+                state.finished_at.elapsed().as_millis() as u64,
                 state.cache_instability_score as u64,
                 state.seen_bucket_tokens_128.max(state.seen_bucket_tokens),
                 state.cache_read_tokens,
@@ -3109,6 +3130,7 @@ async fn wait_for_provider_prefix_settle(
         wait,
         reason,
         source,
+        state_age_ms,
         cache_instability_score,
         seen_bucket_tokens,
         state_cache_read_tokens,
@@ -3132,6 +3154,7 @@ async fn wait_for_provider_prefix_settle(
                     ),
                     budget_exhausted,
                     source: Some(source),
+                    state_age_ms: Some(state_age_ms),
                     cache_instability_score: Some(cache_instability_score),
                     seen_bucket_tokens: Some(seen_bucket_tokens),
                     state_cache_read_tokens: Some(state_cache_read_tokens),
@@ -3143,6 +3166,7 @@ async fn wait_for_provider_prefix_settle(
                 wait_ms: wait.as_millis() as u64,
                 reason: reason.or_else(|| Some("provider_prefix_settle".to_string())),
                 source: Some(source),
+                state_age_ms: Some(state_age_ms),
                 skip_reason: None,
                 budget_exhausted,
                 cache_instability_score: Some(cache_instability_score),
@@ -3154,6 +3178,7 @@ async fn wait_for_provider_prefix_settle(
             skip_reason: Some("settle_window_elapsed".to_string()),
             reason,
             source: Some(source),
+            state_age_ms: Some(state_age_ms),
             cache_instability_score: Some(cache_instability_score),
             seen_bucket_tokens: Some(seen_bucket_tokens),
             state_cache_read_tokens: Some(state_cache_read_tokens),
@@ -4790,7 +4815,17 @@ fn observe_upstream_response_timing(
     headers_ms: u64,
 ) {
     diagnostics.last_attempt_headers_ms = headers_ms;
-    diagnostics.http_version = Some(format!("{:?}", response.version()));
+    let http_version = format!("{:?}", response.version());
+    diagnostics.pool_diagnostic = Some(
+        if http_version == "HTTP/2.0" {
+            "shared-client:http2-multiplex-capable"
+        } else {
+            "shared-client:pool-enabled-hit-not-exposed"
+        }
+        .to_string(),
+    );
+    diagnostics.http_version = Some(http_version);
+    diagnostics.remote_addr = response.remote_addr().map(|address| address.to_string());
     diagnostics.server_timing = response_header_values(response.headers(), "server-timing");
     if let Some((source, processing_ms)) = reported_upstream_processing_ms(response.headers()) {
         diagnostics.timing_source = Some(source.to_string());
@@ -7828,6 +7863,7 @@ async fn record_upstream_response_observation(
             prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
             prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
             prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+            prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
             prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
             prefix_guard_wait_effect: None,
             prefix_lag_classification: None,
@@ -7846,6 +7882,9 @@ async fn record_upstream_response_observation(
                 upstream_request_diagnostics.last_attempt_headers_ms,
             ),
             upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+            upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
+            upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
+            upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
             upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
             upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
             upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
@@ -7990,6 +8029,7 @@ async fn record_upstream_transport_failure(
         prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
         prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
         prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+        prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
         prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
         prefix_guard_wait_effect: None,
         prefix_lag_classification: None,
@@ -8006,6 +8046,9 @@ async fn record_upstream_transport_failure(
         upstream_headers_ms: Some(0),
         upstream_last_attempt_headers_ms: Some(0),
         upstream_http_version: None,
+        upstream_network_path: None,
+        upstream_remote_addr: None,
+        upstream_pool_diagnostic: None,
         upstream_server_timing: None,
         upstream_timing_source: None,
         upstream_reported_processing_ms: None,
@@ -8164,6 +8207,7 @@ async fn cache_hit_response(
                 prefix_guard_wait_ms: None,
                 prefix_guard_wait_reason: None,
                 prefix_guard_wait_source: None,
+                prefix_guard_state_age_ms: None,
                 prefix_guard_skip_reason: None,
                 prefix_guard_wait_effect: None,
                 prefix_lag_classification: None,
@@ -8180,6 +8224,9 @@ async fn cache_hit_response(
                 upstream_headers_ms: None,
                 upstream_last_attempt_headers_ms: None,
                 upstream_http_version: None,
+                upstream_network_path: None,
+                upstream_remote_addr: None,
+                upstream_pool_diagnostic: None,
                 upstream_server_timing: None,
                 upstream_timing_source: None,
                 upstream_reported_processing_ms: None,
@@ -8924,6 +8971,8 @@ async fn send_upstream_request_to_url_with_diagnostics(
                 diagnostics.headers_ms += headers_ms;
                 diagnostics.last_attempt_headers_ms = headers_ms;
                 diagnostics.http_version = None;
+                diagnostics.remote_addr = None;
+                diagnostics.pool_diagnostic = None;
                 diagnostics.server_timing = None;
                 diagnostics.timing_source = None;
                 diagnostics.reported_processing_ms = None;
@@ -9355,6 +9404,7 @@ async fn stream_upstream(
                 prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
                 prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
                 prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+                prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
                 prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
                 prefix_guard_wait_effect: prefix_guard_wait_effect(
                     &prefix_guard_wait,
@@ -9380,6 +9430,9 @@ async fn stream_upstream(
                     upstream_request_diagnostics.last_attempt_headers_ms,
                 ),
                 upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+                upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
+                upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
+                upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
                 upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
                 upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
                 upstream_reported_processing_ms: upstream_request_diagnostics
@@ -19727,6 +19780,24 @@ mod tests {
     }
 
     #[test]
+    fn responses_measured_128_gap_keeps_bounded_guard() {
+        let mut state = prefix_state(105_281, 105_024, 0);
+        state.avoidable_shortfall_tokens = 0;
+        state.avoidable_shortfall_tokens_128 = 128;
+        state.avoidable_shortfall_streak = 1;
+
+        let wait = provider_prefix_wait_duration_for_channel(
+            &Channel::Responses,
+            &state,
+            &TailInputDiagnostics::default(),
+        )
+        .expect("a measured avoidable 128-token gap still needs a bounded guard");
+
+        assert!(wait > TokioDuration::ZERO);
+        assert!(wait <= responses_foreground_wait_cap());
+    }
+
+    #[test]
     fn responses_foreground_prewarm_settle_delay_scales_for_stable_new_tail() {
         let high_hit = UsageRecord {
             input_tokens: 98_325,
@@ -21850,6 +21921,7 @@ mod tests {
                 wait_ms: 78_000,
                 reason: Some("responses_large_tool_output_tail_guard".to_string()),
                 source: Some("exact".to_string()),
+                state_age_ms: None,
                 skip_reason: None,
                 budget_exhausted: false,
                 cache_instability_score: Some(0),
@@ -23913,6 +23985,10 @@ mod tests {
                     let captured_encoding = captured_encoding_for_route.clone();
                     async move {
                         hits.fetch_add(1, Ordering::SeqCst);
+                        let should_fail = body
+                            .pointer("/metadata/atoapi_test_upstream_502")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         *captured.lock().await = body;
                         *captured_accept.lock().await = headers
                             .get(header::ACCEPT)
@@ -23922,6 +23998,13 @@ mod tests {
                             .get(header::ACCEPT_ENCODING)
                             .and_then(|value| value.to_str().ok())
                             .map(ToOwned::to_owned);
+                        if should_fail {
+                            return raw_response(
+                                502,
+                                "text/html",
+                                b"upstream edge returned 502".to_vec(),
+                            );
+                        }
                         raw_response(
                             200,
                             "text/event-stream",
@@ -23999,6 +24082,7 @@ mod tests {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         }];
 
         let config_dir = std::env::temp_dir().join(format!(
@@ -24032,7 +24116,7 @@ mod tests {
 
         let response = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             body,
             Channel::Responses,
             Some("codex"),
@@ -24082,6 +24166,54 @@ mod tests {
         );
         assert_eq!(metrics.recent_requests[0].client_channel, "responses");
         assert_eq!(metrics.recent_requests[0].upstream_channel, "responses");
+        assert_eq!(
+            metrics.recent_requests[0].upstream_network_path.as_deref(),
+            Some("direct")
+        );
+        assert!(metrics.recent_requests[0].upstream_remote_addr.is_some());
+        assert_eq!(
+            metrics.recent_requests[0]
+                .upstream_pool_diagnostic
+                .as_deref(),
+            Some("shared-client:pool-enabled-hit-not-exposed")
+        );
+
+        let failed_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "metadata": { "atoapi_test_upstream_502": true },
+                "input": [{ "type": "message", "role": "user", "content": "fail" }]
+            }))
+            .unwrap(),
+        );
+        let failed_response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            failed_body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(failed_response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 2);
+        let failed_capture = captured_responses_body.lock().await.clone();
+        assert_eq!(failed_capture["stream"], true);
+
+        let failed_metrics = state.metrics.snapshot().await;
+        assert_eq!(failed_metrics.recent_requests[0].status, 502);
+        assert_eq!(
+            failed_metrics.recent_requests[0]
+                .upstream_call_kind
+                .as_deref(),
+            Some("stream")
+        );
+        assert_eq!(
+            failed_metrics.recent_requests[0]
+                .upstream_pool_diagnostic
+                .as_deref(),
+            Some("shared-client:pool-enabled-hit-not-exposed")
+        );
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -24182,6 +24314,7 @@ mod tests {
             last_injected_at: None,
             last_status: None,
             local_key: None,
+            hidden_provider_ids: Vec::new(),
         }];
 
         let config_dir = std::env::temp_dir().join(format!(
