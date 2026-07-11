@@ -17,7 +17,10 @@ use tokio::{
 use crate::{
     agent_injection,
     cache::{cache_path, CacheStore},
-    config::{app_config_dir, config_path, AppConfig, PublicConfig},
+    config::{
+        app_config_dir, config_path, provider_model_cache_key, AppConfig, ProviderConfig,
+        PublicConfig,
+    },
     metrics::MetricsStore,
     proxy,
 };
@@ -41,7 +44,8 @@ pub struct AppState {
     pub runtime_state_path: PathBuf,
     pub cache: CacheStore,
     pub metrics: MetricsStore,
-    pub client: reqwest::Client,
+    pub direct_client: reqwest::Client,
+    pub system_proxy_client: reqwest::Client,
     pub prefix_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub prefix_states: Mutex<HashMap<String, PrefixWarmState>>,
     pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -146,6 +150,26 @@ struct PersistedResponseSessionCooldownState {
 const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
 
+fn build_http_client(user_agent: &str, use_system_proxy: bool) -> Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .connect_timeout(StdDuration::from_secs(30))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(StdDuration::from_secs(10 * 60))
+        .tcp_keepalive(StdDuration::from_secs(30))
+        .tcp_nodelay(true)
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(StdDuration::from_secs(30))
+        .http2_keep_alive_timeout(StdDuration::from_secs(10))
+        .http2_keep_alive_while_idle(true);
+    let builder = if use_system_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    };
+    Ok(builder.build()?)
+}
+
 impl AppState {
     pub fn load() -> Result<Self> {
         let config_path = config_path()?;
@@ -155,16 +179,16 @@ impl AppState {
         config.save(&config_path)?;
         let cache = CacheStore::load(cache_path(&config_dir))?;
         let runtime_state_path = runtime_state_path(&config_dir);
-        let runtime_state = load_runtime_state(&runtime_state_path)?;
+        let mut runtime_state = load_runtime_state(&runtime_state_path)?;
+        migrate_prefix_states_for_config(&mut runtime_state.prefix_states, &config);
         Ok(Self {
             config: RwLock::new(config),
             config_path: config_path.clone(),
             runtime_state_path,
             cache,
             metrics: MetricsStore::new(),
-            client: reqwest::Client::builder()
-                .user_agent("Atoapi/0.1")
-                .build()?,
+            direct_client: build_http_client("Atoapi/0.1", false)?,
+            system_proxy_client: build_http_client("Atoapi/0.1", true)?,
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(runtime_state.prefix_states),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
@@ -192,9 +216,8 @@ impl AppState {
             runtime_state_path,
             cache,
             metrics: MetricsStore::new(),
-            client: reqwest::Client::builder()
-                .user_agent("AtoapiTest/0.1")
-                .build()?,
+            direct_client: build_http_client("AtoapiTest/0.1", false)?,
+            system_proxy_client: build_http_client("AtoapiTest/0.1", true)?,
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(HashMap::new()),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
@@ -216,6 +239,14 @@ impl AppState {
             .read()
             .await
             .public_view(self.config_path.clone())
+    }
+
+    pub fn upstream_client(&self, use_system_proxy: bool) -> &reqwest::Client {
+        if use_system_proxy {
+            &self.system_proxy_client
+        } else {
+            &self.direct_client
+        }
     }
 
     pub async fn reload_config(&self) -> Result<PublicConfig> {
@@ -403,6 +434,126 @@ fn load_runtime_state(path: &Path) -> Result<RuntimeStateMaps> {
     Ok(persisted.into_runtime())
 }
 
+fn migrate_prefix_states_for_config(
+    prefix_states: &mut HashMap<String, PrefixWarmState>,
+    config: &AppConfig,
+) {
+    let existing = prefix_states.clone();
+    for (key, state) in existing {
+        let parts = key.split('\0').collect::<Vec<_>>();
+        if parts.len() == 4 && parts[0] != "prefix-alias" {
+            let Some((provider_group, model_key)) =
+                prefix_state_migration_target(config, parts[0], parts[1])
+            else {
+                continue;
+            };
+            let migrated_key = format!(
+                "{}\0{}\0{}\0{}",
+                provider_group, model_key, parts[2], parts[3]
+            );
+            insert_stronger_prefix_state(prefix_states, migrated_key.clone(), state.clone());
+            insert_stronger_prefix_state(
+                prefix_states,
+                format!(
+                    "prefix-alias\0{}\0{}\0{}\0{}",
+                    provider_group, model_key, parts[2], parts[3]
+                ),
+                state,
+            );
+        } else if parts.len() == 5 && parts[0] == "prefix-alias" {
+            let Some((provider_group, model_key)) =
+                prefix_state_migration_target(config, parts[1], parts[2])
+            else {
+                continue;
+            };
+            let migrated_key = format!(
+                "prefix-alias\0{}\0{}\0{}\0{}",
+                provider_group, model_key, parts[3], parts[4]
+            );
+            insert_stronger_prefix_state(prefix_states, migrated_key, state);
+        } else if parts.len() == 5 && parts[0] == "prefix-family" {
+            let Some((provider_group, model_key)) =
+                prefix_state_migration_target(config, parts[1], parts[2])
+            else {
+                continue;
+            };
+            let migrated_key = format!(
+                "prefix-family\0{}\0{}\0{}\0{}",
+                provider_group, model_key, parts[3], parts[4]
+            );
+            insert_stronger_prefix_state(prefix_states, migrated_key, state);
+        }
+    }
+}
+
+fn prefix_state_migration_target(
+    config: &AppConfig,
+    provider_scope: &str,
+    model: &str,
+) -> Option<(String, String)> {
+    let providers = config
+        .providers
+        .iter()
+        .filter(|provider| provider.id == provider_scope)
+        .collect::<Vec<_>>();
+    let providers = if providers.is_empty() {
+        config
+            .providers
+            .iter()
+            .filter(|provider| prefix_provider_group(provider) == provider_scope)
+            .collect::<Vec<_>>()
+    } else {
+        providers
+    };
+
+    let mut targets = providers
+        .into_iter()
+        .map(|provider| {
+            (
+                prefix_provider_group(provider),
+                provider_model_cache_key(provider, model),
+            )
+        })
+        .collect::<Vec<_>>();
+    targets.sort();
+    targets.dedup();
+    (targets.len() == 1).then(|| targets.remove(0))
+}
+
+fn prefix_provider_group(provider: &ProviderConfig) -> String {
+    let base_url = provider
+        .base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if base_url.is_empty() {
+        provider.id.clone()
+    } else {
+        base_url
+    }
+}
+
+fn insert_stronger_prefix_state(
+    prefix_states: &mut HashMap<String, PrefixWarmState>,
+    key: String,
+    state: PrefixWarmState,
+) {
+    let should_replace = prefix_states
+        .get(&key)
+        .map(|current| prefix_state_strength(&state) > prefix_state_strength(current))
+        .unwrap_or(true);
+    if should_replace {
+        prefix_states.insert(key, state);
+    }
+}
+
+fn prefix_state_strength(state: &PrefixWarmState) -> u64 {
+    state
+        .seen_bucket_tokens_128
+        .max(state.seen_bucket_tokens)
+        .max(state.cache_read_tokens)
+}
+
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
@@ -584,7 +735,13 @@ impl PersistedRuntimeState {
                 if !active && age > RUNTIME_STATE_TTL {
                     return None;
                 }
-                let until_delta = (state.until_at - now).to_std().ok();
+                let until_delta = (state.until_at - now).to_std().ok().map(|duration| {
+                    if state.unsupported {
+                        duration.min(StdDuration::from_secs(5 * 60))
+                    } else {
+                        duration
+                    }
+                });
                 let until = until_delta
                     .and_then(|duration| instant_now.checked_add(duration))
                     .unwrap_or(instant_now);
@@ -637,12 +794,17 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -773,6 +935,155 @@ mod tests {
         assert!(cooldown.until > Instant::now());
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runtime_state_migrates_old_agent_prefix_keys_to_same_upstream_group() {
+        let mut config = AppConfig::default();
+        config.providers.push(ProviderConfig {
+            id: "agent-codex-hb".to_string(),
+            name: "hb / Codex".to_string(),
+            base_url: "https://hubway.cc/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![ModelConfig {
+                id: "gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(256000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let mut prefix_states = HashMap::new();
+        prefix_states.insert(
+            "agent-codex-hb\0codex-auto-review\0responses\0fingerprint-a".to_string(),
+            PrefixWarmState {
+                finished_at: Instant::now(),
+                input_tokens: 220_000,
+                cache_read_tokens: 215_040,
+                shortfall_tokens: 4_096,
+                seen_bucket_tokens: 215_040,
+                avoidable_shortfall_tokens: 0,
+                avoidable_shortfall_streak: 0,
+                shortfall_tokens_128: 4_096,
+                seen_bucket_tokens_128: 215_040,
+                avoidable_shortfall_tokens_128: 0,
+                small_gap_recovery_streak: 0,
+                cache_instability_score: 0,
+                tail_tool_output_chars: 0,
+                tail_largest_tool_output_chars: 0,
+                tail_tool_output_noise_hint: None,
+            },
+        );
+
+        migrate_prefix_states_for_config(&mut prefix_states, &config);
+
+        let migrated_key = "https://hubway.cc/v1\0gpt-5.6-sol\0responses\0fingerprint-a";
+        let migrated_alias =
+            "prefix-alias\0https://hubway.cc/v1\0gpt-5.6-sol\0responses\0fingerprint-a";
+        assert_eq!(
+            prefix_states
+                .get(migrated_key)
+                .map(|state| state.cache_read_tokens),
+            Some(215_040)
+        );
+        assert_eq!(
+            prefix_states
+                .get(migrated_alias)
+                .map(|state| state.seen_bucket_tokens),
+            Some(215_040)
+        );
+    }
+
+    #[test]
+    fn runtime_state_migrates_existing_upstream_group_alias_to_real_model() {
+        let mut config = AppConfig::default();
+        config.providers.push(ProviderConfig {
+            id: "agent-codex-hb".to_string(),
+            name: "hb / Codex".to_string(),
+            base_url: "https://hubway.cc/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![ModelConfig {
+                id: "gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(256_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        let state = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 174_257,
+            cache_read_tokens: 164_736,
+            shortfall_tokens: 9_344,
+            seen_bucket_tokens: 164_736,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 9_472,
+            seen_bucket_tokens_128: 164_736,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            cache_instability_score: 0,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let mut prefix_states = HashMap::from([
+            (
+                "https://hubway.cc/v1\0gpt-5.5\0responses\0fingerprint-a".to_string(),
+                state.clone(),
+            ),
+            (
+                "prefix-alias\0https://hubway.cc/v1\0gpt-5.5\0responses\0fingerprint-a".to_string(),
+                state,
+            ),
+        ]);
+
+        migrate_prefix_states_for_config(&mut prefix_states, &config);
+
+        assert_eq!(
+            prefix_states
+                .get("https://hubway.cc/v1\0gpt-5.6-sol\0responses\0fingerprint-a")
+                .map(|state| state.seen_bucket_tokens_128),
+            Some(164_736)
+        );
+        assert_eq!(
+            prefix_states
+                .get("prefix-alias\0https://hubway.cc/v1\0gpt-5.6-sol\0responses\0fingerprint-a")
+                .map(|state| state.cache_read_tokens),
+            Some(164_736)
+        );
     }
 
     #[tokio::test]

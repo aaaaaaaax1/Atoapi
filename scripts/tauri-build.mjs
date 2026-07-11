@@ -2,6 +2,14 @@ import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { spawnSync } from "node:child_process";
 
+const patcherBuild = spawnSync(process.execPath, [join("scripts", "build-codex-ui-patcher.mjs")], {
+  stdio: "inherit",
+  shell: false
+});
+if (patcherBuild.status !== 0) {
+  process.exit(patcherBuild.status || 1);
+}
+
 const home = process.env.USERPROFILE || process.env.HOME || "";
 const candidateDirs = [
   process.env.CARGO_HOME ? join(process.env.CARGO_HOME, "bin") : "",

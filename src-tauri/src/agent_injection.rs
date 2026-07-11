@@ -10,11 +10,13 @@ use std::{
 use toml_edit::{value, DocumentMut};
 
 use crate::config::{
-    app_config_dir, normalize_agent_injections, AgentInjectionConfig, AgentInjectionKind,
-    AppConfig, ProviderConfig,
+    app_config_dir, codex_model_alias, model_request_alias, normalize_agent_injections,
+    AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig, ProviderConfig,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
+const CODEX_MODEL_CATALOG_FILE: &str = "atoapi-model-catalog.json";
+const OFFICIAL_CODEX_MODELS_JSON: &str = include_str!("../resources/codex-models.json");
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000345600";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "Atoapi";
 
@@ -50,6 +52,8 @@ struct InjectionContext {
     local_key: String,
     default_channel: String,
     default_model: String,
+    model_context_window: Option<u32>,
+    codex_models: Vec<ModelConfig>,
 }
 
 pub fn ensure_defaults(config: &mut AppConfig) {
@@ -393,14 +397,33 @@ impl InjectionContext {
             .and_then(|id| config.providers.iter().find(|provider| provider.id == id))
             .or_else(|| config.providers.iter().find(|provider| provider.enabled));
         let configured_model_id = item.and_then(|item| item.model_id.as_deref());
-        let model = provider
-            .and_then(|provider| {
-                configured_model_id
-                    .and_then(|model_id| provider.models.iter().find(|model| model.id == model_id))
-                    .or_else(|| provider.models.iter().find(|model| model.enabled))
-            })
+        let model_config = provider.and_then(|provider| {
+            configured_model_id
+                .and_then(|model_id| {
+                    provider
+                        .models
+                        .iter()
+                        .find(|model| injection_model_matches(model, model_id))
+                })
+                .or_else(|| provider.models.iter().find(|model| model.enabled))
+        });
+        let model = model_config
             .map(|model| model.id.clone())
             .unwrap_or_else(|| "gpt-5.2".to_string());
+        let agent_model = model_config
+            .and_then(model_request_alias)
+            .or_else(|| codex_model_alias(&model))
+            .unwrap_or_else(|| model.clone());
+        let codex_models = provider
+            .map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .filter(|model| model.enabled)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Self {
             anthropic_base_url: base.clone(),
@@ -410,9 +433,28 @@ impl InjectionContext {
                 .map(|item| agent_local_key(&config.local_key, &item.id))
                 .unwrap_or_else(|| config.local_key.clone()),
             default_channel: config.default_channel.label().to_string(),
-            default_model: model,
+            default_model: agent_model,
+            model_context_window: model_config.and_then(|model| model.context_window),
+            codex_models,
         }
     }
+}
+
+fn injection_model_matches(model: &crate::config::ModelConfig, requested: &str) -> bool {
+    let requested = requested.trim();
+    if model.id == requested {
+        return true;
+    }
+    if model_request_alias(model)
+        .map(|alias| alias == requested || alias.eq_ignore_ascii_case(requested))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let requested_lower = requested.to_ascii_lowercase();
+    codex_model_alias(&model.id)
+        .map(|alias| alias == requested_lower)
+        .unwrap_or(false)
 }
 
 pub(crate) fn agent_local_key(local_key: &str, agent_id: &str) -> String {
@@ -473,6 +515,23 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["model"] = value(context.default_model.as_str());
     doc["disable_response_storage"] = value(true);
+    let model_catalog_path = write_codex_model_catalog(path, context)?;
+    doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
+    if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
+        doc["model_context_window"] = value(i64::from(context_window));
+    } else {
+        doc.as_table_mut().remove("model_context_window");
+    }
+    if let Some(reasoning_effort) = context
+        .codex_models
+        .iter()
+        .find(|model| injection_model_matches(model, &context.default_model))
+        .filter(|model| model.reasoning_effort_override_enabled)
+        .and_then(|model| model.reasoning_effort.as_deref())
+        .and_then(crate::config::normalize_reasoning_effort)
+    {
+        doc["model_reasoning_effort"] = value(reasoning_effort);
+    }
 
     if !doc.as_table().contains_key("model_providers") {
         doc["model_providers"] = toml_edit::table();
@@ -492,6 +551,193 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     }
 
     write_text(path, &doc.to_string())
+}
+
+fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> Result<PathBuf> {
+    let mut catalog = serde_json::from_str::<Value>(OFFICIAL_CODEX_MODELS_JSON)
+        .context("bundled Codex model catalog is invalid")?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("bundled Codex model catalog has no models array"))?;
+    let fallback_template = models
+        .iter()
+        .find(|model| model.get("slug").and_then(Value::as_str) == Some("gpt-5.2"))
+        .or_else(|| models.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("bundled Codex model catalog is empty"))?;
+    let mut priority = models
+        .iter()
+        .filter_map(|model| model.get("priority").and_then(Value::as_i64))
+        .max()
+        .unwrap_or(100);
+
+    for model in context.codex_models.iter().filter(|model| model.enabled) {
+        let slug = model_request_alias(model)
+            .or_else(|| codex_model_alias(&model.id))
+            .unwrap_or_else(|| model.id.trim().to_string());
+        if slug.is_empty() {
+            continue;
+        }
+        let actual_slug =
+            codex_model_alias(&model.id).unwrap_or_else(|| model.id.trim().to_ascii_lowercase());
+        let official_template = models
+            .iter()
+            .find(|entry| {
+                entry
+                    .get("slug")
+                    .and_then(Value::as_str)
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&actual_slug))
+            })
+            .cloned();
+        let inherits_official_capabilities = official_template.is_some();
+        let template = official_template.unwrap_or_else(|| fallback_template.clone());
+        priority += 1;
+        let catalog_model = codex_catalog_model(
+            &template,
+            model,
+            &slug,
+            priority,
+            inherits_official_capabilities,
+        );
+        if let Some(index) = models.iter().position(|entry| {
+            entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&slug))
+        }) {
+            models[index] = catalog_model;
+        } else {
+            models.push(catalog_model);
+        }
+    }
+
+    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+    let catalog_path = parent.join(CODEX_MODEL_CATALOG_FILE);
+    let catalog_path = if catalog_path.is_absolute() {
+        catalog_path
+    } else {
+        std::env::current_dir()
+            .context("failed to resolve Codex model catalog path")?
+            .join(catalog_path)
+    };
+    write_json_pretty(&catalog_path, &catalog)?;
+    Ok(catalog_path)
+}
+
+fn codex_catalog_model(
+    template: &Value,
+    model: &ModelConfig,
+    slug: &str,
+    priority: i64,
+    inherits_official_capabilities: bool,
+) -> Value {
+    let mut catalog_model = template.clone();
+    catalog_model["slug"] = json!(slug);
+    let display_name = if model_request_alias(model).is_some() {
+        slug
+    } else {
+        let configured = model.display_name.trim();
+        if configured.is_empty() {
+            slug
+        } else {
+            configured
+        }
+    };
+    catalog_model["display_name"] = json!(display_name);
+    catalog_model["description"] = json!("Model supplied by the active Atoapi upstream.");
+    catalog_model["visibility"] = json!("list");
+    catalog_model["supported_in_api"] = json!(true);
+    catalog_model["priority"] = json!(priority);
+    catalog_model["availability_nux"] = Value::Null;
+    catalog_model["upgrade"] = Value::Null;
+    catalog_model["auto_review_model_override"] = Value::Null;
+    if !inherits_official_capabilities {
+        catalog_model["use_responses_lite"] = json!(false);
+        catalog_model["multi_agent_version"] = Value::Null;
+        catalog_model["additional_speed_tiers"] = json!([]);
+        catalog_model["service_tiers"] = json!([]);
+        catalog_model["default_service_tier"] = Value::Null;
+        catalog_model["comp_hash"] = Value::Null;
+        catalog_model["auto_compact_token_limit"] = Value::Null;
+    }
+    catalog_model["supports_parallel_tool_calls"] = json!(model.supports_tools);
+    if let Some(context_window) = model.context_window.filter(|value| *value > 0) {
+        catalog_model["context_window"] = json!(context_window);
+        catalog_model["max_context_window"] = json!(context_window);
+    }
+
+    let supported =
+        if inherits_official_capabilities && model.supported_reasoning_efforts.is_empty() {
+            catalog_model["supported_reasoning_levels"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .filter_map(|effort| crate::config::normalize_reasoning_effort(effort))
+                .map(|effort| {
+                    json!({
+                        "effort": effort,
+                        "description": format!("Use {effort} reasoning for this model")
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+    let default_effort = model
+        .reasoning_effort_override_enabled
+        .then_some(model.reasoning_effort.as_deref())
+        .flatten()
+        .and_then(crate::config::normalize_reasoning_effort)
+        .filter(|effort| {
+            supported
+                .iter()
+                .any(|item| item.get("effort").and_then(Value::as_str) == Some(effort.as_str()))
+        })
+        .or_else(|| {
+            inherits_official_capabilities
+                .then(|| {
+                    catalog_model
+                        .get("default_reasoning_level")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .flatten()
+        })
+        .or_else(|| {
+            model
+                .reasoning_effort
+                .as_deref()
+                .and_then(crate::config::normalize_reasoning_effort)
+                .filter(|effort| {
+                    supported.iter().any(|item| {
+                        item.get("effort").and_then(Value::as_str) == Some(effort.as_str())
+                    })
+                })
+        })
+        .or_else(|| {
+            supported
+                .iter()
+                .find(|item| item.get("effort").and_then(Value::as_str) == Some("medium"))
+                .and_then(|item| item.get("effort"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .or_else(|| {
+            supported
+                .first()
+                .and_then(|item| item.get("effort"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+    let supports_reasoning = !supported.is_empty();
+    catalog_model["supported_reasoning_levels"] = Value::Array(supported);
+    catalog_model["default_reasoning_level"] =
+        default_effort.map(Value::String).unwrap_or(Value::Null);
+    catalog_model["supports_reasoning_summaries"] = json!(supports_reasoning);
+    catalog_model
 }
 
 fn write_opencode_config(path: &Path, context: &InjectionContext) -> Result<()> {
@@ -1000,8 +1246,27 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            model_context_window: Some(128_000),
+            codex_models: vec![ModelConfig {
+                id: "vendor/gpt-custom".to_string(),
+                request_model_id: Some("gpt-custom".to_string()),
+                display_name: "GPT Custom".to_string(),
+                context_window: Some(256_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: vec![
+                    "low".to_string(),
+                    "high".to_string(),
+                    "ultra".to_string(),
+                ],
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
         };
 
+        write_codex_config(&path, &context).unwrap();
         write_codex_config(&path, &context).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -1018,7 +1283,95 @@ command = "npx"
                 .and_then(toml::Value::as_str),
             Some("http://127.0.0.1:18883/codex/v1")
         );
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(128_000)
+        );
         assert!(parsed.get("mcp_servers").is_some());
+        let catalog_path = parsed
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+            .expect("Codex injection should write model_catalog_json");
+        assert!(catalog_path.is_absolute());
+        let catalog: Value =
+            serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        let sol = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .expect("official GPT-5.6 Sol should be present");
+        assert!(sol["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "ultra"));
+        assert!(sol["service_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
+        assert!(sol["additional_speed_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier == "fast"));
+        let terra = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-terra")
+            .expect("official GPT-5.6 Terra should be present");
+        assert!(terra["service_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
+        assert!(terra["additional_speed_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier == "fast"));
+        let luna = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-luna")
+            .expect("official GPT-5.6 Luna should be present");
+        assert!(luna["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "max"));
+        assert!(!luna["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "ultra"));
+        assert!(luna["service_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
+        assert!(luna["additional_speed_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier == "fast"));
+        let custom = models
+            .iter()
+            .filter(|model| model["slug"] == "gpt-custom")
+            .collect::<Vec<_>>();
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0]["context_window"], 256_000);
+        assert!(custom[0]["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "ultra"));
+        assert!(custom[0]["service_tiers"].as_array().unwrap().is_empty());
+        assert!(custom[0]["additional_speed_tiers"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1036,6 +1389,8 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            model_context_window: Some(128_000),
+            codex_models: Vec::new(),
         };
 
         write_proxy_mode_profile(&path, &context).unwrap();
@@ -1076,12 +1431,17 @@ command = "npx"
             channel: crate::config::Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -1118,6 +1478,51 @@ command = "npx"
     fn codex_injection_context_uses_agent_scoped_local_key() {
         let mut config = AppConfig::default();
         config.local_key = "ato-root-key".to_string();
+        config.providers.push(ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: crate::config::Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "nc/gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(372000),
+                output_window: None,
+                reasoning_effort_override_enabled: true,
+                reasoning_effort: Some("ultra".to_string()),
+                supported_reasoning_efforts: vec![
+                    "low".to_string(),
+                    "medium".to_string(),
+                    "high".to_string(),
+                    "xhigh".to_string(),
+                    "max".to_string(),
+                    "ultra".to_string(),
+                ],
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        {
+            let item = config
+                .agent_injections
+                .iter_mut()
+                .find(|item| item.id == "codex")
+                .unwrap();
+            item.provider_id = Some("share".to_string());
+            item.model_id = Some("nc/gpt-5.6-sol".to_string());
+        }
         let item = config
             .agent_injections
             .iter()
@@ -1128,6 +1533,52 @@ command = "npx"
 
         assert_ne!(context.local_key, "PROXY_MANAGED");
         assert_eq!(context.local_key, agent_local_key("ato-root-key", "codex"));
+        assert_eq!(context.default_model, "gpt-5.5");
+        assert_eq!(context.model_context_window, Some(372_000));
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-mapped-model-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("ultra")
+        );
+
+        let catalog_path = parsed
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .unwrap();
+        let catalog: Value =
+            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
+        let mapped = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.5")
+            .unwrap();
+        assert_eq!(mapped["display_name"], "gpt-5.5");
+        assert_eq!(mapped["context_window"], 372_000);
+        assert!(mapped["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|level| level["effort"] == "ultra"));
+        assert!(mapped["service_tiers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1143,12 +1594,17 @@ command = "npx"
             channel: crate::config::Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -1192,12 +1648,17 @@ command = "npx"
                 channel: crate::config::Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -1253,12 +1714,17 @@ command = "npx"
             channel: crate::config::Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![crate::config::ModelConfig {
                 id: "gpt-new".to_string(),
+                request_model_id: None,
                 display_name: "gpt-new".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -1308,6 +1774,8 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "anthropic".to_string(),
             default_model: "gpt-test".to_string(),
+            model_context_window: Some(128_000),
+            codex_models: Vec::new(),
         };
 
         write_claude_code_settings(&path, &context).unwrap();
@@ -1441,6 +1909,8 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            model_context_window: Some(128_000),
+            codex_models: Vec::new(),
         }
     }
 }

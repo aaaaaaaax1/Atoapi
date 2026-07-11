@@ -122,6 +122,8 @@ pub struct ProviderConfig {
     pub prompt_cache_retention_enabled: bool,
     #[serde(default = "default_request_body_gzip_enabled")]
     pub request_body_gzip_enabled: bool,
+    #[serde(default)]
+    pub use_system_proxy: bool,
     pub api_key_encrypted: Option<String>,
     pub models: Vec<ModelConfig>,
     pub enabled: bool,
@@ -145,6 +147,8 @@ pub struct ProviderInput {
     pub prompt_cache_retention_enabled: bool,
     #[serde(default = "default_request_body_gzip_enabled")]
     pub request_body_gzip_enabled: bool,
+    #[serde(default)]
+    pub use_system_proxy: bool,
     #[serde(default)]
     pub non_sse_compact_compat_enabled: bool,
     pub api_key: Option<String>,
@@ -314,12 +318,120 @@ pub struct ProviderKeyInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_model_id: Option<String>,
     pub display_name: String,
     pub context_window: Option<u32>,
     pub output_window: Option<u32>,
+    #[serde(default)]
+    pub reasoning_effort_override_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_reasoning_efforts: Vec<String>,
     pub supports_tools: bool,
     pub supports_streaming: bool,
     pub enabled: bool,
+}
+
+pub const REASONING_EFFORT_VALUES: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    REASONING_EFFORT_VALUES
+        .contains(&normalized.as_str())
+        .then_some(normalized)
+}
+
+pub fn normalize_reasoning_efforts(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let Some(value) = normalize_reasoning_effort(value) else {
+            continue;
+        };
+        if !normalized.contains(&value) {
+            normalized.push(value);
+        }
+    }
+    normalized.sort_by_key(|value| {
+        REASONING_EFFORT_VALUES
+            .iter()
+            .position(|candidate| candidate == value)
+            .unwrap_or(REASONING_EFFORT_VALUES.len())
+    });
+    normalized
+}
+
+pub fn codex_model_alias(model_id: &str) -> Option<String> {
+    let trimmed = model_id.trim();
+    let alias = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();
+    if alias.is_empty() || alias == trimmed {
+        return None;
+    }
+    Some(alias.to_ascii_lowercase())
+}
+
+pub fn model_request_alias(model: &ModelConfig) -> Option<String> {
+    model
+        .request_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty() && *alias != model.id.trim())
+        .map(ToOwned::to_owned)
+}
+
+pub fn provider_model_cache_key(provider: &ProviderConfig, requested_model: &str) -> String {
+    let requested = requested_model.trim();
+    if requested.is_empty() {
+        return String::new();
+    }
+    let requested_lower = requested.to_ascii_lowercase();
+    if let Some(model) = provider.models.iter().find(|model| {
+        model.enabled
+            && (model.id == requested
+                || model_request_alias(model)
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(requested))
+                || codex_model_alias(&model.id).is_some_and(|alias| alias == requested_lower))
+    }) {
+        return model.id.clone();
+    }
+
+    let mut enabled_models = provider.models.iter().filter(|model| model.enabled);
+    let Some(only_model) = enabled_models.next() else {
+        return requested.to_string();
+    };
+    if enabled_models.next().is_none() {
+        only_model.id.clone()
+    } else {
+        requested.to_string()
+    }
+}
+
+pub fn codex_model_display_name(model_id: &str) -> String {
+    model_id
+        .split('-')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            if part.eq_ignore_ascii_case("gpt") {
+                "GPT".to_string()
+            } else {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        format!(
+                            "{}{}",
+                            first.to_uppercase(),
+                            chars.as_str().to_ascii_lowercase()
+                        )
+                    }
+                    None => String::new(),
+                }
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -447,6 +559,7 @@ pub struct PublicProvider {
     pub channel: Channel,
     pub prompt_cache_retention_enabled: bool,
     pub request_body_gzip_enabled: bool,
+    pub use_system_proxy: bool,
     pub non_sse_compact_compat_enabled: bool,
     pub has_api_key: bool,
     pub key_pool: Option<PublicProviderKeyPool>,
@@ -666,6 +779,7 @@ impl AppConfig {
                     channel: provider.channel.clone(),
                     prompt_cache_retention_enabled: provider.prompt_cache_retention_enabled,
                     request_body_gzip_enabled: provider.request_body_gzip_enabled,
+                    use_system_proxy: provider.use_system_proxy,
                     non_sse_compact_compat_enabled: self
                         .non_sse_compact_compat_enabled_for_provider(&provider.id),
                     has_api_key: provider.api_key_encrypted.is_some(),
@@ -936,6 +1050,7 @@ impl AppConfig {
             provider.channel = input.channel;
             provider.prompt_cache_retention_enabled = input.prompt_cache_retention_enabled;
             provider.request_body_gzip_enabled = input.request_body_gzip_enabled;
+            provider.use_system_proxy = input.use_system_proxy;
             provider.enabled = input.enabled;
             provider.updated_at = now;
             if encrypted_key.is_some() {
@@ -952,6 +1067,7 @@ impl AppConfig {
                 channel: input.channel,
                 prompt_cache_retention_enabled: input.prompt_cache_retention_enabled,
                 request_body_gzip_enabled: input.request_body_gzip_enabled,
+                use_system_proxy: input.use_system_proxy,
                 api_key_encrypted: encrypted_key,
                 models: Vec::new(),
                 enabled: input.enabled,
@@ -1428,6 +1544,49 @@ updated_at = "2026-06-21T00:00:00Z"
 "#;
         let provider: ProviderConfig = toml::from_str(raw).expect("legacy provider should parse");
         assert!(provider.prompt_cache_retention_enabled);
+        assert!(!provider.use_system_proxy);
+    }
+
+    #[test]
+    fn provider_cache_model_key_uses_real_model_for_request_alias() {
+        let provider = ProviderConfig {
+            id: "agent-codex-hb".to_string(),
+            name: "hb / Codex".to_string(),
+            base_url: "https://hubway.cc/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![ModelConfig {
+                id: "gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "GPT-5.6 Sol".to_string(),
+                context_window: Some(256_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        assert_eq!(
+            provider_model_cache_key(&provider, "gpt-5.5"),
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            provider_model_cache_key(&provider, "gpt-5.6-sol"),
+            "gpt-5.6-sol"
+        );
     }
 
     #[test]
@@ -1638,6 +1797,7 @@ enabled = true
             channel: Channel::Responses,
             prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             non_sse_compact_compat_enabled: false,
             api_key: None,
             key_pool,

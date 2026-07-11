@@ -64,6 +64,7 @@ interface ProviderDraft {
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
   key_pool: ProviderKeyPoolDraft;
   models: ModelConfig[];
@@ -119,17 +120,29 @@ const keyStrategyOptions: Array<{ value: KeyLoadBalanceStrategy; label: string; 
   { value: "sequential", label: "顺序消耗", hint: "一直使用列表里第一个可用 Key，异常后顺序切到下一个。" }
 ];
 
+const reasoningEffortOptions = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+] as const;
+
 const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
   { id: "cache", label: "缓存统计", icon: <Gauge size={16} /> }
 ];
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.77";
+const appVersion = "v0.1.86";
 const appVersionNotes = [
-  "v0.1.77: Request records now show inbound/upstream IDs and upstream attempt counts.",
-  "v0.1.77: Editing a shared provider from an Agent page clones it into an isolated Agent provider first.",
-  "v0.1.77: Turning Smart Hit off now returns to transparent forwarding without prefix waits or normal session-delta."
+  "v0.1.86: 新增 HTTP 版本、Server-Timing、上游处理时间和非处理等待时间诊断，定位首字额外延迟。",
+  "v0.1.86: 模型别名与真实上游模型统一缓存键，同时保持不同会话锚点隔离。",
+  "v0.1.86: 巨型冷读保留真实总缺口并归类为上游不稳定，不再误算为新尾巴或可避免缺口。",
+  "v0.1.86: 保持按需最多 1 秒智能等待、零额外请求和稳定前缀零等待规则。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -143,6 +156,7 @@ const emptyDraft: ProviderDraft = {
   channel: "responses",
   prompt_cache_retention_enabled: true,
   request_body_gzip_enabled: false,
+  use_system_proxy: false,
   non_sse_compact_compat_enabled: false,
   key_pool: {
     enabled: false,
@@ -323,7 +337,7 @@ export default function App() {
   }
 
   async function editAgentProvider(item: AgentInjectionConfig, provider: ProviderConfig) {
-    if (!config || !providerIsSharedForAgent(config, provider.id, item.id)) {
+    if (!config || providerBelongsToAgent(provider.id, item.id)) {
       editProvider(provider);
       return;
     }
@@ -332,7 +346,11 @@ export default function App() {
     setNotice("");
     try {
       const nextConfig = await command<AppConfig>("clone_provider_for_agent", {
-        input: { agent_id: item.id, provider_id: provider.id }
+        input: {
+          agent_id: item.id,
+          provider_id: provider.id,
+          model_id: item.model_id ?? null
+        }
       });
       setConfig(nextConfig);
       const updatedAgent = nextConfig.agent_injections.find((candidate) => candidate.id === item.id);
@@ -340,7 +358,7 @@ export default function App() {
         (candidate) => candidate.id === updatedAgent?.provider_id
       );
       editProvider(clonedProvider ?? provider);
-      setNotice(`${item.label} 已复制为独立上游，当前编辑不会影响其他 Agent`);
+      setNotice(`${item.label} 已切换为独立设置，当前编辑不会影响其他 Agent`);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -383,7 +401,8 @@ export default function App() {
         is_full_url: draft.is_full_url,
         custom_user_agent: draft.custom_user_agent.trim() || undefined,
         channel: draft.channel,
-        api_key: draft.api_key || undefined
+        api_key: draft.api_key || undefined,
+        use_system_proxy: draft.use_system_proxy
       };
       const models = await command<ModelConfig[]>("fetch_provider_models", { input });
       setModelCandidates(models);
@@ -454,6 +473,7 @@ export default function App() {
         channel: draft.channel,
         prompt_cache_retention_enabled: draft.prompt_cache_retention_enabled,
         request_body_gzip_enabled: draft.request_body_gzip_enabled,
+        use_system_proxy: draft.use_system_proxy,
         non_sse_compact_compat_enabled: draft.non_sse_compact_compat_enabled,
         key_pool: providerKeyPoolInput(draft.key_pool),
         api_key: draft.api_key || undefined,
@@ -514,16 +534,26 @@ export default function App() {
     }
   }
 
-  async function removeProvider(provider: ProviderConfig) {
-    if (!window.confirm(`删除上游 ${provider.name}？`)) return;
-    const nextConfig = await command<AppConfig>("delete_provider", {
-      providerId: provider.id,
-      provider_id: provider.id
-    });
-    setConfig(nextConfig);
-    if (selectedProviderId === provider.id) {
-      setSelectedProviderId("new");
-      setDraft(emptyDraft);
+  async function removeProvider(provider: ProviderConfig, agentId?: string) {
+    const scope = agentId ? "当前 Agent 的" : "";
+    if (!window.confirm(`删除${scope}上游 ${provider.name}？`)) return;
+    setError("");
+    try {
+      const nextConfig = await command<AppConfig>("delete_provider", {
+        providerId: provider.id,
+        provider_id: provider.id,
+        agentId: agentId ?? null,
+        agent_id: agentId ?? null
+      });
+      setConfig(nextConfig);
+      if (selectedProviderId === provider.id) {
+        setSelectedProviderId("new");
+        setDraft(emptyDraft);
+        setProviderEditorOpen(false);
+      }
+      setNotice(agentId ? "已只删除当前 Agent 的上游，其他 Agent 不受影响" : "上游已删除");
+    } catch (err) {
+      setError(String(err));
     }
   }
 
@@ -867,7 +897,7 @@ export default function App() {
               onProxyModeDraftChange={setProxyModeDraft}
               onSaveProxyModeConfig={() => void saveProxyModeConfig()}
               onEditProvider={(provider) => void editAgentProvider(selectedAgent, provider)}
-              onDeleteProvider={(provider) => void removeProvider(provider)}
+              onDeleteProvider={(provider) => void removeProvider(provider, selectedAgent.id)}
             />
           )}
 
@@ -911,7 +941,12 @@ export default function App() {
           onSave={() => void saveProvider()}
           onDelete={() => {
             const provider = config?.providers.find((item) => item.id === draft.id);
-            if (provider) void removeProvider(provider);
+            if (provider) {
+              void removeProvider(
+                provider,
+                activeView === "agent" ? selectedAgent?.id : undefined
+              );
+            }
           }}
           onClose={() => setProviderEditorOpen(false)}
         />
@@ -1063,6 +1098,7 @@ function AgentWorkspace({
   onDeleteProvider: (provider: ProviderConfig) => void;
 }) {
   const selectedProvider = providers.find((provider) => provider.id === item.provider_id) ?? null;
+  const visibleProviders = providersForAgentEditor(providers, item);
   const selectedModel =
     selectedProvider?.models.find((model) => model.id === item.model_id) ??
     selectedProvider?.models.find((model) => model.enabled) ??
@@ -1125,9 +1161,9 @@ function AgentWorkspace({
         )}
       </div>
 
-      {providers.length ? (
+      {visibleProviders.length ? (
         <div className="agent-provider-grid">
-          {providers.map((provider) => {
+          {visibleProviders.map((provider) => {
             const isSelected = item.provider_id === provider.id;
             const providerModel =
               provider.models.find((model) => model.id === (isSelected ? item.model_id : undefined)) ??
@@ -1471,6 +1507,7 @@ function ProviderPanel({
   const isActive = Boolean(draft.id && config?.active_provider_id === draft.id);
   const modeValue: "auto" | Channel = draft.channel_mode === "auto" ? "auto" : draft.channel;
   const supportsPromptCacheRetention = draft.channel !== "anthropic";
+  const [contextDrafts, setContextDrafts] = useState<Record<number, string>>({});
 
   function updateMode(value: "auto" | Channel) {
     if (value === "auto") {
@@ -1478,6 +1515,33 @@ function ProviderPanel({
       return;
     }
     onDraftChange({ ...draft, channel_mode: "manual", channel: value });
+  }
+
+  useEffect(() => {
+    setContextDrafts({});
+  }, [draft.id]);
+
+  function beginContextEdit(index: number, value?: number | null) {
+    setContextDrafts((current) => ({
+      ...current,
+      [index]: formatRawContextInput(value)
+    }));
+  }
+
+  function updateContextEdit(index: number, value: string) {
+    setContextDrafts((current) => ({
+      ...current,
+      [index]: value
+    }));
+    onUpdateModel(index, { context_window: parseContext(value) });
+  }
+
+  function endContextEdit(index: number) {
+    setContextDrafts((current) => {
+      const next = { ...current };
+      delete next[index];
+      return next;
+    });
   }
 
   return (
@@ -1543,6 +1607,29 @@ function ProviderPanel({
         </div>
 
         <div className="provider-option-stack">
+          <div className={draft.use_system_proxy ? "provider-option-control active" : "provider-option-control"}>
+            <h4
+              className="provider-option-title"
+              data-help="默认关闭并直连上游。只有该上游必须通过 Windows 系统代理才能访问时才开启；模型获取、Key 测活、普通转发、压缩和同步都会使用同一网络路径。"
+              tabIndex={0}
+            >
+              使用系统代理
+            </h4>
+            <button
+              className={draft.use_system_proxy ? "smart-cache-toggle on" : "smart-cache-toggle"}
+              type="button"
+              onClick={() =>
+                onDraftChange({
+                  ...draft,
+                  use_system_proxy: !draft.use_system_proxy
+                })
+              }
+            >
+              <span />
+              <b>{draft.use_system_proxy ? "开" : "关"}</b>
+            </button>
+          </div>
+
           {supportsPromptCacheRetention && (
             <div className={draft.prompt_cache_retention_enabled ? "provider-option-control active" : "provider-option-control"}>
               <h4
@@ -1677,22 +1764,94 @@ function ProviderPanel({
           ) : (
             draft.models.map((item, index) => (
               <div className="model-row" key={"model-row-" + index}>
-                <input
-                  value={item.id}
-                  onChange={(event) =>
-                    onUpdateModel(index, {
-                      id: event.target.value,
-                      display_name: event.target.value
-                    })
-                  }
-                  placeholder="模型 ID"
-                />
+                <label className="model-map-field request-model-field">
+                  <span>请求模型</span>
+                  <input
+                    value={item.request_model_id ?? ""}
+                    onChange={(event) =>
+                      onUpdateModel(index, {
+                        request_model_id: event.target.value
+                      })
+                    }
+                    placeholder={item.id || "agent 看到的模型名"}
+                  />
+                </label>
+                <span className="model-map-arrow">→</span>
+                <label className="model-map-field upstream-model-field">
+                  <span>实际模型</span>
+                  <input
+                    value={item.id}
+                    onChange={(event) =>
+                      onUpdateModel(index, {
+                        id: event.target.value,
+                        display_name: event.target.value
+                      })
+                    }
+                    placeholder="发送到 API 的模型"
+                  />
+                </label>
                 <input
                   className="context-field"
-                  value={formatContextInput(item.context_window)}
-                  onChange={(event) => onUpdateModel(index, { context_window: parseContext(event.target.value) })}
+                  inputMode="numeric"
+                  value={contextDrafts[index] ?? formatContextInput(item.context_window)}
+                  onFocus={() => beginContextEdit(index, item.context_window)}
+                  onBlur={() => endContextEdit(index)}
+                  onChange={(event) => updateContextEdit(index, event.target.value)}
                   placeholder="上下文"
+                  title={item.context_window ? formatNumber(item.context_window) : "上下文"}
                 />
+                <div className="model-reasoning-row">
+                  <div
+                    className="model-reasoning-label"
+                    title={
+                      item.supported_reasoning_efforts?.length
+                        ? `上游声明支持：${item.supported_reasoning_efforts.join(" / ")}`
+                        : "默认跟随 Agent，不额外探测上游能力。开启后强制使用右侧强度。"
+                    }
+                  >
+                    <BrainCircuit size={15} />
+                    <span>推理强度</span>
+                  </div>
+                  <button
+                    className={item.reasoning_effort_override_enabled ? "mini-toggle on" : "mini-toggle"}
+                    type="button"
+                    onClick={() =>
+                      onUpdateModel(index, {
+                        reasoning_effort_override_enabled: !item.reasoning_effort_override_enabled,
+                        reasoning_effort: !item.reasoning_effort_override_enabled
+                          ? item.reasoning_effort ?? "medium"
+                          : item.reasoning_effort
+                      })
+                    }
+                    title={item.reasoning_effort_override_enabled ? "关闭后跟随 Agent" : "开启模型级强制覆盖"}
+                  >
+                    <span />
+                  </button>
+                  <SelectShell disabled={!item.reasoning_effort_override_enabled}>
+                    <select
+                      value={
+                        item.reasoning_effort_override_enabled
+                          ? item.reasoning_effort ?? "medium"
+                          : ""
+                      }
+                      disabled={!item.reasoning_effort_override_enabled}
+                      onChange={(event) =>
+                        onUpdateModel(index, {
+                          reasoning_effort: event.target.value
+                        })
+                      }
+                    >
+                      {!item.reasoning_effort_override_enabled ? (
+                        <option value="">跟随 Agent</option>
+                      ) : null}
+                      {reasoningEffortOptions.map((effort) => (
+                        <option key={effort} value={effort}>
+                          {effort}
+                        </option>
+                      ))}
+                    </select>
+                  </SelectShell>
+                </div>
                 <button
                   className={item.enabled ? "mini-toggle on" : "mini-toggle"}
                   onClick={() => onUpdateModel(index, { enabled: !item.enabled })}
@@ -1800,7 +1959,8 @@ function MultiKeyManager({
           models_url: draft.models_url || undefined,
           is_full_url: draft.is_full_url,
           custom_user_agent: draft.custom_user_agent || undefined,
-          channel: draft.channel
+          channel: draft.channel,
+          use_system_proxy: draft.use_system_proxy
         }
       });
       updateKey(key.id, {
@@ -2104,7 +2264,8 @@ function CachePanel({
     : traffic?.total_requests ?? selectedUsageRequests(usage) ?? 0;
   const cacheRatio = inputTokens > 0 ? cacheReadTokens / inputTokens : 0;
   const activeCacheRatio = recentInputTokens > 0 ? recentCacheRatio : cacheRatio;
-  const shownRequests = (metrics?.recent_requests ?? []).filter((request) =>
+  const requestFeed = metrics?.recent_upstream_calls ?? metrics?.recent_requests ?? [];
+  const shownRequests = requestFeed.filter((request) =>
     selectedProvider === "all" || request.provider === selectedProvider
   );
   const pageableRequests = shownRequests.slice(0, requestPageSize * maxRequestPages);
@@ -2307,11 +2468,15 @@ function CachePanel({
                 request.provider_cache_token_ratio ?? 0,
                 request.cache_shortfall_tokens ?? 0,
                 request.cache_new_tail_gap_tokens ?? 0,
-                request.cache_avoidable_gap_tokens ?? 0
+                request.cache_avoidable_gap_tokens ?? 0,
+                request.cache_provider_unstable_gap_tokens ?? 0
               );
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
               const cacheReadTokens = request.cache_read_tokens ?? 0;
+              const requestedModel = request.requested_model?.trim();
+              const hasModelMapping = Boolean(requestedModel && requestedModel !== request.model);
+              const displayModel = hasModelMapping ? requestedModel : request.model;
               const metricTitle = [
                 `首字 ${formatDurationMs(request.ttft_ms)}`,
                 `用时 ${formatDurationMs(request.total_ms)}`,
@@ -2328,7 +2493,12 @@ function CachePanel({
                     <Activity size={14} />
                     <div>
                       <time>{formatRequestTime(request.at)}</time>
-                      <span className="request-provider-text">{request.provider} · {request.model}</span>
+                      <span className="request-provider-text">{request.provider} · {displayModel}</span>
+                      {hasModelMapping ? (
+                        <span className="request-model-map" title={`实际发送到上游：${request.model}`}>
+                          ↳ {request.model}
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                   <div className="request-badges">
@@ -2341,18 +2511,6 @@ function CachePanel({
                     {request.agent_id ? (
                       <span className="request-agent-badge" title={request.agent_label ?? request.agent_id}>
                         {request.agent_id}
-                      </span>
-                    ) : null}
-                    {request.upstream_call_kind && request.upstream_call_kind !== "cache" ? (
-                      <span
-                        className="request-channel-badge"
-                        title={[
-                          request.inbound_request_id ? `入站 ${request.inbound_request_id}` : "",
-                          request.upstream_request_id ? `上游 ${request.upstream_request_id}` : "",
-                          request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
-                        ].filter(Boolean).join(" · ")}
-                      >
-                        调用 {request.upstream_attempt_index ?? 1}/{request.upstream_attempt_total ?? request.upstream_attempts ?? 1}
                       </span>
                     ) : null}
                   </div>
@@ -2545,14 +2703,56 @@ function shortTraceId(id: string): string {
   return id.length > 8 ? id.slice(0, 8) : id;
 }
 
-function providerIsSharedForAgent(config: AppConfig, providerId: string, agentId: string): boolean {
-  const usedByOtherAgent = config.agent_injections.some(
-    (item) => item.id !== agentId && item.provider_id === providerId
+function providersForAgentEditor(
+  providers: ProviderConfig[],
+  agent: AgentInjectionConfig
+): ProviderConfig[] {
+  const ownedProviders = providers.filter((provider) =>
+    providerBelongsToAgent(provider.id, agent.id)
   );
-  const usedByGlobalRoute =
-    config.active_provider_id === providerId ||
-    Boolean(config.route_profiles?.some((profile) => profile.provider_id === providerId));
-  return usedByOtherAgent || usedByGlobalRoute;
+  const sharedProviders = providers.filter((provider) => !provider.id.startsWith("agent-"));
+  const clonedSourceIds = new Set(
+    ownedProviders
+      .map((privateProvider) =>
+        sharedProviders
+          .sort((left, right) => right.id.length - left.id.length)
+          .find((sharedProvider) =>
+            providerCloneMatchesSource(privateProvider.id, sharedProvider.id, agent.id)
+          )?.id
+      )
+      .filter((id): id is string => Boolean(id))
+  );
+
+  return providers.filter((provider) => {
+    if (provider.id.startsWith("agent-")) {
+      return providerBelongsToAgent(provider.id, agent.id);
+    }
+    return !clonedSourceIds.has(provider.id);
+  });
+}
+
+function providerBelongsToAgent(providerId: string, agentId: string): boolean {
+  return providerId.startsWith(`agent-${providerIdPart(agentId)}-`);
+}
+
+function providerCloneMatchesSource(
+  providerId: string,
+  sourceProviderId: string,
+  agentId: string
+): boolean {
+  const base = `agent-${providerIdPart(agentId)}-${providerIdPart(sourceProviderId)}`;
+  if (providerId === base) return true;
+  const suffix = providerId.slice(base.length + 1);
+  return providerId.startsWith(`${base}-`) && /^\d+$/.test(suffix);
+}
+
+function providerIdPart(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "") || "provider";
 }
 
 function providerToDraft(provider: ProviderConfig): ProviderDraft {
@@ -2568,6 +2768,7 @@ function providerToDraft(provider: ProviderConfig): ProviderDraft {
     channel: provider.channel,
     prompt_cache_retention_enabled: provider.prompt_cache_retention_enabled,
     request_body_gzip_enabled: provider.request_body_gzip_enabled,
+    use_system_proxy: provider.use_system_proxy ?? false,
     non_sse_compact_compat_enabled: provider.non_sse_compact_compat_enabled ?? false,
     key_pool: providerKeyPoolToDraft(provider.key_pool),
     models: provider.models,
@@ -2665,13 +2866,23 @@ function normalizeModels(models: ModelConfig[]) {
   for (const item of models) {
     const id = item.id.trim();
     if (!id) continue;
+    const requestModelId = cleanOptionalText(item.request_model_id);
     byId.set(id, {
       ...item,
       id,
-      display_name: (item.display_name || id).trim() || id
+      request_model_id: requestModelId && requestModelId !== id ? requestModelId : null,
+      display_name: (item.display_name || id).trim() || id,
+      reasoning_effort_override_enabled: Boolean(item.reasoning_effort_override_enabled),
+      reasoning_effort: cleanOptionalText(item.reasoning_effort),
+      supported_reasoning_efforts: item.supported_reasoning_efforts ?? []
     });
   }
   return [...byId.values()];
+}
+
+function cleanOptionalText(value?: string | null) {
+  const text = (value ?? "").trim();
+  return text || null;
 }
 
 function nextManualModelId(models: ModelConfig[]) {
@@ -2706,7 +2917,8 @@ function providerBucketDisplay(
   rawRatio: number,
   shortfallTokens: number,
   newTailGapTokens = 0,
-  avoidableGapTokens = 0
+  avoidableGapTokens = 0,
+  providerUnstableGapTokens = 0
 ) {
   if (!inputTokens) return { primary: "", secondary: "" };
   const tokenSummary = `${formatCompactTokens(cachedTokens)} / ${formatCompactTokens(inputTokens)}`;
@@ -2733,7 +2945,8 @@ function providerBucketDisplay(
     tokenSummary,
     shortfallTokens || bucketGap,
     newTailGapTokens,
-    avoidableGapTokens
+    avoidableGapTokens,
+    providerUnstableGapTokens
   );
   return {
     primary,
@@ -2746,11 +2959,24 @@ function providerGapDisplay(
   tokenSummary: string,
   totalGapTokens: number,
   newTailGapTokens: number,
-  avoidableGapTokens: number
+  avoidableGapTokens: number,
+  providerUnstableGapTokens: number
 ) {
   const total = formatCompactTokens(totalGapTokens);
   const avoidable = formatCompactTokens(avoidableGapTokens);
   const newTail = formatCompactTokens(newTailGapTokens);
+  const unstable = formatCompactTokens(providerUnstableGapTokens);
+  if (providerUnstableGapTokens > 0) {
+    const details = [
+      avoidableGapTokens > 0 ? `可避免 ${avoidable}` : "",
+      providerUnstableGapTokens > 0 ? `上游回退 ${unstable}` : "",
+      newTailGapTokens > 0 ? `新尾巴 ${newTail}` : ""
+    ].filter(Boolean);
+    return {
+      compact: `${tokenSummary} · 缺 ${total} · 回退 ${unstable}${newTailGapTokens > 0 ? ` · 新 ${newTail}` : ""}`,
+      full: `${tokenSummary} · 总缺口 ${total}（${details.join(" / ")}）`
+    };
+  }
   if (avoidableGapTokens > 0 && newTailGapTokens > 0) {
     return {
       compact: `${tokenSummary} · 缺 ${total} · 可 ${avoidable} · 新 ${newTail}`,
@@ -2823,6 +3049,11 @@ function formatContextInput(value?: number | null) {
   if (!value) return "";
   if (value >= 10000) return `${Math.round(value / 10000)}万`;
   return String(value);
+}
+
+function formatRawContextInput(value?: number | null) {
+  if (!value) return "";
+  return String(Math.round(value));
 }
 
 function parseContext(value: string): number | null {

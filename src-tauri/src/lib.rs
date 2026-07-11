@@ -1,6 +1,7 @@
 mod admin;
 mod agent_injection;
 mod cache;
+mod codex_ui_patch;
 mod config;
 mod crypto;
 mod metrics;

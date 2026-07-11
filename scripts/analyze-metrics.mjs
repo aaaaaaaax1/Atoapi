@@ -39,7 +39,11 @@ const rows = requests
       loggedNewTailShortfallTokens:
         item.cache_new_tail_gap_tokens == null ? null : Number(item.cache_new_tail_gap_tokens),
       loggedAvoidableShortfallTokens:
-        item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens)
+        item.cache_avoidable_gap_tokens == null ? null : Number(item.cache_avoidable_gap_tokens),
+      loggedProviderUnstableShortfallTokens:
+        item.cache_provider_unstable_gap_tokens == null
+          ? null
+          : Number(item.cache_provider_unstable_gap_tokens)
     };
   });
 annotateGapCausality(rows);
@@ -253,23 +257,50 @@ function annotateGapCausality(items) {
       item.loggedNewTailShortfallTokens == null
         ? null
         : Math.max(0, Math.min(item.bucketGap, item.loggedNewTailShortfallTokens));
+    const loggedProviderUnstable =
+      item.loggedProviderUnstableShortfallTokens == null
+        ? null
+        : Math.max(0, Math.min(item.bucketGap, item.loggedProviderUnstableShortfallTokens));
     item.avoidableShortfallTokens =
       loggedAvoidable ?? Math.min(item.bucketGap, inferredAvoidable);
+    item.providerUnstableShortfallTokens = loggedProviderUnstable ?? 0;
     item.newTailShortfallTokens =
-      loggedNewTail ?? Math.max(0, item.bucketGap - item.avoidableShortfallTokens);
-    const loggedTotal = item.avoidableShortfallTokens + item.newTailShortfallTokens;
+      loggedNewTail ??
+      Math.max(
+        0,
+        item.bucketGap -
+          item.avoidableShortfallTokens -
+          item.providerUnstableShortfallTokens
+      );
+    const loggedTotal =
+      item.avoidableShortfallTokens +
+      item.providerUnstableShortfallTokens +
+      item.newTailShortfallTokens;
     if (loggedTotal > item.bucketGap) {
-      item.newTailShortfallTokens = Math.max(0, item.bucketGap - item.avoidableShortfallTokens);
+      item.newTailShortfallTokens = Math.max(
+        0,
+        item.bucketGap -
+          item.avoidableShortfallTokens -
+          item.providerUnstableShortfallTokens
+      );
     } else if (loggedTotal < item.bucketGap && loggedAvoidable != null && loggedNewTail == null) {
-      item.newTailShortfallTokens = item.bucketGap - item.avoidableShortfallTokens;
+      item.newTailShortfallTokens =
+        item.bucketGap -
+        item.avoidableShortfallTokens -
+        item.providerUnstableShortfallTokens;
     } else if (loggedTotal < item.bucketGap && loggedAvoidable == null && loggedNewTail != null) {
-      item.avoidableShortfallTokens = item.bucketGap - item.newTailShortfallTokens;
+      item.avoidableShortfallTokens =
+        item.bucketGap -
+        item.newTailShortfallTokens -
+        item.providerUnstableShortfallTokens;
     }
     item.gapCause =
       item.cached === 0
         ? "cold"
         : item.avoidableShortfallTokens > 0
         ? "avoidable-prefix-gap"
+        : item.providerUnstableShortfallTokens > 0
+        ? "provider-waterline-rollback"
         : item.newTailShortfallTokens > 0
         ? "new-tail-gap"
         : "full-bucket";

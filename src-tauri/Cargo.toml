@@ -1,6 +1,6 @@
 [package]
 name = "atoapi"
-version = "0.1.77"
+version = "0.1.86"
 description = "Local desktop AI agent proxy with protocol switching, caching, and metrics."
 authors = ["Atoapi"]
 edition = "2021"
@@ -30,7 +30,7 @@ futures-util = "0.3.31"
 flate2 = "1.0.35"
 http = "1.1.0"
 rand = "0.8.5"
-reqwest = { version = "0.12.9", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12.9", default-features = false, features = ["http2", "json", "rustls-tls", "stream", "system-proxy"] }
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.133"
 serde_yaml = "0.9"
@@ -41,7 +41,7 @@ tokio = { version = "1.41.1", features = ["macros", "net", "rt-multi-thread", "s
 toml = "0.8.19"
 toml_edit = "0.22.27"
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
-windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 json5 = "0.4"
 
 [features]

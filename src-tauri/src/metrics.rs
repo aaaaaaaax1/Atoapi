@@ -42,6 +42,7 @@ pub struct MetricsSnapshot {
     pub gap_buckets: Vec<GapBucketStats>,
     pub request_body_buckets: Vec<RequestBodyBucketStats>,
     pub provider_stats: Vec<ProviderTrafficStats>,
+    pub recent_upstream_calls: Vec<RequestLog>,
     pub recent_requests: Vec<RequestLog>,
     pub recent_errors: Vec<ErrorLog>,
 }
@@ -168,6 +169,7 @@ pub struct GapBucketStats {
     pub total_gap_tokens: u64,
     pub new_tail_gap_tokens: u64,
     pub avoidable_gap_tokens: u64,
+    pub provider_unstable_gap_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -206,6 +208,16 @@ pub struct RequestLog {
     pub upstream_channel: String,
     pub provider: String,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_source: Option<String>,
     pub cache_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -256,7 +268,23 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_headers_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_last_attempt_headers_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_http_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_server_timing: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_timing_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_reported_processing_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_non_processing_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_first_chunk_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_upstream_wait_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_client_backpressure_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aggregate_done_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +314,8 @@ pub struct RequestLog {
     pub cache_new_tail_gap_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_avoidable_gap_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_provider_unstable_gap_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_cache_token_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -399,6 +429,7 @@ struct MetricsInner {
     request_body_buckets: Vec<RequestBodyBucketAccumulator>,
     background_prewarm: Vec<BackgroundPrewarmAccumulator>,
     local_proxy_estimated_tokens_saved: u64,
+    recent_upstream_calls: VecDeque<RequestLog>,
     recent_requests: VecDeque<RequestLog>,
     recent_errors: VecDeque<ErrorLog>,
 }
@@ -449,6 +480,7 @@ struct GapBucketAccumulator {
     total_gap_tokens: u64,
     new_tail_gap_tokens: u64,
     avoidable_gap_tokens: u64,
+    provider_unstable_gap_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -508,17 +540,28 @@ impl MetricsStore {
                 request_body_buckets: Vec::new(),
                 background_prewarm: Vec::new(),
                 local_proxy_estimated_tokens_saved: 0,
+                recent_upstream_calls: VecDeque::new(),
                 recent_requests: VecDeque::new(),
                 recent_errors: VecDeque::new(),
             })),
         }
     }
 
+    pub async fn record_upstream_call(&self, log: RequestLog) {
+        let mut inner = self.inner.write().await;
+        push_limited(&mut inner.recent_upstream_calls, log, 400);
+    }
+
     pub async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
-        inner.total_requests += 1;
+        let upstream_attempts = if upstream {
+            request_log_upstream_attempts(&log)
+        } else {
+            1
+        };
+        inner.total_requests += upstream_attempts;
         if upstream {
-            inner.upstream_requests += 1;
+            inner.upstream_requests += upstream_attempts;
         }
         match log.cache_status.as_str() {
             "exact" => inner.response_cache_hits += 1,
@@ -551,11 +594,8 @@ impl MetricsStore {
             }
         }
 
-        let diagnostic_sync = request_log_is_sync_compact_diagnostic(&log);
-        if !diagnostic_sync {
-            push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
-            push_limited(&mut inner.total_samples, log.total_ms, 512);
-        }
+        push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
+        push_limited(&mut inner.total_samples, log.total_ms, 512);
         upsert_gap_bucket(&mut inner.gap_buckets, &log);
         upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
         upsert_provider_traffic(&mut inner.provider_stats, &log, upstream);
@@ -564,9 +604,15 @@ impl MetricsStore {
 
     pub async fn record_upstream_observation(&self, log: RequestLog) {
         let mut inner = self.inner.write().await;
-        inner.upstream_requests += 1;
+        let upstream_attempts = request_log_upstream_attempts(&log);
+        inner.total_requests += upstream_attempts;
+        inner.upstream_requests += upstream_attempts;
+        push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
+        push_limited(&mut inner.total_samples, log.total_ms, 512);
+        upsert_gap_bucket(&mut inner.gap_buckets, &log);
         upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
-        upsert_provider_upstream_observation(&mut inner.provider_stats, &log);
+        upsert_provider_traffic(&mut inner.provider_stats, &log, true);
+        push_limited(&mut inner.recent_upstream_calls, log.clone(), 400);
         push_limited(&mut inner.recent_requests, log, 200);
     }
 
@@ -638,7 +684,7 @@ impl MetricsStore {
             inner.provider_usage_requests,
         );
         let combined_cache_hits = inner.eligible_cache_hits + inner.provider_cache_hit_requests;
-        let combined_cache_lookups = inner.total_requests;
+        let combined_cache_lookups = inner.eligible_cache_lookups + inner.provider_usage_requests;
         MetricsSnapshot {
             started_at: inner.started_at,
             total_requests: inner.total_requests,
@@ -687,6 +733,7 @@ impl MetricsStore {
             gap_buckets: sorted_gap_buckets(&inner.gap_buckets),
             request_body_buckets: sorted_request_body_buckets(&inner.request_body_buckets),
             provider_stats: sorted_provider_stats(&inner.provider_stats, &inner.recent_usage),
+            recent_upstream_calls: inner.recent_upstream_calls.iter().cloned().collect(),
             recent_requests: inner.recent_requests.iter().cloned().collect(),
             recent_errors: inner.recent_errors.iter().cloned().collect(),
         }
@@ -817,9 +864,14 @@ fn upsert_provider_traffic(
             groups.len() - 1
         });
     let group = &mut groups[index];
-    group.total_requests += 1;
+    let upstream_attempts = if upstream {
+        request_log_upstream_attempts(log)
+    } else {
+        1
+    };
+    group.total_requests += upstream_attempts;
     if upstream {
-        group.upstream_requests += 1;
+        group.upstream_requests += upstream_attempts;
     }
     match log.cache_status.as_str() {
         "exact" => {
@@ -837,44 +889,15 @@ fn upsert_provider_traffic(
     if log.status >= 400 {
         group.error_statuses += 1;
     }
-    if !request_log_is_sync_compact_diagnostic(log) && request_log_is_provider_cold_start(log) {
+    if request_log_is_provider_cold_start(log) {
         group.cold_start_requests += 1;
         group.cold_start_input_tokens += log.input_tokens.unwrap_or_default();
         group.cold_start_output_tokens += 0;
     }
     upsert_gap_bucket(&mut group.gap_buckets, log);
     upsert_request_body_bucket(&mut group.request_body_buckets, log);
-    if !request_log_is_sync_compact_diagnostic(log) {
-        push_limited(&mut group.ttft_samples, log.ttft_ms, 512);
-        push_limited(&mut group.total_samples, log.total_ms, 512);
-    }
-}
-
-fn upsert_provider_upstream_observation(
-    groups: &mut Vec<ProviderTrafficAccumulator>,
-    log: &RequestLog,
-) {
-    let provider = if log.provider.trim().is_empty() {
-        "unknown"
-    } else {
-        log.provider.trim()
-    };
-    let index = groups
-        .iter()
-        .position(|group| group.provider == provider)
-        .unwrap_or_else(|| {
-            groups.push(ProviderTrafficAccumulator {
-                provider: provider.to_string(),
-                ..ProviderTrafficAccumulator::default()
-            });
-            groups.len() - 1
-        });
-    let group = &mut groups[index];
-    group.upstream_requests += 1;
-    if log.status >= 400 {
-        group.error_statuses += 1;
-    }
-    upsert_request_body_bucket(&mut group.request_body_buckets, log);
+    push_limited(&mut group.ttft_samples, log.ttft_ms, 512);
+    push_limited(&mut group.total_samples, log.total_ms, 512);
 }
 
 fn sorted_provider_stats(
@@ -902,9 +925,6 @@ fn push_limited<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
 }
 
 fn upsert_gap_bucket(buckets: &mut Vec<GapBucketAccumulator>, log: &RequestLog) {
-    if request_log_is_sync_compact_diagnostic(log) {
-        return;
-    }
     if log.status >= 400 || log.input_tokens.unwrap_or_default() == 0 {
         return;
     }
@@ -925,27 +945,40 @@ fn upsert_gap_bucket(buckets: &mut Vec<GapBucketAccumulator>, log: &RequestLog) 
     item.total_gap_tokens += total_gap;
     item.new_tail_gap_tokens += log.cache_new_tail_gap_tokens.unwrap_or_default();
     item.avoidable_gap_tokens += log.cache_avoidable_gap_tokens.unwrap_or_default();
+    item.provider_unstable_gap_tokens += log.cache_provider_unstable_gap_tokens.unwrap_or_default();
 }
 
 fn gap_bucket_label(total_gap: u64) -> &'static str {
     match total_gap {
         0 => "full",
-        1..=512 => "1-512",
+        1..=128 => "1-128",
+        129..=512 => "129-512",
         513..=1024 => "513-1024",
         1025..=2048 => "1025-2048",
         2049..=4096 => "2049-4096",
-        _ => "4097+",
+        4097..=8192 => "4097-8192",
+        8193..=16_384 => "8193-16384",
+        16_385..=32_768 => "16385-32768",
+        32_769..=65_536 => "32769-65536",
+        65_537..=131_072 => "65537-131072",
+        _ => "131073+",
     }
 }
 
 fn sorted_gap_buckets(buckets: &[GapBucketAccumulator]) -> Vec<GapBucketStats> {
     let order = [
         "full",
-        "1-512",
+        "1-128",
+        "129-512",
         "513-1024",
         "1025-2048",
         "2049-4096",
-        "4097+",
+        "4097-8192",
+        "8193-16384",
+        "16385-32768",
+        "32769-65536",
+        "65537-131072",
+        "131073+",
     ];
     let mut stats = buckets
         .iter()
@@ -955,6 +988,7 @@ fn sorted_gap_buckets(buckets: &[GapBucketAccumulator]) -> Vec<GapBucketStats> {
             total_gap_tokens: item.total_gap_tokens,
             new_tail_gap_tokens: item.new_tail_gap_tokens,
             avoidable_gap_tokens: item.avoidable_gap_tokens,
+            provider_unstable_gap_tokens: item.provider_unstable_gap_tokens,
         })
         .collect::<Vec<_>>();
     stats.sort_by_key(|item| {
@@ -1107,18 +1141,11 @@ fn request_log_is_provider_cold_start(log: &RequestLog) -> bool {
     log.input_tokens.unwrap_or_default() >= 1024 && log.cache_read_tokens.unwrap_or_default() == 0
 }
 
-fn request_log_is_sync_compact_diagnostic(log: &RequestLog) -> bool {
-    if log.upstream_call_kind.as_deref() != Some("sync") {
-        return false;
-    }
-    log.upstream_call_source
-        .as_deref()
-        .map(|source| {
-            source.contains("compact")
-                || source == "responses-sync-main"
-                || source.starts_with("responses-sync-main-")
-        })
-        .unwrap_or(false)
+fn request_log_upstream_attempts(log: &RequestLog) -> u64 {
+    log.upstream_attempt_total
+        .or(log.upstream_attempts)
+        .unwrap_or(1)
+        .max(1)
 }
 
 fn remember_seen_cache_key(inner: &mut MetricsInner, key: &str) -> bool {
@@ -1172,6 +1199,11 @@ mod tests {
             upstream_channel: "chat".to_string(),
             provider: "provider".to_string(),
             model: "model".to_string(),
+            requested_model: None,
+            agent_reasoning_effort: None,
+            configured_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            reasoning_effort_source: None,
             cache_status: cache_status.to_string(),
             agent_id: None,
             agent_label: None,
@@ -1198,7 +1230,15 @@ mod tests {
             upstream_ttft_ms: None,
             local_prepare_ms: None,
             upstream_headers_ms: None,
+            upstream_last_attempt_headers_ms: None,
+            upstream_http_version: None,
+            upstream_server_timing: None,
+            upstream_timing_source: None,
+            upstream_reported_processing_ms: None,
+            upstream_non_processing_ms: None,
             upstream_first_chunk_ms: None,
+            stream_upstream_wait_ms: None,
+            stream_client_backpressure_ms: None,
             aggregate_done_ms: None,
             upstream_retry_wait_ms: None,
             upstream_attempts: None,
@@ -1214,6 +1254,7 @@ mod tests {
             cache_shortfall_tokens: None,
             cache_new_tail_gap_tokens: None,
             cache_avoidable_gap_tokens: None,
+            cache_provider_unstable_gap_tokens: None,
             provider_cache_token_ratio: None,
             tail_input_items: None,
             tail_message_chars: None,
@@ -1305,11 +1346,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_compact_diagnostics_do_not_pollute_main_timing_or_gap_buckets() {
+    async fn sync_compact_with_usage_is_counted_in_true_upstream_metrics() {
         let metrics = MetricsStore::new();
         let mut compact_log = request_log("miss", Some("compact-sync"));
         compact_log.upstream_call_kind = Some("sync".to_string());
         compact_log.upstream_call_source = Some("responses-sync-main".to_string());
+        compact_log.upstream_attempt_total = Some(2);
         compact_log.ttft_ms = 144_000;
         compact_log.total_ms = 144_000;
         compact_log.input_tokens = Some(9_519);
@@ -1320,11 +1362,16 @@ mod tests {
         metrics.record_request(compact_log, true).await;
 
         let snapshot = metrics.snapshot().await;
-        assert_eq!(snapshot.ttft_p95_ms, 0);
-        assert!(snapshot.gap_buckets.is_empty());
-        assert_eq!(snapshot.provider_stats[0].ttft_p95_ms, 0);
-        assert!(snapshot.provider_stats[0].gap_buckets.is_empty());
-        assert_eq!(snapshot.provider_stats[0].cold_start_requests, 0);
+        assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.ttft_p95_ms, 144_000);
+        assert_eq!(snapshot.gap_buckets[0].bucket, "8193-16384");
+        assert_eq!(snapshot.provider_stats[0].ttft_p95_ms, 144_000);
+        assert_eq!(
+            snapshot.provider_stats[0].gap_buckets[0].bucket,
+            "8193-16384"
+        );
+        assert_eq!(snapshot.provider_stats[0].cold_start_requests, 1);
         assert_eq!(
             snapshot.recent_requests[0].upstream_call_source.as_deref(),
             Some("responses-sync-main")
@@ -1350,11 +1397,20 @@ mod tests {
         avoidable_gap.cache_avoidable_gap_tokens = Some(512);
         metrics.record_request(avoidable_gap, true).await;
 
+        let mut provider_rollback = request_log("miss", Some("provider-rollback"));
+        provider_rollback.input_tokens = Some(134_549);
+        provider_rollback.cache_read_tokens = Some(130_432);
+        provider_rollback.cache_shortfall_tokens = Some(3712);
+        provider_rollback.cache_new_tail_gap_tokens = Some(640);
+        provider_rollback.cache_avoidable_gap_tokens = Some(0);
+        provider_rollback.cache_provider_unstable_gap_tokens = Some(3072);
+        metrics.record_request(provider_rollback, true).await;
+
         let snapshot = metrics.snapshot().await;
         let small = snapshot
             .gap_buckets
             .iter()
-            .find(|bucket| bucket.bucket == "1-512")
+            .find(|bucket| bucket.bucket == "129-512")
             .expect("small gap bucket should exist");
         assert_eq!(small.requests, 1);
         assert_eq!(small.new_tail_gap_tokens, 512);
@@ -1366,5 +1422,14 @@ mod tests {
             .expect("medium gap bucket should exist");
         assert_eq!(medium.requests, 1);
         assert_eq!(medium.avoidable_gap_tokens, 512);
+
+        let rollback = snapshot
+            .gap_buckets
+            .iter()
+            .find(|bucket| bucket.bucket == "2049-4096")
+            .expect("provider rollback bucket should exist");
+        assert_eq!(rollback.new_tail_gap_tokens, 640);
+        assert_eq!(rollback.avoidable_gap_tokens, 0);
+        assert_eq!(rollback.provider_unstable_gap_tokens, 3072);
     }
 }

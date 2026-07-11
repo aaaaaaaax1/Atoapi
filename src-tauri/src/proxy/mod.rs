@@ -28,8 +28,10 @@ use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
     config::{
-        AgentInjectionConfig, AgentInjectionKind, AppConfig, CacheMode, Channel,
-        ProviderChannelMode, ProviderConfig, SelectedProviderKey,
+        codex_model_alias, codex_model_display_name, model_request_alias,
+        normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
+        AgentInjectionKind, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
+        SelectedProviderKey,
     },
     metrics::{RequestLog, UsageRecord},
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
@@ -49,10 +51,12 @@ const PREFIX_ERROR_COOLDOWN_SECS: u64 = 45;
 const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 30;
 const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 2 * 60;
 const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 5 * 60;
-const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 24 * 60 * 60;
+const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 5 * 60;
 #[cfg(test)]
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
+const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 
@@ -70,14 +74,30 @@ struct BodyDiagnostics {
     send_body_is_delta: bool,
     payload_too_large_rescue_attempted: bool,
     payload_too_large_rescue_used: bool,
+    reasoning: ReasoningEffortDiagnostics,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReasoningEffortDiagnostics {
+    agent: Option<String>,
+    configured: Option<String>,
+    effective: Option<String>,
+    source: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct UpstreamRequestDiagnostics {
+    network_path: &'static str,
     request_body_bytes: u64,
     attempts: u64,
     retry_wait_ms: u64,
     headers_ms: u64,
+    last_attempt_headers_ms: u64,
+    http_version: Option<String>,
+    server_timing: Option<String>,
+    timing_source: Option<String>,
+    reported_processing_ms: Option<u64>,
+    non_processing_ms: Option<u64>,
     gzip_attempted: bool,
     gzip_fallback_used: bool,
     gzip_skipped_cold_stream: bool,
@@ -86,10 +106,21 @@ struct UpstreamRequestDiagnostics {
 
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
+        if !next.network_path.is_empty() {
+            self.network_path = next.network_path;
+        }
         self.request_body_bytes = next.request_body_bytes;
         self.attempts += next.attempts;
         self.retry_wait_ms += next.retry_wait_ms;
         self.headers_ms += next.headers_ms;
+        if next.last_attempt_headers_ms > 0 || next.http_version.is_some() {
+            self.last_attempt_headers_ms = next.last_attempt_headers_ms;
+            self.http_version = next.http_version.clone();
+            self.server_timing = next.server_timing.clone();
+            self.timing_source = next.timing_source.clone();
+            self.reported_processing_ms = next.reported_processing_ms;
+            self.non_processing_ms = next.non_processing_ms;
+        }
         self.gzip_attempted |= next.gzip_attempted;
         self.gzip_fallback_used |= next.gzip_fallback_used;
         self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
@@ -261,6 +292,7 @@ struct PrefixGuardWaitDiagnostics {
     reason: Option<String>,
     source: Option<String>,
     skip_reason: Option<String>,
+    budget_exhausted: bool,
     cache_instability_score: Option<u64>,
     seen_bucket_tokens: Option<u64>,
     state_cache_read_tokens: Option<u64>,
@@ -385,23 +417,49 @@ async fn list_models_for_agent(
                     .map(|provider_id| provider.id == provider_id)
                     .unwrap_or(true)
         })
-        .flat_map(|provider| {
-            provider
-                .models
-                .iter()
-                .filter(|model| model.enabled)
-                .map(|model| {
-                    json!({
-                        "id": model.id,
-                        "object": "model",
-                        "owned_by": provider.name,
-                        "provider": provider.id,
-                        "context_window": model.context_window
-                    })
-                })
-        })
+        .flat_map(|provider| provider_model_list_items(provider, authorized_agent.is_some()))
         .collect::<Vec<_>>();
     Json(json!({ "object": "list", "data": data })).into_response()
+}
+
+fn provider_model_list_items(provider: &ProviderConfig, include_codex_aliases: bool) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut seen_ids = HashSet::new();
+    for model in provider.models.iter().filter(|model| model.enabled) {
+        seen_ids.insert(model.id.clone());
+        items.push(json!({
+            "id": model.id,
+            "object": "model",
+            "owned_by": provider.name,
+            "provider": provider.id,
+            "context_window": model.context_window,
+            "display_name": model.display_name
+        }));
+        if include_codex_aliases {
+            let mut aliases = Vec::new();
+            if let Some(alias) = model_request_alias(model) {
+                aliases.push(alias);
+            }
+            if let Some(alias) = codex_model_alias(&model.id) {
+                aliases.push(alias);
+            }
+            for alias in aliases {
+                if !seen_ids.insert(alias.clone()) {
+                    continue;
+                }
+                items.push(json!({
+                    "id": alias,
+                    "object": "model",
+                    "owned_by": provider.name,
+                    "provider": provider.id,
+                    "context_window": model.context_window,
+                    "display_name": codex_model_display_name(&alias),
+                    "canonical_id": model.id
+                }));
+            }
+        }
+    }
+    items
 }
 
 async fn chat_completions(
@@ -521,6 +579,7 @@ async fn handle_responses_compact_for_agent(
         Ok(decision) => decision,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
+    let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
     let mut selected_provider_key =
         match select_provider_api_key(&state, &decision.provider.id, None, None).await {
             Ok(selected) => selected,
@@ -555,6 +614,12 @@ async fn handle_responses_compact_for_agent(
     }
     set_request_model(&mut upstream_body, &decision.model);
     set_stream_flag(&mut upstream_body, false);
+    let reasoning_diagnostics = apply_model_reasoning_effort(
+        &client_request,
+        &mut upstream_body,
+        &decision.upstream_channel,
+        &decision,
+    );
     optimize_provider_prefix(&mut upstream_body, &config, &decision);
     let tail_input_diagnostics = tail_input_diagnostics_for_session(
         &state,
@@ -608,10 +673,13 @@ async fn handle_responses_compact_for_agent(
     }
     let send_outcome = match send_upstream_request_to_url_with_diagnostics(
         &state,
+        decision.provider.use_system_proxy,
         &active_url,
         &api_key,
         &active_request_channel,
         &active_upstream_body,
+        &headers,
+        decision.provider.custom_user_agent.as_deref(),
         None,
         decision.provider.request_body_gzip_enabled,
     )
@@ -656,10 +724,13 @@ async fn handle_responses_compact_for_agent(
         api_key = selected_provider_key.secret.clone();
         let send_outcome = match send_upstream_request_to_url_with_diagnostics(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
         )
@@ -731,10 +802,13 @@ async fn handle_responses_compact_for_agent(
         }
         let send_outcome = match send_upstream_request_to_url_with_diagnostics(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
         )
@@ -807,10 +881,13 @@ async fn handle_responses_compact_for_agent(
         );
         let send_outcome = match send_upstream_request_to_url_with_diagnostics(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
         )
@@ -884,7 +961,11 @@ async fn handle_responses_compact_for_agent(
     ));
     let prefix_state_key_for_metrics: Option<&str> = None;
     let usage_record = if compact_success_for_cache {
-        collect_provider_usage_for_diagnostics(&bytes, &decision)
+        let usage = collect_provider_usage_for_diagnostics(&bytes, &decision);
+        if let Some(record) = usage.as_ref() {
+            state.metrics.record_usage(record.clone()).await;
+        }
+        usage
     } else {
         None
     };
@@ -925,6 +1006,11 @@ async fn handle_responses_compact_for_agent(
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         model: decision.model.clone(),
+        requested_model: requested_model_for_log.clone(),
+        agent_reasoning_effort: reasoning_diagnostics.agent.clone(),
+        configured_reasoning_effort: reasoning_diagnostics.configured.clone(),
+        effective_reasoning_effort: reasoning_diagnostics.effective.clone(),
+        reasoning_effort_source: reasoning_diagnostics.source.clone(),
         cache_status: if compact_success_for_cache {
             "compact"
         } else {
@@ -969,7 +1055,17 @@ async fn handle_responses_compact_for_agent(
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, None)),
         local_prepare_ms: None,
         upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
+        upstream_last_attempt_headers_ms: Some(
+            upstream_request_diagnostics.last_attempt_headers_ms,
+        ),
+        upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+        upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
+        upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
+        upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
+        upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
         upstream_first_chunk_ms: body_read.first_chunk_ms,
+        stream_upstream_wait_ms: None,
+        stream_client_backpressure_ms: None,
         aggregate_done_ms: Some(body_read.aggregate_done_ms),
         upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
         upstream_attempts: Some(upstream_request_diagnostics.attempts),
@@ -985,6 +1081,9 @@ async fn handle_responses_compact_for_agent(
         cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
         cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
         cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
+        cache_provider_unstable_gap_tokens: gap_breakdown
+            .as_ref()
+            .map(|gap| gap.provider_unstable_tokens),
         provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
         tail_input_items: None,
         tail_message_chars: None,
@@ -1123,6 +1222,7 @@ async fn handle_generation_for_agent(
     if codex_responses_chat_compat {
         decision.upstream_channel = Channel::Chat;
     }
+    let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
     set_request_model(&mut client_request, &decision.model);
 
     let request_had_stream_field = client_request.get("stream").is_some();
@@ -1157,6 +1257,12 @@ async fn handle_generation_for_agent(
     if matches!(decision.upstream_channel, Channel::Responses) && !codex_native_responses_stream {
         normalize_responses_request(&mut upstream_body);
     }
+    let reasoning_diagnostics = apply_model_reasoning_effort(
+        &client_request,
+        &mut upstream_body,
+        &decision.upstream_channel,
+        &decision,
+    );
     if codex_native_responses_stream {
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
@@ -1167,6 +1273,12 @@ async fn handle_generation_for_agent(
     if codex_native_responses_stream {
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
+        copy_responses_prefix_cache_fields_for_native_stream(
+            &mut upstream_body,
+            &provider_prefix_body,
+            &config,
+            &decision,
+        );
     }
 
     let cross_protocol_stream = client_requested_stream
@@ -1231,6 +1343,7 @@ async fn handle_generation_for_agent(
                 request_id,
                 &client_channel,
                 &decision,
+                requested_model_for_log.clone(),
                 non_sse_compact_compat_for_decision(&config, &decision),
             )
             .await;
@@ -1301,6 +1414,7 @@ async fn handle_generation_for_agent(
                 request_id,
                 &client_channel,
                 &decision,
+                requested_model_for_log.clone(),
                 non_sse_compact_compat_for_decision(&config, &decision),
             )
             .await;
@@ -1430,6 +1544,9 @@ async fn handle_generation_for_agent(
                     diagnostics.skip_reason = Some(cooldown_skip_reason);
                     (upstream_body.clone(), diagnostics)
                 }
+            } else if !main_response_session_delta_enabled_for_agent(forced_agent_id) {
+                diagnostics.skip_reason = Some("codex_main_session_delta_disabled".to_string());
+                (upstream_body.clone(), diagnostics)
             } else if should_attempt_main_response_session_delta(
                 &config,
                 &decision,
@@ -1482,6 +1599,7 @@ async fn handle_generation_for_agent(
         &upstream_send_body,
         active_used_response_session,
     );
+    diagnostics.reasoning = reasoning_diagnostics;
     let mut retried_full_response = false;
     let mut prefix_state_update_key =
         provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
@@ -1535,19 +1653,19 @@ async fn handle_generation_for_agent(
     }
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
-        &state,
         &active_request_channel,
-        provider_prefix_control_key.as_deref(),
         client_requested_stream,
         &active_upstream_body,
-    )
-    .await;
+    );
     let send_outcome = match send_main_upstream_request(
         &state,
+        decision.provider.use_system_proxy,
         &active_url,
         &api_key,
         &active_request_channel,
         &active_upstream_body,
+        &headers,
+        decision.provider.custom_user_agent.as_deref(),
         skip_prefix_guard_for_sync_responses,
         decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
         !client_requested_stream,
@@ -1572,6 +1690,7 @@ async fn handle_generation_for_agent(
                 &active_upstream_body,
                 active_used_response_session,
                 &response_session_reuse_diagnostics,
+                requested_model_for_log.clone(),
                 "main-transport",
             )
             .await;
@@ -1585,7 +1704,8 @@ async fn handle_generation_for_agent(
             );
         }
     };
-    upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+    let mut current_send_diagnostics = send_outcome.diagnostics.clone();
+    upstream_request_diagnostics.absorb(&current_send_diagnostics);
     upstream_request_diagnostics.gzip_skipped_cold_stream |= skip_gzip_for_cold_stream;
     let mut upstream = send_outcome.response;
     let mut upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
@@ -1609,15 +1729,46 @@ async fn handle_generation_for_agent(
     )
     .await
     {
+        record_upstream_response_observation(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            &active_upstream_body,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            current_non_stream_upstream_call_source(
+                skip_prefix_guard_for_sync_responses,
+                active_responses_non_stream_chat_compat,
+                responses_sync_main_chat_compat_fallback,
+            ),
+            status,
+            &current_send_diagnostics,
+            agent_log_id.clone(),
+            agent_log_label.clone(),
+        )
+        .await;
         state.metrics.record_retry().await;
         selected_provider_key = next_key;
         api_key = selected_provider_key.secret.clone();
         let send_outcome = match send_main_upstream_request(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             skip_prefix_guard_for_sync_responses,
             decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
             !client_requested_stream,
@@ -1642,6 +1793,7 @@ async fn handle_generation_for_agent(
                     &active_upstream_body,
                     active_used_response_session,
                     &response_session_reuse_diagnostics,
+                    requested_model_for_log.clone(),
                     "provider-key-failover-transport",
                 )
                 .await;
@@ -1655,7 +1807,8 @@ async fn handle_generation_for_agent(
                 );
             }
         };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        current_send_diagnostics = send_outcome.diagnostics.clone();
+        upstream_request_diagnostics.absorb(&current_send_diagnostics);
         upstream = send_outcome.response;
         upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
         status = upstream.status().as_u16();
@@ -1670,6 +1823,34 @@ async fn handle_generation_for_agent(
             .unwrap_or(false);
     }
     if should_retry_full_response_after_session_error(status, used_response_session) {
+        record_upstream_response_observation(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            &active_upstream_body,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            current_non_stream_upstream_call_source(
+                skip_prefix_guard_for_sync_responses,
+                active_responses_non_stream_chat_compat,
+                responses_sync_main_chat_compat_fallback,
+            ),
+            status,
+            &current_send_diagnostics,
+            agent_log_id.clone(),
+            agent_log_label.clone(),
+        )
+        .await;
         let session_error_summary = match read_upstream_body_with_diagnostics(
             upstream,
             &content_type,
@@ -1729,10 +1910,13 @@ async fn handle_generation_for_agent(
             provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
         let send_outcome = match send_main_upstream_request(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             skip_prefix_guard_for_sync_responses,
             decision.provider.request_body_gzip_enabled,
             !client_requested_stream,
@@ -1757,6 +1941,7 @@ async fn handle_generation_for_agent(
                     &active_upstream_body,
                     active_used_response_session,
                     &response_session_reuse_diagnostics,
+                    requested_model_for_log.clone(),
                     "session-delta-full-retry-transport",
                 )
                 .await;
@@ -1770,7 +1955,8 @@ async fn handle_generation_for_agent(
                 );
             }
         };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        current_send_diagnostics = send_outcome.diagnostics.clone();
+        upstream_request_diagnostics.absorb(&current_send_diagnostics);
         upstream = send_outcome.response;
         upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
         status = upstream.status().as_u16();
@@ -1789,6 +1975,34 @@ async fn handle_generation_for_agent(
         responses_main_retry_guard,
         responses_non_stream_chat_compat,
     ) {
+        record_upstream_response_observation(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            &active_upstream_body,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            current_non_stream_upstream_call_source(
+                skip_prefix_guard_for_sync_responses,
+                active_responses_non_stream_chat_compat,
+                responses_sync_main_chat_compat_fallback,
+            ),
+            status,
+            &current_send_diagnostics,
+            agent_log_id.clone(),
+            agent_log_label.clone(),
+        )
+        .await;
         state.metrics.record_retry().await;
         active_upstream_body = build_active_upstream_body_for_compat(
             &upstream_body,
@@ -1815,10 +2029,13 @@ async fn handle_generation_for_agent(
         let chat_url = upstream_url(&decision.provider.base_url, &Channel::Chat);
         let send_outcome = match send_main_upstream_request(
             &state,
+            decision.provider.use_system_proxy,
             &chat_url,
             &api_key,
             &Channel::Chat,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             skip_prefix_guard_for_sync_responses,
             decision.provider.request_body_gzip_enabled,
             true,
@@ -1837,7 +2054,8 @@ async fn handle_generation_for_agent(
                 );
             }
         };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        current_send_diagnostics = send_outcome.diagnostics.clone();
+        upstream_request_diagnostics.absorb(&current_send_diagnostics);
         upstream = send_outcome.response;
         upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
         status = upstream.status().as_u16();
@@ -1858,6 +2076,34 @@ async fn handle_generation_for_agent(
             active_responses_non_stream_chat_compat,
         )
     {
+        record_upstream_response_observation(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            &active_upstream_body,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            current_non_stream_upstream_call_source(
+                skip_prefix_guard_for_sync_responses,
+                active_responses_non_stream_chat_compat,
+                responses_sync_main_chat_compat_fallback,
+            ),
+            status,
+            &current_send_diagnostics,
+            agent_log_id.clone(),
+            agent_log_label.clone(),
+        )
+        .await;
         let chat_error_body = match read_upstream_body_with_diagnostics(
             upstream,
             &content_type,
@@ -1902,10 +2148,13 @@ async fn handle_generation_for_agent(
 
         let send_outcome = match send_main_upstream_request(
             &state,
+            decision.provider.use_system_proxy,
             &active_url,
             &api_key,
             &active_request_channel,
             &active_upstream_body,
+            &headers,
+            decision.provider.custom_user_agent.as_deref(),
             skip_prefix_guard_for_sync_responses,
             decision.provider.request_body_gzip_enabled,
             true,
@@ -1924,7 +2173,8 @@ async fn handle_generation_for_agent(
                 );
             }
         };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+        current_send_diagnostics = send_outcome.diagnostics.clone();
+        upstream_request_diagnostics.absorb(&current_send_diagnostics);
         upstream = send_outcome.response;
         upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
         status = upstream.status().as_u16();
@@ -1945,6 +2195,34 @@ async fn handle_generation_for_agent(
         &decision.upstream_channel,
         response_session_cooldown_active,
     ) {
+        record_upstream_response_observation(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            &active_upstream_body,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            current_non_stream_upstream_call_source(
+                skip_prefix_guard_for_sync_responses,
+                active_responses_non_stream_chat_compat,
+                responses_sync_main_chat_compat_fallback,
+            ),
+            status,
+            &current_send_diagnostics,
+            agent_log_id.clone(),
+            agent_log_label.clone(),
+        )
+        .await;
         diagnostics.payload_too_large_rescue_attempted = true;
         let rescue_outcome = maybe_rescue_response_session_after_413(
             &state,
@@ -1970,10 +2248,13 @@ async fn handle_generation_for_agent(
             diagnostics.send_body_is_delta = active_used_response_session;
             let send_outcome = match send_main_upstream_request(
                 &state,
+                decision.provider.use_system_proxy,
                 &url,
                 &api_key,
                 &decision.upstream_channel,
                 &active_upstream_body,
+                &headers,
+                decision.provider.custom_user_agent.as_deref(),
                 skip_prefix_guard_for_sync_responses,
                 decision.provider.request_body_gzip_enabled,
                 !client_requested_stream,
@@ -1998,6 +2279,7 @@ async fn handle_generation_for_agent(
                         &active_upstream_body,
                         active_used_response_session,
                         &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
                         "payload-too-large-rescue-transport",
                     )
                     .await;
@@ -2011,7 +2293,8 @@ async fn handle_generation_for_agent(
                     );
                 }
             };
-            upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+            current_send_diagnostics = send_outcome.diagnostics.clone();
+            upstream_request_diagnostics.absorb(&current_send_diagnostics);
             upstream = send_outcome.response;
             upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
             status = upstream.status().as_u16();
@@ -2026,6 +2309,34 @@ async fn handle_generation_for_agent(
                 .unwrap_or(false);
             if should_retry_full_response_after_session_error(status, active_used_response_session)
             {
+                record_upstream_response_observation(
+                    &state,
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &decision.upstream_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &active_upstream_body,
+                    active_used_response_session,
+                    &response_session_reuse_diagnostics,
+                    requested_model_for_log.clone(),
+                    current_non_stream_upstream_call_source(
+                        skip_prefix_guard_for_sync_responses,
+                        active_responses_non_stream_chat_compat,
+                        responses_sync_main_chat_compat_fallback,
+                    ),
+                    status,
+                    &current_send_diagnostics,
+                    agent_log_id.clone(),
+                    agent_log_label.clone(),
+                )
+                .await;
                 note_response_session_error_cooldown_for_rejection(
                     &state,
                     response_session_cooldown_key.as_deref(),
@@ -2057,10 +2368,13 @@ async fn handle_generation_for_agent(
                     provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
                 let send_outcome = match send_main_upstream_request(
                     &state,
+                    decision.provider.use_system_proxy,
                     &url,
                     &api_key,
                     &decision.upstream_channel,
                     &active_upstream_body,
+                    &headers,
+                    decision.provider.custom_user_agent.as_deref(),
                     skip_prefix_guard_for_sync_responses,
                     decision.provider.request_body_gzip_enabled,
                     !client_requested_stream,
@@ -2085,6 +2399,7 @@ async fn handle_generation_for_agent(
                             &active_upstream_body,
                             active_used_response_session,
                             &response_session_reuse_diagnostics,
+                            requested_model_for_log.clone(),
                             "payload-too-large-full-retry-transport",
                         )
                         .await;
@@ -2098,7 +2413,8 @@ async fn handle_generation_for_agent(
                         );
                     }
                 };
-                upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+                current_send_diagnostics = send_outcome.diagnostics.clone();
+                upstream_request_diagnostics.absorb(&current_send_diagnostics);
                 upstream = send_outcome.response;
                 upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
                 status = upstream.status().as_u16();
@@ -2166,6 +2482,7 @@ async fn handle_generation_for_agent(
             codex_chat_tool_context.clone(),
             agent_log_id.clone(),
             agent_log_label.clone(),
+            requested_model_for_log.clone(),
             prefix_guard_wait.clone(),
             local_prepare_ms,
             upstream_request_diagnostics.clone(),
@@ -2203,6 +2520,34 @@ async fn handle_generation_for_agent(
         if response_session_rejection_classification(status, &error_summary)
             == ResponseSessionRejectionClass::Unsupported
         {
+            record_upstream_response_observation(
+                &state,
+                &request_id,
+                &started,
+                &client_channel,
+                &active_request_channel,
+                &decision,
+                eligible.then_some(metrics_cache_key.as_str()),
+                provider_prefix_key.as_deref(),
+                provider_prefix_fingerprint.as_deref(),
+                &prefix_guard_wait,
+                local_prepare_ms,
+                &diagnostics,
+                &active_upstream_body,
+                active_used_response_session,
+                &response_session_reuse_diagnostics,
+                requested_model_for_log.clone(),
+                current_non_stream_upstream_call_source(
+                    skip_prefix_guard_for_sync_responses,
+                    active_responses_non_stream_chat_compat,
+                    responses_sync_main_chat_compat_fallback,
+                ),
+                status,
+                &current_send_diagnostics,
+                agent_log_id.clone(),
+                agent_log_label.clone(),
+            )
+            .await;
             note_response_session_error_cooldown_for_rejection(
                 &state,
                 response_session_cooldown_key.as_deref(),
@@ -2241,10 +2586,13 @@ async fn handle_generation_for_agent(
 
                 let send_outcome = match send_main_upstream_request(
                     &state,
+                    decision.provider.use_system_proxy,
                     &active_url,
                     &api_key,
                     &active_request_channel,
                     &active_upstream_body,
+                    &headers,
+                    decision.provider.custom_user_agent.as_deref(),
                     skip_prefix_guard_for_sync_responses,
                     decision.provider.request_body_gzip_enabled,
                     !client_requested_stream,
@@ -2253,6 +2601,26 @@ async fn handle_generation_for_agent(
                 {
                     Ok(response) => response,
                     Err(err) => {
+                        record_upstream_transport_failure(
+                            &state,
+                            &request_id,
+                            &started,
+                            &client_channel,
+                            &active_request_channel,
+                            &decision,
+                            eligible.then_some(metrics_cache_key.as_str()),
+                            provider_prefix_key.as_deref(),
+                            provider_prefix_fingerprint.as_deref(),
+                            &prefix_guard_wait,
+                            local_prepare_ms,
+                            &diagnostics,
+                            &active_upstream_body,
+                            active_used_response_session,
+                            &response_session_reuse_diagnostics,
+                            requested_model_for_log.clone(),
+                            "previous-response-id-compat-transport",
+                        )
+                        .await;
                         state
                             .metrics
                             .record_error("upstream_transport", &err.to_string())
@@ -2263,7 +2631,8 @@ async fn handle_generation_for_agent(
                         );
                     }
                 };
-                upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
+                current_send_diagnostics = send_outcome.diagnostics.clone();
+                upstream_request_diagnostics.absorb(&current_send_diagnostics);
                 upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
                 status = send_outcome.response.status().as_u16();
                 content_type = send_outcome
@@ -2348,8 +2717,15 @@ async fn handle_generation_for_agent(
     }
     let sync_compact_diagnostic_only =
         skip_prefix_guard_for_sync_responses || active_responses_non_stream_chat_compat;
-    let usage_record = if is_success_status && sync_compact_diagnostic_only {
-        collect_provider_usage_for_diagnostics(&bytes, &decision)
+    let usage_observation = if is_success_status && sync_compact_diagnostic_only {
+        let raw = collect_provider_usage_for_diagnostics(&bytes, &decision);
+        if let Some(record) = raw.as_ref() {
+            state.metrics.record_usage(record.clone()).await;
+        }
+        raw.map(|raw| ProviderUsageObservation {
+            effective: raw.clone(),
+            raw,
+        })
     } else if is_success_status {
         collect_provider_usage(
             &state,
@@ -2362,6 +2738,10 @@ async fn handle_generation_for_agent(
     } else {
         None
     };
+    let usage_record = usage_observation.as_ref().map(|item| item.raw.clone());
+    let prefix_usage_record = usage_observation
+        .as_ref()
+        .map(|item| item.effective.clone());
     if is_success_status && matches!(active_request_channel, Channel::Responses) {
         update_response_session(
             &state,
@@ -2372,12 +2752,13 @@ async fn handle_generation_for_agent(
         )
         .await;
     }
-    let gap_breakdown = provider_cache_gap_breakdown(
+    let gap_breakdown = provider_cache_gap_breakdown_with_guard(
         &state,
         prefix_state_update_key.as_deref(),
         provider_prefix_family_key.as_deref(),
         usage_record.as_ref(),
         Some(&tail_input_diagnostics),
+        Some(&prefix_guard_wait),
     )
     .await;
     let prefix_lag = prefix_lag_diagnostics(
@@ -2390,14 +2771,15 @@ async fn handle_generation_for_agent(
     )
     .await;
     let session_cache_regressed = if is_success_status && !sync_compact_diagnostic_only {
-        update_provider_prefix_state_with_tail(
+        update_provider_prefix_state_with_tail_and_guard(
             &state,
             prefix_state_update_key.as_deref(),
             provider_prefix_family_key.as_deref(),
-            usage_record.as_ref(),
+            prefix_usage_record.as_ref(),
             &tail_input_diagnostics,
             active_used_response_session,
             retried_full_response,
+            prefix_guard_wait.budget_exhausted,
         )
         .await
     } else {
@@ -2486,6 +2868,11 @@ async fn handle_generation_for_agent(
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         model: decision.model.clone(),
+        requested_model: requested_model_for_log.clone(),
+        agent_reasoning_effort: None,
+        configured_reasoning_effort: None,
+        effective_reasoning_effort: None,
+        reasoning_effort_source: None,
         cache_status: if is_success_status {
             if sync_compact_diagnostic_only {
                 "compact"
@@ -2541,7 +2928,17 @@ async fn handle_generation_for_agent(
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
         local_prepare_ms: Some(local_prepare_ms),
         upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
+        upstream_last_attempt_headers_ms: Some(
+            upstream_request_diagnostics.last_attempt_headers_ms,
+        ),
+        upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+        upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
+        upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
+        upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
+        upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
         upstream_first_chunk_ms: body_read.first_chunk_ms,
+        stream_upstream_wait_ms: None,
+        stream_client_backpressure_ms: None,
         aggregate_done_ms: Some(body_read.aggregate_done_ms),
         upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
         upstream_attempts: Some(upstream_request_diagnostics.attempts),
@@ -2557,6 +2954,9 @@ async fn handle_generation_for_agent(
         cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
         cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
         cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
+        cache_provider_unstable_gap_tokens: gap_breakdown
+            .as_ref()
+            .map(|gap| gap.provider_unstable_tokens),
         provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
         tail_input_items: None,
         tail_message_chars: None,
@@ -2603,6 +3003,10 @@ async fn handle_generation_for_agent(
     apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
     apply_body_diagnostics(&mut request_log, &diagnostics);
     apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
+    state
+        .metrics
+        .record_upstream_call(request_log.clone())
+        .await;
     state.metrics.record_request(request_log, true).await;
 
     if eligible && is_success_status {
@@ -2711,7 +3115,13 @@ async fn wait_for_provider_prefix_settle(
     )) = decision
     {
         if let Some(wait) = wait {
-            let wait = max_wait.map(|max_wait| wait.min(max_wait)).unwrap_or(wait);
+            let requested_wait = wait;
+            let wait = max_wait
+                .map(|max_wait| requested_wait.min(max_wait))
+                .unwrap_or(requested_wait);
+            let budget_exhausted = max_wait
+                .map(|max_wait| requested_wait >= max_wait)
+                .unwrap_or(false);
             if wait.is_zero() {
                 return PrefixGuardWaitDiagnostics {
                     skip_reason: Some(
@@ -2720,6 +3130,7 @@ async fn wait_for_provider_prefix_settle(
                             .unwrap_or("wait_zero")
                             .to_string(),
                     ),
+                    budget_exhausted,
                     source: Some(source),
                     cache_instability_score: Some(cache_instability_score),
                     seen_bucket_tokens: Some(seen_bucket_tokens),
@@ -2733,6 +3144,7 @@ async fn wait_for_provider_prefix_settle(
                 reason: reason.or_else(|| Some("provider_prefix_settle".to_string())),
                 source: Some(source),
                 skip_reason: None,
+                budget_exhausted,
                 cache_instability_score: Some(cache_instability_score),
                 seen_bucket_tokens: Some(seen_bucket_tokens),
                 state_cache_read_tokens: Some(state_cache_read_tokens),
@@ -3105,9 +3517,9 @@ fn chat_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDuration {
     } else if observed_shortfall > 1024 {
         responses_foreground_wait_cap()
     } else if observed_shortfall > 512 {
-        TokioDuration::from_millis(2500)
+        responses_foreground_wait_cap()
     } else if observed_shortfall > 0 {
-        TokioDuration::from_millis(1200)
+        responses_foreground_wait_cap()
     } else {
         TokioDuration::from_millis(250)
     };
@@ -3425,7 +3837,7 @@ fn responses_stale_prefix_recovery_wait(
     } else if avoidable > 0 && medium_current_tool_tail {
         responses_foreground_wait_cap()
     } else if avoidable >= 1024 {
-        TokioDuration::from_secs(3)
+        responses_foreground_wait_cap()
     } else if stale_small_avoidable_risk {
         if elapsed >= std::time::Duration::from_secs(10 * 60) || state.cache_instability_score >= 4
         {
@@ -3854,7 +4266,7 @@ fn responses_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDurat
 }
 
 fn responses_foreground_wait_cap() -> TokioDuration {
-    TokioDuration::from_secs(3)
+    TokioDuration::from_secs(1)
 }
 
 fn prefix_guard_wait_budget_for_channel(
@@ -4099,7 +4511,11 @@ fn prefix_guard_wait_effect(
     let record = usage_record?;
     let ratio = provider_cache_ratio(record).unwrap_or(0.0);
     let gap = gap_breakdown
-        .map(|gap| gap.new_tail_tokens.max(gap.avoidable_tokens))
+        .map(|gap| {
+            gap.new_tail_tokens
+                .max(gap.avoidable_tokens)
+                .max(gap.provider_unstable_tokens)
+        })
         .unwrap_or_else(|| provider_cache_shortfall(record));
     let class = if ratio >= 0.995 {
         "excellent"
@@ -4157,13 +4573,20 @@ async fn prefix_lag_diagnostics(
         .saturating_sub(previous.cache_read_tokens);
     let previous_gap = previous.shortfall_tokens_128.max(previous.shortfall_tokens);
     let current_gap = gap_breakdown
-        .map(|gap| gap.new_tail_tokens.max(gap.avoidable_tokens))
+        .map(|gap| {
+            gap.new_tail_tokens
+                .max(gap.avoidable_tokens)
+                .max(gap.provider_unstable_tokens)
+        })
         .unwrap_or_else(|| provider_cache_shortfall(record));
     let current_avoidable = gap_breakdown
         .map(|gap| gap.avoidable_tokens)
         .unwrap_or_default();
     let current_new_tail = gap_breakdown
         .map(|gap| gap.new_tail_tokens)
+        .unwrap_or_default();
+    let current_provider_unstable = gap_breakdown
+        .map(|gap| gap.provider_unstable_tokens)
         .unwrap_or_default();
     let ratio = provider_cache_ratio(record).unwrap_or_default();
     let real_provider_shortfall = provider_cache_shortfall(record);
@@ -4183,6 +4606,8 @@ async fn prefix_lag_diagnostics(
         "full"
     } else if responses_tool_tail_burst(current_tail) && current_new_tail >= 1024 {
         "tool_tail_burst"
+    } else if current_provider_unstable > 0 {
+        "provider_waterline_rollback"
     } else if current_avoidable > 0 {
         "avoidable_gap"
     } else if previous_gap > 0
@@ -4229,24 +4654,18 @@ fn upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
     }
 }
 
-async fn should_skip_request_body_gzip_for_cold_stream(
-    state: &AppState,
+fn should_skip_request_body_gzip_for_cold_stream(
     channel: &Channel,
-    provider_prefix_control_key: Option<&str>,
     client_requested_stream: bool,
     body: &Value,
 ) -> bool {
     if !client_requested_stream || !matches!(channel, Channel::Responses) {
         return false;
     }
-    if upstream_request_body_bytes(channel, body).len() < 614_400 {
+    if upstream_request_body_bytes(channel, body).len() < REQUEST_BODY_GZIP_MIN_BYTES {
         return false;
     }
-    let Some(key) = provider_prefix_control_key else {
-        return false;
-    };
-    let states = state.prefix_states.lock().await;
-    !states.contains_key(key)
+    false
 }
 
 fn gzip_request_body(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -4266,7 +4685,7 @@ fn should_retry_without_gzip(status: reqwest::StatusCode) -> bool {
     )
 }
 
-fn request_body_gzip_cooldown_key(url: &str, channel: &Channel) -> String {
+fn request_body_gzip_scope_key(url: &str, channel: &Channel) -> String {
     let channel = match channel {
         Channel::Responses => "responses",
         Channel::Chat => "chat",
@@ -4284,7 +4703,11 @@ fn request_body_gzip_cooldown_key(url: &str, channel: &Channel) -> String {
             Some(format!("{scheme}://{host}{port}"))
         })
         .unwrap_or_else(|| url.to_string());
-    format!("gzip\0{channel}\0{provider_scope}")
+    format!("{channel}\0{provider_scope}")
+}
+
+fn request_body_gzip_cooldown_key(url: &str, channel: &Channel) -> String {
+    format!("gzip\0{}", request_body_gzip_scope_key(url, channel))
 }
 
 async fn request_body_gzip_cooldown_active(state: &AppState, key: &str) -> bool {
@@ -4306,29 +4729,148 @@ async fn note_request_body_gzip_fallback(state: &AppState, key: &str) {
     );
 }
 
+fn request_body_gzip_threshold_bytes(channel: &Channel) -> usize {
+    if matches!(channel, Channel::Responses) {
+        REQUEST_BODY_GZIP_WARM_MIN_BYTES
+    } else {
+        REQUEST_BODY_GZIP_MIN_BYTES
+    }
+}
+
 fn upstream_header_wait_class(diagnostics: &UpstreamRequestDiagnostics) -> String {
+    let class = upstream_header_wait_base_class(diagnostics);
+    let network_path = if diagnostics.network_path.is_empty() {
+        "direct"
+    } else {
+        diagnostics.network_path
+    };
+    format!("{network_path}:{class}")
+}
+
+fn upstream_header_wait_base_class(diagnostics: &UpstreamRequestDiagnostics) -> &'static str {
     if diagnostics.gzip_skipped_cold_stream {
-        return "cold_stream_gzip_skipped".to_string();
+        return "cold_stream_gzip_skipped";
     }
     if diagnostics.attempts > 1 || diagnostics.retry_wait_ms > 0 {
-        return "retry_header_wait".to_string();
+        return "retry_header_wait";
     }
     if diagnostics.headers_ms >= 20_000 && diagnostics.request_body_bytes >= 1_000_000 {
-        return "huge_body_header_wait".to_string();
+        return "huge_body_header_wait";
     }
     if diagnostics.headers_ms >= 20_000 && diagnostics.request_body_bytes >= 600_000 {
-        return "large_body_header_wait".to_string();
+        return "large_body_header_wait";
     }
     if diagnostics.headers_ms >= 20_000 {
-        return "header_wait_slow".to_string();
+        return "header_wait_slow";
+    }
+    if diagnostics.headers_ms >= 3_000
+        && diagnostics.request_body_bytes >= 1_000_000
+        && diagnostics.sent_body_bytes >= 600_000
+    {
+        return "huge_body_upload_header_wait";
+    }
+    if diagnostics.headers_ms >= 3_000
+        && diagnostics.request_body_bytes >= 600_000
+        && diagnostics.sent_body_bytes >= 300_000
+    {
+        return "large_body_upload_header_wait";
     }
     if diagnostics.request_body_bytes >= 1_000_000 {
-        return "huge_body_normal_header".to_string();
+        return "huge_body_normal_header";
     }
     if diagnostics.request_body_bytes >= 600_000 {
-        return "large_body_normal_header".to_string();
+        return "large_body_normal_header";
     }
-    "normal".to_string()
+    "normal"
+}
+
+fn observe_upstream_response_timing(
+    diagnostics: &mut UpstreamRequestDiagnostics,
+    response: &reqwest::Response,
+    headers_ms: u64,
+) {
+    diagnostics.last_attempt_headers_ms = headers_ms;
+    diagnostics.http_version = Some(format!("{:?}", response.version()));
+    diagnostics.server_timing = response_header_values(response.headers(), "server-timing");
+    if let Some((source, processing_ms)) = reported_upstream_processing_ms(response.headers()) {
+        diagnostics.timing_source = Some(source.to_string());
+        diagnostics.reported_processing_ms = Some(processing_ms);
+        diagnostics.non_processing_ms = Some(headers_ms.saturating_sub(processing_ms));
+    } else {
+        diagnostics.timing_source = None;
+        diagnostics.reported_processing_ms = None;
+        diagnostics.non_processing_ms = None;
+    }
+}
+
+fn response_header_values(headers: &HeaderMap, name: &str) -> Option<String> {
+    let values = headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join(", ").chars().take(512).collect())
+    }
+}
+
+fn reported_upstream_processing_ms(headers: &HeaderMap) -> Option<(&'static str, u64)> {
+    if let Some(value) = header_duration_ms(headers, "x-envoy-upstream-service-time", 1.0) {
+        return Some(("x-envoy-upstream-service-time", value));
+    }
+    if let Some(value) = server_timing_duration_ms(headers) {
+        return Some(("server-timing", value));
+    }
+    if let Some(value) = header_duration_ms(headers, "x-response-time", 1.0) {
+        return Some(("x-response-time", value));
+    }
+    header_duration_ms(headers, "x-process-time", 1000.0).map(|value| ("x-process-time", value))
+}
+
+fn header_duration_ms(headers: &HeaderMap, name: &str, bare_scale: f64) -> Option<u64> {
+    let raw = headers
+        .get(name)?
+        .to_str()
+        .ok()?
+        .trim()
+        .to_ascii_lowercase();
+    parse_duration_ms(&raw, bare_scale)
+}
+
+fn parse_duration_ms(raw: &str, bare_scale: f64) -> Option<u64> {
+    let (number, scale) = if let Some(value) = raw.strip_suffix("ms") {
+        (value.trim(), 1.0)
+    } else if let Some(value) = raw.strip_suffix('s') {
+        (value.trim(), 1000.0)
+    } else {
+        (raw.trim(), bare_scale)
+    };
+    let value = number.parse::<f64>().ok()? * scale;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some(value.round() as u64)
+}
+
+fn server_timing_duration_ms(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get_all("server-timing")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .flat_map(|metric| metric.split(';').skip(1))
+        .filter_map(|parameter| {
+            let (name, value) = parameter.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("dur")
+                .then(|| parse_duration_ms(value.trim().trim_matches('"'), 1.0))
+                .flatten()
+        })
+        .max()
 }
 
 fn responses_provider_prefix_settle_delay_with_tail(
@@ -4338,6 +4880,9 @@ fn responses_provider_prefix_settle_delay_with_tail(
     let avoidable = state
         .avoidable_shortfall_tokens_128
         .max(state.avoidable_shortfall_tokens);
+    if responses_stable_prefix_needs_no_guard(state, avoidable) {
+        return TokioDuration::ZERO;
+    }
     let base = responses_base_prefix_settle_delay(state, avoidable);
     if state.input_tokens < 4096 {
         return base;
@@ -4429,6 +4974,17 @@ fn responses_provider_prefix_settle_delay_with_tail(
     }
 }
 
+fn responses_stable_prefix_needs_no_guard(state: &PrefixWarmState, avoidable: u64) -> bool {
+    if avoidable > 0
+        || state.input_tokens < 4096
+        || state.cache_read_tokens == 0
+        || state.cache_instability_score > 0
+    {
+        return false;
+    }
+    state.cache_read_tokens as f64 / state.input_tokens as f64 >= 0.995
+}
+
 fn responses_avoidable_tool_output_wait_cap(
     state: &PrefixWarmState,
     current_tail: &TailInputDiagnostics,
@@ -4467,7 +5023,7 @@ fn responses_current_tool_output_wait_cap(
     {
         Some(responses_foreground_wait_cap())
     } else if current_tail.delta_from_session && current_tail.tool_output_chars >= 8_000 {
-        Some(TokioDuration::from_millis(2500))
+        Some(responses_foreground_wait_cap())
     } else {
         None
     }
@@ -4487,6 +5043,22 @@ fn responses_current_tool_output_cap_applies(
 }
 
 fn responses_current_tail_makes_avoidable_unreliable(current_tail: &TailInputDiagnostics) -> bool {
+    let tool_or_mixed_tail = matches!(
+        current_tail.source.as_deref(),
+        Some("mixed") | Some("tool_output")
+    );
+    if tool_or_mixed_tail
+        && (current_tail.tool_output_chars >= 20_000
+            || current_tail.largest_tool_output_chars >= 20_000)
+    {
+        return true;
+    }
+    if tool_or_mixed_tail
+        && current_tail.tool_output_chars >= 20_000
+        && current_tail.tool_output_noise_hint.is_some()
+    {
+        return true;
+    }
     if current_tail.input_items >= 32
         && current_tail.tool_output_chars >= 80_000
         && (matches!(
@@ -4499,6 +5071,34 @@ fn responses_current_tail_makes_avoidable_unreliable(current_tail: &TailInputDia
     }
     if current_tail.input_items >= 128
         && current_tail.tool_output_chars >= 100_000
+        && current_tail.message_chars >= 8_000
+        && current_tail.tool_call_chars >= 8_000
+    {
+        return true;
+    }
+    false
+}
+
+fn responses_current_tail_blocks_sent_bucket_learning(current_tail: &TailInputDiagnostics) -> bool {
+    let tool_or_mixed_tail = matches!(
+        current_tail.source.as_deref(),
+        Some("mixed") | Some("tool_output")
+    );
+    if !tool_or_mixed_tail {
+        return false;
+    }
+    if current_tail.tool_output_chars >= 80_000 || current_tail.largest_tool_output_chars >= 32_000
+    {
+        return true;
+    }
+    if current_tail.input_items >= 32
+        && current_tail.tool_output_chars >= 64_000
+        && (current_tail.tool_output_noise_hint.is_some() || current_tail.message_chars >= 8_000)
+    {
+        return true;
+    }
+    if current_tail.input_items >= 128
+        && current_tail.tool_output_chars >= 80_000
         && current_tail.message_chars >= 8_000
         && current_tail.tool_call_chars >= 8_000
     {
@@ -4527,6 +5127,7 @@ async fn update_provider_prefix_state(
     .await
 }
 
+#[cfg(test)]
 async fn update_provider_prefix_state_with_tail(
     state: &AppState,
     provider_prefix_key: Option<&str>,
@@ -4535,6 +5136,29 @@ async fn update_provider_prefix_state_with_tail(
     tail_input_diagnostics: &TailInputDiagnostics,
     used_response_session: bool,
     retried_full_response: bool,
+) -> bool {
+    update_provider_prefix_state_with_tail_and_guard(
+        state,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        usage_record,
+        tail_input_diagnostics,
+        used_response_session,
+        retried_full_response,
+        false,
+    )
+    .await
+}
+
+async fn update_provider_prefix_state_with_tail_and_guard(
+    state: &AppState,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    usage_record: Option<&UsageRecord>,
+    tail_input_diagnostics: &TailInputDiagnostics,
+    used_response_session: bool,
+    retried_full_response: bool,
+    guard_budget_exhausted: bool,
 ) -> bool {
     let (Some(key), Some(record)) = (provider_prefix_key, usage_record) else {
         return false;
@@ -4550,15 +5174,26 @@ async fn update_provider_prefix_state_with_tail(
     let prefix_break_after_warm_state =
         provider_prefix_break_after_warm_state(previous.as_ref(), record)
             && (record.input_tokens >= 32_000 || responses_tool_tail_burst(tail_input_diagnostics));
+    let huge_dynamic_history_cold_read =
+        responses_huge_dynamic_history_cold_read(record, tail_input_diagnostics);
     let weak_full_retry_after_session_delta = provider_prefix_weak_full_retry_after_session_delta(
         previous.as_ref(),
         record,
         retried_full_response,
     );
-    if prefix_break_after_warm_state || weak_full_retry_after_session_delta {
-        let mut preserved = previous.clone().unwrap();
+    if prefix_break_after_warm_state
+        || weak_full_retry_after_session_delta
+        || huge_dynamic_history_cold_read
+    {
+        let Some(mut preserved) = previous.clone() else {
+            return false;
+        };
         preserved.finished_at = now;
-        let instability_bump = if prefix_break_after_warm_state { 2 } else { 1 };
+        let instability_bump = if prefix_break_after_warm_state || huge_dynamic_history_cold_read {
+            2
+        } else {
+            1
+        };
         preserved.cache_instability_score = preserved
             .cache_instability_score
             .saturating_add(instability_bump)
@@ -4615,18 +5250,30 @@ async fn update_provider_prefix_state_with_tail(
         direct_avoidable_shortfall_tokens_128,
         tail_input_diagnostics,
     );
-    let avoidable_shortfall_tokens = if small_avoidable_is_tail_granularity || avoidable_unreliable
+    let capped_provider_rollback = responses_cap_exhausted_provider_waterline_rollback(
+        previous.as_ref(),
+        record,
+        shortfall_tokens_128,
+        direct_avoidable_shortfall_tokens_128,
+        tail_input_diagnostics,
+        guard_budget_exhausted,
+    );
+    let avoidable_shortfall_tokens = if capped_provider_rollback
+        || small_avoidable_is_tail_granularity
+        || avoidable_unreliable
     {
         0
     } else {
         direct_avoidable_shortfall_tokens
     };
-    let avoidable_shortfall_tokens_128 =
-        if small_avoidable_is_tail_granularity || avoidable_unreliable {
-            0
-        } else {
-            direct_avoidable_shortfall_tokens_128
-        };
+    let avoidable_shortfall_tokens_128 = if capped_provider_rollback
+        || small_avoidable_is_tail_granularity
+        || avoidable_unreliable
+    {
+        0
+    } else {
+        direct_avoidable_shortfall_tokens_128
+    };
     let avoidable_shortfall_streak =
         if avoidable_shortfall_tokens > 0 || avoidable_shortfall_tokens_128 > 0 {
             previous
@@ -4659,6 +5306,8 @@ async fn update_provider_prefix_state_with_tail(
     let severe_cold_read = record.cache_read_tokens == 0 && bucket_max >= 32_000;
     let cache_instability_score = if severe_cold_read {
         previous_instability.saturating_add(3).min(8)
+    } else if capped_provider_rollback {
+        previous_instability.saturating_add(1).min(8)
     } else if large_avoidable >= 4096 {
         previous_instability.saturating_add(2).min(8)
     } else if large_avoidable > 0 {
@@ -4670,7 +5319,8 @@ async fn update_provider_prefix_state_with_tail(
     };
     let current_shortfall = provider_cache_shortfall(record);
     let current_shortfall_128 = provider_cache_shortfall_128(record);
-    let learn_sent_bucket = !small_avoidable_is_tail_granularity
+    let learn_sent_bucket = !capped_provider_rollback
+        && !small_avoidable_is_tail_granularity
         && should_learn_sent_provider_bucket(
             previous.as_ref(),
             record,
@@ -4689,14 +5339,15 @@ async fn update_provider_prefix_state_with_tail(
     } else {
         record.cache_read_tokens
     };
-    let seen_bucket_tokens = if small_avoidable_is_tail_granularity {
+    let seen_bucket_tokens = if capped_provider_rollback || small_avoidable_is_tail_granularity {
         record.cache_read_tokens.max(sent_bucket_tokens)
     } else {
         previous_seen_bucket
             .max(record.cache_read_tokens)
             .max(sent_bucket_tokens)
     };
-    let seen_bucket_tokens_128 = if small_avoidable_is_tail_granularity {
+    let seen_bucket_tokens_128 = if capped_provider_rollback || small_avoidable_is_tail_granularity
+    {
         record.cache_read_tokens.max(sent_bucket_tokens_128)
     } else {
         previous_seen_bucket_128
@@ -4725,7 +5376,9 @@ async fn update_provider_prefix_state_with_tail(
         states.insert(alias_key, next.clone());
     }
     if let Some(family_key) = provider_prefix_family_key {
-        if should_learn_provider_prefix_family_state(record, tail_input_diagnostics) {
+        if !capped_provider_rollback
+            && should_learn_provider_prefix_family_state(record, tail_input_diagnostics)
+        {
             states.insert(family_key.to_string(), next);
         }
     }
@@ -4756,6 +5409,15 @@ fn should_learn_sent_provider_bucket(
     };
     if previous.cache_read_tokens == 0 || previous.seen_bucket_tokens_128 == 0 {
         return false;
+    }
+    if responses_high_hit_fine_tail_can_learn_sent_bucket(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+    ) {
+        return true;
     }
     if responses_precise_tool_tail_can_learn_sent_bucket(
         previous,
@@ -4796,7 +5458,9 @@ fn should_learn_sent_provider_bucket(
     if current_shortfall_128 <= 2048 {
         return false;
     }
-    if !(2560..=4096).contains(&current_shortfall) || current_shortfall % 512 != 0 {
+    if !(2560..=4096).contains(&current_shortfall)
+        || !responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128)
+    {
         return false;
     }
     if current_shortfall_128 > current_shortfall.saturating_add(512) {
@@ -4808,13 +5472,74 @@ fn should_learn_sent_provider_bucket(
     if provider_cache_ratio(record).unwrap_or(0.0) < 0.98 {
         return false;
     }
-    if responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics) {
+    if responses_current_tail_blocks_sent_bucket_learning(tail_input_diagnostics) {
         return false;
     }
     if tail_input_diagnostics.tool_output_chars >= 40_000 {
         return false;
     }
     true
+}
+
+fn responses_tail_gap_is_cache_granular(
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+) -> bool {
+    (current_shortfall >= 512 && current_shortfall % 512 == 0)
+        || (current_shortfall_128 >= 128 && current_shortfall_128 % 128 == 0)
+}
+
+fn responses_tail_gap_128_is_close_to_512_floor(
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+) -> bool {
+    current_shortfall_128 <= current_shortfall.saturating_add(512)
+}
+
+fn responses_high_hit_fine_tail_can_learn_sent_bucket(
+    previous: &PrefixWarmState,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+) -> bool {
+    if current_shortfall_128 == 0 || current_shortfall_128 > 2048 {
+        return false;
+    }
+    if !responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128)
+        || !responses_tail_gap_128_is_close_to_512_floor(current_shortfall, current_shortfall_128)
+    {
+        return false;
+    }
+    if record.input_tokens < 32_000 || record.cache_read_tokens == 0 {
+        return false;
+    }
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens);
+    if previous_seen < 32_000 || record.cache_read_tokens.saturating_add(512) < previous_seen {
+        return false;
+    }
+    if responses_current_tail_blocks_sent_bucket_learning(tail_input_diagnostics) {
+        return false;
+    }
+    let tail_signal = tail_input_diagnostics.message_chars > 0
+        || tail_input_diagnostics.tool_output_chars > 0
+        || tail_input_diagnostics.largest_tool_output_chars > 0
+        || tail_input_diagnostics.tool_call_chars > 0
+        || tail_input_diagnostics.tool_output_noise_hint.is_some()
+        || previous.small_gap_recovery_streak > 0;
+    if !tail_signal {
+        return false;
+    }
+    let ratio = provider_cache_ratio(record).unwrap_or(0.0);
+    if current_shortfall_128 <= 512 {
+        ratio >= 0.995
+    } else if current_shortfall_128 <= 1024 {
+        ratio >= 0.992
+    } else {
+        ratio >= 0.988
+    }
 }
 
 fn responses_small_residual_after_tool_burst_can_learn_sent_bucket(
@@ -4831,10 +5556,13 @@ fn responses_small_residual_after_tool_burst_can_learn_sent_bucket(
     if !previous_tool_burst {
         return false;
     }
-    if current_shortfall < 512 || current_shortfall > 4096 || current_shortfall % 512 != 0 {
+    if current_shortfall < 128
+        || current_shortfall > 4096
+        || !responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128)
+    {
         return false;
     }
-    if current_shortfall_128 > current_shortfall.saturating_add(512) {
+    if !responses_tail_gap_128_is_close_to_512_floor(current_shortfall, current_shortfall_128) {
         return false;
     }
     if record.input_tokens < 16_000 || record.cache_read_tokens == 0 {
@@ -4846,7 +5574,7 @@ fn responses_small_residual_after_tool_burst_can_learn_sent_bucket(
     if previous_seen < 8_000 || record.cache_read_tokens.saturating_add(512) < previous_seen {
         return false;
     }
-    if responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics)
+    if responses_current_tail_blocks_sent_bucket_learning(tail_input_diagnostics)
         || responses_tool_tail_burst(tail_input_diagnostics)
     {
         return false;
@@ -4876,10 +5604,11 @@ fn responses_medium_message_tail_can_learn_sent_bucket(
     current_shortfall_128: u64,
     tail_input_diagnostics: &TailInputDiagnostics,
 ) -> bool {
-    if current_shortfall < 512 || current_shortfall > 8192 {
+    if current_shortfall < 128 || current_shortfall > 8192 {
         return false;
     }
-    if current_shortfall % 512 != 0 || current_shortfall_128 > current_shortfall.saturating_add(512)
+    if !responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128)
+        || !responses_tail_gap_128_is_close_to_512_floor(current_shortfall, current_shortfall_128)
     {
         return false;
     }
@@ -4918,10 +5647,11 @@ fn responses_all_stage_tail_can_learn_sent_bucket(
     current_shortfall_128: u64,
     tail_input_diagnostics: &TailInputDiagnostics,
 ) -> bool {
-    if current_shortfall < 2048 || current_shortfall > 131_072 {
+    if current_shortfall < 128 {
         return false;
     }
-    if current_shortfall % 512 != 0 || current_shortfall_128 > current_shortfall.saturating_add(512)
+    if !responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128)
+        || !responses_tail_gap_128_is_close_to_512_floor(current_shortfall, current_shortfall_128)
     {
         return false;
     }
@@ -4945,7 +5675,9 @@ fn responses_all_stage_tail_can_learn_sent_bucket(
         return false;
     }
     let ratio = provider_cache_ratio(record).unwrap_or(0.0);
-    if current_shortfall > 65_536 {
+    if current_shortfall > 131_072 {
+        ratio >= 0.90
+    } else if current_shortfall > 65_536 {
         ratio >= 0.86
     } else if current_shortfall > 32_768 {
         ratio >= 0.80
@@ -4976,8 +5708,8 @@ fn responses_precise_tool_tail_can_learn_sent_bucket(
     {
         return false;
     }
-    let aligned_tail_gap = current_shortfall % 512 == 0
-        || (current_shortfall <= 2048 && current_shortfall_128 % 128 == 0);
+    let aligned_tail_gap =
+        responses_tail_gap_is_cache_granular(current_shortfall, current_shortfall_128);
     if current_shortfall < 128 || current_shortfall > 12_288 || !aligned_tail_gap {
         return false;
     }
@@ -4987,7 +5719,7 @@ fn responses_precise_tool_tail_can_learn_sent_bucket(
     if record.input_tokens < 32_000 || previous.seen_bucket_tokens_128 < 32_000 {
         return false;
     }
-    if responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics) {
+    if responses_current_tail_blocks_sent_bucket_learning(tail_input_diagnostics) {
         return false;
     }
     if tail_input_diagnostics.tool_output_chars >= 40_000
@@ -5072,6 +5804,54 @@ fn responses_small_avoidable_tail_granularity(
         || previous.cache_instability_score >= 3
 }
 
+fn responses_cap_exhausted_provider_waterline_rollback(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    current_shortfall_128: u64,
+    direct_avoidable_shortfall_tokens_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+    guard_budget_exhausted: bool,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if !guard_budget_exhausted
+        || direct_avoidable_shortfall_tokens_128 == 0
+        || direct_avoidable_shortfall_tokens_128 > 4096
+        || current_shortfall_128 == 0
+        || current_shortfall_128 > 4096
+    {
+        return false;
+    }
+    if direct_avoidable_shortfall_tokens_128 % 128 != 0 || current_shortfall_128 % 128 != 0 {
+        return false;
+    }
+    if record.input_tokens < 32_000 || record.cache_read_tokens < 32_000 {
+        return false;
+    }
+    if provider_cache_ratio(record).unwrap_or_default() < 0.96 {
+        return false;
+    }
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens)
+        .max(previous.cache_read_tokens);
+    if previous_seen < 32_000
+        || record.cache_read_tokens >= previous_seen
+        || record.cache_read_tokens.saturating_add(4096) < previous_seen
+        || record.input_tokens.saturating_sub(previous.input_tokens) > 8192
+    {
+        return false;
+    }
+    if responses_tool_tail_burst(tail_input_diagnostics)
+        || tail_input_diagnostics.tool_output_chars >= 4096
+        || tail_input_diagnostics.tool_call_chars >= 4096
+    {
+        return false;
+    }
+    true
+}
+
 fn should_learn_provider_prefix_family_state(
     record: &UsageRecord,
     tail_input_diagnostics: &TailInputDiagnostics,
@@ -5136,11 +5916,12 @@ fn provider_prefix_control_key(
     decision: &RouteDecision,
     channel: &Channel,
 ) -> Option<String> {
+    let provider_group = provider_prefix_provider_group(decision);
     provider_prefix_key.map(|key| {
         format!(
             "{}\0{}\0{}\0{}",
-            decision.provider.id,
-            decision.model,
+            provider_group,
+            provider_prefix_model_key(decision),
             channel.label(),
             key
         )
@@ -5155,11 +5936,12 @@ fn provider_prefix_family_control_key(
     if !matches!(channel, Channel::Responses) {
         return None;
     }
+    let provider_group = provider_prefix_provider_group(decision);
     response_session_scope_key.map(|scope| {
         format!(
             "prefix-family\0{}\0{}\0{}\0{}",
-            decision.provider.id,
-            decision.model,
+            provider_group,
+            provider_prefix_model_key(decision),
             channel.label(),
             scope
         )
@@ -5168,26 +5950,49 @@ fn provider_prefix_family_control_key(
 
 fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     let mut parts = control_key.split('\0');
-    let _provider_id = parts.next()?;
+    let provider_group = parts.next()?;
     let model = parts.next()?;
     let channel = parts.next()?;
     let fingerprint = parts.next()?;
-    if parts.next().is_some() || model.is_empty() || channel.is_empty() || fingerprint.is_empty() {
+    if parts.next().is_some()
+        || provider_group.is_empty()
+        || model.is_empty()
+        || channel.is_empty()
+        || fingerprint.is_empty()
+    {
         return None;
     }
     Some(format!(
-        "prefix-alias\0{}\0{}\0{}",
-        model, channel, fingerprint
+        "prefix-alias\0{}\0{}\0{}\0{}",
+        provider_group, model, channel, fingerprint
     ))
+}
+
+fn provider_prefix_provider_group(decision: &RouteDecision) -> String {
+    let base_url = decision
+        .provider
+        .base_url
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    if base_url.is_empty() {
+        decision.provider.id.clone()
+    } else {
+        base_url
+    }
+}
+
+fn provider_prefix_model_key(decision: &RouteDecision) -> String {
+    provider_model_cache_key(&decision.provider, &decision.model)
 }
 
 fn lookup_provider_prefix_state<'a>(
     states: &'a HashMap<String, PrefixWarmState>,
     key: &str,
 ) -> Option<&'a PrefixWarmState> {
-    states
-        .get(key)
-        .or_else(|| provider_prefix_state_alias_key(key).and_then(|alias| states.get(&alias)))
+    let exact = states.get(key);
+    let alias = provider_prefix_state_alias_key(key).and_then(|alias| states.get(&alias));
+    stronger_prefix_state(exact, alias)
 }
 
 fn lookup_provider_prefix_state_with_source<'a>(
@@ -5195,16 +6000,62 @@ fn lookup_provider_prefix_state_with_source<'a>(
     provider_prefix_key: Option<&str>,
     provider_prefix_family_key: Option<&str>,
 ) -> Option<(&'static str, &'a PrefixWarmState)> {
-    provider_prefix_key
-        .and_then(|key| states.get(key).map(|state| ("exact", state)))
-        .or_else(|| {
-            provider_prefix_family_key
-                .and_then(|key| states.get(key).map(|state| ("session-sibling", state)))
-        })
+    let direct = provider_prefix_key.and_then(|key| {
+        let exact = states.get(key).map(|state| ("exact", state));
+        let alias = provider_prefix_state_alias_key(key)
+            .and_then(|alias| states.get(&alias))
+            .map(|state| ("shared-responses", state));
+        stronger_prefix_state_with_source(exact, alias)
+    });
+    stronger_prefix_state_with_source(
+        direct,
+        provider_prefix_family_key
+            .and_then(|key| states.get(key).map(|state| ("session-sibling", state))),
+    )
 }
 
 fn provider_prefix_state_update_key(provider_prefix_key: Option<&str>) -> Option<String> {
     provider_prefix_key.map(ToOwned::to_owned)
+}
+
+fn stronger_prefix_state<'a>(
+    left: Option<&'a PrefixWarmState>,
+    right: Option<&'a PrefixWarmState>,
+) -> Option<&'a PrefixWarmState> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if prefix_state_strength(right) > prefix_state_strength(left) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(state), None) | (None, Some(state)) => Some(state),
+        (None, None) => None,
+    }
+}
+
+fn stronger_prefix_state_with_source<'a>(
+    left: Option<(&'static str, &'a PrefixWarmState)>,
+    right: Option<(&'static str, &'a PrefixWarmState)>,
+) -> Option<(&'static str, &'a PrefixWarmState)> {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            if prefix_state_strength(right.1) > prefix_state_strength(left.1) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(state), None) | (None, Some(state)) => Some(state),
+        (None, None) => None,
+    }
+}
+
+fn prefix_state_strength(state: &PrefixWarmState) -> u64 {
+    provider_prefix_raw_seen_bucket(state)
+        .max(state.seen_bucket_tokens_128)
+        .max(state.cache_read_tokens)
 }
 
 fn provider_prefix_usage_is_safe_to_learn(
@@ -5304,6 +6155,7 @@ struct ProviderCacheGapBreakdown {
     total_tokens: u64,
     new_tail_tokens: u64,
     avoidable_tokens: u64,
+    provider_unstable_tokens: u64,
 }
 
 async fn provider_cache_gap_breakdown(
@@ -5313,17 +6165,37 @@ async fn provider_cache_gap_breakdown(
     usage_record: Option<&UsageRecord>,
     tail_input_diagnostics: Option<&TailInputDiagnostics>,
 ) -> Option<ProviderCacheGapBreakdown> {
+    provider_cache_gap_breakdown_with_guard(
+        state,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        usage_record,
+        tail_input_diagnostics,
+        None,
+    )
+    .await
+}
+
+async fn provider_cache_gap_breakdown_with_guard(
+    state: &AppState,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    usage_record: Option<&UsageRecord>,
+    tail_input_diagnostics: Option<&TailInputDiagnostics>,
+    prefix_guard_wait: Option<&PrefixGuardWaitDiagnostics>,
+) -> Option<ProviderCacheGapBreakdown> {
     let record = usage_record?;
     if record.input_tokens < 1024 {
         return Some(ProviderCacheGapBreakdown {
             total_tokens: 0,
             new_tail_tokens: 0,
             avoidable_tokens: 0,
+            provider_unstable_tokens: 0,
         });
     }
     let bucket = provider_cache_bucket_max(record.input_tokens);
     let total = bucket.saturating_sub(record.cache_read_tokens);
-    let (previous_exact, previous_any, previous_family) = if let Some(key) = provider_prefix_key {
+    let (previous_exact, previous_best, previous_family) = if let Some(key) = provider_prefix_key {
         let states = state.prefix_states.lock().await;
         (
             states.get(key).cloned(),
@@ -5342,23 +6214,24 @@ async fn provider_cache_gap_breakdown(
         })
         .unwrap_or(false);
     if provider_prefix_break_after_warm_state(previous_exact.as_ref(), record)
-        || (provider_prefix_break_after_warm_state(previous_any.as_ref(), record)
+        || (provider_prefix_break_after_warm_state(previous_best.as_ref(), record)
             && cold_read_has_unreliable_dynamic_tail)
         || (previous_exact.is_none()
-            && previous_any.is_none()
+            && previous_best.is_none()
             && provider_prefix_break_after_warm_state(previous_family.as_ref(), record)
             && cold_read_has_unreliable_dynamic_tail)
         || (previous_exact.is_none()
-            && previous_any.is_none()
+            && previous_best.is_none()
             && responses_huge_dynamic_history_cold_read(
                 record,
                 tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
             ))
     {
         return Some(ProviderCacheGapBreakdown {
-            total_tokens: 0,
+            total_tokens: total,
             new_tail_tokens: 0,
             avoidable_tokens: 0,
+            provider_unstable_tokens: total,
         });
     }
     let avoidable_unreliable = tail_input_diagnostics
@@ -5370,7 +6243,7 @@ async fn provider_cache_gap_breakdown(
     let direct_avoidable = if avoidable_unreliable {
         0
     } else {
-        previous_exact
+        previous_best
             .as_ref()
             .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record).0)
             .unwrap_or(0)
@@ -5380,7 +6253,7 @@ async fn provider_cache_gap_breakdown(
     let direct_avoidable_128 = if avoidable_unreliable {
         0
     } else {
-        previous_exact
+        previous_best
             .as_ref()
             .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record).1)
             .unwrap_or(0)
@@ -5388,21 +6261,38 @@ async fn provider_cache_gap_breakdown(
             .saturating_sub(record.cache_read_tokens)
     };
     let small_avoidable_is_tail_granularity = responses_small_avoidable_tail_granularity(
-        previous_exact.as_ref(),
+        previous_best.as_ref(),
         record,
         provider_cache_shortfall_128(record),
         direct_avoidable_128,
         tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
     );
-    let direct_avoidable = if small_avoidable_is_tail_granularity {
+    let provider_unstable_tokens = if responses_cap_exhausted_provider_waterline_rollback(
+        previous_exact.as_ref(),
+        record,
+        provider_cache_shortfall_128(record),
+        direct_avoidable_128,
+        tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
+        prefix_guard_wait
+            .map(|wait| wait.budget_exhausted)
+            .unwrap_or(false),
+    ) {
+        direct_avoidable
+    } else {
+        0
+    };
+    let direct_avoidable = if provider_unstable_tokens > 0 || small_avoidable_is_tail_granularity {
         0
     } else {
         direct_avoidable
     };
     Some(ProviderCacheGapBreakdown {
         total_tokens: total,
-        new_tail_tokens: total.saturating_sub(direct_avoidable),
+        new_tail_tokens: total
+            .saturating_sub(direct_avoidable)
+            .saturating_sub(provider_unstable_tokens),
         avoidable_tokens: direct_avoidable,
+        provider_unstable_tokens,
     })
 }
 
@@ -5585,6 +6475,9 @@ fn should_attempt_main_response_session_delta(
     {
         return false;
     }
+    if !supports_main_response_session_delta(decision) {
+        return false;
+    }
     if session_anchor.source.as_deref() != Some("exact") {
         return false;
     }
@@ -5607,6 +6500,14 @@ fn should_attempt_main_response_session_delta(
     current_tail.tool_output_chars >= 2_048
         || current_tail.largest_tool_output_chars >= 2_048
         || current_tail.message_chars >= 8_192
+}
+
+fn supports_main_response_session_delta(decision: &RouteDecision) -> bool {
+    matches!(decision.upstream_channel, Channel::Responses)
+}
+
+fn main_response_session_delta_enabled_for_agent(forced_agent_id: Option<&str>) -> bool {
+    forced_agent_id != Some("codex")
 }
 
 fn response_session_delta_is_beneficial(
@@ -6116,6 +7017,10 @@ fn response_input_delta_start_index(
     previous_items: &[Value],
     current_items: &[Value],
 ) -> Option<usize> {
+    if let Some(index) = response_input_raw_prefix_delta_start_index(previous_items, current_items)
+    {
+        return Some(index);
+    }
     let previous_essential = response_input_essential_items(previous_items);
     let current_essential = response_input_essential_items(current_items);
     if current_essential.len() <= previous_essential.len() {
@@ -6131,6 +7036,20 @@ fn response_input_delta_start_index(
     current_essential
         .get(previous_essential.len())
         .map(|(index, _)| *index)
+}
+
+fn response_input_raw_prefix_delta_start_index(
+    previous_items: &[Value],
+    current_items: &[Value],
+) -> Option<usize> {
+    if previous_items.is_empty() || previous_items.len() >= current_items.len() {
+        return None;
+    }
+    previous_items
+        .iter()
+        .zip(current_items.iter())
+        .all(|(previous, current)| previous == current)
+        .then_some(previous_items.len())
 }
 
 fn response_input_essential_prefix_matches(
@@ -6418,6 +7337,7 @@ fn body_diagnostics(
         send_body_is_delta,
         payload_too_large_rescue_attempted: false,
         payload_too_large_rescue_used: false,
+        reasoning: ReasoningEffortDiagnostics::default(),
     }
 }
 
@@ -6427,6 +7347,10 @@ fn apply_body_diagnostics(log: &mut RequestLog, diagnostics: &BodyDiagnostics) {
     log.send_body_is_delta = Some(diagnostics.send_body_is_delta);
     log.payload_too_large_rescue_attempted = Some(diagnostics.payload_too_large_rescue_attempted);
     log.payload_too_large_rescue_used = Some(diagnostics.payload_too_large_rescue_used);
+    log.agent_reasoning_effort = diagnostics.reasoning.agent.clone();
+    log.configured_reasoning_effort = diagnostics.reasoning.configured.clone();
+    log.effective_reasoning_effort = diagnostics.reasoning.effective.clone();
+    log.reasoning_effort_source = diagnostics.reasoning.source.clone();
 }
 
 async fn tail_input_diagnostics_for_session(
@@ -6809,6 +7733,195 @@ fn request_body_stream_flag(body: &Value) -> bool {
     body.get("stream").and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn current_non_stream_upstream_call_source(
+    sync_responses_main: bool,
+    active_responses_non_stream_chat_compat: bool,
+    responses_sync_main_chat_compat_fallback: bool,
+) -> &'static str {
+    if active_responses_non_stream_chat_compat {
+        if responses_sync_main_chat_compat_fallback {
+            "responses-sync-main-chat-compat-fallback"
+        } else {
+            "responses-sync-main-chat-compat"
+        }
+    } else if sync_responses_main {
+        "responses-sync-main"
+    } else {
+        "main"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn record_upstream_response_observation(
+    state: &AppState,
+    request_id: &str,
+    started: &Instant,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+    decision: &RouteDecision,
+    cache_key: Option<&str>,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_fingerprint: Option<&str>,
+    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
+    local_prepare_ms: u64,
+    body_diagnostics: &BodyDiagnostics,
+    body: &Value,
+    used_response_session: bool,
+    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    requested_model: Option<String>,
+    source: &str,
+    status: u16,
+    upstream_request_diagnostics: &UpstreamRequestDiagnostics,
+    agent_log_id: Option<String>,
+    agent_log_label: Option<String>,
+) {
+    let elapsed = started.elapsed().as_millis() as u64;
+    let body_bytes = serialized_body_len(upstream_channel, body);
+    let original_body_bytes = if body_diagnostics.original_body_bytes > 0 {
+        body_diagnostics.original_body_bytes
+    } else {
+        body_bytes
+    };
+    let send_body_bytes = if body_diagnostics.send_body_bytes > 0 {
+        body_diagnostics.send_body_bytes
+    } else {
+        body_bytes
+    };
+    let is_success_status = StatusCode::from_u16(status)
+        .map(|code| code.is_success())
+        .unwrap_or(false);
+
+    state
+        .metrics
+        .record_upstream_call(RequestLog {
+            id: Uuid::new_v4().to_string(),
+            at: Utc::now(),
+            inbound_request_id: Some(request_id.to_string()),
+            upstream_request_id: Some(Uuid::new_v4().to_string()),
+            upstream_attempt_index: Some(1),
+            upstream_attempt_total: Some(1),
+            client_channel: client_channel.label().to_string(),
+            upstream_channel: upstream_channel.label().to_string(),
+            provider: decision.provider.name.clone(),
+            model: decision.model.clone(),
+            requested_model,
+            agent_reasoning_effort: body_diagnostics.reasoning.agent.clone(),
+            configured_reasoning_effort: body_diagnostics.reasoning.configured.clone(),
+            effective_reasoning_effort: body_diagnostics.reasoning.effective.clone(),
+            reasoning_effort_source: body_diagnostics.reasoning.source.clone(),
+            cache_status: if is_success_status { "miss" } else { "error" }.to_string(),
+            agent_id: agent_log_id,
+            agent_label: agent_log_label,
+            upstream_call_kind: Some(
+                if request_body_stream_flag(body) {
+                    "stream"
+                } else {
+                    "sync"
+                }
+                .to_string(),
+            ),
+            upstream_call_source: Some(source.to_string()),
+            cache_key: cache_key.map(ToOwned::to_owned),
+            provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
+            provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
+            provider_cache_diagnostic: None,
+            prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
+            prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
+            prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+            prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
+            prefix_guard_wait_effect: None,
+            prefix_lag_classification: None,
+            prefix_lag_input_delta_tokens: None,
+            prefix_lag_cache_delta_tokens: None,
+            prefix_lag_previous_gap_tokens: None,
+            prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
+            prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
+            prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
+            status,
+            ttft_ms: elapsed,
+            upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
+            local_prepare_ms: Some(local_prepare_ms),
+            upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
+            upstream_last_attempt_headers_ms: Some(
+                upstream_request_diagnostics.last_attempt_headers_ms,
+            ),
+            upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+            upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
+            upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
+            upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
+            upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
+            upstream_first_chunk_ms: None,
+            stream_upstream_wait_ms: None,
+            stream_client_backpressure_ms: None,
+            aggregate_done_ms: None,
+            upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
+            upstream_attempts: Some(upstream_request_diagnostics.attempts),
+            request_body_bytes: Some(body_bytes),
+            sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes.max(body_bytes)),
+            gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
+            gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
+            upstream_header_wait_class: Some(upstream_header_wait_class(
+                upstream_request_diagnostics,
+            )),
+            total_ms: elapsed,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_shortfall_tokens: None,
+            cache_new_tail_gap_tokens: None,
+            cache_avoidable_gap_tokens: None,
+            cache_provider_unstable_gap_tokens: None,
+            provider_cache_token_ratio: None,
+            tail_input_items: None,
+            tail_message_chars: None,
+            tail_tool_call_chars: None,
+            tail_tool_output_chars: None,
+            tail_largest_tool_output_chars: None,
+            tail_tool_output_lines: None,
+            tail_tool_output_repeated_line_chars: None,
+            tail_tool_output_timestamp_like_count: None,
+            tail_tool_output_path_like_count: None,
+            tail_tool_output_url_like_count: None,
+            tail_tool_output_hash_like_count: None,
+            tail_tool_output_json_like_chars: None,
+            tail_tool_output_noise_hint: None,
+            tail_source: None,
+            response_session_reused: Some(used_response_session),
+            response_session_candidate_count: Some(
+                response_session_reuse_diagnostics.candidate_count,
+            ),
+            response_session_skip_reason: response_session_reuse_diagnostics.skip_reason.clone(),
+            response_session_exact_key_hit: Some(response_session_reuse_diagnostics.exact_key_hit),
+            response_session_scope_match_count: Some(
+                response_session_reuse_diagnostics.scope_match_count,
+            ),
+            response_session_append_delta_match: Some(
+                response_session_reuse_diagnostics.append_delta_match,
+            ),
+            response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+            response_session_cooldown_active: Some(
+                response_session_reuse_diagnostics.cooldown_active,
+            ),
+            response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
+            session_anchor_hash: None,
+            session_anchor_source: None,
+            session_anchor_changed: None,
+            session_anchor_peer_count: None,
+            original_body_bytes: Some(original_body_bytes),
+            send_body_bytes: Some(send_body_bytes),
+            send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
+            payload_too_large_rescue_attempted: Some(
+                body_diagnostics.payload_too_large_rescue_attempted,
+            ),
+            payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
+            sse_end_reason: None,
+            sse_completed_event_seen: None,
+            sse_done_marker_seen: None,
+            sse_chunks: None,
+        })
+        .await;
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn record_upstream_transport_failure(
     state: &AppState,
@@ -6826,6 +7939,7 @@ async fn record_upstream_transport_failure(
     body: &Value,
     used_response_session: bool,
     response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    requested_model: Option<String>,
     source: &str,
 ) {
     let elapsed = started.elapsed().as_millis() as u64;
@@ -6841,125 +7955,133 @@ async fn record_upstream_transport_failure(
         body_bytes
     };
 
-    state
-        .metrics
-        .record_request(
-            RequestLog {
-                id: request_id.to_string(),
-                at: Utc::now(),
-                inbound_request_id: Some(request_id.to_string()),
-                upstream_request_id: Some(Uuid::new_v4().to_string()),
-                upstream_attempt_index: Some(1),
-                upstream_attempt_total: Some(1),
-                client_channel: client_channel.label().to_string(),
-                upstream_channel: upstream_channel.label().to_string(),
-                provider: decision.provider.name.clone(),
-                model: decision.model.clone(),
-                cache_status: "error".to_string(),
-                agent_id: None,
-                agent_label: None,
-                upstream_call_kind: Some(
-                    if request_body_stream_flag(body) {
-                        "stream"
-                    } else {
-                        "sync"
-                    }
-                    .to_string(),
-                ),
-                upstream_call_source: Some(source.to_string()),
-                cache_key: cache_key.map(ToOwned::to_owned),
-                provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
-                provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
-                provider_cache_diagnostic: None,
-                prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
-                prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
-                prefix_guard_wait_source: prefix_guard_wait.source.clone(),
-                prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
-                prefix_guard_wait_effect: None,
-                prefix_lag_classification: None,
-                prefix_lag_input_delta_tokens: None,
-                prefix_lag_cache_delta_tokens: None,
-                prefix_lag_previous_gap_tokens: None,
-                prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
-                prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
-                prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
-                status: 0,
-                ttft_ms: elapsed,
-                upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
-                local_prepare_ms: Some(local_prepare_ms),
-                upstream_headers_ms: Some(0),
-                upstream_first_chunk_ms: None,
-                aggregate_done_ms: None,
-                upstream_retry_wait_ms: Some(0),
-                upstream_attempts: Some(1),
-                request_body_bytes: Some(body_bytes),
-                sent_body_bytes: Some(body_bytes),
-                gzip_attempted: Some(false),
-                gzip_fallback_used: Some(false),
-                upstream_header_wait_class: Some("transport_error".to_string()),
-                total_ms: elapsed,
-                input_tokens: None,
-                output_tokens: None,
-                cache_read_tokens: None,
-                cache_shortfall_tokens: None,
-                cache_new_tail_gap_tokens: None,
-                cache_avoidable_gap_tokens: None,
-                provider_cache_token_ratio: None,
-                tail_input_items: None,
-                tail_message_chars: None,
-                tail_tool_call_chars: None,
-                tail_tool_output_chars: None,
-                tail_largest_tool_output_chars: None,
-                tail_tool_output_lines: None,
-                tail_tool_output_repeated_line_chars: None,
-                tail_tool_output_timestamp_like_count: None,
-                tail_tool_output_path_like_count: None,
-                tail_tool_output_url_like_count: None,
-                tail_tool_output_hash_like_count: None,
-                tail_tool_output_json_like_chars: None,
-                tail_tool_output_noise_hint: None,
-                tail_source: None,
-                response_session_reused: Some(used_response_session),
-                response_session_candidate_count: Some(
-                    response_session_reuse_diagnostics.candidate_count,
-                ),
-                response_session_skip_reason: response_session_reuse_diagnostics
-                    .skip_reason
-                    .clone(),
-                response_session_exact_key_hit: Some(
-                    response_session_reuse_diagnostics.exact_key_hit,
-                ),
-                response_session_scope_match_count: Some(
-                    response_session_reuse_diagnostics.scope_match_count,
-                ),
-                response_session_append_delta_match: Some(
-                    response_session_reuse_diagnostics.append_delta_match,
-                ),
-                response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
-                response_session_cooldown_active: Some(
-                    response_session_reuse_diagnostics.cooldown_active,
-                ),
-                response_session_rejected_status: response_session_reuse_diagnostics
-                    .rejected_status,
-                session_anchor_hash: None,
-                session_anchor_source: None,
-                session_anchor_changed: None,
-                session_anchor_peer_count: None,
-                original_body_bytes: Some(original_body_bytes),
-                send_body_bytes: Some(send_body_bytes),
-                send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
-                payload_too_large_rescue_attempted: Some(
-                    body_diagnostics.payload_too_large_rescue_attempted,
-                ),
-                payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
-                sse_end_reason: Some("transport_error".to_string()),
-                sse_completed_event_seen: None,
-                sse_done_marker_seen: None,
-                sse_chunks: None,
-            },
-            true,
-        )
-        .await;
+    let log = RequestLog {
+        id: request_id.to_string(),
+        at: Utc::now(),
+        inbound_request_id: Some(request_id.to_string()),
+        upstream_request_id: Some(Uuid::new_v4().to_string()),
+        upstream_attempt_index: Some(1),
+        upstream_attempt_total: Some(1),
+        client_channel: client_channel.label().to_string(),
+        upstream_channel: upstream_channel.label().to_string(),
+        provider: decision.provider.name.clone(),
+        model: decision.model.clone(),
+        requested_model,
+        agent_reasoning_effort: body_diagnostics.reasoning.agent.clone(),
+        configured_reasoning_effort: body_diagnostics.reasoning.configured.clone(),
+        effective_reasoning_effort: body_diagnostics.reasoning.effective.clone(),
+        reasoning_effort_source: body_diagnostics.reasoning.source.clone(),
+        cache_status: "error".to_string(),
+        agent_id: None,
+        agent_label: None,
+        upstream_call_kind: Some(
+            if request_body_stream_flag(body) {
+                "stream"
+            } else {
+                "sync"
+            }
+            .to_string(),
+        ),
+        upstream_call_source: Some(source.to_string()),
+        cache_key: cache_key.map(ToOwned::to_owned),
+        provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
+        provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
+        provider_cache_diagnostic: None,
+        prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
+        prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
+        prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+        prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
+        prefix_guard_wait_effect: None,
+        prefix_lag_classification: None,
+        prefix_lag_input_delta_tokens: None,
+        prefix_lag_cache_delta_tokens: None,
+        prefix_lag_previous_gap_tokens: None,
+        prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
+        prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
+        prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
+        status: 0,
+        ttft_ms: elapsed,
+        upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
+        local_prepare_ms: Some(local_prepare_ms),
+        upstream_headers_ms: Some(0),
+        upstream_last_attempt_headers_ms: Some(0),
+        upstream_http_version: None,
+        upstream_server_timing: None,
+        upstream_timing_source: None,
+        upstream_reported_processing_ms: None,
+        upstream_non_processing_ms: None,
+        upstream_first_chunk_ms: None,
+        stream_upstream_wait_ms: None,
+        stream_client_backpressure_ms: None,
+        aggregate_done_ms: None,
+        upstream_retry_wait_ms: Some(0),
+        upstream_attempts: Some(1),
+        request_body_bytes: Some(body_bytes),
+        sent_body_bytes: Some(body_bytes),
+        gzip_attempted: Some(false),
+        gzip_fallback_used: Some(false),
+        upstream_header_wait_class: Some(format!(
+            "{}:transport_error",
+            if decision.provider.use_system_proxy {
+                "system-proxy"
+            } else {
+                "direct"
+            }
+        )),
+        total_ms: elapsed,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_shortfall_tokens: None,
+        cache_new_tail_gap_tokens: None,
+        cache_avoidable_gap_tokens: None,
+        cache_provider_unstable_gap_tokens: None,
+        provider_cache_token_ratio: None,
+        tail_input_items: None,
+        tail_message_chars: None,
+        tail_tool_call_chars: None,
+        tail_tool_output_chars: None,
+        tail_largest_tool_output_chars: None,
+        tail_tool_output_lines: None,
+        tail_tool_output_repeated_line_chars: None,
+        tail_tool_output_timestamp_like_count: None,
+        tail_tool_output_path_like_count: None,
+        tail_tool_output_url_like_count: None,
+        tail_tool_output_hash_like_count: None,
+        tail_tool_output_json_like_chars: None,
+        tail_tool_output_noise_hint: None,
+        tail_source: None,
+        response_session_reused: Some(used_response_session),
+        response_session_candidate_count: Some(response_session_reuse_diagnostics.candidate_count),
+        response_session_skip_reason: response_session_reuse_diagnostics.skip_reason.clone(),
+        response_session_exact_key_hit: Some(response_session_reuse_diagnostics.exact_key_hit),
+        response_session_scope_match_count: Some(
+            response_session_reuse_diagnostics.scope_match_count,
+        ),
+        response_session_append_delta_match: Some(
+            response_session_reuse_diagnostics.append_delta_match,
+        ),
+        response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+        response_session_cooldown_active: Some(response_session_reuse_diagnostics.cooldown_active),
+        response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
+        session_anchor_hash: None,
+        session_anchor_source: None,
+        session_anchor_changed: None,
+        session_anchor_peer_count: None,
+        original_body_bytes: Some(original_body_bytes),
+        send_body_bytes: Some(send_body_bytes),
+        send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
+        payload_too_large_rescue_attempted: Some(
+            body_diagnostics.payload_too_large_rescue_attempted,
+        ),
+        payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
+        sse_end_reason: Some("transport_error".to_string()),
+        sse_completed_event_seen: None,
+        sse_done_marker_seen: None,
+        sse_chunks: None,
+    };
+    state.metrics.record_upstream_call(log.clone()).await;
+    state.metrics.record_request(log, true).await;
 }
 
 async fn lookup_cache(
@@ -6997,6 +8119,7 @@ async fn cache_hit_response(
     request_id: String,
     client_channel: &Channel,
     decision: &RouteDecision,
+    requested_model: Option<String>,
     non_sse_compact_compat: bool,
 ) -> Response {
     let cache_status = match hit.status {
@@ -7024,6 +8147,11 @@ async fn cache_hit_response(
                 upstream_channel: decision.upstream_channel.label().to_string(),
                 provider: decision.provider.name.clone(),
                 model: decision.model.clone(),
+                requested_model,
+                agent_reasoning_effort: None,
+                configured_reasoning_effort: None,
+                effective_reasoning_effort: None,
+                reasoning_effort_source: None,
                 cache_status: cache_status.to_string(),
                 agent_id: None,
                 agent_label: None,
@@ -7050,7 +8178,15 @@ async fn cache_hit_response(
                 upstream_ttft_ms: Some(0),
                 local_prepare_ms: None,
                 upstream_headers_ms: None,
+                upstream_last_attempt_headers_ms: None,
+                upstream_http_version: None,
+                upstream_server_timing: None,
+                upstream_timing_source: None,
+                upstream_reported_processing_ms: None,
+                upstream_non_processing_ms: None,
                 upstream_first_chunk_ms: None,
+                stream_upstream_wait_ms: None,
+                stream_client_backpressure_ms: None,
                 aggregate_done_ms: None,
                 upstream_retry_wait_ms: None,
                 upstream_attempts: None,
@@ -7074,6 +8210,7 @@ async fn cache_hit_response(
                     .then_some(provider_cache_shortfall(&cached_usage)),
                 cache_new_tail_gap_tokens: None,
                 cache_avoidable_gap_tokens: None,
+                cache_provider_unstable_gap_tokens: None,
                 provider_cache_token_ratio: provider_cache_ratio(&cached_usage),
                 tail_input_items: None,
                 tail_message_chars: None,
@@ -7537,10 +8674,13 @@ async fn try_retry_with_next_provider_key(
 
 async fn send_main_upstream_request(
     state: &AppState,
+    use_system_proxy: bool,
     url: &str,
     api_key: &str,
     channel: &Channel,
     body: &Value,
+    inbound_headers: &HeaderMap,
+    custom_user_agent: Option<&str>,
     sync_responses_main: bool,
     request_body_gzip_enabled: bool,
     no_internal_retry: bool,
@@ -7549,22 +8689,134 @@ async fn send_main_upstream_request(
     let max_attempts = Some(1);
     send_upstream_request_to_url_with_diagnostics(
         state,
+        use_system_proxy,
         url,
         api_key,
         channel,
         body,
+        inbound_headers,
+        custom_user_agent,
         max_attempts,
         request_body_gzip_enabled,
     )
     .await
 }
 
+fn build_upstream_request_headers(
+    inbound_headers: &HeaderMap,
+    api_key: &str,
+    channel: &Channel,
+    stream: bool,
+    custom_user_agent: Option<&str>,
+    content_encoding_gzip: bool,
+) -> HeaderMap {
+    let mut outbound = HeaderMap::new();
+    for (name, value) in inbound_headers {
+        let name_text = name.as_str();
+        if upstream_header_is_blocked(name_text)
+            || name == header::CONTENT_TYPE
+            || name == header::CONTENT_ENCODING
+            || name == header::ACCEPT_ENCODING
+            || (name == header::USER_AGENT && custom_user_agent.is_some())
+        {
+            continue;
+        }
+        outbound.append(name.clone(), value.clone());
+    }
+
+    outbound.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!("Bearer {api_key}")) {
+        outbound.insert(header::AUTHORIZATION, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(api_key) {
+        outbound.insert("x-api-key", value);
+    }
+    if let Some(user_agent) = custom_user_agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        outbound.insert(header::USER_AGENT, user_agent);
+    }
+    if stream {
+        outbound.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+    }
+    outbound.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    if content_encoding_gzip {
+        outbound.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+    }
+    if matches!(channel, Channel::Anthropic) && !outbound.contains_key("anthropic-version") {
+        outbound.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+    }
+    outbound
+}
+
+fn upstream_header_is_blocked(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "authorization"
+            | "x-api-key"
+            | "x-goog-api-key"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-port"
+            | "x-forwarded-proto"
+            | "cf-connecting-ip"
+            | "cf-ipcountry"
+            | "cf-ray"
+            | "cf-visitor"
+            | "true-client-ip"
+            | "fastly-client-ip"
+            | "x-azure-clientip"
+            | "x-azure-fdid"
+            | "x-azure-ref"
+            | "akamai-origin-hop"
+            | "x-akamai-config-log-detail"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "x-trace-id"
+            | "x-amzn-trace-id"
+            | "x-b3-traceid"
+            | "x-b3-spanid"
+            | "x-b3-parentspanid"
+            | "x-b3-sampled"
+            | "b3"
+            | "traceparent"
+            | "tracestate"
+    ) || name.starts_with("x-forwarded-")
+        || name.starts_with("cf-")
+        || name.starts_with("x-b3-")
+}
+
 async fn send_upstream_request_to_url_with_diagnostics(
     state: &AppState,
+    use_system_proxy: bool,
     url: &str,
     api_key: &str,
     channel: &Channel,
     body: &Value,
+    inbound_headers: &HeaderMap,
+    custom_user_agent: Option<&str>,
     max_attempts_override: Option<usize>,
     request_body_gzip_enabled: bool,
 ) -> reqwest::Result<UpstreamSendOutcome> {
@@ -7577,14 +8829,20 @@ async fn send_upstream_request_to_url_with_diagnostics(
     let gzip_cooldown_key = request_body_gzip_cooldown_key(url, channel);
     let gzip_cooldown_active = request_body_gzip_enabled
         && request_body_gzip_cooldown_active(state, &gzip_cooldown_key).await;
+    let gzip_threshold = request_body_gzip_threshold_bytes(channel);
     let use_gzip =
-        request_body_gzip_enabled && !gzip_cooldown_active && original_body.len() >= 614_400;
+        request_body_gzip_enabled && !gzip_cooldown_active && original_body.len() >= gzip_threshold;
     let compressed_body = if use_gzip {
         gzip_request_body(&original_body).ok()
     } else {
         None
     };
     let mut diagnostics = UpstreamRequestDiagnostics {
+        network_path: if use_system_proxy {
+            "system-proxy"
+        } else {
+            "direct"
+        },
         request_body_bytes: original_body_len,
         gzip_attempted: compressed_body.is_some(),
         sent_body_bytes: compressed_body
@@ -7601,24 +8859,21 @@ async fn send_upstream_request_to_url_with_diagnostics(
             state.metrics.record_retry().await;
         }
 
-        let mut request = state
-            .client
-            .post(url)
-            .header(header::CONTENT_TYPE, "application/json")
-            .bearer_auth(api_key)
-            .header("x-api-key", api_key);
-        if request_body_stream_flag(body) {
-            request = request
-                .header(header::ACCEPT, "text/event-stream")
-                .header(header::ACCEPT_ENCODING, "identity");
-        }
-        if matches!(channel, Channel::Anthropic) {
-            request = request.header("anthropic-version", "2023-06-01");
-        }
-
         let sending_gzip = compressed_body.is_some() && !gzip_disabled_after_fallback;
+        let outbound_headers = build_upstream_request_headers(
+            inbound_headers,
+            api_key,
+            channel,
+            request_body_stream_flag(body),
+            custom_user_agent,
+            sending_gzip,
+        );
+        let request = state
+            .upstream_client(use_system_proxy)
+            .post(url)
+            .headers(outbound_headers);
         let request = if sending_gzip {
-            request.header(header::CONTENT_ENCODING, "gzip").body(
+            request.body(
                 compressed_body
                     .clone()
                     .unwrap_or_else(|| original_body.clone()),
@@ -7632,7 +8887,9 @@ async fn send_upstream_request_to_url_with_diagnostics(
         let send_started = Instant::now();
         match request.send().await {
             Ok(response) => {
-                diagnostics.headers_ms += send_started.elapsed().as_millis() as u64;
+                let headers_ms = send_started.elapsed().as_millis() as u64;
+                diagnostics.headers_ms += headers_ms;
+                observe_upstream_response_timing(&mut diagnostics, &response, headers_ms);
                 if sending_gzip && should_retry_without_gzip(response.status()) {
                     note_request_body_gzip_fallback(state, &gzip_cooldown_key).await;
                     if attempt + 1 < max_attempts {
@@ -7663,7 +8920,14 @@ async fn send_upstream_request_to_url_with_diagnostics(
                 });
             }
             Err(err) => {
-                diagnostics.headers_ms += send_started.elapsed().as_millis() as u64;
+                let headers_ms = send_started.elapsed().as_millis() as u64;
+                diagnostics.headers_ms += headers_ms;
+                diagnostics.last_attempt_headers_ms = headers_ms;
+                diagnostics.http_version = None;
+                diagnostics.server_timing = None;
+                diagnostics.timing_source = None;
+                diagnostics.reported_processing_ms = None;
+                diagnostics.non_processing_ms = None;
                 if attempt + 1 >= max_attempts {
                     return Err(err);
                 }
@@ -7896,6 +9160,7 @@ async fn stream_upstream(
     codex_chat_tool_context: Option<transform_codex_chat::CodexToolContext>,
     agent_log_id: Option<String>,
     agent_log_label: Option<String>,
+    requested_model: Option<String>,
     prefix_guard_wait: PrefixGuardWaitDiagnostics,
     local_prepare_ms: u64,
     upstream_request_diagnostics: UpstreamRequestDiagnostics,
@@ -7929,6 +9194,8 @@ async fn stream_upstream(
     let mut stream_metadata = SseStreamMetadataCollector::default();
     let mut sse_chunks = 0u64;
     let mut sse_end_reason = "upstream_eof".to_string();
+    let mut stream_upstream_wait_ms = 0u64;
+    let mut stream_client_backpressure_ms = 0u64;
     let state_for_stream = state.clone();
     let response_content_type = if convert_codex_chat_sse_to_responses_sse {
         "text/event-stream".to_string()
@@ -7937,7 +9204,14 @@ async fn stream_upstream(
     };
     let content_type_for_cache = response_content_type.clone();
     let stream_body = async_stream::stream! {
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let upstream_wait_started = Instant::now();
+            let next_chunk = stream.next().await;
+            stream_upstream_wait_ms = stream_upstream_wait_ms
+                .saturating_add(upstream_wait_started.elapsed().as_millis() as u64);
+            let Some(chunk) = next_chunk else {
+                break;
+            };
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(err) => {
@@ -7957,7 +9231,10 @@ async fn stream_upstream(
             if eligible {
                 cache_body.extend_from_slice(&chunk);
             }
+            let client_backpressure_started = Instant::now();
             yield Ok::<Bytes, Infallible>(chunk);
+            stream_client_backpressure_ms = stream_client_backpressure_ms
+                .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
         }
         stream_metadata.finish();
         if stream_metadata.error_event_seen && sse_end_reason == "upstream_eof" {
@@ -7972,7 +9249,7 @@ async fn stream_upstream(
                 .await;
         }
         let total_ms = started.elapsed().as_millis() as u64;
-        let usage_record = if stream_success_for_cache {
+        let usage_observation = if stream_success_for_cache {
             collect_provider_usage_from_record(
                 &state_for_stream,
                 stream_metadata.usage.clone(),
@@ -7983,6 +9260,10 @@ async fn stream_upstream(
         } else {
             None
         };
+        let usage_record = usage_observation.as_ref().map(|item| item.raw.clone());
+        let prefix_usage_record = usage_observation
+            .as_ref()
+            .map(|item| item.effective.clone());
         if stream_success_for_cache {
             update_response_session_with_id(
                 &state_for_stream,
@@ -7992,12 +9273,13 @@ async fn stream_upstream(
                 stream_metadata.response_id.clone(),
             ).await;
         }
-        let gap_breakdown = provider_cache_gap_breakdown(
+        let gap_breakdown = provider_cache_gap_breakdown_with_guard(
             &state_for_stream,
             prefix_state_key.as_deref(),
             provider_prefix_family_key.as_deref(),
             usage_record.as_ref(),
             Some(&tail_input_diagnostics),
+            Some(&prefix_guard_wait),
         ).await;
         let prefix_lag = prefix_lag_diagnostics(
             &state_for_stream,
@@ -8008,14 +9290,15 @@ async fn stream_upstream(
             &tail_input_diagnostics,
         ).await;
         let session_cache_regressed = if stream_success_for_cache {
-            update_provider_prefix_state_with_tail(
+            update_provider_prefix_state_with_tail_and_guard(
                 &state_for_stream,
                 prefix_state_key.as_deref(),
                 provider_prefix_family_key.as_deref(),
-                usage_record.as_ref(),
+                prefix_usage_record.as_ref(),
                 &tail_input_diagnostics,
                 used_response_session,
                 retried_full_response,
+                prefix_guard_wait.budget_exhausted,
             ).await
         } else {
             false
@@ -8051,6 +9334,11 @@ async fn stream_upstream(
                 upstream_channel: decision.upstream_channel.label().to_string(),
                 provider: decision.provider.name.clone(),
                 model: decision.model.clone(),
+                requested_model,
+                agent_reasoning_effort: None,
+                configured_reasoning_effort: None,
+                effective_reasoning_effort: None,
+                reasoning_effort_source: None,
                 cache_status: if stream_success_for_cache {
                     if eligible { "miss" } else { "bypass" }
                 } else {
@@ -8088,7 +9376,18 @@ async fn stream_upstream(
                 )),
                 local_prepare_ms: Some(local_prepare_ms),
                 upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
+                upstream_last_attempt_headers_ms: Some(
+                    upstream_request_diagnostics.last_attempt_headers_ms,
+                ),
+                upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+                upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
+                upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
+                upstream_reported_processing_ms: upstream_request_diagnostics
+                    .reported_processing_ms,
+                upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
                 upstream_first_chunk_ms: Some(upstream_first_chunk_ms),
+                stream_upstream_wait_ms: Some(stream_upstream_wait_ms),
+                stream_client_backpressure_ms: Some(stream_client_backpressure_ms),
                 aggregate_done_ms: None,
                 upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
                 upstream_attempts: Some(upstream_request_diagnostics.attempts),
@@ -8108,6 +9407,9 @@ async fn stream_upstream(
                 cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
                 cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
                 cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
+                cache_provider_unstable_gap_tokens: gap_breakdown
+                    .as_ref()
+                    .map(|gap| gap.provider_unstable_tokens),
                 provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
                 tail_input_items: None,
                 tail_message_chars: None,
@@ -8163,6 +9465,7 @@ async fn stream_upstream(
         apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
         apply_body_diagnostics(&mut request_log, &diagnostics);
         apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
+        state_for_stream.metrics.record_upstream_call(request_log.clone()).await;
         state_for_stream.metrics.record_request(request_log, true).await;
         if eligible && stream_success_for_cache {
             insert_cache_entries(
@@ -8412,12 +9715,13 @@ fn apply_provider_route_affinity(
         .map(str::trim)
         .filter(|model| !model.is_empty());
     let model = if let Some(requested_model) = requested_model {
-        if !provider_supports_requested_model(provider, Some(requested_model)) {
+        if let Some(model) = resolve_provider_model_id(provider, requested_model) {
+            model
+        } else {
             return decision;
         }
-        requested_model.to_string()
-    } else if provider_supports_requested_model(provider, Some(&decision.model)) {
-        decision.model.clone()
+    } else if let Some(model) = resolve_provider_model_id(provider, &decision.model) {
+        model
     } else if let Some(model) = provider
         .models
         .iter()
@@ -8502,11 +9806,7 @@ fn decide_route(
 
     let requested_model_provider = requested_model.as_deref().and_then(|model| {
         config.providers.iter().find(|provider| {
-            provider.enabled
-                && provider
-                    .models
-                    .iter()
-                    .any(|item| item.enabled && item.id == model)
+            provider.enabled && provider_supports_requested_model(provider, Some(model))
         })
     });
 
@@ -8530,12 +9830,9 @@ fn decide_route(
 
     let agent_model = authorized_agent
         .and_then(|agent| agent.model_id.clone())
-        .filter(|model| provider_supports_requested_model(provider, Some(model)));
-    let requested_model_for_provider = if agent_provider.is_some() {
-        requested_model
-    } else {
-        requested_model.filter(|model| provider_supports_requested_model(provider, Some(model)))
-    };
+        .and_then(|model| resolve_provider_model_id(provider, &model));
+    let requested_model_for_provider =
+        requested_model.and_then(|model| resolve_provider_model_id(provider, &model));
 
     let model = requested_model_for_provider
         .or(agent_model)
@@ -8599,17 +9896,178 @@ fn provider_supports_requested_model(
     let Some(model) = requested_model else {
         return true;
     };
-    provider.models.is_empty()
-        || provider
-            .models
-            .iter()
-            .any(|item| item.enabled && item.id == model)
+    resolve_provider_model_id(provider, model).is_some()
+}
+
+fn resolve_provider_model_id(provider: &ProviderConfig, requested_model: &str) -> Option<String> {
+    let requested = requested_model.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    if provider.models.is_empty() {
+        return Some(requested.to_string());
+    }
+    if let Some(model) = provider
+        .models
+        .iter()
+        .find(|item| item.enabled && item.id == requested)
+    {
+        return Some(model.id.clone());
+    }
+    if let Some(model) = provider.models.iter().find(|item| {
+        item.enabled
+            && model_request_alias(item)
+                .map(|alias| alias == requested)
+                .unwrap_or(false)
+    }) {
+        return Some(model.id.clone());
+    }
+    let requested_alias = requested.to_ascii_lowercase();
+    provider
+        .models
+        .iter()
+        .find(|item| {
+            item.enabled
+                && model_request_alias(item)
+                    .map(|alias| alias.to_ascii_lowercase() == requested_alias)
+                    .unwrap_or(false)
+        })
+        .or_else(|| {
+            provider.models.iter().find(|item| {
+                item.enabled
+                    && codex_model_alias(&item.id)
+                        .map(|alias| alias == requested_alias)
+                        .unwrap_or(false)
+            })
+        })
+        .map(|model| model.id.clone())
 }
 
 fn set_request_model(request: &mut Value, model: &str) {
     if let Some(object) = request.as_object_mut() {
         object.insert("model".to_string(), Value::String(model.to_string()));
     }
+}
+
+fn apply_model_reasoning_effort(
+    client_request: &Value,
+    upstream_request: &mut Value,
+    upstream_channel: &Channel,
+    decision: &RouteDecision,
+) -> ReasoningEffortDiagnostics {
+    let agent = request_reasoning_effort(client_request);
+    let model = decision
+        .provider
+        .models
+        .iter()
+        .find(|model| model.id == decision.model)
+        .or_else(|| {
+            decision.provider.models.iter().find(|model| {
+                model_request_alias(model)
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&decision.model))
+            })
+        });
+    let configured = model
+        .filter(|model| model.reasoning_effort_override_enabled)
+        .and_then(|model| model.reasoning_effort.as_deref())
+        .and_then(normalize_request_reasoning_effort);
+    let (effective, source) = if let Some(configured) = configured.clone() {
+        let downgrade_ultra = configured == "ultra"
+            && model.is_some_and(|model| {
+                model
+                    .supported_reasoning_efforts
+                    .iter()
+                    .any(|effort| effort == "max")
+                    && !model
+                        .supported_reasoning_efforts
+                        .iter()
+                        .any(|effort| effort == "ultra")
+            });
+        if downgrade_ultra {
+            (
+                Some("max".to_string()),
+                Some("model_override_ultra_to_max".to_string()),
+            )
+        } else {
+            (Some(configured), Some("model_override".to_string()))
+        }
+    } else if agent.is_some() {
+        (agent.clone(), Some("agent".to_string()))
+    } else {
+        (None, Some("agent_default".to_string()))
+    };
+
+    if let Some(effective) = effective.as_deref() {
+        set_request_reasoning_effort(upstream_request, upstream_channel, effective);
+    }
+
+    ReasoningEffortDiagnostics {
+        agent,
+        configured,
+        effective,
+        source,
+    }
+}
+
+fn request_reasoning_effort(request: &Value) -> Option<String> {
+    [
+        request.pointer("/reasoning/effort"),
+        request.get("reasoning_effort"),
+        request.pointer("/thinking/effort"),
+        request.pointer("/thinking/level"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .and_then(normalize_request_reasoning_effort)
+}
+
+fn normalize_request_reasoning_effort(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "disabled" => Some("none".to_string()),
+        normalized => normalize_reasoning_effort(normalized),
+    }
+}
+
+fn set_request_reasoning_effort(request: &mut Value, channel: &Channel, effort: &str) {
+    let Some(object) = request.as_object_mut() else {
+        return;
+    };
+    match channel {
+        Channel::Responses => {
+            object.remove("reasoning_effort");
+            let reasoning = object
+                .entry("reasoning".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !reasoning.is_object() {
+                *reasoning = Value::Object(Map::new());
+            }
+            if let Some(reasoning) = reasoning.as_object_mut() {
+                reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+            }
+        }
+        Channel::Chat => {
+            object.insert(
+                "reasoning_effort".to_string(),
+                Value::String(effort.to_string()),
+            );
+            if let Some(reasoning) = object.get_mut("reasoning").and_then(Value::as_object_mut) {
+                reasoning.remove("effort");
+                if reasoning.is_empty() {
+                    object.remove("reasoning");
+                }
+            }
+        }
+        Channel::Anthropic => {}
+    }
+}
+
+fn requested_model_for_log(request: &Value, upstream_model: &str) -> Option<String> {
+    let requested = request.get("model").and_then(Value::as_str)?.trim();
+    if requested.is_empty() || requested == upstream_model.trim() {
+        return None;
+    }
+    Some(requested.to_string())
 }
 
 fn request_agent_log_fields(
@@ -8663,6 +10121,25 @@ fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &
             add_anthropic_cache_control(request);
         }
     }
+}
+
+fn copy_responses_prefix_cache_fields_for_native_stream(
+    outbound: &mut Value,
+    prefix_body: &Value,
+    config: &AppConfig,
+    decision: &RouteDecision,
+) {
+    strip_provider_cache_key_fields(outbound);
+    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+        return;
+    }
+    let Some(cache_key) = openai_prompt_cache_key(prefix_body) else {
+        return;
+    };
+    if let Some(object) = outbound.as_object_mut() {
+        object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
+    }
+    apply_openai_prompt_cache_retention(outbound, decision);
 }
 
 fn stabilize_responses_provider_prefix(request: &mut Value) {
@@ -9204,15 +10681,32 @@ fn provider_prompt_cache_key(
     request: &Value,
     channel: &Channel,
 ) -> String {
+    let model_key = provider_prefix_model_key(decision);
     let mut hasher = Sha256::new();
     hasher.update(config.workspace_fingerprint.as_bytes());
     hasher.update(b"\0");
-    hasher.update(decision.model.as_bytes());
+    hasher.update(model_key.as_bytes());
     hasher.update(b"\0");
     hasher.update(channel.label().as_bytes());
     hasher.update(b"\0");
-    hasher.update(provider_prefix_sample(request, channel).as_bytes());
+    hasher.update(provider_prompt_cache_key_material(request, channel).as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn provider_prompt_cache_key_material(request: &Value, channel: &Channel) -> String {
+    if !matches!(channel, Channel::Responses) {
+        return provider_prefix_sample(request, channel);
+    }
+
+    let mut material = request.clone();
+    strip_provider_cache_key_fields(&mut material);
+    strip_provider_prefix_context_fields(&mut material);
+    canonicalize_responses_instruction_shape(&mut material);
+    strip_response_session_volatile_fields(&mut material);
+    trim_response_session_input_to_anchor(&mut material);
+    stabilize_responses_provider_prefix(&mut material);
+    canonicalize_object_keys(&mut material, "$.provider_prompt_cache_key");
+    serialize_responses_body_for_provider_prefix(&material)
 }
 
 fn provider_prompt_cache_key_for_outbound(
@@ -9254,11 +10748,12 @@ fn provider_prefix_sample(request: &Value, channel: &Channel) -> String {
 
     let mut prefix = request.clone();
     strip_provider_cache_key_fields(&mut prefix);
+    strip_provider_prefix_context_fields(&mut prefix);
     match channel {
         Channel::Responses => {
             canonicalize_responses_instruction_shape(&mut prefix);
             stabilize_responses_provider_prefix(&mut prefix);
-            trim_responses_provider_cache_tail_to_session_anchor(&mut prefix);
+            strip_responses_dynamic_provider_cache_tail(&mut prefix);
             canonicalize_object_keys(&mut prefix, "$.provider_prefix_sample");
         }
         Channel::Chat => {
@@ -9284,6 +10779,7 @@ fn provider_prefix_fingerprint_sample(request: &Value, channel: &Channel) -> Str
 
     let mut prefix = request.clone();
     strip_provider_cache_key_fields(&mut prefix);
+    strip_provider_prefix_context_fields(&mut prefix);
     match channel {
         Channel::Responses => {
             canonicalize_responses_instruction_shape(&mut prefix);
@@ -9307,6 +10803,12 @@ fn provider_prefix_fingerprint_sample(request: &Value, channel: &Channel) -> Str
         serde_json::to_string(&prefix).unwrap_or_else(|_| "null".to_string())
     };
     serialized.chars().take(SAMPLE_CHARS).collect()
+}
+
+fn strip_provider_prefix_context_fields(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("model");
+    }
 }
 
 fn strip_responses_dynamic_provider_cache_tail(value: &mut Value) {
@@ -10058,6 +11560,9 @@ fn chat_to_responses_request(request: &Value) -> Value {
         ],
     );
     copy_max_tokens(request, &mut object, "max_output_tokens");
+    if let Some(effort) = request_reasoning_effort(request) {
+        object.insert("reasoning".to_string(), json!({ "effort": effort }));
+    }
     if let Some(stop) = request.get("stop").cloned() {
         object.insert("stop".to_string(), stop);
     }
@@ -10139,6 +11644,9 @@ fn responses_to_chat_request(request: &Value) -> Value {
         ],
     );
     copy_max_tokens(request, &mut object, "max_tokens");
+    if let Some(effort) = request_reasoning_effort(request) {
+        object.insert("reasoning_effort".to_string(), Value::String(effort));
+    }
     if let Some(stop) = request.get("stop").cloned() {
         object.insert("stop".to_string(), stop);
     }
@@ -11309,13 +12817,19 @@ fn collect_provider_usage_for_diagnostics(
     Some(record)
 }
 
+#[derive(Debug, Clone)]
+struct ProviderUsageObservation {
+    raw: UsageRecord,
+    effective: UsageRecord,
+}
+
 async fn collect_provider_usage(
     state: &AppState,
     bytes: &[u8],
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
     used_response_session: bool,
-) -> Option<UsageRecord> {
+) -> Option<ProviderUsageObservation> {
     let mut record = provider_usage_from_bytes(bytes);
     if !record.has_usage() {
         return None;
@@ -11331,9 +12845,12 @@ async fn collect_provider_usage(
         used_response_session,
     )
     .await;
-    record = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
+    let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
     state.metrics.record_usage(record.clone()).await;
-    Some(record)
+    Some(ProviderUsageObservation {
+        raw: record,
+        effective,
+    })
 }
 
 async fn collect_provider_usage_from_record(
@@ -11342,7 +12859,7 @@ async fn collect_provider_usage_from_record(
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
     used_response_session: bool,
-) -> Option<UsageRecord> {
+) -> Option<ProviderUsageObservation> {
     if !record.has_usage() {
         return None;
     }
@@ -11357,9 +12874,12 @@ async fn collect_provider_usage_from_record(
         used_response_session,
     )
     .await;
-    record = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
+    let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
     state.metrics.record_usage(record.clone()).await;
-    Some(record)
+    Some(ProviderUsageObservation {
+        raw: record,
+        effective,
+    })
 }
 
 async fn provider_usage_is_response_session_delta(
@@ -11459,7 +12979,7 @@ fn responses_session_key(
     hasher.update(b"\0");
     hasher.update(decision.provider.id.as_bytes());
     hasher.update(b"\0");
-    hasher.update(decision.model.as_bytes());
+    hasher.update(provider_prefix_model_key(decision).as_bytes());
     hasher.update(b"\0");
     hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
     Some(format!("{:x}", hasher.finalize()))
@@ -11486,7 +13006,7 @@ fn responses_session_scope_key(
     hasher.update(b"\0");
     hasher.update(decision.provider.id.as_bytes());
     hasher.update(b"\0");
-    hasher.update(decision.model.as_bytes());
+    hasher.update(provider_prefix_model_key(decision).as_bytes());
     hasher.update(b"\0");
     hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
     Some(format!("{:x}", hasher.finalize()))
@@ -11667,6 +13187,7 @@ mod tests {
     use super::*;
     use crate::{
         cache::{cache_path, CacheStore},
+        config::ModelConfig,
         state::AppState,
     };
     use axum::http::HeaderValue;
@@ -12247,13 +13768,14 @@ mod tests {
         let provider = ProviderConfig {
             id: "71c595c5-a6c7-4a57-a01e-6fd1e4c101f9".to_string(),
             name: "Long Provider".to_string(),
-            base_url: "https://api.example.com/v1".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
             models_url: None,
             is_full_url: false,
             custom_user_agent: None,
             channel: Channel::Responses,
             prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12291,6 +13813,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12337,6 +13860,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12378,6 +13902,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12418,6 +13943,7 @@ mod tests {
             channel: Channel::Chat,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12524,6 +14050,7 @@ mod tests {
             channel: Channel::Anthropic,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12615,6 +14142,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12653,6 +14181,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12694,6 +14223,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12721,7 +14251,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_prompt_cache_key_keeps_same_session_and_splits_different_anchor() {
+    fn provider_prompt_cache_key_separates_session_anchor_and_ignores_dynamic_noise() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace".to_string();
         let provider = ProviderConfig {
@@ -12734,6 +14264,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12763,6 +14294,11 @@ mod tests {
             "instructions": "stable system",
             "input": [{ "type": "message", "role": "user", "content": "project beta stable prefix" }]
         });
+        let changed_stable_header = json!({
+            "model": "gpt-5.5",
+            "instructions": "different stable system",
+            "input": [{ "type": "message", "role": "user", "content": "project alpha stable prefix" }]
+        });
         let different_model_decision = RouteDecision {
             model: "gpt-5.4".to_string(),
             ..decision.clone()
@@ -12777,6 +14313,12 @@ mod tests {
         );
         let different_key =
             provider_prompt_cache_key(&config, &decision, &different_prefix, &Channel::Responses);
+        let changed_header_key = provider_prompt_cache_key(
+            &config,
+            &decision,
+            &changed_stable_header,
+            &Channel::Responses,
+        );
         let different_model_key = provider_prompt_cache_key(
             &config,
             &different_model_decision,
@@ -12786,6 +14328,7 @@ mod tests {
 
         assert_eq!(base_key, same_key);
         assert_ne!(base_key, different_key);
+        assert_ne!(base_key, changed_header_key);
         assert_ne!(base_key, different_model_key);
         assert_eq!(
             provider_prefix_fingerprint(&base, &Channel::Responses),
@@ -12795,10 +14338,93 @@ mod tests {
             provider_prefix_fingerprint(&base, &Channel::Responses),
             provider_prefix_fingerprint(&different_prefix, &Channel::Responses)
         );
+        assert_ne!(
+            provider_prefix_fingerprint(&base, &Channel::Responses),
+            provider_prefix_fingerprint(&changed_stable_header, &Channel::Responses)
+        );
     }
 
     #[test]
-    fn responses_provider_cache_key_uses_session_anchor_without_tail_split() {
+    fn provider_prompt_cache_key_uses_configured_model_for_client_alias() {
+        let mut config = AppConfig::default();
+        config.workspace_fingerprint = "workspace".to_string();
+        let provider = ProviderConfig {
+            id: "agent-codex-hb".to_string(),
+            name: "hb / Codex".to_string(),
+            base_url: "https://hubway.cc/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![ModelConfig {
+                id: "gpt-5.5".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.5".to_string(),
+                context_window: Some(256000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let alias_decision = RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Responses,
+            model: "codex-auto-review".to_string(),
+        };
+        let configured_decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let alias_request = json!({
+            "model": "codex-auto-review",
+            "instructions": "stable system",
+            "input": [{ "type": "message", "role": "user", "content": "dynamic tail" }]
+        });
+        let configured_request = json!({
+            "model": "gpt-5.5",
+            "instructions": "stable system",
+            "input": [{ "type": "message", "role": "user", "content": "dynamic tail" }]
+        });
+
+        assert_eq!(
+            provider_prompt_cache_key(
+                &config,
+                &alias_decision,
+                &alias_request,
+                &Channel::Responses
+            ),
+            provider_prompt_cache_key(
+                &config,
+                &configured_decision,
+                &configured_request,
+                &Channel::Responses
+            )
+        );
+        assert_eq!(
+            provider_prefix_control_key(
+                Some("fingerprint-a"),
+                &alias_decision,
+                &Channel::Responses
+            )
+            .as_deref(),
+            Some("https://hubway.cc/v1\0gpt-5.5\0responses\0fingerprint-a")
+        );
+    }
+
+    #[test]
+    fn responses_provider_cache_key_uses_stable_session_anchor() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace".to_string();
         let provider = ProviderConfig {
@@ -12811,6 +14437,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12868,6 +14495,182 @@ mod tests {
     }
 
     #[test]
+    fn upstream_headers_preserve_client_capabilities_and_replace_local_auth() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-proxy-key"),
+        );
+        inbound.insert("x-api-key", HeaderValue::from_static("local-proxy-key"));
+        inbound.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18883"));
+        inbound.insert(header::CONTENT_LENGTH, HeaderValue::from_static("123"));
+        inbound.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        inbound.insert("x-request-id", HeaderValue::from_static("local-request"));
+        inbound.insert("traceparent", HeaderValue::from_static("00-local-trace"));
+        inbound.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("codex-desktop/1.2.3"),
+        );
+        inbound.insert("openai-beta", HeaderValue::from_static("responses=v1"));
+        inbound.insert("x-openai-client-version", HeaderValue::from_static("1.2.3"));
+
+        let outbound = build_upstream_request_headers(
+            &inbound,
+            "real-upstream-key",
+            &Channel::Responses,
+            true,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            outbound
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer real-upstream-key")
+        );
+        assert_eq!(
+            outbound
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("real-upstream-key")
+        );
+        assert_eq!(
+            outbound
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("codex-desktop/1.2.3")
+        );
+        assert_eq!(
+            outbound
+                .get("openai-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("responses=v1")
+        );
+        assert_eq!(
+            outbound
+                .get("x-openai-client-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            outbound
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            outbound
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+        for blocked in [
+            header::HOST.as_str(),
+            header::CONTENT_LENGTH.as_str(),
+            header::CONNECTION.as_str(),
+            "x-request-id",
+            "traceparent",
+        ] {
+            assert!(
+                outbound.get(blocked).is_none(),
+                "{blocked} must not be forwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_headers_apply_provider_user_agent_override() {
+        let mut inbound = HeaderMap::new();
+        inbound.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("codex-desktop/1.2.3"),
+        );
+
+        let outbound = build_upstream_request_headers(
+            &inbound,
+            "real-upstream-key",
+            &Channel::Responses,
+            false,
+            Some("Provider-Compatible/2.0"),
+            true,
+        );
+
+        assert_eq!(
+            outbound
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some("Provider-Compatible/2.0")
+        );
+        assert_eq!(
+            outbound
+                .get(header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("gzip")
+        );
+    }
+
+    #[test]
+    fn invalid_upstream_key_does_not_emit_fake_authorization() {
+        let outbound = build_upstream_request_headers(
+            &HeaderMap::new(),
+            "invalid\nkey",
+            &Channel::Responses,
+            true,
+            None,
+            false,
+        );
+
+        assert!(outbound.get(header::AUTHORIZATION).is_none());
+        assert!(outbound.get("x-api-key").is_none());
+    }
+
+    #[test]
+    fn upstream_processing_timing_prefers_explicit_envoy_header() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "server-timing",
+            HeaderValue::from_static("edge;dur=12.5, app;dur=120.4"),
+        );
+        headers.insert("x-response-time", HeaderValue::from_static("140ms"));
+        headers.insert(
+            "x-envoy-upstream-service-time",
+            HeaderValue::from_static("87"),
+        );
+
+        assert_eq!(
+            reported_upstream_processing_ms(&headers),
+            Some(("x-envoy-upstream-service-time", 87))
+        );
+        assert_eq!(
+            response_header_values(&headers, "server-timing").as_deref(),
+            Some("edge;dur=12.5, app;dur=120.4")
+        );
+    }
+
+    #[test]
+    fn upstream_processing_timing_parses_server_and_process_durations() {
+        let mut server_headers = HeaderMap::new();
+        server_headers.append(
+            "server-timing",
+            HeaderValue::from_static("edge;dur=12.5, app;dur=120.4"),
+        );
+        assert_eq!(
+            reported_upstream_processing_ms(&server_headers),
+            Some(("server-timing", 120))
+        );
+
+        let mut process_headers = HeaderMap::new();
+        process_headers.insert("x-process-time", HeaderValue::from_static("0.245"));
+        assert_eq!(
+            reported_upstream_processing_ms(&process_headers),
+            Some(("x-process-time", 245))
+        );
+        assert_eq!(parse_duration_ms("1.5s", 1.0), Some(1500));
+        assert_eq!(parse_duration_ms("32ms", 1000.0), Some(32));
+    }
+
+    #[test]
     fn chat_provider_cache_key_keeps_stable_prefix_and_ignores_dynamic_tail() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace".to_string();
@@ -12881,6 +14684,7 @@ mod tests {
             channel: Channel::Chat,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -12983,13 +14787,14 @@ mod tests {
             provider: ProviderConfig {
                 id: "share".to_string(),
                 name: "Share".to_string(),
-                base_url: "https://share.example/v1".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
                 models_url: None,
                 is_full_url: false,
                 custom_user_agent: None,
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13010,6 +14815,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13039,6 +14845,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13059,6 +14866,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13085,17 +14893,21 @@ mod tests {
 
     #[test]
     fn provider_prefix_state_alias_reuses_same_model_channel_fingerprint() {
-        let share_key = "share\0gpt-5.5\0responses\0stable-fingerprint";
-        let api_key = "api-1\0gpt-5.5\0responses\0stable-fingerprint";
+        let share_key = "https://share.example/v1\0gpt-5.5\0responses\0stable-fingerprint";
+        let share_clone_key = "https://share.example/v1\0gpt-5.5\0responses\0stable-fingerprint";
+        let api_key = "https://api.example/v1\0gpt-5.5\0responses\0stable-fingerprint";
 
-        assert_ne!(share_key, api_key);
         assert_eq!(
+            provider_prefix_state_alias_key(share_key),
+            provider_prefix_state_alias_key(share_clone_key)
+        );
+        assert_ne!(
             provider_prefix_state_alias_key(share_key),
             provider_prefix_state_alias_key(api_key)
         );
         assert_eq!(
             provider_prefix_state_alias_key(share_key).as_deref(),
-            Some("prefix-alias\0gpt-5.5\0responses\0stable-fingerprint")
+            Some("prefix-alias\0https://share.example/v1\0gpt-5.5\0responses\0stable-fingerprint")
         );
     }
 
@@ -13124,6 +14936,34 @@ mod tests {
         assert_eq!(
             appended_response_input_delta(&previous, &json!("plain text")),
             None
+        );
+    }
+
+    #[test]
+    fn large_exact_session_append_uses_raw_prefix_delta() {
+        let previous = (0..800)
+            .map(|index| {
+                json!({
+                    "type": "function_call_output",
+                    "call_id": format!("call-{index}"),
+                    "output": format!("line-{index}: {}", "x".repeat(256))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut current = previous.clone();
+        current.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }));
+
+        assert_eq!(
+            response_input_raw_prefix_delta_start_index(&previous, &current),
+            Some(800)
+        );
+        assert_eq!(
+            response_input_delta_start_index(&previous, &current),
+            Some(800)
         );
     }
 
@@ -13324,6 +15164,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13380,6 +15221,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13467,6 +15309,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13538,6 +15381,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13642,13 +15486,14 @@ mod tests {
             provider: ProviderConfig {
                 id: "share".to_string(),
                 name: "Share".to_string(),
-                base_url: "https://share.example/v1".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
                 models_url: None,
                 is_full_url: false,
                 custom_user_agent: None,
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -13698,6 +15543,30 @@ mod tests {
             &TailInputDiagnostics::default(),
             &exact_anchor,
         ));
+        let third_party_decision = RouteDecision {
+            provider: ProviderConfig {
+                base_url: "https://hubway.cc/v1".to_string(),
+                ..decision.provider.clone()
+            },
+            ..decision
+        };
+        assert!(should_attempt_main_response_session_delta(
+            &config,
+            &third_party_decision,
+            true,
+            &request,
+            &TailInputDiagnostics::default(),
+            &exact_anchor,
+        ));
+    }
+
+    #[test]
+    fn codex_disables_main_response_session_delta() {
+        assert!(main_response_session_delta_enabled_for_agent(None));
+        assert!(main_response_session_delta_enabled_for_agent(Some("zcode")));
+        assert!(!main_response_session_delta_enabled_for_agent(Some(
+            "codex"
+        )));
     }
 
     #[tokio::test]
@@ -13714,6 +15583,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -14571,12 +16441,17 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![crate::config::ModelConfig {
                 id: "gpt-route".to_string(),
+                request_model_id: None,
                 display_name: "gpt-route".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -14614,12 +16489,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14638,12 +16518,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14682,12 +16567,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14706,12 +16596,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14782,12 +16677,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14806,12 +16706,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14871,12 +16776,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14895,12 +16805,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5-share".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5-share".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -14925,7 +16840,55 @@ mod tests {
     }
 
     #[test]
-    fn authorized_agent_bound_provider_preserves_client_requested_model() {
+    fn codex_model_list_includes_alias_without_dropping_canonical_id() {
+        let provider = ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "nc/gpt-5.6-sol".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let normal = provider_model_list_items(&provider, false);
+        let codex = provider_model_list_items(&provider, true);
+        let ids = codex
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(normal.len(), 1);
+        assert!(ids.contains(&"nc/gpt-5.6-sol"));
+        assert!(ids.contains(&"gpt-5.6-sol"));
+        assert!(codex.iter().any(|item| {
+            item.get("canonical_id").and_then(Value::as_str) == Some("nc/gpt-5.6-sol")
+                && item.get("id").and_then(Value::as_str) == Some("gpt-5.6-sol")
+        }));
+    }
+
+    #[test]
+    fn codex_alias_model_routes_to_canonical_provider_model() {
         let mut config = AppConfig::default();
         config.providers = vec![ProviderConfig {
             id: "share".to_string(),
@@ -14937,12 +16900,215 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "nc/gpt-5.6-sol".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("nc/gpt-5.6-sol".to_string());
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.6-sol", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.model, "nc/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn custom_request_model_mapping_is_listed_for_agents() {
+        let provider = ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let items = provider_model_list_items(&provider, true);
+        assert!(items.iter().any(|item| {
+            item.get("id").and_then(Value::as_str) == Some("gpt-5.5")
+                && item.get("canonical_id").and_then(Value::as_str) == Some("gpt-5.6-sol")
+        }));
+    }
+
+    #[test]
+    fn custom_request_model_routes_to_upstream_model() {
+        let mut config = AppConfig::default();
+        config.providers = vec![ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.6-sol".to_string(),
+                request_model_id: Some("gpt-5.5".to_string()),
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let agent = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        agent.enabled = true;
+        agent.provider_id = Some("share".to_string());
+        agent.model_id = Some("gpt-5.6-sol".to_string());
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.5", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn agent_alias_model_routes_to_canonical_provider_model() {
+        let mut config = AppConfig::default();
+        config.providers = vec![ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![crate::config::ModelConfig {
+                id: "nc/gpt-5.6-sol".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.6-sol".to_string(),
+                context_window: Some(128000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let agent = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "claude-code")
+            .unwrap();
+        agent.enabled = true;
+        agent.provider_id = Some("share".to_string());
+        agent.model_id = Some("nc/gpt-5.6-sol".to_string());
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.6-sol", "input": "ping" }),
+            &Channel::Responses,
+            Some("claude-code"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.model, "nc/gpt-5.6-sol");
+    }
+
+    #[test]
+    fn authorized_agent_bound_provider_falls_back_from_unknown_client_model() {
+        let mut config = AppConfig::default();
+        config.providers = vec![ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: vec![crate::config::ModelConfig {
                 id: "ui-fallback-model".to_string(),
+                request_model_id: None,
                 display_name: "ui-fallback-model".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -14969,7 +17135,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.provider.id, "share");
-        assert_eq!(decision.model, "client-requested-model");
+        assert_eq!(decision.model, "ui-fallback-model");
     }
 
     #[test]
@@ -14986,12 +17152,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15010,12 +17181,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15044,7 +17220,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.provider.id, "share");
-        assert_eq!(decision.model, "orc");
+        assert_eq!(decision.model, "gpt-5.5");
     }
 
     #[test]
@@ -15079,12 +17255,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15103,12 +17284,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15154,12 +17340,17 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
+                    request_model_id: None,
                     display_name: "gpt-5.5".to_string(),
                     context_window: Some(128000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15178,12 +17369,17 @@ mod tests {
                 channel: Channel::Anthropic,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: vec![crate::config::ModelConfig {
                     id: "claude-opus-4.7".to_string(),
+                    request_model_id: None,
                     display_name: "claude-opus-4.7".to_string(),
                     context_window: Some(200000),
                     output_window: None,
+                    reasoning_effort_override_enabled: false,
+                    reasoning_effort: None,
+                    supported_reasoning_efforts: Vec::new(),
                     supports_tools: true,
                     supports_streaming: true,
                     enabled: true,
@@ -15444,6 +17640,142 @@ mod tests {
         assert_eq!(regressed.total_tokens, 4_608);
         assert_eq!(regressed.new_tail_tokens, 4_096);
         assert_eq!(regressed.avoidable_tokens, 512);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn provider_gap_breakdown_does_not_repeat_short_provider_waterline_rollback() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-short-waterline-rollback-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            input_tokens: 134_144,
+            cache_read_tokens: 133_504,
+            ..UsageRecord::default()
+        };
+        let transient_rollback = UsageRecord {
+            input_tokens: 134_549,
+            cache_read_tokens: 130_432,
+            ..UsageRecord::default()
+        };
+        let recovered = UsageRecord {
+            input_tokens: 134_804,
+            cache_read_tokens: 133_504,
+            ..UsageRecord::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        let guard = PrefixGuardWaitDiagnostics {
+            wait_ms: 900,
+            budget_exhausted: true,
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let rollback_gap = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&transient_rollback),
+            None,
+            Some(&guard),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rollback_gap.total_tokens, 3_712);
+        assert_eq!(rollback_gap.new_tail_tokens, 640);
+        assert_eq!(rollback_gap.avoidable_tokens, 0);
+        assert_eq!(rollback_gap.provider_unstable_tokens, 3_072);
+
+        update_provider_prefix_state_with_tail_and_guard(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&transient_rollback),
+            &TailInputDiagnostics::default(),
+            false,
+            false,
+            true,
+        )
+        .await;
+        {
+            let states = state.prefix_states.lock().await;
+            let calibrated = states.get("main-prefix").unwrap();
+            assert_eq!(calibrated.seen_bucket_tokens, 130_432);
+            assert_eq!(calibrated.avoidable_shortfall_tokens, 0);
+        }
+
+        let recovered_gap =
+            provider_cache_gap_breakdown(&state, Some("main-prefix"), None, Some(&recovered), None)
+                .await
+                .unwrap();
+        assert_eq!(recovered_gap.avoidable_tokens, 0);
+        assert_eq!(recovered_gap.provider_unstable_tokens, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn huge_new_anchor_cold_read_is_provider_unstable_and_not_learned() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-huge-new-anchor-cold-read-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let cold_read = UsageRecord {
+            input_tokens: 249_750,
+            cache_read_tokens: 3_840,
+            ..UsageRecord::default()
+        };
+        let huge_tool_history = TailInputDiagnostics {
+            input_items: 180,
+            message_chars: 120_000,
+            tool_output_chars: 516_851,
+            largest_tool_output_chars: 180_000,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("new-session-prefix"),
+            None,
+            Some(&cold_read),
+            Some(&huge_tool_history),
+        )
+        .await
+        .unwrap();
+        let expected_gap = provider_cache_shortfall(&cold_read);
+
+        assert_eq!(gap.total_tokens, expected_gap);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, expected_gap);
+
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("new-session-prefix"),
+            None,
+            Some(&cold_read),
+            &huge_tool_history,
+            false,
+            false,
+        )
+        .await;
+        assert!(
+            !state
+                .prefix_states
+                .lock()
+                .await
+                .contains_key("new-session-prefix"),
+            "a huge low-hit new anchor must not become the learned waterline"
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -15735,7 +18067,7 @@ mod tests {
         });
 
         let upstream = state
-            .client
+            .upstream_client(false)
             .post(format!("http://{upstream_addr}/stream"))
             .send()
             .await
@@ -15760,6 +18092,7 @@ mod tests {
                     channel: Channel::Responses,
                     prompt_cache_retention_enabled: false,
                     request_body_gzip_enabled: false,
+                    use_system_proxy: false,
                     models: Vec::new(),
                     enabled: true,
                     created_at: Utc::now(),
@@ -15791,6 +18124,7 @@ mod tests {
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
             ResponseSessionReuseDiagnostics::default(),
+            None,
             None,
             None,
             None,
@@ -16028,7 +18362,7 @@ mod tests {
         small_bucket_tail.small_gap_recovery_streak = 1;
         assert_eq!(
             responses_provider_prefix_settle_delay(&small_bucket_tail),
-            TokioDuration::from_secs(2)
+            responses_foreground_wait_cap()
         );
 
         let huge_tail = PrefixWarmState {
@@ -16227,7 +18561,7 @@ mod tests {
                 &repeated_small_tail,
                 &current_tool_tail,
             ),
-            TokioDuration::from_millis(2500)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -16249,7 +18583,7 @@ mod tests {
                 &repeated_small_tail,
                 &current_tool_tail,
             ),
-            TokioDuration::from_millis(2500)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -16267,7 +18601,7 @@ mod tests {
                 &repeated_small_tail,
                 &current_tool_tail,
             ),
-            TokioDuration::from_secs(3)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -16318,7 +18652,7 @@ mod tests {
         ));
         assert_eq!(
             responses_provider_prefix_settle_delay_with_tail(&stable_small_gap, &current_tail),
-            TokioDuration::from_secs(3)
+            responses_foreground_wait_cap()
         );
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
@@ -16331,7 +18665,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_current_large_tool_output_preserves_avoidable_accounting_but_caps_wait() {
+    fn responses_current_large_tool_output_is_not_counted_as_reliable_avoidable_gap() {
         let mut stable_gap = prefix_state(47_981, 40_448, 7_168);
         stable_gap.avoidable_shortfall_tokens = 7_168;
         stable_gap.avoidable_shortfall_tokens_128 = 7_168;
@@ -16345,7 +18679,7 @@ mod tests {
             ..TailInputDiagnostics::default()
         };
 
-        assert!(!responses_current_tail_makes_avoidable_unreliable(
+        assert!(responses_current_tail_makes_avoidable_unreliable(
             &current_tail
         ));
         assert_eq!(
@@ -16407,6 +18741,38 @@ mod tests {
         assert_eq!(
             responses_provider_prefix_settle_delay(&tiny),
             responses_foreground_wait_cap()
+        );
+    }
+
+    #[test]
+    fn responses_stable_995_prefix_without_avoidable_gap_has_zero_guard() {
+        let mut stable = prefix_state(200_000, 199_168, 512);
+        stable.avoidable_shortfall_tokens = 0;
+        stable.avoidable_shortfall_tokens_128 = 0;
+        stable.cache_instability_score = 0;
+        stable.small_gap_recovery_streak = 0;
+        stable.tail_tool_output_chars = 0;
+        stable.tail_largest_tool_output_chars = 0;
+        stable.tail_tool_output_noise_hint = None;
+        let current_tail = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 64,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(
+            provider_cache_ratio(&UsageRecord {
+                input_tokens: stable.input_tokens,
+                cache_read_tokens: stable.cache_read_tokens,
+                ..UsageRecord::default()
+            })
+            .unwrap()
+                >= 0.995
+        );
+        assert_eq!(
+            responses_provider_prefix_settle_delay_with_tail(&stable, &current_tail),
+            TokioDuration::ZERO
         );
     }
 
@@ -16541,7 +18907,7 @@ mod tests {
 
         let floor = responses_cold_unstable_recent_warm_floor(&unstable_recent_warm);
         assert!(floor <= responses_foreground_wait_cap());
-        assert!(floor >= TokioDuration::from_millis(2_900));
+        assert!(floor > TokioDuration::ZERO);
         assert_eq!(
             provider_prefix_wait_reason_for_channel(
                 &Channel::Responses,
@@ -16568,7 +18934,7 @@ mod tests {
                 request_body_bytes: 700_000,
                 ..UpstreamRequestDiagnostics::default()
             }),
-            "retry_header_wait"
+            "direct:retry_header_wait"
         );
         assert_eq!(
             upstream_header_wait_class(&UpstreamRequestDiagnostics {
@@ -16578,7 +18944,7 @@ mod tests {
                 request_body_bytes: 1_200_000,
                 ..UpstreamRequestDiagnostics::default()
             }),
-            "huge_body_header_wait"
+            "direct:huge_body_header_wait"
         );
         assert_eq!(
             upstream_header_wait_class(&UpstreamRequestDiagnostics {
@@ -16588,7 +18954,7 @@ mod tests {
                 request_body_bytes: 120_000,
                 ..UpstreamRequestDiagnostics::default()
             }),
-            "header_wait_slow"
+            "direct:header_wait_slow"
         );
         assert_eq!(
             upstream_header_wait_class(&UpstreamRequestDiagnostics {
@@ -16598,7 +18964,18 @@ mod tests {
                 request_body_bytes: 120_000,
                 ..UpstreamRequestDiagnostics::default()
             }),
-            "normal"
+            "direct:normal"
+        );
+        assert_eq!(
+            upstream_header_wait_class(&UpstreamRequestDiagnostics {
+                network_path: "system-proxy",
+                attempts: 1,
+                headers_ms: 8_000,
+                request_body_bytes: 700_000,
+                sent_body_bytes: 350_000,
+                ..UpstreamRequestDiagnostics::default()
+            }),
+            "system-proxy:large_body_upload_header_wait"
         );
     }
 
@@ -16619,7 +18996,7 @@ mod tests {
         one_k.avoidable_shortfall_streak = 1;
         assert_eq!(
             responses_provider_prefix_settle_delay(&one_k),
-            TokioDuration::from_secs(3)
+            responses_foreground_wait_cap()
         );
 
         let mut fifteen_thirty_six = prefix_state(123_816, 121_856, 1_536);
@@ -16628,7 +19005,7 @@ mod tests {
         fifteen_thirty_six.avoidable_shortfall_streak = 1;
         assert_eq!(
             responses_provider_prefix_settle_delay(&fifteen_thirty_six),
-            TokioDuration::from_secs(3)
+            responses_foreground_wait_cap()
         );
     }
 
@@ -16819,6 +19196,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: true,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -16906,15 +19284,7 @@ mod tests {
 
     #[test]
     fn responses_prefix_settle_delay_uses_512_bucket_guard_for_new_tail() {
-        for (tail, expected) in [
-            (512, 3),
-            (1024, 3),
-            (1536, 3),
-            (2048, 3),
-            (2560, 3),
-            (7168, 3),
-            (9728, 3),
-        ] {
+        for tail in [512, 1024, 1536, 2048, 2560, 7168, 9728] {
             let mut state = prefix_state(240_000 + tail, 235_000, tail);
             state.avoidable_shortfall_tokens = 0;
             state.avoidable_shortfall_tokens_128 = 0;
@@ -16923,7 +19293,7 @@ mod tests {
             state.small_gap_recovery_streak = 1;
             assert_eq!(
                 responses_provider_prefix_settle_delay(&state),
-                TokioDuration::from_secs(expected),
+                responses_foreground_wait_cap(),
                 "new tail bucket {tail} should be guarded"
             );
         }
@@ -17547,7 +19917,7 @@ mod tests {
             &TailInputDiagnostics::default(),
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(2)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -17945,6 +20315,36 @@ mod tests {
     }
 
     #[test]
+    fn responses_extreme_tail_can_learn_sent_bucket_with_strong_hit_ratio() {
+        let mut previous = prefix_state(1_900_000, 1_820_032, 79_872);
+        previous.seen_bucket_tokens = 1_820_032;
+        previous.seen_bucket_tokens_128 = 1_820_032;
+        previous.avoidable_shortfall_tokens = 0;
+        previous.avoidable_shortfall_tokens_128 = 0;
+        let record = UsageRecord {
+            input_tokens: 2_000_000,
+            cache_read_tokens: 1_820_032,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 12,
+            message_chars: 700_000,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert!(provider_cache_shortfall(&record) > 131_072);
+        assert!(should_learn_sent_provider_bucket(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+        ));
+    }
+
+    #[test]
     fn responses_long_idle_warm_prefix_gets_cold_read_guard() {
         let mut state = prefix_state(126_139, 120_832, 3_584);
         state.finished_at = Instant::now() - std::time::Duration::from_secs(44 * 60);
@@ -18210,7 +20610,7 @@ mod tests {
             },
         );
 
-        assert_eq!(wait, Some(TokioDuration::from_secs(2)));
+        assert_eq!(wait, Some(responses_foreground_wait_cap()));
     }
 
     #[test]
@@ -18479,7 +20879,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_huge_dynamic_history_cold_read_is_not_plain_new_tail() {
+    async fn first_huge_dynamic_history_cold_read_is_provider_unstable() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-first-huge-history-tail-{}",
@@ -18524,9 +20924,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(gap.total_tokens, 0);
+        let expected_gap = provider_cache_shortfall(&cold_history);
+        assert_eq!(gap.total_tokens, expected_gap);
         assert_eq!(gap.new_tail_tokens, 0);
         assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, expected_gap);
         assert_eq!(
             lag.classification.as_deref(),
             Some("first_prefix_huge_dynamic_history")
@@ -18581,14 +20983,16 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(gap.total_tokens, 0);
+        let expected_gap = provider_cache_shortfall(&cold_history);
+        assert_eq!(gap.total_tokens, expected_gap);
         assert_eq!(gap.new_tail_tokens, 0);
         assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, expected_gap);
 
         fs::remove_dir_all(dir).ok();
     }
     #[tokio::test]
-    async fn responses_same_prefix_cold_read_does_not_become_avoidable_gap() {
+    async fn responses_same_prefix_cold_read_is_provider_unstable_not_avoidable() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-same-prefix-cold-read-isolated-{}",
@@ -18641,9 +21045,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(gap.total_tokens, 0);
+        let expected_gap = provider_cache_shortfall(&cold_read);
+        assert_eq!(gap.total_tokens, expected_gap);
         assert_eq!(gap.new_tail_tokens, 0);
         assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, expected_gap);
 
         update_provider_prefix_state_with_tail(
             &state,
@@ -19100,6 +21506,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn high_hit_128_granular_tool_tail_advances_sent_bucket() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-128-tool-tail-waterline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 90_881,
+            output_tokens: 10,
+            cache_read_tokens: 62_336,
+            cache_creation_tokens: 0,
+        };
+        let tail_record = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 93_414,
+            output_tokens: 10,
+            cache_read_tokens: 90_496,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 1,
+            tool_output_chars: 6_000,
+            largest_tool_output_chars: 6_000,
+            tool_output_noise_hint: Some("repeated_lines".to_string()),
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        assert_eq!(provider_cache_shortfall(&tail_record), 2_688);
+        assert_ne!(provider_cache_shortfall(&tail_record) % 512, 0);
+        assert_eq!(provider_cache_shortfall_128(&tail_record) % 128, 0);
+        assert!(should_learn_sent_provider_bucket(
+            state.prefix_states.lock().await.get("main-prefix"),
+            &tail_record,
+            provider_cache_shortfall(&tail_record),
+            provider_cache_shortfall_128(&tail_record),
+            &tail,
+            false
+        ));
+
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&tail_record),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(
+            kept.seen_bucket_tokens,
+            provider_cache_bucket_max(tail_record.input_tokens)
+        );
+        assert_eq!(
+            kept.seen_bucket_tokens_128,
+            provider_cache_bucket_max_128(tail_record.input_tokens)
+        );
+        drop(states);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn large_128_granular_tool_tail_learns_sent_bucket_without_extra_request() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-large-128-tool-tail-waterline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 46_774,
+            output_tokens: 10,
+            cache_read_tokens: 9_088,
+            cache_creation_tokens: 0,
+        };
+        let large_tail = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 62_618,
+            output_tokens: 10,
+            cache_read_tokens: 46_464,
+            cache_creation_tokens: 0,
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 4,
+            tool_output_chars: 51_000,
+            largest_tool_output_chars: 24_000,
+            tool_output_noise_hint: Some("path_like,url_like".to_string()),
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
+        assert_eq!(provider_cache_shortfall(&large_tail), 16_000);
+        assert_ne!(provider_cache_shortfall(&large_tail) % 512, 0);
+        assert_eq!(provider_cache_shortfall_128(&large_tail) % 128, 0);
+        assert!(provider_cache_ratio(&large_tail).unwrap() >= 0.72);
+        assert!(should_learn_sent_provider_bucket(
+            state.prefix_states.lock().await.get("main-prefix"),
+            &large_tail,
+            provider_cache_shortfall(&large_tail),
+            provider_cache_shortfall_128(&large_tail),
+            &tail,
+            false
+        ));
+
+        update_provider_prefix_state_with_tail(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&large_tail),
+            &tail,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get("main-prefix").unwrap();
+        assert_eq!(
+            kept.seen_bucket_tokens,
+            provider_cache_bucket_max(large_tail.input_tokens)
+        );
+        assert_eq!(
+            kept.seen_bucket_tokens_128,
+            provider_cache_bucket_max_128(large_tail.input_tokens)
+        );
+        drop(states);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn compact_aligned_10k_tool_tail_advances_sent_bucket_for_next_guard() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -19298,6 +21851,7 @@ mod tests {
                 reason: Some("responses_large_tool_output_tail_guard".to_string()),
                 source: Some("exact".to_string()),
                 skip_reason: None,
+                budget_exhausted: false,
                 cache_instability_score: Some(0),
                 seen_bucket_tokens: Some(59_392),
                 state_cache_read_tokens: Some(59_392),
@@ -19347,6 +21901,7 @@ mod tests {
             total_tokens: 0,
             new_tail_tokens: 0,
             avoidable_tokens: 0,
+            provider_unstable_tokens: 0,
         };
 
         let diag = prefix_lag_diagnostics(
@@ -19394,6 +21949,7 @@ mod tests {
             total_tokens: 0,
             new_tail_tokens: 0,
             avoidable_tokens: 0,
+            provider_unstable_tokens: 0,
         };
 
         let diag = prefix_lag_diagnostics(
@@ -19687,8 +22243,7 @@ mod tests {
 
         let states = state.prefix_states.lock().await;
         assert!(states.get(api_key).is_none());
-        let alias_state = lookup_provider_prefix_state(&states, api_key).unwrap();
-        assert_eq!(alias_state.cache_read_tokens, 209_920);
+        assert!(lookup_provider_prefix_state(&states, api_key).is_none());
         drop(states);
 
         let wait = wait_for_provider_prefix_settle(
@@ -19715,8 +22270,8 @@ mod tests {
         ));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let warm_key = "share\0gpt-5.5\0responses\0stable-fingerprint";
-        let current_key = "api-1\0gpt-5.5\0responses\0stable-fingerprint";
+        let warm_key = "https://hubway.cc/v1\0gpt-5.5\0responses\0stable-fingerprint";
+        let current_key = "https://hubway.cc/v1\0gpt-5.5\0responses\0stable-fingerprint";
         let warm = UsageRecord {
             provider: "share".to_string(),
             model: "gpt-5.5".to_string(),
@@ -19809,9 +22364,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(gap.total_tokens, 0);
+        let expected_gap = provider_cache_shortfall(&cold_dynamic);
+        assert_eq!(gap.total_tokens, expected_gap);
         assert_eq!(gap.new_tail_tokens, 0);
         assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, expected_gap);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -19864,8 +22421,11 @@ mod tests {
             provider_cache_gap_breakdown(&state, Some(key), None, Some(&cold), Some(&huge_tail))
                 .await
                 .unwrap();
-        assert_eq!(cold_gap.total_tokens, 0);
+        let cold_expected_gap = provider_cache_shortfall(&cold);
+        assert_eq!(cold_gap.total_tokens, cold_expected_gap);
         assert_eq!(cold_gap.new_tail_tokens, 0);
+        assert_eq!(cold_gap.avoidable_tokens, 0);
+        assert_eq!(cold_gap.provider_unstable_tokens, cold_expected_gap);
 
         update_provider_prefix_state_with_tail(
             &state,
@@ -19893,8 +22453,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(weak_gap.total_tokens, 0);
+        let weak_expected_gap = provider_cache_shortfall(&weak);
+        assert_eq!(weak_gap.total_tokens, weak_expected_gap);
         assert_eq!(weak_gap.new_tail_tokens, 0);
+        assert_eq!(weak_gap.avoidable_tokens, 0);
+        assert_eq!(weak_gap.provider_unstable_tokens, weak_expected_gap);
 
         update_provider_prefix_state_with_tail(
             &state,
@@ -19957,7 +22520,7 @@ mod tests {
         {
             let states = state.prefix_states.lock().await;
             assert!(states.get(api_key).is_none());
-            assert!(lookup_provider_prefix_state(&states, api_key).is_some());
+            assert!(lookup_provider_prefix_state(&states, api_key).is_none());
         }
 
         let gap = provider_cache_gap_breakdown(&state, Some(api_key), None, Some(&api_cold), None)
@@ -20057,6 +22620,7 @@ mod tests {
                 channel: Channel::Responses,
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
+                use_system_proxy: false,
                 api_key_encrypted: None,
                 models: Vec::new(),
                 enabled: true,
@@ -20313,6 +22877,7 @@ mod tests {
                     total_tokens: 73_216,
                     new_tail_tokens: 16_384,
                     avoidable_tokens: 56_832,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             (
@@ -20335,6 +22900,7 @@ mod tests {
                     total_tokens: 76_800,
                     new_tail_tokens: 6656,
                     avoidable_tokens: 70_144,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             (
@@ -20348,6 +22914,7 @@ mod tests {
                     total_tokens: 6144,
                     new_tail_tokens: 4096,
                     avoidable_tokens: 2048,
+                    provider_unstable_tokens: 0,
                 }),
             ),
         ];
@@ -20377,6 +22944,7 @@ mod tests {
                         total_tokens: tail,
                         new_tail_tokens: tail,
                         avoidable_tokens: 0,
+                        provider_unstable_tokens: 0,
                     }),
                 ),
                 0,
@@ -20397,6 +22965,7 @@ mod tests {
                     total_tokens: 9728,
                     new_tail_tokens: 9728,
                     avoidable_tokens: 0,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20430,6 +22999,7 @@ mod tests {
                         total_tokens: avoidable,
                         new_tail_tokens: 0,
                         avoidable_tokens: avoidable,
+                        provider_unstable_tokens: 0,
                     }),
                 ),
                 expected,
@@ -20444,6 +23014,7 @@ mod tests {
                     total_tokens: 4096,
                     new_tail_tokens: 0,
                     avoidable_tokens: 4096,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20456,6 +23027,7 @@ mod tests {
                     total_tokens: 8192,
                     new_tail_tokens: 0,
                     avoidable_tokens: 8192,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20468,6 +23040,7 @@ mod tests {
                     total_tokens: 1536,
                     new_tail_tokens: 0,
                     avoidable_tokens: 1536,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20495,6 +23068,7 @@ mod tests {
             total_tokens: 1536,
             new_tail_tokens: 1536,
             avoidable_tokens: 0,
+            provider_unstable_tokens: 0,
         };
 
         assert_eq!(
@@ -20525,6 +23099,7 @@ mod tests {
                     total_tokens: 2048,
                     new_tail_tokens: 1536,
                     avoidable_tokens: 512,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20537,6 +23112,7 @@ mod tests {
                     total_tokens: 9728,
                     new_tail_tokens: 9728,
                     avoidable_tokens: 0,
+                    provider_unstable_tokens: 0,
                 }),
             ),
             0
@@ -20732,6 +23308,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -20801,14 +23378,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cold_large_responses_stream_skips_first_gzip_attempt() {
-        let config = AppConfig::default();
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-cold-stream-gzip-skip-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+    async fn cold_large_responses_stream_keeps_opted_in_gzip() {
         let body = json!({
             "model": "gpt-5.5",
             "stream": true,
@@ -20819,34 +23389,9 @@ mod tests {
         });
 
         assert!(
-            should_skip_request_body_gzip_for_cold_stream(
-                &state,
-                &Channel::Responses,
-                Some("ls\0gpt-5.5\0responses\0stable-prefix"),
-                true,
-                &body,
-            )
-            .await,
-            "a first large streaming request to an exact-cold provider must avoid an extra gzip fallback attempt"
+            !should_skip_request_body_gzip_for_cold_stream(&Channel::Responses, true, &body,),
+            "an explicitly enabled gzip path must not raw-upload a cold large responses stream"
         );
-
-        state.prefix_states.lock().await.insert(
-            "ls\0gpt-5.5\0responses\0stable-prefix".to_string(),
-            prefix_state(160_000, 159_744, 0),
-        );
-        assert!(
-            !should_skip_request_body_gzip_for_cold_stream(
-                &state,
-                &Channel::Responses,
-                Some("ls\0gpt-5.5\0responses\0stable-prefix"),
-                true,
-                &body,
-            )
-            .await,
-            "once the same upstream has exact prefix state, keep the user's gzip setting available"
-        );
-
-        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -20900,12 +23445,16 @@ mod tests {
                 "content": "x".repeat(750_000)
             }]
         });
+        let inbound_headers = HeaderMap::new();
         let outcome = send_main_upstream_request(
             &state,
+            false,
             &format!("http://{upstream_addr}/v1/responses"),
             "upstream-key",
             &Channel::Responses,
             &body,
+            &inbound_headers,
+            None,
             true,
             true,
             true,
@@ -20920,6 +23469,84 @@ mod tests {
         assert!(outcome.diagnostics.gzip_attempted);
         assert!(!outcome.diagnostics.gzip_fallback_used);
         assert!(outcome.diagnostics.sent_body_bytes < outcome.diagnostics.request_body_bytes);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_gzip_compresses_medium_requests_without_extra_retry() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-medium-gzip-threshold-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let gzip_hits = Arc::new(AtomicUsize::new(0));
+        let gzip_hits_for_route = gzip_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let gzip_hits = gzip_hits_for_route.clone();
+                async move {
+                    if headers
+                        .get(header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("gzip")
+                    {
+                        gzip_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "resp_warm_gzip",
+                            "output": [],
+                            "usage": { "input_tokens": 1, "output_tokens": 1 }
+                        })),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let url = format!("http://{upstream_addr}/v1/responses");
+        let medium_body = json!({
+            "model": "gpt-5.5",
+            "stream": false,
+            "input": [{
+                "role": "user",
+                "content": "x".repeat(320_000)
+            }]
+        });
+        let inbound_headers = HeaderMap::new();
+
+        let outcome = send_main_upstream_request(
+            &state,
+            false,
+            &url,
+            "upstream-key",
+            &Channel::Responses,
+            &medium_body,
+            &inbound_headers,
+            None,
+            true,
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.response.status(), StatusCode::OK);
+        assert!(
+            outcome.diagnostics.gzip_attempted,
+            "an opted-in responses provider should compress medium request bodies immediately"
+        );
+        assert_eq!(outcome.diagnostics.attempts, 1);
+        assert!(!outcome.diagnostics.gzip_fallback_used);
+        assert_eq!(gzip_hits.load(Ordering::SeqCst), 1);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -20943,6 +23570,7 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: None,
             models: Vec::new(),
             enabled: true,
@@ -21176,12 +23804,17 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: Some("upstream-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(300000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -21239,9 +23872,12 @@ mod tests {
         assert!(captured.get("input").is_none());
 
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
         assert_eq!(metrics.cache_misses, 0);
-        assert_eq!(metrics.provider_input_tokens, 0);
+        assert_eq!(metrics.provider_input_tokens, 2048);
+        assert_eq!(metrics.provider_cached_tokens, 1536);
+        assert_eq!(metrics.recent_requests[0].upstream_attempt_total, Some(2));
         assert_eq!(
             metrics.recent_requests[0].upstream_call_source.as_deref(),
             Some("compact-fallback-chat-compat")
@@ -21333,12 +23969,17 @@ mod tests {
             channel: Channel::Responses,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: Some("upstream-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(300000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -21413,8 +24054,18 @@ mod tests {
         let captured = captured_responses_body.lock().await.clone();
         assert_eq!(captured["stream"], true);
         assert!(captured.get("input").is_some());
-        assert!(captured.get("prompt_cache_key").is_none());
-        assert!(captured.get("prompt_cache_retention").is_none());
+        let forwarded_cache_key = captured
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_ne!(forwarded_cache_key, "client-key-must-not-be-forwarded");
+        assert!(provider_prompt_cache_key_is_valid(forwarded_cache_key));
+        assert_eq!(
+            captured
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            None
+        );
         assert_eq!(
             captured_responses_accept.lock().await.as_deref(),
             Some("text/event-stream")
@@ -21501,12 +24152,17 @@ mod tests {
             channel: Channel::Chat,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: Some("upstream-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.5".to_string(),
+                request_model_id: None,
                 display_name: "gpt-5.5".to_string(),
                 context_window: Some(300000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,
@@ -21590,6 +24246,137 @@ mod tests {
         fs::remove_dir_all(config_dir).ok();
     }
 
+    fn reasoning_test_decision(configured: Option<&str>, supported: &[&str]) -> RouteDecision {
+        RouteDecision {
+            provider: ProviderConfig {
+                id: "reasoning-provider".to_string(),
+                name: "Reasoning Provider".to_string(),
+                base_url: "https://reasoning.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                prompt_cache_retention_enabled: true,
+                request_body_gzip_enabled: false,
+                use_system_proxy: false,
+                api_key_encrypted: None,
+                models: vec![crate::config::ModelConfig {
+                    id: "reasoning-model".to_string(),
+                    request_model_id: None,
+                    display_name: "Reasoning Model".to_string(),
+                    context_window: Some(128_000),
+                    output_window: None,
+                    reasoning_effort_override_enabled: configured.is_some(),
+                    reasoning_effort: configured.map(ToOwned::to_owned),
+                    supported_reasoning_efforts: supported
+                        .iter()
+                        .map(|effort| (*effort).to_string())
+                        .collect(),
+                    supports_tools: true,
+                    supports_streaming: true,
+                    enabled: true,
+                }],
+                enabled: true,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            upstream_channel: Channel::Responses,
+            model: "reasoning-model".to_string(),
+        }
+    }
+
+    #[test]
+    fn reasoning_override_off_preserves_agent_effort_across_channel_conversion() {
+        let client = json!({
+            "model": "reasoning-model",
+            "reasoning": { "effort": "xhigh" },
+            "input": "hello"
+        });
+        let mut upstream = responses_to_chat_request(&client);
+        let decision = reasoning_test_decision(None, &[]);
+
+        let diagnostics =
+            apply_model_reasoning_effort(&client, &mut upstream, &Channel::Chat, &decision);
+
+        assert_eq!(upstream["reasoning_effort"], "xhigh");
+        assert_eq!(diagnostics.agent.as_deref(), Some("xhigh"));
+        assert_eq!(diagnostics.configured, None);
+        assert_eq!(diagnostics.effective.as_deref(), Some("xhigh"));
+        assert_eq!(diagnostics.source.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn reasoning_override_forces_configured_effort_and_changes_cache_material() {
+        let client = json!({
+            "model": "reasoning-model",
+            "reasoning": { "effort": "low" },
+            "input": "hello"
+        });
+        let low_decision = reasoning_test_decision(Some("low"), &[]);
+        let high_decision = reasoning_test_decision(Some("high"), &[]);
+        let mut low_body = client.clone();
+        let mut high_body = client.clone();
+
+        apply_model_reasoning_effort(&client, &mut low_body, &Channel::Responses, &low_decision);
+        let diagnostics = apply_model_reasoning_effort(
+            &client,
+            &mut high_body,
+            &Channel::Responses,
+            &high_decision,
+        );
+        let low_key = cache::cache_key(
+            &json!({ "request": low_body }),
+            "reasoning-provider",
+            "reasoning-model",
+            "workspace",
+        );
+        let high_key = cache::cache_key(
+            &json!({ "request": high_body }),
+            "reasoning-provider",
+            "reasoning-model",
+            "workspace",
+        );
+
+        assert_eq!(high_body.pointer("/reasoning/effort"), Some(&json!("high")));
+        assert_eq!(diagnostics.agent.as_deref(), Some("low"));
+        assert_eq!(diagnostics.configured.as_deref(), Some("high"));
+        assert_eq!(diagnostics.effective.as_deref(), Some("high"));
+        assert_eq!(diagnostics.source.as_deref(), Some("model_override"));
+        assert_ne!(low_key, high_key);
+    }
+
+    #[test]
+    fn ultra_downgrades_to_max_only_when_capability_proves_it() {
+        let client = json!({ "reasoning": { "effort": "low" } });
+        let mut unknown_body = client.clone();
+        let unknown_decision = reasoning_test_decision(Some("ultra"), &[]);
+        let unknown = apply_model_reasoning_effort(
+            &client,
+            &mut unknown_body,
+            &Channel::Responses,
+            &unknown_decision,
+        );
+        assert_eq!(unknown.effective.as_deref(), Some("ultra"));
+
+        let mut proven_body = client.clone();
+        let proven_decision = reasoning_test_decision(Some("ultra"), &["max"]);
+        let proven = apply_model_reasoning_effort(
+            &client,
+            &mut proven_body,
+            &Channel::Responses,
+            &proven_decision,
+        );
+        assert_eq!(
+            proven_body.pointer("/reasoning/effort"),
+            Some(&json!("max"))
+        );
+        assert_eq!(proven.effective.as_deref(), Some("max"));
+        assert_eq!(
+            proven.source.as_deref(),
+            Some("model_override_ultra_to_max")
+        );
+    }
+
     #[tokio::test]
     async fn passive_warm_miss_then_local_replay_does_not_hit_upstream_again() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
@@ -21635,12 +24422,17 @@ mod tests {
             channel: Channel::Chat,
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
+            use_system_proxy: false,
             api_key_encrypted: Some("upstream-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "warm-model".to_string(),
+                request_model_id: None,
                 display_name: "warm-model".to_string(),
                 context_window: Some(128000),
                 output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
                 supports_tools: true,
                 supports_streaming: true,
                 enabled: true,

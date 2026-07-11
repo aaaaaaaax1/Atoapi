@@ -17,9 +17,13 @@ export type ProviderKeyStatus = "unknown" | "healthy" | "unhealthy";
 
 export interface ModelConfig {
   id: string;
+  request_model_id?: string | null;
   display_name: string;
   context_window?: number | null;
   output_window?: number | null;
+  reasoning_effort_override_enabled: boolean;
+  reasoning_effort?: string | null;
+  supported_reasoning_efforts?: string[];
   supports_tools: boolean;
   supports_streaming: boolean;
   enabled: boolean;
@@ -36,6 +40,7 @@ export interface ProviderConfig {
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
   has_api_key: boolean;
   key_pool?: PublicProviderKeyPool | null;
@@ -197,7 +202,7 @@ export interface MetricsSnapshot {
   gap_buckets?: GapBucketStats[];
   request_body_buckets?: RequestBodyBucketStats[];
   provider_stats: ProviderTrafficStats[];
-  recent_requests: Array<{
+  recent_upstream_calls?: Array<{
     id: string;
     at: string;
     inbound_request_id?: string | null;
@@ -208,6 +213,11 @@ export interface MetricsSnapshot {
     upstream_channel: string;
     provider: string;
     model: string;
+    requested_model?: string | null;
+    agent_reasoning_effort?: string | null;
+    configured_reasoning_effort?: string | null;
+    effective_reasoning_effort?: string | null;
+    reasoning_effort_source?: string | null;
     cache_status: string;
     agent_id?: string | null;
     agent_label?: string | null;
@@ -218,7 +228,15 @@ export interface MetricsSnapshot {
     upstream_ttft_ms?: number | null;
     local_prepare_ms?: number | null;
     upstream_headers_ms?: number | null;
+    upstream_last_attempt_headers_ms?: number | null;
+    upstream_http_version?: string | null;
+    upstream_server_timing?: string | null;
+    upstream_timing_source?: string | null;
+    upstream_reported_processing_ms?: number | null;
+    upstream_non_processing_ms?: number | null;
     upstream_first_chunk_ms?: number | null;
+    stream_upstream_wait_ms?: number | null;
+    stream_client_backpressure_ms?: number | null;
     upstream_retry_wait_ms?: number | null;
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
@@ -236,6 +254,67 @@ export interface MetricsSnapshot {
     cache_shortfall_tokens?: number | null;
     cache_new_tail_gap_tokens?: number | null;
     cache_avoidable_gap_tokens?: number | null;
+    cache_provider_unstable_gap_tokens?: number | null;
+    provider_cache_token_ratio?: number | null;
+    response_session_reused?: boolean | null;
+    session_anchor_hash?: string | null;
+    session_anchor_source?: string | null;
+    session_anchor_changed?: boolean | null;
+    session_anchor_peer_count?: number | null;
+  }>;
+  recent_requests: Array<{
+    id: string;
+    at: string;
+    inbound_request_id?: string | null;
+    upstream_request_id?: string | null;
+    upstream_attempt_index?: number | null;
+    upstream_attempt_total?: number | null;
+    client_channel: string;
+    upstream_channel: string;
+    provider: string;
+    model: string;
+    requested_model?: string | null;
+    agent_reasoning_effort?: string | null;
+    configured_reasoning_effort?: string | null;
+    effective_reasoning_effort?: string | null;
+    reasoning_effort_source?: string | null;
+    cache_status: string;
+    agent_id?: string | null;
+    agent_label?: string | null;
+    upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
+    upstream_call_source?: string | null;
+    status: number;
+    ttft_ms: number;
+    upstream_ttft_ms?: number | null;
+    local_prepare_ms?: number | null;
+    upstream_headers_ms?: number | null;
+    upstream_last_attempt_headers_ms?: number | null;
+    upstream_http_version?: string | null;
+    upstream_server_timing?: string | null;
+    upstream_timing_source?: string | null;
+    upstream_reported_processing_ms?: number | null;
+    upstream_non_processing_ms?: number | null;
+    upstream_first_chunk_ms?: number | null;
+    stream_upstream_wait_ms?: number | null;
+    stream_client_backpressure_ms?: number | null;
+    upstream_retry_wait_ms?: number | null;
+    upstream_attempts?: number | null;
+    request_body_bytes?: number | null;
+    sent_body_bytes?: number | null;
+    gzip_attempted?: boolean | null;
+    gzip_fallback_used?: boolean | null;
+    upstream_header_wait_class?: string | null;
+    prefix_cache_instability_score?: number | null;
+    prefix_seen_bucket_tokens?: number | null;
+    prefix_state_cache_read_tokens?: number | null;
+    total_ms: number;
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    cache_read_tokens?: number | null;
+    cache_shortfall_tokens?: number | null;
+    cache_new_tail_gap_tokens?: number | null;
+    cache_avoidable_gap_tokens?: number | null;
+    cache_provider_unstable_gap_tokens?: number | null;
     provider_cache_token_ratio?: number | null;
     response_session_reused?: boolean | null;
     session_anchor_hash?: string | null;
@@ -278,6 +357,7 @@ export interface GapBucketStats {
   total_gap_tokens: number;
   new_tail_gap_tokens: number;
   avoidable_gap_tokens: number;
+  provider_unstable_gap_tokens: number;
 }
 
 export interface BackgroundPrewarmStats {
@@ -368,6 +448,7 @@ export interface ProviderInput {
   channel: Channel;
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
+  use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
   key_pool?: ProviderKeyPoolInput | null;
   api_key?: string;
@@ -383,6 +464,7 @@ export interface FetchModelsInput {
   custom_user_agent?: string;
   channel: Channel;
   api_key?: string;
+  use_system_proxy: boolean;
 }
 
 export interface ProxyModeConfigInput {
@@ -663,12 +745,36 @@ function fallback(name: string, args?: Record<string, unknown>) {
     return fallbackConfig;
   }
   if (name === "clone_provider_for_agent") {
-    const input = args?.input as { agent_id?: string; provider_id?: string } | undefined;
+    const input = args?.input as { agent_id?: string; provider_id?: string; model_id?: string | null } | undefined;
     const agentId = input?.agent_id ?? "";
     const providerId = input?.provider_id ?? "";
     const source = fallbackConfig.providers.find((item) => item.id === providerId);
     if (!agentId || !source) return fallbackConfig;
     const now = new Date().toISOString();
+    const existingClone = fallbackConfig.providers.find((item) =>
+      providerCloneMatchesSourcePreview(item.id, providerId, agentId)
+    );
+    if (providerBelongsToAgentPreview(providerId, agentId) || existingClone) {
+      const target = existingClone ?? source;
+      fallbackConfig = {
+        ...fallbackConfig,
+        agent_injections: fallbackConfig.agent_injections.map((item) =>
+          item.id === agentId
+            ? {
+                ...item,
+                provider_id: target.id,
+                model_id:
+                  input?.model_id ??
+                  target.models.find((model) => model.enabled)?.id ??
+                  target.models[0]?.id ??
+                  null
+              }
+            : item
+        ),
+        updated_at: now
+      };
+      return fallbackConfig;
+    }
     const id = uniquePreviewProviderId(`agent-${agentId}-${providerId}`);
     const name = uniquePreviewProviderName(`${source.name} / ${agentId}`);
     const clonedKeyPool = source.key_pool
@@ -696,7 +802,15 @@ function fallback(name: string, args?: Record<string, unknown>) {
         : fallbackConfig.provider_key_pools,
       agent_injections: fallbackConfig.agent_injections.map((item) =>
         item.id === agentId
-          ? { ...item, provider_id: id, model_id: item.model_id ?? source.models.find((model) => model.enabled)?.id ?? source.models[0]?.id ?? null }
+          ? {
+              ...item,
+              provider_id: id,
+              model_id:
+                input?.model_id ??
+                source.models.find((model) => model.enabled)?.id ??
+                source.models[0]?.id ??
+                null
+            }
           : item
       ),
       updated_at: now
@@ -728,6 +842,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       channel: input.channel,
       prompt_cache_retention_enabled: input.prompt_cache_retention_enabled ?? true,
       request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? false,
+      use_system_proxy: input.use_system_proxy ?? existing?.use_system_proxy ?? false,
       non_sse_compact_compat_enabled: input.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
       has_api_key: Boolean(input.api_key) || existing?.has_api_key || false,
       key_pool: input.key_pool
@@ -781,6 +896,19 @@ function fallback(name: string, args?: Record<string, unknown>) {
   }
   if (name === "delete_provider" && (args?.providerId || args?.provider_id)) {
     const providerId = String(args.providerId ?? args.provider_id);
+    const agentId = String(args?.agentId ?? args?.agent_id ?? "");
+    if (agentId && !providerBelongsToAgentPreview(providerId, agentId)) {
+      fallbackConfig = {
+        ...fallbackConfig,
+        agent_injections: fallbackConfig.agent_injections.map((item) =>
+          item.id === agentId && item.provider_id === providerId
+            ? { ...item, enabled: false, provider_id: null, model_id: null }
+            : item
+        ),
+        updated_at: new Date().toISOString()
+      };
+      return fallbackConfig;
+    }
     fallbackProviderSecrets.delete(providerId);
     for (const secretId of Array.from(fallbackProviderKeySecrets.keys())) {
       if (secretId.startsWith(providerId + ":")) fallbackProviderKeySecrets.delete(secretId);
@@ -796,7 +924,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       provider_key_pools: (fallbackConfig.provider_key_pools ?? []).filter((item) => item.provider_id !== providerId),
       active_provider_id: activeProviderId,
       agent_injections: fallbackConfig.agent_injections.map((item) =>
-        item.provider_id === providerId
+        item.provider_id === providerId && (!agentId || item.id === agentId)
           ? { ...item, provider_id: null, model_id: null }
           : item
       ),
@@ -855,9 +983,13 @@ function fallback(name: string, args?: Record<string, unknown>) {
 export function model(id: string, contextWindow?: number): ModelConfig {
   return {
     id,
+    request_model_id: null,
     display_name: id,
     context_window: contextWindow ?? null,
     output_window: null,
+    reasoning_effort_override_enabled: false,
+    reasoning_effort: null,
+    supported_reasoning_efforts: [],
     supports_tools: true,
     supports_streaming: true,
     enabled: true
@@ -968,6 +1100,17 @@ function inferPreviewModels(baseUrl: string, channel: Channel): ModelConfig[] {
     return [model("gpt-5.2", 400_000), model("gpt-5.2-mini", 400_000)];
   }
   return [model("gpt-5.2", 400_000), model("gpt-5.2-mini", 400_000), model("o4-mini", 200_000)];
+}
+
+function providerBelongsToAgentPreview(providerId: string, agentId: string) {
+  return providerId.startsWith(`agent-${slugify(agentId)}-`);
+}
+
+function providerCloneMatchesSourcePreview(providerId: string, sourceId: string, agentId: string) {
+  const base = `agent-${slugify(agentId)}-${slugify(sourceId)}`;
+  if (providerId === base) return true;
+  const suffix = providerId.slice(base.length + 1);
+  return providerId.startsWith(`${base}-`) && /^\d+$/.test(suffix);
 }
 
 function uniquePreviewProviderId(base: string) {

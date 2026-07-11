@@ -9,6 +9,7 @@ use crate::{
     agent_injection::{
         self, AgentInjectionResult, AgentInjectionRouteUpdate, AgentInjectionUpdate,
     },
+    codex_ui_patch,
     config::{AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput, PublicConfig},
     metrics::MetricsSnapshot,
     state::{AppState, ProxyStatus},
@@ -55,6 +56,8 @@ pub struct ProviderModelFetchInput {
     pub custom_user_agent: Option<String>,
     pub channel: Channel,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub use_system_proxy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +71,8 @@ pub struct ProviderKeyTestInput {
     pub is_full_url: bool,
     pub custom_user_agent: Option<String>,
     pub channel: Channel,
+    #[serde(default)]
+    pub use_system_proxy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +88,8 @@ pub struct ProviderKeyTestResult {
 pub struct AgentProviderCloneInput {
     pub agent_id: String,
     pub provider_id: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,81 +185,19 @@ pub async fn clone_provider_for_agent(
     let source_provider_id = input.provider_id.trim().to_string();
     let should_start_proxy = {
         let mut config = state.config.write().await;
-        let source_provider = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == source_provider_id)
-            .cloned()
-            .ok_or_else(|| format!("provider {source_provider_id} was not found"))?;
+        clone_provider_for_agent_config(
+            &mut config,
+            &agent_id,
+            &source_provider_id,
+            input.model_id.as_deref(),
+        )
+        .map_err(to_command_error)?;
         let agent_index = config
             .agent_injections
             .iter()
             .position(|agent| agent.id == agent_id)
             .ok_or_else(|| format!("agent injection {agent_id} was not found"))?;
-        let cloned_id = unique_agent_provider_id(&config, &source_provider.id, &agent_id);
-        let cloned_name = unique_agent_provider_name(
-            &config,
-            &format!(
-                "{} / {}",
-                source_provider.name, config.agent_injections[agent_index].label
-            ),
-        );
         let now = Utc::now();
-
-        let mut cloned_provider = source_provider.clone();
-        cloned_provider.id = cloned_id.clone();
-        cloned_provider.name = cloned_name;
-        cloned_provider.created_at = now;
-        cloned_provider.updated_at = now;
-        config.providers.push(cloned_provider);
-
-        if let Some(mut pool) = config
-            .provider_key_pools
-            .iter()
-            .find(|pool| pool.provider_id == source_provider.id)
-            .cloned()
-        {
-            pool.provider_id = cloned_id.clone();
-            pool.updated_at = now;
-            config.provider_key_pools.push(pool);
-        }
-        if let Some(mut compact_mode) = config
-            .provider_compact_modes
-            .iter()
-            .find(|item| item.provider_id == source_provider.id)
-            .cloned()
-        {
-            compact_mode.provider_id = cloned_id.clone();
-            compact_mode.updated_at = now;
-            config.provider_compact_modes.push(compact_mode);
-        }
-        if let Some(mut channel_mode) = config
-            .provider_channel_modes
-            .iter()
-            .find(|item| item.provider_id == source_provider.id)
-            .cloned()
-        {
-            channel_mode.provider_id = cloned_id.clone();
-            channel_mode.updated_at = now;
-            config.provider_channel_modes.push(channel_mode);
-        }
-
-        let agent = &mut config.agent_injections[agent_index];
-        agent.provider_id = Some(cloned_id);
-        if agent.model_id.is_none()
-            || !source_provider
-                .models
-                .iter()
-                .any(|model| Some(model.id.as_str()) == agent.model_id.as_deref())
-        {
-            agent.model_id = source_provider
-                .models
-                .iter()
-                .find(|model| model.enabled)
-                .or_else(|| source_provider.models.first())
-                .map(|model| model.id.clone());
-        }
-        agent.last_status = Some("已复制为当前 Agent 独立上游".to_string());
         config.updated_at = now;
         config.save(&state.config_path).map_err(to_command_error)?;
         config.agent_injections[agent_index].enabled
@@ -269,6 +214,111 @@ pub async fn clone_provider_for_agent(
         }
     }
     Ok(state.public_config().await)
+}
+
+fn clone_provider_for_agent_config(
+    config: &mut AppConfig,
+    agent_id: &str,
+    source_provider_id: &str,
+    requested_model_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let agent_index = config
+        .agent_injections
+        .iter()
+        .position(|agent| agent.id == agent_id)
+        .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
+    let source_provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == source_provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("provider {source_provider_id} was not found"))?;
+
+    let target_provider_id =
+        if provider_belongs_to_agent(source_provider_id, agent_id) {
+            source_provider_id.to_string()
+        } else if let Some(existing) = config.providers.iter().find(|provider| {
+            provider_clone_matches_source(&provider.id, source_provider_id, agent_id)
+        }) {
+            existing.id.clone()
+        } else {
+            let cloned_id = unique_agent_provider_id(config, source_provider_id, agent_id);
+            let cloned_name = unique_agent_provider_name(
+                config,
+                &format!(
+                    "{} / {}",
+                    source_provider.name, config.agent_injections[agent_index].label
+                ),
+            );
+            let now = Utc::now();
+            let mut cloned_provider = source_provider.clone();
+            cloned_provider.id = cloned_id.clone();
+            cloned_provider.name = cloned_name;
+            cloned_provider.created_at = now;
+            cloned_provider.updated_at = now;
+            config.providers.push(cloned_provider);
+
+            if let Some(mut pool) = config
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == source_provider.id)
+                .cloned()
+            {
+                pool.provider_id = cloned_id.clone();
+                pool.updated_at = now;
+                config.provider_key_pools.push(pool);
+            }
+            if let Some(mut compact_mode) = config
+                .provider_compact_modes
+                .iter()
+                .find(|item| item.provider_id == source_provider.id)
+                .cloned()
+            {
+                compact_mode.provider_id = cloned_id.clone();
+                compact_mode.updated_at = now;
+                config.provider_compact_modes.push(compact_mode);
+            }
+            if let Some(mut channel_mode) = config
+                .provider_channel_modes
+                .iter()
+                .find(|item| item.provider_id == source_provider.id)
+                .cloned()
+            {
+                channel_mode.provider_id = cloned_id.clone();
+                channel_mode.updated_at = now;
+                config.provider_channel_modes.push(channel_mode);
+            }
+            cloned_id
+        };
+
+    let target_provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == target_provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("provider {target_provider_id} was not found"))?;
+    let selected_model = requested_model_id
+        .filter(|model_id| {
+            target_provider
+                .models
+                .iter()
+                .any(|model| model.id == *model_id)
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            target_provider
+                .models
+                .iter()
+                .find(|model| model.enabled)
+                .or_else(|| target_provider.models.first())
+                .map(|model| model.id.clone())
+        });
+
+    let agent = &mut config.agent_injections[agent_index];
+    agent.provider_id = Some(target_provider_id.clone());
+    agent.model_id = selected_model;
+    agent.last_status = Some("已绑定当前 Agent 独立上游".to_string());
+    Ok(target_provider_id)
 }
 
 fn unique_agent_provider_id(config: &AppConfig, source_id: &str, agent_id: &str) -> String {
@@ -328,6 +378,26 @@ fn sanitize_provider_id_part(value: &str) -> String {
     }
 }
 
+fn agent_provider_prefix(agent_id: &str) -> String {
+    format!("agent-{}-", sanitize_provider_id_part(agent_id))
+}
+
+fn provider_belongs_to_agent(provider_id: &str, agent_id: &str) -> bool {
+    provider_id.starts_with(&agent_provider_prefix(agent_id))
+}
+
+fn provider_clone_matches_source(provider_id: &str, source_id: &str, agent_id: &str) -> bool {
+    let base = format!(
+        "{}{}",
+        agent_provider_prefix(agent_id),
+        sanitize_provider_id_part(source_id)
+    );
+    provider_id == base
+        || provider_id
+            .strip_prefix(&format!("{base}-"))
+            .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
 #[tauri::command]
 pub async fn add_or_update_provider(
     state: State<'_, Arc<AppState>>,
@@ -336,8 +406,9 @@ pub async fn add_or_update_provider(
     let mut config = state.config.write().await;
     let id = config.upsert_provider(input).map_err(to_command_error)?;
     if config.active_provider_id.is_none() {
-        config.active_provider_id = Some(id);
+        config.active_provider_id = Some(id.clone());
     }
+    refresh_enabled_injections_for_provider(&mut config, &id).map_err(to_command_error)?;
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);
     Ok(state.public_config().await)
@@ -347,8 +418,116 @@ pub async fn add_or_update_provider(
 pub async fn delete_provider(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
+    agent_id: Option<String>,
 ) -> CommandResult<PublicConfig> {
     let mut config = state.config.write().await;
+    delete_provider_config(&mut config, &provider_id, agent_id.as_deref())
+        .map_err(to_command_error)?;
+    config.updated_at = Utc::now();
+    config.save(&state.config_path).map_err(to_command_error)?;
+    drop(config);
+    Ok(state.public_config().await)
+}
+
+fn delete_provider_config(
+    config: &mut AppConfig,
+    provider_id: &str,
+    agent_id: Option<&str>,
+) -> anyhow::Result<()> {
+    if !config
+        .providers
+        .iter()
+        .any(|provider| provider.id == provider_id)
+    {
+        return Err(anyhow::anyhow!("provider {provider_id} was not found"));
+    }
+
+    if let Some(agent_id) = agent_id {
+        let agent_index = config
+            .agent_injections
+            .iter()
+            .position(|agent| agent.id == agent_id)
+            .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
+
+        if !provider_belongs_to_agent(provider_id, agent_id) {
+            if config.agent_injections[agent_index].provider_id.as_deref() == Some(provider_id) {
+                let agent = &mut config.agent_injections[agent_index];
+                agent.provider_id = None;
+                agent.model_id = None;
+                agent.enabled = false;
+                agent.last_status =
+                    Some("已从当前 Agent 移除共享上游，其他 Agent 不受影响".to_string());
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(
+                "shared provider {provider_id} is only a template in this Agent; select or edit it to create an independent copy"
+            ));
+        }
+
+        if config.active_provider_id.as_deref() == Some(provider_id)
+            || config
+                .route_profiles
+                .iter()
+                .any(|profile| profile.provider_id.as_deref() == Some(provider_id))
+        {
+            return Err(anyhow::anyhow!(
+                "provider {provider_id} is still referenced by a global route"
+            ));
+        }
+
+        let other_agent_ids = config
+            .agent_injections
+            .iter()
+            .filter(|agent| {
+                agent.id != agent_id && agent.provider_id.as_deref() == Some(provider_id)
+            })
+            .map(|agent| agent.id.clone())
+            .collect::<Vec<_>>();
+        for other_agent_id in other_agent_ids {
+            let other_model_id = config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == other_agent_id)
+                .and_then(|agent| agent.model_id.clone());
+            clone_provider_for_agent_config(
+                config,
+                &other_agent_id,
+                provider_id,
+                other_model_id.as_deref(),
+            )?;
+        }
+
+        remove_provider_records(config, provider_id);
+        let agent = &mut config.agent_injections[agent_index];
+        if agent.provider_id.as_deref() == Some(provider_id) {
+            agent.provider_id = None;
+            agent.model_id = None;
+            agent.enabled = false;
+            agent.last_status =
+                Some("已删除当前 Agent 的独立上游，其他 Agent 不受影响".to_string());
+        }
+        return Ok(());
+    }
+
+    let referenced_by_agents = config
+        .agent_injections
+        .iter()
+        .any(|agent| agent.provider_id.as_deref() == Some(provider_id));
+    let referenced_by_global_route = config.active_provider_id.as_deref() == Some(provider_id)
+        || config
+            .route_profiles
+            .iter()
+            .any(|profile| profile.provider_id.as_deref() == Some(provider_id));
+    if referenced_by_agents || referenced_by_global_route {
+        return Err(anyhow::anyhow!(
+            "provider {provider_id} is still referenced; remove it from the Agent or global route first"
+        ));
+    }
+    remove_provider_records(config, provider_id);
+    Ok(())
+}
+
+fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
     config
         .providers
         .retain(|provider| provider.id != provider_id);
@@ -361,19 +540,6 @@ pub async fn delete_provider(
     config
         .provider_channel_modes
         .retain(|item| item.provider_id != provider_id);
-    if config.active_provider_id.as_deref() == Some(provider_id.as_str()) {
-        config.active_provider_id = config.providers.first().map(|provider| provider.id.clone());
-    }
-    for item in &mut config.agent_injections {
-        if item.provider_id.as_deref() == Some(provider_id.as_str()) {
-            item.provider_id = None;
-            item.model_id = None;
-        }
-    }
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
-    Ok(state.public_config().await)
 }
 
 #[tauri::command]
@@ -447,6 +613,7 @@ pub async fn test_provider_key_pool(
             is_full_url: provider.is_full_url,
             custom_user_agent: provider.custom_user_agent.clone(),
             channel: provider.channel.clone(),
+            use_system_proxy: provider.use_system_proxy,
         };
         let result = test_provider_key_inner(&state, &input)
             .await
@@ -540,7 +707,7 @@ pub async fn fetch_provider_models(
     }
 
     let models = fetch_models_from_upstream_with_options(
-        &state.client,
+        state.upstream_client(input.use_system_proxy),
         &base_url,
         input.channel,
         upstream_secret.as_deref(),
@@ -584,7 +751,7 @@ async fn test_provider_key_inner(
         });
     };
     let models = fetch_models_from_upstream_with_options(
-        &state.client,
+        state.upstream_client(input.use_system_proxy),
         &input.base_url,
         input.channel.clone(),
         Some(upstream_secret.as_str()),
@@ -616,26 +783,69 @@ pub async fn add_or_update_model(
     state: State<'_, Arc<AppState>>,
     input: ModelInput,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    let provider = config
-        .providers
-        .iter_mut()
-        .find(|provider| provider.id == input.provider_id)
-        .ok_or_else(|| format!("provider {} was not found", input.provider_id))?;
-    if let Some(model) = provider
-        .models
-        .iter_mut()
-        .find(|model| model.id == input.model.id)
-    {
-        *model = input.model;
-    } else {
-        provider.models.push(input.model);
+    let mut normalized_model = input.model;
+    normalized_model.id = normalized_model.id.trim().to_string();
+    if normalized_model.id.is_empty() {
+        return Err("model id cannot be empty".to_string());
     }
-    provider.updated_at = Utc::now();
+    normalized_model.request_model_id = clean_optional_string(normalized_model.request_model_id)
+        .filter(|alias| alias != &normalized_model.id);
+    normalized_model.display_name = normalized_model.display_name.trim().to_string();
+    if normalized_model.display_name.is_empty() {
+        normalized_model.display_name = normalized_model.id.clone();
+    }
+    normalized_model.reasoning_effort = normalized_model
+        .reasoning_effort
+        .as_deref()
+        .and_then(crate::config::normalize_reasoning_effort);
+    normalized_model.supported_reasoning_efforts =
+        crate::config::normalize_reasoning_efforts(&normalized_model.supported_reasoning_efforts);
+    if normalized_model.reasoning_effort_override_enabled
+        && normalized_model.reasoning_effort.is_none()
+    {
+        return Err("reasoning effort override requires a valid effort".to_string());
+    }
+    let mut config = state.config.write().await;
+    {
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == input.provider_id)
+            .ok_or_else(|| format!("provider {} was not found", input.provider_id))?;
+        if let Some(model) = provider
+            .models
+            .iter_mut()
+            .find(|item| item.id == normalized_model.id)
+        {
+            *model = normalized_model.clone();
+        } else {
+            provider.models.push(normalized_model);
+        }
+        provider.updated_at = Utc::now();
+    }
     config.updated_at = Utc::now();
+    refresh_enabled_injections_for_provider(&mut config, &input.provider_id)
+        .map_err(to_command_error)?;
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);
     Ok(state.public_config().await)
+}
+
+fn refresh_enabled_injections_for_provider(
+    config: &mut AppConfig,
+    provider_id: &str,
+) -> Result<Vec<AgentInjectionResult>> {
+    let agent_ids = config
+        .agent_injections
+        .iter()
+        .filter(|agent| agent.enabled && agent.provider_id.as_deref() == Some(provider_id))
+        .map(|agent| agent.id.clone())
+        .collect::<Vec<_>>();
+    let mut results = Vec::new();
+    for agent_id in agent_ids {
+        results.extend(agent_injection::apply_one_by_id(config, &agent_id)?);
+    }
+    Ok(results)
 }
 
 #[tauri::command]
@@ -719,13 +929,37 @@ pub async fn set_agent_injection_enabled(
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let enabled = input.enabled;
     let agent_id = input.id.clone();
-    let results = {
+    let previous_enabled = {
+        let config = state.config.read().await;
+        config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == agent_id)
+            .map(|item| item.enabled)
+            .unwrap_or(false)
+    };
+    let patch_status = if agent_id == "codex" && previous_enabled != enabled {
+        Some(codex_ui_patch::set_enabled(enabled).map_err(to_command_error)?)
+    } else {
+        None
+    };
+    let results = match async {
         let mut config = state.config.write().await;
         let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
             .map_err(to_command_error)?;
         config.updated_at = Utc::now();
         config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        Ok::<_, String>(results)
+    }
+    .await
+    {
+        Ok(results) => results,
+        Err(err) => {
+            if agent_id == "codex" && previous_enabled != enabled {
+                let _ = codex_ui_patch::set_enabled(previous_enabled);
+            }
+            return Err(err);
+        }
     };
     if agent_id == "proxy-mode" {
         if enabled {
@@ -742,6 +976,10 @@ pub async fn set_agent_injection_enabled(
     } else if enabled {
         state.start_proxy().await.map_err(to_command_error)?;
     }
+    let mut results = results;
+    if let (Some(status), Some(result)) = (patch_status, results.first_mut()) {
+        result.status = format!("{}；{}", result.status, status);
+    }
     Ok(results)
 }
 
@@ -750,13 +988,37 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let results = {
+    let previous_enabled = {
+        let config = state.config.read().await;
+        config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == id)
+            .map(|item| item.enabled)
+            .unwrap_or(false)
+    };
+    let patch_status = if id == "codex" {
+        Some(codex_ui_patch::set_enabled(true).map_err(to_command_error)?)
+    } else {
+        None
+    };
+    let results = match async {
         let mut config = state.config.write().await;
         let results =
             agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
         config.updated_at = Utc::now();
         config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        Ok::<_, String>(results)
+    }
+    .await
+    {
+        Ok(results) => results,
+        Err(err) => {
+            if id == "codex" && !previous_enabled {
+                let _ = codex_ui_patch::set_enabled(false);
+            }
+            return Err(err);
+        }
     };
     if id == "proxy-mode" {
         state
@@ -766,6 +1028,10 @@ pub async fn apply_agent_injection(
     } else {
         state.start_proxy().await.map_err(to_command_error)?;
     }
+    let mut results = results;
+    if let (Some(status), Some(result)) = (patch_status, results.first_mut()) {
+        result.status = format!("{}；{}", result.status, status);
+    }
     Ok(results)
 }
 
@@ -773,6 +1039,18 @@ pub async fn apply_agent_injection(
 pub async fn apply_enabled_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
+    let codex_enabled = {
+        let config = state.config.read().await;
+        config
+            .agent_injections
+            .iter()
+            .any(|item| item.id == "codex" && item.enabled)
+    };
+    let patch_status = if codex_enabled {
+        Some(codex_ui_patch::set_enabled(true).map_err(to_command_error)?)
+    } else {
+        None
+    };
     let results = {
         let mut config = state.config.write().await;
         let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
@@ -789,13 +1067,19 @@ pub async fn apply_enabled_agent_injections(
     if results.iter().any(|item| item.id != "proxy-mode") {
         state.start_proxy().await.map_err(to_command_error)?;
     }
+    let mut results = results;
+    if let Some(status) = patch_status {
+        if let Some(result) = results.iter_mut().find(|item| item.id == "codex") {
+            result.status = format!("{}；{}", result.status, status);
+        }
+    }
     Ok(results)
 }
 
 #[tauri::command]
 pub async fn update_agent_injection_route(
     state: State<'_, Arc<AppState>>,
-    input: AgentInjectionRouteUpdate,
+    mut input: AgentInjectionRouteUpdate,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let agent_id = input.id.clone();
     let should_start_proxy = {
@@ -807,6 +1091,18 @@ pub async fn update_agent_injection_route(
     };
     let results = {
         let mut config = state.config.write().await;
+        if let Some(provider_id) = input.provider_id.clone() {
+            if !provider_belongs_to_agent(&provider_id, &agent_id) {
+                let private_provider_id = clone_provider_for_agent_config(
+                    &mut config,
+                    &agent_id,
+                    &provider_id,
+                    input.model_id.as_deref(),
+                )
+                .map_err(to_command_error)?;
+                input.provider_id = Some(private_provider_id);
+            }
+        }
         let results =
             agent_injection::update_route(&mut config, input).map_err(to_command_error)?;
         config.updated_at = Utc::now();
@@ -1051,6 +1347,7 @@ fn parse_model(value: &Value) -> Option<ModelConfig> {
         .map(|value| value as u32);
     Some(ModelConfig {
         id,
+        request_model_id: None,
         display_name,
         context_window,
         output_window: value
@@ -1058,6 +1355,9 @@ fn parse_model(value: &Value) -> Option<ModelConfig> {
             .or_else(|| value.get("output_window"))
             .and_then(Value::as_u64)
             .map(|value| value as u32),
+        reasoning_effort_override_enabled: false,
+        reasoning_effort: None,
+        supported_reasoning_efforts: parse_reasoning_efforts(value),
         supports_tools: value
             .get("supports_tools")
             .or_else(|| value.pointer("/capabilities/tools"))
@@ -1070,6 +1370,33 @@ fn parse_model(value: &Value) -> Option<ModelConfig> {
             .unwrap_or(true),
         enabled: true,
     })
+}
+
+fn parse_reasoning_efforts(value: &Value) -> Vec<String> {
+    let candidates = [
+        value.get("supported_reasoning_efforts"),
+        value.get("reasoning_efforts"),
+        value
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("reasoning_efforts")),
+        value
+            .get("reasoning")
+            .and_then(|reasoning| reasoning.get("supported_efforts")),
+    ];
+    let parsed = candidates
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| {
+            candidate.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap_or_default();
+    crate::config::normalize_reasoning_efforts(&parsed)
 }
 
 fn to_command_error(err: impl std::fmt::Display) -> String {
@@ -1087,6 +1414,26 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn test_provider(id: &str) -> crate::config::ProviderConfig {
+        crate::config::ProviderConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            base_url: format!("https://{id}.example/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn parses_openai_style_models() {
         let value = json!({
@@ -1099,6 +1446,77 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-5.5");
         assert_eq!(models[0].context_window, Some(800000));
+    }
+
+    #[test]
+    fn parses_reasoning_capabilities_without_extra_probe() {
+        let explicit = parse_model(&json!({
+            "id": "provider-model",
+            "supported_reasoning_efforts": ["low", "high", "ultra"]
+        }))
+        .unwrap();
+        assert_eq!(
+            explicit.supported_reasoning_efforts,
+            vec!["low", "high", "ultra"]
+        );
+
+        let unspecified = parse_model(&json!({ "id": "gpt-5.6" })).unwrap();
+        assert!(unspecified.supported_reasoning_efforts.is_empty());
+    }
+
+    #[test]
+    fn refreshes_enabled_agent_catalog_after_bound_model_update() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-model-refresh-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let config_path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let mut provider = test_provider("share");
+        provider.models = vec![ModelConfig {
+            id: "vendor/gpt-custom".to_string(),
+            request_model_id: Some("gpt-custom".to_string()),
+            display_name: "GPT Custom".to_string(),
+            context_window: Some(128_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = Some("vendor/gpt-custom".to_string());
+        codex.target_path = Some(config_path.clone());
+
+        refresh_enabled_injections_for_provider(&mut config, "share").unwrap();
+        config.providers[0].models[0].context_window = Some(256_000);
+        refresh_enabled_injections_for_provider(&mut config, "share").unwrap();
+
+        let parsed: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let catalog_path = parsed
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .unwrap();
+        let catalog: Value =
+            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
+        let custom = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "gpt-custom")
+            .unwrap();
+        assert_eq!(custom["context_window"], 256_000);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -1139,5 +1557,74 @@ mod tests {
             model_endpoint_candidates("https://proxy.example.com/v1/chat/completions", true, None)
                 .unwrap();
         assert_eq!(candidates, vec!["https://proxy.example.com/v1/models"]);
+    }
+
+    #[test]
+    fn deleting_one_agent_clone_keeps_other_agent_and_source_provider() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        let codex_provider =
+            clone_provider_for_agent_config(&mut config, "codex", "shared", None).unwrap();
+        let opencode_provider =
+            clone_provider_for_agent_config(&mut config, "opencode", "shared", None).unwrap();
+
+        assert_ne!(codex_provider, opencode_provider);
+        delete_provider_config(&mut config, &codex_provider, Some("codex")).unwrap();
+
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "shared"));
+        assert!(!config
+            .providers
+            .iter()
+            .any(|provider| provider.id == codex_provider));
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == opencode_provider));
+        assert_eq!(
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "opencode")
+                .and_then(|agent| agent.provider_id.as_deref()),
+            Some(opencode_provider.as_str())
+        );
+    }
+
+    #[test]
+    fn deleting_shared_provider_from_agent_only_detaches_that_agent() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        for agent_id in ["codex", "opencode"] {
+            let agent = config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .unwrap();
+            agent.enabled = true;
+            agent.provider_id = Some("shared".to_string());
+        }
+
+        delete_provider_config(&mut config, "shared", Some("codex")).unwrap();
+
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "shared"));
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        let opencode = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "opencode")
+            .unwrap();
+        assert!(!codex.enabled);
+        assert!(codex.provider_id.is_none());
+        assert_eq!(opencode.provider_id.as_deref(), Some("shared"));
     }
 }

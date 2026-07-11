@@ -8,7 +8,7 @@ const WORKLOAD_LABEL = `${Math.round(TOTAL_BUDGET / 1000)}k_budget_${Math.round(
 const PROVIDER_ID = "provider-a";
 const MODEL = "model-a";
 const WORKSPACE = "workspace-a";
-const MIN_HIT_RATE = 0.99;
+const MIN_HIT_RATE = 0.995;
 const MAX_P95_MS = 50;
 
 const warmReplay = runWarmReplay(SCENARIO_TOTAL);
@@ -76,7 +76,7 @@ console.log(
       acceptance: {
         pass,
         criterion:
-          ">=99% applies to already warmed or repeatable eligible local response-cache requests in session/prefix modes; first-seen novel prompts and ineligible bypasses are reported separately. Passive mode is expected to be exact replay only."
+          ">=99.5% applies to already warmed or repeatable eligible local response-cache requests in session/prefix modes; first-seen novel prompts and ineligible bypasses are reported separately. Passive mode is expected to be exact replay only."
       }
     },
     null,
