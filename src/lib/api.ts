@@ -243,6 +243,8 @@ export interface MetricsSnapshot {
     upstream_first_chunk_ms?: number | null;
     stream_upstream_wait_ms?: number | null;
     stream_client_backpressure_ms?: number | null;
+    sse_end_reason?: string | null;
+    downstream_disconnected?: boolean | null;
     upstream_retry_wait_ms?: number | null;
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
@@ -265,6 +267,7 @@ export interface MetricsSnapshot {
     cache_provider_unstable_gap_tokens?: number | null;
     provider_cache_token_ratio?: number | null;
     response_session_reused?: boolean | null;
+    response_session_skip_reason?: string | null;
     session_anchor_hash?: string | null;
     session_anchor_source?: string | null;
     session_anchor_changed?: boolean | null;
@@ -310,6 +313,8 @@ export interface MetricsSnapshot {
     upstream_first_chunk_ms?: number | null;
     stream_upstream_wait_ms?: number | null;
     stream_client_backpressure_ms?: number | null;
+    sse_end_reason?: string | null;
+    downstream_disconnected?: boolean | null;
     upstream_retry_wait_ms?: number | null;
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
@@ -332,11 +337,13 @@ export interface MetricsSnapshot {
     cache_provider_unstable_gap_tokens?: number | null;
     provider_cache_token_ratio?: number | null;
     response_session_reused?: boolean | null;
+    response_session_skip_reason?: string | null;
     session_anchor_hash?: string | null;
     session_anchor_source?: string | null;
     session_anchor_changed?: boolean | null;
     session_anchor_peer_count?: number | null;
   }>;
+  recent_failed_requests?: MetricsSnapshot["recent_requests"];
   recent_errors?: Array<{
     at: string;
     scope: string;
@@ -610,7 +617,8 @@ const fallbackMetrics: MetricsSnapshot = {
   gap_buckets: [],
   request_body_buckets: [],
   provider_stats: [],
-  recent_requests: []
+  recent_requests: [],
+  recent_failed_requests: []
 };
 
 const fallbackProviderSecrets = new Map<string, string>();
@@ -781,11 +789,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
                 hidden_provider_ids: (item.hidden_provider_ids ?? []).filter(
                   (hiddenId) => hiddenId !== providerId
                 ),
-                model_id:
-                  input?.model_id ??
-                  target.models.find((model) => model.enabled)?.id ??
-                  target.models[0]?.id ??
-                  null
+                model_id: input?.model_id ?? null
               }
             : item
         ),
@@ -826,11 +830,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
               hidden_provider_ids: (item.hidden_provider_ids ?? []).filter(
                 (hiddenId) => hiddenId !== providerId
               ),
-              model_id:
-                input?.model_id ??
-                source.models.find((model) => model.enabled)?.id ??
-                source.models[0]?.id ??
-                null
+              model_id: input?.model_id ?? null
             }
           : item
       ),

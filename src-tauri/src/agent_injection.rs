@@ -74,7 +74,6 @@ fn ensure_enabled_agents_have_provider(config: &mut AppConfig) {
             continue;
         }
         item.provider_id = Some(default_provider.id.clone());
-        item.model_id = default_agent_model(&default_provider).map(ToOwned::to_owned);
         item.last_status = Some(format!("已默认绑定 {}", default_provider.name));
     }
 }
@@ -91,15 +90,6 @@ fn default_agent_provider(config: &AppConfig) -> Option<&ProviderConfig> {
         })
         .or_else(|| config.providers.iter().find(|provider| provider.enabled))
         .or_else(|| config.providers.first())
-}
-
-fn default_agent_model(provider: &ProviderConfig) -> Option<&str> {
-    provider
-        .models
-        .iter()
-        .find(|model| model.enabled)
-        .or_else(|| provider.models.first())
-        .map(|model| model.id.as_str())
 }
 
 pub fn set_enabled(
@@ -127,7 +117,6 @@ pub fn set_enabled(
         if enabled && item.provider_id.is_none() {
             if let Some(provider) = default_provider.as_ref() {
                 item.provider_id = Some(provider.id.clone());
-                item.model_id = default_agent_model(provider).map(ToOwned::to_owned);
             }
         }
         if !enabled {
@@ -1582,7 +1571,7 @@ command = "npx"
     }
 
     #[test]
-    fn enabled_agent_without_provider_defaults_to_active_provider() {
+    fn enabled_agent_without_provider_defaults_to_active_provider_without_forcing_model() {
         let mut config = AppConfig::default();
         config.providers.push(ProviderConfig {
             id: "torch".to_string(),
@@ -1631,7 +1620,7 @@ command = "npx"
             .find(|item| item.id == "codex")
             .unwrap();
         assert_eq!(codex.provider_id.as_deref(), Some("torch"));
-        assert_eq!(codex.model_id.as_deref(), Some("gpt-5.5"));
+        assert_eq!(codex.model_id, None);
     }
 
     #[test]

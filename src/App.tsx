@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   ArrowUp,
   Bot,
@@ -51,6 +52,10 @@ import {
 } from "./lib/api";
 
 type ViewId = "agent" | "cache";
+type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
+type RequestFeedEntry =
+  | ({ feed_kind: "request" } & RequestLogEntry)
+  | ({ feed_kind: "failed" } & RequestLogEntry);
 
 interface ProviderDraft {
   id?: string;
@@ -137,11 +142,10 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.87";
+const appVersion = "v0.1.92";
 const appVersionNotes = [
-  "v0.1.87: Codex 注入与 UI 补丁彻底解耦，后台进程不再阻止注入开关。",
-  "v0.1.87: 注入配置和本地代理优先热更新，UI 模型列表补丁需要重启时只提示、不回滚。",
-  "v0.1.87: 修复 Codex 注入连续开、关、再开时误报必须关闭 Codex 的状态问题。"
+  "v0.1.92: Responses 核心重构，使用量观测与会话身份归并为单一可信路径。",
+  "v0.1.92: 仅在精确可避免证据下等待，最长 1 秒；流生命周期和全阶段尾巴分类已覆盖。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -406,7 +410,7 @@ export default function App() {
       const models = await command<ModelConfig[]>("fetch_provider_models", { input });
       setModelCandidates(models);
       setSelectedFetchedModelId(models[0]?.id ?? "");
-      setNotice(models.length ? `已获取 ${models.length} 个模型，请从下拉栏选择加入` : "没有获取到模型");
+      setNotice(models.length ? `已获取 ${models.length} 个模型，可作为映射项加入` : "没有获取到模型；不添加映射也可以直接代理转发");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -507,16 +511,10 @@ export default function App() {
         setDraft({ ...draft, id: provider.id, models: modelsToSave });
         const selectedAgent = nextConfig.agent_injections.find((item) => item.id === selectedAgentId);
         if (activeView === "agent" && selectedAgent) {
-          const selectedModel =
-            modelsToSave.find((item) => item.enabled)?.id ??
-            modelsToSave[0]?.id ??
-            provider.models.find((item) => item.enabled)?.id ??
-            provider.models[0]?.id;
           await command<AgentInjectionResult[]>("update_agent_injection_route", {
             input: {
               id: selectedAgent.id,
-              provider_id: provider.id,
-              model_id: selectedModel ?? null
+              provider_id: provider.id
             }
           });
           nextConfig = await command<AppConfig>("get_config");
@@ -589,7 +587,7 @@ export default function App() {
         setError("请先添加一个上游，然后再开启这个 Agent。");
         return;
       }
-      await activateAgentProvider(item, defaultProvider, undefined, true);
+      await activateAgentProvider(item, defaultProvider, true);
       return;
     }
     setInjectingId(item.id);
@@ -647,8 +645,7 @@ export default function App() {
 
   async function updateAgentInjectionRoute(
     item: AgentInjectionConfig,
-    providerId: string,
-    modelId?: string
+    providerId: string
   ) {
     setInjectingId(`${item.id}:route`);
     setError("");
@@ -657,8 +654,7 @@ export default function App() {
       const results = await command<AgentInjectionResult[]>("update_agent_injection_route", {
         input: {
           id: item.id,
-          provider_id: providerId || null,
-          model_id: modelId || null
+          provider_id: providerId || null
         }
       });
       setConfig(await command<AppConfig>("get_config"));
@@ -673,13 +669,8 @@ export default function App() {
   async function activateAgentProvider(
     item: AgentInjectionConfig,
     provider: ProviderConfig,
-    modelId?: string,
     enableAfterBind = false
   ) {
-    const selectedModel =
-      modelId ||
-      provider.models.find((item) => item.enabled)?.id ||
-      provider.models[0]?.id;
     setInjectingId(`${item.id}:route`);
     setError("");
     setNotice("");
@@ -687,8 +678,7 @@ export default function App() {
       await command<AgentInjectionResult[]>("update_agent_injection_route", {
         input: {
           id: item.id,
-          provider_id: provider.id,
-          model_id: selectedModel ?? null
+          provider_id: provider.id
         }
       });
       let latestConfig = await command<AppConfig>("get_config");
@@ -890,8 +880,7 @@ export default function App() {
               providers={providers}
               injectingId={injectingId}
               onToggle={toggleAgentInjection}
-              onProviderSelect={(provider, modelId) => void activateAgentProvider(selectedAgent, provider, modelId)}
-              onModelSelect={(provider, modelId) => void activateAgentProvider(selectedAgent, provider, modelId)}
+              onProviderSelect={(provider) => void activateAgentProvider(selectedAgent, provider)}
               onCreateProvider={createProvider}
               onProxyModeDraftChange={setProxyModeDraft}
               onSaveProxyModeConfig={() => void saveProxyModeConfig()}
@@ -1002,7 +991,9 @@ function AgentSideTab({
   onSelect: () => void;
   onToggle: () => void;
 }) {
-  const modelLabel = item.model_id || provider?.models.find((model) => model.enabled)?.id || provider?.models[0]?.id;
+  const routeSummary = provider
+    ? `${provider.name} · ${providerModelMappingLabel(provider)}`
+    : "未选择上游";
   const busy = injectingId === item.id || injectingId === `${item.id}:route`;
 
   return (
@@ -1021,7 +1012,7 @@ function AgentSideTab({
       <div className="agent-icon">{agentIcon(item.kind)}</div>
       <div className="agent-side-copy">
         <b>{item.label}</b>
-        <small>{provider ? `${provider.name}${modelLabel ? ` / ${modelLabel}` : ""}` : "未选择上游"}</small>
+        <small>{routeSummary}</small>
       </div>
       <button
         className={item.enabled ? "mini-toggle on" : "mini-toggle"}
@@ -1050,7 +1041,7 @@ function AgentEmptySelection({
       <div className="empty-state agent-empty">
         <Workflow size={26} />
         <span>
-          请选择左侧某个 Agent 后再配置上游。已启用的 Agent 会继续使用上次保存的上游和模型，不会在打开软件时被自动改选。
+          请选择左侧某个 Agent 后再配置上游。已启用的 Agent 会继续使用上次保存的上游；模型未命中映射时会直接透传。
         </span>
         {!providers.length && (
           <button className="primary-button" onClick={onCreateProvider}>
@@ -1073,7 +1064,6 @@ function AgentWorkspace({
   injectingId,
   onToggle,
   onProviderSelect,
-  onModelSelect,
   onCreateProvider,
   onProxyModeDraftChange,
   onSaveProxyModeConfig,
@@ -1088,8 +1078,7 @@ function AgentWorkspace({
   providers: ProviderConfig[];
   injectingId: string;
   onToggle: (item: AgentInjectionConfig) => void;
-  onProviderSelect: (provider: ProviderConfig, modelId?: string) => void;
-  onModelSelect: (provider: ProviderConfig, modelId: string) => void;
+  onProviderSelect: (provider: ProviderConfig) => void;
   onCreateProvider: () => void;
   onProxyModeDraftChange: Dispatch<SetStateAction<ProxyModeDraft>>;
   onSaveProxyModeConfig: () => void;
@@ -1098,13 +1087,7 @@ function AgentWorkspace({
 }) {
   const selectedProvider = providers.find((provider) => provider.id === item.provider_id) ?? null;
   const visibleProviders = providersForAgentEditor(providers, item);
-  const selectedModel =
-    selectedProvider?.models.find((model) => model.id === item.model_id) ??
-    selectedProvider?.models.find((model) => model.enabled) ??
-    selectedProvider?.models[0] ??
-    null;
   const routeBusy = injectingId === `${item.id}:route`;
-  const itemBusy = injectingId === item.id;
 
   return (
     <section className="agent-workspace">
@@ -1116,9 +1099,9 @@ function AgentWorkspace({
             <p>
               {selectedProvider
                 ? item.enabled
-                  ? `已启用并绑定 ${selectedProvider.name}${selectedModel ? ` / ${selectedModel.id}` : ""}`
-                  : `已选择 ${selectedProvider.name}${selectedModel ? ` / ${selectedModel.id}` : ""}，但这个 Agent 未启用`
-                : "为这个 Agent 选择一个中转上游。每个 Agent 的上游和模型互不影响。"}
+                  ? `已启用并绑定 ${selectedProvider.name} · ${providerModelMappingLabel(selectedProvider)}`
+                  : `已选择 ${selectedProvider.name} · ${providerModelMappingLabel(selectedProvider)}，但这个 Agent 未启用`
+                : "为这个 Agent 选择一个中转上游。模型未命中映射时会直接透传 Agent 请求里的 model。"}
             </p>
             {item.target_path && <code>{item.target_path}</code>}
           </div>
@@ -1150,7 +1133,7 @@ function AgentWorkspace({
       <div className="agent-provider-head">
         <div>
           <h3>选择这个 Agent 使用的上游</h3>
-          <p>点中某个上游后，这个 Agent 会立即启用、绑定并同步配置；其他 Agent 不会被改动。</p>
+          <p>点中某个上游后，这个 Agent 会绑定并同步配置；模型映射在上游编辑里维护，未命中时直接透传。</p>
         </div>
         {routeBusy && (
           <span className="route-saving">
@@ -1164,11 +1147,6 @@ function AgentWorkspace({
         <div className="agent-provider-grid">
           {visibleProviders.map((provider) => {
             const isSelected = item.provider_id === provider.id;
-            const providerModel =
-              provider.models.find((model) => model.id === (isSelected ? item.model_id : undefined)) ??
-              provider.models.find((model) => model.enabled) ??
-              provider.models[0] ??
-              null;
 
             return (
               <div
@@ -1176,11 +1154,11 @@ function AgentWorkspace({
                 key={provider.id}
                 role="button"
                 tabIndex={0}
-                onClick={() => onProviderSelect(provider, providerModel?.id)}
+                onClick={() => onProviderSelect(provider)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" || event.key === " ") {
                     event.preventDefault();
-                    onProviderSelect(provider, providerModel?.id);
+                    onProviderSelect(provider);
                   }
                 }}
               >
@@ -1188,7 +1166,7 @@ function AgentWorkspace({
                   <span className="provider-glyph">{provider.name.slice(0, 1).toUpperCase()}</span>
                   <div>
                     <h4>{provider.name}</h4>
-                    <p>{channelLabel(provider.channel)} / {provider.models.length} 个模型</p>
+                    <p>{channelLabel(provider.channel)} / {providerModelMappingLabel(provider)}</p>
                   </div>
                   {isSelected ? (
                     <span className={item.enabled ? "selected-badge" : "selected-badge pending"}>
@@ -1201,25 +1179,6 @@ function AgentWorkspace({
                 </div>
 
                 <code>{provider.base_url}</code>
-
-                <div className="provider-card-model" onClick={(event) => event.stopPropagation()}>
-                  <Field label="这个 Agent 使用的模型">
-                    <SelectShell disabled={!provider.models.length || routeBusy}>
-                      <select
-                        value={providerModel?.id ?? ""}
-                        disabled={!provider.models.length || routeBusy}
-                        onChange={(event) => onModelSelect(provider, event.target.value)}
-                      >
-                        {!provider.models.length && <option value="">请先添加模型</option>}
-                        {provider.models.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.id}
-                          </option>
-                        ))}
-                      </select>
-                    </SelectShell>
-                  </Field>
-                </div>
 
                 <div className="provider-card-actions" onClick={(event) => event.stopPropagation()}>
                   <button className="soft-button" onClick={() => onEditProvider(provider)}>
@@ -1720,8 +1679,8 @@ function ProviderPanel({
       <section className="surface model-surface">
         <div className="panel-head compact">
           <div>
-            <h3>模型</h3>
-            <p>{draft.models.length ? draft.models.length + " 个模型已在列表中" : "获取模型后从下拉选择，也可以手动添加模型 ID。"}</p>
+            <h3>模型映射</h3>
+            <p>{draft.models.length ? draft.models.length + " 个映射已在列表中" : "不配置映射也可以直接代理转发；获取模型只是为了快速加入映射。"}</p>
           </div>
           <button className="soft-button" onClick={onAddManualModel}>
             <Plus size={16} />
@@ -1758,7 +1717,7 @@ function ProviderPanel({
           {draft.models.length === 0 ? (
             <div className="empty-state">
               <DatabaseZap size={22} />
-              <span>模型列表为空。Agent 里填写的 Model ID 必须在这里存在。</span>
+              <span>映射列表为空。Agent 发来的模型会原样发给上游。</span>
             </div>
           ) : (
             draft.models.map((item, index) => (
@@ -2263,7 +2222,11 @@ function CachePanel({
     : traffic?.total_requests ?? selectedUsageRequests(usage) ?? 0;
   const cacheRatio = inputTokens > 0 ? cacheReadTokens / inputTokens : 0;
   const activeCacheRatio = recentInputTokens > 0 ? recentCacheRatio : cacheRatio;
-  const requestFeed = metrics?.recent_upstream_calls ?? metrics?.recent_requests ?? [];
+  const successfulRequestFeed = metrics?.recent_upstream_calls ?? metrics?.recent_requests ?? [];
+  const requestFeed: RequestFeedEntry[] = [
+    ...successfulRequestFeed.map((request) => ({ ...request, feed_kind: "request" as const })),
+    ...(metrics?.recent_failed_requests ?? []).map((request) => ({ ...request, feed_kind: "failed" as const }))
+  ].sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
   const shownRequests = requestFeed.filter((request) =>
     selectedProvider === "all" || request.provider === selectedProvider
   );
@@ -2470,13 +2433,22 @@ function CachePanel({
                 request.cache_avoidable_gap_tokens ?? 0,
                 request.cache_provider_unstable_gap_tokens ?? 0
               );
-              const cacheStatusLabel = request.cache_status === "miss" ? "" : request.cache_status;
-              const cacheResultLabel = [cacheStatusLabel, cacheDisplay.primary]
+              const primaryStatus = requestPrimaryStatus(
+                request,
+                request.input_tokens ?? 0,
+                request.cache_read_tokens ?? 0
+              );
+              const cacheStatusLabel = ["miss", "compact", "error"].includes(request.cache_status)
+                ? ""
+                : request.cache_status;
+              const cacheResultLabel = [primaryStatus, cacheStatusLabel, cacheDisplay.primary]
                 .filter(Boolean)
                 .join(" · ");
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
               const cacheReadTokens = request.cache_read_tokens ?? 0;
+              const isFailedRequest =
+                request.feed_kind === "failed" || request.status >= 400 || request.cache_status === "error";
               const requestedModel = request.requested_model?.trim();
               const hasModelMapping = Boolean(requestedModel && requestedModel !== request.model);
               const displayModel = hasModelMapping ? requestedModel : request.model;
@@ -2491,9 +2463,9 @@ function CachePanel({
                 request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
               ].filter(Boolean).join(" · ");
               return (
-                <div className="request-row" key={request.id}>
+                <div className={isFailedRequest ? "request-row failed" : "request-row"} key={`${request.feed_kind}-${request.id}`}>
                   <div className="request-identity">
-                    <Activity size={14} />
+                    {isFailedRequest ? <AlertTriangle size={14} /> : <Activity size={14} />}
                     <div>
                       <time>{formatRequestTime(request.at)}</time>
                       <span className="request-provider-text">{request.provider} · {displayModel}</span>
@@ -2915,6 +2887,33 @@ function percent(value?: number) {
   return `${((value ?? 0) * 100).toFixed(1)}%`;
 }
 
+function requestPrimaryStatus(
+  request: MetricsSnapshot["recent_requests"][number],
+  inputTokens: number,
+  cacheReadTokens: number
+) {
+  if (request.status >= 400 || request.cache_status === "error") {
+    return request.status ? `上游失败 ${request.status}` : "上游异常";
+  }
+  if (request.downstream_disconnected) {
+    return "下游已断开";
+  }
+  if (request.cache_status === "compact") {
+    return "实际压缩";
+  }
+  if (
+    request.response_session_reused === false &&
+    request.response_session_skip_reason &&
+    request.response_session_skip_reason !== "compact_non_streaming"
+  ) {
+    return `会话复用失败：${request.response_session_skip_reason}`;
+  }
+  if (inputTokens >= 1024 && cacheReadTokens === 0) {
+    return "冷启动";
+  }
+  return "";
+}
+
 function providerBucketDisplay(
   inputTokens: number,
   cachedTokens: number,
@@ -3007,6 +3006,10 @@ function providerGapDisplay(
 
 function channelLabel(channel: Channel) {
   return channelOptions.find((option) => option.value === channel)?.label ?? channel;
+}
+
+function providerModelMappingLabel(provider: ProviderConfig) {
+  return provider.models.length ? `${provider.models.length} 个映射` : "直接透传";
 }
 
 function requestChannelLabel(clientChannel?: string | null, upstreamChannel?: string | null) {

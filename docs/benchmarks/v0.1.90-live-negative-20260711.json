@@ -1,0 +1,24 @@
+{
+  "version": "0.1.90",
+  "verdict": "negative",
+  "date": "2026-07-11",
+  "confirmed_bug": "The main Responses stream could stop at [DONE] before a later response.completed event, producing stream closed before response.completed.",
+  "negative_change": "Terminal events detached the remaining upstream body into background drain tasks that could overlap later Codex calls.",
+  "gzip_ab": {
+    "gzip_on_examples": [
+      { "input_tokens": 177111, "sent_body_bytes": 300793, "headers_ms": 26862, "ttft_ms": 28193 },
+      { "input_tokens": 176572, "sent_body_bytes": 298250, "headers_ms": 13411, "ttft_ms": 19396 }
+    ],
+    "gzip_off_examples": [
+      { "input_tokens": 216675, "sent_body_bytes": 1139849, "headers_ms": 31989, "ttft_ms": 36883 },
+      { "input_tokens": 213828, "sent_body_bytes": 1126750, "headers_ms": 44146, "ttft_ms": 56258 }
+    ],
+    "decision": "Disabling gzip was negative for this direct route; restore the provider gzip setting."
+  },
+  "recovery": {
+    "baseline": "v0.1.89 single foreground stream through upstream EOF",
+    "keep": ["truthful first model output timing", "tiered gzip", "direct HTTP/1.1 stability"],
+    "remove": ["terminal-event early break", "detached upstream drain"],
+    "extra_upstream_requests": 0
+  }
+}

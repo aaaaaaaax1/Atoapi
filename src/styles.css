@@ -1273,10 +1273,6 @@ button:disabled {
   background: #f1c96b;
 }
 
-.provider-card-model .field {
-  gap: 6px;
-}
-
 .provider-card-actions {
   display: flex;
   justify-content: flex-end;
@@ -1854,6 +1850,21 @@ button:disabled {
 .request-row:hover {
   border-color: rgba(126, 236, 176, 0.22);
   background: linear-gradient(145deg, rgba(33, 38, 34, 0.78), rgba(25, 28, 26, 0.56));
+}
+
+.request-row.failed {
+  border-color: rgba(255, 119, 103, 0.34);
+  background: linear-gradient(145deg, rgba(55, 28, 26, 0.64), rgba(30, 24, 24, 0.5));
+}
+
+.request-row.failed:hover {
+  border-color: rgba(255, 144, 125, 0.5);
+  background: linear-gradient(145deg, rgba(66, 32, 29, 0.78), rgba(34, 25, 24, 0.62));
+}
+
+.request-row.failed .request-identity svg,
+.request-row.failed b {
+  color: #ffb4a8;
 }
 
 .request-identity {

@@ -44,6 +44,7 @@ pub struct MetricsSnapshot {
     pub provider_stats: Vec<ProviderTrafficStats>,
     pub recent_upstream_calls: Vec<RequestLog>,
     pub recent_requests: Vec<RequestLog>,
+    pub recent_failed_requests: Vec<RequestLog>,
     pub recent_errors: Vec<ErrorLog>,
 }
 
@@ -401,6 +402,8 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_end_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_disconnected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_completed_event_seen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_done_marker_seen: Option<bool>,
@@ -447,6 +450,7 @@ struct MetricsInner {
     local_proxy_estimated_tokens_saved: u64,
     recent_upstream_calls: VecDeque<RequestLog>,
     recent_requests: VecDeque<RequestLog>,
+    recent_failed_requests: VecDeque<RequestLog>,
     recent_errors: VecDeque<ErrorLog>,
 }
 
@@ -558,12 +562,16 @@ impl MetricsStore {
                 local_proxy_estimated_tokens_saved: 0,
                 recent_upstream_calls: VecDeque::new(),
                 recent_requests: VecDeque::new(),
+                recent_failed_requests: VecDeque::new(),
                 recent_errors: VecDeque::new(),
             })),
         }
     }
 
     pub async fn record_upstream_call(&self, log: RequestLog) {
+        if !request_log_is_successful_history(&log) {
+            return;
+        }
         let mut inner = self.inner.write().await;
         push_limited(&mut inner.recent_upstream_calls, log, 400);
     }
@@ -615,7 +623,11 @@ impl MetricsStore {
         upsert_gap_bucket(&mut inner.gap_buckets, &log);
         upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
         upsert_provider_traffic(&mut inner.provider_stats, &log, upstream);
-        push_limited(&mut inner.recent_requests, log, 200);
+        if request_log_is_successful_history(&log) {
+            push_limited(&mut inner.recent_requests, log, 200);
+        } else {
+            push_limited(&mut inner.recent_failed_requests, log, 200);
+        }
     }
 
     pub async fn record_upstream_observation(&self, log: RequestLog) {
@@ -628,8 +640,12 @@ impl MetricsStore {
         upsert_gap_bucket(&mut inner.gap_buckets, &log);
         upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
         upsert_provider_traffic(&mut inner.provider_stats, &log, true);
-        push_limited(&mut inner.recent_upstream_calls, log.clone(), 400);
-        push_limited(&mut inner.recent_requests, log, 200);
+        if request_log_is_successful_history(&log) {
+            push_limited(&mut inner.recent_upstream_calls, log.clone(), 400);
+            push_limited(&mut inner.recent_requests, log, 200);
+        } else {
+            push_limited(&mut inner.recent_failed_requests, log, 200);
+        }
     }
 
     pub async fn record_local_proxy_hit(&self, estimated_tokens_saved: u64) {
@@ -751,6 +767,7 @@ impl MetricsStore {
             provider_stats: sorted_provider_stats(&inner.provider_stats, &inner.recent_usage),
             recent_upstream_calls: inner.recent_upstream_calls.iter().cloned().collect(),
             recent_requests: inner.recent_requests.iter().cloned().collect(),
+            recent_failed_requests: inner.recent_failed_requests.iter().cloned().collect(),
             recent_errors: inner.recent_errors.iter().cloned().collect(),
         }
     }
@@ -1164,6 +1181,10 @@ fn request_log_upstream_attempts(log: &RequestLog) -> u64 {
         .max(1)
 }
 
+fn request_log_is_successful_history(log: &RequestLog) -> bool {
+    (200..300).contains(&log.status) && log.cache_status != "error"
+}
+
 fn remember_seen_cache_key(inner: &mut MetricsInner, key: &str) -> bool {
     const SEEN_CACHE_KEY_LIMIT: usize = 300_000;
 
@@ -1313,6 +1334,7 @@ mod tests {
             payload_too_large_rescue_attempted: None,
             payload_too_large_rescue_used: None,
             sse_end_reason: None,
+            downstream_disconnected: None,
             sse_completed_event_seen: None,
             sse_done_marker_seen: None,
             sse_chunks: None,
@@ -1367,6 +1389,29 @@ mod tests {
         assert_eq!(snapshot.upstream_requests, 1);
         assert_eq!(snapshot.provider_cache_hit_requests, 1);
         assert_eq!(snapshot.provider_cache_request_hit_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn failed_upstream_attempts_are_not_added_to_success_history() {
+        let metrics = MetricsStore::new();
+        let mut failed = request_log("error", None);
+        failed.status = 503;
+        metrics.record_upstream_call(failed.clone()).await;
+        metrics.record_request(failed, true).await;
+
+        let successful = request_log("miss", Some("success-history"));
+        metrics.record_upstream_call(successful.clone()).await;
+        metrics.record_request(successful, true).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls[0].status, 200);
+        assert_eq!(snapshot.recent_requests[0].status, 200);
+        assert_eq!(snapshot.recent_failed_requests[0].status, 503);
     }
 
     #[tokio::test]

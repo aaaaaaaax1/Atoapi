@@ -307,15 +307,7 @@ fn clone_provider_for_agent_config(
                 .iter()
                 .any(|model| model.id == *model_id)
         })
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            target_provider
-                .models
-                .iter()
-                .find(|model| model.enabled)
-                .or_else(|| target_provider.models.first())
-                .map(|model| model.id.clone())
-        });
+        .map(ToOwned::to_owned);
 
     let agent = &mut config.agent_injections[agent_index];
     agent

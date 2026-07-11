@@ -22,7 +22,7 @@ use crate::{
         PublicConfig,
     },
     metrics::MetricsStore,
-    proxy,
+    proxy::{self, TransportClients},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,8 +44,7 @@ pub struct AppState {
     pub runtime_state_path: PathBuf,
     pub cache: CacheStore,
     pub metrics: MetricsStore,
-    pub direct_client: reqwest::Client,
-    pub system_proxy_client: reqwest::Client,
+    pub transport_clients: TransportClients,
     pub prefix_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     pub prefix_states: Mutex<HashMap<String, PrefixWarmState>>,
     pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -150,26 +149,6 @@ struct PersistedResponseSessionCooldownState {
 const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
 
-fn build_http_client(user_agent: &str, use_system_proxy: bool) -> Result<reqwest::Client> {
-    let builder = reqwest::Client::builder()
-        .user_agent(user_agent)
-        .connect_timeout(StdDuration::from_secs(30))
-        .pool_max_idle_per_host(32)
-        .pool_idle_timeout(StdDuration::from_secs(10 * 60))
-        .tcp_keepalive(StdDuration::from_secs(30))
-        .tcp_nodelay(true)
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(StdDuration::from_secs(30))
-        .http2_keep_alive_timeout(StdDuration::from_secs(10))
-        .http2_keep_alive_while_idle(true);
-    let builder = if use_system_proxy {
-        builder
-    } else {
-        builder.no_proxy()
-    };
-    Ok(builder.build()?)
-}
-
 impl AppState {
     pub fn load() -> Result<Self> {
         let config_path = config_path()?;
@@ -187,8 +166,7 @@ impl AppState {
             runtime_state_path,
             cache,
             metrics: MetricsStore::new(),
-            direct_client: build_http_client("Atoapi/0.1", false)?,
-            system_proxy_client: build_http_client("Atoapi/0.1", true)?,
+            transport_clients: TransportClients::new("Atoapi/0.1")?,
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(runtime_state.prefix_states),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
@@ -216,8 +194,7 @@ impl AppState {
             runtime_state_path,
             cache,
             metrics: MetricsStore::new(),
-            direct_client: build_http_client("AtoapiTest/0.1", false)?,
-            system_proxy_client: build_http_client("AtoapiTest/0.1", true)?,
+            transport_clients: TransportClients::new("AtoapiTest/0.1")?,
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(HashMap::new()),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
@@ -242,11 +219,7 @@ impl AppState {
     }
 
     pub fn upstream_client(&self, use_system_proxy: bool) -> &reqwest::Client {
-        if use_system_proxy {
-            &self.system_proxy_client
-        } else {
-            &self.direct_client
-        }
+        self.transport_clients.client(use_system_proxy)
     }
 
     pub async fn reload_config(&self) -> Result<PublicConfig> {

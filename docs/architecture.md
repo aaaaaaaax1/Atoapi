@@ -23,6 +23,14 @@
 9. Successful eligible response is encrypted and cached.
 10. Metrics are updated.
 
+## Upstream Transport
+
+- Providers with `use_system_proxy = false` use a pooled HTTP/1.1 client. This follows the stable CCSwitch direct path and avoids large HTTP/2 request-body stalls observed on some Cloudflare routes.
+- Providers with `use_system_proxy = true` use the Windows system proxy and retain normal HTTP protocol negotiation.
+- Both clients are reused across requests. A provider setting change is applied through config hot reload and does not create an extra upstream request.
+- Request-body gzip is opt-in per provider and uses stronger compression for larger payloads to reduce upload time.
+- Streaming metrics distinguish the first SSE chunk from the first real model output. The upstream SSE body remains in one foreground task through EOF so late `response.completed` events are preserved and detached drains cannot overlap later requests.
+
 ## Active Upstream
 
 The selected provider in the left UI column writes `active_provider_id`.

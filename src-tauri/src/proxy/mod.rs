@@ -1,3 +1,15 @@
+use crate::{
+    agent_injection,
+    cache::{self, CacheEntry, CacheLookupStatus},
+    config::{
+        codex_model_alias, codex_model_display_name, model_request_alias,
+        normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
+        AgentInjectionKind, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
+        SelectedProviderKey,
+    },
+    metrics::{RequestLog, UsageRecord},
+    state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
+};
 use anyhow::{anyhow, Context, Result};
 use axum::{
     body::Body,
@@ -21,31 +33,27 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use tokio::time::{sleep, Duration as TokioDuration};
-use uuid::Uuid;
-
-use crate::{
-    agent_injection,
-    cache::{self, CacheEntry, CacheLookupStatus},
-    config::{
-        codex_model_alias, codex_model_display_name, model_request_alias,
-        normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
-        AgentInjectionKind, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
-        SelectedProviderKey,
-    },
-    metrics::{RequestLog, UsageRecord},
-    state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
+use tokio::{
+    sync::mpsc,
+    time::{sleep, Duration as TokioDuration},
 };
-
+use uuid::Uuid;
 mod codex_chat_common;
 mod json_canonical;
-mod prefix_guard;
+mod prefix_control;
+mod responses_stream;
+mod session_identity;
 mod sse;
 mod streaming_codex_chat;
 mod transform_codex_chat;
-
-use prefix_guard::{decide_responses_guard, ResponsesGuardInput};
-
+mod transport;
+use prefix_control::{
+    PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
+    ProviderCacheGapBreakdown,
+};
+use responses_stream::ResponsesStreamState;
+use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
+pub(crate) use transport::TransportClients;
 #[cfg(test)]
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
 #[cfg(test)]
@@ -62,14 +70,13 @@ const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
-
+const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
 #[derive(Debug, Clone)]
 struct RouteDecision {
     provider: ProviderConfig,
     upstream_channel: Channel,
     model: String,
 }
-
 #[derive(Debug, Clone, Default)]
 struct BodyDiagnostics {
     original_body_bytes: u64,
@@ -79,7 +86,6 @@ struct BodyDiagnostics {
     payload_too_large_rescue_used: bool,
     reasoning: ReasoningEffortDiagnostics,
 }
-
 #[derive(Debug, Clone, Default)]
 struct ReasoningEffortDiagnostics {
     agent: Option<String>,
@@ -87,7 +93,6 @@ struct ReasoningEffortDiagnostics {
     effective: Option<String>,
     source: Option<String>,
 }
-
 #[derive(Debug, Clone, Default)]
 struct UpstreamRequestDiagnostics {
     network_path: &'static str,
@@ -112,7 +117,6 @@ struct UpstreamRequestDiagnostics {
     gzip_skipped_cold_stream: bool,
     sent_body_bytes: u64,
 }
-
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
         if !next.network_path.is_empty() {
@@ -142,97 +146,16 @@ impl UpstreamRequestDiagnostics {
         self.sent_body_bytes = next.sent_body_bytes;
     }
 }
-
 struct UpstreamSendOutcome {
     response: reqwest::Response,
     diagnostics: UpstreamRequestDiagnostics,
 }
-
 struct UpstreamBodyReadOutcome {
     bytes: Vec<u8>,
     first_chunk_ms: Option<u64>,
     aggregate_done_ms: u64,
     sse_chunks: Option<u64>,
 }
-
-#[derive(Debug, Clone, Default)]
-struct SseStreamMetadataCollector {
-    pending_line: String,
-    usage: UsageRecord,
-    response_id: Option<String>,
-    completed_event_seen: bool,
-    done_marker_seen: bool,
-    error_event_seen: bool,
-}
-
-impl SseStreamMetadataCollector {
-    fn process_chunk(&mut self, chunk: &[u8]) {
-        let text = String::from_utf8_lossy(chunk);
-        self.pending_line.push_str(&text);
-        while let Some(newline_index) = self.pending_line.find('\n') {
-            let line = self.pending_line[..newline_index]
-                .trim_end_matches('\r')
-                .to_string();
-            self.pending_line.drain(..=newline_index);
-            self.process_line(&line);
-        }
-        if self.pending_line.len() > 1_048_576 {
-            self.pending_line.clear();
-        }
-    }
-
-    fn finish(&mut self) {
-        if !self.pending_line.is_empty() {
-            let line = std::mem::take(&mut self.pending_line);
-            self.process_line(line.trim_end_matches('\r'));
-        }
-    }
-
-    fn process_line(&mut self, line: &str) {
-        let Some(payload) = line.trim_start().strip_prefix("data:") else {
-            if line.contains("message_stop") {
-                self.completed_event_seen = true;
-            }
-            return;
-        };
-        let payload = payload.trim();
-        if payload.is_empty() {
-            return;
-        }
-        if payload == "[DONE]" {
-            self.done_marker_seen = true;
-            return;
-        }
-        if payload.contains("response.completed") || payload.contains("message_stop") {
-            self.completed_event_seen = true;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            if value.get("error").is_some()
-                || value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| {
-                        matches!(
-                            kind,
-                            "error"
-                                | "response.failed"
-                                | "response.incomplete"
-                                | "message_delta_error"
-                        ) || kind.ends_with(".failed")
-                            || kind.ends_with(".incomplete")
-                            || kind.ends_with(".error")
-                    })
-            {
-                self.error_event_seen = true;
-            }
-            self.usage.merge(provider_usage_from_value(&value));
-            if let Some(id) = response_id_from_value(&value) {
-                self.response_id = Some(id);
-            }
-        }
-    }
-}
-
 fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
     let text_like = content_type.contains("json")
         || content_type.contains("event-stream")
@@ -254,7 +177,6 @@ fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
     }
     false
 }
-
 fn json_value_has_error(value: &Value) -> bool {
     if value.get("error").is_some() {
         return true;
@@ -269,7 +191,6 @@ fn json_value_has_error(value: &Value) -> bool {
                 || kind.ends_with(".error")
         })
 }
-
 #[derive(Debug, Clone, Default)]
 struct TailInputDiagnostics {
     input_items: u64,
@@ -288,7 +209,6 @@ struct TailInputDiagnostics {
     tool_output_noise_hint: Option<String>,
     source: Option<String>,
 }
-
 #[derive(Debug, Clone, Default)]
 struct ToolOutputNoiseDiagnostics {
     lines: u64,
@@ -300,7 +220,6 @@ struct ToolOutputNoiseDiagnostics {
     json_like_chars: u64,
     hint: Option<String>,
 }
-
 #[derive(Debug, Clone, Default)]
 struct PrefixGuardWaitDiagnostics {
     wait_ms: u64,
@@ -313,7 +232,6 @@ struct PrefixGuardWaitDiagnostics {
     seen_bucket_tokens: Option<u64>,
     state_cache_read_tokens: Option<u64>,
 }
-
 #[derive(Debug, Clone, Default)]
 struct PrefixLagDiagnostics {
     classification: Option<String>,
@@ -321,7 +239,11 @@ struct PrefixLagDiagnostics {
     cache_delta_tokens: Option<u64>,
     previous_gap_tokens: Option<u64>,
 }
-
+#[derive(Debug, Clone, Default)]
+struct ProviderPrefixUsageObservation {
+    gap: Option<ProviderCacheGapBreakdown>,
+    previous: Option<PrefixWarmState>,
+}
 #[derive(Debug, Clone, Default)]
 struct SessionAnchorDiagnostics {
     hash: Option<String>,
@@ -329,19 +251,16 @@ struct SessionAnchorDiagnostics {
     changed: Option<bool>,
     peer_count: Option<u64>,
 }
-
 #[derive(Debug, Clone)]
 struct ResponseSessionReuseOutcome {
     body: Value,
     diagnostics: ResponseSessionReuseDiagnostics,
 }
-
 #[derive(Debug, Clone)]
 struct PreviousResponseCompatBody {
     body: Value,
     reason: &'static str,
 }
-
 #[derive(Debug, Clone, Default)]
 struct ResponseSessionReuseDiagnostics {
     candidate_count: u64,
@@ -353,7 +272,6 @@ struct ResponseSessionReuseDiagnostics {
     cooldown_active: bool,
     rejected_status: Option<u16>,
 }
-
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -381,7 +299,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
         .with_state(state)
 }
-
 async fn health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
@@ -389,22 +306,18 @@ async fn health() -> impl IntoResponse {
         "time": Utc::now()
     }))
 }
-
 async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.metrics.snapshot().await)
 }
-
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
     list_models_for_agent(state, headers, None).await
 }
-
 async fn codex_list_models(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Response {
     list_models_for_agent(state, headers, Some("codex")).await
 }
-
 async fn list_models_for_agent(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -437,7 +350,6 @@ async fn list_models_for_agent(
         .collect::<Vec<_>>();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
-
 fn provider_model_list_items(provider: &ProviderConfig, include_codex_aliases: bool) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -477,7 +389,6 @@ fn provider_model_list_items(provider: &ProviderConfig, include_codex_aliases: b
     }
     items
 }
-
 async fn chat_completions(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -485,7 +396,6 @@ async fn chat_completions(
 ) -> Response {
     handle_generation(state, headers, body, Channel::Chat).await
 }
-
 async fn responses(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -493,7 +403,6 @@ async fn responses(
 ) -> Response {
     handle_generation(state, headers, body, Channel::Responses).await
 }
-
 async fn responses_compact_legacy(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -501,7 +410,6 @@ async fn responses_compact_legacy(
 ) -> Response {
     handle_responses_compact(state, headers, body, None).await
 }
-
 async fn responses_compact(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(response_id): Path<String>,
@@ -510,7 +418,6 @@ async fn responses_compact(
 ) -> Response {
     handle_responses_compact(state, headers, body, Some(response_id)).await
 }
-
 async fn codex_chat_completions(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -518,7 +425,6 @@ async fn codex_chat_completions(
 ) -> Response {
     handle_generation_for_agent(state, headers, body, Channel::Chat, Some("codex")).await
 }
-
 async fn codex_responses(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -526,7 +432,6 @@ async fn codex_responses(
 ) -> Response {
     handle_generation_for_agent(state, headers, body, Channel::Responses, Some("codex")).await
 }
-
 async fn codex_responses_compact_legacy(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -534,7 +439,6 @@ async fn codex_responses_compact_legacy(
 ) -> Response {
     handle_responses_compact_for_agent(state, headers, body, None, Some("codex")).await
 }
-
 async fn codex_responses_compact(
     AxumState(state): AxumState<Arc<AppState>>,
     Path(response_id): Path<String>,
@@ -543,7 +447,6 @@ async fn codex_responses_compact(
 ) -> Response {
     handle_responses_compact_for_agent(state, headers, body, Some(response_id), Some("codex")).await
 }
-
 async fn messages(
     AxumState(state): AxumState<Arc<AppState>>,
     headers: HeaderMap,
@@ -551,7 +454,6 @@ async fn messages(
 ) -> Response {
     handle_generation(state, headers, body, Channel::Anthropic).await
 }
-
 async fn handle_responses_compact(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -560,7 +462,6 @@ async fn handle_responses_compact(
 ) -> Response {
     handle_responses_compact_for_agent(state, headers, body, response_id, None).await
 }
-
 async fn handle_responses_compact_for_agent(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -570,12 +471,10 @@ async fn handle_responses_compact_for_agent(
 ) -> Response {
     let started = Instant::now();
     let request_id = Uuid::new_v4().to_string();
-
     let authorized_agent = match authorize_for_agent(&state, &headers, forced_agent_id).await {
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
-
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
@@ -584,7 +483,6 @@ async fn handle_responses_compact_for_agent(
         compact_request_set_response_id(&mut client_request, response_id);
     }
     set_stream_flag(&mut client_request, false);
-
     let config = state.config.read().await.clone();
     let decision = match decide_route(
         &config,
@@ -619,7 +517,6 @@ async fn handle_responses_compact_for_agent(
             "provider API key is not configured",
         );
     }
-
     let mut upstream_body = transform_request_for_channel(
         &client_request,
         &Channel::Responses,
@@ -654,7 +551,6 @@ async fn handle_responses_compact_for_agent(
             &tail_input_diagnostics,
             serialized_body_len(&decision.upstream_channel, &upstream_body),
         );
-
     let compact_url = response_id
         .as_deref()
         .map(|id| responses_compact_url(&decision.provider.base_url, id));
@@ -1148,6 +1044,7 @@ async fn handle_responses_compact_for_agent(
         payload_too_large_rescue_attempted: Some(false),
         payload_too_large_rescue_used: Some(false),
         sse_end_reason: None,
+        downstream_disconnected: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: body_read.sse_chunks,
@@ -1287,16 +1184,24 @@ async fn handle_generation_for_agent(
         &decision.upstream_channel,
         &decision,
     );
+    let session_identity =
+        SessionIdentity::derive(&config, &decision, &client_request, &upstream_body);
     if codex_native_responses_stream {
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
+        apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
     }
 
     let mut provider_prefix_body = upstream_body.clone();
     if codex_native_responses_stream {
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
+        apply_session_provider_cache_key(
+            &mut provider_prefix_body,
+            &config,
+            session_identity.as_ref(),
+        );
         copy_responses_prefix_cache_fields_for_native_stream(
             &mut upstream_body,
             &provider_prefix_body,
@@ -1312,22 +1217,31 @@ async fn handle_generation_for_agent(
         set_stream_flag(&mut upstream_body, false);
     }
     let provider_prefix_key = openai_prompt_cache_key(&provider_prefix_body);
-    let provider_prefix_fingerprint = Some(provider_prefix_fingerprint(
-        &provider_prefix_body,
-        &decision.upstream_channel,
-    ));
+    let provider_prefix_fingerprint = session_identity
+        .as_ref()
+        .map(|identity| identity.control_fingerprint.clone())
+        .or_else(|| {
+            Some(provider_prefix_fingerprint(
+                &provider_prefix_body,
+                &decision.upstream_channel,
+            ))
+        });
     let provider_prefix_control_key = provider_prefix_control_key(
         provider_prefix_fingerprint.as_deref(),
         &decision,
         &decision.upstream_channel,
     );
     let response_session_key = if responses_session_reuse_enabled(&config) {
-        responses_session_key(&config, &decision, &upstream_body)
+        session_identity
+            .as_ref()
+            .map(|identity| identity.anchor_key.clone())
     } else {
         None
     };
     let response_session_scope_key = if responses_session_reuse_enabled(&config) {
-        responses_session_scope_key(&config, &decision, &upstream_body)
+        session_identity
+            .as_ref()
+            .map(|identity| identity.scope_key.clone())
     } else {
         None
     };
@@ -2498,7 +2412,6 @@ async fn handle_generation_for_agent(
             full_response_input.clone(),
             active_used_response_session,
             retried_full_response,
-            active_upstream_body.clone(),
             diagnostics.clone(),
             tail_input_diagnostics.clone(),
             session_anchor_diagnostics.clone(),
@@ -2776,48 +2689,32 @@ async fn handle_generation_for_agent(
         )
         .await;
     }
-    let gap_breakdown = provider_cache_gap_breakdown_with_guard(
+    let prefix_observation = observe_provider_prefix_usage(
         &state,
         prefix_state_update_key.as_deref(),
         provider_prefix_family_key.as_deref(),
         usage_record.as_ref(),
-        Some(&tail_input_diagnostics),
-        Some(&prefix_guard_wait),
-    )
-    .await;
-    let prefix_lag = prefix_lag_diagnostics(
-        &state,
-        prefix_state_update_key.as_deref(),
-        usage_record.as_ref(),
-        gap_breakdown.as_ref(),
-        &prefix_guard_wait,
+        prefix_usage_record.as_ref(),
         &tail_input_diagnostics,
+        active_used_response_session,
+        retried_full_response,
+        prefix_guard_wait.budget_exhausted,
+        is_success_status && !sync_compact_diagnostic_only,
     )
     .await;
-    let session_cache_regressed = if is_success_status && !sync_compact_diagnostic_only {
-        update_provider_prefix_state_with_tail_and_guard(
-            &state,
-            prefix_state_update_key.as_deref(),
-            provider_prefix_family_key.as_deref(),
-            prefix_usage_record.as_ref(),
-            &tail_input_diagnostics,
-            active_used_response_session,
-            retried_full_response,
-            prefix_guard_wait.budget_exhausted,
-        )
-        .await
-    } else {
-        false
-    };
-    if session_cache_regressed {
-        let stale_response_id = previous_response_id_from_request(&active_upstream_body);
-        clear_response_session_reference(
-            &state,
-            response_session_key.as_deref(),
-            stale_response_id.as_deref(),
-        )
-        .await;
-    }
+    let gap_breakdown = prefix_observation.gap;
+    let prefix_lag = usage_record
+        .as_ref()
+        .map(|record| {
+            prefix_lag_diagnostics_from_previous(
+                prefix_observation.previous.as_ref(),
+                record,
+                gap_breakdown.as_ref(),
+                &prefix_guard_wait,
+                &tail_input_diagnostics,
+            )
+        })
+        .unwrap_or_default();
     if !is_success_status {
         let error_summary = upstream_error_summary(&bytes);
         if should_cooldown_prefix_after_status(status)
@@ -3034,6 +2931,7 @@ async fn handle_generation_for_agent(
         payload_too_large_rescue_attempted: None,
         payload_too_large_rescue_used: None,
         sse_end_reason: None,
+        downstream_disconnected: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: body_read.sse_chunks,
@@ -3144,7 +3042,7 @@ async fn wait_for_provider_prefix_settle(
             let avoidable_tokens = state
                 .avoidable_shortfall_tokens_128
                 .max(state.avoidable_shortfall_tokens);
-            let policy = decide_responses_guard(ResponsesGuardInput {
+            let policy = PrefixController::before_request(PrefixControlInput {
                 source_is_exact: source == "exact",
                 avoidable_tokens,
                 state_age,
@@ -3599,485 +3497,14 @@ fn chat_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDuration {
 fn provider_prefix_wait_duration_for_channel(
     channel: &Channel,
     state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
+    _current_tail: &TailInputDiagnostics,
 ) -> Option<TokioDuration> {
     let delay = match channel {
         Channel::Chat => chat_provider_prefix_settle_delay(state),
-        Channel::Responses => responses_provider_prefix_settle_delay_with_tail(state, current_tail),
+        Channel::Responses => return None,
         Channel::Anthropic => provider_prefix_settle_delay(state),
     };
-    let elapsed = state.finished_at.elapsed();
-    if let Some(wait) = delay.checked_sub(elapsed) {
-        let wait = wait.max(responses_minimum_avoidable_request_wait(
-            channel,
-            state,
-            current_tail,
-        ));
-        let wait = wait.max(responses_minimum_new_tail_request_wait(
-            channel,
-            state,
-            current_tail,
-        ));
-        if matches!(channel, Channel::Responses) {
-            let avoidable = state
-                .avoidable_shortfall_tokens_128
-                .max(state.avoidable_shortfall_tokens);
-            return Some(wait.min(responses_avoidable_wait_cap_for_99(state, avoidable)));
-        }
-        return Some(wait);
-    }
-    let stale_wait =
-        provider_prefix_stale_recovery_wait_for_channel(channel, state, current_tail, elapsed);
-    if matches!(channel, Channel::Responses) {
-        let avoidable = state
-            .avoidable_shortfall_tokens_128
-            .max(state.avoidable_shortfall_tokens);
-        let minimum_new_tail_wait =
-            responses_minimum_new_tail_request_wait(channel, state, current_tail);
-        return match stale_wait {
-            Some(wait) => Some(
-                wait.max(minimum_new_tail_wait)
-                    .min(responses_avoidable_wait_cap_for_99(state, avoidable)),
-            ),
-            None if !minimum_new_tail_wait.is_zero() => Some(
-                minimum_new_tail_wait.min(responses_avoidable_wait_cap_for_99(state, avoidable)),
-            ),
-            None => None,
-        };
-    }
-    stale_wait
-}
-
-fn responses_minimum_new_tail_request_wait(
-    channel: &Channel,
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-) -> TokioDuration {
-    if !matches!(channel, Channel::Responses) {
-        return TokioDuration::ZERO;
-    }
-    if state.cache_read_tokens == 0 || state.input_tokens < 16_000 {
-        return TokioDuration::ZERO;
-    }
-    let avoidable = state
-        .avoidable_shortfall_tokens_128
-        .max(state.avoidable_shortfall_tokens);
-    if avoidable > 0 {
-        return TokioDuration::ZERO;
-    }
-    let observed_bucket_shortfall =
-        provider_cache_bucket_max(state.input_tokens).saturating_sub(state.cache_read_tokens);
-    if observed_bucket_shortfall == 0 {
-        return TokioDuration::ZERO;
-    }
-
-    let small_bucket_tail =
-        observed_bucket_shortfall <= 2048 && observed_bucket_shortfall % 128 == 0;
-    let noisy_or_tool_tail = current_tail.message_chars > 0
-        || current_tail.tool_output_chars >= 512
-        || state.tail_tool_output_chars >= 512
-        || current_tail.tool_output_noise_hint.is_some()
-        || state.tail_tool_output_noise_hint.is_some();
-    if small_bucket_tail && noisy_or_tool_tail {
-        return responses_foreground_wait_cap();
-    }
-    if responses_medium_tool_tail_carryover_guard(state, current_tail, observed_bucket_shortfall) {
-        return responses_foreground_wait_cap();
-    }
-    if responses_all_stage_tail_carryover_guard(state, current_tail, observed_bucket_shortfall) {
-        return responses_foreground_wait_cap();
-    }
-    if small_bucket_tail
-        && state.input_tokens >= 32_000
-        && state.small_gap_recovery_streak > 0
-        && state.finished_at.elapsed() < std::time::Duration::from_secs(5)
-    {
-        return responses_foreground_wait_cap();
-    }
-
-    TokioDuration::ZERO
-}
-
-fn responses_medium_tool_tail_carryover_guard(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    observed_bucket_shortfall: u64,
-) -> bool {
-    if observed_bucket_shortfall < 2048 || state.input_tokens < 16_000 {
-        return false;
-    }
-    if state.finished_at.elapsed() > std::time::Duration::from_secs(10 * 60) {
-        return false;
-    }
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) {
-        return false;
-    }
-    let current_tool_signal = current_tail.tool_output_chars >= 512
-        || current_tail.largest_tool_output_chars >= 512
-        || current_tail.tool_output_noise_hint.is_some();
-    let previous_tool_signal = state.tail_tool_output_chars >= 2048
-        || state.tail_largest_tool_output_chars >= 2048
-        || state.tail_tool_output_noise_hint.is_some();
-
-    current_tool_signal || previous_tool_signal
-}
-
-fn responses_all_stage_tail_carryover_guard(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    observed_bucket_shortfall: u64,
-) -> bool {
-    if observed_bucket_shortfall == 0 || state.input_tokens < 8_000 {
-        return false;
-    }
-    if state.cache_read_tokens == 0 {
-        return false;
-    }
-    if state.finished_at.elapsed() > std::time::Duration::from_secs(20 * 60) {
-        return false;
-    }
-    let large_bucket_lag = observed_bucket_shortfall >= 4096;
-    let huge_bucket_lag = observed_bucket_shortfall >= 8192;
-    let huge_message_tail = huge_bucket_lag && current_tail.message_chars >= 32_000;
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) && current_tail.tool_output_chars == 0
-        && !huge_message_tail
-    {
-        return false;
-    }
-
-    let current_tool_signal = current_tail.tool_output_chars >= 2048
-        || current_tail.largest_tool_output_chars >= 2048
-        || current_tail.tool_call_chars >= 2048
-        || (current_tail.tool_output_noise_hint.is_some() && current_tail.tool_output_chars >= 512);
-    let current_mixed_signal = matches!(current_tail.source.as_deref(), Some("mixed"))
-        && (current_tail.tool_output_chars >= 1024
-            || current_tail
-                .message_chars
-                .saturating_add(current_tail.tool_output_chars)
-                >= 8192);
-    let current_tail_signal = current_tool_signal || current_mixed_signal || huge_message_tail;
-    let previous_tool_signal = state.tail_tool_output_chars >= 4096
-        || state.tail_largest_tool_output_chars >= 4096
-        || (state.tail_tool_output_noise_hint.is_some() && state.tail_tool_output_chars >= 2048);
-    let unstable_large_lag = state.cache_instability_score >= 2 && large_bucket_lag;
-
-    (huge_bucket_lag && (current_tail_signal || previous_tool_signal))
-        || (large_bucket_lag
-            && (current_tail_signal
-                || (previous_tool_signal && current_tail.tool_output_chars > 0)))
-        || unstable_large_lag
-}
-
-fn responses_minimum_avoidable_request_wait(
-    channel: &Channel,
-    state: &PrefixWarmState,
-    _current_tail: &TailInputDiagnostics,
-) -> TokioDuration {
-    if !matches!(channel, Channel::Responses) {
-        return TokioDuration::ZERO;
-    }
-    let avoidable = state
-        .avoidable_shortfall_tokens_128
-        .max(state.avoidable_shortfall_tokens);
-    if avoidable == 0 {
-        return TokioDuration::ZERO;
-    }
-
-    if state.input_tokens < 16_000 && avoidable <= 512 {
-        return TokioDuration::from_secs(2);
-    }
-    responses_foreground_wait_cap()
-}
-
-fn provider_prefix_stale_recovery_wait_for_channel(
-    channel: &Channel,
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> Option<TokioDuration> {
-    if !matches!(channel, Channel::Responses) {
-        return None;
-    }
-    responses_stale_prefix_recovery_wait(state, current_tail, elapsed)
-}
-
-fn responses_stale_prefix_recovery_wait(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> Option<TokioDuration> {
-    if state.input_tokens < 4096 {
-        return None;
-    }
-    if responses_long_idle_warm_prefix_guard(state, current_tail, elapsed) {
-        return Some(responses_foreground_wait_cap());
-    }
-    if responses_idle_warm_tail_guard(state, current_tail, elapsed) {
-        return Some(responses_foreground_wait_cap());
-    }
-
-    let avoidable = state
-        .avoidable_shortfall_tokens_128
-        .max(state.avoidable_shortfall_tokens);
-    let observed_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
-    let seen_bucket = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
-    let severe_cold_read = state.cache_read_tokens == 0 && seen_bucket >= 32_000;
-    let unstable_tail = state.cache_instability_score > 0
-        && (avoidable > 0
-            || observed_shortfall > 0
-            || current_tail.tool_output_chars > 0
-            || current_tail.message_chars > 0);
-    if avoidable == 0 && responses_stale_current_tail_guard(state, current_tail, elapsed) {
-        return Some(responses_foreground_wait_cap());
-    }
-    if elapsed > std::time::Duration::from_secs(20 * 60) {
-        return None;
-    }
-
-    if state.input_tokens < 16_000 {
-        let early_large_tool_tail = current_tail.tool_output_chars >= 8_000
-            || current_tail.largest_tool_output_chars >= 8_000;
-        if state.cache_read_tokens == 0 && observed_shortfall >= 1024 && early_large_tool_tail {
-            return Some(responses_foreground_wait_cap());
-        }
-        if state.cache_read_tokens == 0 && observed_shortfall >= 1024 {
-            return Some(responses_foreground_wait_cap());
-        }
-        if early_large_tool_tail && observed_shortfall >= 2048 {
-            return Some(responses_foreground_wait_cap());
-        }
-        if avoidable >= 2048 {
-            return Some(responses_foreground_wait_cap());
-        }
-        if avoidable >= 1024 {
-            return Some(responses_foreground_wait_cap());
-        }
-        if avoidable > 0 && state.input_tokens >= 8192 {
-            return Some(responses_foreground_wait_cap());
-        }
-        if avoidable > 0 || (state.small_gap_recovery_streak > 0 && observed_shortfall > 0) {
-            return Some(TokioDuration::from_secs(2));
-        }
-        return None;
-    }
-
-    if !(severe_cold_read || avoidable > 0 || unstable_tail) {
-        if responses_stale_medium_tool_tail_probe(state, current_tail, elapsed) {
-            return Some(responses_foreground_wait_cap());
-        }
-        if responses_stale_large_tool_tail_catchup(state, current_tail, elapsed) {
-            return Some(responses_foreground_wait_cap());
-        }
-        if responses_long_idle_large_tail_probe(state, current_tail, elapsed) {
-            return Some(responses_foreground_wait_cap());
-        }
-        return None;
-    }
-
-    let large_current_tool_tail = current_tail.tool_output_chars >= 20_000
-        || current_tail.largest_tool_output_chars >= 12_000;
-    let medium_current_tool_tail =
-        current_tail.tool_output_chars >= 8_000 || current_tail.largest_tool_output_chars >= 4_000;
-    let stale_small_avoidable_risk = avoidable > 0
-        && avoidable < 2048
-        && state.input_tokens >= 64_000
-        && (state.cache_instability_score >= 2
-            || elapsed >= std::time::Duration::from_secs(10 * 60)
-            || current_tail.message_chars >= 128
-            || current_tail.tool_output_chars >= 512
-            || current_tail.tool_call_chars >= 512);
-
-    let wait = if severe_cold_read || avoidable >= 32_768 {
-        responses_foreground_wait_cap()
-    } else if avoidable > 0 && large_current_tool_tail {
-        responses_foreground_wait_cap()
-    } else if avoidable >= 4096 {
-        responses_foreground_wait_cap()
-    } else if avoidable >= 2048 {
-        responses_foreground_wait_cap()
-    } else if avoidable > 0 && medium_current_tool_tail {
-        responses_foreground_wait_cap()
-    } else if avoidable >= 1024 {
-        responses_foreground_wait_cap()
-    } else if stale_small_avoidable_risk {
-        if elapsed >= std::time::Duration::from_secs(10 * 60) || state.cache_instability_score >= 4
-        {
-            responses_foreground_wait_cap()
-        } else {
-            responses_foreground_wait_cap()
-        }
-    } else if avoidable > 0 && state.input_tokens >= 64_000 {
-        TokioDuration::from_secs(2)
-    } else if avoidable > 0 {
-        TokioDuration::from_secs(2)
-    } else if observed_shortfall >= 2048 {
-        responses_foreground_wait_cap()
-    } else {
-        TokioDuration::from_secs(2)
-    };
-
-    Some(wait.min(responses_non_avoidable_wait_cap(state)))
-}
-
-fn responses_long_idle_warm_prefix_guard(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if elapsed < std::time::Duration::from_secs(20 * 60)
-        || elapsed > std::time::Duration::from_secs(6 * 60 * 60)
-    {
-        return false;
-    }
-    if state.input_tokens < 64_000 || state.cache_read_tokens < 64_000 {
-        return false;
-    }
-    if state.seen_bucket_tokens_128.max(state.seen_bucket_tokens) < 64_000 {
-        return false;
-    }
-    if state.cache_read_tokens == 0 {
-        return false;
-    }
-    let has_new_tail = current_tail.input_items > 0
-        || current_tail.message_chars > 0
-        || current_tail.tool_output_chars > 0
-        || current_tail.tool_call_chars > 0;
-    if !has_new_tail {
-        return false;
-    }
-    let previous_gap = state.shortfall_tokens_128.max(state.shortfall_tokens);
-    previous_gap > 0 || state.cache_instability_score > 0 || state.small_gap_recovery_streak > 0
-}
-
-fn responses_stale_current_tail_guard(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if state.input_tokens < 8_000 || state.cache_read_tokens == 0 {
-        return false;
-    }
-    if elapsed > std::time::Duration::from_secs(6 * 60 * 60) {
-        return false;
-    }
-    current_tail.message_chars >= 512
-        || current_tail.tool_call_chars > 0
-        || (current_tail.tool_output_chars > 0
-            && (elapsed <= std::time::Duration::from_secs(10)
-                || current_tail.tool_output_chars >= 512
-                || current_tail.largest_tool_output_chars >= 512))
-        || (current_tail.input_items >= 2 && current_tail.message_chars >= 128)
-}
-
-fn responses_idle_warm_tail_guard(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if elapsed < std::time::Duration::from_secs(3 * 60)
-        || elapsed > std::time::Duration::from_secs(20 * 60)
-    {
-        return false;
-    }
-    if state.input_tokens < 64_000 || state.cache_read_tokens < 64_000 {
-        return false;
-    }
-    let seen_bucket = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
-    if seen_bucket < 64_000 {
-        return false;
-    }
-    let previous_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
-    if previous_shortfall > 1024 {
-        return false;
-    }
-    let previous_ratio = state.cache_read_tokens as f64 / state.input_tokens.max(1) as f64;
-    if previous_ratio < 0.98 {
-        return false;
-    }
-    current_tail.message_chars >= 128
-        || current_tail.tool_output_chars > 0
-        || current_tail.tool_call_chars > 0
-        || current_tail.input_items > 0
-}
-
-fn responses_stale_medium_tool_tail_probe(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if state.input_tokens < 32_000 || state.cache_read_tokens < 32_000 {
-        return false;
-    }
-    if elapsed < std::time::Duration::from_secs(30)
-        || elapsed > std::time::Duration::from_secs(12 * 60)
-    {
-        return false;
-    }
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) {
-        return false;
-    }
-    let medium_tail =
-        current_tail.tool_output_chars >= 2_048 || current_tail.largest_tool_output_chars >= 2_048;
-    let not_huge_tail =
-        current_tail.tool_output_chars < 20_000 && current_tail.largest_tool_output_chars < 12_000;
-    medium_tail && not_huge_tail
-}
-
-fn responses_stale_large_tool_tail_catchup(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if state.input_tokens < 8_000 || state.cache_read_tokens < 1024 {
-        return false;
-    }
-    if elapsed < std::time::Duration::from_secs(5)
-        || elapsed > std::time::Duration::from_secs(8 * 60)
-    {
-        return false;
-    }
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) {
-        return false;
-    }
-    current_tail.tool_output_chars >= 18_000 || current_tail.largest_tool_output_chars >= 10_000
-}
-
-fn responses_long_idle_large_tail_probe(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-    elapsed: std::time::Duration,
-) -> bool {
-    if state.input_tokens < 32_000 {
-        return false;
-    }
-    if elapsed < std::time::Duration::from_secs(60) {
-        return false;
-    }
-    if elapsed > std::time::Duration::from_secs(30 * 60) {
-        return false;
-    }
-    if state.cache_read_tokens == 0 {
-        return false;
-    }
-    if current_tail.tool_output_chars < 20_000 && current_tail.largest_tool_output_chars < 8_000 {
-        return false;
-    }
-    !matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    )
+    delay.checked_sub(state.finished_at.elapsed())
 }
 
 fn responses_sync_main_skips_prefix_guard(
@@ -4242,70 +3669,14 @@ fn strip_chat_compat_compact_tool_fields(body: &mut Value) {
 fn provider_prefix_wait_reason_for_channel(
     channel: &Channel,
     state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
+    _current_tail: &TailInputDiagnostics,
 ) -> Option<String> {
     let avoidable = state
         .avoidable_shortfall_tokens_128
         .max(state.avoidable_shortfall_tokens);
     let observed_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
     match channel {
-        Channel::Responses => {
-            if responses_long_idle_warm_prefix_guard(
-                state,
-                current_tail,
-                state.finished_at.elapsed(),
-            ) {
-                Some("responses_long_idle_warm_prefix_guard".to_string())
-            } else if responses_idle_warm_tail_guard(
-                state,
-                current_tail,
-                state.finished_at.elapsed(),
-            ) {
-                Some("responses_idle_warm_tail_guard".to_string())
-            } else if responses_current_tool_output_cap_applies(state, current_tail) {
-                Some("responses_current_tool_output_tail_cap".to_string())
-            } else if avoidable > 0 {
-                Some("responses_avoidable_gap".to_string())
-            } else if responses_cold_unstable_recent_warm_floor(state) > TokioDuration::ZERO {
-                Some("responses_cold_unstable_recent_warm_guard".to_string())
-            } else if state.tail_tool_output_chars >= 1024
-                && state.tail_tool_output_noise_hint.is_some()
-            {
-                Some("responses_noisy_tool_output_tail_guard_1024".to_string())
-            } else if state.tail_tool_output_chars >= 8_000 {
-                Some("responses_large_tool_output_tail_guard".to_string())
-            } else if responses_stale_medium_tool_tail_probe(
-                state,
-                current_tail,
-                state.finished_at.elapsed(),
-            ) {
-                Some("responses_stale_medium_tool_tail_probe".to_string())
-            } else if responses_medium_tool_tail_carryover_guard(
-                state,
-                current_tail,
-                observed_shortfall,
-            ) {
-                Some("responses_medium_tool_tail_carryover_guard".to_string())
-            } else if responses_all_stage_tail_carryover_guard(
-                state,
-                current_tail,
-                observed_shortfall,
-            ) {
-                Some("responses_all_stage_tail_guard".to_string())
-            } else if responses_current_tail_floor(state, current_tail) > TokioDuration::ZERO {
-                Some("responses_current_tail_guard".to_string())
-            } else if responses_stale_current_tail_guard(
-                state,
-                current_tail,
-                state.finished_at.elapsed(),
-            ) {
-                Some("responses_stale_current_tail_guard".to_string())
-            } else if observed_shortfall > 0 || state.small_gap_recovery_streak > 0 {
-                Some("responses_small_tail_guard".to_string())
-            } else {
-                Some("provider_prefix_settle".to_string())
-            }
-        }
+        Channel::Responses => None,
         Channel::Chat => {
             if avoidable > 0 {
                 Some("chat_avoidable_gap".to_string())
@@ -4327,11 +3698,6 @@ fn provider_prefix_wait_reason_for_channel(
     }
 }
 
-#[cfg(test)]
-fn responses_provider_prefix_settle_delay(state: &PrefixWarmState) -> TokioDuration {
-    responses_provider_prefix_settle_delay_with_tail(state, &TailInputDiagnostics::default())
-}
-
 fn responses_foreground_wait_cap() -> TokioDuration {
     TokioDuration::from_secs(1)
 }
@@ -4345,220 +3711,6 @@ fn prefix_guard_wait_budget_for_channel(
             .checked_sub(elapsed_since_request_start)
             .unwrap_or(TokioDuration::ZERO)
     })
-}
-
-fn cap_responses_foreground_wait(wait: TokioDuration) -> TokioDuration {
-    wait.min(responses_foreground_wait_cap())
-}
-
-fn responses_base_prefix_settle_delay(state: &PrefixWarmState, avoidable: u64) -> TokioDuration {
-    let base = provider_prefix_settle_delay(state);
-    if avoidable == 0 {
-        return cap_responses_foreground_wait(base);
-    }
-
-    let light_base = responses_avoidable_gap_floor(avoidable, state.avoidable_shortfall_streak);
-    cap_responses_foreground_wait(base.min(light_base))
-}
-
-fn responses_avoidable_gap_floor(tokens: u64, streak: u32) -> TokioDuration {
-    if tokens == 0 {
-        return TokioDuration::ZERO;
-    }
-
-    let base_ms: u64 = if tokens > 90_000 {
-        45_000
-    } else if tokens > 65_536 {
-        32_000
-    } else if tokens > 32_768 {
-        24_000
-    } else if tokens > 16_384 {
-        18_000
-    } else if tokens > 8192 {
-        12_000
-    } else if tokens > 4096 {
-        8_000
-    } else if tokens >= 2048 {
-        4_000
-    } else if tokens >= 1024 {
-        3_000
-    } else if tokens >= 512 {
-        2_000
-    } else {
-        500
-    };
-    let streak_bonus_ms: u64 = if streak >= 4 {
-        2_000
-    } else if streak >= 2 {
-        1_000
-    } else {
-        0
-    };
-
-    cap_responses_foreground_wait(TokioDuration::from_millis(base_ms + streak_bonus_ms))
-}
-
-fn responses_bucket_tail_floor(tokens: u64, streak: u32, input_tokens: u64) -> TokioDuration {
-    if tokens == 0 {
-        return TokioDuration::ZERO;
-    }
-
-    let high_context = input_tokens >= 64_000;
-    let mid_context = input_tokens >= 16_000;
-    let aligned_512 = tokens >= 512 && tokens % 512 == 0;
-
-    let base_secs = if tokens > 65_536 {
-        180
-    } else if tokens > 32_768 {
-        150
-    } else if tokens > 16_384 {
-        135
-    } else if tokens >= 8192 {
-        105
-    } else if tokens >= 4096 {
-        90
-    } else if tokens >= 2048 {
-        if high_context {
-            60
-        } else if mid_context {
-            45
-        } else {
-            30
-        }
-    } else if tokens >= 512 && aligned_512 {
-        if high_context {
-            45
-        } else if mid_context {
-            45
-        } else {
-            2
-        }
-    } else if tokens > 0 {
-        if high_context {
-            45
-        } else if mid_context {
-            30
-        } else {
-            2
-        }
-    } else {
-        0
-    };
-    let streak_bonus_secs = if tokens >= 4096 && streak >= 4 {
-        18
-    } else if tokens >= 4096 && streak >= 2 {
-        9
-    } else if tokens >= 2048 && streak >= 4 {
-        12
-    } else if tokens >= 2048 && streak >= 2 {
-        6
-    } else if streak >= 1 && aligned_512 {
-        0
-    } else {
-        0
-    };
-
-    cap_responses_foreground_wait(TokioDuration::from_secs(base_secs + streak_bonus_secs))
-}
-
-fn responses_instability_floor(state: &PrefixWarmState) -> TokioDuration {
-    if state.cache_instability_score == 0 || state.input_tokens < 16_000 {
-        return TokioDuration::ZERO;
-    }
-    let age = state.finished_at.elapsed();
-    let score = state.cache_instability_score;
-    let base_secs = if state.input_tokens >= 96_000 {
-        180
-    } else if state.input_tokens >= 64_000 {
-        150
-    } else if state.input_tokens >= 32_000 {
-        120
-    } else {
-        75
-    };
-    let bonus_secs = if score >= 4 {
-        60
-    } else if score >= 2 {
-        30
-    } else {
-        0
-    };
-    let floor = cap_responses_foreground_wait(TokioDuration::from_secs(base_secs + bonus_secs));
-    floor.checked_sub(age).unwrap_or(TokioDuration::ZERO)
-}
-
-fn responses_cold_unstable_recent_warm_floor(state: &PrefixWarmState) -> TokioDuration {
-    if state.cache_instability_score < 2 || state.input_tokens < 32_000 {
-        return TokioDuration::ZERO;
-    }
-    if state.cache_read_tokens == 0 {
-        return TokioDuration::ZERO;
-    }
-    let seen_bucket = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
-    if seen_bucket < 32_000 {
-        return TokioDuration::ZERO;
-    }
-    if state.input_tokens >= 96_000 && state.cache_instability_score >= 4 {
-        return responses_foreground_wait_cap();
-    }
-    let shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
-    if shortfall > 2048 {
-        return TokioDuration::ZERO;
-    }
-    let age = state.finished_at.elapsed();
-    let floor = responses_foreground_wait_cap();
-    floor.checked_sub(age).unwrap_or(TokioDuration::ZERO)
-}
-
-fn responses_non_avoidable_wait_cap(state: &PrefixWarmState) -> TokioDuration {
-    let _ = state;
-    responses_foreground_wait_cap()
-}
-
-fn responses_avoidable_wait_cap_for_99(state: &PrefixWarmState, avoidable: u64) -> TokioDuration {
-    if avoidable == 0 || state.input_tokens == 0 {
-        return responses_non_avoidable_wait_cap(state);
-    }
-
-    let projected_cached = state.input_tokens.saturating_sub(avoidable);
-    let projected_ratio = projected_cached as f64 / state.input_tokens.max(1) as f64;
-    if projected_ratio >= 0.99 {
-        return responses_non_avoidable_wait_cap(state);
-    }
-
-    responses_foreground_wait_cap()
-}
-
-fn responses_current_tail_floor(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-) -> TokioDuration {
-    if state.input_tokens < 16_000 {
-        return TokioDuration::ZERO;
-    }
-
-    let mixed_message_tool_tail =
-        current_tail.message_chars >= 1024 && current_tail.tool_output_chars > 0;
-
-    if mixed_message_tool_tail {
-        responses_foreground_wait_cap()
-    } else if current_tail.tool_output_chars >= 20_000 {
-        responses_foreground_wait_cap()
-    } else if current_tail.tool_output_chars >= 8_000 {
-        responses_foreground_wait_cap()
-    } else if current_tail.tool_output_chars >= 4_000 {
-        responses_foreground_wait_cap()
-    } else if current_tail.tool_output_chars >= 1024 {
-        responses_foreground_wait_cap()
-    } else if current_tail.tool_output_chars > 0 {
-        responses_foreground_wait_cap()
-    } else if current_tail.message_chars >= 1024 {
-        responses_foreground_wait_cap()
-    } else if current_tail.message_chars > 0 {
-        responses_foreground_wait_cap()
-    } else {
-        TokioDuration::ZERO
-    }
 }
 
 fn prefix_guard_wait_effect(
@@ -4614,13 +3766,29 @@ async fn prefix_lag_diagnostics(
     wait: &PrefixGuardWaitDiagnostics,
     current_tail: &TailInputDiagnostics,
 ) -> PrefixLagDiagnostics {
-    let (Some(key), Some(record)) = (provider_prefix_key, usage_record) else {
+    let Some(record) = usage_record else {
         return PrefixLagDiagnostics::default();
     };
     let previous = {
         let states = state.prefix_states.lock().await;
-        lookup_provider_prefix_state(&states, key).cloned()
+        provider_prefix_key.and_then(|key| lookup_provider_prefix_state(&states, key).cloned())
     };
+    prefix_lag_diagnostics_from_previous(
+        previous.as_ref(),
+        record,
+        gap_breakdown,
+        wait,
+        current_tail,
+    )
+}
+
+fn prefix_lag_diagnostics_from_previous(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    gap_breakdown: Option<&ProviderCacheGapBreakdown>,
+    wait: &PrefixGuardWaitDiagnostics,
+    current_tail: &TailInputDiagnostics,
+) -> PrefixLagDiagnostics {
     let Some(previous) = previous else {
         if responses_huge_dynamic_history_cold_read(record, current_tail) {
             return PrefixLagDiagnostics {
@@ -4658,7 +3826,7 @@ async fn prefix_lag_diagnostics(
     let ratio = provider_cache_ratio(record).unwrap_or_default();
     let real_provider_shortfall = provider_cache_shortfall(record);
 
-    let previous_seen = provider_prefix_raw_seen_bucket(&previous);
+    let previous_seen = provider_prefix_raw_seen_bucket(previous);
     let classification = if record.cache_read_tokens == 0 && real_provider_shortfall >= 1024 {
         if previous_seen >= 32_000 {
             "cold_read_after_warm"
@@ -4735,8 +3903,18 @@ fn should_skip_request_body_gzip_for_cold_stream(
     false
 }
 
+fn request_body_gzip_compression(body_bytes: usize) -> Compression {
+    if body_bytes >= 1_048_576 {
+        Compression::best()
+    } else if body_bytes >= REQUEST_BODY_GZIP_MIN_BYTES {
+        Compression::default()
+    } else {
+        Compression::fast()
+    }
+}
+
 fn gzip_request_body(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut encoder = GzEncoder::new(Vec::new(), request_body_gzip_compression(bytes.len()));
     encoder.write_all(bytes)?;
     encoder.finish()
 }
@@ -4979,175 +4157,6 @@ fn server_timing_duration_ms(headers: &HeaderMap) -> Option<u64> {
         .max()
 }
 
-fn responses_provider_prefix_settle_delay_with_tail(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-) -> TokioDuration {
-    let avoidable = state
-        .avoidable_shortfall_tokens_128
-        .max(state.avoidable_shortfall_tokens);
-    if responses_stable_prefix_needs_no_guard(state, avoidable) {
-        return TokioDuration::ZERO;
-    }
-    let base = responses_base_prefix_settle_delay(state, avoidable);
-    if state.input_tokens < 4096 {
-        return base;
-    }
-
-    let avoidable_floor = if avoidable > 0 {
-        responses_avoidable_gap_floor(avoidable, state.avoidable_shortfall_streak).max(
-            responses_minimum_avoidable_request_wait(&Channel::Responses, state, current_tail),
-        )
-    } else {
-        TokioDuration::ZERO
-    };
-
-    if state.cache_read_tokens == 0 && avoidable == 0 {
-        return base
-            .max(responses_instability_floor(state))
-            .min(responses_non_avoidable_wait_cap(state));
-    }
-
-    let observed_shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
-    let bucket_tail_floor = if avoidable == 0 {
-        responses_bucket_tail_floor(
-            observed_shortfall,
-            state.small_gap_recovery_streak,
-            state.input_tokens,
-        )
-    } else {
-        TokioDuration::ZERO
-    };
-    let noisy_tool_tail_floor = if avoidable == 0
-        && state.tail_tool_output_chars >= 1024
-        && state.tail_tool_output_noise_hint.is_some()
-    {
-        responses_foreground_wait_cap()
-    } else {
-        TokioDuration::ZERO
-    };
-    let tool_tail_floor = if state.tail_tool_output_chars >= 40_000 {
-        responses_foreground_wait_cap()
-    } else if state.tail_tool_output_chars >= 20_000 {
-        responses_foreground_wait_cap()
-    } else if state.tail_tool_output_chars >= 8_000 {
-        responses_foreground_wait_cap()
-    } else {
-        TokioDuration::ZERO
-    };
-    let current_tail_floor = if avoidable == 0 {
-        responses_current_tail_floor(state, current_tail)
-    } else {
-        TokioDuration::ZERO
-    };
-    let cold_unstable_recent_warm_floor = if avoidable == 0 {
-        responses_cold_unstable_recent_warm_floor(state)
-    } else {
-        TokioDuration::ZERO
-    };
-    let large_tail_floor = if avoidable == 0 && observed_shortfall > 65_536 {
-        responses_foreground_wait_cap()
-    } else if avoidable == 0 && observed_shortfall > 32_768 {
-        responses_foreground_wait_cap()
-    } else if avoidable == 0 && observed_shortfall > 16_384 {
-        responses_foreground_wait_cap()
-    } else {
-        TokioDuration::ZERO
-    };
-
-    let delay = base
-        .max(responses_instability_floor(state))
-        .max(avoidable_floor)
-        .max(bucket_tail_floor)
-        .max(noisy_tool_tail_floor)
-        .max(tool_tail_floor)
-        .max(current_tail_floor)
-        .max(cold_unstable_recent_warm_floor)
-        .max(large_tail_floor);
-
-    if avoidable == 0 {
-        let capped_delay = delay.min(responses_non_avoidable_wait_cap(state));
-        if let Some(cap) = responses_current_tool_output_wait_cap(current_tail) {
-            return capped_delay.min(cap);
-        }
-        return capped_delay;
-    } else {
-        let cap = responses_avoidable_wait_cap_for_99(state, avoidable);
-        if let Some(tool_cap) = responses_avoidable_tool_output_wait_cap(state, current_tail) {
-            return delay.min(cap).min(tool_cap);
-        }
-        return delay.min(cap);
-    }
-}
-
-fn responses_stable_prefix_needs_no_guard(state: &PrefixWarmState, avoidable: u64) -> bool {
-    if avoidable > 0
-        || state.input_tokens < 4096
-        || state.cache_read_tokens == 0
-        || state.cache_instability_score > 0
-    {
-        return false;
-    }
-    state.cache_read_tokens as f64 / state.input_tokens as f64 >= 0.995
-}
-
-fn responses_avoidable_tool_output_wait_cap(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-) -> Option<TokioDuration> {
-    if state.cache_instability_score < 2 {
-        return None;
-    }
-    if current_tail.tool_output_chars < 4_000 {
-        return None;
-    }
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) {
-        return None;
-    }
-    if current_tail.tool_output_chars >= 20_000 {
-        Some(responses_foreground_wait_cap())
-    } else if current_tail.tool_output_chars >= 8_000 {
-        Some(responses_foreground_wait_cap())
-    } else {
-        Some(responses_foreground_wait_cap())
-    }
-}
-
-fn responses_current_tool_output_wait_cap(
-    current_tail: &TailInputDiagnostics,
-) -> Option<TokioDuration> {
-    if matches!(
-        current_tail.source.as_deref(),
-        Some("message") | Some("tool_call")
-    ) {
-        return None;
-    }
-    if current_tail.tool_output_chars >= 20_000 || current_tail.largest_tool_output_chars >= 12_000
-    {
-        Some(responses_foreground_wait_cap())
-    } else if current_tail.delta_from_session && current_tail.tool_output_chars >= 8_000 {
-        Some(responses_foreground_wait_cap())
-    } else {
-        None
-    }
-}
-
-fn responses_current_tool_output_cap_applies(
-    state: &PrefixWarmState,
-    current_tail: &TailInputDiagnostics,
-) -> bool {
-    let avoidable = state
-        .avoidable_shortfall_tokens_128
-        .max(state.avoidable_shortfall_tokens);
-    if avoidable > 0 {
-        return false;
-    }
-    responses_current_tool_output_wait_cap(current_tail).is_some()
-}
-
 fn responses_current_tail_makes_avoidable_unreliable(current_tail: &TailInputDiagnostics) -> bool {
     let tool_or_mixed_tail = matches!(
         current_tail.source.as_deref(),
@@ -5256,6 +4265,7 @@ async fn update_provider_prefix_state_with_tail(
     .await
 }
 
+#[cfg(test)]
 async fn update_provider_prefix_state_with_tail_and_guard(
     state: &AppState,
     provider_prefix_key: Option<&str>,
@@ -5266,236 +4276,102 @@ async fn update_provider_prefix_state_with_tail_and_guard(
     retried_full_response: bool,
     guard_budget_exhausted: bool,
 ) -> bool {
-    let (Some(key), Some(record)) = (provider_prefix_key, usage_record) else {
-        return false;
-    };
-    if record.input_tokens == 0 {
-        return false;
-    }
-    let now = Instant::now();
-    let bucket_max = provider_cache_bucket_max(record.input_tokens);
-    let bucket_max_128 = provider_cache_bucket_max_128(record.input_tokens);
-    let mut states = state.prefix_states.lock().await;
-    let previous = lookup_provider_prefix_state(&states, key).cloned();
-    let prefix_break_after_warm_state =
-        provider_prefix_break_after_warm_state(previous.as_ref(), record)
-            && (record.input_tokens >= 32_000 || responses_tool_tail_burst(tail_input_diagnostics));
-    let huge_dynamic_history_cold_read =
-        responses_huge_dynamic_history_cold_read(record, tail_input_diagnostics);
-    let weak_full_retry_after_session_delta = provider_prefix_weak_full_retry_after_session_delta(
-        previous.as_ref(),
-        record,
+    observe_provider_prefix_usage(
+        state,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        usage_record,
+        usage_record,
+        tail_input_diagnostics,
+        used_response_session,
         retried_full_response,
-    );
-    if prefix_break_after_warm_state
-        || weak_full_retry_after_session_delta
-        || huge_dynamic_history_cold_read
-    {
-        let Some(mut preserved) = previous.clone() else {
-            return false;
-        };
-        preserved.finished_at = now;
-        let instability_bump = if prefix_break_after_warm_state || huge_dynamic_history_cold_read {
-            2
+        guard_budget_exhausted,
+        true,
+    )
+    .await;
+    false
+}
+
+async fn observe_provider_prefix_usage(
+    state: &AppState,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    raw_usage: Option<&UsageRecord>,
+    effective_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    used_response_session: bool,
+    retried_full_response: bool,
+    guard_budget_exhausted: bool,
+    learn_state: bool,
+) -> ProviderPrefixUsageObservation {
+    let Some(raw) = raw_usage else {
+        return ProviderPrefixUsageObservation::default();
+    };
+    let (previous_exact, previous_best, previous_family, next, learn_family) = {
+        let mut states = state.prefix_states.lock().await;
+        let key = provider_prefix_key;
+        let previous_exact = key.and_then(|key| states.get(key).cloned());
+        let previous_best = key.and_then(|key| lookup_provider_prefix_state(&states, key).cloned());
+        let previous_family = provider_prefix_family_key.and_then(|key| states.get(key).cloned());
+        let state_observation = if learn_state {
+            effective_usage.map(|usage| {
+                PrefixController::observe(PrefixStateInput {
+                    previous: previous_best.as_ref(),
+                    usage,
+                    tail,
+                    used_response_session,
+                    retried_full_response,
+                    guard_budget_exhausted,
+                })
+            })
         } else {
-            1
+            None
         };
-        preserved.cache_instability_score = preserved
-            .cache_instability_score
-            .saturating_add(instability_bump)
-            .min(8);
-        preserved.shortfall_tokens = provider_cache_shortfall(record);
-        preserved.shortfall_tokens_128 = provider_cache_shortfall_128(record);
-        preserved.avoidable_shortfall_tokens = 0;
-        preserved.avoidable_shortfall_tokens_128 = 0;
-        preserved.avoidable_shortfall_streak = 0;
-        preserved.small_gap_recovery_streak = 0;
-        preserved.tail_tool_output_chars = tail_input_diagnostics.tool_output_chars;
-        preserved.tail_largest_tool_output_chars = tail_input_diagnostics.largest_tool_output_chars;
-        preserved.tail_tool_output_noise_hint =
-            tail_input_diagnostics.tool_output_noise_hint.clone();
-        states.insert(key.to_string(), preserved.clone());
-        if let Some(alias_key) = provider_prefix_state_alias_key(key) {
-            states.insert(alias_key, preserved);
+        let next = state_observation
+            .as_ref()
+            .and_then(|observation| observation.next.clone());
+        let learn_family = state_observation
+            .as_ref()
+            .is_some_and(|observation| observation.learn_family);
+        if let (Some(key), Some(next)) = (key, next.as_ref()) {
+            states.insert(key.to_string(), next.clone());
+            if let Some(alias_key) = provider_prefix_state_alias_key(key) {
+                states.insert(alias_key, next.clone());
+            }
+            if learn_family {
+                if let Some(family_key) = provider_prefix_family_key {
+                    states.insert(family_key.to_string(), next.clone());
+                }
+            }
         }
-        drop(states);
+        (
+            previous_exact,
+            previous_best,
+            previous_family,
+            next,
+            learn_family,
+        )
+    };
+    let gap = Some(PrefixController::classify_gap(PrefixGapInput {
+        previous_exact: previous_exact.as_ref(),
+        previous_best: previous_best.as_ref(),
+        previous_family: previous_family.as_ref(),
+        usage: raw,
+        tail,
+        guard_budget_exhausted,
+    }));
+    if next.is_some() || learn_family {
         if let Err(err) = state.persist_runtime_state().await {
             state
                 .metrics
                 .record_error("runtime_state_save", &err.to_string())
                 .await;
         }
-        return false;
     }
-    if !provider_prefix_usage_is_safe_to_learn(
-        previous.as_ref(),
-        record,
-        used_response_session,
-        retried_full_response,
-    ) {
-        return false;
+    ProviderPrefixUsageObservation {
+        gap,
+        previous: previous_best,
     }
-    let (previous_seen_bucket, previous_seen_bucket_128) = previous
-        .as_ref()
-        .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record))
-        .unwrap_or((0, 0));
-    let expected_cached_bucket = previous_seen_bucket.min(bucket_max);
-    let direct_avoidable_shortfall_tokens =
-        expected_cached_bucket.saturating_sub(record.cache_read_tokens);
-    let expected_cached_bucket_128 = previous_seen_bucket_128.min(bucket_max_128);
-    let direct_avoidable_shortfall_tokens_128 =
-        expected_cached_bucket_128.saturating_sub(record.cache_read_tokens);
-    let shortfall_tokens = provider_cache_shortfall(record);
-    let shortfall_tokens_128 = provider_cache_shortfall_128(record);
-    let avoidable_unreliable =
-        responses_current_tail_makes_avoidable_unreliable(tail_input_diagnostics);
-    let small_avoidable_is_tail_granularity = responses_small_avoidable_tail_granularity(
-        previous.as_ref(),
-        record,
-        shortfall_tokens_128,
-        direct_avoidable_shortfall_tokens_128,
-        tail_input_diagnostics,
-    );
-    let capped_provider_rollback = responses_cap_exhausted_provider_waterline_rollback(
-        previous.as_ref(),
-        record,
-        shortfall_tokens_128,
-        direct_avoidable_shortfall_tokens_128,
-        tail_input_diagnostics,
-        guard_budget_exhausted,
-    );
-    let avoidable_shortfall_tokens = if capped_provider_rollback
-        || small_avoidable_is_tail_granularity
-        || avoidable_unreliable
-    {
-        0
-    } else {
-        direct_avoidable_shortfall_tokens
-    };
-    let avoidable_shortfall_tokens_128 = if capped_provider_rollback
-        || small_avoidable_is_tail_granularity
-        || avoidable_unreliable
-    {
-        0
-    } else {
-        direct_avoidable_shortfall_tokens_128
-    };
-    let avoidable_shortfall_streak =
-        if avoidable_shortfall_tokens > 0 || avoidable_shortfall_tokens_128 > 0 {
-            previous
-                .as_ref()
-                .map(|state| state.avoidable_shortfall_streak.saturating_add(1))
-                .unwrap_or(1)
-        } else {
-            0
-        };
-    let small_gap_signal = shortfall_tokens_128 > 0 && shortfall_tokens_128 <= 2048;
-    let small_gap_recovery_streak = if small_gap_signal {
-        previous
-            .as_ref()
-            .map(|state| state.small_gap_recovery_streak.saturating_add(1))
-            .unwrap_or(1)
-    } else if previous
-        .as_ref()
-        .map(|state| state.small_gap_recovery_streak > 0 && shortfall_tokens_128 == 0)
-        .unwrap_or(false)
-    {
-        1
-    } else {
-        0
-    };
-    let previous_instability = previous
-        .as_ref()
-        .map(|state| state.cache_instability_score)
-        .unwrap_or(0);
-    let large_avoidable = avoidable_shortfall_tokens.max(avoidable_shortfall_tokens_128);
-    let severe_cold_read = record.cache_read_tokens == 0 && bucket_max >= 32_000;
-    let cache_instability_score = if severe_cold_read {
-        previous_instability.saturating_add(3).min(8)
-    } else if capped_provider_rollback {
-        previous_instability.saturating_add(1).min(8)
-    } else if large_avoidable >= 4096 {
-        previous_instability.saturating_add(2).min(8)
-    } else if large_avoidable > 0 {
-        previous_instability.saturating_add(1).min(8)
-    } else if shortfall_tokens_128 <= 512 && record.cache_read_tokens >= 1024 {
-        previous_instability.saturating_sub(1)
-    } else {
-        previous_instability
-    };
-    let current_shortfall = provider_cache_shortfall(record);
-    let current_shortfall_128 = provider_cache_shortfall_128(record);
-    let learn_sent_bucket = !capped_provider_rollback
-        && !small_avoidable_is_tail_granularity
-        && should_learn_sent_provider_bucket(
-            previous.as_ref(),
-            record,
-            current_shortfall,
-            current_shortfall_128,
-            tail_input_diagnostics,
-            used_response_session,
-        );
-    let sent_bucket_tokens = if learn_sent_bucket {
-        provider_cache_bucket_max(record.input_tokens)
-    } else {
-        record.cache_read_tokens
-    };
-    let sent_bucket_tokens_128 = if learn_sent_bucket {
-        provider_cache_bucket_max_128(record.input_tokens)
-    } else {
-        record.cache_read_tokens
-    };
-    let seen_bucket_tokens = if capped_provider_rollback || small_avoidable_is_tail_granularity {
-        record.cache_read_tokens.max(sent_bucket_tokens)
-    } else {
-        previous_seen_bucket
-            .max(record.cache_read_tokens)
-            .max(sent_bucket_tokens)
-    };
-    let seen_bucket_tokens_128 = if capped_provider_rollback || small_avoidable_is_tail_granularity
-    {
-        record.cache_read_tokens.max(sent_bucket_tokens_128)
-    } else {
-        previous_seen_bucket_128
-            .max(record.cache_read_tokens)
-            .max(sent_bucket_tokens_128)
-    };
-    let next = PrefixWarmState {
-        finished_at: now,
-        input_tokens: record.input_tokens,
-        cache_read_tokens: record.cache_read_tokens,
-        shortfall_tokens,
-        seen_bucket_tokens,
-        avoidable_shortfall_tokens,
-        avoidable_shortfall_streak,
-        shortfall_tokens_128,
-        seen_bucket_tokens_128,
-        avoidable_shortfall_tokens_128,
-        small_gap_recovery_streak,
-        cache_instability_score,
-        tail_tool_output_chars: tail_input_diagnostics.tool_output_chars,
-        tail_largest_tool_output_chars: tail_input_diagnostics.largest_tool_output_chars,
-        tail_tool_output_noise_hint: tail_input_diagnostics.tool_output_noise_hint.clone(),
-    };
-    states.insert(key.to_string(), next.clone());
-    if let Some(alias_key) = provider_prefix_state_alias_key(key) {
-        states.insert(alias_key, next.clone());
-    }
-    if let Some(family_key) = provider_prefix_family_key {
-        if !capped_provider_rollback
-            && should_learn_provider_prefix_family_state(record, tail_input_diagnostics)
-        {
-            states.insert(family_key.to_string(), next);
-        }
-    }
-    drop(states);
-    if let Err(err) = state.persist_runtime_state().await {
-        state
-            .metrics
-            .record_error("runtime_state_save", &err.to_string())
-            .await;
-    }
-    false
 }
 
 fn should_learn_sent_provider_bucket(
@@ -6256,14 +5132,6 @@ fn provider_prefix_weak_full_retry_after_session_delta(
     provider_cache_ratio(record).unwrap_or_default() < 0.96
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProviderCacheGapBreakdown {
-    total_tokens: u64,
-    new_tail_tokens: u64,
-    avoidable_tokens: u64,
-    provider_unstable_tokens: u64,
-}
-
 async fn provider_cache_gap_breakdown(
     state: &AppState,
     provider_prefix_key: Option<&str>,
@@ -6291,16 +5159,6 @@ async fn provider_cache_gap_breakdown_with_guard(
     prefix_guard_wait: Option<&PrefixGuardWaitDiagnostics>,
 ) -> Option<ProviderCacheGapBreakdown> {
     let record = usage_record?;
-    if record.input_tokens < 1024 {
-        return Some(ProviderCacheGapBreakdown {
-            total_tokens: 0,
-            new_tail_tokens: 0,
-            avoidable_tokens: 0,
-            provider_unstable_tokens: 0,
-        });
-    }
-    let bucket = provider_cache_bucket_max(record.input_tokens);
-    let total = bucket.saturating_sub(record.cache_read_tokens);
     let (previous_exact, previous_best, previous_family) = if let Some(key) = provider_prefix_key {
         let states = state.prefix_states.lock().await;
         (
@@ -6311,95 +5169,17 @@ async fn provider_cache_gap_breakdown_with_guard(
     } else {
         (None, None, None)
     };
-    let cold_read_has_unreliable_dynamic_tail = tail_input_diagnostics
-        .map(|tail| {
-            responses_current_tail_makes_avoidable_unreliable(tail)
-                || responses_tool_tail_burst(tail)
-                || tail.tool_output_chars >= 80_000
-                || tail.message_chars >= 80_000
-        })
-        .unwrap_or(false);
-    if provider_prefix_break_after_warm_state(previous_exact.as_ref(), record)
-        || (provider_prefix_break_after_warm_state(previous_best.as_ref(), record)
-            && cold_read_has_unreliable_dynamic_tail)
-        || (previous_exact.is_none()
-            && previous_best.is_none()
-            && provider_prefix_break_after_warm_state(previous_family.as_ref(), record)
-            && cold_read_has_unreliable_dynamic_tail)
-        || (previous_exact.is_none()
-            && previous_best.is_none()
-            && responses_huge_dynamic_history_cold_read(
-                record,
-                tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
-            ))
-    {
-        return Some(ProviderCacheGapBreakdown {
-            total_tokens: total,
-            new_tail_tokens: 0,
-            avoidable_tokens: 0,
-            provider_unstable_tokens: total,
-        });
-    }
-    let avoidable_unreliable = tail_input_diagnostics
-        .map(|tail| {
-            responses_current_tail_makes_avoidable_unreliable(tail)
-                || (record.cache_read_tokens == 0 && responses_tool_tail_burst(tail))
-        })
-        .unwrap_or(false);
-    let direct_avoidable = if avoidable_unreliable {
-        0
-    } else {
-        previous_best
-            .as_ref()
-            .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record).0)
-            .unwrap_or(0)
-            .min(bucket)
-            .saturating_sub(record.cache_read_tokens)
-    };
-    let direct_avoidable_128 = if avoidable_unreliable {
-        0
-    } else {
-        previous_best
-            .as_ref()
-            .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record).1)
-            .unwrap_or(0)
-            .min(provider_cache_bucket_max_128(record.input_tokens))
-            .saturating_sub(record.cache_read_tokens)
-    };
-    let small_avoidable_is_tail_granularity = responses_small_avoidable_tail_granularity(
-        previous_best.as_ref(),
-        record,
-        provider_cache_shortfall_128(record),
-        direct_avoidable_128,
-        tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
-    );
-    let provider_unstable_tokens = if responses_cap_exhausted_provider_waterline_rollback(
-        previous_exact.as_ref(),
-        record,
-        provider_cache_shortfall_128(record),
-        direct_avoidable_128,
-        tail_input_diagnostics.unwrap_or(&TailInputDiagnostics::default()),
-        prefix_guard_wait
+    let default_tail = TailInputDiagnostics::default();
+    Some(PrefixController::classify_gap(PrefixGapInput {
+        previous_exact: previous_exact.as_ref(),
+        previous_best: previous_best.as_ref(),
+        previous_family: previous_family.as_ref(),
+        usage: record,
+        tail: tail_input_diagnostics.unwrap_or(&default_tail),
+        guard_budget_exhausted: prefix_guard_wait
             .map(|wait| wait.budget_exhausted)
             .unwrap_or(false),
-    ) {
-        direct_avoidable
-    } else {
-        0
-    };
-    let direct_avoidable = if provider_unstable_tokens > 0 || small_avoidable_is_tail_granularity {
-        0
-    } else {
-        direct_avoidable
-    };
-    Some(ProviderCacheGapBreakdown {
-        total_tokens: total,
-        new_tail_tokens: total
-            .saturating_sub(direct_avoidable)
-            .saturating_sub(provider_unstable_tokens),
-        avoidable_tokens: direct_avoidable,
-        provider_unstable_tokens,
-    })
+    }))
 }
 
 fn responses_tool_tail_burst(current_tail: &TailInputDiagnostics) -> bool {
@@ -8029,6 +6809,7 @@ async fn record_upstream_response_observation(
             ),
             payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
             sse_end_reason: None,
+            downstream_disconnected: None,
             sse_completed_event_seen: None,
             sse_done_marker_seen: None,
             sse_chunks: None,
@@ -8198,6 +6979,7 @@ async fn record_upstream_transport_failure(
         ),
         payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
         sse_end_reason: Some("transport_error".to_string()),
+        downstream_disconnected: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: None,
@@ -8375,6 +7157,7 @@ async fn cache_hit_response(
                 payload_too_large_rescue_attempted: None,
                 payload_too_large_rescue_used: None,
                 sse_end_reason: None,
+                downstream_disconnected: None,
                 sse_completed_event_seen: None,
                 sse_done_marker_seen: None,
                 sse_chunks: None,
@@ -9170,6 +7953,7 @@ fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
         "tools",
         "tool_choice",
         "parallel_tool_calls",
+        "input",
         "reasoning",
         "text",
         "response_format",
@@ -9181,7 +7965,6 @@ fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
         "store",
         "service_tier",
         "truncation",
-        "input",
         "previous_response_id",
         "metadata",
         "user",
@@ -9294,7 +8077,6 @@ async fn stream_upstream(
     full_response_input: Option<Value>,
     used_response_session: bool,
     retried_full_response: bool,
-    active_upstream_body: Value,
     diagnostics: BodyDiagnostics,
     tail_input_diagnostics: TailInputDiagnostics,
     session_anchor_diagnostics: SessionAnchorDiagnostics,
@@ -9317,35 +8099,40 @@ async fn stream_upstream(
 
     let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Chat);
-    let raw_stream = upstream.bytes_stream();
-    let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
-        if convert_codex_chat_sse_to_responses_sse {
-            let tool_context = codex_chat_tool_context.unwrap_or_default();
-            Box::pin(
-                streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
-                    raw_stream,
-                    tool_context,
-                )
-                .map(|item| item.map_err(|err| err.to_string())),
-            )
-        } else {
-            Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
-        };
-    let mut first_chunk_at: Option<u64> = None;
-    let mut cache_body = Vec::new();
-    let mut stream_metadata = SseStreamMetadataCollector::default();
-    let mut sse_chunks = 0u64;
-    let mut sse_end_reason = "upstream_eof".to_string();
-    let mut stream_upstream_wait_ms = 0u64;
-    let mut stream_client_backpressure_ms = 0u64;
-    let state_for_stream = state.clone();
     let response_content_type = if convert_codex_chat_sse_to_responses_sse {
         "text/event-stream".to_string()
     } else {
         content_type.clone()
     };
     let content_type_for_cache = response_content_type.clone();
-    let stream_body = async_stream::stream! {
+    let (downstream_sender, mut downstream_receiver) =
+        mpsc::channel::<Result<Bytes, Infallible>>(STREAM_RELAY_CHANNEL_CAPACITY);
+
+    tokio::spawn(async move {
+        let raw_stream = upstream.bytes_stream();
+        let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
+            if convert_codex_chat_sse_to_responses_sse {
+                let tool_context = codex_chat_tool_context.unwrap_or_default();
+                Box::pin(
+                    streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
+                        raw_stream,
+                        tool_context,
+                    )
+                    .map(|item| item.map_err(|err| err.to_string())),
+                )
+            } else {
+                Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
+            };
+        let mut first_chunk_at: Option<u64> = None;
+        let mut first_model_output_at: Option<u64> = None;
+        let mut cache_body = Vec::new();
+        let mut stream_state = ResponsesStreamState::default();
+        let mut sse_chunks = 0u64;
+        let mut sse_end_reason = "upstream_eof".to_string();
+        let mut stream_upstream_wait_ms = 0u64;
+        let mut stream_client_backpressure_ms = 0u64;
+        let mut downstream_disconnected = false;
+        let state_for_stream = state.clone();
         loop {
             let upstream_wait_started = Instant::now();
             let next_chunk = stream.next().await;
@@ -9369,16 +8156,27 @@ async fn stream_upstream(
                 first_chunk_at = Some(started.elapsed().as_millis() as u64);
             }
             sse_chunks += 1;
-            stream_metadata.process_chunk(&chunk);
+            let observation = stream_state.ingest(&chunk);
+            if first_model_output_at.is_none() && observation.model_output_started {
+                first_model_output_at = Some(started.elapsed().as_millis() as u64);
+            }
             if eligible {
                 cache_body.extend_from_slice(&chunk);
             }
-            let client_backpressure_started = Instant::now();
-            yield Ok::<Bytes, Infallible>(chunk);
-            stream_client_backpressure_ms = stream_client_backpressure_ms
-                .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
+            if !downstream_disconnected {
+                let client_backpressure_started = Instant::now();
+                if downstream_sender
+                    .send(Ok::<Bytes, Infallible>(chunk))
+                    .await
+                    .is_err()
+                {
+                    downstream_disconnected = true;
+                }
+                stream_client_backpressure_ms = stream_client_backpressure_ms
+                    .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
+            }
         }
-        stream_metadata.finish();
+        let stream_metadata = stream_state.finish();
         if stream_metadata.error_event_seen && sse_end_reason == "upstream_eof" {
             sse_end_reason = "upstream_sse_error".to_string();
         }
@@ -9398,7 +8196,8 @@ async fn stream_upstream(
                 &decision,
                 prefix_state_key.as_deref(),
                 used_response_session,
-            ).await
+            )
+            .await
         } else {
             None
         };
@@ -9413,47 +8212,35 @@ async fn stream_upstream(
                 response_session_scope_key.as_deref(),
                 full_response_input.as_ref(),
                 stream_metadata.response_id.clone(),
-            ).await;
+            )
+            .await;
         }
-        let gap_breakdown = provider_cache_gap_breakdown_with_guard(
+        let prefix_observation = observe_provider_prefix_usage(
             &state_for_stream,
             prefix_state_key.as_deref(),
             provider_prefix_family_key.as_deref(),
             usage_record.as_ref(),
-            Some(&tail_input_diagnostics),
-            Some(&prefix_guard_wait),
-        ).await;
-        let prefix_lag = prefix_lag_diagnostics(
-            &state_for_stream,
-            prefix_state_key.as_deref(),
-            usage_record.as_ref(),
-            gap_breakdown.as_ref(),
-            &prefix_guard_wait,
+            prefix_usage_record.as_ref(),
             &tail_input_diagnostics,
-        ).await;
-        let session_cache_regressed = if stream_success_for_cache {
-            update_provider_prefix_state_with_tail_and_guard(
-                &state_for_stream,
-                prefix_state_key.as_deref(),
-                provider_prefix_family_key.as_deref(),
-                prefix_usage_record.as_ref(),
-                &tail_input_diagnostics,
-                used_response_session,
-                retried_full_response,
-                prefix_guard_wait.budget_exhausted,
-            ).await
-        } else {
-            false
-        };
-        if session_cache_regressed {
-            let stale_response_id = previous_response_id_from_request(&active_upstream_body);
-            clear_response_session_reference(
-                &state_for_stream,
-                response_session_key.as_deref(),
-                stale_response_id.as_deref(),
-            )
-            .await;
-        }
+            used_response_session,
+            retried_full_response,
+            prefix_guard_wait.budget_exhausted,
+            stream_success_for_cache,
+        )
+        .await;
+        let gap_breakdown = prefix_observation.gap;
+        let prefix_lag = usage_record
+            .as_ref()
+            .map(|record| {
+                prefix_lag_diagnostics_from_previous(
+                    prefix_observation.previous.as_ref(),
+                    record,
+                    gap_breakdown.as_ref(),
+                    &prefix_guard_wait,
+                    &tail_input_diagnostics,
+                )
+            })
+            .unwrap_or_default();
         if stream_success_for_cache {
             note_provider_route_affinity(
                 &state_for_stream,
@@ -9463,162 +8250,167 @@ async fn stream_upstream(
             .await;
             clear_prefix_error_cooldown(&state_for_stream, prefix_state_key.as_deref()).await;
         }
-        let ttft_ms = first_chunk_at.unwrap_or(total_ms);
-        let upstream_first_chunk_ms = ttft_ms.saturating_sub(upstream_response_headers_at_ms);
+        let ttft_ms = first_model_output_at.or(first_chunk_at).unwrap_or(total_ms);
+        let upstream_first_chunk_ms = first_chunk_at
+            .unwrap_or(total_ms)
+            .saturating_sub(upstream_response_headers_at_ms);
         let mut request_log = RequestLog {
-                id: request_id.clone(),
-                at: Utc::now(),
-                inbound_request_id: Some(request_id.clone()),
-                upstream_request_id: Some(Uuid::new_v4().to_string()),
-                upstream_attempt_index: Some(1),
-                upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
-                client_channel: client_channel.label().to_string(),
-                upstream_channel: decision.upstream_channel.label().to_string(),
-                provider: decision.provider.name.clone(),
-                model: decision.model.clone(),
-                requested_model,
-                agent_reasoning_effort: None,
-                configured_reasoning_effort: None,
-                effective_reasoning_effort: None,
-                reasoning_effort_source: None,
-                cache_status: if stream_success_for_cache {
-                    if eligible { "miss" } else { "bypass" }
+            id: request_id.clone(),
+            at: Utc::now(),
+            inbound_request_id: Some(request_id.clone()),
+            upstream_request_id: Some(Uuid::new_v4().to_string()),
+            upstream_attempt_index: Some(1),
+            upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
+            client_channel: client_channel.label().to_string(),
+            upstream_channel: decision.upstream_channel.label().to_string(),
+            provider: decision.provider.name.clone(),
+            model: decision.model.clone(),
+            requested_model,
+            agent_reasoning_effort: None,
+            configured_reasoning_effort: None,
+            effective_reasoning_effort: None,
+            reasoning_effort_source: None,
+            cache_status: if stream_success_for_cache {
+                if eligible {
+                    "miss"
                 } else {
-                    "error"
-                }.to_string(),
-                agent_id: agent_log_id.clone(),
-                agent_label: agent_log_label.clone(),
-                upstream_call_kind: Some("stream".to_string()),
-                upstream_call_source: Some("main".to_string()),
-                cache_key: if eligible && stream_success_for_cache { Some(metrics_cache_key.clone()) } else { None },
-                provider_prefix_key: provider_prefix_key.clone(),
-                provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
-                provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
-                prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
-                prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
-                prefix_guard_wait_source: prefix_guard_wait.source.clone(),
-                prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
-                prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
-                prefix_guard_wait_effect: prefix_guard_wait_effect(
-                    &prefix_guard_wait,
-                    usage_record.as_ref(),
-                    gap_breakdown.as_ref(),
-                ),
-                prefix_lag_classification: None,
-                prefix_lag_input_delta_tokens: None,
-                prefix_lag_cache_delta_tokens: None,
-                prefix_lag_previous_gap_tokens: None,
-                prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
-                prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
-                prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
-                status,
-                ttft_ms,
-                upstream_ttft_ms: Some(upstream_ttft_ms(
-                    ttft_ms,
-                    Some(prefix_guard_wait.wait_ms),
-                )),
-                local_prepare_ms: Some(local_prepare_ms),
-                upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
-                upstream_last_attempt_headers_ms: Some(
-                    upstream_request_diagnostics.last_attempt_headers_ms,
-                ),
-                upstream_http_version: upstream_request_diagnostics.http_version.clone(),
-                upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
-                upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
-                upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
-                upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
-                upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
-                upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
-                upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
-                upstream_reported_processing_ms: upstream_request_diagnostics
-                    .reported_processing_ms,
-                upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
-                upstream_first_chunk_ms: Some(upstream_first_chunk_ms),
-                stream_upstream_wait_ms: Some(stream_upstream_wait_ms),
-                stream_client_backpressure_ms: Some(stream_client_backpressure_ms),
-                aggregate_done_ms: None,
-                upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
-                upstream_attempts: Some(upstream_request_diagnostics.attempts),
-                request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
-                sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
-                request_body_encode_ms: Some(
-                    upstream_request_diagnostics.request_body_encode_ms,
-                ),
-                gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
-                gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
-                gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
-                upstream_header_wait_class: Some(upstream_header_wait_class(
-                    &upstream_request_diagnostics,
-                )),
-                total_ms,
-                input_tokens: usage_record.as_ref().map(|record| record.input_tokens),
-                output_tokens: usage_record.as_ref().map(|record| record.output_tokens),
-                cache_read_tokens: usage_record
-                    .as_ref()
-                    .map(|record| record.cache_read_tokens),
-                cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
-                cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
-                cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
-                cache_provider_unstable_gap_tokens: gap_breakdown
-                    .as_ref()
-                    .map(|gap| gap.provider_unstable_tokens),
-                provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
-                tail_input_items: None,
-                tail_message_chars: None,
-                tail_tool_call_chars: None,
-                tail_tool_output_chars: None,
-                tail_largest_tool_output_chars: None,
-                tail_tool_output_lines: None,
-                tail_tool_output_repeated_line_chars: None,
-                tail_tool_output_timestamp_like_count: None,
-                tail_tool_output_path_like_count: None,
-                tail_tool_output_url_like_count: None,
-                tail_tool_output_hash_like_count: None,
-                tail_tool_output_json_like_chars: None,
-                tail_tool_output_noise_hint: None,
-                tail_source: None,
-                response_session_reused: Some(used_response_session),
-                response_session_candidate_count: Some(
-                    response_session_reuse_diagnostics.candidate_count,
-                ),
-                response_session_skip_reason: response_session_reuse_diagnostics
-                    .skip_reason
-                    .clone(),
-                response_session_exact_key_hit: Some(
-                    response_session_reuse_diagnostics.exact_key_hit,
-                ),
-                response_session_scope_match_count: Some(
-                    response_session_reuse_diagnostics.scope_match_count,
-                ),
-                response_session_append_delta_match: Some(
-                    response_session_reuse_diagnostics.append_delta_match,
-                ),
-                response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
-                response_session_cooldown_active: Some(
-                    response_session_reuse_diagnostics.cooldown_active,
-                ),
-                response_session_rejected_status: response_session_reuse_diagnostics
-                    .rejected_status,
-                session_anchor_hash: None,
-                session_anchor_source: None,
-                session_anchor_changed: None,
-                session_anchor_peer_count: None,
-                original_body_bytes: None,
-                send_body_bytes: None,
-                send_body_is_delta: None,
-                payload_too_large_rescue_attempted: None,
-                payload_too_large_rescue_used: None,
-                sse_end_reason: Some(sse_end_reason),
-                sse_completed_event_seen: Some(stream_metadata.completed_event_seen),
-                sse_done_marker_seen: Some(stream_metadata.done_marker_seen),
-                sse_chunks: Some(sse_chunks),
-            };
+                    "bypass"
+                }
+            } else {
+                "error"
+            }
+            .to_string(),
+            agent_id: agent_log_id.clone(),
+            agent_label: agent_log_label.clone(),
+            upstream_call_kind: Some("stream".to_string()),
+            upstream_call_source: Some("main".to_string()),
+            cache_key: if eligible && stream_success_for_cache {
+                Some(metrics_cache_key.clone())
+            } else {
+                None
+            },
+            provider_prefix_key: provider_prefix_key.clone(),
+            provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
+            provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+            prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
+            prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
+            prefix_guard_wait_source: prefix_guard_wait.source.clone(),
+            prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
+            prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
+            prefix_guard_wait_effect: prefix_guard_wait_effect(
+                &prefix_guard_wait,
+                usage_record.as_ref(),
+                gap_breakdown.as_ref(),
+            ),
+            prefix_lag_classification: None,
+            prefix_lag_input_delta_tokens: None,
+            prefix_lag_cache_delta_tokens: None,
+            prefix_lag_previous_gap_tokens: None,
+            prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
+            prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
+            prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
+            status,
+            ttft_ms,
+            upstream_ttft_ms: Some(upstream_ttft_ms(ttft_ms, Some(prefix_guard_wait.wait_ms))),
+            local_prepare_ms: Some(local_prepare_ms),
+            upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
+            upstream_last_attempt_headers_ms: Some(
+                upstream_request_diagnostics.last_attempt_headers_ms,
+            ),
+            upstream_http_version: upstream_request_diagnostics.http_version.clone(),
+            upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
+            upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
+            upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
+            upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
+            upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
+            upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
+            upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
+            upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
+            upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
+            upstream_first_chunk_ms: Some(upstream_first_chunk_ms),
+            stream_upstream_wait_ms: Some(stream_upstream_wait_ms),
+            stream_client_backpressure_ms: Some(stream_client_backpressure_ms),
+            aggregate_done_ms: None,
+            upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
+            upstream_attempts: Some(upstream_request_diagnostics.attempts),
+            request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
+            sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
+            request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
+            gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
+            gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
+            gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
+            upstream_header_wait_class: Some(upstream_header_wait_class(
+                &upstream_request_diagnostics,
+            )),
+            total_ms,
+            input_tokens: usage_record.as_ref().map(|record| record.input_tokens),
+            output_tokens: usage_record.as_ref().map(|record| record.output_tokens),
+            cache_read_tokens: usage_record.as_ref().map(|record| record.cache_read_tokens),
+            cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
+            cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
+            cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
+            cache_provider_unstable_gap_tokens: gap_breakdown
+                .as_ref()
+                .map(|gap| gap.provider_unstable_tokens),
+            provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
+            tail_input_items: None,
+            tail_message_chars: None,
+            tail_tool_call_chars: None,
+            tail_tool_output_chars: None,
+            tail_largest_tool_output_chars: None,
+            tail_tool_output_lines: None,
+            tail_tool_output_repeated_line_chars: None,
+            tail_tool_output_timestamp_like_count: None,
+            tail_tool_output_path_like_count: None,
+            tail_tool_output_url_like_count: None,
+            tail_tool_output_hash_like_count: None,
+            tail_tool_output_json_like_chars: None,
+            tail_tool_output_noise_hint: None,
+            tail_source: None,
+            response_session_reused: Some(used_response_session),
+            response_session_candidate_count: Some(
+                response_session_reuse_diagnostics.candidate_count,
+            ),
+            response_session_skip_reason: response_session_reuse_diagnostics.skip_reason.clone(),
+            response_session_exact_key_hit: Some(response_session_reuse_diagnostics.exact_key_hit),
+            response_session_scope_match_count: Some(
+                response_session_reuse_diagnostics.scope_match_count,
+            ),
+            response_session_append_delta_match: Some(
+                response_session_reuse_diagnostics.append_delta_match,
+            ),
+            response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+            response_session_cooldown_active: Some(
+                response_session_reuse_diagnostics.cooldown_active,
+            ),
+            response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
+            session_anchor_hash: None,
+            session_anchor_source: None,
+            session_anchor_changed: None,
+            session_anchor_peer_count: None,
+            original_body_bytes: None,
+            send_body_bytes: None,
+            send_body_is_delta: None,
+            payload_too_large_rescue_attempted: None,
+            payload_too_large_rescue_used: None,
+            sse_end_reason: Some(sse_end_reason),
+            downstream_disconnected: Some(downstream_disconnected),
+            sse_completed_event_seen: Some(stream_metadata.completed_event_seen),
+            sse_done_marker_seen: Some(stream_metadata.done_marker_seen),
+            sse_chunks: Some(sse_chunks),
+        };
         apply_prefix_lag_diagnostics(&mut request_log, prefix_lag);
         apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
         apply_body_diagnostics(&mut request_log, &diagnostics);
         apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
-        state_for_stream.metrics.record_upstream_call(request_log.clone()).await;
-        state_for_stream.metrics.record_request(request_log, true).await;
+        state_for_stream
+            .metrics
+            .record_upstream_call(request_log.clone())
+            .await;
+        state_for_stream
+            .metrics
+            .record_request(request_log, true)
+            .await;
         if eligible && stream_success_for_cache {
             insert_cache_entries(
                 &state_for_stream,
@@ -9630,7 +8422,14 @@ async fn stream_upstream(
                 cache_body,
                 &decision,
                 &config,
-            ).await;
+            )
+            .await;
+        }
+    });
+
+    let stream_body = async_stream::stream! {
+        while let Some(chunk) = downstream_receiver.recv().await {
+            yield chunk;
         }
     };
 
@@ -9738,6 +8537,7 @@ fn provider_route_affinity_key(
     strip_provider_cache_key_fields(&mut material);
     canonicalize_responses_instruction_shape(&mut material);
     strip_response_session_volatile_fields(&mut material);
+    strip_dynamic_invocation_fields(&mut material);
     trim_response_session_input_to_anchor(&mut material);
     stabilize_responses_provider_prefix(&mut material);
     canonicalize_object_keys(&mut material, "$.provider_route_affinity_key");
@@ -9983,10 +8783,12 @@ fn decide_route(
     let agent_model = authorized_agent
         .and_then(|agent| agent.model_id.clone())
         .and_then(|model| resolve_provider_model_id(provider, &model));
-    let requested_model_for_provider =
-        requested_model.and_then(|model| resolve_provider_model_id(provider, &model));
+    let requested_model_for_provider = requested_model
+        .as_deref()
+        .and_then(|model| resolve_provider_model_id(provider, model));
 
     let model = requested_model_for_provider
+        .or(requested_model)
         .or(agent_model)
         .or_else(|| {
             profile
@@ -10273,6 +9075,23 @@ fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &
             add_anthropic_cache_control(request);
         }
     }
+}
+
+fn apply_session_provider_cache_key(
+    request: &mut Value,
+    config: &AppConfig,
+    identity: Option<&SessionIdentity>,
+) {
+    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+        return;
+    }
+    let (Some(object), Some(identity)) = (request.as_object_mut(), identity) else {
+        return;
+    };
+    object.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(identity.provider_cache_key.clone()),
+    );
 }
 
 fn copy_responses_prefix_cache_fields_for_native_stream(
@@ -10905,6 +9724,7 @@ fn provider_prefix_sample(request: &Value, channel: &Channel) -> String {
         Channel::Responses => {
             canonicalize_responses_instruction_shape(&mut prefix);
             stabilize_responses_provider_prefix(&mut prefix);
+            strip_dynamic_invocation_fields(&mut prefix);
             strip_responses_dynamic_provider_cache_tail(&mut prefix);
             canonicalize_object_keys(&mut prefix, "$.provider_prefix_sample");
         }
@@ -10936,6 +9756,7 @@ fn provider_prefix_fingerprint_sample(request: &Value, channel: &Channel) -> Str
         Channel::Responses => {
             canonicalize_responses_instruction_shape(&mut prefix);
             stabilize_responses_provider_prefix(&mut prefix);
+            strip_dynamic_invocation_fields(&mut prefix);
             trim_responses_provider_cache_tail_to_session_anchor(&mut prefix);
             canonicalize_object_keys(&mut prefix, "$.provider_prefix_fingerprint");
         }
@@ -13110,60 +11931,6 @@ fn provider_cache_bucket_max_128(input_tokens: u64) -> u64 {
     }
 }
 
-fn responses_session_key(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    request: &Value,
-) -> Option<String> {
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return None;
-    }
-    let mut material = request.clone();
-    strip_provider_cache_key_fields(&mut material);
-    canonicalize_responses_instruction_shape(&mut material);
-    strip_response_session_volatile_fields(&mut material);
-    trim_response_session_input_to_anchor(&mut material);
-    stabilize_responses_provider_prefix(&mut material);
-    canonicalize_object_keys(&mut material, "$.response_session_key");
-
-    let mut hasher = Sha256::new();
-    hasher.update(config.workspace_fingerprint.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(decision.provider.id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(provider_prefix_model_key(decision).as_bytes());
-    hasher.update(b"\0");
-    hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-fn responses_session_scope_key(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    request: &Value,
-) -> Option<String> {
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return None;
-    }
-    let mut material = request.clone();
-    strip_provider_cache_key_fields(&mut material);
-    canonicalize_responses_instruction_shape(&mut material);
-    strip_response_session_volatile_fields(&mut material);
-    strip_responses_dynamic_provider_cache_tail(&mut material);
-    stabilize_responses_provider_prefix(&mut material);
-    canonicalize_object_keys(&mut material, "$.response_session_scope_key");
-
-    let mut hasher = Sha256::new();
-    hasher.update(config.workspace_fingerprint.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(decision.provider.id.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(provider_prefix_model_key(decision).as_bytes());
-    hasher.update(b"\0");
-    hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
-}
-
 fn strip_response_session_volatile_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -13352,6 +12119,26 @@ mod tests {
         },
     };
     use tokio::net::TcpListener;
+
+    fn test_responses_provider(base_url: String) -> ProviderConfig {
+        ProviderConfig {
+            id: "provider".to_string(),
+            name: "provider".to_string(),
+            base_url,
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            api_key_encrypted: Some("key".to_string()),
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
 
     #[test]
     fn codex_responses_defaults_to_stream_when_stream_is_absent() {
@@ -15363,9 +14150,16 @@ mod tests {
             "input": [{ "type": "message", "role": "user", "content": "project beta stable anchor" }]
         });
 
-        let first_key = responses_session_key(&config, &decision, &first).unwrap();
-        let appended_key = responses_session_key(&config, &decision, &appended).unwrap();
-        let different_key = responses_session_key(&config, &decision, &different_anchor).unwrap();
+        let first_key = SessionIdentity::derive(&config, &decision, &first, &first)
+            .unwrap()
+            .anchor_key;
+        let appended_key = SessionIdentity::derive(&config, &decision, &appended, &appended)
+            .unwrap()
+            .anchor_key;
+        let different_key =
+            SessionIdentity::derive(&config, &decision, &different_anchor, &different_anchor)
+                .unwrap()
+                .anchor_key;
 
         assert_eq!(first_key, appended_key);
         assert_ne!(first_key, different_key);
@@ -15423,11 +14217,17 @@ mod tests {
         normalize_responses_request(&mut equivalent);
         normalize_responses_request(&mut changed_skill);
 
-        let canonical_scope = responses_session_scope_key(&config, &decision, &canonical).unwrap();
+        let canonical_scope = SessionIdentity::derive(&config, &decision, &canonical, &canonical)
+            .unwrap()
+            .scope_key;
         let equivalent_scope =
-            responses_session_scope_key(&config, &decision, &equivalent).unwrap();
+            SessionIdentity::derive(&config, &decision, &equivalent, &equivalent)
+                .unwrap()
+                .scope_key;
         let changed_scope =
-            responses_session_scope_key(&config, &decision, &changed_skill).unwrap();
+            SessionIdentity::derive(&config, &decision, &changed_skill, &changed_skill)
+                .unwrap()
+                .scope_key;
 
         assert_eq!(canonical_scope, equivalent_scope);
         assert_ne!(canonical_scope, changed_scope);
@@ -17251,7 +16051,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_agent_bound_provider_falls_back_from_unknown_client_model() {
+    fn authorized_agent_bound_provider_passes_through_unknown_client_model() {
         let mut config = AppConfig::default();
         config.providers = vec![ProviderConfig {
             id: "share".to_string(),
@@ -17300,11 +16100,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.provider.id, "share");
-        assert_eq!(decision.model, "ui-fallback-model");
+        assert_eq!(decision.model, "client-requested-model");
     }
 
     #[test]
-    fn authorized_agent_route_wins_over_global_active_provider_and_requested_model() {
+    fn authorized_agent_empty_mapping_passes_through_request_model() {
+        let mut config = AppConfig::default();
+        config.providers = vec![ProviderConfig {
+            id: "share".to_string(),
+            name: "share".to_string(),
+            base_url: "https://share.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("share".to_string());
+        codex.model_id = None;
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.5", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "share");
+        assert_eq!(decision.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn authorized_agent_provider_wins_over_global_active_provider_without_forcing_model() {
         let mut config = AppConfig::default();
         config.providers = vec![
             ProviderConfig {
@@ -17385,7 +16226,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(decision.provider.id, "share");
-        assert_eq!(decision.model, "gpt-5.5");
+        assert_eq!(decision.model, "orc");
     }
 
     #[test]
@@ -17594,9 +16435,10 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_serialization_keeps_stable_prefix_before_dynamic_input() {
+    fn responses_body_serialization_keeps_stable_history_before_dynamic_invocation() {
         let body = json!({
             "temperature": 0,
+            "reasoning": { "effort": "low" },
             "previous_response_id": "resp_dynamic",
             "stream": true,
             "store": true,
@@ -17617,27 +16459,29 @@ mod tests {
         let cache_key_at = serialized.find("\"prompt_cache_key\"").unwrap();
         let instructions_at = serialized.find("\"instructions\"").unwrap();
         let tools_at = serialized.find("\"tools\"").unwrap();
+        let input_at = serialized.find("\"input\"").unwrap();
+        let reasoning_at = serialized.find("\"reasoning\"").unwrap();
         let temperature_at = serialized.find("\"temperature\"").unwrap();
         let include_at = serialized.find("\"include\"").unwrap();
         let stream_at = serialized.find("\"stream\"").unwrap();
         let store_at = serialized.find("\"store\"").unwrap();
         let service_tier_at = serialized.find("\"service_tier\"").unwrap();
         let truncation_at = serialized.find("\"truncation\"").unwrap();
-        let input_at = serialized.find("\"input\"").unwrap();
         let previous_response_at = serialized.find("\"previous_response_id\"").unwrap();
         let metadata_at = serialized.find("\"metadata\"").unwrap();
 
         assert!(model_at < cache_key_at);
         assert!(cache_key_at < instructions_at);
         assert!(instructions_at < tools_at);
-        assert!(tools_at < temperature_at);
+        assert!(tools_at < input_at);
+        assert!(input_at < reasoning_at);
+        assert!(reasoning_at < temperature_at);
         assert!(temperature_at < include_at);
         assert!(include_at < stream_at);
         assert!(stream_at < store_at);
         assert!(store_at < service_tier_at);
         assert!(service_tier_at < truncation_at);
-        assert!(truncation_at < input_at);
-        assert!(input_at < previous_response_at);
+        assert!(truncation_at < previous_response_at);
         assert!(previous_response_at < metadata_at);
         assert!(serde_json::from_str::<Value>(&serialized).is_ok());
     }
@@ -17658,33 +16502,21 @@ mod tests {
     }
 
     #[test]
-    fn stream_metadata_collector_extracts_usage_and_response_id_incrementally() {
-        let mut collector = SseStreamMetadataCollector::default();
-        collector.process_chunk(b"event: response.completed\n");
-        collector.process_chunk(
-            br#"data: {"type":"response.completed","response":{"id":"resp_stream","model":"gpt-test","usage":{"input_tokens":20,"output_tokens":2,"input_tokens_details":{"cached_tokens":19}}}}"#,
+    fn request_body_gzip_uses_stronger_compression_for_large_payloads() {
+        assert_eq!(request_body_gzip_compression(262_144).level(), 1);
+        assert_eq!(
+            request_body_gzip_compression(REQUEST_BODY_GZIP_MIN_BYTES).level(),
+            6
         );
-        collector.process_chunk(b"\n\n");
-        collector.process_chunk(b"data: [DONE]\n\n");
-        collector.finish();
+        assert_eq!(request_body_gzip_compression(1_048_576).level(), 9);
 
-        assert!(collector.completed_event_seen);
-        assert!(collector.done_marker_seen);
-        assert_eq!(collector.response_id.as_deref(), Some("resp_stream"));
-        assert_eq!(collector.usage.input_tokens, 20);
-        assert_eq!(collector.usage.cache_read_tokens, 19);
-        assert_eq!(collector.usage.output_tokens, 2);
+        let payload = vec![b'a'; 1_048_576];
+        let compressed = gzip_request_body(&payload).unwrap();
+        assert!(compressed.len() < payload.len() / 100);
     }
 
     #[test]
-    fn stream_metadata_collector_marks_sse_error_events() {
-        let mut collector = SseStreamMetadataCollector::default();
-        collector.process_chunk(
-            br#"data: {"type":"response.failed","error":{"message":"provider failed"}}"#,
-        );
-        collector.finish();
-
-        assert!(collector.error_event_seen);
+    fn upstream_body_error_detection_handles_responses_and_sse() {
         assert!(upstream_body_has_error(
             br#"{"type":"response.failed","error":{"message":"provider failed"}}"#,
             "application/json"
@@ -18084,28 +16916,6 @@ mod tests {
         assert_eq!(gap.avoidable_tokens, 2_560);
         assert_eq!(gap.new_tail_tokens, 512);
 
-        let mut prefix = prefix_state(32_733, 29_184, 3_072);
-        prefix.seen_bucket_tokens = 31_744;
-        prefix.seen_bucket_tokens_128 = 31_744;
-        prefix.avoidable_shortfall_tokens = 2_560;
-        prefix.avoidable_shortfall_tokens_128 = 2_560;
-        assert_ne!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &prefix,
-                &TailInputDiagnostics::default(),
-            ),
-            Some("responses_current_tool_output_tail_cap".to_string())
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(&Channel::Responses, &prefix, &current_tail),
-            Some("responses_avoidable_gap".to_string())
-        );
-        assert!(
-            responses_provider_prefix_settle_delay_with_tail(&prefix, &current_tail)
-                <= TokioDuration::from_secs(30)
-        );
-
         fs::remove_dir_all(dir).ok();
     }
 
@@ -18197,6 +17007,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_upstream_forwards_complete_stream_once_when_consumed_normally() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-normal-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_normal\"}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_normal\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "normal-request".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+        )
+        .await;
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("hello"));
+        assert_eq!(text.matches("\"type\":\"response.completed\"").count(), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        let log = &metrics.recent_requests[0];
+        assert_eq!(log.sse_end_reason.as_deref(), Some("upstream_eof"));
+        assert_eq!(log.downstream_disconnected, Some(false));
+        assert_eq!(log.sse_completed_event_seen, Some(true));
+        assert_eq!(log.sse_done_marker_seen, Some(true));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
     async fn stream_upstream_releases_prefix_guard_before_body_is_consumed() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-prefix-release-{}",
@@ -18217,14 +17148,26 @@ mod tests {
 
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
         let upstream_app = Router::new().route(
             "/stream",
-            axum::routing::post(|| async {
-                raw_response(
-                    200,
-                    "text/event-stream",
-                    b"data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}\n\n".to_vec(),
-                )
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let delayed = async_stream::stream! {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"usage\":{\"input_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(delayed))
+                        .unwrap()
+                }
             }),
         );
         tokio::spawn(async move {
@@ -18284,7 +17227,6 @@ mod tests {
             None,
             false,
             false,
-            json!({ "stream": true, "input": [] }),
             BodyDiagnostics::default(),
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
@@ -18310,6 +17252,172 @@ mod tests {
             "stream proxy must not hold prefix guard until the SSE body is consumed"
         );
         drop(response);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(
+            metrics.recent_upstream_calls.len(),
+            1,
+            "a successful upstream response must be recorded even when the downstream client abandons the body"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            metrics.recent_upstream_calls[0].downstream_disconnected,
+            Some(true)
+        );
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_keeps_stream_when_done_precedes_response_completed() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-terminal-finish-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let delayed = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_terminal\"}}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: [DONE]\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(delayed))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            started,
+            "terminal-request".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: ProviderConfig {
+                    id: "provider".to_string(),
+                    name: "provider".to_string(),
+                    base_url: format!("http://{upstream_addr}/v1"),
+                    models_url: None,
+                    is_full_url: false,
+                    custom_user_agent: None,
+                    api_key_encrypted: Some("key".to_string()),
+                    channel: Channel::Responses,
+                    prompt_cache_retention_enabled: false,
+                    request_body_gzip_enabled: false,
+                    use_system_proxy: false,
+                    models: Vec::new(),
+                    enabled: true,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                },
+                model: "model".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+        )
+        .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "delayed downstream consumption must not trigger another upstream request"
+        );
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("foreground stream should finish after upstream EOF")
+        .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("response.completed"));
+        assert!(text.contains("[DONE]"));
+        assert_eq!(text.matches("\"type\":\"response.completed\"").count(), 1);
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        let log = &metrics.recent_requests[0];
+        assert_eq!(log.sse_end_reason.as_deref(), Some("upstream_eof"));
+        assert_eq!(log.downstream_disconnected, Some(false));
+        assert!(log.ttft_ms >= 70);
+        assert!(log.ttft_ms < 500);
+        assert!(log.total_ms >= 2_000);
+        assert!(log.total_ms < 3_000);
+
         fs::remove_dir_all(config_dir).ok();
     }
 
@@ -18479,468 +17587,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn responses_prefix_settle_delay_keeps_v019_for_small_gaps_but_guards_large_tail() {
-        let mut medium = prefix_state(59_422, 55_808, 3_584);
-        medium.avoidable_shortfall_tokens = 2_560;
-        medium.avoidable_shortfall_tokens_128 = 2_560;
-        assert_eq!(
-            provider_prefix_settle_delay(&medium),
-            TokioDuration::from_secs(12)
-        );
-
-        let mut large = prefix_state(58_605, 50_688, 7_680);
-        large.avoidable_shortfall_tokens = 5_120;
-        large.avoidable_shortfall_tokens_128 = 5_120;
-        assert_eq!(
-            provider_prefix_settle_delay(&large),
-            TokioDuration::from_secs(18)
-        );
-
-        let large_tail = PrefixWarmState {
-            finished_at: Instant::now(),
-            input_tokens: 67_181,
-            cache_read_tokens: 50_176,
-            shortfall_tokens: 16_896,
-            seen_bucket_tokens: 50_176,
-            avoidable_shortfall_tokens: 0,
-            avoidable_shortfall_streak: 0,
-            shortfall_tokens_128: 17_024,
-            seen_bucket_tokens_128: 50_176,
-            avoidable_shortfall_tokens_128: 0,
-            small_gap_recovery_streak: 0,
-            cache_instability_score: 0,
-            tail_tool_output_chars: 0,
-            tail_largest_tool_output_chars: 0,
-            tail_tool_output_noise_hint: None,
-        };
-        assert_eq!(
-            provider_prefix_settle_delay(&large_tail),
-            TokioDuration::from_millis(900)
-        );
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&large_tail),
-            responses_foreground_wait_cap()
-        );
-
-        let mut small_bucket_tail = prefix_state(7_898, 7_168, 512);
-        small_bucket_tail.small_gap_recovery_streak = 1;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&small_bucket_tail),
-            responses_foreground_wait_cap()
-        );
-
-        let huge_tail = PrefixWarmState {
-            finished_at: Instant::now(),
-            input_tokens: 164_931,
-            cache_read_tokens: 100_352,
-            shortfall_tokens: 64_512,
-            seen_bucket_tokens: 100_352,
-            avoidable_shortfall_tokens: 0,
-            avoidable_shortfall_streak: 0,
-            shortfall_tokens_128: 64_512,
-            seen_bucket_tokens_128: 100_352,
-            avoidable_shortfall_tokens_128: 0,
-            small_gap_recovery_streak: 0,
-            cache_instability_score: 0,
-            tail_tool_output_chars: 0,
-            tail_largest_tool_output_chars: 0,
-            tail_tool_output_noise_hint: None,
-        };
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&huge_tail),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_guards_after_large_tool_output_tail() {
-        let mut large_tool_tail = prefix_state(177_194, 168_960, 8_192);
-        large_tool_tail.avoidable_shortfall_tokens = 0;
-        large_tool_tail.avoidable_shortfall_tokens_128 = 0;
-        large_tool_tail.tail_tool_output_chars = 23_573;
-        large_tool_tail.tail_largest_tool_output_chars = 11_535;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&large_tool_tail),
-            responses_foreground_wait_cap()
-        );
-
-        let mut huge_tool_tail = prefix_state(169_815, 156_160, 13_312);
-        huge_tool_tail.avoidable_shortfall_tokens = 0;
-        huge_tool_tail.avoidable_shortfall_tokens_128 = 0;
-        huge_tool_tail.tail_tool_output_chars = 45_342;
-        huge_tool_tail.tail_largest_tool_output_chars = 19_892;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&huge_tool_tail),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_non_avoidable_tail_wait_is_capped_to_normal_ttft_range() {
-        let mut cold_then_warm_tail = prefix_state(149_923, 148_992, 512);
-        cold_then_warm_tail.avoidable_shortfall_tokens = 0;
-        cold_then_warm_tail.avoidable_shortfall_tokens_128 = 0;
-        cold_then_warm_tail.small_gap_recovery_streak = 1;
-        cold_then_warm_tail.cache_instability_score = 3;
-        cold_then_warm_tail.tail_tool_output_chars = 310_461;
-        cold_then_warm_tail.tail_largest_tool_output_chars = 310_461;
-        cold_then_warm_tail.tail_tool_output_noise_hint = Some("path_like".to_string());
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&cold_then_warm_tail),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_guards_noisy_tool_output_from_1024_bucket() {
-        let mut noisy_tool_tail = prefix_state(66_912, 65_536, 1_024);
-        noisy_tool_tail.avoidable_shortfall_tokens = 0;
-        noisy_tool_tail.avoidable_shortfall_tokens_128 = 0;
-        noisy_tool_tail.shortfall_tokens = 0;
-        noisy_tool_tail.shortfall_tokens_128 = 0;
-        noisy_tool_tail.small_gap_recovery_streak = 0;
-        noisy_tool_tail.tail_tool_output_chars = 1_024;
-        noisy_tool_tail.tail_largest_tool_output_chars = 1_024;
-        noisy_tool_tail.tail_tool_output_noise_hint = Some("timestamp_like,path_like".to_string());
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&noisy_tool_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &noisy_tool_tail,
-                &TailInputDiagnostics::default(),
-            ),
-            Some("responses_noisy_tool_output_tail_guard_1024".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_repeated_small_bucket_tail_keeps_short_guard_without_new_tool_noise() {
-        let mut repeated_small_tail = prefix_state(80_583, 79_872, 512);
-        repeated_small_tail.avoidable_shortfall_tokens = 0;
-        repeated_small_tail.avoidable_shortfall_tokens_128 = 0;
-        repeated_small_tail.small_gap_recovery_streak = 2;
-        repeated_small_tail.tail_tool_output_chars = 0;
-        repeated_small_tail.tail_largest_tool_output_chars = 0;
-        repeated_small_tail.tail_tool_output_noise_hint = None;
-
-        assert_eq!(
-            responses_minimum_new_tail_request_wait(
-                &Channel::Responses,
-                &repeated_small_tail,
-                &TailInputDiagnostics::default(),
-            ),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_medium_bucket_tail_followed_by_small_tool_tail_gets_short_carryover_guard() {
-        let mut medium_tail = prefix_state(151_613, 145_408, 6_144);
-        medium_tail.avoidable_shortfall_tokens = 0;
-        medium_tail.avoidable_shortfall_tokens_128 = 0;
-        medium_tail.tail_tool_output_chars = 4_096;
-        medium_tail.tail_largest_tool_output_chars = 4_096;
-
-        let current_small_tool_tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 184,
-            largest_tool_output_chars: 184,
-            tool_output_noise_hint: Some("path_like".to_string()),
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_minimum_new_tail_request_wait(
-                &Channel::Responses,
-                &medium_tail,
-                &current_small_tool_tail,
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &medium_tail,
-                &current_small_tool_tail,
-            ),
-            Some("responses_medium_tool_tail_carryover_guard".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_medium_bucket_tail_does_not_guard_pure_message_tail() {
-        let mut medium_tail = prefix_state(151_613, 145_408, 6_144);
-        medium_tail.avoidable_shortfall_tokens = 0;
-        medium_tail.avoidable_shortfall_tokens_128 = 0;
-        medium_tail.tail_tool_output_chars = 20_356;
-        medium_tail.tail_largest_tool_output_chars = 20_356;
-
-        let current_message_tail = TailInputDiagnostics {
-            input_items: 1,
-            message_chars: 184,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_minimum_new_tail_request_wait(
-                &Channel::Responses,
-                &medium_tail,
-                &current_message_tail,
-            ),
-            TokioDuration::ZERO
-        );
-    }
-
-    #[test]
-    fn responses_current_tool_output_keeps_tail_guard_for_large_current_tools() {
-        let mut repeated_small_tail = prefix_state(252_572, 246_784, 5_632);
-        repeated_small_tail.avoidable_shortfall_tokens = 0;
-        repeated_small_tail.avoidable_shortfall_tokens_128 = 0;
-        repeated_small_tail.small_gap_recovery_streak = 1;
-
-        let mut current_tool_tail = TailInputDiagnostics {
-            input_items: 3,
-            delta_from_session: true,
-            tool_output_chars: 15_272,
-            largest_tool_output_chars: 11_520,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&repeated_small_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            Some("responses_current_tool_output_tail_cap".to_string())
-        );
-
-        repeated_small_tail.shortfall_tokens = 1_536;
-        repeated_small_tail.shortfall_tokens_128 = 1_536;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&repeated_small_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            Some("responses_current_tool_output_tail_cap".to_string())
-        );
-
-        repeated_small_tail.avoidable_shortfall_tokens = 1_536;
-        repeated_small_tail.avoidable_shortfall_tokens_128 = 1_536;
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-
-        current_tool_tail.delta_from_session = false;
-        repeated_small_tail.avoidable_shortfall_tokens = 0;
-        repeated_small_tail.avoidable_shortfall_tokens_128 = 0;
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &repeated_small_tail,
-                &current_tool_tail,
-            ),
-            Some("responses_current_tail_guard".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_current_medium_tool_output_uses_light_exact_small_gap_guard() {
-        let mut stable_small_gap = prefix_state(92_169, 90_624, 1_536);
-        stable_small_gap.avoidable_shortfall_tokens = 1_536;
-        stable_small_gap.avoidable_shortfall_tokens_128 = 1_536;
-        stable_small_gap.avoidable_shortfall_streak = 1;
-
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 5_044,
-            largest_tool_output_chars: 5_044,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert!(!responses_current_tail_makes_avoidable_unreliable(
-            &current_tail
-        ));
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&stable_small_gap, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &stable_small_gap,
-                &current_tail,
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_current_large_tool_output_is_not_counted_as_reliable_avoidable_gap() {
-        let mut stable_gap = prefix_state(47_981, 40_448, 7_168);
-        stable_gap.avoidable_shortfall_tokens = 7_168;
-        stable_gap.avoidable_shortfall_tokens_128 = 7_168;
-        stable_gap.avoidable_shortfall_streak = 1;
-
-        let current_tail = TailInputDiagnostics {
-            input_items: 3,
-            tool_output_chars: 23_734,
-            largest_tool_output_chars: 11_224,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert!(responses_current_tail_makes_avoidable_unreliable(
-            &current_tail
-        ));
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &stable_gap,
-                &current_tail
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-
-        stable_gap.cache_instability_score = 3;
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_current_small_tool_output_uses_full_avoidable_wait_floor() {
-        let mut stable_gap = prefix_state(38_724, 37_888, 512);
-        stable_gap.avoidable_shortfall_tokens = 512;
-        stable_gap.avoidable_shortfall_tokens_128 = 512;
-        stable_gap.avoidable_shortfall_streak = 1;
-
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 1_469,
-            largest_tool_output_chars: 1_469,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&stable_gap, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &stable_gap,
-                &current_tail
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_avoidable_gap_uses_light_guard_when_99_percent_is_already_safe() {
-        let mut tiny = prefix_state(160_024, 159_232, 512);
-        tiny.avoidable_shortfall_tokens = 512;
-        tiny.avoidable_shortfall_tokens_128 = 512;
-        tiny.avoidable_shortfall_streak = 3;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&tiny),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_stable_995_prefix_without_avoidable_gap_has_zero_guard() {
-        let mut stable = prefix_state(200_000, 199_168, 512);
-        stable.avoidable_shortfall_tokens = 0;
-        stable.avoidable_shortfall_tokens_128 = 0;
-        stable.cache_instability_score = 0;
-        stable.small_gap_recovery_streak = 0;
-        stable.tail_tool_output_chars = 0;
-        stable.tail_largest_tool_output_chars = 0;
-        stable.tail_tool_output_noise_hint = None;
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            message_chars: 64,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert!(
-            provider_cache_ratio(&UsageRecord {
-                input_tokens: stable.input_tokens,
-                cache_read_tokens: stable.cache_read_tokens,
-                ..UsageRecord::default()
-            })
-            .unwrap()
-                >= 0.995
-        );
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&stable, &current_tail),
-            TokioDuration::ZERO
-        );
-    }
-
     #[tokio::test]
     async fn responses_missing_exact_prefix_state_does_not_wait_on_related_prefix() {
         let config = AppConfig::default();
@@ -18990,103 +17636,6 @@ mod tests {
         assert_eq!(wait.reason, None);
         assert_eq!(wait.skip_reason, Some("no_prefix_state".to_string()));
         fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_guards_cold_read_avoidable_gap() {
-        let mut cold_read_regression = prefix_state(18_071, 0, 17_920);
-        cold_read_regression.seen_bucket_tokens = 17_408;
-        cold_read_regression.seen_bucket_tokens_128 = 17_408;
-        cold_read_regression.avoidable_shortfall_tokens = 17_408;
-        cold_read_regression.avoidable_shortfall_tokens_128 = 17_408;
-        cold_read_regression.avoidable_shortfall_streak = 1;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&cold_read_regression),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &cold_read_regression,
-                &TailInputDiagnostics::default(),
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-
-        let mut huge_cold_read_regression = prefix_state(125_584, 0, 125_440);
-        huge_cold_read_regression.seen_bucket_tokens = 125_440;
-        huge_cold_read_regression.seen_bucket_tokens_128 = 125_440;
-        huge_cold_read_regression.avoidable_shortfall_tokens = 125_440;
-        huge_cold_read_regression.avoidable_shortfall_tokens_128 = 125_440;
-        huge_cold_read_regression.avoidable_shortfall_streak = 2;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&huge_cold_read_regression),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_large_avoidable_cold_read_keeps_strong_guard() {
-        let mut state = prefix_state(174_456, 0, 174_080);
-        state.seen_bucket_tokens = 161_280;
-        state.seen_bucket_tokens_128 = 161_280;
-        state.avoidable_shortfall_tokens = 161_280;
-        state.avoidable_shortfall_tokens_128 = 161_280;
-        state.avoidable_shortfall_streak = 1;
-        state.cache_instability_score = 3;
-        state.tail_tool_output_chars = 3_297;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(
-                &state,
-                &TailInputDiagnostics {
-                    input_items: 2,
-                    message_chars: 512,
-                    tool_output_chars: 3_297,
-                    largest_tool_output_chars: 3_297,
-                    source: Some("mixed".to_string()),
-                    ..TailInputDiagnostics::default()
-                }
-            ),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &state,
-                &TailInputDiagnostics::default(),
-            ),
-            Some("responses_avoidable_gap".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_cold_unstable_recent_warm_guard_is_narrow() {
-        let mut unstable_recent_warm = prefix_state(152_948, 152_576, 512);
-        unstable_recent_warm.avoidable_shortfall_tokens = 0;
-        unstable_recent_warm.avoidable_shortfall_tokens_128 = 0;
-        unstable_recent_warm.cache_instability_score = 2;
-        unstable_recent_warm.seen_bucket_tokens = 152_576;
-        unstable_recent_warm.seen_bucket_tokens_128 = 152_576;
-
-        let floor = responses_cold_unstable_recent_warm_floor(&unstable_recent_warm);
-        assert!(floor <= responses_foreground_wait_cap());
-        assert!(floor > TokioDuration::ZERO);
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(
-                &Channel::Responses,
-                &unstable_recent_warm,
-                &TailInputDiagnostics::default(),
-            ),
-            Some("responses_cold_unstable_recent_warm_guard".to_string())
-        );
-
-        unstable_recent_warm.cache_read_tokens = 0;
-        assert_eq!(
-            responses_cold_unstable_recent_warm_floor(&unstable_recent_warm),
-            TokioDuration::ZERO
-        );
     }
 
     #[test]
@@ -19142,62 +17691,6 @@ mod tests {
             }),
             "system-proxy:large_body_upload_header_wait"
         );
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_guards_all_avoidable_gaps_with_short_cap() {
-        let mut tiny = prefix_state(124_609, 123_904, 512);
-        tiny.avoidable_shortfall_tokens = 512;
-        tiny.avoidable_shortfall_tokens_128 = 512;
-        tiny.avoidable_shortfall_streak = 1;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&tiny),
-            responses_foreground_wait_cap()
-        );
-
-        let mut one_k = prefix_state(124_609, 123_392, 1_024);
-        one_k.avoidable_shortfall_tokens = 1_024;
-        one_k.avoidable_shortfall_tokens_128 = 1_024;
-        one_k.avoidable_shortfall_streak = 1;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&one_k),
-            responses_foreground_wait_cap()
-        );
-
-        let mut fifteen_thirty_six = prefix_state(123_816, 121_856, 1_536);
-        fifteen_thirty_six.avoidable_shortfall_tokens = 1_536;
-        fifteen_thirty_six.avoidable_shortfall_tokens_128 = 1_536;
-        fifteen_thirty_six.avoidable_shortfall_streak = 1;
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&fifteen_thirty_six),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_guards_avoidable_gap_sizes_without_unbounded_wait() {
-        for (gap, expected) in [
-            (128, responses_foreground_wait_cap()),
-            (512, responses_foreground_wait_cap()),
-            (1024, responses_foreground_wait_cap()),
-            (1536, responses_foreground_wait_cap()),
-            (2560, responses_foreground_wait_cap()),
-            (4608, responses_foreground_wait_cap()),
-            (9728, responses_foreground_wait_cap()),
-            (20_992, responses_foreground_wait_cap()),
-            (70_144, responses_foreground_wait_cap()),
-            (92_160, responses_foreground_wait_cap()),
-        ] {
-            let mut state = prefix_state(180_000 + gap, 175_000, gap);
-            state.avoidable_shortfall_tokens = gap;
-            state.avoidable_shortfall_tokens_128 = gap;
-            state.avoidable_shortfall_streak = 1;
-            assert_eq!(
-                responses_provider_prefix_settle_delay(&state),
-                expected,
-                "avoidable gap {gap} should be guarded"
-            );
-        }
     }
 
     #[test]
@@ -19445,117 +17938,6 @@ mod tests {
         let value = serde_json::from_slice::<Value>(&body).unwrap();
 
         assert_eq!(value["error"]["type"], "atoapi_compact_stream_incomplete");
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_uses_512_bucket_guard_for_new_tail() {
-        for tail in [512, 1024, 1536, 2048, 2560, 7168, 9728] {
-            let mut state = prefix_state(240_000 + tail, 235_000, tail);
-            state.avoidable_shortfall_tokens = 0;
-            state.avoidable_shortfall_tokens_128 = 0;
-            state.shortfall_tokens = tail;
-            state.shortfall_tokens_128 = tail;
-            state.small_gap_recovery_streak = 1;
-            assert_eq!(
-                responses_provider_prefix_settle_delay(&state),
-                responses_foreground_wait_cap(),
-                "new tail bucket {tail} should be guarded"
-            );
-        }
-    }
-
-    #[test]
-    fn responses_current_small_tool_output_gets_tail_guard_without_extra_request() {
-        let mut state = prefix_state(127_499, 126_464, 1024);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.small_gap_recovery_streak = 0;
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 120,
-            largest_tool_output_chars: 120,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            responses_foreground_wait_cap()
-        );
-    }
-
-    #[test]
-    fn responses_small_tool_tail_keeps_guard_for_30k_regression() {
-        let mut state = prefix_state(30_046, 29_184, 512);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 512;
-        state.shortfall_tokens_128 = 512;
-        state.small_gap_recovery_streak = 1;
-        state.tail_tool_output_chars = 128;
-        state.tail_largest_tool_output_chars = 128;
-        state.tail_tool_output_noise_hint = Some("path_like".to_string());
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 128,
-            largest_tool_output_chars: 128,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
-            Some("responses_current_tail_guard".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_mixed_message_tool_tail_gets_redundant_guard_for_cold_read_regression() {
-        let mut state = prefix_state(32_580, 31_232, 1_024);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 1_024;
-        state.shortfall_tokens_128 = 1_024;
-        state.small_gap_recovery_streak = 1;
-        let current_tail = TailInputDiagnostics {
-            input_items: 2,
-            message_chars: 3_474,
-            tool_output_chars: 581,
-            largest_tool_output_chars: 581,
-            source: Some("mixed".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay_with_tail(&state, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
-            Some("responses_current_tail_guard".to_string())
-        );
-    }
-
-    #[test]
-    fn responses_prefix_settle_delay_does_not_over_guard_quiet_1024_tool_output() {
-        let mut quiet_tool_tail = prefix_state(66_912, 65_536, 1_024);
-        quiet_tool_tail.avoidable_shortfall_tokens = 0;
-        quiet_tool_tail.avoidable_shortfall_tokens_128 = 0;
-        quiet_tool_tail.shortfall_tokens = 0;
-        quiet_tool_tail.shortfall_tokens_128 = 0;
-        quiet_tool_tail.small_gap_recovery_streak = 0;
-        quiet_tool_tail.tail_tool_output_chars = 1_024;
-        quiet_tool_tail.tail_largest_tool_output_chars = 1_024;
-        quiet_tool_tail.tail_tool_output_noise_hint = None;
-
-        assert_eq!(
-            responses_provider_prefix_settle_delay(&quiet_tool_tail),
-            TokioDuration::from_millis(150)
-        );
     }
 
     #[test]
@@ -19892,24 +18274,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_measured_128_gap_keeps_bounded_guard() {
-        let mut state = prefix_state(105_281, 105_024, 0);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 128;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        )
-        .expect("a measured avoidable 128-token gap still needs a bounded guard");
-
-        assert!(wait > TokioDuration::ZERO);
-        assert!(wait <= responses_foreground_wait_cap());
-    }
-
-    #[test]
     fn responses_foreground_prewarm_settle_delay_scales_for_stable_new_tail() {
         let high_hit = UsageRecord {
             input_tokens: 98_325,
@@ -20048,178 +18412,7 @@ mod tests {
         assert_eq!(kept.avoidable_shortfall_tokens, 0);
         assert_eq!(kept.avoidable_shortfall_streak, 0);
         assert!(kept.cache_instability_score > 0);
-        assert!(provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            kept,
-            &TailInputDiagnostics::default(),
-        )
-        .is_some());
-
         fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn responses_stale_avoidable_prefix_keeps_bounded_recovery_guard() {
-        let mut state = prefix_state(100_313, 0, 99_840);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(43);
-        state.seen_bucket_tokens = 99_840;
-        state.seen_bucket_tokens_128 = 99_840;
-        state.avoidable_shortfall_tokens = 99_328;
-        state.avoidable_shortfall_tokens_128 = 99_328;
-        state.avoidable_shortfall_streak = 2;
-        state.cache_instability_score = 3;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 3,
-                tool_output_chars: 2_179,
-                largest_tool_output_chars: 1_992,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_small_avoidable_prefix_gets_light_recovery_guard() {
-        let mut state = prefix_state(78_608, 77_824, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(18);
-        state.seen_bucket_tokens = 78_336;
-        state.seen_bucket_tokens_128 = 78_336;
-        state.avoidable_shortfall_tokens = 512;
-        state.avoidable_shortfall_tokens_128 = 512;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_small_avoidable_prefix_gets_risk_guard_after_idle() {
-        let mut state = prefix_state(88_626, 88_064, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(13 * 60);
-        state.seen_bucket_tokens = 88_576;
-        state.seen_bucket_tokens_128 = 88_576;
-        state.avoidable_shortfall_tokens = 512;
-        state.avoidable_shortfall_tokens_128 = 512;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_small_avoidable_prefix_gets_risk_guard_for_tail_change() {
-        let mut state = prefix_state(89_553, 88_064, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(90);
-        state.seen_bucket_tokens = 88_576;
-        state.seen_bucket_tokens_128 = 88_576;
-        state.avoidable_shortfall_tokens = 512;
-        state.avoidable_shortfall_tokens_128 = 512;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 2,
-                message_chars: 421,
-                tool_output_chars: 581,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_medium_avoidable_prefix_gets_light_recovery_guard() {
-        let mut state = prefix_state(90_581, 88_064, 2_048);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(54);
-        state.seen_bucket_tokens = 90_112;
-        state.seen_bucket_tokens_128 = 90_112;
-        state.avoidable_shortfall_tokens = 2_048;
-        state.avoidable_shortfall_tokens_128 = 2_048;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 2,
-                tool_output_chars: 7_070,
-                largest_tool_output_chars: 3_557,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_large_tool_tail_gets_short_catchup_without_avoidable_gap() {
-        let mut state = prefix_state(48_343, 31_232, 2_176);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(45);
-        state.seen_bucket_tokens = 31_232;
-        state.seen_bucket_tokens_128 = 31_232;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 4,
-                tool_output_chars: 60_948,
-                largest_tool_output_chars: 45_214,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_all_stage_message_tail_gets_short_guard() {
-        let mut state = prefix_state(25_057, 8_704, 15_872);
-        state.seen_bucket_tokens = 8_704;
-        state.seen_bucket_tokens_128 = 8_704;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.avoidable_shortfall_streak = 0;
-        state.small_gap_recovery_streak = 0;
-        let current_tail = TailInputDiagnostics {
-            input_items: 1,
-            message_chars: 66_218,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_minimum_new_tail_request_wait(&Channel::Responses, &state, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
-            Some("responses_all_stage_tail_guard".to_string())
-        );
     }
 
     #[test]
@@ -20356,29 +18549,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
     #[test]
-    fn responses_stale_current_message_tail_gets_guard_after_window_elapsed() {
-        let mut state = prefix_state(52_513, 49_152, 3_072);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(24 * 60);
-        state.seen_bucket_tokens = 49_152;
-        state.seen_bucket_tokens_128 = 49_152;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 128;
-        state.shortfall_tokens_128 = 128;
-        let tail = TailInputDiagnostics {
-            input_items: 2,
-            message_chars: 3_742,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail),
-            Some(responses_foreground_wait_cap())
-        );
-    }
-
-    #[test]
     fn responses_medium_message_tail_learns_sent_bucket_with_high_ratio() {
         let mut previous = prefix_state(53_806, 52_736, 1_024);
         previous.seen_bucket_tokens = 52_736;
@@ -20445,30 +18615,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_unseen_huge_tail_size_is_covered_by_general_guard() {
-        let mut state = prefix_state(140_000, 92_160, 47_616);
-        state.seen_bucket_tokens = 92_160;
-        state.seen_bucket_tokens_128 = 92_160;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        let current_tail = TailInputDiagnostics {
-            input_items: 6,
-            message_chars: 180_000,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        assert_eq!(
-            responses_minimum_new_tail_request_wait(&Channel::Responses, &state, &current_tail),
-            responses_foreground_wait_cap()
-        );
-        assert_eq!(
-            provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &current_tail),
-            Some("responses_all_stage_tail_guard".to_string())
-        );
-    }
-
-    #[test]
     fn responses_unseen_huge_tail_can_learn_sent_bucket_with_high_hit_ratio() {
         let mut previous = prefix_state(280_000, 260_096, 19_456);
         previous.seen_bucket_tokens = 260_096;
@@ -20525,400 +18671,6 @@ mod tests {
             &tail,
             false,
         ));
-    }
-
-    #[test]
-    fn responses_long_idle_warm_prefix_gets_cold_read_guard() {
-        let mut state = prefix_state(126_139, 120_832, 3_584);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(44 * 60);
-        state.seen_bucket_tokens = 124_416;
-        state.seen_bucket_tokens_128 = 124_416;
-        state.cache_instability_score = 3;
-        let tail = TailInputDiagnostics {
-            input_items: 2,
-            message_chars: 1_682,
-            source: Some("message".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-
-        let wait = provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail);
-        let reason = provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &tail);
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-        assert_eq!(
-            reason.as_deref(),
-            Some("responses_long_idle_warm_prefix_guard")
-        );
-    }
-
-    #[test]
-    fn responses_long_idle_warm_prefix_without_tail_does_not_wait() {
-        let mut state = prefix_state(126_139, 120_832, 3_584);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(44 * 60);
-        state.seen_bucket_tokens = 124_416;
-        state.seen_bucket_tokens_128 = 124_416;
-        state.cache_instability_score = 3;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        );
-
-        assert_eq!(wait, None);
-    }
-
-    #[test]
-    fn responses_stale_small_tool_tail_does_not_get_large_tail_catchup() {
-        let mut state = prefix_state(140_301, 139_264, 768);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(45);
-        state.seen_bucket_tokens = 139_264;
-        state.seen_bucket_tokens_128 = 139_264;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 1,
-                tool_output_chars: 160,
-                largest_tool_output_chars: 160,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, None);
-    }
-
-    #[test]
-    fn responses_recent_small_tool_tail_lag_gets_short_guard() {
-        let mut state = prefix_state(156_915, 156_160, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(3);
-        state.seen_bucket_tokens = 156_160;
-        state.seen_bucket_tokens_128 = 156_160;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.cache_instability_score = 1;
-        state.tail_tool_output_chars = 165;
-        state.tail_largest_tool_output_chars = 165;
-        state.tail_tool_output_noise_hint = Some("path_like".to_string());
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 1,
-                tool_output_chars: 165,
-                largest_tool_output_chars: 165,
-                tool_output_noise_hint: Some("path_like".to_string()),
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_small_bucket_tail_lag_still_gets_guard_after_window_elapsed() {
-        let mut state = prefix_state(35_253, 34_304, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(45);
-        state.seen_bucket_tokens = 34_304;
-        state.seen_bucket_tokens_128 = 34_304;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.cache_instability_score = 0;
-        state.small_gap_recovery_streak = 0;
-        state.tail_tool_output_chars = 1008;
-        state.tail_largest_tool_output_chars = 1008;
-        state.tail_tool_output_noise_hint = Some("path_like".to_string());
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 1,
-                tool_output_chars: 1008,
-                largest_tool_output_chars: 1008,
-                tool_output_noise_hint: Some("path_like".to_string()),
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_early_anchor_large_tool_tail_gets_short_catchup() {
-        let mut state = prefix_state(13_000, 7_680, 5_248);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(18);
-        state.seen_bucket_tokens = 7_680;
-        state.seen_bucket_tokens_128 = 7_680;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 6,
-                tool_output_chars: 44_311,
-                largest_tool_output_chars: 11_652,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_early_cold_anchor_large_tool_tail_gets_short_guard() {
-        let mut state = prefix_state(7_906, 0, 7_680);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(32);
-        state.seen_bucket_tokens = 0;
-        state.seen_bucket_tokens_128 = 0;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 6,
-                tool_output_chars: 18_498,
-                largest_tool_output_chars: 10_712,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_small_context_medium_avoidable_prefix_gets_full_short_guard() {
-        let mut state = prefix_state(12_408, 7_680, 2_048);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(38);
-        state.seen_bucket_tokens = 12_288;
-        state.seen_bucket_tokens_128 = 12_288;
-        state.avoidable_shortfall_tokens = 2_048;
-        state.avoidable_shortfall_tokens_128 = 2_048;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 10,
-                message_chars: 13_072,
-                tool_output_chars: 15_395,
-                largest_tool_output_chars: 15_297,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_small_context_1024_avoidable_prefix_gets_short_guard() {
-        let mut state = prefix_state(12_408, 7_680, 1_024);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(38);
-        state.seen_bucket_tokens = 12_288;
-        state.seen_bucket_tokens_128 = 12_288;
-        state.avoidable_shortfall_tokens = 1_024;
-        state.avoidable_shortfall_tokens_128 = 1_024;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_high_context_avoidable_prefix_gets_light_per_request_floor() {
-        let mut state = prefix_state(119_002, 115_200, 2_560);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(4);
-        state.seen_bucket_tokens = 118_784;
-        state.seen_bucket_tokens_128 = 118_784;
-        state.avoidable_shortfall_tokens = 2_560;
-        state.avoidable_shortfall_tokens_128 = 2_560;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 36,
-                message_chars: 1_005,
-                tool_call_chars: 8_479,
-                tool_output_chars: 2_511,
-                largest_tool_output_chars: 1_069,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_high_context_512_avoidable_prefix_gets_light_guard() {
-        let mut state = prefix_state(118_113, 117_248, 512);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(4);
-        state.seen_bucket_tokens = 117_760;
-        state.seen_bucket_tokens_128 = 117_760;
-        state.avoidable_shortfall_tokens = 512;
-        state.avoidable_shortfall_tokens_128 = 512;
-        state.avoidable_shortfall_streak = 1;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 1,
-                tool_output_chars: 128,
-                largest_tool_output_chars: 128,
-                source: Some("tool_output".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_avoidable_large_tool_tail_gets_full_short_guard() {
-        let mut state = prefix_state(116_443, 100_352, 15_872);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(180);
-        state.seen_bucket_tokens = 111_616;
-        state.seen_bucket_tokens_128 = 111_616;
-        state.avoidable_shortfall_tokens = 11_264;
-        state.avoidable_shortfall_tokens_128 = 11_264;
-        state.avoidable_shortfall_streak = 1;
-        state.cache_instability_score = 2;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 315,
-                message_chars: 28_971,
-                tool_call_chars: 36_837,
-                tool_output_chars: 295_472,
-                largest_tool_output_chars: 33_924,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_small_context_stale_cold_start_gets_short_guard() {
-        let mut state = prefix_state(7_726, 0, 7_680);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(26);
-        state.seen_bucket_tokens = 7_680;
-        state.seen_bucket_tokens_128 = 7_680;
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.avoidable_shortfall_streak = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 3,
-                message_chars: 13_029,
-                source: Some("message".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_stale_full_prefix_does_not_wait_without_instability() {
-        let mut state = prefix_state(93_845, 93_696, 0);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(120);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 0;
-        state.shortfall_tokens_128 = 0;
-        state.cache_instability_score = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics::default(),
-        );
-
-        assert_eq!(wait, None);
-    }
-
-    #[test]
-    fn responses_long_idle_large_tail_gets_probe_guard_even_without_prior_gap() {
-        let mut state = prefix_state(65_295, 65_024, 0);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(5 * 60);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 0;
-        state.shortfall_tokens_128 = 0;
-        state.cache_instability_score = 0;
-
-        let wait = provider_prefix_wait_duration_for_channel(
-            &Channel::Responses,
-            &state,
-            &TailInputDiagnostics {
-                input_items: 332,
-                message_chars: 30_103,
-                tool_call_chars: 37_383,
-                tool_output_chars: 115_995,
-                largest_tool_output_chars: 33_924,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-        );
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-    }
-
-    #[test]
-    fn responses_long_idle_medium_tool_tail_gets_probe_guard() {
-        let mut state = prefix_state(89_559, 89_088, 0);
-        state.finished_at = Instant::now() - std::time::Duration::from_secs(90);
-        state.avoidable_shortfall_tokens = 0;
-        state.avoidable_shortfall_tokens_128 = 0;
-        state.shortfall_tokens = 0;
-        state.shortfall_tokens_128 = 0;
-        state.cache_instability_score = 0;
-
-        let tail = TailInputDiagnostics {
-            input_items: 1,
-            tool_output_chars: 3_009,
-            largest_tool_output_chars: 3_009,
-            source: Some("tool_output".to_string()),
-            ..TailInputDiagnostics::default()
-        };
-        let wait = provider_prefix_wait_duration_for_channel(&Channel::Responses, &state, &tail);
-        let reason = provider_prefix_wait_reason_for_channel(&Channel::Responses, &state, &tail);
-
-        assert_eq!(wait, Some(responses_foreground_wait_cap()));
-        assert_eq!(
-            reason.as_deref(),
-            Some("responses_stale_medium_tool_tail_probe")
-        );
     }
 
     #[test]
@@ -21300,21 +19052,6 @@ mod tests {
             prefix.cache_instability_score > 0,
             "one recovered turn must not erase recent cold-read instability"
         );
-        assert!(
-            provider_prefix_wait_duration_for_channel(
-                &Channel::Responses,
-                prefix,
-                &TailInputDiagnostics {
-                    tool_output_chars: 40,
-                    largest_tool_output_chars: 40,
-                    source: Some("tool_output".to_string()),
-                    ..TailInputDiagnostics::default()
-                },
-            )
-            .is_some_and(|wait| wait <= TokioDuration::from_secs(30)),
-            "recent instability should keep a bounded Responses guard"
-        );
-
         fs::remove_dir_all(dir).ok();
     }
 
@@ -24364,13 +22101,26 @@ mod tests {
             Some("codex"),
         )
         .await;
-        assert_eq!(failed_response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(responses_hits.load(Ordering::SeqCst), 2);
         let failed_capture = captured_responses_body.lock().await.clone();
         assert_eq!(failed_capture["stream"], true);
+        assert_eq!(
+            failed_capture.pointer("/metadata/atoapi_test_upstream_502"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(failed_response.status(), StatusCode::BAD_GATEWAY);
 
         let failed_metrics = state.metrics.snapshot().await;
-        assert_eq!(failed_metrics.recent_requests[0].status, 502);
+        assert_eq!(failed_metrics.total_requests, 2);
+        assert_eq!(failed_metrics.upstream_requests, 2);
+        assert_eq!(failed_metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(failed_metrics.recent_requests.len(), 1);
+        assert_eq!(failed_metrics.recent_requests[0].status, 200);
+        assert!(failed_metrics.errors > 0);
+        assert!(failed_metrics
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "upstream_bad_gateway"));
         assert_eq!(
             failed_metrics.recent_requests[0]
                 .upstream_call_kind
