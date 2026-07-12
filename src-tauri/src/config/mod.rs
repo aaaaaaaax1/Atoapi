@@ -492,19 +492,21 @@ impl CacheConfig {
         }
     }
 
-    pub fn normalize_smart_max_hit(&mut self) {
-        self.mode = CacheMode::PrefixPrewarm;
+    pub fn normalize_fast_forwarding_hit_policy(&mut self) {
         if self.enabled {
             self.exact_enabled = true;
             self.semantic_enabled = true;
-            self.prewarm_enabled = true;
+            if matches!(self.mode, CacheMode::PassiveWarm) {
+                self.prewarm_enabled = false;
+            }
         } else {
             self.exact_enabled = false;
             self.semantic_enabled = false;
             self.prewarm_enabled = false;
         }
-        // Active prewarm was removed by product rule: do not spend a second
-        // upstream request to improve cosmetic cache hit rate.
+        // Active companion prewarm is intentionally kept off the foreground
+        // path: hit-rate learning happens from real requests and cache writes,
+        // while current requests continue forwarding immediately.
         self.background_prewarm_enabled = false;
         self.semantic_threshold = 0.985;
     }
@@ -697,7 +699,7 @@ impl AppConfig {
             let mut config: AppConfig = toml::from_str(&raw)
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             let mut changed = false;
-            config.cache.normalize_smart_max_hit();
+            config.cache.normalize_fast_forwarding_hit_policy();
             if !raw.contains("proxy_auto_start") {
                 config.proxy_auto_start = default_proxy_auto_start();
                 changed = true;
@@ -1535,8 +1537,22 @@ mod tests {
         let mut cache = CacheConfig::smart_max_hit();
         assert!(!cache.background_prewarm_enabled);
         cache.background_prewarm_enabled = true;
-        cache.normalize_smart_max_hit();
+        cache.normalize_fast_forwarding_hit_policy();
         assert!(!cache.background_prewarm_enabled);
+    }
+
+    #[test]
+    fn cache_normalization_preserves_user_selected_mode() {
+        let mut cache = CacheConfig::smart_max_hit();
+        cache.mode = CacheMode::PassiveWarm;
+        cache.prewarm_enabled = true;
+
+        cache.normalize_fast_forwarding_hit_policy();
+
+        assert_eq!(cache.mode, CacheMode::PassiveWarm);
+        assert!(!cache.prewarm_enabled);
+        assert!(cache.exact_enabled);
+        assert!(cache.semantic_enabled);
     }
 
     #[test]

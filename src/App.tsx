@@ -57,6 +57,20 @@ type RequestFeedEntry =
   | ({ feed_kind: "request" } & RequestLogEntry)
   | ({ feed_kind: "failed" } & RequestLogEntry);
 
+interface ResponseSessionDiagnosticChip {
+  label: string;
+  value: string;
+  title?: string;
+}
+
+interface ResponseSessionDiagnostic {
+  tone: "warning" | "success" | "info";
+  title: string;
+  summary: string;
+  reason: string | null;
+  chips: ResponseSessionDiagnosticChip[];
+}
+
 interface ProviderDraft {
   id?: string;
   name: string;
@@ -142,10 +156,10 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.92";
+const appVersion = "v0.1.95";
 const appVersionNotes = [
-  "v0.1.92: Responses 核心重构，使用量观测与会话身份归并为单一可信路径。",
-  "v0.1.92: 仅在精确可避免证据下等待，最长 1 秒；流生命周期和全阶段尾巴分类已覆盖。"
+  "v0.1.95: Codex 主会话 delta 复用不再被硬关闭，进入安全判断与上游拒绝回退链路。",
+  "v0.1.95: 请求记录默认保持简洁，缓存/会话诊断改为点击单条记录后展开。"
 ];
 
 const emptyDraft: ProviderDraft = {
@@ -2186,6 +2200,7 @@ function CachePanel({
   onRefresh: () => void;
 }) {
   const [requestPage, setRequestPage] = useState(1);
+  const [expandedRequestKey, setExpandedRequestKey] = useState("");
   const usage = selectedProvider === "all"
     ? metrics?.usage
     : metrics?.usage.by_provider.find((item) => item.key === selectedProvider);
@@ -2438,6 +2453,7 @@ function CachePanel({
                 request.input_tokens ?? 0,
                 request.cache_read_tokens ?? 0
               );
+              const sessionDiagnostic = responseSessionDiagnostics(request);
               const cacheStatusLabel = ["miss", "compact", "error"].includes(request.cache_status)
                 ? ""
                 : request.cache_status;
@@ -2447,11 +2463,29 @@ function CachePanel({
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
               const cacheReadTokens = request.cache_read_tokens ?? 0;
+              const cacheHitRatio = inputTokens > 0 ? cacheReadTokens / inputTokens : 0;
               const isFailedRequest =
                 request.feed_kind === "failed" || request.status >= 400 || request.cache_status === "error";
               const requestedModel = request.requested_model?.trim();
               const hasModelMapping = Boolean(requestedModel && requestedModel !== request.model);
               const displayModel = hasModelMapping ? requestedModel : request.model;
+              const requestMetricItems = [
+                { label: "首字", value: formatDurationMs(request.ttft_ms) },
+                { label: "用时", value: formatDurationMs(request.total_ms) },
+                { label: "输入", value: formatCompactTokens(inputTokens) },
+                { label: "输出", value: formatCompactTokens(outputTokens) },
+                { label: "命中", value: formatCompactTokens(cacheReadTokens) },
+                { label: "命中率", value: inputTokens > 0 ? percent(cacheHitRatio) : "—" }
+              ];
+              const traceItems = [
+                request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
+                request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
+                request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
+              ].filter(Boolean);
+              const requestKey = `${request.feed_kind}-${request.id}`;
+              const detailsId = `request-details-${requestKey}`;
+              const hasRequestDetails = Boolean(sessionDiagnostic || cacheDisplay.secondary || traceItems.length);
+              const isExpanded = expandedRequestKey === requestKey;
               const metricTitle = [
                 `首字 ${formatDurationMs(request.ttft_ms)}`,
                 `用时 ${formatDurationMs(request.total_ms)}`,
@@ -2463,44 +2497,114 @@ function CachePanel({
                 request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
               ].filter(Boolean).join(" · ");
               return (
-                <div className={isFailedRequest ? "request-row failed" : "request-row"} key={`${request.feed_kind}-${request.id}`}>
-                  <div className="request-identity">
-                    {isFailedRequest ? <AlertTriangle size={14} /> : <Activity size={14} />}
-                    <div>
-                      <time>{formatRequestTime(request.at)}</time>
-                      <span className="request-provider-text">{request.provider} · {displayModel}</span>
-                      {hasModelMapping ? (
-                        <span className="request-model-map" title={`实际发送到上游：${request.model}`}>
-                          ↳ {request.model}
+                <div className="request-entry" key={requestKey}>
+                  <div
+                    aria-controls={hasRequestDetails ? detailsId : undefined}
+                    aria-expanded={hasRequestDetails ? isExpanded : undefined}
+                    className={[
+                      "request-row",
+                      isFailedRequest ? "failed" : "",
+                      hasRequestDetails ? "clickable" : "",
+                      isExpanded ? "expanded" : ""
+                    ].filter(Boolean).join(" ")}
+                    onClick={() => {
+                      if (!hasRequestDetails) return;
+                      setExpandedRequestKey((current) => (current === requestKey ? "" : requestKey));
+                    }}
+                    onKeyDown={(event) => {
+                      if (!hasRequestDetails || (event.key !== "Enter" && event.key !== " ")) return;
+                      event.preventDefault();
+                      setExpandedRequestKey((current) => (current === requestKey ? "" : requestKey));
+                    }}
+                    role={hasRequestDetails ? "button" : undefined}
+                    tabIndex={hasRequestDetails ? 0 : undefined}
+                  >
+                    <div className="request-row-top">
+                      <div className="request-identity">
+                        {isFailedRequest ? <AlertTriangle size={14} /> : <Activity size={14} />}
+                        <div>
+                          <time>{formatRequestTime(request.at)}</time>
+                          <span className="request-provider-text">{request.provider} · {displayModel}</span>
+                          {hasModelMapping ? (
+                            <span className="request-model-map" title={`实际发送到上游：${request.model}`}>
+                              ↳ {request.model}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="request-badges">
+                        <span className={`request-call-badge ${requestCallKindClass(request.upstream_call_kind)}`}>
+                          {requestCallKindLabel(request.upstream_call_kind, request.upstream_call_source)}
+                        </span>
+                        <span className="request-channel-badge">
+                          {requestChannelLabel(request.client_channel, request.upstream_channel)}
+                        </span>
+                        {request.agent_id ? (
+                          <span className="request-agent-badge" title={request.agent_label ?? request.agent_id}>
+                            {request.agent_id}
+                          </span>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="request-metrics" title={metricTitle}>
+                      {requestMetricItems.map((item) => (
+                        <span className="request-metric-chip" key={item.label}>
+                          <small>{item.label}</small>
+                          <b>{item.value}</b>
+                        </span>
+                      ))}
+                    </div>
+                    <div className="request-cache-result">
+                      {cacheResultLabel ? <b>{cacheResultLabel}</b> : <b>已转发</b>}
+                      {hasRequestDetails ? (
+                        <span className="request-detail-hint">
+                          {isExpanded ? "收起详情" : "查看详情"}
+                          <ChevronDown size={14} />
                         </span>
                       ) : null}
                     </div>
                   </div>
-                  <div className="request-badges">
-                    <span className={`request-call-badge ${requestCallKindClass(request.upstream_call_kind)}`}>
-                      {requestCallKindLabel(request.upstream_call_kind, request.upstream_call_source)}
-                    </span>
-                    <span className="request-channel-badge">
-                      {requestChannelLabel(request.client_channel, request.upstream_channel)}
-                    </span>
-                    {request.agent_id ? (
-                      <span className="request-agent-badge" title={request.agent_label ?? request.agent_id}>
-                        {request.agent_id}
-                      </span>
-                    ) : null}
-                  </div>
-                  <div className="request-metrics" title={metricTitle}>
-                    <strong>首字 {formatDurationMs(request.ttft_ms)} · 用时 {formatDurationMs(request.total_ms)}</strong>
-                    <em>输入 {formatCompactTokens(inputTokens)} · 输出 {formatCompactTokens(outputTokens)} · 命中 {formatCompactTokens(cacheReadTokens)}</em>
-                  </div>
-                  <div className="request-cache-result">
-                    {cacheResultLabel ? <b>{cacheResultLabel}</b> : null}
-                    {cacheDisplay.secondary ? (
-                      <small title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>
-                        {cacheDisplay.secondary}
-                      </small>
-                    ) : null}
-                  </div>
+                  {hasRequestDetails && isExpanded ? (
+                    <div className="request-detail-panel" id={detailsId}>
+                      {cacheDisplay.secondary ? (
+                        <div className="request-detail-line">
+                          <span>缓存细节</span>
+                          <b title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>{cacheDisplay.secondary}</b>
+                        </div>
+                      ) : null}
+                      {sessionDiagnostic ? (
+                        <div className={`request-session-diagnostics ${sessionDiagnostic.tone}`}>
+                          <div className="request-session-diagnostics-head">
+                            <strong>{sessionDiagnostic.title}</strong>
+                            <em>Response session</em>
+                          </div>
+                          <p>{sessionDiagnostic.summary}</p>
+                          {sessionDiagnostic.reason ? (
+                            <div className="request-session-reason" title={sessionDiagnostic.reason}>
+                              <span>原始 reason</span>
+                              <code>{sessionDiagnostic.reason}</code>
+                            </div>
+                          ) : null}
+                          {sessionDiagnostic.chips.length ? (
+                            <div className="request-session-chips">
+                              {sessionDiagnostic.chips.map((chip) => (
+                                <span title={chip.title ?? `${chip.label}: ${chip.value}`} key={`${chip.label}-${chip.value}`}>
+                                  <small>{chip.label}</small>
+                                  <b>{chip.value}</b>
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      {traceItems.length ? (
+                        <div className="request-detail-line muted">
+                          <span>追踪</span>
+                          <b>{traceItems.join(" · ")}</b>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
               );
             })}
@@ -2888,12 +2992,12 @@ function percent(value?: number) {
 }
 
 function requestPrimaryStatus(
-  request: MetricsSnapshot["recent_requests"][number],
+  request: RequestLogEntry,
   inputTokens: number,
   cacheReadTokens: number
 ) {
   if (request.status >= 400 || request.cache_status === "error") {
-    return request.status ? `上游失败 ${request.status}` : "上游异常";
+    return request.status ? `error ${request.status}` : "error";
   }
   if (request.downstream_disconnected) {
     return "下游已断开";
@@ -2901,17 +3005,117 @@ function requestPrimaryStatus(
   if (request.cache_status === "compact") {
     return "实际压缩";
   }
-  if (
-    request.response_session_reused === false &&
-    request.response_session_skip_reason &&
-    request.response_session_skip_reason !== "compact_non_streaming"
-  ) {
-    return `会话复用失败：${request.response_session_skip_reason}`;
-  }
   if (inputTokens >= 1024 && cacheReadTokens === 0) {
     return "冷启动";
   }
   return "";
+}
+
+function responseSessionDiagnostics(request: RequestLogEntry): ResponseSessionDiagnostic | null {
+  const reason = responseSessionMeaningfulReason(request);
+  const rejectedStatus = request.response_session_rejected_status;
+  const cooldownActive = request.response_session_cooldown_active === true;
+  if (!responseSessionNeedsVisibleDiagnostic(reason, rejectedStatus, cooldownActive)) {
+    return null;
+  }
+
+  const chips: ResponseSessionDiagnosticChip[] = [];
+  addNumberChip(chips, "候选", request.response_session_candidate_count);
+  addBoolChip(chips, "精确 Key", request.response_session_exact_key_hit);
+  addNumberChip(chips, "同 scope", request.response_session_scope_match_count);
+  addBoolChip(chips, "可追加 delta", request.response_session_append_delta_match);
+  addNumberChip(chips, "delta 项", request.response_session_delta_items);
+  if (cooldownActive) {
+    chips.push({ label: "冷却", value: "生效" });
+  }
+  if (rejectedStatus !== undefined && rejectedStatus !== null) {
+    chips.push({ label: "拒绝状态", value: String(rejectedStatus) });
+  }
+  const anchorSource = cleanOptionalText(request.session_anchor_source);
+  if (anchorSource) {
+    chips.push({ label: "anchor", value: anchorSource, title: `session_anchor_source: ${anchorSource}` });
+  }
+  addBoolChip(chips, "anchor 变化", request.session_anchor_changed);
+  addNumberChip(chips, "同 anchor", request.session_anchor_peer_count);
+  const prefixGuardReason = cleanOptionalText(request.prefix_guard_skip_reason);
+  if (prefixGuardReason) {
+    chips.push({
+      label: "前缀保护",
+      value: prefixGuardReason,
+      title: `prefix_guard_skip_reason: ${prefixGuardReason}`
+    });
+  }
+
+  const reused = request.response_session_reused === true;
+  return {
+    tone: reused ? "success" : "warning",
+    title: reused ? "会话复用已生效" : "会话复用未生效",
+    summary: responseSessionReasonSummary(reason, rejectedStatus, cooldownActive),
+    reason,
+    chips
+  };
+}
+
+function responseSessionMeaningfulReason(request: RequestLogEntry) {
+  const reason = cleanOptionalText(request.response_session_skip_reason);
+  if (!reason || reason === "compact_non_streaming") return null;
+  return reason;
+}
+
+function responseSessionNeedsVisibleDiagnostic(
+  reason: string | null,
+  rejectedStatus?: number | null,
+  cooldownActive = false
+) {
+  return Boolean(
+    reason ||
+      cooldownActive ||
+      (rejectedStatus !== undefined && rejectedStatus !== null)
+  );
+}
+
+function responseSessionReasonSummary(
+  reason: string | null,
+  rejectedStatus?: number | null,
+  cooldownActive = false
+) {
+  if (reason === "codex_main_session_delta_disabled") {
+    return "Codex 主会话 delta 续接开关没有启用，所以这次保持完整请求。";
+  }
+  if (reason === "main_session_delta_guard_not_eligible") {
+    return "主会话 delta 保护条件没有通过，通常是 anchor、输入结构或可安全追加的尾部不够稳定。";
+  }
+  if (reason === "main_session_delta_not_beneficial") {
+    return "这次即使改成 session delta 也不会更省 token，因此保持完整请求。";
+  }
+  if (reason === "provider_session_delta_unsupported") {
+    return "上游拒绝过 previous_response_id / session delta，当前 provider 正在按不支持处理。";
+  }
+  if (reason === "provider_session_delta_cooldown" || cooldownActive) {
+    return "最近一次 session delta 被上游拒绝，暂时进入冷却期以避免连续失败。";
+  }
+  if (rejectedStatus !== undefined && rejectedStatus !== null) {
+    return `上游以 ${rejectedStatus} 拒绝了 session delta，本次已回退完整请求。`;
+  }
+  return "这次 Responses 会话续接没有使用；保留原始 reason 和诊断字段，方便定位具体卡点。";
+}
+
+function addNumberChip(
+  chips: ResponseSessionDiagnosticChip[],
+  label: string,
+  value?: number | null
+) {
+  if (value === undefined || value === null) return;
+  chips.push({ label, value: formatNumber(value) });
+}
+
+function addBoolChip(
+  chips: ResponseSessionDiagnosticChip[],
+  label: string,
+  value?: boolean | null
+) {
+  if (value === undefined || value === null) return;
+  chips.push({ label, value: value ? "是" : "否" });
 }
 
 function providerBucketDisplay(

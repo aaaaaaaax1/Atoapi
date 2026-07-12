@@ -1256,7 +1256,12 @@ async fn handle_generation_for_agent(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("no-store"))
         .unwrap_or(false);
-    let eligible = config.cache.enabled && !no_store && cache::is_cache_eligible(&client_request);
+    let eligible = local_response_cache_eligible(
+        &config,
+        no_store,
+        &client_request,
+        authorized_agent.as_deref(),
+    );
     let key_material = json!({
         "client_channel": client_channel.label(),
         "upstream_channel": decision.upstream_channel.label(),
@@ -1416,7 +1421,12 @@ async fn handle_generation_for_agent(
             "upstream is cooling down after recent sync failure; retry shortly",
         );
     }
-    let prefix_guard = if skip_prefix_guard_for_sync_responses || !smart_hit_enabled(&config) {
+    let prefix_guard_skip_reason = provider_prefix_guard_skip_reason(
+        &config,
+        skip_prefix_guard_for_sync_responses,
+        authorized_agent.as_deref(),
+    );
+    let prefix_guard = if prefix_guard_skip_reason.is_some() {
         None
     } else {
         acquire_provider_prefix_guard(
@@ -1454,14 +1464,21 @@ async fn handle_generation_for_agent(
         )
         .await
     } else {
-        PrefixGuardWaitDiagnostics::default()
+        PrefixGuardWaitDiagnostics {
+            skip_reason: prefix_guard_skip_reason.map(str::to_string),
+            ..PrefixGuardWaitDiagnostics::default()
+        }
     };
-    let response_session_guard = acquire_response_session_guard(
-        &state,
-        &decision.upstream_channel,
-        response_session_key.as_deref(),
-    )
-    .await;
+    let response_session_guard = if foreground_cache_wait_enabled(&config) {
+        acquire_response_session_guard(
+            &state,
+            &decision.upstream_channel,
+            response_session_key.as_deref(),
+        )
+        .await
+    } else {
+        None
+    };
     let response_session_cooldown_key = response_session_error_cooldown_key(&decision);
     let response_session_cooldown_active =
         response_session_cooldown_active(&state, response_session_cooldown_key.as_deref()).await;
@@ -5392,8 +5409,8 @@ fn supports_main_response_session_delta(decision: &RouteDecision) -> bool {
     matches!(decision.upstream_channel, Channel::Responses)
 }
 
-fn main_response_session_delta_enabled_for_agent(forced_agent_id: Option<&str>) -> bool {
-    forced_agent_id != Some("codex")
+fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>) -> bool {
+    true
 }
 
 fn response_session_delta_is_beneficial(
@@ -6171,6 +6188,22 @@ fn truncate_log_message(message: &str) -> String {
     }
 }
 
+fn is_agent_generation_request(authorized_agent_id: Option<&str>) -> bool {
+    authorized_agent_id.is_some()
+}
+
+fn local_response_cache_eligible(
+    config: &AppConfig,
+    no_store: bool,
+    client_request: &Value,
+    authorized_agent_id: Option<&str>,
+) -> bool {
+    config.cache.enabled
+        && !no_store
+        && !is_agent_generation_request(authorized_agent_id)
+        && cache::is_cache_eligible(client_request)
+}
+
 fn local_session_keys_enabled(config: &AppConfig) -> bool {
     smart_hit_enabled(config)
 }
@@ -6186,6 +6219,28 @@ fn smart_hit_enabled(config: &AppConfig) -> bool {
             config.cache.mode,
             CacheMode::SessionPrewarm | CacheMode::PrefixPrewarm
         )
+}
+
+fn foreground_cache_wait_enabled(_config: &AppConfig) -> bool {
+    false
+}
+
+fn provider_prefix_guard_skip_reason(
+    config: &AppConfig,
+    skip_sync_responses_main: bool,
+    authorized_agent_id: Option<&str>,
+) -> Option<&'static str> {
+    if is_agent_generation_request(authorized_agent_id) {
+        Some("agent_request")
+    } else if skip_sync_responses_main {
+        Some("sync_responses_main")
+    } else if !smart_hit_enabled(config) {
+        Some("smart_hit_disabled")
+    } else if !foreground_cache_wait_enabled(config) {
+        Some("fast_forward_no_foreground_cache_wait")
+    } else {
+        None
+    }
 }
 
 fn metrics_cache_key(cache_keys: &[String]) -> String {
@@ -12172,6 +12227,47 @@ mod tests {
         assert!(request.get("stream").is_none());
     }
 
+    #[test]
+    fn agent_generation_bypasses_local_response_replay_cache() {
+        let config = AppConfig::default();
+        let request = json!({
+            "model": "gpt-5.5",
+            "temperature": 0.0,
+            "messages": [{ "role": "user", "content": "hello" }]
+        });
+
+        assert!(local_response_cache_eligible(
+            &config, false, &request, None
+        ));
+        assert!(!local_response_cache_eligible(
+            &config,
+            false,
+            &request,
+            Some("codex")
+        ));
+    }
+
+    #[test]
+    fn agent_generation_skips_prefix_guard_even_when_smart_hit_is_enabled() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, false, None),
+            Some("fast_forward_no_foreground_cache_wait")
+        );
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, false, Some("codex")),
+            Some("agent_request")
+        );
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, true, None),
+            Some("sync_responses_main")
+        );
+    }
+
     #[tokio::test]
     async fn codex_responses_accepts_large_request_bodies() {
         let config_dir = std::env::temp_dir().join(format!(
@@ -12824,6 +12920,21 @@ mod tests {
         assert!(request.get("prompt_cache_retention").is_none());
         assert!(!responses_session_reuse_enabled(&config));
         assert!(!local_session_keys_enabled(&config));
+    }
+
+    #[test]
+    fn smart_hit_mode_keeps_prefix_optimization_but_skips_foreground_wait() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+
+        assert!(smart_hit_enabled(&config));
+        assert!(!foreground_cache_wait_enabled(&config));
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, false, None),
+            Some("fast_forward_no_foreground_cache_wait")
+        );
     }
 
     #[test]
@@ -14526,12 +14637,10 @@ mod tests {
     }
 
     #[test]
-    fn codex_disables_main_response_session_delta() {
+    fn codex_allows_main_response_session_delta() {
         assert!(main_response_session_delta_enabled_for_agent(None));
         assert!(main_response_session_delta_enabled_for_agent(Some("zcode")));
-        assert!(!main_response_session_delta_enabled_for_agent(Some(
-            "codex"
-        )));
+        assert!(main_response_session_delta_enabled_for_agent(Some("codex")));
     }
 
     #[tokio::test]

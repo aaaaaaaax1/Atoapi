@@ -52,6 +52,7 @@ struct InjectionContext {
     local_key: String,
     default_channel: String,
     default_model: String,
+    default_model_is_explicit: bool,
     model_context_window: Option<u32>,
     codex_models: Vec<ModelConfig>,
 }
@@ -386,15 +387,16 @@ impl InjectionContext {
             .and_then(|id| config.providers.iter().find(|provider| provider.id == id))
             .or_else(|| config.providers.iter().find(|provider| provider.enabled));
         let configured_model_id = item.and_then(|item| item.model_id.as_deref());
-        let model_config = provider.and_then(|provider| {
-            configured_model_id
-                .and_then(|model_id| {
-                    provider
-                        .models
-                        .iter()
-                        .find(|model| injection_model_matches(model, model_id))
-                })
-                .or_else(|| provider.models.iter().find(|model| model.enabled))
+        let explicit_model_config = provider.and_then(|provider| {
+            configured_model_id.and_then(|model_id| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| injection_model_matches(model, model_id))
+            })
+        });
+        let model_config = explicit_model_config.or_else(|| {
+            provider.and_then(|provider| provider.models.iter().find(|model| model.enabled))
         });
         let model = model_config
             .map(|model| model.id.clone())
@@ -423,6 +425,7 @@ impl InjectionContext {
                 .unwrap_or_else(|| config.local_key.clone()),
             default_channel: config.default_channel.label().to_string(),
             default_model: agent_model,
+            default_model_is_explicit: explicit_model_config.is_some(),
             model_context_window: model_config.and_then(|model| model.context_window),
             codex_models,
         }
@@ -502,24 +505,26 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     };
 
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
-    doc["model"] = value(context.default_model.as_str());
     doc["disable_response_storage"] = value(true);
     let model_catalog_path = write_codex_model_catalog(path, context)?;
     doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
-    if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
-        doc["model_context_window"] = value(i64::from(context_window));
-    } else {
-        doc.as_table_mut().remove("model_context_window");
-    }
-    if let Some(reasoning_effort) = context
-        .codex_models
-        .iter()
-        .find(|model| injection_model_matches(model, &context.default_model))
-        .filter(|model| model.reasoning_effort_override_enabled)
-        .and_then(|model| model.reasoning_effort.as_deref())
-        .and_then(crate::config::normalize_reasoning_effort)
-    {
-        doc["model_reasoning_effort"] = value(reasoning_effort);
+    if context.default_model_is_explicit {
+        doc["model"] = value(context.default_model.as_str());
+        if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
+            doc["model_context_window"] = value(i64::from(context_window));
+        } else {
+            doc.as_table_mut().remove("model_context_window");
+        }
+        if let Some(reasoning_effort) = context
+            .codex_models
+            .iter()
+            .find(|model| injection_model_matches(model, &context.default_model))
+            .filter(|model| model.reasoning_effort_override_enabled)
+            .and_then(|model| model.reasoning_effort.as_deref())
+            .and_then(crate::config::normalize_reasoning_effort)
+        {
+            doc["model_reasoning_effort"] = value(reasoning_effort);
+        }
     }
 
     if !doc.as_table().contains_key("model_providers") {
@@ -1235,6 +1240,7 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            default_model_is_explicit: true,
             model_context_window: Some(128_000),
             codex_models: vec![ModelConfig {
                 id: "vendor/gpt-custom".to_string(),
@@ -1365,6 +1371,95 @@ command = "npx"
     }
 
     #[test]
+    fn codex_injection_without_selected_model_preserves_existing_model_choice() {
+        let mut config = AppConfig::default();
+        config.providers.push(ProviderConfig {
+            id: "torch".to_string(),
+            name: "torch".to_string(),
+            base_url: "https://torch.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: crate::config::Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: vec![ModelConfig {
+                id: "gpt-5.2".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.2".to_string(),
+                context_window: Some(400_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+        {
+            let codex = config
+                .agent_injections
+                .iter_mut()
+                .find(|item| item.id == "codex")
+                .unwrap();
+            codex.provider_id = Some("torch".to_string());
+            codex.model_id = None;
+        }
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == "codex")
+            .unwrap();
+        let context = InjectionContext::from_config(&config, Some(codex));
+        assert!(!context.default_model_is_explicit);
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-preserve-model-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        write_text(
+            &path,
+            r#"model = "gpt-5.5"
+model_reasoning_effort = "ultra"
+model_context_window = 888000
+"#,
+        )
+        .unwrap();
+
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.5")
+        );
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("ultra")
+        );
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(888_000)
+        );
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some(CODEX_PROVIDER_ID)
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn proxy_mode_profile_contains_both_base_urls() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-mode-inject-{}",
@@ -1378,6 +1473,7 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            default_model_is_explicit: true,
             model_context_window: Some(128_000),
             codex_models: Vec::new(),
         };
@@ -1763,6 +1859,7 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "anthropic".to_string(),
             default_model: "gpt-test".to_string(),
+            default_model_is_explicit: true,
             model_context_window: Some(128_000),
             codex_models: Vec::new(),
         };
@@ -1898,6 +1995,7 @@ command = "npx"
             local_key: "ato-test".to_string(),
             default_channel: "responses".to_string(),
             default_model: "gpt-test".to_string(),
+            default_model_is_explicit: true,
             model_context_window: Some(128_000),
             codex_models: Vec::new(),
         }

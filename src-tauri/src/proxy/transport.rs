@@ -44,9 +44,10 @@ fn build_client(user_agent: &str, path: NetworkPath) -> Result<reqwest::Client> 
         .http2_keep_alive_timeout(Duration::from_secs(10))
         .http2_keep_alive_while_idle(true);
     let builder = match path {
-        // CCSwitch's stable direct adapter is HTTP/1.1-only. Keep this policy
-        // explicit here so it cannot leak into the system-proxy adapter.
-        NetworkPath::Direct => builder.no_proxy().http1_only(),
+        // Direct traffic should keep reqwest's protocol negotiation. Forcing
+        // HTTP/1.1 here makes streaming requests pay extra latency on
+        // providers that support HTTP/2 multiplexing.
+        NetworkPath::Direct => builder.no_proxy(),
         NetworkPath::SystemProxy => builder,
     };
     Ok(builder.build()?)

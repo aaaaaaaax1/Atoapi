@@ -119,7 +119,7 @@ pub async fn save_config(
     config.workspace_fingerprint = input.workspace_fingerprint;
     if let Some(cache) = input.cache {
         config.cache = cache;
-        config.cache.normalize_smart_max_hit();
+        config.cache.normalize_fast_forwarding_hit_policy();
     }
     config.updated_at = Utc::now();
     config.save(&state.config_path).map_err(to_command_error)?;
@@ -919,7 +919,7 @@ pub async fn save_cache_policy(
     mut input: CacheConfig,
 ) -> CommandResult<PublicConfig> {
     let mut config = state.config.write().await;
-    input.normalize_smart_max_hit();
+    input.normalize_fast_forwarding_hit_policy();
     config.cache = input;
     config.updated_at = Utc::now();
     config.save(&state.config_path).map_err(to_command_error)?;
