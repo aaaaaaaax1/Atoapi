@@ -13,6 +13,7 @@ const RECENT_USAGE_WINDOW_SECONDS: u64 = 30 * 60;
 pub struct MetricsSnapshot {
     pub started_at: DateTime<Utc>,
     pub total_requests: u64,
+    pub successful_requests: u64,
     pub upstream_requests: u64,
     pub response_cache_hits: u64,
     pub semantic_cache_hits: u64,
@@ -144,6 +145,7 @@ pub struct LocalProxyStats {
 pub struct ProviderTrafficStats {
     pub provider: String,
     pub total_requests: u64,
+    pub successful_requests: u64,
     pub upstream_requests: u64,
     pub cache_hits: u64,
     pub exact_hits: u64,
@@ -422,6 +424,7 @@ pub struct ErrorLog {
 struct MetricsInner {
     started_at: DateTime<Utc>,
     total_requests: u64,
+    successful_requests: u64,
     upstream_requests: u64,
     response_cache_hits: u64,
     semantic_cache_hits: u64,
@@ -477,6 +480,7 @@ struct TimedUsageRecord {
 struct ProviderTrafficAccumulator {
     provider: String,
     total_requests: u64,
+    successful_requests: u64,
     upstream_requests: u64,
     cache_hits: u64,
     exact_hits: u64,
@@ -534,6 +538,7 @@ impl MetricsStore {
             inner: Arc::new(RwLock::new(MetricsInner {
                 started_at: Utc::now(),
                 total_requests: 0,
+                successful_requests: 0,
                 upstream_requests: 0,
                 response_cache_hits: 0,
                 semantic_cache_hits: 0,
@@ -579,6 +584,9 @@ impl MetricsStore {
     pub async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
         inner.total_requests += 1;
+        if request_log_is_successful_history(&log) {
+            inner.successful_requests += 1;
+        }
         if upstream {
             inner.upstream_requests += 1;
         }
@@ -628,6 +636,9 @@ impl MetricsStore {
     pub async fn record_upstream_observation(&self, log: RequestLog) {
         let mut inner = self.inner.write().await;
         inner.total_requests += 1;
+        if request_log_is_successful_history(&log) {
+            inner.successful_requests += 1;
+        }
         inner.upstream_requests += 1;
         push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
         push_limited(&mut inner.total_samples, log.total_ms, 512);
@@ -714,6 +725,7 @@ impl MetricsStore {
         MetricsSnapshot {
             started_at: inner.started_at,
             total_requests: inner.total_requests,
+            successful_requests: inner.successful_requests,
             upstream_requests: inner.upstream_requests,
             response_cache_hits: inner.response_cache_hits,
             semantic_cache_hits: inner.semantic_cache_hits,
@@ -773,6 +785,7 @@ impl ProviderTrafficAccumulator {
         ProviderTrafficStats {
             provider: self.provider.clone(),
             total_requests: self.total_requests,
+            successful_requests: self.successful_requests,
             upstream_requests: self.upstream_requests,
             cache_hits: self.cache_hits,
             exact_hits: self.exact_hits,
@@ -892,6 +905,9 @@ fn upsert_provider_traffic(
         });
     let group = &mut groups[index];
     group.total_requests += 1;
+    if request_log_is_successful_history(log) {
+        group.successful_requests += 1;
+    }
     if upstream {
         group.upstream_requests += 1;
     }
@@ -1387,6 +1403,7 @@ mod tests {
 
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.successful_requests, 1);
         assert_eq!(snapshot.upstream_requests, 2);
         assert_eq!(snapshot.recent_upstream_calls.len(), 1);
         assert_eq!(snapshot.recent_requests.len(), 1);
@@ -1394,6 +1411,8 @@ mod tests {
         assert_eq!(snapshot.recent_upstream_calls[0].status, 200);
         assert_eq!(snapshot.recent_requests[0].status, 200);
         assert_eq!(snapshot.recent_failed_requests[0].status, 503);
+        assert_eq!(snapshot.provider_stats[0].successful_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].error_statuses, 1);
     }
 
     #[tokio::test]

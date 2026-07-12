@@ -12,9 +12,10 @@ use crate::{
     codex_ui_patch,
     config::{
         AgentInjectionConfig, AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput,
-        PublicConfig,
+        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus, PublicConfig,
     },
     metrics::MetricsSnapshot,
+    proxy,
     state::{AppState, ProxyStatus},
 };
 
@@ -85,6 +86,12 @@ pub struct ProviderKeyTestResult {
     pub ok: bool,
     pub message: String,
     pub models_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderResponseSessionReuseProbeInput {
+    pub provider_id: String,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,6 +420,93 @@ pub async fn add_or_update_provider(
 }
 
 #[tauri::command]
+pub async fn probe_provider_response_session_reuse(
+    state: State<'_, Arc<AppState>>,
+    input: ProviderResponseSessionReuseProbeInput,
+) -> CommandResult<ProviderResponseSessionReuseProbeResult> {
+    let provider_id = input.provider_id.trim();
+    let model_id = input.model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err("provider and actual upstream model are required for verification".to_string());
+    }
+    let (probe_target, probe_record_snapshot) = {
+        let config = state.config.read().await;
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == provider_id)
+        {
+            return Err(format!("provider {provider_id} was not found"));
+        }
+        (
+            config
+                .response_session_reuse_probe_target(provider_id)
+                .ok_or_else(|| format!("provider {provider_id} was not found"))?,
+            config.response_session_reuse_record_snapshot(provider_id, model_id),
+        )
+    };
+
+    let mut result =
+        match proxy::probe_provider_response_session_reuse(&state, provider_id, model_id).await {
+            Ok(result) => result,
+            Err(err) => ProviderResponseSessionReuseProbeResult {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+                status: ProviderResponseSessionReuseStatus::Error,
+                enabled: false,
+                message: err.to_string(),
+                checked_at: Some(Utc::now()),
+                first_status: None,
+                continuation_status: None,
+            },
+        };
+
+    {
+        let mut config = state.config.write().await;
+        if config
+            .response_session_reuse_probe_target(provider_id)
+            .as_ref()
+            != Some(&probe_target)
+            || config.response_session_reuse_record_snapshot(provider_id, model_id)
+                != probe_record_snapshot
+        {
+            result.status = ProviderResponseSessionReuseStatus::Error;
+            result.enabled = false;
+            result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
+                .to_string();
+            result.checked_at = Some(Utc::now());
+            return Ok(result);
+        }
+        config.record_response_session_reuse_probe(
+            provider_id,
+            model_id,
+            result.status.clone(),
+            (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
+                .then(|| result.message.clone()),
+        );
+        config.save(&state.config_path).map_err(to_command_error)?;
+    }
+    result.checked_at = Some(Utc::now());
+    Ok(result)
+}
+
+#[tauri::command]
+pub async fn set_provider_response_session_reuse_enabled(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+    model_id: String,
+    enabled: bool,
+) -> CommandResult<PublicConfig> {
+    let mut config = state.config.write().await;
+    config
+        .set_response_session_reuse_enabled(provider_id.trim(), model_id.trim(), enabled)
+        .map_err(to_command_error)?;
+    config.save(&state.config_path).map_err(to_command_error)?;
+    drop(config);
+    Ok(state.public_config().await)
+}
+
+#[tauri::command]
 pub async fn delete_provider(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
@@ -544,6 +638,9 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
         .retain(|item| item.provider_id != provider_id);
     config
         .provider_channel_modes
+        .retain(|item| item.provider_id != provider_id);
+    config
+        .provider_response_session_reuse
         .retain(|item| item.provider_id != provider_id);
     for agent in &mut config.agent_injections {
         agent
@@ -875,13 +972,16 @@ pub async fn delete_model(
     model_id: String,
 ) -> CommandResult<PublicConfig> {
     let mut config = state.config.write().await;
-    let provider = config
-        .providers
-        .iter_mut()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| format!("provider {provider_id} was not found"))?;
-    provider.models.retain(|model| model.id != model_id);
-    provider.updated_at = Utc::now();
+    {
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| format!("provider {provider_id} was not found"))?;
+        provider.models.retain(|model| model.id != model_id);
+        provider.updated_at = Utc::now();
+    }
+    config.clear_response_session_reuse_for_model(&provider_id, &model_id);
     config.updated_at = Utc::now();
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);

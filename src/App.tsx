@@ -48,6 +48,7 @@ import {
   ProviderInput,
   ProviderKeyStatus,
   ProviderKeyTestResult,
+  ProviderResponseSessionReuseProbeResult,
   ProxyModeConfigInput
 } from "./lib/api";
 
@@ -156,9 +157,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.98";
+const appVersion = "v0.1.99";
 const appVersionNotes = [
-  "v0.1.98: 优化流式 relay 首 chunk 转发；第三方 Responses 默认跳过不兼容的 previous_response_id 复用，避免 400 后重复完整请求；保留第三方 prompt_cache_retention 独立启用。",
+  "v0.1.99: 第三方 Responses 仅在手动兼容性验证通过后启用会话增量复用；Agent 请求严格一次入站、一次上游，避免 Key 切换、协议回退或完整上下文补发拖慢首字。",
   "v0.1.97: 修正请求数统计口径，一条入站请求只计一次；修复压缩后会话续接丢锚点；优化请求记录两行指标与命中详情布局。",
   "v0.1.96: 修复请求历史与上游调用记录口径不一致导致的漏显示，并将请求记录改回紧凑的一行式列表。",
   "v0.1.95: Codex 主会话 delta 复用不再被硬关闭，进入安全判断与上游拒绝回退链路。",
@@ -202,6 +203,7 @@ export default function App() {
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
   const [savingProvider, setSavingProvider] = useState(false);
+  const [probingSessionReuse, setProbingSessionReuse] = useState("");
   const [savingCachePolicy, setSavingCachePolicy] = useState(false);
   const [savingProxyModeConfig, setSavingProxyModeConfig] = useState(false);
   const [proxyModeDraft, setProxyModeDraft] = useState<ProxyModeDraft>({ host: "127.0.0.1", port: "18884" });
@@ -432,6 +434,71 @@ export default function App() {
       setError(String(err));
     } finally {
       setLoadingModels(false);
+    }
+  }
+
+  async function probeResponseSessionReuse(modelId: string) {
+    const providerId = draft.id?.trim();
+    const actualModelId = modelId.trim();
+    if (!providerId) {
+      setError("请先保存上游，再验证会话复用");
+      return;
+    }
+    if (!actualModelId) {
+      setError("请填写实际发送给上游的模型 ID");
+      return;
+    }
+    const probeKey = `${providerId}:${actualModelId}`;
+    setProbingSessionReuse(probeKey);
+    setError("");
+    setNotice("");
+    try {
+      const result = await command<ProviderResponseSessionReuseProbeResult>(
+        "probe_provider_response_session_reuse",
+        {
+          input: {
+            provider_id: providerId,
+            model_id: actualModelId
+          }
+        }
+      );
+      const nextConfig = await command<AppConfig>("get_config");
+      setConfig(nextConfig);
+      setNotice(
+        result.status === "verified"
+          ? `${actualModelId} 已验证并启用会话增量复用`
+          : `${actualModelId} 未启用会话复用：${result.message}`
+      );
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setProbingSessionReuse("");
+    }
+  }
+
+  async function setResponseSessionReuseEnabled(modelId: string, enabled: boolean) {
+    const providerId = draft.id?.trim();
+    if (!providerId || !modelId.trim()) return;
+    const settingKey = `${providerId}:${modelId}`;
+    setProbingSessionReuse(settingKey);
+    setError("");
+    try {
+      const nextConfig = await command<AppConfig>(
+        "set_provider_response_session_reuse_enabled",
+        {
+          providerId,
+          provider_id: providerId,
+          modelId: modelId,
+          model_id: modelId,
+          enabled
+        }
+      );
+      setConfig(nextConfig);
+      setNotice(enabled ? `${modelId} 会话增量复用已开启` : `${modelId} 会话增量复用已关闭`);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setProbingSessionReuse("");
     }
   }
 
@@ -933,6 +1000,7 @@ export default function App() {
           apiKeyVisible={apiKeyVisible}
           loadingModels={loadingModels}
           savingProvider={savingProvider}
+          probingSessionReuse={probingSessionReuse}
           modelCandidates={modelCandidates}
           selectedFetchedModelId={selectedFetchedModelId}
           onDraftChange={setDraft}
@@ -943,6 +1011,10 @@ export default function App() {
           onAddManualModel={addManualModel}
           onUpdateModel={updateModel}
           onRemoveModel={removeModel}
+          onProbeSessionReuse={(modelId) => void probeResponseSessionReuse(modelId)}
+          onSetSessionReuseEnabled={(modelId, enabled) =>
+            void setResponseSessionReuseEnabled(modelId, enabled)
+          }
           onSave={() => void saveProvider()}
           onDelete={() => {
             const provider = config?.providers.find((item) => item.id === draft.id);
@@ -1361,6 +1433,7 @@ function ProviderEditorModal({
   apiKeyVisible,
   loadingModels,
   savingProvider,
+  probingSessionReuse,
   modelCandidates,
   selectedFetchedModelId,
   onDraftChange,
@@ -1371,6 +1444,8 @@ function ProviderEditorModal({
   onAddManualModel,
   onUpdateModel,
   onRemoveModel,
+  onProbeSessionReuse,
+  onSetSessionReuseEnabled,
   onSave,
   onDelete,
   onClose
@@ -1381,6 +1456,7 @@ function ProviderEditorModal({
   apiKeyVisible: boolean;
   loadingModels: boolean;
   savingProvider: boolean;
+  probingSessionReuse: string;
   modelCandidates: ModelConfig[];
   selectedFetchedModelId: string;
   onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
@@ -1391,6 +1467,8 @@ function ProviderEditorModal({
   onAddManualModel: () => void;
   onUpdateModel: (index: number, patch: Partial<ModelConfig>) => void;
   onRemoveModel: (index: number) => void;
+  onProbeSessionReuse: (modelId: string) => void;
+  onSetSessionReuseEnabled: (modelId: string, enabled: boolean) => void;
   onSave: () => void;
   onDelete: () => void;
   onClose: () => void;
@@ -1421,6 +1499,7 @@ function ProviderEditorModal({
             apiKeyVisible={apiKeyVisible}
             loadingModels={loadingModels}
             savingProvider={savingProvider}
+            probingSessionReuse={probingSessionReuse}
             modelCandidates={modelCandidates}
             selectedFetchedModelId={selectedFetchedModelId}
             onDraftChange={onDraftChange}
@@ -1431,6 +1510,8 @@ function ProviderEditorModal({
             onAddManualModel={onAddManualModel}
             onUpdateModel={onUpdateModel}
             onRemoveModel={onRemoveModel}
+            onProbeSessionReuse={onProbeSessionReuse}
+            onSetSessionReuseEnabled={onSetSessionReuseEnabled}
             onSave={onSave}
             onDelete={onDelete}
           />
@@ -1447,6 +1528,7 @@ function ProviderPanel({
   apiKeyVisible,
   loadingModels,
   savingProvider,
+  probingSessionReuse,
   modelCandidates,
   selectedFetchedModelId,
   onDraftChange,
@@ -1457,6 +1539,8 @@ function ProviderPanel({
   onAddManualModel,
   onUpdateModel,
   onRemoveModel,
+  onProbeSessionReuse,
+  onSetSessionReuseEnabled,
   onSave,
   onDelete
 }: {
@@ -1466,6 +1550,7 @@ function ProviderPanel({
   apiKeyVisible: boolean;
   loadingModels: boolean;
   savingProvider: boolean;
+  probingSessionReuse: string;
   modelCandidates: ModelConfig[];
   selectedFetchedModelId: string;
   onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
@@ -1476,12 +1561,17 @@ function ProviderPanel({
   onAddManualModel: () => void;
   onUpdateModel: (index: number, patch: Partial<ModelConfig>) => void;
   onRemoveModel: (index: number) => void;
+  onProbeSessionReuse: (modelId: string) => void;
+  onSetSessionReuseEnabled: (modelId: string, enabled: boolean) => void;
   onSave: () => void;
   onDelete: () => void;
 }) {
   const isActive = Boolean(draft.id && config?.active_provider_id === draft.id);
   const modeValue: "auto" | Channel = draft.channel_mode === "auto" ? "auto" : draft.channel;
   const supportsPromptCacheRetention = draft.channel !== "anthropic";
+  const supportsResponseSessionReuse =
+    draft.channel === "responses" && !isOfficialOpenAiResponsesProvider(draft.base_url);
+  const savedProvider = config?.providers.find((provider) => provider.id === draft.id) ?? null;
   const [contextDrafts, setContextDrafts] = useState<Record<number, string>>({});
 
   function updateMode(value: "auto" | Channel) {
@@ -1628,6 +1718,17 @@ function ProviderPanel({
                 <b>{draft.prompt_cache_retention_enabled ? "开" : "关"}</b>
               </button>
             </div>
+          )}
+
+          {supportsResponseSessionReuse && (
+            <ResponseSessionReuseControl
+              providerId={draft.id}
+              models={draft.models}
+              records={savedProvider?.response_session_reuse_models ?? []}
+              busyKey={probingSessionReuse}
+              onProbe={onProbeSessionReuse}
+              onSetEnabled={onSetSessionReuseEnabled}
+            />
           )}
 
           <div className={draft.request_body_gzip_enabled ? "provider-option-control active" : "provider-option-control"}>
@@ -1842,6 +1943,94 @@ function ProviderPanel({
           )}
         </div>
       </section>
+    </div>
+  );
+}
+
+function ResponseSessionReuseControl({
+  providerId,
+  models,
+  records,
+  busyKey,
+  onProbe,
+  onSetEnabled
+}: {
+  providerId?: string;
+  models: ModelConfig[];
+  records: NonNullable<ProviderConfig["response_session_reuse_models"]>;
+  busyKey: string;
+  onProbe: (modelId: string) => void;
+  onSetEnabled: (modelId: string, enabled: boolean) => void;
+}) {
+  const verifiedModel = records.find((item) => item.status === "verified")?.model_id ?? "";
+  const lastCheckedModel = records.find((item) => item.status !== "unverified")?.model_id ?? "";
+  const mappedModel = models.find((item) => item.enabled)?.id ?? "";
+  const [modelId, setModelId] = useState(verifiedModel || lastCheckedModel || mappedModel);
+
+  useEffect(() => {
+    setModelId(verifiedModel || lastCheckedModel || mappedModel);
+  }, [providerId, verifiedModel, lastCheckedModel, mappedModel]);
+
+  const record = records.find((item) => item.model_id === modelId) ?? null;
+  const status = record?.status ?? "unverified";
+  const statusLabel =
+    !providerId
+      ? "保存后可验证"
+      : status === "verified"
+        ? record?.enabled ? "已验证 · 已启用" : "已验证 · 已关闭"
+        : status === "unsupported"
+          ? "上游不支持"
+          : status === "error"
+            ? "验证失败"
+            : "未验证";
+  const busy = Boolean(providerId && modelId && busyKey === `${providerId}:${modelId}`);
+  const canToggle = status === "verified" && Boolean(record);
+  const message =
+    record?.last_error ??
+    "验证会发送两条极小的管理请求，不使用 Agent 对话内容；只有验证成功后才会对该模型发送 previous_response_id 增量。";
+
+  return (
+    <div className={`provider-session-reuse ${status}`}>
+      <div className="provider-session-reuse-copy">
+        <div className="provider-session-reuse-title">
+          <ShieldCheck size={16} />
+          <span>Responses 会话复用</span>
+          <small>{statusLabel}</small>
+        </div>
+        <p>{message}</p>
+      </div>
+      <div className="provider-session-reuse-actions">
+        <input
+          value={modelId}
+          disabled={!providerId || busy}
+          onChange={(event) => setModelId(event.target.value)}
+          placeholder="实际上游模型 ID"
+          title="验证范围只覆盖这个实际上游模型"
+        />
+        <button
+          className="soft-button session-reuse-probe"
+          type="button"
+          onClick={() => {
+            const actualModelId = modelId.trim();
+            if (!actualModelId) return;
+            setModelId(actualModelId);
+            onProbe(actualModelId);
+          }}
+          disabled={!providerId || !modelId.trim() || busy}
+        >
+          {busy ? <Loader2 className="spin" size={15} /> : <ShieldCheck size={15} />}
+          {status === "verified" ? "重新验证" : "验证并启用"}
+        </button>
+        <button
+          className={record?.enabled ? "mini-toggle on" : "mini-toggle"}
+          type="button"
+          onClick={() => record && onSetEnabled(record.model_id, !record.enabled)}
+          disabled={!canToggle || busy}
+          title={canToggle ? "验证通过后可随时关闭或重新开启" : "需先完成兼容性验证"}
+        >
+          <span />
+        </button>
+      </div>
     </div>
   );
 }
@@ -2235,9 +2424,14 @@ function CachePanel({
     : usage?.cold_start_requests ?? traffic?.cold_start_requests ?? 0;
   const coldStartScopeLabel = selectedProvider === "all" ? "全部上游冷启动" : "当前上游冷启动";
   const recentColdStartRequests = recentUsage?.cold_start_requests ?? 0;
-  const totalRequests = selectedProvider === "all"
+  const observedTotalRequests = selectedProvider === "all"
     ? metrics?.total_requests ?? 0
     : traffic?.total_requests ?? selectedUsageRequests(usage) ?? 0;
+  const successfulRequests = selectedProvider === "all"
+    ? metrics?.successful_requests ?? metrics?.usage.by_provider.reduce((total, group) => total + group.requests, 0) ?? 0
+    : traffic?.successful_requests ?? selectedUsageRequests(usage) ?? 0;
+  const errorRequests = Math.max(0, observedTotalRequests - successfulRequests);
+  const totalRequests = successfulRequests;
   const cacheRatio = inputTokens > 0 ? cacheReadTokens / inputTokens : 0;
   const activeCacheRatio = recentInputTokens > 0 ? recentCacheRatio : cacheRatio;
   const successfulRequestFeed = buildSuccessfulRequestFeed(
@@ -2387,6 +2581,7 @@ function CachePanel({
             <UsageStatCard
               title="历史请求数"
               value={formatNumber(totalRequests)}
+              errorCount={errorRequests}
               rows={[
                 { label: "单次平均", value: formatCompactTokens(totalRequests ? Math.round(totalTokens / totalRequests) : 0), detail: "tokens" },
                 { label: "平均输入", value: formatCompactTokens(totalRequests ? Math.round(inputTokens / totalRequests) : 0), detail: percent(inputTokens > 0 ? cacheRatio : 0) },
@@ -2739,18 +2934,23 @@ function Summary({ label, value, tone }: { label: string; value: string; tone?: 
 function UsageStatCard({
   title,
   value,
-  rows
+  rows,
+  errorCount = 0
 }: {
   title: string;
   value: string;
   rows: Array<{ label: string; value: string; detail?: string }>;
+  errorCount?: number;
 }) {
   return (
     <div className="usage-stat-card">
       <div className="usage-stat-head">
         <span>{title}</span>
       </div>
-      <strong>{value}</strong>
+      <div className="usage-stat-value">
+        <strong>{value}</strong>
+        {errorCount > 0 ? <small className="usage-stat-error">error {errorCount}</small> : null}
+      </div>
       <div className="usage-stat-rule" />
       <div className="usage-stat-rows">
         {rows.map((row) => (
@@ -2927,6 +3127,14 @@ function providerKeyPoolInput(pool: ProviderKeyPoolDraft) {
       disabled_until: key.disabled_until ?? null
     }))
   };
+}
+
+function isOfficialOpenAiResponsesProvider(baseUrl: string) {
+  try {
+    return new URL(baseUrl.trim()).hostname.toLowerCase() === "api.openai.com";
+  } catch {
+    return false;
+  }
 }
 
 function newProviderKeyDraft(key: string): ProviderKeyDraft {
@@ -3352,16 +3560,7 @@ function formatDurationMs(value?: number | null) {
 
 function formatReasoningEffort(value?: string | null) {
   const normalized = value?.trim().toLowerCase();
-  if (!normalized) return "默认";
-  const labels: Record<string, string> = {
-    none: "无",
-    minimal: "极低",
-    low: "低",
-    medium: "中",
-    high: "高",
-    xhigh: "极高"
-  };
-  return labels[normalized] ?? normalized;
+  return normalized || "-";
 }
 
 function visiblePages(current: number, total: number): Array<number | "ellipsis"> {

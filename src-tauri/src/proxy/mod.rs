@@ -5,6 +5,7 @@ use crate::{
         codex_model_alias, codex_model_display_name, model_request_alias,
         normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
         AgentInjectionKind, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
+        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus,
         SelectedProviderKey,
     },
     metrics::{RequestLog, UsageRecord},
@@ -1143,6 +1144,10 @@ async fn handle_generation_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
+    // Agent calls must preserve their retry semantics at the client boundary:
+    // one inbound turn gets one generation attempt upstream. The client can
+    // decide whether to issue another turn after seeing the original error.
+    let allow_automatic_upstream_retry = !is_agent_generation_request(authorized_agent.as_deref());
 
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -1722,109 +1727,123 @@ async fn handle_generation_for_agent(
     let mut is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
-    if let Some(next_key) = try_retry_with_next_provider_key(
-        &state,
-        &decision.provider.id,
-        &selected_provider_key,
-        status,
-        provider_prefix_control_key.as_deref(),
-    )
-    .await
-    {
-        record_upstream_response_observation(
+    // A verified third-party delta is deliberately a one-shot request. Do
+    // not turn an upstream rejection into a second generation attempt with a
+    // different key, a full body, or another protocol.  The manual probe is
+    // the only allowed multi-request operation for this capability.
+    let verified_third_party_delta_in_flight = active_used_response_session
+        && is_verified_third_party_response_session_reuse(&config, &decision);
+    if allow_automatic_upstream_retry && !verified_third_party_delta_in_flight {
+        if let Some(next_key) = try_retry_with_next_provider_key(
             &state,
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            &active_upstream_body,
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            current_non_stream_upstream_call_source(
-                skip_prefix_guard_for_sync_responses,
-                active_responses_non_stream_chat_compat,
-                responses_sync_main_chat_compat_fallback,
-            ),
+            &decision.provider.id,
+            &selected_provider_key,
             status,
-            &current_send_diagnostics,
-            agent_log_id.clone(),
-            agent_log_label.clone(),
-        )
-        .await;
-        state.metrics.record_retry().await;
-        selected_provider_key = next_key;
-        api_key = selected_provider_key.secret.clone();
-        let send_outcome = match send_main_upstream_request(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            skip_prefix_guard_for_sync_responses,
-            decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-            !client_requested_stream,
+            provider_prefix_control_key.as_deref(),
         )
         .await
         {
-            Ok(response) => response,
-            Err(err) => {
-                record_upstream_transport_failure(
-                    &state,
-                    &request_id,
-                    &started,
-                    &client_channel,
-                    &active_request_channel,
-                    &decision,
-                    eligible.then_some(metrics_cache_key.as_str()),
-                    provider_prefix_key.as_deref(),
-                    provider_prefix_fingerprint.as_deref(),
-                    &prefix_guard_wait,
-                    local_prepare_ms,
-                    &diagnostics,
-                    &active_upstream_body,
-                    active_used_response_session,
-                    &response_session_reuse_diagnostics,
-                    requested_model_for_log.clone(),
-                    "provider-key-failover-transport",
-                )
-                .await;
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
+            record_upstream_response_observation(
+                &state,
+                &request_id,
+                &started,
+                &client_channel,
+                &active_request_channel,
+                &decision,
+                eligible.then_some(metrics_cache_key.as_str()),
+                provider_prefix_key.as_deref(),
+                provider_prefix_fingerprint.as_deref(),
+                &prefix_guard_wait,
+                local_prepare_ms,
+                &diagnostics,
+                &active_upstream_body,
+                active_used_response_session,
+                &response_session_reuse_diagnostics,
+                requested_model_for_log.clone(),
+                current_non_stream_upstream_call_source(
+                    skip_prefix_guard_for_sync_responses,
+                    active_responses_non_stream_chat_compat,
+                    responses_sync_main_chat_compat_fallback,
+                ),
+                status,
+                &current_send_diagnostics,
+                agent_log_id.clone(),
+                agent_log_label.clone(),
+            )
+            .await;
+            state.metrics.record_retry().await;
+            selected_provider_key = next_key;
+            api_key = selected_provider_key.secret.clone();
+            let send_outcome = match send_main_upstream_request(
+                &state,
+                decision.provider.use_system_proxy,
+                &active_url,
+                &api_key,
+                &active_request_channel,
+                &active_upstream_body,
+                &headers,
+                decision.provider.custom_user_agent.as_deref(),
+                skip_prefix_guard_for_sync_responses,
+                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+                !client_requested_stream,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    record_upstream_transport_failure(
+                        &state,
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &active_request_channel,
+                        &decision,
+                        eligible.then_some(metrics_cache_key.as_str()),
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
+                        "provider-key-failover-transport",
+                    )
                     .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream request failed after key failover: {err}"),
-                );
-            }
-        };
-        current_send_diagnostics = send_outcome.diagnostics.clone();
-        upstream_request_diagnostics.absorb(&current_send_diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        is_success_status = StatusCode::from_u16(status)
-            .map(|status| status.is_success())
-            .unwrap_or(false);
+                    state
+                        .metrics
+                        .record_error("upstream_transport", &err.to_string())
+                        .await;
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("upstream request failed after key failover: {err}"),
+                    );
+                }
+            };
+            current_send_diagnostics = send_outcome.diagnostics.clone();
+            upstream_request_diagnostics.absorb(&current_send_diagnostics);
+            upstream = send_outcome.response;
+            upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+            status = upstream.status().as_u16();
+            content_type = upstream
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            is_success_status = StatusCode::from_u16(status)
+                .map(|status| status.is_success())
+                .unwrap_or(false);
+        }
     }
-    if should_retry_full_response_after_session_error(status, used_response_session) {
+    let allow_full_session_retry =
+        allow_automatic_upstream_retry && !verified_third_party_delta_in_flight;
+    if should_retry_full_response_after_session_error(
+        status,
+        used_response_session,
+        allow_full_session_retry,
+    ) {
         record_upstream_response_observation(
             &state,
             &request_id,
@@ -1976,7 +1995,9 @@ async fn handle_generation_for_agent(
         status,
         responses_main_retry_guard,
         responses_non_stream_chat_compat,
-    ) {
+    ) && allow_automatic_upstream_retry
+        && !verified_third_party_delta_in_flight
+    {
         record_upstream_response_observation(
             &state,
             &request_id,
@@ -2071,7 +2092,8 @@ async fn handle_generation_for_agent(
             .map(|status| status.is_success())
             .unwrap_or(false);
     }
-    if !responses_sync_main_chat_compat_fallback
+    if allow_automatic_upstream_retry
+        && !responses_sync_main_chat_compat_fallback
         && should_fallback_chat_compat_compact_to_responses(
             status,
             skip_prefix_guard_for_sync_responses,
@@ -2190,13 +2212,15 @@ async fn handle_generation_for_agent(
             .map(|status| status.is_success())
             .unwrap_or(false);
     }
-    if should_attempt_response_session_rescue_after_413(
-        status,
-        active_used_response_session,
-        active_responses_non_stream_chat_compat,
-        &decision.upstream_channel,
-        response_session_cooldown_active,
-    ) {
+    if allow_automatic_upstream_retry
+        && should_attempt_response_session_rescue_after_413(
+            status,
+            active_used_response_session,
+            active_responses_non_stream_chat_compat,
+            &decision.upstream_channel,
+            response_session_cooldown_active,
+        )
+    {
         record_upstream_response_observation(
             &state,
             &request_id,
@@ -2309,8 +2333,11 @@ async fn handle_generation_for_agent(
             is_success_status = StatusCode::from_u16(status)
                 .map(|status| status.is_success())
                 .unwrap_or(false);
-            if should_retry_full_response_after_session_error(status, active_used_response_session)
-            {
+            if should_retry_full_response_after_session_error(
+                status,
+                active_used_response_session,
+                allow_full_session_retry,
+            ) {
                 record_upstream_response_observation(
                     &state,
                     &request_id,
@@ -2513,13 +2540,53 @@ async fn handle_generation_for_agent(
         }
     };
     let mut bytes = body_read.bytes;
+    let automatic_verified_third_party_delta = active_used_response_session
+        && is_verified_third_party_response_session_reuse(&config, &decision);
     if !is_success_status
         && matches!(active_request_channel, Channel::Responses)
         && active_upstream_body.get("previous_response_id").is_some()
     {
         let error_summary = upstream_error_summary(&bytes);
-        if response_session_rejection_classification(status, &error_summary)
-            == ResponseSessionRejectionClass::Unsupported
+        let rejection = response_session_rejection_classification(status, &error_summary);
+        if automatic_verified_third_party_delta {
+            response_session_reuse_diagnostics.rejected_status = Some(status);
+            if !error_summary.is_empty() {
+                state
+                    .metrics
+                    .record_error("verified_response_session_delta_rejected", &error_summary)
+                    .await;
+            }
+            note_response_session_error_cooldown_for_rejection(
+                &state,
+                response_session_cooldown_key.as_deref(),
+                status,
+                &error_summary,
+            )
+            .await;
+            if matches!(
+                rejection,
+                ResponseSessionRejectionClass::StaleReference
+                    | ResponseSessionRejectionClass::Unsupported
+            ) {
+                let stale_response_id = previous_response_id_from_request(&active_upstream_body);
+                clear_response_session_reference(
+                    &state,
+                    response_session_key.as_deref(),
+                    stale_response_id.as_deref(),
+                )
+                .await;
+            }
+            if rejection == ResponseSessionRejectionClass::Unsupported {
+                invalidate_verified_third_party_response_session_reuse(
+                    &state,
+                    &decision.provider.id,
+                    &decision.model,
+                    &error_summary,
+                )
+                .await;
+            }
+        } else if allow_automatic_upstream_retry
+            && rejection == ResponseSessionRejectionClass::Unsupported
         {
             record_upstream_response_observation(
                 &state,
@@ -3328,6 +3395,37 @@ async fn note_response_session_error_cooldown_for_rejection(
     }
 }
 
+async fn invalidate_verified_third_party_response_session_reuse(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+    summary: &str,
+) {
+    let message = if summary.trim().is_empty() {
+        "upstream rejected previous_response_id".to_string()
+    } else {
+        truncate_log_message(summary)
+    };
+    let mut config = state.config.write().await;
+    if !config.response_session_reuse_verified_for(provider_id, model_id) {
+        return;
+    }
+    config.record_response_session_reuse_probe(
+        provider_id,
+        model_id,
+        ProviderResponseSessionReuseStatus::Unsupported,
+        Some(message),
+    );
+    let save_error = config.save(&state.config_path).err();
+    drop(config);
+    if let Some(err) = save_error {
+        state
+            .metrics
+            .record_error("response_session_reuse_capability_save", &err.to_string())
+            .await;
+    }
+}
+
 async fn note_response_session_error_cooldown_internal(
     state: &AppState,
     key: Option<&str>,
@@ -3989,9 +4087,15 @@ fn should_retry_without_gzip(status: reqwest::StatusCode) -> bool {
         reqwest::StatusCode::BAD_REQUEST
             | reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
             | reqwest::StatusCode::NOT_IMPLEMENTED
-            | reqwest::StatusCode::BAD_GATEWAY
-            | reqwest::StatusCode::SERVICE_UNAVAILABLE
     )
+}
+
+fn should_fallback_to_uncompressed(
+    status: reqwest::StatusCode,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    should_retry_without_gzip(status) && attempt + 1 < max_attempts
 }
 
 fn request_body_gzip_scope_key(url: &str, channel: &Channel) -> String {
@@ -5425,7 +5529,7 @@ fn should_attempt_main_response_session_delta(
     {
         return false;
     }
-    if !supports_main_response_session_delta(decision) {
+    if !supports_main_response_session_delta(config, decision) {
         return false;
     }
     if session_anchor.source.as_deref() != Some("exact") {
@@ -5452,21 +5556,31 @@ fn should_attempt_main_response_session_delta(
         || current_tail.message_chars >= 8_192
 }
 
-fn supports_main_response_session_delta(decision: &RouteDecision) -> bool {
+fn supports_main_response_session_delta(config: &AppConfig, decision: &RouteDecision) -> bool {
     if !matches!(decision.upstream_channel, Channel::Responses) {
         return false;
     }
 
-    // This gate is only for `previous_response_id` server-side session reuse;
-    // it does not control prompt-cache retention, which remains independently
-    // opt-in for third-party providers in `supports_extended_prompt_cache_retention`.
-    // Third-party gateways frequently accept the session field but reject it
-    // after reading the body, forcing a second full request and adding seconds
-    // to TTFT. Keep the zero-extra-request path as the default for them.
+    // Official Responses support remains available by default. Third-party
+    // providers must pass the user-triggered semantic probe for this exact
+    // resolved upstream model before a delta can be sent.
+    is_official_openai_responses_provider(decision)
+        || config.response_session_reuse_verified_for(&decision.provider.id, &decision.model)
+}
+
+fn is_official_openai_responses_provider(decision: &RouteDecision) -> bool {
     reqwest::Url::parse(&decision.provider.base_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == "api.openai.com")
+}
+
+fn is_verified_third_party_response_session_reuse(
+    config: &AppConfig,
+    decision: &RouteDecision,
+) -> bool {
+    !is_official_openai_responses_provider(decision)
+        && config.response_session_reuse_verified_for(&decision.provider.id, &decision.model)
 }
 
 fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>) -> bool {
@@ -5648,8 +5762,9 @@ fn response_session_delta_request(candidate: &Value, original: &Value) -> bool {
 fn should_retry_full_response_after_session_error(
     status: u16,
     used_response_session: bool,
+    allow_full_retry: bool,
 ) -> bool {
-    if !used_response_session {
+    if !used_response_session || !allow_full_retry {
         return false;
     }
     matches!(status, 400 | 404 | 409 | 410 | 422)
@@ -7730,6 +7845,219 @@ async fn send_main_upstream_request(
     .await
 }
 
+#[derive(Debug)]
+struct ResponseSessionReuseProbeResponse {
+    status: u16,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+pub(crate) async fn probe_provider_response_session_reuse(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<ProviderResponseSessionReuseProbeResult> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return Err(anyhow!(
+            "an actual upstream model id is required for verification"
+        ));
+    }
+    let provider = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?
+    };
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    let selected_key = select_provider_api_key(state, provider_id, None, None).await?;
+    if selected_key.secret.trim().is_empty() {
+        return Err(anyhow!("provider API key is not configured"));
+    }
+
+    let nonce = format!("ato-session-{}", Uuid::new_v4().simple());
+    let seed_body = json!({
+        "model": model_id,
+        "input": format!(
+            "This is a connection compatibility check. Remember the exact token {nonce}. Reply only ACK."
+        ),
+        "store": true,
+        "stream": false,
+        "max_output_tokens": 32,
+    });
+    let first = send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &seed_body,
+    )
+    .await?;
+    if !is_successful_probe_response(&first) {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            probe_status_for_failure(first.status, &first.bytes),
+            format!(
+                "seed request returned HTTP {}: {}",
+                first.status,
+                upstream_error_summary(&first.bytes)
+            ),
+            Some(first.status),
+            None,
+        ));
+    }
+    let Some(previous_response_id) = response_id_from_bytes(&first.bytes) else {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "seed response did not include a reusable response id".to_string(),
+            Some(first.status),
+            None,
+        ));
+    };
+
+    let continuation_body = json!({
+        "model": model_id,
+        "previous_response_id": previous_response_id,
+        "input": "Return only the exact verification token from the immediately previous turn.",
+        "store": true,
+        "stream": false,
+        "max_output_tokens": 32,
+    });
+    let continuation = send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &continuation_body,
+    )
+    .await?;
+    if !is_successful_probe_response(&continuation) {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            probe_status_for_failure(continuation.status, &continuation.bytes),
+            format!(
+                "continuation returned HTTP {}: {}",
+                continuation.status,
+                upstream_error_summary(&continuation.bytes)
+            ),
+            Some(first.status),
+            Some(continuation.status),
+        ));
+    }
+    let output = serde_json::from_slice::<Value>(&continuation.bytes)
+        .ok()
+        .and_then(|value| extract_response_text(&value))
+        .unwrap_or_default();
+    if output
+        .to_ascii_lowercase()
+        .contains(&nonce.to_ascii_lowercase())
+    {
+        Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            ProviderResponseSessionReuseStatus::Verified,
+            "verification passed; semantic continuation was preserved".to_string(),
+            Some(first.status),
+            Some(continuation.status),
+        ))
+    } else {
+        Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "continuation succeeded but did not preserve the verification token".to_string(),
+            Some(first.status),
+            Some(continuation.status),
+        ))
+    }
+}
+
+async fn send_response_session_reuse_probe_request(
+    state: &AppState,
+    provider: &ProviderConfig,
+    api_key: &str,
+    body: &Value,
+) -> Result<ResponseSessionReuseProbeResponse> {
+    let started = Instant::now();
+    let outcome = send_main_upstream_request(
+        state,
+        provider.use_system_proxy,
+        &upstream_url(&provider.base_url, &Channel::Responses),
+        api_key,
+        &Channel::Responses,
+        body,
+        &HeaderMap::new(),
+        provider.custom_user_agent.as_deref(),
+        false,
+        false,
+        true,
+    )
+    .await?;
+    let status = outcome.response.status().as_u16();
+    let content_type = outcome
+        .response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let headers_at_ms = started.elapsed().as_millis() as u64;
+    let body = read_upstream_body_with_diagnostics(
+        outcome.response,
+        &content_type,
+        started,
+        headers_at_ms,
+    )
+    .await?;
+    Ok(ResponseSessionReuseProbeResponse {
+        status,
+        content_type,
+        bytes: body.bytes,
+    })
+}
+
+fn is_successful_probe_response(response: &ResponseSessionReuseProbeResponse) -> bool {
+    (200..300).contains(&response.status)
+        && !upstream_body_has_error(&response.bytes, &response.content_type)
+}
+
+fn probe_status_for_failure(status: u16, bytes: &[u8]) -> ProviderResponseSessionReuseStatus {
+    if response_session_rejection_classification(status, &upstream_error_summary(bytes))
+        == ResponseSessionRejectionClass::Unsupported
+    {
+        ProviderResponseSessionReuseStatus::Unsupported
+    } else {
+        ProviderResponseSessionReuseStatus::Error
+    }
+}
+
+fn response_session_reuse_probe_result(
+    provider_id: &str,
+    model_id: &str,
+    status: ProviderResponseSessionReuseStatus,
+    message: String,
+    first_status: Option<u16>,
+    continuation_status: Option<u16>,
+) -> ProviderResponseSessionReuseProbeResult {
+    ProviderResponseSessionReuseProbeResult {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        enabled: status == ProviderResponseSessionReuseStatus::Verified,
+        status,
+        message,
+        checked_at: Some(Utc::now()),
+        first_status,
+        continuation_status,
+    }
+}
+
 fn build_upstream_request_headers(
     inbound_headers: &HeaderMap,
     api_key: &str,
@@ -7928,14 +8256,18 @@ async fn send_upstream_request_to_url_with_diagnostics(
                 let headers_ms = send_started.elapsed().as_millis() as u64;
                 diagnostics.headers_ms += headers_ms;
                 observe_upstream_response_timing(&mut diagnostics, &response, headers_ms);
-                if sending_gzip && should_retry_without_gzip(response.status()) {
+                if sending_gzip
+                    && should_fallback_to_uncompressed(response.status(), attempt, max_attempts)
+                {
+                    // Only mark the provider as gzip-incompatible when we are
+                    // actually going to retry the same request uncompressed.
+                    // Streaming requests intentionally use one attempt; a
+                    // transient 4xx/5xx there must not disable gzip for hours.
                     note_request_body_gzip_fallback(state, &gzip_cooldown_key).await;
-                    if attempt + 1 < max_attempts {
-                        diagnostics.gzip_fallback_used = true;
-                        diagnostics.sent_body_bytes = original_body_len;
-                        gzip_disabled_after_fallback = true;
-                        continue;
-                    }
+                    diagnostics.gzip_fallback_used = true;
+                    diagnostics.sent_body_bytes = original_body_len;
+                    gzip_disabled_after_fallback = true;
+                    continue;
                 }
                 if should_retry_status(response.status())
                     && attempt + 1 < max_attempts_for_status(response.status()).min(max_attempts)
@@ -8241,6 +8573,7 @@ async fn stream_upstream(
         let mut first_chunk_at: Option<u64> = None;
         let mut first_model_output_at: Option<u64> = None;
         let mut cache_body = Vec::new();
+        let mut session_error_body = Vec::new();
         let mut stream_state = ResponsesStreamState::default();
         let mut sse_chunks = 0u64;
         let mut sse_end_reason = "upstream_eof".to_string();
@@ -8291,10 +8624,56 @@ async fn stream_upstream(
             if eligible {
                 cache_body.extend_from_slice(&chunk);
             }
+            if used_response_session && session_error_body.len() < 65_536 {
+                let remaining = 65_536usize.saturating_sub(session_error_body.len());
+                session_error_body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
         }
         let stream_metadata = stream_state.finish();
         if stream_metadata.error_event_seen && sse_end_reason == "upstream_eof" {
             sse_end_reason = "upstream_sse_error".to_string();
+        }
+        if used_response_session
+            && is_verified_third_party_response_session_reuse(&config, &decision)
+            && stream_metadata.error_event_seen
+        {
+            let error_summary = upstream_error_summary(&session_error_body);
+            let rejection = response_session_rejection_classification(status, &error_summary);
+            if !error_summary.is_empty() {
+                state_for_stream
+                    .metrics
+                    .record_error("verified_response_session_delta_rejected", &error_summary)
+                    .await;
+            }
+            let cooldown_key = response_session_error_cooldown_key(&decision);
+            note_response_session_error_cooldown_for_rejection(
+                &state_for_stream,
+                cooldown_key.as_deref(),
+                status,
+                &error_summary,
+            )
+            .await;
+            if matches!(
+                rejection,
+                ResponseSessionRejectionClass::StaleReference
+                    | ResponseSessionRejectionClass::Unsupported
+            ) {
+                clear_response_session_reference(
+                    &state_for_stream,
+                    response_session_key.as_deref(),
+                    None,
+                )
+                .await;
+            }
+            if rejection == ResponseSessionRejectionClass::Unsupported {
+                invalidate_verified_third_party_response_session_reuse(
+                    &state_for_stream,
+                    &decision.provider.id,
+                    &decision.model,
+                    &error_summary,
+                )
+                .await;
+            }
         }
         let stream_success_for_cache =
             (200..300).contains(&status) && sse_end_reason == "upstream_eof";
@@ -21271,17 +21650,34 @@ mod tests {
     fn response_session_errors_fallback_only_for_invalid_session_statuses() {
         for status in [400, 404, 409, 410, 422] {
             assert!(
-                should_retry_full_response_after_session_error(status, true),
+                should_retry_full_response_after_session_error(status, true, true),
                 "status {status} should retry as a full Responses request after session reuse fails"
             );
         }
-        assert!(!should_retry_full_response_after_session_error(408, true));
-        assert!(!should_retry_full_response_after_session_error(429, true));
-        assert!(!should_retry_full_response_after_session_error(502, false));
-        assert!(!should_retry_full_response_after_session_error(502, true));
-        assert!(!should_retry_full_response_after_session_error(503, true));
-        assert!(!should_retry_full_response_after_session_error(401, true));
-        assert!(!should_retry_full_response_after_session_error(403, true));
+        assert!(!should_retry_full_response_after_session_error(
+            408, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            429, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            502, false, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            502, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            503, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            401, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            403, true, true
+        ));
+        assert!(!should_retry_full_response_after_session_error(
+            400, true, false
+        ));
     }
 
     #[test]
@@ -21523,6 +21919,519 @@ mod tests {
         assert!(request_body_gzip_cooldown_active(&state, &same_provider_key).await);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn third_party_session_reuse_probe_requires_semantic_continuation() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let nonce = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let hits_for_route = hits.clone();
+        let nonce_for_route = nonce.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let nonce = nonce_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        let input = body["input"].as_str().unwrap_or_default();
+                        let token = input
+                            .split("token ")
+                            .nth(1)
+                            .and_then(|value| value.split('.').next())
+                            .unwrap_or_default()
+                            .to_string();
+                        *nonce.lock().await = token;
+                        Json(json!({
+                            "id": "resp_probe_seed",
+                            "output": [{
+                                "type": "message",
+                                "content": [{ "type": "output_text", "text": "ACK" }]
+                            }]
+                        }))
+                    } else {
+                        assert_eq!(body["previous_response_id"], "resp_probe_seed");
+                        let token = nonce.lock().await.clone();
+                        Json(json!({
+                            "id": "resp_probe_continuation",
+                            "output": [{
+                                "type": "message",
+                                "content": [{ "type": "output_text", "text": token }]
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "probe-provider".to_string();
+        config.providers = vec![provider];
+        let dir =
+            std::env::temp_dir().join(format!("atoapi-session-probe-{}", Uuid::new_v4().simple()));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result = probe_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ProviderResponseSessionReuseStatus::Verified);
+        assert!(result.enabled);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn third_party_session_reuse_probe_rejects_nonsemantic_continuation() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Json(json!({
+                            "id": "resp_probe_seed",
+                            "output": [{
+                                "type": "message",
+                                "content": [{ "type": "output_text", "text": "ACK" }]
+                            }]
+                        }))
+                    } else {
+                        assert_eq!(body["previous_response_id"], "resp_probe_seed");
+                        Json(json!({
+                            "id": "resp_probe_continuation",
+                            "output": [{
+                                "type": "message",
+                                "content": [{ "type": "output_text", "text": "not-the-token" }]
+                            }]
+                        }))
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "probe-provider-nonsemantic".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-session-probe-nonsemantic-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result =
+            probe_provider_response_session_reuse(&state, "probe-provider-nonsemantic", "gpt-5.5")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            ProviderResponseSessionReuseStatus::Unsupported
+        );
+        assert!(!result.enabled);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_generation_does_not_fallback_to_a_second_upstream_request() {
+        let responses_hits = Arc::new(AtomicUsize::new(0));
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let responses_hits_for_route = responses_hits.clone();
+        let chat_hits_for_route = chat_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let responses_hits = responses_hits_for_route.clone();
+                    async move {
+                        responses_hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "error": { "message": "request rejected" } })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let chat_hits = chat_hits_for_route.clone();
+                    async move {
+                        chat_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "single-attempt-provider".to_string();
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider.id.clone(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: vec![
+                crate::config::ProviderKeyConfig {
+                    id: "key-a".to_string(),
+                    alias: None,
+                    key_encrypted: Some("key-a".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                crate::config::ProviderKeyConfig {
+                    id: "key-b".to_string(),
+                    alias: None,
+                    key_encrypted: Some("key-b".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ],
+            updated_at: now,
+        }];
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("single-attempt-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-single-upstream-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "single-attempt-session",
+                "model": "gpt-5.5",
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        );
+
+        let response =
+            handle_generation_for_agent(state, headers, request, Channel::Responses, Some("codex"))
+                .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn verified_third_party_delta_rejection_never_retries_full_context() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let captured_second_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let hits_for_route = hits.clone();
+        let chat_hits_for_route = chat_hits.clone();
+        let captured_for_route = captured_second_body.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let hits = hits_for_route.clone();
+                    let captured = captured_for_route.clone();
+                    async move {
+                        let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                        if attempt == 0 {
+                            raw_response(
+                                200,
+                                "text/event-stream",
+                                concat!(
+                                    "event: response.output_text.delta\n",
+                                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                                    "event: response.completed\n",
+                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_seed\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"
+                                )
+                                .as_bytes()
+                                .to_vec(),
+                            )
+                        } else {
+                            *captured.lock().await = body;
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": { "message": "Unsupported parameter: previous_response_id" }
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let chat_hits = chat_hits_for_route.clone();
+                    async move {
+                        chat_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NOT_FOUND
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "verified-third-party".to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        config.record_response_session_reuse_probe(
+            "verified-third-party",
+            "gpt-5.5",
+            ProviderResponseSessionReuseStatus::Verified,
+            None,
+        );
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("verified-third-party".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-verified-third-party-single-call-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let stable_prefix = "stable prior context ".repeat(8_000);
+        let first = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "verified-session",
+                "model": "gpt-5.5",
+                "input": [{ "type": "message", "role": "user", "content": stable_prefix }]
+            }))
+            .unwrap(),
+        );
+        let first_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            first,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !state.response_sessions.lock().await.is_empty(),
+            "the seed stream must save a response id before the delta request"
+        );
+
+        let incremental_tail = "the only newly appended turn".repeat(16);
+        let second = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "verified-session",
+                "model": "gpt-5.5",
+                "input": [
+                    { "type": "message", "role": "user", "content": stable_prefix },
+                    { "type": "message", "role": "user", "content": incremental_tail }
+                ]
+            }))
+            .unwrap(),
+        );
+        let rejected = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            second,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+
+        let rejected_status = rejected.status();
+        let rejected_body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected_status,
+            StatusCode::BAD_REQUEST,
+            "hits={} body={}",
+            hits.load(Ordering::SeqCst),
+            String::from_utf8_lossy(&rejected_body)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        let captured = captured_second_body.lock().await.clone();
+        assert_eq!(captured["previous_response_id"], "resp_seed");
+        assert_eq!(captured["input"].as_array().map(Vec::len), Some(1));
+        let config = state.config.read().await;
+        assert!(!config.response_session_reuse_verified_for("verified-third-party", "gpt-5.5"));
+        drop(config);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn verified_third_party_session_reuse_is_model_scoped() {
+        let mut config = AppConfig::default();
+        let provider = test_responses_provider("https://third-party.example/v1".to_string());
+        let decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+
+        assert!(!supports_main_response_session_delta(&config, &decision));
+        config.record_response_session_reuse_probe(
+            &decision.provider.id,
+            "gpt-5.5",
+            ProviderResponseSessionReuseStatus::Verified,
+            None,
+        );
+        assert!(supports_main_response_session_delta(&config, &decision));
+
+        let other_model = RouteDecision {
+            model: "gpt-5.6".to_string(),
+            ..decision
+        };
+        assert!(!supports_main_response_session_delta(&config, &other_model));
+    }
+
+    #[test]
+    fn gzip_fallback_only_targets_encoding_rejection_and_requires_retry() {
+        assert!(should_retry_without_gzip(StatusCode::BAD_REQUEST));
+        assert!(should_retry_without_gzip(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        ));
+        assert!(should_retry_without_gzip(StatusCode::NOT_IMPLEMENTED));
+        assert!(!should_retry_without_gzip(StatusCode::BAD_GATEWAY));
+        assert!(!should_retry_without_gzip(StatusCode::SERVICE_UNAVAILABLE));
+
+        assert!(should_fallback_to_uncompressed(
+            StatusCode::BAD_REQUEST,
+            0,
+            2
+        ));
+        assert!(!should_fallback_to_uncompressed(
+            StatusCode::BAD_REQUEST,
+            0,
+            1
+        ));
+        assert!(!should_fallback_to_uncompressed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            0,
+            3
+        ));
     }
 
     #[tokio::test]
