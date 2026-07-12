@@ -533,13 +533,42 @@ async fn handle_responses_compact_for_agent(
         &decision.upstream_channel,
         &decision,
     );
+    let session_identity = SessionIdentity::derive_for_agent(
+        &config,
+        &decision,
+        &client_request,
+        &upstream_body,
+        authorized_agent.as_deref(),
+    );
     optimize_provider_prefix(&mut upstream_body, &config, &decision);
+    apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
+    let response_session_key = if responses_session_reuse_enabled(&config) {
+        session_identity
+            .as_ref()
+            .map(|identity| identity.anchor_key.clone())
+    } else {
+        None
+    };
+    let response_session_scope_key = if responses_session_reuse_enabled(&config) {
+        session_identity
+            .as_ref()
+            .map(|identity| identity.scope_key.clone())
+    } else {
+        None
+    };
+    let full_response_input = upstream_body.get("input").cloned();
     let tail_input_diagnostics = tail_input_diagnostics_for_session(
         &state,
         &decision.upstream_channel,
-        None,
-        None,
-        upstream_body.get("input"),
+        response_session_key.as_deref(),
+        response_session_scope_key.as_deref(),
+        full_response_input.as_ref(),
+    )
+    .await;
+    let session_anchor_diagnostics = response_session_anchor_diagnostics(
+        &state,
+        response_session_key.as_deref(),
+        response_session_scope_key.as_deref(),
     )
     .await;
     let compact_chat_compat_cooldown_key = compact_chat_compat_cooldown_key(&decision);
@@ -881,6 +910,16 @@ async fn handle_responses_compact_for_agent(
     } else {
         None
     };
+    if compact_success_for_cache && matches!(active_request_channel, Channel::Responses) {
+        update_response_session(
+            &state,
+            response_session_key.as_deref(),
+            response_session_scope_key.as_deref(),
+            full_response_input.as_ref(),
+            &bytes,
+        )
+        .await;
+    }
     let gap_breakdown = provider_cache_gap_breakdown(
         &state,
         prefix_state_key_for_metrics,
@@ -1020,10 +1059,12 @@ async fn handle_responses_compact_for_agent(
         tail_tool_output_noise_hint: None,
         tail_source: None,
         response_session_reused: Some(false),
-        response_session_candidate_count: Some(0),
+        response_session_candidate_count: Some(session_anchor_diagnostics.peer_count.unwrap_or(0)),
         response_session_skip_reason: Some("compact_non_streaming".to_string()),
-        response_session_exact_key_hit: Some(false),
-        response_session_scope_match_count: Some(0),
+        response_session_exact_key_hit: Some(
+            session_anchor_diagnostics.source.as_deref() == Some("exact"),
+        ),
+        response_session_scope_match_count: session_anchor_diagnostics.peer_count,
         response_session_append_delta_match: Some(false),
         response_session_delta_items: Some(0),
         response_session_cooldown_active: Some(false),
@@ -1051,6 +1092,7 @@ async fn handle_responses_compact_for_agent(
     };
     apply_prefix_lag_diagnostics(&mut request_log, prefix_lag);
     apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
+    apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
     state.metrics.record_upstream_observation(request_log).await;
 
     let bytes_for_client = if is_text_event_stream(&content_type) {
@@ -1184,8 +1226,13 @@ async fn handle_generation_for_agent(
         &decision.upstream_channel,
         &decision,
     );
-    let session_identity =
-        SessionIdentity::derive(&config, &decision, &client_request, &upstream_body);
+    let session_identity = SessionIdentity::derive_for_agent(
+        &config,
+        &decision,
+        &client_request,
+        &upstream_body,
+        authorized_agent.as_deref(),
+    );
     if codex_native_responses_stream {
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
@@ -21959,8 +22006,8 @@ mod tests {
         assert!(captured.get("input").is_none());
 
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.total_requests, 2);
-        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.upstream_requests, 1);
         assert_eq!(metrics.cache_misses, 0);
         assert_eq!(metrics.provider_input_tokens, 2048);
         assert_eq!(metrics.provider_cached_tokens, 1536);
@@ -21972,6 +22019,172 @@ mod tests {
         assert_eq!(
             metrics.recent_requests[0].upstream_call_kind.as_deref(),
             Some("sync")
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_compact_success_updates_response_session_for_next_turn() {
+        let compact_hits = Arc::new(AtomicUsize::new(0));
+        let captured_compact_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let compact_hits_for_route = compact_hits.clone();
+        let captured_body_for_route = captured_compact_body.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses/:response_id/compact",
+            post(move |Json(body): Json<Value>| {
+                let hits = compact_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    Json(json!({
+                        "id": "resp_compacted",
+                        "object": "response",
+                        "model": "gpt-5.5",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_compact",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "compact summary" }]
+                        }],
+                        "usage": {
+                            "input_tokens": 2048,
+                            "output_tokens": 64,
+                            "input_tokens_details": { "cached_tokens": 1536 }
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("mock-responses".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "mock-responses".to_string(),
+            name: "Mock Responses".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.5".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.5".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-compact-session-e2e-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let initial_input = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "please compact context" }]
+            }
+        ]);
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": initial_input
+            }))
+            .unwrap(),
+        );
+
+        let response =
+            handle_responses_compact(state.clone(), headers, body, Some("resp_old".to_string()))
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+
+        let sessions = state.response_sessions.lock().await.clone();
+        assert_eq!(sessions.len(), 1);
+        let (session_key, session) = sessions.iter().next().unwrap();
+        assert_eq!(session.response_id, "resp_compacted");
+        assert_eq!(session.input, initial_input);
+        assert!(session.scope_key.is_some());
+
+        let decision = RouteDecision {
+            provider: state.config.read().await.providers[0].clone(),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let next_input = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "please compact context" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "continue after compact" }]
+            }
+        ]);
+        let next_request = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": next_input
+        });
+        let reuse = maybe_reuse_response_session(
+            &state,
+            &next_request,
+            Some(session_key),
+            session.scope_key.as_deref(),
+            &decision,
+            true,
+            false,
+        )
+        .await;
+
+        assert_eq!(reuse.body["previous_response_id"], "resp_compacted");
+        assert_eq!(
+            reuse.body["input"],
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "continue after compact" }]
+            }])
         );
     }
 

@@ -156,8 +156,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.96";
+const appVersion = "v0.1.97";
 const appVersionNotes = [
+  "v0.1.97: 修正请求数统计口径，一条入站请求只计一次；修复压缩后会话续接丢锚点；优化请求记录两行指标与命中详情布局。",
   "v0.1.96: 修复请求历史与上游调用记录口径不一致导致的漏显示，并将请求记录改回紧凑的一行式列表。",
   "v0.1.95: Codex 主会话 delta 复用不再被硬关闭，进入安全判断与上游拒绝回退链路。",
   "v0.1.95: 请求记录默认保持简洁，缓存/会话诊断改为点击单条记录后展开。"
@@ -2458,12 +2459,6 @@ function CachePanel({
                 request.cache_read_tokens ?? 0
               );
               const sessionDiagnostic = responseSessionDiagnostics(request);
-              const cacheStatusLabel = ["miss", "compact", "error"].includes(request.cache_status)
-                ? ""
-                : request.cache_status;
-              const cacheResultLabel = [primaryStatus, cacheStatusLabel, cacheDisplay.primary]
-                .filter(Boolean)
-                .join(" · ");
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
               const cacheReadTokens = request.cache_read_tokens ?? 0;
@@ -2473,14 +2468,17 @@ function CachePanel({
               const requestedModel = request.requested_model?.trim();
               const hasModelMapping = Boolean(requestedModel && requestedModel !== request.model);
               const displayModel = hasModelMapping ? requestedModel : request.model;
-              const requestMetricItems = [
+              const priorityMetricItems = [
                 { label: "首字", value: formatDurationMs(request.ttft_ms) },
-                { label: "用时", value: formatDurationMs(request.total_ms) },
+                { label: "用时", value: formatDurationMs(request.total_ms) }
+              ];
+              const secondaryMetricItems = [
                 { label: "输入", value: formatCompactTokens(inputTokens) },
                 { label: "输出", value: formatCompactTokens(outputTokens) },
-                { label: "命中", value: formatCompactTokens(cacheReadTokens) },
-                { label: "命中率", value: inputTokens > 0 ? percent(cacheHitRatio) : "—" }
+                { label: "命中", value: formatCompactTokens(cacheReadTokens) }
               ];
+              const cacheRatioLabel = inputTokens > 0 ? percent(cacheHitRatio) : "—";
+              const cacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
               const traceItems = [
                 request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
                 request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
@@ -2551,15 +2549,28 @@ function CachePanel({
                       </div>
                     </div>
                     <div className="request-metrics" title={metricTitle}>
-                      {requestMetricItems.map((item) => (
-                        <span className="request-metric-chip" key={item.label}>
-                          <small>{item.label}</small>
-                          <b>{item.value}</b>
-                        </span>
-                      ))}
+                      <div className="request-metrics-priority">
+                        {priorityMetricItems.map((item) => (
+                          <span className="request-metric-chip hot" key={item.label}>
+                            <small>{item.label}</small>
+                            <b>{item.value}</b>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="request-metrics-rest">
+                        {secondaryMetricItems.map((item) => (
+                          <span className="request-metric-chip" key={item.label}>
+                            <small>{item.label}</small>
+                            <b>{item.value}</b>
+                          </span>
+                        ))}
+                      </div>
                     </div>
                     <div className="request-cache-result">
-                      {cacheResultLabel ? <b>{cacheResultLabel}</b> : <b>已转发</b>}
+                      <div className="request-cache-summary">
+                        <b>{isFailedRequest ? (primaryStatus || "error") : `命中率 ${cacheRatioLabel}`}</b>
+                        <small title={cacheDisplay.secondaryTitle ?? cacheDetailLabel}>{cacheDetailLabel}</small>
+                      </div>
                       {hasRequestDetails ? (
                         <span className="request-detail-hint">
                           {isExpanded ? "收起详情" : "查看详情"}

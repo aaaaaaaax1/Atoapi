@@ -1845,9 +1845,9 @@ button:disabled {
 
 .request-row {
   display: grid;
-  grid-template-columns: minmax(250px, 1.25fr) minmax(390px, 1.85fr) minmax(150px, 0.8fr);
+  grid-template-columns: minmax(240px, 1.2fr) minmax(330px, 1.35fr) minmax(210px, 0.95fr);
   align-items: center;
-  gap: 8px 12px;
+  gap: 8px 14px;
   justify-content: stretch;
   min-width: 0;
   min-height: 48px;
@@ -2042,14 +2042,29 @@ button:disabled {
 }
 
 .request-row .request-metrics {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 11px;
+  display: grid;
+  gap: 5px;
   min-width: 0;
   padding: 0;
   color: #d6dbd3;
   font-size: 12px;
+}
+
+.request-metrics-priority,
+.request-metrics-rest {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 5px 14px;
+  min-width: 0;
+}
+
+.request-metrics-priority {
+  color: #f6d47c;
+}
+
+.request-metrics-rest {
+  color: #d6dbd3;
 }
 
 .request-metric-chip {
@@ -2085,6 +2100,16 @@ button:disabled {
   font-weight: 850;
 }
 
+.request-metric-chip.hot small {
+  color: #ddb96b;
+}
+
+.request-metric-chip.hot b {
+  color: #ffd784;
+  font-size: 14px;
+  text-shadow: 0 0 18px rgba(255, 197, 93, 0.14);
+}
+
 .request-cache-result {
   display: flex;
   align-items: center;
@@ -2096,6 +2121,14 @@ button:disabled {
   border-radius: 0;
   background: transparent;
   text-align: right;
+}
+
+.request-cache-summary {
+  display: grid;
+  justify-items: end;
+  gap: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .request-cache-result b {
@@ -2134,14 +2167,15 @@ button:disabled {
 }
 
 .request-cache-result small {
-  color: #c7cac3;
-  font-size: 12px;
-  text-align: left;
-  white-space: normal;
-  overflow: visible;
-  overflow-wrap: anywhere;
+  color: #aeb8ad;
+  font-size: 11px;
+  font-weight: 720;
+  text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   word-break: keep-all;
-  line-height: 1.35;
+  line-height: 1.25;
   max-width: 100%;
 }
 
@@ -2448,9 +2482,9 @@ button:disabled {
   }
 
   .request-row {
-    grid-template-columns: minmax(0, 1fr);
-    align-items: start;
-    gap: 5px;
+    grid-template-columns: minmax(180px, 1fr) minmax(260px, 1.2fr) minmax(170px, 0.9fr);
+    align-items: center;
+    gap: 8px 10px;
     padding: 8px 10px;
   }
 
@@ -2491,7 +2525,7 @@ button:disabled {
   }
 
   .request-row .request-metrics {
-    gap: 4px 10px;
+    gap: 5px;
   }
 
   .request-metric-chip small {
@@ -2500,11 +2534,6 @@ button:disabled {
 
   .request-metric-chip b {
     font-size: 12px;
-  }
-
-  .request-cache-result {
-    justify-content: flex-start;
-    text-align: left;
   }
 
   .request-cache-result b {
@@ -2942,11 +2971,6 @@ button:disabled {
 
   .cold-start-meta {
     justify-items: start;
-    text-align: left;
-  }
-
-  .request-cache-result {
-    justify-content: flex-start;
     text-align: left;
   }
 

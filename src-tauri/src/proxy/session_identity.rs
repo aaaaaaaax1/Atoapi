@@ -21,11 +21,22 @@ pub(super) struct SessionIdentity {
 }
 
 impl SessionIdentity {
+    #[cfg(test)]
     pub fn derive(
         config: &AppConfig,
         decision: &RouteDecision,
         client_request: &Value,
         upstream_request: &Value,
+    ) -> Option<Self> {
+        Self::derive_for_agent(config, decision, client_request, upstream_request, None)
+    }
+
+    pub fn derive_for_agent(
+        config: &AppConfig,
+        decision: &RouteDecision,
+        client_request: &Value,
+        upstream_request: &Value,
+        agent_id: Option<&str>,
     ) -> Option<Self> {
         if !matches!(decision.upstream_channel, Channel::Responses) {
             return None;
@@ -44,11 +55,13 @@ impl SessionIdentity {
             .unwrap_or("content-anchor");
         let model = provider_prefix_model_key(decision);
         let provider_group = provider_prefix_provider_group(decision);
+        let agent_scope = agent_identity_scope(agent_id);
 
         Some(Self {
             anchor_key: hash_parts(&[
                 "session-anchor-v2",
                 &config.workspace_fingerprint,
+                &agent_scope,
                 &decision.provider.id,
                 &model,
                 &identity_material,
@@ -56,6 +69,7 @@ impl SessionIdentity {
             scope_key: hash_parts(&[
                 "session-scope-v2",
                 &config.workspace_fingerprint,
+                &agent_scope,
                 &decision.provider.id,
                 &model,
                 &scope_material,
@@ -63,6 +77,7 @@ impl SessionIdentity {
             provider_cache_key: hash_parts(&[
                 "provider-cache-v2",
                 &config.workspace_fingerprint,
+                &agent_scope,
                 &provider_group,
                 &model,
                 &identity_material,
@@ -70,6 +85,7 @@ impl SessionIdentity {
             control_fingerprint: hash_parts(&[
                 "prefix-control-v2",
                 &config.workspace_fingerprint,
+                &agent_scope,
                 &decision.provider.id,
                 &model,
                 &identity_material,
@@ -109,6 +125,14 @@ fn explicit_identity(request: &Value) -> Option<ExplicitIdentity> {
         }
     }
     None
+}
+
+fn agent_identity_scope(agent_id: Option<&str>) -> String {
+    agent_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("agent:{value}"))
+        .unwrap_or_else(|| "agent:default".to_string())
 }
 
 fn non_empty_identity_value(value: &Value) -> Option<String> {
@@ -271,6 +295,33 @@ mod tests {
 
         assert_ne!(left.anchor_key, right.anchor_key);
         assert_ne!(left.provider_cache_key, right.provider_cache_key);
+    }
+
+    #[test]
+    fn explicit_thread_identity_is_also_scoped_by_agent() {
+        let (config, decision) = context();
+        let request = json!({ "thread_id": "same-thread", "input": ["same"] });
+
+        let codex = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &request,
+            &request,
+            Some("codex"),
+        )
+        .unwrap();
+        let zcode = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &request,
+            &request,
+            Some("zcode"),
+        )
+        .unwrap();
+
+        assert_ne!(codex.anchor_key, zcode.anchor_key);
+        assert_ne!(codex.scope_key, zcode.scope_key);
+        assert_ne!(codex.provider_cache_key, zcode.provider_cache_key);
     }
 
     #[test]

@@ -578,14 +578,9 @@ impl MetricsStore {
 
     pub async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
-        let upstream_attempts = if upstream {
-            request_log_upstream_attempts(&log)
-        } else {
-            1
-        };
-        inner.total_requests += upstream_attempts;
+        inner.total_requests += 1;
         if upstream {
-            inner.upstream_requests += upstream_attempts;
+            inner.upstream_requests += 1;
         }
         match log.cache_status.as_str() {
             "exact" => inner.response_cache_hits += 1,
@@ -632,9 +627,8 @@ impl MetricsStore {
 
     pub async fn record_upstream_observation(&self, log: RequestLog) {
         let mut inner = self.inner.write().await;
-        let upstream_attempts = request_log_upstream_attempts(&log);
-        inner.total_requests += upstream_attempts;
-        inner.upstream_requests += upstream_attempts;
+        inner.total_requests += 1;
+        inner.upstream_requests += 1;
         push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
         push_limited(&mut inner.total_samples, log.total_ms, 512);
         upsert_gap_bucket(&mut inner.gap_buckets, &log);
@@ -897,14 +891,9 @@ fn upsert_provider_traffic(
             groups.len() - 1
         });
     let group = &mut groups[index];
-    let upstream_attempts = if upstream {
-        request_log_upstream_attempts(log)
-    } else {
-        1
-    };
-    group.total_requests += upstream_attempts;
+    group.total_requests += 1;
     if upstream {
-        group.upstream_requests += upstream_attempts;
+        group.upstream_requests += 1;
     }
     match log.cache_status.as_str() {
         "exact" => {
@@ -1174,13 +1163,6 @@ fn request_log_is_provider_cold_start(log: &RequestLog) -> bool {
     log.input_tokens.unwrap_or_default() >= 1024 && log.cache_read_tokens.unwrap_or_default() == 0
 }
 
-fn request_log_upstream_attempts(log: &RequestLog) -> u64 {
-    log.upstream_attempt_total
-        .or(log.upstream_attempts)
-        .unwrap_or(1)
-        .max(1)
-}
-
 fn request_log_is_successful_history(log: &RequestLog) -> bool {
     (200..300).contains(&log.status) && log.cache_status != "error"
 }
@@ -1431,8 +1413,10 @@ mod tests {
         metrics.record_request(compact_log, true).await;
 
         let snapshot = metrics.snapshot().await;
-        assert_eq!(snapshot.total_requests, 2);
-        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].total_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].upstream_requests, 1);
         assert_eq!(snapshot.ttft_p95_ms, 144_000);
         assert_eq!(snapshot.gap_buckets[0].bucket, "8193-16384");
         assert_eq!(snapshot.provider_stats[0].ttft_p95_ms, 144_000);
