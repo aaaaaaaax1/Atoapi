@@ -156,8 +156,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.95";
+const appVersion = "v0.1.96";
 const appVersionNotes = [
+  "v0.1.96: 修复请求历史与上游调用记录口径不一致导致的漏显示，并将请求记录改回紧凑的一行式列表。",
   "v0.1.95: Codex 主会话 delta 复用不再被硬关闭，进入安全判断与上游拒绝回退链路。",
   "v0.1.95: 请求记录默认保持简洁，缓存/会话诊断改为点击单条记录后展开。"
 ];
@@ -2237,7 +2238,10 @@ function CachePanel({
     : traffic?.total_requests ?? selectedUsageRequests(usage) ?? 0;
   const cacheRatio = inputTokens > 0 ? cacheReadTokens / inputTokens : 0;
   const activeCacheRatio = recentInputTokens > 0 ? recentCacheRatio : cacheRatio;
-  const successfulRequestFeed = metrics?.recent_upstream_calls ?? metrics?.recent_requests ?? [];
+  const successfulRequestFeed = buildSuccessfulRequestFeed(
+    metrics?.recent_requests ?? [],
+    metrics?.recent_upstream_calls ?? []
+  );
   const requestFeed: RequestFeedEntry[] = [
     ...successfulRequestFeed.map((request) => ({ ...request, feed_kind: "request" as const })),
     ...(metrics?.recent_failed_requests ?? []).map((request) => ({ ...request, feed_kind: "failed" as const }))
@@ -3009,6 +3013,22 @@ function requestPrimaryStatus(
     return "冷启动";
   }
   return "";
+}
+
+function buildSuccessfulRequestFeed(
+  recentRequests: RequestLogEntry[],
+  recentUpstreamCalls: RequestLogEntry[]
+) {
+  const byId = new Map<string, RequestLogEntry>();
+  for (const request of recentRequests) {
+    byId.set(request.id, request);
+  }
+  for (const request of recentUpstreamCalls) {
+    if (!byId.has(request.id)) {
+      byId.set(request.id, request);
+    }
+  }
+  return Array.from(byId.values());
 }
 
 function responseSessionDiagnostics(request: RequestLogEntry): ResponseSessionDiagnostic | null {
