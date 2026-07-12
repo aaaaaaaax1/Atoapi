@@ -13,6 +13,7 @@ import {
   Eye,
   EyeOff,
   Gauge,
+  Info,
   KeyRound,
   Link2,
   Loader2,
@@ -157,8 +158,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.99";
+const appVersion = "v0.1.100";
 const appVersionNotes = [
+  "v0.1.100: 修复第三方 Responses 探测将 error:null 误判为失败；会话复用提示收起原始回包，并重排请求记录为紧凑三栏两行布局。",
   "v0.1.99: 第三方 Responses 仅在手动兼容性验证通过后启用会话增量复用；Agent 请求严格一次入站、一次上游，避免 Key 切换、协议回退或完整上下文补发拖慢首字。",
   "v0.1.97: 修正请求数统计口径，一条入站请求只计一次；修复压缩后会话续接丢锚点；优化请求记录两行指标与命中详情布局。",
   "v0.1.96: 修复请求历史与上游调用记录口径不一致导致的漏显示，并将请求记录改回紧凑的一行式列表。",
@@ -464,11 +466,11 @@ export default function App() {
       );
       const nextConfig = await command<AppConfig>("get_config");
       setConfig(nextConfig);
-      setNotice(
-        result.status === "verified"
-          ? `${actualModelId} 已验证并启用会话增量复用`
-          : `${actualModelId} 未启用会话复用：${result.message}`
-      );
+      if (result.status === "verified") {
+        setNotice(`${actualModelId} 已验证并启用会话增量复用`);
+      } else {
+        setError(`${actualModelId} 未启用会话复用：${result.message}`);
+      }
     } catch (err) {
       setError(String(err));
     } finally {
@@ -947,10 +949,7 @@ export default function App() {
         </header>
 
         {feedbackMessage && (
-          <div className={error ? "notice error" : "notice success"}>
-            {error ? <ShieldCheck size={16} /> : <Check size={16} />}
-            <span>{feedbackMessage}</span>
-          </div>
+          <FeedbackNotice message={feedbackMessage} error={Boolean(error)} />
         )}
 
         <section className="workspace">
@@ -1947,6 +1946,57 @@ function ProviderPanel({
   );
 }
 
+function compactFeedbackMessage(message: string) {
+  const detail = message.trim();
+  const payloadStart = detail.indexOf("{");
+  const prefix = payloadStart > 0 ? detail.slice(0, payloadStart).trim().replace(/[：:]\s*$/, "") : detail;
+  const probeMatch = prefix.match(/(seed request|continuation) returned HTTP (\d+)/i);
+  const beforeProbe =
+    probeMatch?.index && probeMatch.index > 0
+      ? prefix.slice(0, probeMatch.index).trim().replace(/[：:]\s*$/, "")
+      : "";
+  const probeSummary = probeMatch
+    ? `${probeMatch[1].toLowerCase() === "seed request" ? "种子请求" : "续接请求"}返回 HTTP ${probeMatch[2]}`
+    : "";
+  const summary = probeMatch
+    ? beforeProbe ? `${beforeProbe}：${probeSummary}` : probeSummary
+    : prefix || "上游返回了较长的响应详情";
+
+  if (payloadStart > 0 || detail.length > 180) {
+    return { summary, detail };
+  }
+  return { summary, detail: null };
+}
+
+function FeedbackNotice({ message, error }: { message: string; error: boolean }) {
+  const compact = compactFeedbackMessage(message);
+  const [showDetails, setShowDetails] = useState(false);
+
+  useEffect(() => setShowDetails(false), [message]);
+
+  return (
+    <div className={error ? "notice error" : "notice success"}>
+      {error ? <ShieldCheck size={16} /> : <Check size={16} />}
+      <span className="notice-summary" title={compact.summary}>
+        {compact.summary}
+      </span>
+      {compact.detail && (
+        <button
+          className="icon-button notice-detail-toggle"
+          type="button"
+          title={showDetails ? "收起详情" : "查看详情"}
+          aria-label={showDetails ? "收起详情" : "查看详情"}
+          aria-expanded={showDetails}
+          onClick={() => setShowDetails((current) => !current)}
+        >
+          <Info size={15} />
+        </button>
+      )}
+      {showDetails && compact.detail && <pre className="notice-details">{compact.detail}</pre>}
+    </div>
+  );
+}
+
 function ResponseSessionReuseControl({
   providerId,
   models,
@@ -1988,6 +2038,10 @@ function ResponseSessionReuseControl({
   const message =
     record?.last_error ??
     "验证会发送两条极小的管理请求，不使用 Agent 对话内容；只有验证成功后才会对该模型发送 previous_response_id 增量。";
+  const compactMessage = compactFeedbackMessage(message);
+  const [showDetails, setShowDetails] = useState(false);
+
+  useEffect(() => setShowDetails(false), [message, providerId, modelId]);
 
   return (
     <div className={`provider-session-reuse ${status}`}>
@@ -1997,7 +2051,21 @@ function ResponseSessionReuseControl({
           <span>Responses 会话复用</span>
           <small>{statusLabel}</small>
         </div>
-        <p>{message}</p>
+        <div className="provider-session-reuse-message">
+          <p title={compactMessage.summary}>{compactMessage.summary}</p>
+          {compactMessage.detail && (
+            <button
+              className="icon-button session-reuse-detail-toggle"
+              type="button"
+              title={showDetails ? "收起验证详情" : "查看验证详情"}
+              aria-label={showDetails ? "收起验证详情" : "查看验证详情"}
+              aria-expanded={showDetails}
+              onClick={() => setShowDetails((current) => !current)}
+            >
+              <Info size={14} />
+            </button>
+          )}
+        </div>
       </div>
       <div className="provider-session-reuse-actions">
         <input
@@ -2031,6 +2099,9 @@ function ResponseSessionReuseControl({
           <span />
         </button>
       </div>
+      {showDetails && compactMessage.detail && (
+        <pre className="provider-session-reuse-detail">{compactMessage.detail}</pre>
+      )}
     </div>
   );
 }
@@ -2680,7 +2751,8 @@ function CachePanel({
                 { label: "思考", value: formatReasoningEffort(effectiveReasoningEffort) }
               ];
               const cacheRatioLabel = inputTokens > 0 ? percent(cacheHitRatio) : "—";
-              const cacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
+              const rawCacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
+              const cacheDetailLabel = rawCacheDetailLabel.replace(/^.+? \/ .+? · /, "");
               const traceItems = [
                 request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
                 request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
@@ -2772,17 +2844,8 @@ function CachePanel({
                     <div className="request-cache-result">
                       <div className="request-cache-summary">
                         <b>{isFailedRequest ? (primaryStatus || "error") : `命中率 ${cacheRatioLabel}`}</b>
-                        <small title={cacheDisplay.secondaryTitle ?? cacheDetailLabel}>{cacheDetailLabel}</small>
+                        <small title={cacheDisplay.secondaryTitle ?? rawCacheDetailLabel}>{cacheDetailLabel}</small>
                       </div>
-                      {hasRequestDetails ? (
-                        <span
-                          className="request-detail-hint"
-                          aria-label={isExpanded ? "收起详情" : "查看详情"}
-                          title={isExpanded ? "收起详情" : "查看详情"}
-                        >
-                          <ChevronDown size={14} />
-                        </span>
-                      ) : null}
                     </div>
                   </div>
                   {hasRequestDetails && isExpanded ? (

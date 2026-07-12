@@ -164,22 +164,31 @@ fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
     if !text_like {
         return false;
     }
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return json_value_has_error(&value);
+    }
     let text = String::from_utf8_lossy(bytes);
     if text.contains("\"type\":\"error\"")
         || text.contains("\"type\":\"response.failed\"")
         || text.contains("\"type\":\"response.incomplete\"")
-        || text.contains("\"error\":")
         || text.contains("event: error")
     {
         return true;
     }
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        return json_value_has_error(&value);
+    for line in text.lines() {
+        let Some(data) = line.trim_start().strip_prefix("data:") else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
+            if json_value_has_error(&value) {
+                return true;
+            }
+        }
     }
     false
 }
 fn json_value_has_error(value: &Value) -> bool {
-    if value.get("error").is_some() {
+    if value.get("error").is_some_and(|error| !error.is_null()) {
         return true;
     }
     value
@@ -17074,8 +17083,24 @@ mod tests {
             b"event: error\ndata: {\"message\":\"bad\"}\n\n",
             "text/event-stream"
         ));
+        assert!(upstream_body_has_error(
+            b"event: message\ndata: {\"error\":{\"message\":\"bad\"}}\n\n",
+            "text/event-stream"
+        ));
+        assert!(!upstream_body_has_error(
+            b"event: message\ndata: {\"error\":null}\n\n",
+            "text/event-stream"
+        ));
         assert!(!upstream_body_has_error(
             br#"{"type":"response.completed","usage":{"input_tokens":1}}"#,
+            "application/json"
+        ));
+        assert!(!upstream_body_has_error(
+            br#"{"type":"response.completed","error":null,"id":"resp_ok"}"#,
+            "application/json"
+        ));
+        assert!(upstream_body_has_error(
+            br#"{"error":{"message":"provider failed"}}"#,
             "application/json"
         ));
     }
@@ -21947,6 +21972,7 @@ mod tests {
                         *nonce.lock().await = token;
                         Json(json!({
                             "id": "resp_probe_seed",
+                            "error": null,
                             "output": [{
                                 "type": "message",
                                 "content": [{ "type": "output_text", "text": "ACK" }]
@@ -21957,6 +21983,7 @@ mod tests {
                         let token = nonce.lock().await.clone();
                         Json(json!({
                             "id": "resp_probe_continuation",
+                            "error": null,
                             "output": [{
                                 "type": "message",
                                 "content": [{ "type": "output_text", "text": token }]
