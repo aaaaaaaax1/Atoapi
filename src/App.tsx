@@ -156,8 +156,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.97";
+const appVersion = "v0.1.98";
 const appVersionNotes = [
+  "v0.1.98: 优化流式 relay 首 chunk 转发；第三方 Responses 默认跳过不兼容的 previous_response_id 复用，避免 400 后重复完整请求；保留第三方 prompt_cache_retention 独立启用。",
   "v0.1.97: 修正请求数统计口径，一条入站请求只计一次；修复压缩后会话续接丢锚点；优化请求记录两行指标与命中详情布局。",
   "v0.1.96: 修复请求历史与上游调用记录口径不一致导致的漏显示，并将请求记录改回紧凑的一行式列表。",
   "v0.1.95: Codex 主会话 delta 复用不再被硬关闭，进入安全判断与上游拒绝回退链路。",
@@ -2468,6 +2469,11 @@ function CachePanel({
               const requestedModel = request.requested_model?.trim();
               const hasModelMapping = Boolean(requestedModel && requestedModel !== request.model);
               const displayModel = hasModelMapping ? requestedModel : request.model;
+              const effectiveReasoningEffort =
+                request.effective_reasoning_effort?.trim() ||
+                request.configured_reasoning_effort?.trim() ||
+                request.agent_reasoning_effort?.trim() ||
+                null;
               const priorityMetricItems = [
                 { label: "首字", value: formatDurationMs(request.ttft_ms) },
                 { label: "用时", value: formatDurationMs(request.total_ms) }
@@ -2475,7 +2481,8 @@ function CachePanel({
               const secondaryMetricItems = [
                 { label: "输入", value: formatCompactTokens(inputTokens) },
                 { label: "输出", value: formatCompactTokens(outputTokens) },
-                { label: "命中", value: formatCompactTokens(cacheReadTokens) }
+                { label: "命中", value: formatCompactTokens(cacheReadTokens) },
+                { label: "思考", value: formatReasoningEffort(effectiveReasoningEffort) }
               ];
               const cacheRatioLabel = inputTokens > 0 ? percent(cacheHitRatio) : "—";
               const cacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
@@ -2494,6 +2501,7 @@ function CachePanel({
                 `输入 ${formatNumber(inputTokens)}`,
                 `输出 ${formatNumber(outputTokens)}`,
                 `缓存命中 ${formatNumber(cacheReadTokens)}`,
+                `思考 ${formatReasoningEffort(effectiveReasoningEffort)}`,
                 request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
                 request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
                 request.upstream_attempt_total ? `尝试 ${request.upstream_attempt_index ?? 1}/${request.upstream_attempt_total}` : ""
@@ -2572,8 +2580,11 @@ function CachePanel({
                         <small title={cacheDisplay.secondaryTitle ?? cacheDetailLabel}>{cacheDetailLabel}</small>
                       </div>
                       {hasRequestDetails ? (
-                        <span className="request-detail-hint">
-                          {isExpanded ? "收起详情" : "查看详情"}
+                        <span
+                          className="request-detail-hint"
+                          aria-label={isExpanded ? "收起详情" : "查看详情"}
+                          title={isExpanded ? "收起详情" : "查看详情"}
+                        >
                           <ChevronDown size={14} />
                         </span>
                       ) : null}
@@ -3337,6 +3348,20 @@ function formatDurationMs(value?: number | null) {
   if (ms >= 10_000) return `${Math.round(ms / 1000)}s`;
   if (ms >= 1000) return `${trimNumber(ms / 1000)}s`;
   return `${ms}ms`;
+}
+
+function formatReasoningEffort(value?: string | null) {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return "默认";
+  const labels: Record<string, string> = {
+    none: "无",
+    minimal: "极低",
+    low: "低",
+    medium: "中",
+    high: "高",
+    xhigh: "极高"
+  };
+  return labels[normalized] ?? normalized;
 }
 
 function visiblePages(current: number, total: number): Array<number | "ellipsis"> {

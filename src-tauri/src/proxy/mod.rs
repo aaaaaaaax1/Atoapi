@@ -5453,7 +5453,20 @@ fn should_attempt_main_response_session_delta(
 }
 
 fn supports_main_response_session_delta(decision: &RouteDecision) -> bool {
-    matches!(decision.upstream_channel, Channel::Responses)
+    if !matches!(decision.upstream_channel, Channel::Responses) {
+        return false;
+    }
+
+    // This gate is only for `previous_response_id` server-side session reuse;
+    // it does not control prompt-cache retention, which remains independently
+    // opt-in for third-party providers in `supports_extended_prompt_cache_retention`.
+    // Third-party gateways frequently accept the session field but reject it
+    // after reading the body, forcing a second full request and adding seconds
+    // to TTFT. Keep the zero-extra-request path as the default for them.
+    reqwest::Url::parse(&decision.provider.base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.openai.com")
 }
 
 fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>) -> bool {
@@ -8254,21 +8267,15 @@ async fn stream_upstream(
                     break;
                 }
             };
+            let chunk_received_at = started.elapsed().as_millis() as u64;
             if first_chunk_at.is_none() {
-                first_chunk_at = Some(started.elapsed().as_millis() as u64);
+                first_chunk_at = Some(chunk_received_at);
             }
             sse_chunks += 1;
-            let observation = stream_state.ingest(&chunk);
-            if first_model_output_at.is_none() && observation.model_output_started {
-                first_model_output_at = Some(started.elapsed().as_millis() as u64);
-            }
-            if eligible {
-                cache_body.extend_from_slice(&chunk);
-            }
             if !downstream_disconnected {
                 let client_backpressure_started = Instant::now();
                 if downstream_sender
-                    .send(Ok::<Bytes, Infallible>(chunk))
+                    .send(Ok::<Bytes, Infallible>(chunk.clone()))
                     .await
                     .is_err()
                 {
@@ -8276,6 +8283,13 @@ async fn stream_upstream(
                 }
                 stream_client_backpressure_ms = stream_client_backpressure_ms
                     .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
+            }
+            let observation = stream_state.ingest(&chunk);
+            if first_model_output_at.is_none() && observation.model_output_started {
+                first_model_output_at = Some(chunk_received_at);
+            }
+            if eligible {
+                cache_body.extend_from_slice(&chunk);
             }
         }
         let stream_metadata = stream_state.finish();
@@ -14673,7 +14687,7 @@ mod tests {
             },
             ..decision
         };
-        assert!(should_attempt_main_response_session_delta(
+        assert!(!should_attempt_main_response_session_delta(
             &config,
             &third_party_decision,
             true,
