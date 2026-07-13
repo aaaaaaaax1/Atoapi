@@ -2,7 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tauri::State;
 
 use crate::{
@@ -22,6 +25,7 @@ use crate::{
 type CommandResult<T> = Result<T, String>;
 
 const ERROR_BODY_MAX_CHARS: usize = 512;
+const PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
 const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/api/claudecode",
     "/api/anthropic",
@@ -86,6 +90,33 @@ pub struct ProviderKeyTestResult {
     pub ok: bool,
     pub message: String,
     pub models_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderNetworkPathDiagnosticResult {
+    pub provider_id: String,
+    pub target_url: String,
+    pub paths: Vec<ProviderNetworkPathResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderNetworkPathResult {
+    pub path: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+struct ProviderNetworkPathAttempt {
+    result: ProviderNetworkPathResult,
+    has_valid_model_list: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -755,6 +786,16 @@ pub async fn test_provider_key_pool(
 }
 
 #[tauri::command]
+pub async fn diagnose_provider_network_paths(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<ProviderNetworkPathDiagnosticResult> {
+    diagnose_provider_network_paths_inner(&state, &provider_id)
+        .await
+        .map_err(to_command_error)
+}
+
+#[tauri::command]
 pub async fn reveal_provider_api_key(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
@@ -836,6 +877,205 @@ pub async fn fetch_provider_models(
     .map_err(to_command_error)?;
 
     Ok(models)
+}
+
+async fn diagnose_provider_network_paths_inner(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<ProviderNetworkPathDiagnosticResult> {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(anyhow!("provider id is empty"));
+    }
+
+    // Select from a config snapshot so this manual diagnostic never rotates a
+    // pool, updates key counters, or otherwise changes the saved provider.
+    let (provider, api_key) = {
+        let config = state.config.read().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+        let mut selection_snapshot = config.clone();
+        let selected_key = selection_snapshot
+            .select_provider_key_for_request(provider_id, None, None)
+            .with_context(|| format!("failed to select provider key for {provider_id}"))?
+            .ok_or_else(|| anyhow!("provider API key is not configured"))?;
+        if selected_key.secret.trim().is_empty() {
+            return Err(anyhow!("provider API key is not configured"));
+        }
+        (provider, selected_key.secret)
+    };
+
+    let candidates = model_endpoint_candidates(
+        &provider.base_url,
+        provider.is_full_url,
+        provider.models_url.as_deref(),
+    )
+    .with_context(|| format!("could not derive a models URL for provider {provider_id}"))?;
+
+    let custom_user_agent = provider.custom_user_agent.as_deref();
+    let mut last_attempt = None;
+    for target_url in candidates {
+        // Each candidate is compared over the same endpoint and credentials.
+        // Only a valid model list can select it; a status-only 200 is not
+        // enough to hide a compatibility fallback.
+        let (direct, system_proxy) = tokio::join!(
+            diagnose_model_endpoint(
+                "direct",
+                state.upstream_client(false),
+                &target_url,
+                &provider.channel,
+                &api_key,
+                custom_user_agent,
+            ),
+            diagnose_model_endpoint(
+                "system-proxy",
+                state.upstream_client(true),
+                &target_url,
+                &provider.channel,
+                &api_key,
+                custom_user_agent,
+            )
+        );
+        let has_valid_model_list = direct.has_valid_model_list || system_proxy.has_valid_model_list;
+        let paths = vec![direct.result, system_proxy.result];
+        if has_valid_model_list {
+            return Ok(ProviderNetworkPathDiagnosticResult {
+                provider_id: provider_id.to_string(),
+                target_url,
+                paths,
+            });
+        }
+        last_attempt = Some((target_url, paths));
+    }
+
+    let (target_url, paths) = last_attempt
+        .ok_or_else(|| anyhow!("could not derive a models URL for provider {provider_id}"))?;
+    Ok(ProviderNetworkPathDiagnosticResult {
+        provider_id: provider_id.to_string(),
+        target_url,
+        paths,
+    })
+}
+
+async fn diagnose_model_endpoint(
+    path: &'static str,
+    client: &reqwest::Client,
+    url: &str,
+    channel: &Channel,
+    api_key: &str,
+    custom_user_agent: Option<&str>,
+) -> ProviderNetworkPathAttempt {
+    let started_at = Instant::now();
+    let outcome = tokio::time::timeout(
+        PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT,
+        model_list_request(client, url, channel, Some(api_key), custom_user_agent).send(),
+    )
+    .await;
+    let elapsed_ms = started_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+    match outcome {
+        Ok(Ok(response)) => {
+            let status = response.status();
+            let mut result = ProviderNetworkPathResult {
+                path: path.to_string(),
+                ok: false,
+                status: Some(status.as_u16()),
+                elapsed_ms,
+                http_version: Some(format!("{:?}", response.version())),
+                remote_addr: response.remote_addr().map(|address| address.to_string()),
+                error: None,
+            };
+            if !status.is_success() {
+                result.error = Some(format!("HTTP {status}"));
+                return ProviderNetworkPathAttempt {
+                    result,
+                    has_valid_model_list: false,
+                };
+            }
+
+            let remaining = PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT
+                .checked_sub(started_at.elapsed())
+                .unwrap_or_default();
+            let body = match tokio::time::timeout(remaining, response.text()).await {
+                Ok(Ok(body)) => body,
+                Ok(Err(_)) => {
+                    result.error = Some("could not read response body".to_string());
+                    return ProviderNetworkPathAttempt {
+                        result,
+                        has_valid_model_list: false,
+                    };
+                }
+                Err(_) => {
+                    result.error = Some(format!(
+                        "timed out after {}s",
+                        PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT.as_secs()
+                    ));
+                    return ProviderNetworkPathAttempt {
+                        result,
+                        has_valid_model_list: false,
+                    };
+                }
+            };
+            let value = match serde_json::from_str::<Value>(&body) {
+                Ok(value) => value,
+                Err(_) => {
+                    result.error = Some("response body was not valid JSON".to_string());
+                    return ProviderNetworkPathAttempt {
+                        result,
+                        has_valid_model_list: false,
+                    };
+                }
+            };
+            if value.get("success").and_then(Value::as_bool) == Some(false) {
+                result.error = Some("upstream reported failure".to_string());
+                return ProviderNetworkPathAttempt {
+                    result,
+                    has_valid_model_list: false,
+                };
+            }
+
+            let has_valid_model_list = !parse_models(value).is_empty();
+            result.ok = has_valid_model_list;
+            if !has_valid_model_list {
+                result.error = Some("response did not contain model records".to_string());
+            }
+            ProviderNetworkPathAttempt {
+                result,
+                has_valid_model_list,
+            }
+        }
+        Ok(Err(err)) => ProviderNetworkPathAttempt {
+            result: ProviderNetworkPathResult {
+                path: path.to_string(),
+                ok: false,
+                status: None,
+                elapsed_ms,
+                http_version: None,
+                remote_addr: None,
+                error: Some(err.to_string()),
+            },
+            has_valid_model_list: false,
+        },
+        Err(_) => ProviderNetworkPathAttempt {
+            result: ProviderNetworkPathResult {
+                path: path.to_string(),
+                ok: false,
+                status: None,
+                elapsed_ms,
+                http_version: None,
+                remote_addr: None,
+                error: Some(format!(
+                    "timed out after {}s",
+                    PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT.as_secs()
+                )),
+            },
+            has_valid_model_list: false,
+        },
+    }
 }
 
 async fn test_provider_key_inner(
@@ -1235,6 +1475,28 @@ pub async fn update_agent_injection_route(
     Ok(results)
 }
 
+fn model_list_request(
+    client: &reqwest::Client,
+    url: &str,
+    channel: &Channel,
+    api_key: Option<&str>,
+    custom_user_agent: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut request = client.get(url);
+    if let Some(api_key) = api_key {
+        request = request.bearer_auth(api_key);
+        if matches!(channel, Channel::Anthropic) {
+            request = request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01");
+        }
+    }
+    if let Some(user_agent) = custom_user_agent {
+        request = request.header(reqwest::header::USER_AGENT, user_agent);
+    }
+    request
+}
+
 async fn fetch_models_from_upstream_with_options(
     client: &reqwest::Client,
     base_url: &str,
@@ -1247,19 +1509,10 @@ async fn fetch_models_from_upstream_with_options(
     let candidates = model_endpoint_candidates(base_url, is_full_url, models_url)?;
     let mut last_error = None;
     for url in candidates {
-        let mut request = client.get(&url);
-        if let Some(api_key) = api_key {
-            request = request.bearer_auth(api_key);
-            if matches!(channel, Channel::Anthropic) {
-                request = request
-                    .header("x-api-key", api_key)
-                    .header("anthropic-version", "2023-06-01");
-            }
-        }
-        if let Some(user_agent) = custom_user_agent {
-            request = request.header(reqwest::header::USER_AGENT, user_agent);
-        }
-        match request.send().await {
+        match model_list_request(client, &url, &channel, api_key, custom_user_agent)
+            .send()
+            .await
+        {
             Ok(response) => {
                 let status = response.status();
                 let content_type = response
@@ -1695,6 +1948,152 @@ mod tests {
             model_endpoint_candidates("https://proxy.example.com/v1/chat/completions", true, None)
                 .unwrap();
         assert_eq!(candidates, vec!["https://proxy.example.com/v1/models"]);
+    }
+
+    #[tokio::test]
+    async fn provider_network_path_diagnostic_uses_one_saved_endpoint_and_key_without_mutation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen_headers = Arc::new(tokio::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen_headers_for_app = seen_headers.clone();
+        let upstream_app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen_headers = seen_headers_for_app.clone();
+                async move {
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    let user_agent = headers
+                        .get(axum::http::header::USER_AGENT)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen_headers.lock().await.push((authorization, user_agent));
+                    axum::Json(json!({ "data": [{ "id": "diagnostic-model" }] }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-network-path-diagnostic-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let mut config = AppConfig::default();
+        let mut provider = test_provider("network-diagnostic");
+        provider.base_url = format!("http://{address}/v1");
+        provider.custom_user_agent = Some("AtoapiNetworkDiagnosticTest/1.0".to_string());
+        provider.api_key_encrypted = Some("diagnostic-secret".to_string());
+        config.providers.push(provider);
+        let config_before = toml::to_string(&config).unwrap();
+        let state = AppState::for_test(
+            config,
+            config_dir.join("config.toml"),
+            crate::cache::CacheStore::load(config_dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        let result = diagnose_provider_network_paths_inner(&state, "network-diagnostic")
+            .await
+            .unwrap();
+
+        assert_eq!(result.provider_id, "network-diagnostic");
+        assert_eq!(result.target_url, format!("http://{address}/v1/models"));
+        assert_eq!(result.paths.len(), 2);
+        assert_eq!(result.paths[0].path, "direct");
+        assert_eq!(result.paths[1].path, "system-proxy");
+        assert!(result.paths.iter().all(|path| path.ok));
+        assert!(result
+            .paths
+            .iter()
+            .all(|path| path.status == Some(200) && path.error.is_none()));
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("diagnostic-secret"));
+
+        let config_after = {
+            let config = state.config.read().await;
+            toml::to_string(&*config).unwrap()
+        };
+        assert_eq!(config_after, config_before);
+
+        let seen_headers = seen_headers.lock().await;
+        assert_eq!(seen_headers.len(), 2);
+        assert!(seen_headers.iter().all(|(authorization, user_agent)| {
+            authorization == "Bearer diagnostic-secret"
+                && user_agent == "AtoapiNetworkDiagnosticTest/1.0"
+        }));
+
+        std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn provider_network_path_diagnostic_falls_back_to_next_common_models_endpoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_candidate_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_candidate_hits = Arc::new(AtomicUsize::new(0));
+        let first_candidate_hits_for_app = first_candidate_hits.clone();
+        let fallback_candidate_hits_for_app = fallback_candidate_hits.clone();
+        let upstream_app = axum::Router::new()
+            .route(
+                "/api/anthropic/v1/models",
+                axum::routing::get(move || {
+                    let hits = first_candidate_hits_for_app.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({ "data": [] }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                axum::routing::get(move || {
+                    let hits = fallback_candidate_hits_for_app.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({ "data": [{ "id": "fallback-model" }] }))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-network-path-diagnostic-fallback-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let mut config = AppConfig::default();
+        let mut provider = test_provider("network-diagnostic-fallback");
+        provider.base_url = format!("http://{address}/api/anthropic");
+        provider.api_key_encrypted = Some("diagnostic-secret".to_string());
+        config.providers.push(provider);
+        let state = AppState::for_test(
+            config,
+            config_dir.join("config.toml"),
+            crate::cache::CacheStore::load(config_dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        let result = diagnose_provider_network_paths_inner(&state, "network-diagnostic-fallback")
+            .await
+            .unwrap();
+
+        assert_eq!(result.target_url, format!("http://{address}/v1/models"));
+        assert!(result.paths.iter().all(|path| path.ok));
+        assert_eq!(first_candidate_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_candidate_hits.load(Ordering::SeqCst), 2);
+
+        std::fs::remove_dir_all(config_dir).ok();
     }
 
     #[test]

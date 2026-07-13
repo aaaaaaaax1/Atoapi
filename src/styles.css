@@ -49,7 +49,6 @@
 
 body {
   margin: 0;
-  min-width: 1000px;
   min-height: 100dvh;
   background: #20211f;
 }
@@ -1349,6 +1348,7 @@ button:disabled {
 .request-log-panel {
   gap: 10px;
   min-width: 0;
+  container-type: inline-size;
 }
 
 .request-log-head {
@@ -1852,13 +1852,13 @@ button:disabled {
 
 .request-row {
   display: grid;
-  grid-template-columns: minmax(230px, 0.82fr) minmax(300px, 1fr) minmax(190px, 0.58fr);
+  grid-template-columns: minmax(220px, 0.84fr) minmax(280px, 1fr) minmax(166px, 0.55fr);
   grid-template-areas: "top metrics cache";
   align-items: center;
-  gap: 12px 18px;
+  gap: 10px 16px;
   justify-content: stretch;
   min-width: 0;
-  min-height: 68px;
+  min-height: 72px;
   padding: 8px 10px;
   border: 1px solid rgba(150, 158, 148, 0.12);
   border-radius: 10px;
@@ -2176,8 +2176,8 @@ button:disabled {
   word-break: break-word;
   text-overflow: clip;
   line-height: 1.25;
-  font-size: 11px;
-  font-weight: 850;
+  font-size: 16px;
+  font-weight: 900;
 }
 
 .request-cache-result b,
@@ -2514,10 +2514,6 @@ button:disabled {
 }
 
 @media (max-width: 1180px) {
-  body {
-    min-width: 900px;
-  }
-
   .app-shell {
     grid-template-columns: 286px minmax(0, 1fr);
   }
@@ -2541,20 +2537,6 @@ button:disabled {
   .summary-strip {
     width: min(480px, 54vw);
     grid-template-columns: repeat(3, minmax(110px, 1fr));
-  }
-
-  .request-row {
-    grid-template-columns: minmax(0, 1fr) minmax(150px, 0.46fr);
-    grid-template-areas:
-      "top cache"
-      "metrics cache";
-    align-items: start;
-    gap: 8px 10px;
-    padding: 8px 10px;
-  }
-
-  .request-cache-result {
-    grid-column: auto;
   }
 
   .request-row-top {
@@ -2605,11 +2587,156 @@ button:disabled {
   }
 
   .request-cache-result b {
-    font-size: 11px;
+    font-size: 14px;
+    line-height: 1.15;
   }
 
   .request-detail-panel {
     margin-left: 24px;
+  }
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 208px minmax(0, 1fr);
+  }
+
+  .side-rail {
+    gap: 12px;
+    padding: 16px 12px;
+  }
+
+  .main-panel {
+    gap: 14px;
+    padding: 14px;
+  }
+
+  .surface {
+    padding: 14px;
+  }
+
+  .topbar,
+  .panel-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+
+  .topbar > div:first-child,
+  .panel-head > div {
+    min-width: 0;
+  }
+
+  .summary-strip {
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .summary-card {
+    padding: 9px 10px;
+  }
+
+  .summary-card span {
+    font-size: 11px;
+  }
+
+  .summary-card b {
+    font-size: 18px;
+  }
+}
+
+@media (max-width: 700px) {
+  .app-shell {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  .side-rail {
+    align-items: stretch;
+    gap: 10px;
+    padding: 12px 10px;
+  }
+
+  .brand-lockup {
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+  }
+
+  .brand-lockup > div:not(.brand-mark),
+  .side-section-head,
+  .agent-side-copy,
+  .agent-side-tab > .mini-toggle {
+    display: none;
+  }
+
+  .agent-side-list {
+    gap: 6px;
+  }
+
+  .agent-side-tab {
+    min-height: 50px;
+    grid-template-columns: 1fr;
+    justify-items: center;
+    padding: 8px;
+  }
+
+  .side-utility-nav {
+    gap: 6px;
+    padding-top: 8px;
+  }
+
+  .utility-tab {
+    justify-content: center;
+    gap: 0;
+    padding: 0;
+    font-size: 0;
+  }
+
+  .utility-tab svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .main-panel {
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .surface {
+    padding: 12px;
+  }
+
+  .summary-strip {
+    gap: 6px;
+  }
+
+  .summary-card {
+    padding: 7px 6px;
+  }
+
+  .summary-card span,
+  .summary-card b {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .summary-card span {
+    font-size: 9px;
+  }
+
+  .summary-card b {
+    font-size: 14px;
+  }
+
+  .request-log-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+
+  .request-log-head span {
+    font-size: 11px;
   }
 }
 
@@ -2637,6 +2764,32 @@ button:disabled {
 
 .provider-option-control h4 {
   font-size: 14px;
+}
+
+.provider-option-actions {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 8px;
+}
+
+.provider-option-actions .icon-button {
+  width: 34px;
+  height: 34px;
+  padding: 0;
+}
+
+.provider-network-path-button {
+  color: #b9d9e7;
+}
+
+.provider-network-path-result {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: #aebbb2;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .provider-option-title {
@@ -3189,28 +3342,6 @@ button:disabled {
     gap: 4px 7px;
   }
 
-  .request-row {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-areas:
-      "top"
-      "metrics"
-      "cache";
-  }
-
-  .request-cache-result {
-    grid-column: auto;
-    justify-content: center;
-    align-items: flex-start;
-  }
-
-  .request-cache-summary {
-    justify-items: center;
-  }
-
-  .request-cache-result small {
-    text-align: center;
-  }
-
   .request-model-map {
     max-width: 100%;
   }
@@ -3222,6 +3353,170 @@ button:disabled {
   .request-detail-line {
     grid-template-columns: 1fr;
     gap: 4px;
+  }
+}
+
+@container (max-width: 760px) {
+  .request-row {
+    grid-template-columns: minmax(120px, 0.95fr) minmax(168px, 1.18fr) minmax(96px, 0.72fr);
+    grid-template-areas: "top metrics cache";
+    align-items: center;
+    gap: 8px;
+    min-height: 64px;
+    padding: 7px 8px;
+  }
+
+  .request-row-top {
+    grid-template-columns: 14px minmax(0, 1fr);
+    gap: 3px 5px;
+  }
+
+  .request-row time {
+    font-size: 10px;
+  }
+
+  .request-provider-text {
+    overflow: hidden;
+    font-size: 11px;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .request-model-map {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 9px;
+    line-height: 1.2;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .request-badges {
+    gap: 3px;
+  }
+
+  .request-row .request-channel-badge,
+  .request-row .request-agent-badge,
+  .request-row .request-call-badge {
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    padding: 2px 4px;
+    font-size: 9px;
+    text-overflow: ellipsis;
+  }
+
+  .request-row .request-metrics {
+    gap: 3px;
+    font-size: 10px;
+  }
+
+  .request-metrics-priority,
+  .request-metrics-rest {
+    flex-wrap: nowrap;
+    gap: 2px 6px;
+  }
+
+  .request-metrics-priority .request-metric-chip {
+    flex: 0 1 auto;
+  }
+
+  .request-metrics-rest .request-metric-chip {
+    flex: 1 1 0;
+    gap: 2px;
+    justify-content: center;
+  }
+
+  .request-metric-chip small {
+    font-size: 8px;
+  }
+
+  .request-metric-chip b {
+    font-size: 10px;
+  }
+
+  .request-metric-chip.hot b {
+    font-size: 11px;
+  }
+
+  .request-cache-result {
+    align-items: center;
+    justify-content: flex-end;
+    align-self: stretch;
+    text-align: right;
+  }
+
+  .request-cache-summary {
+    justify-items: end;
+    gap: 2px;
+  }
+
+  .request-cache-result b,
+  .request-cache-result small {
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 9px;
+    text-align: right;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .request-cache-result b {
+    font-size: 13px;
+    line-height: 1.15;
+  }
+
+  .request-detail-panel {
+    margin-left: 0;
+  }
+}
+
+@container (max-width: 430px) {
+  .request-row {
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 1.14fr) minmax(0, 0.71fr);
+    gap: 5px;
+    min-height: 60px;
+    padding: 6px;
+  }
+
+  .request-row-top {
+    grid-template-columns: 12px minmax(0, 1fr);
+    gap: 3px 4px;
+  }
+
+  .request-identity svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .request-metrics-priority,
+  .request-metrics-rest {
+    gap: 1px 2px;
+  }
+
+  .request-metrics-priority .request-metric-chip,
+  .request-metrics-rest .request-metric-chip {
+    gap: 1px;
+  }
+
+  .request-metric-chip small {
+    font-size: 7px;
+  }
+
+  .request-metric-chip b,
+  .request-metric-chip.hot b {
+    font-size: 9px;
+  }
+
+  .request-cache-result b {
+    font-size: 11px;
+    line-height: 1.1;
+  }
+
+  .request-cache-result small {
+    font-size: 8px;
   }
 }
 

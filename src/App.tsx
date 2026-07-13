@@ -32,7 +32,7 @@ import {
   Zap
 } from "lucide-react";
 import type { Dispatch, ReactNode, SetStateAction } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AgentInjectionConfig,
   AgentInjectionResult,
@@ -49,6 +49,7 @@ import {
   ProviderInput,
   ProviderKeyStatus,
   ProviderKeyTestResult,
+  ProviderNetworkPathDiagnosticResult,
   ProviderResponseSessionReuseProbeResult,
   ProxyModeConfigInput
 } from "./lib/api";
@@ -158,8 +159,11 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.1.100";
+const appVersion = "v0.2.3";
 const appVersionNotes = [
+  "v0.2.3: 思考强度上游返回 HTML 502 时执行一次受控降档探测，仅在下一档成功后持久化降档。",
+  "v0.2.2: 网络路径诊断支持一键应用较快的成功路径；会话复用未验证原因更精确显示。",
+  "v0.2.1: 新增上游网络路径诊断；推理强度按 high → medium → low 严格降档；流式交接不再被 Key 成功状态写入阻塞。",
   "v0.1.100: 修复第三方 Responses 探测将 error:null 误判为失败；会话复用提示收起原始回包，并重排请求记录为紧凑三栏两行布局。",
   "v0.1.99: 第三方 Responses 仅在手动兼容性验证通过后启用会话增量复用；Agent 请求严格一次入站、一次上游，避免 Key 切换、协议回退或完整上下文补发拖慢首字。",
   "v0.1.97: 修正请求数统计口径，一条入站请求只计一次；修复压缩后会话续接丢锚点；优化请求记录两行指标与命中详情布局。",
@@ -204,6 +208,9 @@ export default function App() {
   const [selectedFetchedModelId, setSelectedFetchedModelId] = useState("");
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [loadingModels, setLoadingModels] = useState(false);
+  const [diagnosingNetworkPaths, setDiagnosingNetworkPaths] = useState(false);
+  const [networkPathDiagnostic, setNetworkPathDiagnostic] =
+    useState<ProviderNetworkPathDiagnosticResult | null>(null);
   const [savingProvider, setSavingProvider] = useState(false);
   const [probingSessionReuse, setProbingSessionReuse] = useState("");
   const [savingCachePolicy, setSavingCachePolicy] = useState(false);
@@ -216,14 +223,45 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [dismissedRetentionWarningKey, setDismissedRetentionWarningKey] = useState("");
+  const configRef = useRef<AppConfig | null>(null);
+  const reasoningFallbackConfigSyncing = useRef(false);
+  const seenReasoningFallbackFailures = useRef(new Set<string>());
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   useEffect(() => {
     void refreshAll();
     const timer = window.setInterval(() => {
       void refreshMetrics();
-    }, 2500);
+    }, 1000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    const fallbackFailures = (metrics?.recent_failed_requests ?? []).filter(
+      isPersistedModelReasoningFallbackFailure
+    );
+    const hasUnseenFailure = fallbackFailures.some(
+      (request) => !seenReasoningFallbackFailures.current.has(request.id)
+    );
+    if (!hasUnseenFailure || reasoningFallbackConfigSyncing.current) return;
+
+    reasoningFallbackConfigSyncing.current = true;
+    void syncPersistedModelReasoningFallback().then(
+      () => {
+        fallbackFailures.forEach((request) => {
+          seenReasoningFallbackFailures.current.add(request.id);
+        });
+      },
+      () => {
+        // Leave the failure unseen so the next metrics poll can retry the UI sync.
+      }
+    ).finally(() => {
+      reasoningFallbackConfigSyncing.current = false;
+    });
+  }, [metrics]);
 
   useEffect(() => {
     if (!versionOpen) return;
@@ -309,6 +347,18 @@ export default function App() {
     }
   }
 
+  async function syncPersistedModelReasoningFallback() {
+    const nextConfig = await command<AppConfig>("get_config");
+    const previousConfig = configRef.current;
+    if (previousConfig) {
+      setDraft((current) =>
+        mergePersistedModelReasoningFallback(current, previousConfig, nextConfig)
+      );
+    }
+    configRef.current = nextConfig;
+    setConfig(nextConfig);
+  }
+
   async function saveProxyModeConfig() {
     if (!config) return;
     const host = proxyModeDraft.host.trim();
@@ -344,6 +394,7 @@ export default function App() {
     setSelectedProviderId("new");
     setDraft(emptyDraft);
     setApiKeyVisible(false);
+    setNetworkPathDiagnostic(null);
     resetModelPicker();
     setProviderEditorOpen(true);
     setNotice("");
@@ -354,6 +405,7 @@ export default function App() {
     setSelectedProviderId(provider.id);
     setDraft(providerToDraft(provider));
     setApiKeyVisible(false);
+    setNetworkPathDiagnostic(null);
     resetModelPicker();
     setProviderEditorOpen(true);
     setNotice("");
@@ -436,6 +488,30 @@ export default function App() {
       setError(String(err));
     } finally {
       setLoadingModels(false);
+    }
+  }
+
+  async function diagnoseNetworkPaths() {
+    const providerId = draft.id?.trim();
+    if (!providerId) {
+      setError("请先保存上游，再比较网络路径");
+      return;
+    }
+    setDiagnosingNetworkPaths(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await command<ProviderNetworkPathDiagnosticResult>(
+        "diagnose_provider_network_paths",
+        { providerId, provider_id: providerId }
+      );
+      setNetworkPathDiagnostic(result);
+      setNotice(`路径诊断完成：${formatNetworkPathDiagnostic(result)}`);
+    } catch (err) {
+      setNetworkPathDiagnostic(null);
+      setError(String(err));
+    } finally {
+      setDiagnosingNetworkPaths(false);
     }
   }
 
@@ -998,6 +1074,8 @@ export default function App() {
           selectedProviderId={selectedProviderId}
           apiKeyVisible={apiKeyVisible}
           loadingModels={loadingModels}
+          diagnosingNetworkPaths={diagnosingNetworkPaths}
+          networkPathDiagnostic={networkPathDiagnostic}
           savingProvider={savingProvider}
           probingSessionReuse={probingSessionReuse}
           modelCandidates={modelCandidates}
@@ -1005,6 +1083,7 @@ export default function App() {
           onDraftChange={setDraft}
           onApiKeyVisibleChange={(visible) => void toggleApiKeyVisibility(visible)}
           onFetchModels={() => void fetchModels()}
+          onDiagnoseNetworkPaths={() => void diagnoseNetworkPaths()}
           onSelectedFetchedModelChange={setSelectedFetchedModelId}
           onAddFetchedModel={addFetchedModel}
           onAddManualModel={addManualModel}
@@ -1431,6 +1510,8 @@ function ProviderEditorModal({
   selectedProviderId,
   apiKeyVisible,
   loadingModels,
+  diagnosingNetworkPaths,
+  networkPathDiagnostic,
   savingProvider,
   probingSessionReuse,
   modelCandidates,
@@ -1438,6 +1519,7 @@ function ProviderEditorModal({
   onDraftChange,
   onApiKeyVisibleChange,
   onFetchModels,
+  onDiagnoseNetworkPaths,
   onSelectedFetchedModelChange,
   onAddFetchedModel,
   onAddManualModel,
@@ -1454,6 +1536,8 @@ function ProviderEditorModal({
   selectedProviderId: string;
   apiKeyVisible: boolean;
   loadingModels: boolean;
+  diagnosingNetworkPaths: boolean;
+  networkPathDiagnostic: ProviderNetworkPathDiagnosticResult | null;
   savingProvider: boolean;
   probingSessionReuse: string;
   modelCandidates: ModelConfig[];
@@ -1461,6 +1545,7 @@ function ProviderEditorModal({
   onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
   onApiKeyVisibleChange: (visible: boolean) => void;
   onFetchModels: () => void;
+  onDiagnoseNetworkPaths: () => void;
   onSelectedFetchedModelChange: (id: string) => void;
   onAddFetchedModel: () => void;
   onAddManualModel: () => void;
@@ -1497,6 +1582,8 @@ function ProviderEditorModal({
             selectedProviderId={selectedProviderId}
             apiKeyVisible={apiKeyVisible}
             loadingModels={loadingModels}
+            diagnosingNetworkPaths={diagnosingNetworkPaths}
+            networkPathDiagnostic={networkPathDiagnostic}
             savingProvider={savingProvider}
             probingSessionReuse={probingSessionReuse}
             modelCandidates={modelCandidates}
@@ -1504,6 +1591,7 @@ function ProviderEditorModal({
             onDraftChange={onDraftChange}
             onApiKeyVisibleChange={onApiKeyVisibleChange}
             onFetchModels={onFetchModels}
+            onDiagnoseNetworkPaths={onDiagnoseNetworkPaths}
             onSelectedFetchedModelChange={onSelectedFetchedModelChange}
             onAddFetchedModel={onAddFetchedModel}
             onAddManualModel={onAddManualModel}
@@ -1526,6 +1614,8 @@ function ProviderPanel({
   selectedProviderId,
   apiKeyVisible,
   loadingModels,
+  diagnosingNetworkPaths,
+  networkPathDiagnostic,
   savingProvider,
   probingSessionReuse,
   modelCandidates,
@@ -1533,6 +1623,7 @@ function ProviderPanel({
   onDraftChange,
   onApiKeyVisibleChange,
   onFetchModels,
+  onDiagnoseNetworkPaths,
   onSelectedFetchedModelChange,
   onAddFetchedModel,
   onAddManualModel,
@@ -1548,6 +1639,8 @@ function ProviderPanel({
   selectedProviderId: string;
   apiKeyVisible: boolean;
   loadingModels: boolean;
+  diagnosingNetworkPaths: boolean;
+  networkPathDiagnostic: ProviderNetworkPathDiagnosticResult | null;
   savingProvider: boolean;
   probingSessionReuse: string;
   modelCandidates: ModelConfig[];
@@ -1555,6 +1648,7 @@ function ProviderPanel({
   onDraftChange: Dispatch<SetStateAction<ProviderDraft>>;
   onApiKeyVisibleChange: (visible: boolean) => void;
   onFetchModels: () => void;
+  onDiagnoseNetworkPaths: () => void;
   onSelectedFetchedModelChange: (id: string) => void;
   onAddFetchedModel: () => void;
   onAddManualModel: () => void;
@@ -1571,6 +1665,13 @@ function ProviderPanel({
   const supportsResponseSessionReuse =
     draft.channel === "responses" && !isOfficialOpenAiResponsesProvider(draft.base_url);
   const savedProvider = config?.providers.find((provider) => provider.id === draft.id) ?? null;
+  const canDiagnoseNetworkPaths = Boolean(
+    savedProvider && providerDraftMatchesSavedNetworkPath(savedProvider, draft)
+  );
+  const currentNetworkPathDiagnostic =
+    canDiagnoseNetworkPaths && networkPathDiagnostic?.provider_id === draft.id
+      ? networkPathDiagnostic
+      : null;
   const [contextDrafts, setContextDrafts] = useState<Record<number, string>>({});
 
   function updateMode(value: "auto" | Channel) {
@@ -1674,24 +1775,71 @@ function ProviderPanel({
           <div className={draft.use_system_proxy ? "provider-option-control active" : "provider-option-control"}>
             <h4
               className="provider-option-title"
-              data-help="默认关闭并直连上游。只有该上游必须通过 Windows 系统代理才能访问时才开启；模型获取、Key 测活、普通转发、压缩和同步都会使用同一网络路径。"
+              data-help="默认关闭并直连上游。只有该上游必须通过 Windows 系统代理才能访问时才开启；模型获取、Key 测活、普通转发、压缩和同步都会使用同一网络路径。仪表按钮会用同一个模型列表端点分别探测直连与系统代理，不生成模型内容；闪电按钮只会把探测到的较快成功路径写入未保存草稿。"
               tabIndex={0}
             >
               使用系统代理
             </h4>
-            <button
-              className={draft.use_system_proxy ? "smart-cache-toggle on" : "smart-cache-toggle"}
-              type="button"
-              onClick={() =>
-                onDraftChange({
-                  ...draft,
-                  use_system_proxy: !draft.use_system_proxy
-                })
-              }
-            >
-              <span />
-              <b>{draft.use_system_proxy ? "开" : "关"}</b>
-            </button>
+            <div className="provider-option-actions">
+              {draft.id ? (
+                <button
+                  className="icon-button provider-network-path-button"
+                  type="button"
+                  onClick={onDiagnoseNetworkPaths}
+                  disabled={diagnosingNetworkPaths || !canDiagnoseNetworkPaths}
+                  title={
+                    canDiagnoseNetworkPaths
+                      ? "比较直连与系统代理的模型列表响应头耗时"
+                      : "请先保存 Base URL、模型列表地址、通道、User-Agent 或 API Key 的修改"
+                  }
+                  aria-label="比较直连与系统代理的模型列表响应头耗时"
+                >
+                  {diagnosingNetworkPaths ? <Loader2 className="spin" size={16} /> : <Gauge size={16} />}
+                </button>
+              ) : null}
+              {currentNetworkPathDiagnostic ? (
+                <button
+                  className="icon-button provider-network-path-button"
+                  type="button"
+                  onClick={() => {
+                    const fastest = currentNetworkPathDiagnostic.paths
+                      .filter((path) => path.ok)
+                      .sort((left, right) => left.elapsed_ms - right.elapsed_ms)[0];
+                    if (!fastest) return;
+                    onDraftChange({
+                      ...draft,
+                      use_system_proxy: fastest.path === "system-proxy"
+                    });
+                  }}
+                  title="应用探测到的较快成功路径"
+                  aria-label="应用探测到的较快成功路径"
+                >
+                  <Zap size={16} />
+                </button>
+              ) : null}
+              <button
+                className={draft.use_system_proxy ? "smart-cache-toggle on" : "smart-cache-toggle"}
+                type="button"
+                onClick={() =>
+                  onDraftChange({
+                    ...draft,
+                    use_system_proxy: !draft.use_system_proxy
+                  })
+                }
+              >
+                <span />
+                <b>{draft.use_system_proxy ? "开" : "关"}</b>
+              </button>
+            </div>
+            {currentNetworkPathDiagnostic ? (
+              <p
+                className="provider-network-path-result"
+                role="status"
+                title={networkPathDiagnosticTitle(currentNetworkPathDiagnostic)}
+              >
+                {formatNetworkPathDiagnostic(currentNetworkPathDiagnostic)}
+              </p>
+            ) : null}
           </div>
 
           {supportsPromptCacheRetention && (
@@ -2753,6 +2901,7 @@ function CachePanel({
               const cacheRatioLabel = inputTokens > 0 ? percent(cacheHitRatio) : "—";
               const rawCacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
               const cacheDetailLabel = rawCacheDetailLabel.replace(/^.+? \/ .+? · /, "");
+              const timingDetail = requestTimingDetail(request);
               const traceItems = [
                 request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
                 request.upstream_request_id ? `上游 ${shortTraceId(request.upstream_request_id)}` : "",
@@ -2760,7 +2909,7 @@ function CachePanel({
               ].filter(Boolean);
               const requestKey = `${request.feed_kind}-${request.id}`;
               const detailsId = `request-details-${requestKey}`;
-              const hasRequestDetails = Boolean(sessionDiagnostic || cacheDisplay.secondary || traceItems.length);
+              const hasRequestDetails = Boolean(timingDetail || sessionDiagnostic || cacheDisplay.secondary || traceItems.length);
               const isExpanded = expandedRequestKey === requestKey;
               const metricTitle = [
                 `首字 ${formatDurationMs(request.ttft_ms)}`,
@@ -2850,6 +2999,12 @@ function CachePanel({
                   </div>
                   {hasRequestDetails && isExpanded ? (
                     <div className="request-detail-panel" id={detailsId}>
+                      {timingDetail ? (
+                        <div className="request-detail-line muted">
+                          <span>时延分段</span>
+                          <b>{timingDetail}</b>
+                        </div>
+                      ) : null}
                       {cacheDisplay.secondary ? (
                         <div className="request-detail-line">
                           <span>缓存细节</span>
@@ -3257,6 +3412,67 @@ function normalizeModels(models: ModelConfig[]) {
   return [...byId.values()];
 }
 
+function isPersistedModelReasoningFallbackFailure(request: RequestLogEntry) {
+  return (
+    request.status >= 400 &&
+    request.reasoning_effort_source?.startsWith("model_override") === true &&
+    Boolean(request.configured_reasoning_effort?.trim())
+  );
+}
+
+function mergePersistedModelReasoningFallback(
+  draft: ProviderDraft,
+  previousConfig: AppConfig,
+  nextConfig: AppConfig
+): ProviderDraft {
+  if (!draft.id) return draft;
+  const previousProvider = previousConfig.providers.find((provider) => provider.id === draft.id);
+  const nextProvider = nextConfig.providers.find((provider) => provider.id === draft.id);
+  if (!previousProvider || !nextProvider) return draft;
+
+  const fallbackByModelId = new Map<string, { from: string; to: string }>();
+  for (const nextModel of nextProvider.models) {
+    const previousModel = previousProvider.models.find((model) => model.id === nextModel.id);
+    if (
+      !previousModel?.reasoning_effort_override_enabled ||
+      !nextModel.reasoning_effort_override_enabled
+    ) {
+      continue;
+    }
+    const from = normalizedReasoningEffort(previousModel.reasoning_effort);
+    const to = normalizedReasoningEffort(nextModel.reasoning_effort);
+    const fromLevel = reasoningEffortLevel(from);
+    const toLevel = reasoningEffortLevel(to);
+    if (!from || !to || fromLevel < 0 || toLevel < 0 || toLevel >= fromLevel) continue;
+    fallbackByModelId.set(nextModel.id, { from, to });
+  }
+  if (!fallbackByModelId.size) return draft;
+
+  let changed = false;
+  const models = draft.models.map((model) => {
+    const fallback = fallbackByModelId.get(model.id);
+    // A local edit wins. Only replace the value that was still showing the saved tier.
+    if (
+      !fallback ||
+      !model.reasoning_effort_override_enabled ||
+      normalizedReasoningEffort(model.reasoning_effort) !== fallback.from
+    ) {
+      return model;
+    }
+    changed = true;
+    return { ...model, reasoning_effort: fallback.to };
+  });
+  return changed ? { ...draft, models } : draft;
+}
+
+function normalizedReasoningEffort(value?: string | null) {
+  return value?.trim().toLowerCase() ?? "";
+}
+
+function reasoningEffortLevel(value: string) {
+  return reasoningEffortOptions.indexOf(value as (typeof reasoningEffortOptions)[number]);
+}
+
 function cleanOptionalText(value?: string | null) {
   const text = (value ?? "").trim();
   return text || null;
@@ -3306,6 +3522,58 @@ function requestPrimaryStatus(
     return "冷启动";
   }
   return "";
+}
+
+function requestTimingDetail(request: RequestLogEntry) {
+  const headersMs = request.upstream_headers_ms;
+  const firstChunkMs = request.upstream_first_chunk_ms;
+  if (headersMs == null || firstChunkMs == null) return null;
+
+  const parts = [
+    `上游响应头 ${formatDurationMs(headersMs)}`,
+    `首个 SSE +${formatDurationMs(firstChunkMs)}`,
+    `首字总 ${formatDurationMs(request.ttft_ms)}`
+  ];
+  if ((request.stream_client_backpressure_ms ?? 0) > 0) {
+    parts.push(`下游背压 ${formatDurationMs(request.stream_client_backpressure_ms ?? 0)}`);
+  }
+  return parts.join(" · ");
+}
+
+function formatNetworkPathDiagnostic(result: ProviderNetworkPathDiagnosticResult) {
+  return result.paths
+    .map((path) => {
+      const label = path.path === "direct" ? "直连" : "系统代理";
+      const outcome = path.status
+        ? path.ok
+          ? "可达"
+          : `HTTP ${path.status}`
+        : path.error
+          ? "失败"
+          : "无响应";
+      return `${label} ${formatDurationMs(path.elapsed_ms)} · ${outcome}`;
+    })
+    .join(" · ");
+}
+
+function networkPathDiagnosticTitle(result: ProviderNetworkPathDiagnosticResult) {
+  const details = result.paths.map((path) => {
+    const label = path.path === "direct" ? "直连" : "系统代理";
+    const outcome = path.status ? `HTTP ${path.status}` : path.error || "无响应";
+    return `${label}: ${formatDurationMs(path.elapsed_ms)} · ${outcome}`;
+  });
+  return [`模型列表探针：${result.target_url}`, ...details].join("\n");
+}
+
+function providerDraftMatchesSavedNetworkPath(provider: ProviderConfig, draft: ProviderDraft) {
+  return (
+    !draft.api_key.trim() &&
+    draft.base_url.trim() === provider.base_url.trim() &&
+    draft.models_url.trim() === (provider.models_url ?? "").trim() &&
+    draft.is_full_url === provider.is_full_url &&
+    draft.custom_user_agent.trim() === (provider.custom_user_agent ?? "").trim() &&
+    draft.channel === provider.channel
+  );
 }
 
 function buildSuccessfulRequestFeed(
@@ -3397,6 +3665,18 @@ function responseSessionReasonSummary(
   }
   if (reason === "main_session_delta_guard_not_eligible") {
     return "主会话 delta 保护条件没有通过，通常是 anchor、输入结构或可安全追加的尾部不够稳定。";
+  }
+  if (reason === "provider_session_delta_unverified") {
+    return "当前 provider / model 尚未通过会话续接验证，本次保持完整请求。";
+  }
+  if (reason === "session_anchor_scope_sibling") {
+    return "只找到同会话范围的其他 anchor，为避免上下文串接，本次保持完整请求。";
+  }
+  if (reason === "session_anchor_missing" || reason === "session_anchor_not_exact") {
+    return "当前会话没有可验证的 exact anchor，本次保持完整请求。";
+  }
+  if (reason === "session_delta_tail_not_large_enough") {
+    return "本次新增上下文不足以产生有效节省，因此保持完整请求。";
   }
   if (reason === "main_session_delta_not_beneficial") {
     return "这次即使改成 session delta 也不会更省 token，因此保持完整请求。";

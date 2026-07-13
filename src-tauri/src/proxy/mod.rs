@@ -4,9 +4,9 @@ use crate::{
     config::{
         codex_model_alias, codex_model_display_name, model_request_alias,
         normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
-        AgentInjectionKind, AppConfig, CacheMode, Channel, ProviderChannelMode, ProviderConfig,
-        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus,
-        SelectedProviderKey,
+        AgentInjectionKind, AppConfig, CacheMode, Channel, ModelConfig, ProviderChannelMode,
+        ProviderConfig, ProviderResponseSessionReuseProbeResult,
+        ProviderResponseSessionReuseStatus, SelectedProviderKey, REASONING_EFFORT_VALUES,
     },
     metrics::{RequestLog, UsageRecord},
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
@@ -70,6 +70,7 @@ const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
+const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
 #[derive(Debug, Clone)]
@@ -1234,12 +1235,20 @@ async fn handle_generation_for_agent(
     if matches!(decision.upstream_channel, Channel::Responses) && !codex_native_responses_stream {
         normalize_responses_request(&mut upstream_body);
     }
-    let reasoning_diagnostics = apply_model_reasoning_effort(
+    let mut reasoning_diagnostics = apply_model_reasoning_effort(
         &client_request,
         &mut upstream_body,
         &decision.upstream_channel,
         &decision,
     );
+    let _ = apply_runtime_reasoning_effort_cap(
+        &state,
+        &mut upstream_body,
+        &decision.upstream_channel,
+        &decision,
+        &mut reasoning_diagnostics,
+    )
+    .await;
     let session_identity = SessionIdentity::derive_for_agent(
         &config,
         &decision,
@@ -1317,7 +1326,7 @@ async fn handle_generation_for_agent(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("no-store"))
         .unwrap_or(false);
-    let eligible = local_response_cache_eligible(
+    let mut eligible = local_response_cache_eligible(
         &config,
         no_store,
         &client_request,
@@ -1546,6 +1555,14 @@ async fn handle_generation_for_agent(
     let (upstream_send_body, mut response_session_reuse_diagnostics) =
         if matches!(decision.upstream_channel, Channel::Responses) {
             let mut diagnostics = ResponseSessionReuseDiagnostics::default();
+            let main_delta_skip_reason = main_response_session_delta_skip_reason(
+                &config,
+                &decision,
+                client_requested_stream,
+                &upstream_body,
+                &tail_input_diagnostics,
+                &session_anchor_diagnostics,
+            );
             if let Some(cooldown_skip_reason) = response_session_cooldown_skip_reason(
                 &state,
                 response_session_cooldown_key.as_deref(),
@@ -1563,14 +1580,7 @@ async fn handle_generation_for_agent(
             } else if !main_response_session_delta_enabled_for_agent(forced_agent_id) {
                 diagnostics.skip_reason = Some("codex_main_session_delta_disabled".to_string());
                 (upstream_body.clone(), diagnostics)
-            } else if should_attempt_main_response_session_delta(
-                &config,
-                &decision,
-                client_requested_stream,
-                &upstream_body,
-                &tail_input_diagnostics,
-                &session_anchor_diagnostics,
-            ) {
+            } else if main_delta_skip_reason.is_none() {
                 let outcome = maybe_reuse_response_session(
                     &state,
                     &upstream_body,
@@ -1595,7 +1605,7 @@ async fn handle_generation_for_agent(
                     (upstream_body.clone(), diagnostics)
                 }
             } else {
-                diagnostics.skip_reason = Some("main_session_delta_guard_not_eligible".to_string());
+                diagnostics.skip_reason = main_delta_skip_reason.map(str::to_string);
                 (upstream_body.clone(), diagnostics)
             }
         } else {
@@ -2468,6 +2478,299 @@ async fn handle_generation_for_agent(
             }
         }
     }
+    let mut pending_upstream = Some(upstream);
+    let mut pre_read_body = None;
+    if is_agent_generation_request(authorized_agent.as_deref())
+        && !active_used_response_session
+        && !verified_third_party_delta_in_flight
+        && !is_success_status
+    {
+        if let Some(current_effort) = diagnostics.reasoning.effective.clone() {
+            let rejected =
+                rejected_reasoning_efforts(&state, &decision, &active_request_channel).await;
+            if let Some(next_effort) = next_lower_reasoning_effort(&current_effort, &rejected) {
+                let body_read = match read_upstream_body_with_diagnostics(
+                    pending_upstream
+                        .take()
+                        .expect("the pending upstream response must exist before fallback"),
+                    &content_type,
+                    started,
+                    upstream_response_headers_at_ms,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        state
+                            .metrics
+                            .record_error("reasoning_effort_error_body", &err.to_string())
+                            .await;
+                        return json_error(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("failed to read upstream error body: {err}"),
+                        );
+                    }
+                };
+                let error_summary = upstream_error_summary(&body_read.bytes);
+                let explicit_reasoning_rejection =
+                    is_explicit_reasoning_effort_rejection(status, &body_read.bytes);
+                let opaque_reasoning_probe = !explicit_reasoning_rejection
+                    && should_probe_opaque_reasoning_fallback(
+                        status,
+                        &body_read.bytes,
+                        &diagnostics.reasoning,
+                    );
+                if explicit_reasoning_rejection || opaque_reasoning_probe {
+                    if explicit_reasoning_rejection {
+                        note_reasoning_effort_rejection(
+                            &state,
+                            &decision,
+                            &active_request_channel,
+                            &current_effort,
+                        )
+                        .await;
+                        if let Err(err) = persist_model_reasoning_effort_fallback(
+                            &state,
+                            &decision,
+                            &current_effort,
+                            &next_effort,
+                        )
+                        .await
+                        {
+                            state
+                                .metrics
+                                .record_error("reasoning_effort_persist", &err.to_string())
+                                .await;
+                        }
+                    }
+                    record_upstream_response_observation(
+                        &state,
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &active_request_channel,
+                        &decision,
+                        eligible.then_some(metrics_cache_key.as_str()),
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
+                        if explicit_reasoning_rejection {
+                            "reasoning-effort-rejected"
+                        } else {
+                            "reasoning-effort-opaque-502-probe"
+                        },
+                        status,
+                        &current_send_diagnostics,
+                        agent_log_id.clone(),
+                        agent_log_label.clone(),
+                    )
+                    .await;
+                    state
+                        .metrics
+                        .record_error(
+                            if explicit_reasoning_rejection {
+                                "reasoning_effort_rejected"
+                            } else {
+                                "reasoning_effort_opaque_502"
+                            },
+                            &error_summary,
+                        )
+                        .await;
+                    state.metrics.record_retry().await;
+                    set_request_reasoning_effort(
+                        &mut active_upstream_body,
+                        &active_request_channel,
+                        &next_effort,
+                    );
+                    let original_reasoning_diagnostics = diagnostics.reasoning.clone();
+                    diagnostics.reasoning.effective = Some(next_effort.clone());
+                    if explicit_reasoning_rejection {
+                        diagnostics.reasoning.source = Some(
+                            if diagnostics.reasoning.configured.is_some() {
+                                "model_override_fallback"
+                            } else {
+                                "agent_reasoning_fallback"
+                            }
+                            .to_string(),
+                        );
+                    }
+                    diagnostics.send_body_bytes =
+                        serialized_body_len(&active_request_channel, &active_upstream_body);
+                    diagnostics.send_body_is_delta = false;
+                    prefix_state_update_key = None;
+                    eligible = false;
+
+                    let send_outcome = match send_main_upstream_request(
+                        &state,
+                        decision.provider.use_system_proxy,
+                        &active_url,
+                        &api_key,
+                        &active_request_channel,
+                        &active_upstream_body,
+                        &headers,
+                        decision.provider.custom_user_agent.as_deref(),
+                        skip_prefix_guard_for_sync_responses,
+                        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+                        !client_requested_stream,
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            record_upstream_transport_failure(
+                                &state,
+                                &request_id,
+                                &started,
+                                &client_channel,
+                                &active_request_channel,
+                                &decision,
+                                None,
+                                provider_prefix_key.as_deref(),
+                                provider_prefix_fingerprint.as_deref(),
+                                &prefix_guard_wait,
+                                local_prepare_ms,
+                                &diagnostics,
+                                &active_upstream_body,
+                                false,
+                                &response_session_reuse_diagnostics,
+                                requested_model_for_log.clone(),
+                                "reasoning-effort-fallback-transport",
+                            )
+                            .await;
+                            state
+                                .metrics
+                                .record_error("upstream_transport", &err.to_string())
+                                .await;
+                            return json_error(
+                                StatusCode::BAD_GATEWAY,
+                                &format!("upstream reasoning fallback failed: {err}"),
+                            );
+                        }
+                    };
+                    current_send_diagnostics = send_outcome.diagnostics.clone();
+                    upstream_request_diagnostics.absorb(&current_send_diagnostics);
+                    pending_upstream = Some(send_outcome.response);
+                    upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+                    let retried_upstream = pending_upstream.as_ref().expect(
+                        "the pending upstream response must exist after reasoning fallback",
+                    );
+                    status = retried_upstream.status().as_u16();
+                    content_type = retried_upstream
+                        .headers()
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("application/json")
+                        .to_string();
+                    is_success_status = StatusCode::from_u16(status)
+                        .map(|status| status.is_success())
+                        .unwrap_or(false);
+                    if is_success_status && opaque_reasoning_probe {
+                        note_reasoning_effort_rejection(
+                            &state,
+                            &decision,
+                            &active_request_channel,
+                            &current_effort,
+                        )
+                        .await;
+                        if let Err(err) = persist_model_reasoning_effort_fallback(
+                            &state,
+                            &decision,
+                            &current_effort,
+                            &next_effort,
+                        )
+                        .await
+                        {
+                            state
+                                .metrics
+                                .record_error("reasoning_effort_persist", &err.to_string())
+                                .await;
+                        }
+                        diagnostics.reasoning.source = Some(
+                            if diagnostics.reasoning.configured.is_some() {
+                                "model_override_opaque_502_fallback"
+                            } else {
+                                "agent_reasoning_opaque_502_fallback"
+                            }
+                            .to_string(),
+                        );
+                    } else if !is_success_status {
+                        let fallback_body_read = match read_upstream_body_with_diagnostics(
+                            pending_upstream.take().expect(
+                                "the pending upstream response must exist after reasoning fallback",
+                            ),
+                            &content_type,
+                            started,
+                            upstream_response_headers_at_ms,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                state
+                                    .metrics
+                                    .record_error("reasoning_effort_error_body", &err.to_string())
+                                    .await;
+                                return json_error(
+                                    StatusCode::BAD_GATEWAY,
+                                    &format!("failed to read upstream reasoning fallback error body: {err}"),
+                                );
+                            }
+                        };
+                        if explicit_reasoning_rejection
+                            && is_explicit_reasoning_effort_rejection(
+                                status,
+                                &fallback_body_read.bytes,
+                            )
+                        {
+                            note_reasoning_effort_rejection(
+                                &state,
+                                &decision,
+                                &active_request_channel,
+                                &next_effort,
+                            )
+                            .await;
+                            let rejected_after_fallback = rejected_reasoning_efforts(
+                                &state,
+                                &decision,
+                                &active_request_channel,
+                            )
+                            .await;
+                            if let Some(next_after_fallback) =
+                                next_lower_reasoning_effort(&next_effort, &rejected_after_fallback)
+                            {
+                                if let Err(err) = persist_model_reasoning_effort_fallback(
+                                    &state,
+                                    &decision,
+                                    &next_effort,
+                                    &next_after_fallback,
+                                )
+                                .await
+                                {
+                                    state
+                                        .metrics
+                                        .record_error("reasoning_effort_persist", &err.to_string())
+                                        .await;
+                                }
+                            }
+                        }
+                        if opaque_reasoning_probe {
+                            diagnostics.reasoning = original_reasoning_diagnostics;
+                        }
+                        pre_read_body = Some(fallback_body_read);
+                    }
+                } else {
+                    pre_read_body = Some(body_read);
+                }
+            }
+        }
+    }
+
     let is_stream = should_proxy_upstream_as_stream(
         is_success_status,
         client_requested_stream,
@@ -2477,17 +2780,12 @@ async fn handle_generation_for_agent(
     );
 
     if is_stream {
-        note_selected_provider_key_status(
-            &state,
-            &decision.provider.id,
-            &selected_provider_key,
-            status,
-            None,
-        )
-        .await;
-        return stream_upstream(
-            state,
-            upstream,
+        let selected_provider_id = decision.provider.id.clone();
+        let response = stream_upstream(
+            state.clone(),
+            pending_upstream
+                .take()
+                .expect("the pending upstream response must exist for relay"),
             content_type,
             status,
             started,
@@ -2526,27 +2824,42 @@ async fn handle_generation_for_agent(
             upstream_response_headers_at_ms,
         )
         .await;
+
+        // A successful multi-key status update takes the config write lock.
+        // The relay is already running before that bookkeeping is scheduled,
+        // so a concurrent settings save cannot delay the first SSE packet.
+        let _ = spawn_selected_provider_key_success(
+            state,
+            selected_provider_id,
+            &selected_provider_key,
+        );
+        return response;
     }
 
-    let mut body_read = match read_upstream_body_with_diagnostics(
-        upstream,
-        &content_type,
-        started,
-        upstream_response_headers_at_ms,
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            state
-                .metrics
-                .record_error("upstream_body", &err.to_string())
-                .await;
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("failed to read upstream body: {err}"),
-            );
-        }
+    let mut body_read = match pre_read_body {
+        Some(outcome) => outcome,
+        None => match read_upstream_body_with_diagnostics(
+            pending_upstream
+                .take()
+                .expect("the pending upstream response must exist for body read"),
+            &content_type,
+            started,
+            upstream_response_headers_at_ms,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                state
+                    .metrics
+                    .record_error("upstream_body", &err.to_string())
+                    .await;
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("failed to read upstream body: {err}"),
+                );
+            }
+        },
     };
     let mut bytes = body_read.bytes;
     let automatic_verified_third_party_delta = active_used_response_session
@@ -5523,6 +5836,7 @@ async fn maybe_rescue_response_session_after_413(
     .await
 }
 
+#[cfg(test)]
 fn should_attempt_main_response_session_delta(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -5531,26 +5845,60 @@ fn should_attempt_main_response_session_delta(
     current_tail: &TailInputDiagnostics,
     session_anchor: &SessionAnchorDiagnostics,
 ) -> bool {
-    if !responses_session_reuse_enabled(config)
-        || !config.cache.prewarm_enabled
-        || !matches!(decision.upstream_channel, Channel::Responses)
-        || !client_requested_stream
-    {
-        return false;
+    main_response_session_delta_skip_reason(
+        config,
+        decision,
+        client_requested_stream,
+        request,
+        current_tail,
+        session_anchor,
+    )
+    .is_none()
+}
+
+/// Return the first reason a main Responses request cannot use a session delta.
+///
+/// Keeping this decision explainable matters for latency work: a generic
+/// "guard not eligible" label hides whether the request is paying the full
+/// history upload because the provider is unverified, the session anchor is
+/// missing, or the tail is simply too small to benefit.
+fn main_response_session_delta_skip_reason(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    client_requested_stream: bool,
+    request: &Value,
+    current_tail: &TailInputDiagnostics,
+    session_anchor: &SessionAnchorDiagnostics,
+) -> Option<&'static str> {
+    if !responses_session_reuse_enabled(config) {
+        return Some("session_reuse_disabled");
+    }
+    if !config.cache.prewarm_enabled {
+        return Some("session_prewarm_disabled");
+    }
+    if !matches!(decision.upstream_channel, Channel::Responses) {
+        return Some("upstream_channel_not_responses");
+    }
+    if !client_requested_stream {
+        return Some("client_stream_disabled");
     }
     if !supports_main_response_session_delta(config, decision) {
-        return false;
+        return Some("provider_session_delta_unverified");
     }
     if session_anchor.source.as_deref() != Some("exact") {
-        return false;
+        return Some(match session_anchor.source.as_deref() {
+            Some("scope-sibling") => "session_anchor_scope_sibling",
+            Some("new-anchor") => "session_anchor_missing",
+            _ => "session_anchor_not_exact",
+        });
     }
     if request.get("previous_response_id").is_some() {
-        return false;
+        return Some("client_previous_response_id_present");
     }
 
     let body_bytes = serialized_body_len(&Channel::Responses, request);
     if body_bytes >= 96 * 1024 {
-        return true;
+        return None;
     }
     if current_tail.delta_from_session
         && (current_tail.tool_output_chars >= 512
@@ -5558,11 +5906,15 @@ fn should_attempt_main_response_session_delta(
             || current_tail.message_chars >= 512
             || current_tail.input_items >= 2)
     {
-        return true;
+        return None;
     }
-    current_tail.tool_output_chars >= 2_048
+    if current_tail.tool_output_chars >= 2_048
         || current_tail.largest_tool_output_chars >= 2_048
         || current_tail.message_chars >= 8_192
+    {
+        return None;
+    }
+    Some("session_delta_tail_not_large_enough")
 }
 
 fn supports_main_response_session_delta(config: &AppConfig, decision: &RouteDecision) -> bool {
@@ -6918,7 +7270,7 @@ async fn record_upstream_response_observation(
 
     state
         .metrics
-        .record_upstream_call(RequestLog {
+        .record_upstream_observation(RequestLog {
             id: Uuid::new_v4().to_string(),
             at: Utc::now(),
             inbound_request_id: Some(request_id.to_string()),
@@ -7735,14 +8087,17 @@ async fn note_selected_provider_key_status(
     if selected.key_id.is_none() {
         return;
     }
+    let Some(key_id) = selected.key_id.as_deref() else {
+        return;
+    };
     let Ok(status_code) = StatusCode::from_u16(status) else {
         return;
     };
-    let mut config = state.config.write().await;
     if status_code.is_success() {
-        config.mark_provider_key_success(provider_id, selected.key_id.as_deref());
+        mark_selected_provider_key_success(state, provider_id, key_id).await;
         return;
     }
+    let mut config = state.config.write().await;
     if is_provider_key_failure_status(status_code)
         || error_summary
             .map(is_provider_key_failure_message)
@@ -7760,6 +8115,22 @@ async fn note_selected_provider_key_status(
                 .await;
         }
     }
+}
+
+async fn mark_selected_provider_key_success(state: &AppState, provider_id: &str, key_id: &str) {
+    let mut config = state.config.write().await;
+    config.mark_provider_key_success(provider_id, Some(key_id));
+}
+
+fn spawn_selected_provider_key_success(
+    state: Arc<AppState>,
+    provider_id: String,
+    selected: &SelectedProviderKey,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let key_id = selected.key_id.clone()?;
+    Some(tokio::spawn(async move {
+        mark_selected_provider_key_success(&state, &provider_id, &key_id).await;
+    }))
 }
 
 fn is_provider_key_failure_status(status: StatusCode) -> bool {
@@ -9414,46 +9785,40 @@ fn apply_model_reasoning_effort(
     decision: &RouteDecision,
 ) -> ReasoningEffortDiagnostics {
     let agent = request_reasoning_effort(client_request);
-    let model = decision
-        .provider
-        .models
-        .iter()
-        .find(|model| model.id == decision.model)
-        .or_else(|| {
-            decision.provider.models.iter().find(|model| {
-                model_request_alias(model)
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&decision.model))
-            })
-        });
+    let model = model_for_route_decision(decision);
     let configured = model
         .filter(|model| model.reasoning_effort_override_enabled)
         .and_then(|model| model.reasoning_effort.as_deref())
         .and_then(normalize_request_reasoning_effort);
-    let (effective, source) = if let Some(configured) = configured.clone() {
-        let downgrade_ultra = configured == "ultra"
-            && model.is_some_and(|model| {
-                model
-                    .supported_reasoning_efforts
-                    .iter()
-                    .any(|effort| effort == "max")
-                    && !model
-                        .supported_reasoning_efforts
-                        .iter()
-                        .any(|effort| effort == "ultra")
-            });
-        if downgrade_ultra {
-            (
-                Some("max".to_string()),
-                Some("model_override_ultra_to_max".to_string()),
-            )
-        } else {
-            (Some(configured), Some("model_override".to_string()))
-        }
+    let (mut effective, mut source) = if let Some(configured) = configured.clone() {
+        (Some(configured), Some("model_override".to_string()))
     } else if agent.is_some() {
         (agent.clone(), Some("agent".to_string()))
     } else {
         (None, Some("agent_default".to_string()))
     };
+
+    if let (Some(requested), Some(model)) = (effective.as_deref(), model) {
+        if let Some(capped) = strongest_supported_reasoning_effort_at_or_below(
+            requested,
+            &model.supported_reasoning_efforts,
+            &HashSet::new(),
+        ) {
+            if capped != requested {
+                source = Some(
+                    if configured.is_some() && requested == "ultra" && capped == "max" {
+                        "model_override_ultra_to_max"
+                    } else if configured.is_some() {
+                        "model_override_supported_cap"
+                    } else {
+                        "agent_supported_cap"
+                    }
+                    .to_string(),
+                );
+                effective = Some(capped);
+            }
+        }
+    }
 
     if let Some(effective) = effective.as_deref() {
         set_request_reasoning_effort(upstream_request, upstream_channel, effective);
@@ -9465,6 +9830,284 @@ fn apply_model_reasoning_effort(
         effective,
         source,
     }
+}
+
+fn model_for_route_decision(decision: &RouteDecision) -> Option<&ModelConfig> {
+    decision
+        .provider
+        .models
+        .iter()
+        .find(|model| model.id == decision.model)
+        .or_else(|| {
+            decision.provider.models.iter().find(|model| {
+                model_request_alias(model)
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&decision.model))
+            })
+        })
+}
+
+fn reasoning_effort_rank(effort: &str) -> Option<usize> {
+    REASONING_EFFORT_VALUES
+        .iter()
+        .position(|candidate| *candidate == effort)
+}
+
+fn strongest_supported_reasoning_effort_at_or_below(
+    requested: &str,
+    supported: &[String],
+    rejected: &HashSet<String>,
+) -> Option<String> {
+    let requested_rank = reasoning_effort_rank(requested)?;
+    supported
+        .iter()
+        .filter_map(|effort| normalize_request_reasoning_effort(effort))
+        .filter(|effort| !rejected.contains(effort))
+        .filter_map(|effort| {
+            reasoning_effort_rank(&effort)
+                .filter(|rank| *rank <= requested_rank)
+                .map(|rank| (rank, effort))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, effort)| effort)
+}
+
+fn next_lower_reasoning_effort(current: &str, rejected: &HashSet<String>) -> Option<String> {
+    let current_rank = reasoning_effort_rank(current)?;
+    REASONING_EFFORT_VALUES[..current_rank]
+        .iter()
+        .rev()
+        .find(|candidate| !rejected.contains(**candidate))
+        .map(|candidate| (*candidate).to_string())
+}
+
+fn reasoning_effort_rejection_key(
+    decision: &RouteDecision,
+    upstream_channel: &Channel,
+    effort: &str,
+) -> String {
+    format!(
+        "{}\0{}\0{}\0{}",
+        decision.provider.id,
+        decision.model,
+        upstream_channel.label(),
+        effort
+    )
+}
+
+async fn rejected_reasoning_efforts(
+    state: &AppState,
+    decision: &RouteDecision,
+    upstream_channel: &Channel,
+) -> HashSet<String> {
+    let now = Instant::now();
+    let ttl = TokioDuration::from_secs(REASONING_EFFORT_REJECTION_COOLDOWN_SECS);
+    let mut rejections = state.reasoning_effort_rejections.lock().await;
+    rejections.retain(|_, rejected_at| now.duration_since(*rejected_at) < ttl);
+    REASONING_EFFORT_VALUES
+        .iter()
+        .filter(|effort| {
+            rejections.contains_key(&reasoning_effort_rejection_key(
+                decision,
+                upstream_channel,
+                effort,
+            ))
+        })
+        .map(|effort| (*effort).to_string())
+        .collect()
+}
+
+async fn note_reasoning_effort_rejection(
+    state: &AppState,
+    decision: &RouteDecision,
+    upstream_channel: &Channel,
+    effort: &str,
+) {
+    state.reasoning_effort_rejections.lock().await.insert(
+        reasoning_effort_rejection_key(decision, upstream_channel, effort),
+        Instant::now(),
+    );
+}
+
+/// Advances only the exact persisted manual override that sent the rejected
+/// effort. A concurrent settings edit wins instead of being overwritten.
+async fn persist_model_reasoning_effort_fallback(
+    state: &AppState,
+    decision: &RouteDecision,
+    current_effort: &str,
+    next_effort: &str,
+) -> Result<bool> {
+    let Some(model_id) = model_for_route_decision(decision).map(|model| model.id.clone()) else {
+        return Ok(false);
+    };
+    let Some(current_effort) = normalize_request_reasoning_effort(current_effort) else {
+        return Ok(false);
+    };
+    let Some(next_effort) = normalize_request_reasoning_effort(next_effort) else {
+        return Ok(false);
+    };
+
+    let mut config = state.config.write().await;
+    let original_config = config.clone();
+    let now = Utc::now();
+    let Some(provider) = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == decision.provider.id)
+    else {
+        return Ok(false);
+    };
+    let Some(model) = provider
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+    else {
+        return Ok(false);
+    };
+    let configured_effort = model
+        .reasoning_effort
+        .as_deref()
+        .and_then(normalize_request_reasoning_effort);
+    if !model.reasoning_effort_override_enabled
+        || configured_effort.as_deref() != Some(current_effort.as_str())
+    {
+        return Ok(false);
+    }
+
+    model.reasoning_effort = Some(next_effort);
+    provider.updated_at = now;
+    config.updated_at = now;
+    if let Err(err) = config.save(&state.config_path) {
+        *config = original_config;
+        return Err(err);
+    }
+    Ok(true)
+}
+
+async fn apply_runtime_reasoning_effort_cap(
+    state: &AppState,
+    upstream_request: &mut Value,
+    upstream_channel: &Channel,
+    decision: &RouteDecision,
+    diagnostics: &mut ReasoningEffortDiagnostics,
+) -> bool {
+    let Some(current) = diagnostics.effective.clone() else {
+        return false;
+    };
+    let rejected = rejected_reasoning_efforts(state, decision, upstream_channel).await;
+    if !rejected.contains(&current) {
+        return false;
+    }
+    let Some(next) = next_lower_reasoning_effort(&current, &rejected) else {
+        return false;
+    };
+    set_request_reasoning_effort(upstream_request, upstream_channel, &next);
+    diagnostics.effective = Some(next);
+    diagnostics.source = Some(
+        if diagnostics.configured.is_some() {
+            "model_override_runtime_cap"
+        } else {
+            "agent_runtime_cap"
+        }
+        .to_string(),
+    );
+    true
+}
+
+/// Some third-party gateways turn an unsupported reasoning value into a bare
+/// HTML 502 and discard the parameter error. That response is not proof by
+/// itself, so probe only when the Agent supplied a lower effort than the
+/// model-level override. The override is persisted only after the next tier
+/// returns a successful response; ordinary 502s without that intent stay
+/// pass-through.
+fn should_probe_opaque_reasoning_fallback(
+    status: u16,
+    error_body: &[u8],
+    diagnostics: &ReasoningEffortDiagnostics,
+) -> bool {
+    if status != 502 {
+        return false;
+    }
+    let Some(configured) = diagnostics.configured.as_deref() else {
+        return false;
+    };
+    let Some(agent) = diagnostics.agent.as_deref() else {
+        return false;
+    };
+    let Some(configured_rank) = reasoning_effort_rank(configured) else {
+        return false;
+    };
+    let Some(agent_rank) = reasoning_effort_rank(agent) else {
+        return false;
+    };
+    if configured_rank <= agent_rank {
+        return false;
+    }
+
+    let error = String::from_utf8_lossy(error_body).to_ascii_lowercase();
+    error.contains("<html") || error.contains("<!doctype html") || error.contains("502 bad gateway")
+}
+
+fn is_explicit_reasoning_effort_rejection(status: u16, error_body: &[u8]) -> bool {
+    if !(400..=599).contains(&status) {
+        return false;
+    }
+
+    // Classify the full upstream diagnostic while keeping only a capped summary
+    // in logs. For JSON responses, inspect the declared error message rather
+    // than arbitrary echoed request fields.
+    let error = upstream_error_text_for_reasoning_classification(error_body).to_ascii_lowercase();
+    const PARAMETER_TERMS: &[&str] = &[
+        "reasoning.effort",
+        "reasoning_effort",
+        "reasoning effort",
+        "reasoning",
+        "thinking.effort",
+        "thinking_effort",
+        "thinking effort",
+        "thinking",
+    ];
+    const REJECTION_TERMS: &[&str] = &[
+        "unsupported_parameter",
+        "unsupported parameter",
+        "not supported",
+        "unsupported",
+        "invalid_parameter",
+        "invalid parameter",
+        "not available",
+        "unavailable",
+        "invalid",
+    ];
+
+    PARAMETER_TERMS.iter().any(|parameter| {
+        REJECTION_TERMS
+            .iter()
+            .any(|rejection| error_terms_are_nearby(&error, parameter, rejection))
+    })
+}
+
+fn upstream_error_text_for_reasoning_classification(error_body: &[u8]) -> String {
+    if let Ok(value) = serde_json::from_slice::<Value>(error_body) {
+        return value
+            .pointer("/error/message")
+            .or_else(|| value.get("message"))
+            .or_else(|| value.pointer("/error/detail"))
+            .or_else(|| value.get("detail"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+    }
+    String::from_utf8_lossy(error_body).into_owned()
+}
+
+fn error_terms_are_nearby(error: &str, parameter: &str, rejection: &str) -> bool {
+    const MAX_TERM_DISTANCE_CHARS: usize = 120;
+    error.match_indices(parameter).any(|(parameter_at, _)| {
+        error.match_indices(rejection).any(|(rejection_at, _)| {
+            let start = parameter_at.min(rejection_at);
+            let end = (parameter_at + parameter.len()).max(rejection_at + rejection.len());
+            error[start..end].chars().count() <= MAX_TERM_DISTANCE_CHARS
+        })
+    })
 }
 
 fn request_reasoning_effort(request: &Value) -> Option<String> {
@@ -15040,7 +15683,7 @@ mod tests {
             ..SessionAnchorDiagnostics::default()
         };
         let sibling_anchor = SessionAnchorDiagnostics {
-            source: Some("scope".to_string()),
+            source: Some("scope-sibling".to_string()),
             ..SessionAnchorDiagnostics::default()
         };
 
@@ -15073,7 +15716,7 @@ mod tests {
                 base_url: "https://hubway.cc/v1".to_string(),
                 ..decision.provider.clone()
             },
-            ..decision
+            ..decision.clone()
         };
         assert!(!should_attempt_main_response_session_delta(
             &config,
@@ -15083,6 +15726,28 @@ mod tests {
             &TailInputDiagnostics::default(),
             &exact_anchor,
         ));
+        assert_eq!(
+            main_response_session_delta_skip_reason(
+                &config,
+                &third_party_decision,
+                true,
+                &request,
+                &TailInputDiagnostics::default(),
+                &exact_anchor,
+            ),
+            Some("provider_session_delta_unverified")
+        );
+        assert_eq!(
+            main_response_session_delta_skip_reason(
+                &config,
+                &decision,
+                true,
+                &request,
+                &TailInputDiagnostics::default(),
+                &sibling_anchor,
+            ),
+            Some("session_anchor_scope_sibling")
+        );
     }
 
     #[test]
@@ -17838,6 +18503,47 @@ mod tests {
             metrics.recent_upstream_calls[0].downstream_disconnected,
             Some(true)
         );
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn selected_provider_key_success_update_does_not_block_stream_handoff() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-key-status-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let config_write_guard = state.config.write().await;
+        let mut status_update = spawn_selected_provider_key_success(
+            state.clone(),
+            "provider".to_string(),
+            &SelectedProviderKey {
+                secret: "unused".to_string(),
+                key_id: Some("key-id".to_string()),
+            },
+        )
+        .expect("a pooled key should schedule a background success update");
+
+        assert!(
+            tokio::time::timeout(TokioDuration::from_millis(25), &mut status_update)
+                .await
+                .is_err(),
+            "the queued status update should wait behind the config lock without blocking the stream handoff"
+        );
+        drop(config_write_guard);
+        tokio::time::timeout(TokioDuration::from_millis(250), status_update)
+            .await
+            .expect("the queued status update should finish after the config lock is released")
+            .expect("background status update task should not panic");
+
         fs::remove_dir_all(config_dir).ok();
     }
 
@@ -22092,9 +22798,11 @@ mod tests {
                     let responses_hits = responses_hits_for_route.clone();
                     async move {
                         responses_hits.fetch_add(1, Ordering::SeqCst);
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            Json(json!({ "error": { "message": "request rejected" } })),
+                        raw_response(
+                            502,
+                            "text/html",
+                            br#"<!DOCTYPE html><div id=\"cf-error-details\">502: Bad gateway</div>"#
+                                .to_vec(),
                         )
                     }
                 }),
@@ -22170,7 +22878,7 @@ mod tests {
             output_window: None,
             reasoning_effort_override_enabled: false,
             reasoning_effort: None,
-            supported_reasoning_efforts: Vec::new(),
+            supported_reasoning_efforts: vec!["high".to_string(), "low".to_string()],
             supports_tools: true,
             supports_streaming: true,
             enabled: true,
@@ -22210,6 +22918,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "thread_id": "single-attempt-session",
                 "model": "gpt-5.5",
+                "reasoning": { "effort": "high" },
                 "input": [{ "type": "message", "role": "user", "content": "hello" }]
             }))
             .unwrap(),
@@ -22219,9 +22928,547 @@ mod tests {
             handle_generation_for_agent(state, headers, request, Channel::Responses, Some("codex"))
                 .await;
 
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn configured_model_reasoning_rejection_persists_one_level_per_failure() {
+        let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let attempted_efforts_for_route = attempted_efforts.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let attempted_efforts = attempted_efforts_for_route.clone();
+                async move {
+                    let effort = body
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    attempted_efforts.lock().await.push(effort.clone());
+                    if matches!(effort.as_str(), "ultra" | "max") {
+                        // Keep the decisive words beyond the log truncation
+                        // boundary. Classification must still see the full body.
+                        let rejection = json!({
+                            "error": {
+                                "message": format!(
+                                    "{} unsupported_parameter: reasoning.effort {effort} is not supported",
+                                    "x".repeat(720)
+                                )
+                            }
+                        });
+                        raw_response(
+                            502,
+                            "application/json",
+                            serde_json::to_vec(&rejection).unwrap(),
+                        )
+                    } else if effort == "xhigh" {
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_reasoning\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    } else {
+                        raw_response(
+                            400,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": { "message": format!("unexpected effort {effort}") }
+                            }))
+                            .unwrap(),
+                        )
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "reasoning-fallback-provider".to_string();
+        provider.models = vec![
+            ModelConfig {
+                id: "gpt-5.6-luna".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.6-luna".to_string(),
+                context_window: None,
+                output_window: None,
+                reasoning_effort_override_enabled: true,
+                reasoning_effort: Some("ultra".to_string()),
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            },
+            ModelConfig {
+                id: "unrelated-model".to_string(),
+                request_model_id: None,
+                display_name: "Unrelated Model".to_string(),
+                context_window: None,
+                output_window: None,
+                reasoning_effort_override_enabled: true,
+                reasoning_effort: Some("ultra".to_string()),
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            },
+        ];
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("reasoning-fallback-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-reasoning-fallback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config_path = dir.join("config.toml");
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_path.clone(),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "thread_id": "reasoning-fallback-session",
+                    "model": "gpt-5.6-luna",
+                    "input": [{ "type": "message", "role": "user", "content": "hello" }]
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            *attempted_efforts.lock().await,
+            vec!["ultra".to_string(), "max".to_string()]
+        );
+        {
+            let config = state.config.read().await;
+            let provider = config
+                .providers
+                .iter()
+                .find(|provider| provider.id == "reasoning-fallback-provider")
+                .unwrap();
+            assert_eq!(
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == "gpt-5.6-luna")
+                    .and_then(|model| model.reasoning_effort.as_deref()),
+                Some("xhigh")
+            );
+            assert_eq!(
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.id == "unrelated-model")
+                    .and_then(|model| model.reasoning_effort.as_deref()),
+                Some("ultra")
+            );
+        }
+        let persisted: AppConfig =
+            toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let persisted_provider = persisted
+            .providers
+            .iter()
+            .find(|provider| provider.id == "reasoning-fallback-provider")
+            .unwrap();
+        assert_eq!(
+            persisted_provider
+                .models
+                .iter()
+                .find(|model| model.id == "gpt-5.6-luna")
+                .and_then(|model| model.reasoning_effort.as_deref()),
+            Some("xhigh")
+        );
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&second_body).contains("ready"));
+        assert_eq!(
+            *attempted_efforts.lock().await,
+            vec!["ultra".to_string(), "max".to_string(), "xhigh".to_string()]
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 3);
+        assert_eq!(metrics.successful_requests, 1);
+        assert_eq!(metrics.upstream_requests, 3);
+        assert_eq!(metrics.retries, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_failed_requests.len(), 2);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_cloudflare_and_generic_5xx_do_not_downgrade_model_reasoning_effort() {
+        let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let attempted_efforts_for_route = attempted_efforts.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let attempted_efforts = attempted_efforts_for_route.clone();
+                async move {
+                    let effort = body
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    attempted_efforts.lock().await.push(effort);
+                    if body
+                        .pointer("/input/0/content")
+                        .and_then(Value::as_str)
+                        == Some("generic-5xx")
+                    {
+                        raw_response(
+                            502,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": { "message": "invalid upstream gateway response" }
+                            }))
+                            .unwrap(),
+                        )
+                    } else {
+                        raw_response(
+                            502,
+                            "text/html",
+                            format!(
+                                "<!DOCTYPE html><html><body>{}</body><div id=\"cf-error-details\">502: Bad gateway</div></html>",
+                                "x".repeat(720)
+                            )
+                            .into_bytes(),
+                        )
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "ordinary-gateway-provider".to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.6-luna".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-luna".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: true,
+            reasoning_effort: Some("ultra".to_string()),
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("ordinary-gateway-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-ordinary-gateway-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config_path = dir.join("config.toml");
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_path.clone(),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = |content: &str| {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "thread_id": "ordinary-gateway-session",
+                    "model": "gpt-5.6-luna",
+                    "input": [{ "type": "message", "role": "user", "content": content }]
+                }))
+                .unwrap(),
+            )
+        };
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request("cloudflare-502"),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(*attempted_efforts.lock().await, vec!["ultra".to_string()]);
+
+        // Keep the second assertion focused on error classification rather
+        // than the independent short-lived prefix error guard.
+        state.prefix_error_cooldowns.lock().await.clear();
+
+        let generic = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request("generic-5xx"),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(generic.status(), StatusCode::BAD_GATEWAY);
+        let _ = axum::body::to_bytes(generic.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            *attempted_efforts.lock().await,
+            vec!["ultra".to_string(), "ultra".to_string()]
+        );
+        assert!(!config_path.exists());
+
+        let config = state.config.read().await;
+        let model = config.providers[0]
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(model.reasoning_effort.as_deref(), Some("ultra"));
+        drop(config);
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn opaque_cloudflare_502_uses_agent_effort_as_verified_fallback_floor() {
+        let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let attempted_efforts_for_route = attempted_efforts.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let attempted_efforts = attempted_efforts_for_route.clone();
+                async move {
+                    let effort = body
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    attempted_efforts.lock().await.push(effort.clone());
+                    match effort.as_str() {
+                        "ultra" => raw_response(
+                            502,
+                            "text/html",
+                            b"<!DOCTYPE html><html><title>opaque 502: Bad gateway</title></html>"
+                                .to_vec(),
+                        ),
+                        "max" => raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_opaque_fallback\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        ),
+                        _ => raw_response(
+                            400,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": { "message": format!("unexpected effort {effort}") }
+                            }))
+                            .unwrap(),
+                        ),
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "opaque-502-provider".to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.6-luna".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-luna".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: true,
+            reasoning_effort: Some("ultra".to_string()),
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("opaque-502-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-opaque-reasoning-fallback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config_path = dir.join("config.toml");
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_path.clone(),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "opaque-reasoning-session",
+                "model": "gpt-5.6-luna",
+                "reasoning": { "effort": "xhigh" },
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ready"));
+        assert_eq!(
+            *attempted_efforts.lock().await,
+            vec!["ultra".to_string(), "max".to_string()]
+        );
+
+        let config = state.config.read().await;
+        assert_eq!(
+            config.providers[0].models[0].reasoning_effort.as_deref(),
+            Some("max")
+        );
+        drop(config);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.retries, 1);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(
+            metrics.recent_requests[0]
+                .reasoning_effort_source
+                .as_deref(),
+            Some("model_override_opaque_502_fallback")
+        );
+
         fs::remove_dir_all(dir).ok();
     }
 
@@ -23698,6 +24945,62 @@ mod tests {
         assert_eq!(
             proven.source.as_deref(),
             Some("model_override_ultra_to_max")
+        );
+    }
+
+    #[test]
+    fn opaque_reasoning_probe_requires_higher_manual_override_and_html_502() {
+        let diagnostics = ReasoningEffortDiagnostics {
+            agent: Some("xhigh".to_string()),
+            configured: Some("ultra".to_string()),
+            effective: Some("ultra".to_string()),
+            source: Some("model_override".to_string()),
+        };
+        assert!(should_probe_opaque_reasoning_fallback(
+            502,
+            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
+            &diagnostics,
+        ));
+        assert!(!should_probe_opaque_reasoning_fallback(
+            502,
+            br#"{"error":{"message":"invalid upstream gateway response"}}"#,
+            &diagnostics,
+        ));
+        assert!(!should_probe_opaque_reasoning_fallback(
+            502,
+            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
+            &ReasoningEffortDiagnostics {
+                agent: None,
+                ..diagnostics.clone()
+            },
+        ));
+        assert!(!should_probe_opaque_reasoning_fallback(
+            502,
+            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
+            &ReasoningEffortDiagnostics {
+                configured: Some("high".to_string()),
+                ..diagnostics
+            },
+        ));
+    }
+
+    #[test]
+    fn reasoning_capability_cap_chooses_the_nearest_lower_effort() {
+        let client = json!({ "reasoning": { "effort": "low" } });
+        let mut upstream = client.clone();
+        let decision = reasoning_test_decision(Some("high"), &["low", "medium"]);
+
+        let diagnostics =
+            apply_model_reasoning_effort(&client, &mut upstream, &Channel::Responses, &decision);
+
+        assert_eq!(
+            upstream.pointer("/reasoning/effort"),
+            Some(&json!("medium"))
+        );
+        assert_eq!(diagnostics.effective.as_deref(), Some("medium"));
+        assert_eq!(
+            diagnostics.source.as_deref(),
+            Some("model_override_supported_cap")
         );
     }
 

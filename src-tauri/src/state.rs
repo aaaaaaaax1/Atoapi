@@ -52,6 +52,7 @@ pub struct AppState {
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
     pub response_session_error_cooldowns: Mutex<HashMap<String, ResponseSessionCooldownState>>,
     pub response_sessions: Mutex<HashMap<String, ResponseSessionState>>,
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
@@ -174,6 +175,7 @@ impl AppState {
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns: Mutex::new(
                 runtime_state.response_session_error_cooldowns,
             ),
@@ -202,6 +204,7 @@ impl AppState {
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns: Mutex::new(HashMap::new()),
             response_sessions: Mutex::new(HashMap::new()),
             provider_route_affinity: Mutex::new(HashMap::new()),

@@ -107,6 +107,22 @@ export interface ProviderKeyTestResult {
   models_count: number;
 }
 
+export interface ProviderNetworkPathResult {
+  path: "direct" | "system-proxy" | string;
+  ok: boolean;
+  status?: number | null;
+  elapsed_ms: number;
+  http_version?: string | null;
+  remote_addr?: string | null;
+  error?: string | null;
+}
+
+export interface ProviderNetworkPathDiagnosticResult {
+  provider_id: string;
+  target_url: string;
+  paths: ProviderNetworkPathResult[];
+}
+
 export interface AppConfig {
   host: string;
   port: number;
@@ -741,6 +757,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
     };
   }
   if (name === "get_metrics") return fallbackMetrics;
+  if (name === "diagnose_provider_network_paths") {
+    throw new Error("网络路径诊断仅在桌面代理运行时可用");
+  }
   if (name === "fetch_provider_models") {
     const input = args?.input as FetchModelsInput | undefined;
     const models = inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
