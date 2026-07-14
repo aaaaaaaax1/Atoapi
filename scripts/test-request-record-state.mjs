@@ -53,8 +53,13 @@ assert.deepEqual(
   { label: "冷启动", tone: "cold" }
 );
 assert.deepEqual(
-  state({ cacheStatus: "compact", downstreamDisconnected: true }),
-  { label: "下游已断开", tone: "disconnect" }
+  state({
+    cacheStatus: "compact",
+    upstreamCallSource: "responses-compaction-v2",
+    downstreamDisconnected: true
+  }),
+  { label: "实际压缩", tone: "compact" },
+  "a confirmed compaction must remain the primary state when Codex drops the downstream body"
 );
 assert.deepEqual(
   state({ status: 502, cacheStatus: "error" }),

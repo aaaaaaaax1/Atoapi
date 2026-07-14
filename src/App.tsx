@@ -165,8 +165,10 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.7";
+const appVersion = "v0.2.9";
 const appVersionNotes = [
+  "v0.2.9: 修复本地压缩状态识别与请求记录优先级；新增大工具输出的 shadow 分类和黏性观测。本版未启用 Stage 3 wire canary，不修改上游请求、缓存键或重试次数。",
+  "v0.2.8: 修复 Codex 自动/手动本地摘要压缩未显示“实际压缩”；可信 compaction 请求在普通摘要输出完成后正确落账，并清理旧前缀与会话状态。",
   "v0.2.7: 确认 Responses 压缩边界后清理旧前缀状态；压缩后首个后续请求安全冷启动，下一次成功请求恢复稳定命中；未通过效益门的 candidate 仅保留 shadow 观测，正式包隐藏受控验证面板。",
   "v0.2.6: 新增按上游和主模型精确限定的确定性 baseline / candidate 缓存验证；支持实时命中率、TTFT、错误与应用进度，并在超时或回归时自动退出。",
   "v0.2.5: 修复无可信会话 ID 时 Stage 2 全部落入 transparent 的问题，改用稳定内容锚点完成无状态 5% 分组；请求记录直接显示 candidate、baseline 或未应用状态。",

@@ -185,6 +185,9 @@ pub(super) fn compute_shadow_affinity(
         assignment.last_seen_at = now;
         assignment.cohort_id = identity.cohort_id.clone();
         assignment.realm_id = identity.realm_id.clone();
+        if giant_tail && assignment.lane == ShadowCacheLane::Steady {
+            assignment.lane = ShadowCacheLane::ToolBurstQuarantine;
+        }
         (
             assignment.realm_id.clone(),
             assignment.cohort_id.clone(),
@@ -395,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    fn assignments_are_sticky_and_missing_identity_is_transparent() {
+    fn trusted_assignments_enter_sticky_tool_burst_quarantine() {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
         let first = identity("thread-a");
@@ -412,7 +415,38 @@ mod tests {
             first_decision.assignment_key,
             second_decision.assignment_key
         );
-        assert_eq!(first_decision.lane, second_decision.lane);
+        assert_eq!(first_decision.lane, ShadowCacheLane::Steady);
+        assert_eq!(second_decision.lane, ShadowCacheLane::ToolBurstQuarantine);
+        let assignment_key = second_decision.assignment_key.clone().unwrap();
+        assert_eq!(
+            store.assignments[&assignment_key].lane,
+            ShadowCacheLane::ToolBurstQuarantine
+        );
+
+        let quiet_followup =
+            compute_shadow_affinity(&mut store, &first, None, now + Duration::minutes(2), 0, 0);
+        assert_eq!(quiet_followup.lane, ShadowCacheLane::ToolBurstQuarantine);
+        observe_shadow_affinity(
+            &mut store,
+            &quiet_followup,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 99_000,
+                ..ShadowObservationInput::default()
+            },
+            now + Duration::minutes(2),
+        );
+        assert_eq!(
+            store.assignments[&assignment_key].lane,
+            ShadowCacheLane::ToolBurstQuarantine
+        );
+
+        reset_anchor(&mut store, &assignment_key, now + Duration::minutes(3));
+        let reset =
+            compute_shadow_affinity(&mut store, &first, None, now + Duration::minutes(3), 0, 0);
+        assert_eq!(reset.lane, ShadowCacheLane::CompactedAnchor);
         assert_eq!(store.assignments.len(), 1);
 
         let mut no_identity = first.clone();
@@ -437,6 +471,17 @@ mod tests {
         assert!(decision.assignment_key.is_none());
         assert_eq!(decision.lane, ShadowCacheLane::Steady);
         assert_eq!(decision.decision, "stateless_assigned");
+        assert!(store.assignments.is_empty());
+
+        let burst = compute_shadow_affinity(
+            &mut store,
+            &untrusted,
+            Some("content-anchor-a"),
+            now + Duration::seconds(1),
+            GIANT_TAIL_CHARS,
+            GIANT_TAIL_CHARS,
+        );
+        assert_eq!(burst.lane, ShadowCacheLane::ToolBurstQuarantine);
         assert!(store.assignments.is_empty());
     }
 

@@ -65,8 +65,8 @@ use prefix_control::{
     ProviderCacheGapBreakdown,
 };
 use responses_stream::{
-    evaluate_terminal, value_has_compaction_output, ResponsesStreamState, StreamEnd,
-    TerminalCompatibility, TerminalFailure,
+    evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
+    StreamEnd, TerminalCompatibility, TerminalFailure,
 };
 use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
 pub(crate) use transport::TransportClients;
@@ -103,6 +103,7 @@ struct BodyDiagnostics {
     payload_too_large_rescue_attempted: bool,
     payload_too_large_rescue_used: bool,
     compaction_trigger_requested: bool,
+    trusted_codex_compaction_requested: bool,
     reasoning: ReasoningEffortDiagnostics,
 }
 #[derive(Debug, Clone, Default)]
@@ -1767,7 +1768,7 @@ async fn run_generation_for_authorized_agent(
         &upstream_send_body,
         active_used_response_session,
     );
-    diagnostics.compaction_trigger_requested |= trusted_codex_metadata
+    diagnostics.trusted_codex_compaction_requested = trusted_codex_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.compaction_requested);
     diagnostics.reasoning = reasoning_diagnostics;
@@ -3569,12 +3570,14 @@ async fn run_generation_for_authorized_agent(
     let prefix_usage_record = usage_observation
         .as_ref()
         .map(|item| item.effective.clone());
-    let (compaction_output_seen, compaction_terminal_seen) =
+    let (compaction_output_seen, model_output_seen, compaction_terminal_seen) =
         response_body_compaction_evidence(&bytes, &content_type);
     let confirmed_compaction = confirmed_responses_compaction(
         &active_request_channel,
         diagnostics.compaction_trigger_requested,
+        diagnostics.trusted_codex_compaction_requested,
         compaction_output_seen,
+        model_output_seen,
         is_success_status,
         compaction_terminal_seen,
     );
@@ -7635,6 +7638,7 @@ fn body_diagnostics(
         payload_too_large_rescue_used: false,
         compaction_trigger_requested: matches!(channel, Channel::Responses)
             && responses_request_has_compaction_trigger(original_body),
+        trusted_codex_compaction_requested: false,
         reasoning: ReasoningEffortDiagnostics::default(),
     }
 }
@@ -7700,29 +7704,60 @@ fn responses_request_has_compaction_trigger(request: &Value) -> bool {
         == Some("compaction_trigger")
 }
 
-fn response_body_compaction_evidence(bytes: &[u8], content_type: &str) -> (bool, bool) {
+fn response_body_compaction_evidence(bytes: &[u8], content_type: &str) -> (bool, bool, bool) {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        return (value_has_compaction_output(&value), true);
+        return (
+            value_has_compaction_output(&value),
+            value_has_model_output(&value),
+            true,
+        );
     }
     if is_text_event_stream(content_type) {
         let mut stream = ResponsesStreamState::default();
         stream.ingest(bytes);
         let summary = stream.finish();
-        return (summary.compaction_output_seen, summary.completed_event_seen);
+        return (
+            summary.compaction_output_seen,
+            summary.model_output_seen,
+            summary.completed_event_seen,
+        );
     }
-    (false, false)
+    (false, false, false)
 }
 
 fn confirmed_responses_compaction(
     channel: &Channel,
-    trigger_requested: bool,
+    protocol_trigger_requested: bool,
+    trusted_codex_compaction_requested: bool,
     output_seen: bool,
+    model_output_seen: bool,
     http_success: bool,
     terminal_success: bool,
 ) -> bool {
     matches!(channel, Channel::Responses)
-        && trigger_requested
-        && output_seen
+        && (protocol_trigger_requested || trusted_codex_compaction_requested)
+        && http_success
+        && terminal_success
+        && (output_seen
+            || confirmed_codex_local_compaction(
+                channel,
+                trusted_codex_compaction_requested,
+                model_output_seen,
+                http_success,
+                terminal_success,
+            ))
+}
+
+fn confirmed_codex_local_compaction(
+    channel: &Channel,
+    trusted_request: bool,
+    model_output_seen: bool,
+    http_success: bool,
+    terminal_success: bool,
+) -> bool {
+    matches!(channel, Channel::Responses)
+        && trusted_request
+        && model_output_seen
         && http_success
         && terminal_success
 }
@@ -10159,7 +10194,9 @@ async fn stream_upstream(
         let confirmed_compaction = confirmed_responses_compaction(
             &decision.upstream_channel,
             diagnostics.compaction_trigger_requested,
+            diagnostics.trusted_codex_compaction_requested,
             stream_metadata.compaction_output_seen,
+            stream_metadata.model_output_seen,
             (200..300).contains(&status),
             terminal_verdict.success,
         );
@@ -17254,19 +17291,16 @@ mod tests {
         assert!(confirmed_responses_compaction(
             &Channel::Responses,
             true,
+            false,
             true,
+            false,
             true,
             true
         ));
         assert!(!confirmed_responses_compaction(
             &Channel::Responses,
             false,
-            true,
-            true,
-            true
-        ));
-        assert!(!confirmed_responses_compaction(
-            &Channel::Responses,
+            false,
             true,
             false,
             true,
@@ -17275,21 +17309,36 @@ mod tests {
         assert!(!confirmed_responses_compaction(
             &Channel::Responses,
             true,
+            false,
+            false,
+            false,
             true,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            false,
+            true,
+            false,
             false,
             true
         ));
         assert!(!confirmed_responses_compaction(
             &Channel::Responses,
             true,
+            false,
             true,
+            false,
             true,
             false
         ));
         assert!(!confirmed_responses_compaction(
             &Channel::Chat,
             true,
+            false,
             true,
+            false,
             true,
             true
         ));
@@ -17297,6 +17346,31 @@ mod tests {
         assert_eq!(generation_cache_status(false, true, true, false), "bypass");
         assert_eq!(generation_cache_status(false, true, false, true), "miss");
         assert_eq!(generation_cache_status(false, false, false, true), "error");
+        assert!(confirmed_codex_local_compaction(
+            &Channel::Responses,
+            true,
+            true,
+            true,
+            true
+        ));
+        assert!(confirmed_responses_compaction(
+            &Channel::Responses,
+            false,
+            true,
+            false,
+            true,
+            true,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            false,
+            false,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]
@@ -19886,7 +19960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_v2_compaction_resets_old_prefix_and_session_state_after_success() {
+    async fn codex_local_compaction_resets_old_prefix_and_session_state_after_success() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-compaction-boundary-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -19946,7 +20020,7 @@ mod tests {
                     upstream_hits.fetch_add(1, Ordering::SeqCst);
                     let stream = async_stream::stream! {
                         yield Ok::<Bytes, Infallible>(Bytes::from_static(
-                            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"compacted summary\"}\n\n",
                         ));
                         yield Ok::<Bytes, Infallible>(Bytes::from_static(
                             b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compaction\",\"usage\":{\"input_tokens\":311117,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":6912}}}}\n\n",
@@ -19973,8 +20047,15 @@ mod tests {
             .unwrap();
         let compaction_input = json!([
             {"type":"message","role":"user","content":"old history"},
-            {"type":"compaction_trigger"}
+            {"type":"message","role":"user","content":"Please summarize this conversation."}
         ]);
+        let mut compaction_diagnostics = body_diagnostics(
+            &Channel::Responses,
+            &json!({"input": compaction_input.clone()}),
+            &json!({"input": compaction_input}),
+            false,
+        );
+        compaction_diagnostics.trusted_codex_compaction_requested = true;
         let response = stream_upstream(
             state.clone(),
             upstream,
@@ -20006,12 +20087,7 @@ mod tests {
             Some(compaction_input.clone()),
             false,
             false,
-            body_diagnostics(
-                &Channel::Responses,
-                &json!({"input": compaction_input}),
-                &json!({"input": [{"type":"compaction_trigger"}]}),
-                false,
-            ),
+            compaction_diagnostics,
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
             ResponseSessionReuseDiagnostics::default(),

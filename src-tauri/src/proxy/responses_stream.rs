@@ -17,6 +17,7 @@ pub(super) struct StreamSummary {
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
     pub compaction_output_seen: bool,
+    pub model_output_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -93,12 +94,11 @@ pub(super) struct ResponsesStreamState {
     pending_line: String,
     utf8_remainder: Vec<u8>,
     summary: StreamSummary,
-    model_output_seen: bool,
 }
 
 impl ResponsesStreamState {
     pub fn ingest(&mut self, chunk: &[u8]) -> StreamObservation {
-        let output_seen_before = self.model_output_seen;
+        let output_seen_before = self.summary.model_output_seen;
         sse::append_utf8_safe(&mut self.pending_line, &mut self.utf8_remainder, chunk);
         while let Some(newline_index) = self.pending_line.find('\n') {
             let line = self.pending_line[..newline_index]
@@ -111,7 +111,7 @@ impl ResponsesStreamState {
             self.pending_line.clear();
         }
         StreamObservation {
-            model_output_started: !output_seen_before && self.model_output_seen,
+            model_output_started: !output_seen_before && self.summary.model_output_seen,
         }
     }
 
@@ -146,7 +146,7 @@ impl ResponsesStreamState {
             self.summary.completed_event_seen = true;
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            self.model_output_seen |= value_has_model_output(&value);
+            self.summary.model_output_seen |= value_has_model_output(&value);
             self.summary.compaction_output_seen |= value_has_compaction_output(&value);
             if value.get("error").is_some()
                 || value
@@ -189,7 +189,11 @@ fn is_error_event_type(kind: &str) -> bool {
         || kind.ends_with(".error")
 }
 
-fn value_has_model_output(value: &Value) -> bool {
+pub(super) fn value_has_model_output(value: &Value) -> bool {
+    if let Value::Array(items) = value {
+        return items.iter().any(value_has_model_output);
+    }
+
     let event_type = value.get("type").and_then(Value::as_str);
     if event_type.is_some_and(|kind| kind.ends_with(".delta"))
         && value.get("delta").is_some_and(delta_has_content)
@@ -202,14 +206,27 @@ fn value_has_model_output(value: &Value) -> bool {
         return true;
     }
 
+    if event_type == Some("output_text")
+        && value
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    {
+        return true;
+    }
+
+    if event_type == Some("message") && value.get("content").is_some_and(value_has_model_output) {
+        return true;
+    }
+
     value
         .get("choices")
         .and_then(Value::as_array)
-        .is_some_and(|choices| {
-            choices
-                .iter()
-                .any(|choice| choice.get("delta").is_some_and(delta_has_content))
-        })
+        .is_some_and(|choices| choices.iter().any(value_has_model_output))
+        || ["item", "output", "response", "data", "content"]
+            .into_iter()
+            .filter_map(|key| value.get(key))
+            .any(value_has_model_output)
 }
 
 fn delta_has_content(value: &Value) -> bool {
@@ -284,6 +301,20 @@ mod tests {
                 .ingest(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"again\"}\n\n")
                 .model_output_started
         );
+        assert!(state.finish().model_output_seen);
+    }
+
+    #[test]
+    fn detects_model_output_in_complete_response_json() {
+        assert!(value_has_model_output(&serde_json::json!({
+            "id": "resp_summary",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "compacted summary"}]
+            }]
+        })));
     }
 
     #[test]

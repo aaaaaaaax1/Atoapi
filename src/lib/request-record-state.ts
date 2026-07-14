@@ -23,11 +23,11 @@ export function requestRecordState(input: RequestRecordStateInput): RequestRecor
       tone: "error"
     };
   }
-  if (input.downstreamDisconnected) {
-    return { label: "下游已断开", tone: "disconnect" };
-  }
   if (input.cacheStatus === "compact" && isConfirmedCompactionSource(input.upstreamCallSource)) {
     return { label: "实际压缩", tone: "compact" };
+  }
+  if (input.downstreamDisconnected) {
+    return { label: "下游已断开", tone: "disconnect" };
   }
   if (requestIsColdStart(input)) {
     const afterCompaction =
