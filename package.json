@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "0.2.5",
+  "version": "0.2.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "preview": "vite preview --host 127.0.0.1",
     "analyze:metrics": "node scripts/analyze-metrics.mjs",
     "test:metrics": "node scripts/test-analyze-metrics.mjs",
+    "test:request-state": "node scripts/test-request-record-state.mjs",
     "build:codex-patcher": "node scripts/build-codex-ui-patcher.mjs",
     "soak:metrics": "node scripts/soak-metrics.mjs",
     "verify:cache": "node scripts/verify-cache.mjs",

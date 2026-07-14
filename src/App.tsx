@@ -37,6 +37,9 @@ import {
   AgentInjectionConfig,
   AgentInjectionResult,
   AppConfig,
+  CacheValidationControlInput,
+  CacheValidationMode,
+  CacheValidationStatus,
   Channel,
   command,
   FetchModelsInput,
@@ -53,6 +56,9 @@ import {
   ProviderResponseSessionReuseProbeResult,
   ProxyModeConfigInput
 } from "./lib/api";
+import { requestRecordState } from "./lib/request-record-state";
+
+const CACHE_VALIDATION_TOOLS_ENABLED = import.meta.env.DEV;
 
 type ViewId = "agent" | "cache";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
@@ -159,8 +165,10 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.5";
+const appVersion = "v0.2.7";
 const appVersionNotes = [
+  "v0.2.7: 确认 Responses 压缩边界后清理旧前缀状态；压缩后首个后续请求安全冷启动，下一次成功请求恢复稳定命中；未通过效益门的 candidate 仅保留 shadow 观测，正式包隐藏受控验证面板。",
+  "v0.2.6: 新增按上游和主模型精确限定的确定性 baseline / candidate 缓存验证；支持实时命中率、TTFT、错误与应用进度，并在超时或回归时自动退出。",
   "v0.2.5: 修复无可信会话 ID 时 Stage 2 全部落入 transparent 的问题，改用稳定内容锚点完成无状态 5% 分组；请求记录直接显示 candidate、baseline 或未应用状态。",
   "v0.2.4: 流式 relay 由唯一 owner 完成上游读取、实时转发、usage、缓存和收尾；Agent 默认一次入站一次上游，并加入 Stage 2 5% 缓存亲和候选灰度与诊断。",
   "v0.2.3: 思考强度上游返回 HTML 502 时执行一次受控降档探测，仅在下一档成功后持久化降档。",
@@ -216,6 +224,8 @@ export default function App() {
   const [savingProvider, setSavingProvider] = useState(false);
   const [probingSessionReuse, setProbingSessionReuse] = useState("");
   const [savingCachePolicy, setSavingCachePolicy] = useState(false);
+  const [cacheValidation, setCacheValidation] = useState<CacheValidationStatus | null>(null);
+  const [savingCacheValidation, setSavingCacheValidation] = useState(false);
   const [savingProxyModeConfig, setSavingProxyModeConfig] = useState(false);
   const [proxyModeDraft, setProxyModeDraft] = useState<ProxyModeDraft>({ host: "127.0.0.1", port: "18884" });
   const [injectingId, setInjectingId] = useState("");
@@ -321,12 +331,17 @@ export default function App() {
 
   async function refreshAll() {
     setError("");
-    const [nextConfig, nextMetrics] = await Promise.all([
+    const cacheValidationRequest = CACHE_VALIDATION_TOOLS_ENABLED
+      ? command<CacheValidationStatus>("get_cache_validation_status")
+      : Promise.resolve(null);
+    const [nextConfig, nextMetrics, nextCacheValidation] = await Promise.all([
       command<AppConfig>("reload_config"),
-      command<MetricsSnapshot>("get_metrics")
+      command<MetricsSnapshot>("get_metrics"),
+      cacheValidationRequest
     ]);
     setConfig(nextConfig);
     setMetrics(nextMetrics);
+    setCacheValidation(nextCacheValidation);
     if (selectedProviderId === "new" && nextConfig.providers.length > 0 && !draftHasInput(draft)) {
       setSelectedProviderId(nextConfig.active_provider_id ?? nextConfig.providers[0].id);
     }
@@ -343,7 +358,15 @@ export default function App() {
 
   async function refreshMetrics() {
     try {
-      setMetrics(await command<MetricsSnapshot>("get_metrics"));
+      const cacheValidationRequest = CACHE_VALIDATION_TOOLS_ENABLED
+        ? command<CacheValidationStatus>("get_cache_validation_status")
+        : Promise.resolve(null);
+      const [nextMetrics, nextCacheValidation] = await Promise.all([
+        command<MetricsSnapshot>("get_metrics"),
+        cacheValidationRequest
+      ]);
+      setMetrics(nextMetrics);
+      setCacheValidation(nextCacheValidation);
     } catch {
       // Keep the last known state in the UI.
     }
@@ -878,6 +901,25 @@ export default function App() {
     }
   }
 
+  async function setCacheValidationMode(input: CacheValidationControlInput) {
+    setSavingCacheValidation(true);
+    setError("");
+    setNotice("");
+    try {
+      const status = await command<CacheValidationStatus>("set_cache_validation_mode", { input });
+      setCacheValidation(status);
+      setNotice(
+        status.mode === "auto"
+          ? "缓存验证已恢复自动模式"
+          : `缓存验证已切换为 ${status.mode}：${status.provider_name} · ${status.model}`
+      );
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSavingCacheValidation(false);
+    }
+  }
+
   function updateConfig(patch: Partial<AppConfig>) {
     setConfig((current) => (current ? { ...current, ...patch } : current));
   }
@@ -1058,12 +1100,15 @@ export default function App() {
             <CachePanel
               config={config}
               metrics={metrics}
+              cacheValidation={cacheValidation}
               selectedProvider={cacheProviderFilter}
               savingCachePolicy={savingCachePolicy}
+              savingCacheValidation={savingCacheValidation}
               includeColdStarts={includeColdStarts}
               onSelectedProviderChange={setCacheProviderFilter}
               onIncludeColdStartsChange={setIncludeColdStarts}
               onSmartCacheChange={(nextCache) => void saveCachePolicy(nextCache)}
+              onCacheValidationChange={(input) => void setCacheValidationMode(input)}
               onRefresh={() => void refreshMetrics()}
             />
           )}
@@ -2594,26 +2639,34 @@ function MultiKeyManager({
 function CachePanel({
   config,
   metrics,
+  cacheValidation,
   selectedProvider,
   savingCachePolicy,
+  savingCacheValidation,
   includeColdStarts,
   onSelectedProviderChange,
   onIncludeColdStartsChange,
   onSmartCacheChange,
+  onCacheValidationChange,
   onRefresh
 }: {
   config: AppConfig | null;
   metrics: MetricsSnapshot | null;
+  cacheValidation: CacheValidationStatus | null;
   selectedProvider: string;
   savingCachePolicy: boolean;
+  savingCacheValidation: boolean;
   includeColdStarts: boolean;
   onSelectedProviderChange: (provider: string) => void;
   onIncludeColdStartsChange: (include: boolean) => void;
   onSmartCacheChange: (nextCache: AppConfig["cache"]) => void;
+  onCacheValidationChange: (input: CacheValidationControlInput) => void;
   onRefresh: () => void;
 }) {
   const [requestPage, setRequestPage] = useState(1);
   const [expandedRequestKey, setExpandedRequestKey] = useState("");
+  const [validationProviderId, setValidationProviderId] = useState("");
+  const [validationModel, setValidationModel] = useState("");
   const usage = selectedProvider === "all"
     ? metrics?.usage
     : metrics?.usage.by_provider.find((item) => item.key === selectedProvider);
@@ -2663,6 +2716,27 @@ function CachePanel({
     ...successfulRequestFeed.map((request) => ({ ...request, feed_kind: "request" as const })),
     ...(metrics?.recent_failed_requests ?? []).map((request) => ({ ...request, feed_kind: "failed" as const }))
   ].sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
+  const validationProviders = (config?.providers ?? []).filter((provider) => provider.enabled);
+  const validationProvider = validationProviders.find(
+    (provider) => provider.id === validationProviderId
+  ) ?? null;
+  const validationModelScores = new Map<string, number>();
+  for (const request of requestFeed) {
+    if (!validationProvider || request.provider !== validationProvider.name || !request.agent_id) {
+      continue;
+    }
+    validationModelScores.set(
+      request.model,
+      Math.max(validationModelScores.get(request.model) ?? 0, request.input_tokens ?? 0)
+    );
+  }
+  const validationModelOptions = Array.from(new Set([
+    ...validationModelScores.keys(),
+    ...(validationProvider?.models.filter((model) => model.enabled).map((model) => model.id) ?? [])
+  ])).sort((left, right) =>
+    (validationModelScores.get(right) ?? 0) - (validationModelScores.get(left) ?? 0) ||
+    left.localeCompare(right)
+  );
   const shownRequests = requestFeed.filter((request) =>
     selectedProvider === "all" || request.provider === selectedProvider
   );
@@ -2693,6 +2767,46 @@ function CachePanel({
       prewarm_enabled: !smartCacheEnabled
     });
   }
+
+  function changeCacheValidation(mode: CacheValidationMode) {
+    if (mode === "auto") {
+      onCacheValidationChange({ mode });
+      return;
+    }
+    if (!validationProviderId || !validationModel) return;
+    onCacheValidationChange({
+      mode,
+      provider_id: validationProviderId,
+      model: validationModel
+    });
+  }
+
+  useEffect(() => {
+    if (cacheValidation?.run_id && cacheValidation.provider_id) {
+      setValidationProviderId(cacheValidation.provider_id);
+      return;
+    }
+    setValidationProviderId((current) => {
+      if (validationProviders.some((provider) => provider.id === current)) return current;
+      const selectedByName = validationProviders.find(
+        (provider) => provider.name === selectedProvider
+      );
+      const codexProviderId = config?.agent_injections.find(
+        (agent) => agent.id === "codex" && agent.enabled
+      )?.provider_id;
+      return selectedByName?.id ?? codexProviderId ?? validationProviders[0]?.id ?? "";
+    });
+  }, [cacheValidation?.run_id, cacheValidation?.provider_id, config, selectedProvider]);
+
+  useEffect(() => {
+    if (cacheValidation?.run_id && cacheValidation.model) {
+      setValidationModel(cacheValidation.model);
+      return;
+    }
+    setValidationModel((current) =>
+      validationModelOptions.includes(current) ? current : validationModelOptions[0] ?? ""
+    );
+  }, [cacheValidation?.run_id, cacheValidation?.model, validationProviderId, validationModelOptions.join("|")]);
 
   useEffect(() => {
     setRequestPage(1);
@@ -2732,6 +2846,82 @@ function CachePanel({
             <b>{savingCachePolicy ? "保存中" : smartCacheEnabled ? "已开启" : "已关闭"}</b>
           </button>
         </div>
+
+        {CACHE_VALIDATION_TOOLS_ENABLED ? (
+          <div className={`cache-validation-band ${cacheValidation?.mode ?? "auto"}`}>
+          <div className="cache-validation-head">
+            <div className="cache-validation-title">
+              <ShieldCheck size={18} />
+              <div>
+                <h4>受控命中验证</h4>
+                <span>
+                  {cacheValidation?.mode === "auto"
+                    ? cacheValidation?.last_run
+                      ? validationRunReasonLabel(cacheValidation.last_run.completion_reason)
+                      : "自动"
+                    : `${cacheValidation?.provider_name} · ${cacheValidation?.model}`}
+                </span>
+              </div>
+            </div>
+            <div className="cache-validation-segment" role="group" aria-label="缓存验证模式">
+              {(["auto", "baseline", "candidate"] as CacheValidationMode[]).map((mode) => (
+                <button
+                  className={cacheValidation?.mode === mode ? `active ${mode}` : mode}
+                  disabled={
+                    savingCacheValidation ||
+                    (mode !== "auto" && (!smartCacheEnabled || !validationProviderId || !validationModel))
+                  }
+                  key={mode}
+                  onClick={() => changeCacheValidation(mode)}
+                  type="button"
+                >
+                  {savingCacheValidation && cacheValidation?.mode !== mode ? "…" : mode}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="cache-validation-targets">
+            <label>
+              <span>上游</span>
+              <select
+                value={validationProviderId}
+                onChange={(event) => setValidationProviderId(event.target.value)}
+                disabled={savingCacheValidation || Boolean(cacheValidation?.run_id)}
+              >
+                {validationProviders.map((provider) => (
+                  <option value={provider.id} key={provider.id}>{provider.name}</option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span>主模型</span>
+              <select
+                value={validationModel}
+                onChange={(event) => setValidationModel(event.target.value)}
+                disabled={savingCacheValidation || Boolean(cacheValidation?.run_id)}
+              >
+                {validationModelOptions.map((model) => (
+                  <option value={model} key={model}>{model}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          {cacheValidation?.run_id ? (
+            <div className="cache-validation-progress">
+              <span><small>成功</small><b>{cacheValidation.successful_requests} / {cacheValidation.target_successful_requests}</b></span>
+              <span><small>输入</small><b>{formatCompactTokens(cacheValidation.input_tokens)} / {formatCompactTokens(cacheValidation.target_input_tokens)}</b></span>
+              <span><small>命中率</small><b>{percent(cacheValidation.cache_ratio)}</b></span>
+              <span><small>TTFT p95</small><b>{formatDurationMs(cacheValidation.ttft_p95_ms)}</b></span>
+              <span><small>error</small><b>{cacheValidation.failed_requests}</b></span>
+              {cacheValidation.mode === "candidate" ? (
+                <span><small>应用 / 跳过</small><b>{cacheValidation.candidate_applied_requests} / {cacheValidation.candidate_skipped_requests}</b></span>
+              ) : null}
+            </div>
+          ) : null}
+          </div>
+        ) : null}
 
 
         <div className="cold-start-control">
@@ -2870,11 +3060,17 @@ function CachePanel({
                 request.cache_avoidable_gap_tokens ?? 0,
                 request.cache_provider_unstable_gap_tokens ?? 0
               );
-              const primaryStatus = requestPrimaryStatus(
-                request,
-                request.input_tokens ?? 0,
-                request.cache_read_tokens ?? 0
-              );
+              const primaryState = requestRecordState({
+                status: request.status,
+                cacheStatus: request.cache_status,
+                upstreamCallSource: request.upstream_call_source,
+                downstreamDisconnected: request.downstream_disconnected,
+                shadowAffinityLane: request.shadow_affinity_lane,
+                prefixLagClassification: request.prefix_lag_classification,
+                inputTokens: request.input_tokens ?? 0,
+                cacheReadTokens: request.cache_read_tokens ?? 0
+              });
+              const primaryStatus = primaryState?.label ?? "";
               const sessionDiagnostic = responseSessionDiagnostics(request);
               const inputTokens = request.input_tokens ?? 0;
               const outputTokens = request.output_tokens ?? 0;
@@ -2893,7 +3089,8 @@ function CachePanel({
               const affinityArm = request.shadow_affinity_arm?.trim().toLowerCase() ?? "";
               const affinityDecision = request.shadow_affinity_decision?.trim().toLowerCase() ?? "";
               const candidateApplied = affinityDecision === "candidate_applied" ||
-                affinityDecision === "stateless_candidate_applied";
+                affinityDecision === "stateless_candidate_applied" ||
+                affinityDecision === "validation_candidate_applied";
               const affinityLabel = candidateApplied
                 ? "candidate"
                 : affinityArm === "baseline"
@@ -3022,7 +3219,10 @@ function CachePanel({
                       </div>
                     </div>
                     <div className="request-cache-result">
-                      <div className="request-cache-summary">
+                      <div className={`request-cache-summary${primaryState ? ` state-${primaryState.tone}` : ""}`}>
+                        {!isFailedRequest && primaryState ? (
+                          <span className="request-primary-state">{primaryState.label}</span>
+                        ) : null}
                         <b>{isFailedRequest ? (primaryStatus || "error") : `命中率 ${cacheRatioLabel}`}</b>
                         <small title={cacheDisplay.secondaryTitle ?? rawCacheDetailLabel}>{cacheDetailLabel}</small>
                       </div>
@@ -3541,26 +3741,6 @@ function percent(value?: number) {
   return `${((value ?? 0) * 100).toFixed(1)}%`;
 }
 
-function requestPrimaryStatus(
-  request: RequestLogEntry,
-  inputTokens: number,
-  cacheReadTokens: number
-) {
-  if (request.status >= 400 || request.cache_status === "error") {
-    return request.status ? `error ${request.status}` : "error";
-  }
-  if (request.downstream_disconnected) {
-    return "下游已断开";
-  }
-  if (request.cache_status === "compact") {
-    return "实际压缩";
-  }
-  if (inputTokens >= 1024 && cacheReadTokens === 0) {
-    return "冷启动";
-  }
-  return "";
-}
-
 function requestTimingDetail(request: RequestLogEntry) {
   const headersMs = request.upstream_headers_ms;
   const firstChunkMs = request.upstream_first_chunk_ms;
@@ -3936,6 +4116,21 @@ function formatDurationMs(value?: number | null) {
   if (ms >= 10_000) return `${Math.round(ms / 1000)}s`;
   if (ms >= 1000) return `${trimNumber(ms / 1000)}s`;
   return `${ms}ms`;
+}
+
+function validationRunReasonLabel(reason: string) {
+  const labels: Record<string, string> = {
+    target_reached: "目标已完成",
+    manual_stop: "已手动恢复自动",
+    replaced: "已切换验证组",
+    expired: "验证已过期",
+    candidate_not_applicable: "candidate 无法应用",
+    candidate_consecutive_failures: "candidate 连续失败，已回退",
+    candidate_error_rate: "candidate 错误率过高，已回退",
+    candidate_error_regression: "candidate 错误率回归，已回退",
+    candidate_ttft_regression: "candidate TTFT 回归，已回退"
+  };
+  return labels[reason] ?? reason;
 }
 
 function formatReasoningEffort(value?: string | null) {

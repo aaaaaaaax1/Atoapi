@@ -22,7 +22,10 @@ use crate::{
         PublicConfig,
     },
     metrics::MetricsStore,
-    proxy::{self, cache_affinity::ShadowAffinityStore, TransportClients},
+    proxy::{
+        self, cache_affinity::ShadowAffinityStore, cache_validation::CacheValidationController,
+        TransportClients,
+    },
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,6 +61,7 @@ pub struct AppState {
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
     pub shadow_affinity: Mutex<ShadowAffinityStore>,
+    pub cache_validation: Mutex<CacheValidationController>,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
 }
@@ -186,6 +190,7 @@ impl AppState {
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity: Mutex::new(runtime_state.shadow_affinity),
+            cache_validation: Mutex::new(CacheValidationController::default()),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })
@@ -214,6 +219,7 @@ impl AppState {
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity: Mutex::new(ShadowAffinityStore::default()),
+            cache_validation: Mutex::new(CacheValidationController::default()),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })

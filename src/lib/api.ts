@@ -189,6 +189,57 @@ export interface ProxyStatus {
   address?: string | null;
 }
 
+export type CacheValidationMode = "auto" | "baseline" | "candidate";
+
+export interface CacheValidationControlInput {
+  mode: CacheValidationMode;
+  provider_id?: string | null;
+  model?: string | null;
+}
+
+export interface CacheValidationRunSummary {
+  run_id: string;
+  mode: CacheValidationMode;
+  provider_id: string;
+  provider_name: string;
+  model: string;
+  started_at: string;
+  finished_at: string;
+  completion_reason: string;
+  successful_requests: number;
+  failed_requests: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_ratio: number;
+  error_rate: number;
+  ttft_p95_ms: number;
+  candidate_applied_requests: number;
+  candidate_skipped_requests: number;
+}
+
+export interface CacheValidationStatus {
+  mode: CacheValidationMode;
+  run_id?: string | null;
+  provider_id?: string | null;
+  provider_name?: string | null;
+  model?: string | null;
+  started_at?: string | null;
+  expires_at?: string | null;
+  successful_requests: number;
+  failed_requests: number;
+  input_tokens: number;
+  cache_read_tokens: number;
+  cache_ratio: number;
+  error_rate: number;
+  ttft_p95_ms: number;
+  candidate_applied_requests: number;
+  candidate_skipped_requests: number;
+  target_input_tokens: number;
+  target_successful_requests: number;
+  last_run?: CacheValidationRunSummary | null;
+  baseline_reference?: CacheValidationRunSummary | null;
+}
+
 export interface MetricsSnapshot {
   started_at?: string;
   total_requests: number;
@@ -320,6 +371,7 @@ export interface MetricsSnapshot {
     shadow_affinity_skip_reason?: string | null;
     shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
+    prefix_lag_classification?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;
@@ -410,6 +462,7 @@ export interface MetricsSnapshot {
     shadow_affinity_skip_reason?: string | null;
     shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
+    prefix_lag_classification?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;
@@ -704,6 +757,29 @@ const fallbackMetrics: MetricsSnapshot = {
   recent_failed_requests: []
 };
 
+let fallbackCacheValidation: CacheValidationStatus = {
+  mode: "auto",
+  run_id: null,
+  provider_id: null,
+  provider_name: null,
+  model: null,
+  started_at: null,
+  expires_at: null,
+  successful_requests: 0,
+  failed_requests: 0,
+  input_tokens: 0,
+  cache_read_tokens: 0,
+  cache_ratio: 0,
+  error_rate: 0,
+  ttft_p95_ms: 0,
+  candidate_applied_requests: 0,
+  candidate_skipped_requests: 0,
+  target_input_tokens: 5_000_000,
+  target_successful_requests: 50,
+  last_run: null,
+  baseline_reference: null
+};
+
 const fallbackProviderSecrets = new Map<string, string>();
 const fallbackProviderKeySecrets = new Map<string, string>();
 
@@ -803,6 +879,34 @@ function fallback(name: string, args?: Record<string, unknown>) {
     };
   }
   if (name === "get_metrics") return fallbackMetrics;
+  if (name === "get_cache_validation_status") return fallbackCacheValidation;
+  if (name === "set_cache_validation_mode") {
+    const input = args?.input as CacheValidationControlInput | undefined;
+    if (!input || input.mode === "auto") {
+      fallbackCacheValidation = { ...fallbackCacheValidation, mode: "auto", run_id: null };
+      return fallbackCacheValidation;
+    }
+    fallbackCacheValidation = {
+      ...fallbackCacheValidation,
+      mode: input.mode,
+      run_id: `preview-${Date.now()}`,
+      provider_id: input.provider_id ?? null,
+      provider_name: input.provider_id ?? null,
+      model: input.model ?? null,
+      started_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+      successful_requests: 0,
+      failed_requests: 0,
+      input_tokens: 0,
+      cache_read_tokens: 0,
+      cache_ratio: 0,
+      error_rate: 0,
+      ttft_p95_ms: 0,
+      candidate_applied_requests: 0,
+      candidate_skipped_requests: 0
+    };
+    return fallbackCacheValidation;
+  }
   if (name === "diagnose_provider_network_paths") {
     throw new Error("网络路径诊断仅在桌面代理运行时可用");
   }

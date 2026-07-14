@@ -18,7 +18,12 @@ use crate::{
         ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus, PublicConfig,
     },
     metrics::MetricsSnapshot,
-    proxy,
+    proxy::{
+        self,
+        cache_validation::{
+            CacheValidationControlInput, CacheValidationMode, CacheValidationStatus,
+        },
+    },
     state::{AppState, ProxyStatus},
 };
 
@@ -1246,6 +1251,46 @@ pub async fn get_proxy_status(state: State<'_, Arc<AppState>>) -> CommandResult<
 #[tauri::command]
 pub async fn get_metrics(state: State<'_, Arc<AppState>>) -> CommandResult<MetricsSnapshot> {
     Ok(state.metrics.snapshot().await)
+}
+
+#[tauri::command]
+pub async fn get_cache_validation_status(
+    state: State<'_, Arc<AppState>>,
+) -> CommandResult<CacheValidationStatus> {
+    Ok(state.cache_validation.lock().await.status(Utc::now()))
+}
+
+#[tauri::command]
+pub async fn set_cache_validation_mode(
+    state: State<'_, Arc<AppState>>,
+    input: CacheValidationControlInput,
+) -> CommandResult<CacheValidationStatus> {
+    let provider_name = if input.mode == CacheValidationMode::Auto {
+        None
+    } else {
+        let provider_id = input
+            .provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "provider is required for cache validation".to_string())?;
+        Some(
+            state
+                .config
+                .read()
+                .await
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .map(|provider| provider.name.clone())
+                .ok_or_else(|| format!("provider {provider_id} was not found"))?,
+        )
+    };
+    state
+        .cache_validation
+        .lock()
+        .await
+        .configure(input, provider_name, Utc::now())
 }
 
 #[tauri::command]

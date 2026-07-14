@@ -16,6 +16,7 @@ pub(super) struct StreamSummary {
     pub completed_event_seen: bool,
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
+    pub compaction_output_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -146,6 +147,7 @@ impl ResponsesStreamState {
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
             self.model_output_seen |= value_has_model_output(&value);
+            self.summary.compaction_output_seen |= value_has_compaction_output(&value);
             if value.get("error").is_some()
                 || value
                     .get("type")
@@ -159,6 +161,22 @@ impl ResponsesStreamState {
                 self.summary.response_id = Some(id);
             }
         }
+    }
+}
+
+pub(super) fn value_has_compaction_output(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("compaction") {
+                return true;
+            }
+            ["item", "output", "response", "data"]
+                .into_iter()
+                .filter_map(|key| map.get(key))
+                .any(value_has_compaction_output)
+        }
+        Value::Array(items) => items.iter().any(value_has_compaction_output),
+        _ => false,
     }
 }
 
@@ -224,6 +242,31 @@ mod tests {
         assert_eq!(summary.usage.input_tokens, 20);
         assert_eq!(summary.usage.cache_read_tokens, 19);
         assert_eq!(summary.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn detects_compaction_output_in_output_item_event() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+        );
+        state.ingest(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\"}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.compaction_output_seen);
+        assert!(summary.completed_event_seen);
+    }
+
+    #[test]
+    fn ordinary_output_does_not_look_like_compaction() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[]}}\n\n",
+        );
+
+        assert!(!state.finish().compaction_output_seen);
     }
 
     #[test]

@@ -1,0 +1,91 @@
+- main [ref=e3]:
+  - complementary [ref=e4]:
+    - generic [ref=e9]:
+      - heading "Atoapi" [level=1] [ref=e10]
+      - paragraph [ref=e11]: 本地代理加速器
+      - button "查看版本更新" [ref=e13] [cursor=pointer]: v0.2.6
+    - generic [ref=e14]:
+      - generic [ref=e15]: Agent 注入
+      - button "刷新" [ref=e16] [cursor=pointer]
+    - navigation [ref=e22]:
+      - button "Claude Code 未选择上游" [ref=e23] [cursor=pointer]:
+        - generic [ref=e28]:
+          - generic [ref=e29]: Claude Code
+          - generic [ref=e30]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e31]
+      - button "Claude Desktop 未选择上游" [ref=e33] [cursor=pointer]:
+        - generic [ref=e38]:
+          - generic [ref=e39]: Claude Desktop
+          - generic [ref=e40]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e41]
+      - button "Codex 未选择上游" [ref=e43] [cursor=pointer]:
+        - generic [ref=e57]:
+          - generic [ref=e58]: Codex
+          - generic [ref=e59]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e60]
+      - button "Gemini 未选择上游" [ref=e62] [cursor=pointer]:
+        - generic [ref=e66]:
+          - generic [ref=e67]: Gemini
+          - generic [ref=e68]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e69]
+      - button "OpenCode 未选择上游" [ref=e71] [cursor=pointer]:
+        - generic [ref=e77]:
+          - generic [ref=e78]: OpenCode
+          - generic [ref=e79]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e80]
+      - button "OpenClaw 未选择上游" [ref=e82] [cursor=pointer]:
+        - generic [ref=e88]:
+          - generic [ref=e89]: OpenClaw
+          - generic [ref=e90]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e91]
+      - button "Hermes 未选择上游" [ref=e93] [cursor=pointer]:
+        - generic [ref=e97]:
+          - generic [ref=e98]: Hermes
+          - generic [ref=e99]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e100]
+      - button "本地代理模式 未选择上游" [ref=e102] [cursor=pointer]:
+        - generic [ref=e109]:
+          - generic [ref=e110]: 本地代理模式
+          - generic [ref=e111]: 未选择上游
+        - button "开启这个 Agent 注入" [ref=e112]
+    - button "缓存统计" [ref=e115] [cursor=pointer]
+  - generic [ref=e119]:
+    - generic [ref=e120]:
+      - generic [ref=e121]:
+        - paragraph [ref=e122]: Control desk
+        - heading "Claude Code" [level=2] [ref=e123]
+      - generic [ref=e124]:
+        - generic [ref=e125]:
+          - generic [ref=e126]: 累计真实 token
+          - generic [ref=e127]: "0"
+        - generic [ref=e128]:
+          - generic [ref=e129]: 累计上游命中
+          - generic [ref=e130]: "0"
+        - generic [ref=e131]:
+          - generic [ref=e132]: 历史前缀命中率
+          - generic [ref=e133]: 0.0%
+    - generic [ref=e135]:
+      - generic [ref=e136]:
+        - generic [ref=e142]:
+          - heading "Claude Code" [level=3] [ref=e143]
+          - paragraph [ref=e144]: 为这个 Agent 选择一个中转上游。模型未命中映射时会直接透传 Agent 请求里的 model。
+        - button "新增上游" [ref=e146] [cursor=pointer]
+        - generic [ref=e148]:
+          - generic [ref=e149]:
+            - heading "当前 Agent 注入地址" [level=3] [ref=e151]
+            - generic [ref=e152]: 主代理
+          - generic [ref=e153]:
+            - generic [ref=e154]:
+              - generic [ref=e155]: Anthropic Base URL
+              - code [ref=e156]: http://127.0.0.1:18883
+              - button "复制 Anthropic Base URL" [ref=e157] [cursor=pointer]
+            - generic [ref=e161]:
+              - generic [ref=e162]: Agent Key
+              - code [ref=e163]: ato-local-preview
+              - button "复制 Agent Key" [ref=e164] [cursor=pointer]
+      - generic [ref=e169]:
+        - heading "选择这个 Agent 使用的上游" [level=3] [ref=e170]
+        - paragraph [ref=e171]: 点中某个上游后，这个 Agent 会绑定并同步配置；模型映射在上游编辑里维护，未命中时直接透传。
+      - generic [ref=e172]:
+        - generic [ref=e178]: 还没有上游。先新增一个中转，然后这个 Agent 会自动绑定到它。
+        - button "新增上游" [ref=e179] [cursor=pointer]

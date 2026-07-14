@@ -47,6 +47,7 @@ pub(crate) mod affinity_identity;
 mod attempt_gate;
 pub(crate) mod cache_affinity;
 mod cache_directed_relay;
+pub(crate) mod cache_validation;
 mod codex_chat_common;
 mod json_canonical;
 mod prefix_control;
@@ -58,12 +59,14 @@ mod transform_codex_chat;
 mod transport;
 use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken, ReasoningEvidence};
 use cache_affinity::{ShadowAffinityDecision, ShadowObservationInput};
+use cache_validation::CacheValidationObservation;
 use prefix_control::{
     PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
     ProviderCacheGapBreakdown,
 };
 use responses_stream::{
-    evaluate_terminal, ResponsesStreamState, StreamEnd, TerminalCompatibility, TerminalFailure,
+    evaluate_terminal, value_has_compaction_output, ResponsesStreamState, StreamEnd,
+    TerminalCompatibility, TerminalFailure,
 };
 use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
 pub(crate) use transport::TransportClients;
@@ -85,6 +88,7 @@ const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
+const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 #[derive(Debug, Clone)]
 struct RouteDecision {
     provider: ProviderConfig,
@@ -98,6 +102,7 @@ struct BodyDiagnostics {
     send_body_is_delta: bool,
     payload_too_large_rescue_attempted: bool,
     payload_too_large_rescue_used: bool,
+    compaction_trigger_requested: bool,
     reasoning: ReasoningEffortDiagnostics,
 }
 #[derive(Debug, Clone, Default)]
@@ -106,6 +111,13 @@ struct ReasoningEffortDiagnostics {
     configured: Option<String>,
     effective: Option<String>,
     source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrustedCodexRequestMetadata {
+    thread_id: Option<String>,
+    session_id: Option<String>,
+    compaction_requested: bool,
 }
 #[derive(Debug, Clone, Default)]
 struct UpstreamRequestDiagnostics {
@@ -306,6 +318,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/admin/metrics", get(admin_metrics))
+        .route("/admin/cache-validation", get(admin_cache_validation))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -338,6 +351,9 @@ async fn health() -> impl IntoResponse {
 }
 async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.metrics.snapshot().await)
+}
+async fn admin_cache_validation(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.cache_validation.lock().await.status(Utc::now()))
 }
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
     list_models_for_agent(state, headers, None).await
@@ -505,6 +521,10 @@ async fn handle_responses_compact_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
+    let trusted_codex_metadata = trusted_codex_request_metadata(
+        &headers,
+        forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
+    );
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
@@ -563,10 +583,12 @@ async fn handle_responses_compact_for_agent(
         &decision.upstream_channel,
         &decision,
     );
+    let identity_client_request =
+        identity_request_with_codex_metadata(&client_request, trusted_codex_metadata.as_ref());
     let session_identity = SessionIdentity::derive_for_agent(
         &config,
         &decision,
-        &client_request,
+        &identity_client_request,
         &upstream_body,
         authorized_agent.as_deref(),
     );
@@ -957,7 +979,7 @@ async fn handle_responses_compact_for_agent(
             let identity = affinity_identity::derive(
                 &config,
                 &decision,
-                &client_request,
+                &identity_client_request,
                 &upstream_body,
                 authorized_agent.as_deref(),
                 &selected_provider_key,
@@ -1270,6 +1292,10 @@ async fn run_generation_for_authorized_agent(
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
     };
+    let trusted_codex_metadata = trusted_codex_request_metadata(
+        &headers,
+        forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
+    );
     let config = state.config.read().await.clone();
     let route_affinity_key = provider_route_affinity_key(&config, &client_request, &client_channel);
     let route_affinity_provider_id =
@@ -1356,10 +1382,12 @@ async fn run_generation_for_authorized_agent(
         &mut reasoning_diagnostics,
     )
     .await;
+    let identity_client_request =
+        identity_request_with_codex_metadata(&client_request, trusted_codex_metadata.as_ref());
     let session_identity = SessionIdentity::derive_for_agent(
         &config,
         &decision,
-        &client_request,
+        &identity_client_request,
         &upstream_body,
         authorized_agent.as_deref(),
     );
@@ -1422,8 +1450,15 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
+    let provider_prefix_family_identity = session_identity.as_ref().map(|identity| {
+        if session_identity_source_is_trusted(identity.source) {
+            identity.anchor_key.as_str()
+        } else {
+            identity.scope_key.as_str()
+        }
+    });
     let provider_prefix_family_key = provider_prefix_family_control_key(
-        response_session_scope_key.as_deref(),
+        provider_prefix_family_identity,
         &decision,
         &decision.upstream_channel,
     );
@@ -1732,6 +1767,9 @@ async fn run_generation_for_authorized_agent(
         &upstream_send_body,
         active_used_response_session,
     );
+    diagnostics.compaction_trigger_requested |= trusted_codex_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.compaction_requested);
     diagnostics.reasoning = reasoning_diagnostics;
     let mut retried_full_response = false;
     let mut prefix_state_update_key =
@@ -1800,7 +1838,7 @@ async fn run_generation_for_authorized_agent(
         let identity = affinity_identity::derive(
             &config,
             &decision,
-            &client_request,
+            &identity_client_request,
             &upstream_body,
             authorized_agent.as_deref(),
             &selected_provider_key,
@@ -1819,11 +1857,34 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
+    let validation_selection = if agent_generation {
+        state.cache_validation.lock().await.selection(
+            &decision.provider.id,
+            &decision.model,
+            Utc::now(),
+        )
+    } else {
+        None
+    };
     let static_cohort_canary_applied = shadow_affinity_decision.as_mut().and_then(|decision| {
-        let can_apply = matches!(active_request_channel, Channel::Responses | Channel::Chat)
-            && !explicit_client_prompt_cache_key
-            && cache_affinity::apply_static_cohort_canary(decision, smart_hit_enabled(&config));
-        if !can_apply
+        let channel_eligible = matches!(active_request_channel, Channel::Responses | Channel::Chat);
+        let can_apply = if let Some(selection) = validation_selection.as_ref() {
+            cache_validation::apply_controlled_selection(
+                decision,
+                selection,
+                smart_hit_enabled(&config),
+                channel_eligible,
+            )
+        } else {
+            channel_eligible
+                && !explicit_client_prompt_cache_key
+                && cache_affinity::apply_automatic_static_cohort_canary(
+                    decision,
+                    smart_hit_enabled(&config),
+                )
+        };
+        if validation_selection.is_none()
+            && !can_apply
             && explicit_client_prompt_cache_key
             && decision.arm == cache_affinity::ShadowAffinityArm::Candidate
         {
@@ -3508,7 +3569,19 @@ async fn run_generation_for_authorized_agent(
     let prefix_usage_record = usage_observation
         .as_ref()
         .map(|item| item.effective.clone());
-    if is_success_status && matches!(active_request_channel, Channel::Responses) {
+    let (compaction_output_seen, compaction_terminal_seen) =
+        response_body_compaction_evidence(&bytes, &content_type);
+    let confirmed_compaction = confirmed_responses_compaction(
+        &active_request_channel,
+        diagnostics.compaction_trigger_requested,
+        compaction_output_seen,
+        is_success_status,
+        compaction_terminal_seen,
+    );
+    if is_success_status
+        && !confirmed_compaction
+        && matches!(active_request_channel, Channel::Responses)
+    {
         update_response_session(
             &state,
             response_session_key.as_deref(),
@@ -3544,6 +3617,17 @@ async fn run_generation_for_authorized_agent(
             )
         })
         .unwrap_or_default();
+    if confirmed_compaction {
+        let shadow_assignment_key = mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
+        finalize_confirmed_responses_compaction(
+            &state,
+            response_session_key.as_deref(),
+            prefix_state_update_key.as_deref(),
+            provider_prefix_family_key.as_deref(),
+            shadow_assignment_key.as_deref(),
+        )
+        .await;
+    }
     if !is_success_status {
         let error_summary = upstream_error_summary(&bytes);
         if should_cooldown_prefix_after_status(status)
@@ -3623,17 +3707,12 @@ async fn run_generation_for_authorized_agent(
         configured_reasoning_effort: None,
         effective_reasoning_effort: None,
         reasoning_effort_source: None,
-        cache_status: if is_success_status {
-            if sync_compact_diagnostic_only {
-                "compact"
-            } else if eligible {
-                "miss"
-            } else {
-                "bypass"
-            }
-        } else {
-            "error"
-        }
+        cache_status: generation_cache_status(
+            confirmed_compaction,
+            is_success_status,
+            sync_compact_diagnostic_only,
+            eligible,
+        )
         .to_string(),
         agent_id: agent_log_id.clone(),
         agent_label: agent_log_label.clone(),
@@ -3646,7 +3725,9 @@ async fn run_generation_for_authorized_agent(
             .to_string(),
         ),
         upstream_call_source: Some(
-            if active_responses_non_stream_chat_compat {
+            if confirmed_compaction {
+                "responses-compaction-v2"
+            } else if active_responses_non_stream_chat_compat {
                 if responses_sync_main_chat_compat_fallback {
                     "responses-sync-main-chat-compat-fallback"
                 } else {
@@ -3820,7 +3901,7 @@ async fn run_generation_for_authorized_agent(
         state.metrics.record_request(request_log, true).await;
     }
 
-    if eligible && is_success_status {
+    if eligible && is_success_status && !confirmed_compaction {
         insert_cache_entries(
             &state,
             cache_keys,
@@ -7046,6 +7127,74 @@ async fn update_response_session_with_id(
     }
 }
 
+async fn finalize_confirmed_responses_compaction(
+    state: &AppState,
+    response_session_key: Option<&str>,
+    prefix_state_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    shadow_assignment_key: Option<&str>,
+) {
+    let clear_family_state = shadow_assignment_key.is_some();
+    if let Some(key) = response_session_key {
+        state.response_sessions.lock().await.remove(key);
+    }
+
+    {
+        let mut states = state.prefix_states.lock().await;
+        if let Some(key) = prefix_state_key {
+            states.remove(key);
+            if let Some(alias) = provider_prefix_state_alias_key(key) {
+                states.remove(&alias);
+            }
+        }
+        if clear_family_state {
+            if let Some(key) = provider_prefix_family_key {
+                states.remove(key);
+            }
+        }
+    }
+
+    {
+        let mut cooldowns = state.prefix_error_cooldowns.lock().await;
+        if let Some(key) = prefix_state_key {
+            cooldowns.remove(key);
+        }
+        if clear_family_state {
+            if let Some(key) = provider_prefix_family_key {
+                cooldowns.remove(key);
+            }
+        }
+    }
+
+    if let Some(key) = shadow_assignment_key {
+        let mut shadow_affinity = state.shadow_affinity.lock().await;
+        cache_affinity::reset_anchor(&mut shadow_affinity, key, Utc::now());
+    }
+
+    if let Err(err) = state.persist_runtime_state().await {
+        state
+            .metrics
+            .record_error("compaction_boundary_state_save", &err.to_string())
+            .await;
+    }
+}
+
+fn mark_shadow_compaction_boundary(
+    decision: &mut Option<ShadowAffinityDecision>,
+) -> Option<String> {
+    let decision = decision.as_mut()?;
+    let assignment_key = decision.assignment_key.clone();
+    if decision.trusted_identity {
+        decision.anchor_epoch = decision.anchor_epoch.saturating_add(1);
+    }
+    decision.lane = cache_affinity::ShadowCacheLane::CompactedAnchor;
+    assignment_key
+}
+
+fn session_identity_source_is_trusted(source: &str) -> bool {
+    matches!(source, "thread-id" | "conversation-id" | "session-id")
+}
+
 fn should_replace_response_session(existing: &Value, next: &Value) -> bool {
     match (existing, next) {
         (Value::Array(existing_items), Value::Array(next_items)) => {
@@ -7279,6 +7428,7 @@ async fn finalize_agent_generation(
     diagnostics: Option<&UpstreamRequestDiagnostics>,
 ) {
     apply_shadow_affinity_log_fields(&mut request_log, shadow_affinity.as_ref());
+    let validation_ttft_ms = request_log.ttft_ms;
     let shadow_observation = shadow_affinity.as_ref().map(|_| ShadowObservationInput {
         success: matches!(inbound_outcome, AgentInboundOutcome::Success),
         has_usage: request_log.input_tokens.unwrap_or_default() > 0,
@@ -7289,6 +7439,7 @@ async fn finalize_agent_generation(
                 .tail_largest_tool_output_chars
                 .unwrap_or_default()
                 >= 80_000,
+        compaction_boundary: request_log.cache_status == "compact",
     });
     if !finish_agent_attempt_lifecycle(
         state,
@@ -7324,6 +7475,19 @@ async fn finalize_agent_generation(
         return;
     }
     if let (Some(decision), Some(observation)) = (shadow_affinity.as_ref(), shadow_observation) {
+        if let Some(run_id) = decision.validation_run_id.as_deref() {
+            state.cache_validation.lock().await.observe(
+                run_id,
+                CacheValidationObservation {
+                    success: observation.success,
+                    input_tokens: observation.input_tokens,
+                    cache_read_tokens: observation.cache_read_tokens,
+                    ttft_ms: validation_ttft_ms,
+                    candidate_applied: decision.decision == "validation_candidate_applied",
+                },
+                Utc::now(),
+            );
+        }
         let mut store = state.shadow_affinity.lock().await;
         cache_affinity::observe_shadow_affinity(&mut store, decision, observation, Utc::now());
         drop(store);
@@ -7469,7 +7633,116 @@ fn body_diagnostics(
         send_body_is_delta,
         payload_too_large_rescue_attempted: false,
         payload_too_large_rescue_used: false,
+        compaction_trigger_requested: matches!(channel, Channel::Responses)
+            && responses_request_has_compaction_trigger(original_body),
         reasoning: ReasoningEffortDiagnostics::default(),
+    }
+}
+
+fn trusted_codex_request_metadata(
+    headers: &HeaderMap,
+    authorized_codex_route: bool,
+) -> Option<TrustedCodexRequestMetadata> {
+    if !authorized_codex_route {
+        return None;
+    }
+    let raw = headers
+        .get(X_CODEX_TURN_METADATA_HEADER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if raw.is_empty() || raw.len() > 32 * 1024 {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let thread_id = value.get("thread_id").and_then(bounded_metadata_id);
+    let session_id = value.get("session_id").and_then(bounded_metadata_id);
+    let compaction_requested =
+        value.get("request_kind").and_then(Value::as_str) == Some("compaction");
+    (thread_id.is_some() || session_id.is_some() || compaction_requested).then_some(
+        TrustedCodexRequestMetadata {
+            thread_id,
+            session_id,
+            compaction_requested,
+        },
+    )
+}
+
+fn bounded_metadata_id(value: &Value) -> Option<String> {
+    let value = value.as_str()?.trim();
+    (!value.is_empty() && value.len() <= 512).then(|| value.to_string())
+}
+
+fn identity_request_with_codex_metadata(
+    request: &Value,
+    metadata: Option<&TrustedCodexRequestMetadata>,
+) -> Value {
+    let mut identity_request = request.clone();
+    let (Some(object), Some(metadata)) = (identity_request.as_object_mut(), metadata) else {
+        return identity_request;
+    };
+    if let Some(thread_id) = metadata.thread_id.as_ref() {
+        object.insert("thread_id".to_string(), Value::String(thread_id.clone()));
+    }
+    if let Some(session_id) = metadata.session_id.as_ref() {
+        object.insert("session_id".to_string(), Value::String(session_id.clone()));
+    }
+    identity_request
+}
+
+fn responses_request_has_compaction_trigger(request: &Value) -> bool {
+    request
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        == Some("compaction_trigger")
+}
+
+fn response_body_compaction_evidence(bytes: &[u8], content_type: &str) -> (bool, bool) {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return (value_has_compaction_output(&value), true);
+    }
+    if is_text_event_stream(content_type) {
+        let mut stream = ResponsesStreamState::default();
+        stream.ingest(bytes);
+        let summary = stream.finish();
+        return (summary.compaction_output_seen, summary.completed_event_seen);
+    }
+    (false, false)
+}
+
+fn confirmed_responses_compaction(
+    channel: &Channel,
+    trigger_requested: bool,
+    output_seen: bool,
+    http_success: bool,
+    terminal_success: bool,
+) -> bool {
+    matches!(channel, Channel::Responses)
+        && trigger_requested
+        && output_seen
+        && http_success
+        && terminal_success
+}
+
+fn generation_cache_status(
+    confirmed_compaction: bool,
+    is_success_status: bool,
+    diagnostic_only: bool,
+    eligible: bool,
+) -> &'static str {
+    if confirmed_compaction {
+        "compact"
+    } else if !is_success_status {
+        "error"
+    } else if diagnostic_only {
+        "bypass"
+    } else if eligible {
+        "miss"
+    } else {
+        "bypass"
     }
 }
 
@@ -9706,7 +9979,7 @@ async fn stream_upstream(
     upstream_request_diagnostics: UpstreamRequestDiagnostics,
     upstream_response_headers_at_ms: u64,
     agent_attempt_id: Option<String>,
-    shadow_affinity_decision: Option<ShadowAffinityDecision>,
+    mut shadow_affinity_decision: Option<ShadowAffinityDecision>,
     agent_generation: bool,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
@@ -9883,6 +10156,13 @@ async fn stream_upstream(
             }
         }
         let stream_success_for_cache = (200..300).contains(&status) && terminal_verdict.success;
+        let confirmed_compaction = confirmed_responses_compaction(
+            &decision.upstream_channel,
+            diagnostics.compaction_trigger_requested,
+            stream_metadata.compaction_output_seen,
+            (200..300).contains(&status),
+            terminal_verdict.success,
+        );
         if !stream_success_for_cache
             && matches!(
                 terminal_verdict.failure,
@@ -9911,7 +10191,7 @@ async fn stream_upstream(
         let prefix_usage_record = usage_observation
             .as_ref()
             .map(|item| item.effective.clone());
-        if stream_success_for_cache {
+        if stream_success_for_cache && !confirmed_compaction {
             update_response_session_with_id(
                 &state_for_stream,
                 response_session_key.as_deref(),
@@ -9947,6 +10227,18 @@ async fn stream_upstream(
                 )
             })
             .unwrap_or_default();
+        if confirmed_compaction {
+            let shadow_assignment_key =
+                mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
+            finalize_confirmed_responses_compaction(
+                &state_for_stream,
+                response_session_key.as_deref(),
+                prefix_state_key.as_deref(),
+                provider_prefix_family_key.as_deref(),
+                shadow_assignment_key.as_deref(),
+            )
+            .await;
+        }
         if stream_success_for_cache {
             note_provider_route_affinity(
                 &state_for_stream,
@@ -9976,7 +10268,9 @@ async fn stream_upstream(
             configured_reasoning_effort: None,
             effective_reasoning_effort: None,
             reasoning_effort_source: None,
-            cache_status: if stream_success_for_cache {
+            cache_status: if confirmed_compaction {
+                "compact"
+            } else if stream_success_for_cache {
                 if eligible {
                     "miss"
                 } else {
@@ -9989,8 +10283,15 @@ async fn stream_upstream(
             agent_id: agent_log_id.clone(),
             agent_label: agent_log_label.clone(),
             upstream_call_kind: Some("stream".to_string()),
-            upstream_call_source: Some("main".to_string()),
-            cache_key: if eligible && stream_success_for_cache {
+            upstream_call_source: Some(
+                if confirmed_compaction {
+                    "responses-compaction-v2"
+                } else {
+                    "main"
+                }
+                .to_string(),
+            ),
+            cache_key: if eligible && stream_success_for_cache && !confirmed_compaction {
                 Some(metrics_cache_key.clone())
             } else {
                 None
@@ -10186,7 +10487,7 @@ async fn stream_upstream(
                 .record_request(request_log, true)
                 .await;
         }
-        if eligible && stream_success_for_cache {
+        if eligible && stream_success_for_cache && !confirmed_compaction {
             insert_cache_entries(
                 &state_for_stream,
                 cache_keys,
@@ -16936,6 +17237,186 @@ mod tests {
     }
 
     #[test]
+    fn responses_compaction_requires_protocol_request_output_and_success_evidence() {
+        let request = json!({
+            "input": [
+                {"type":"message","role":"user","content":"history"},
+                {"type":"compaction_trigger"}
+            ]
+        });
+        assert!(responses_request_has_compaction_trigger(&request));
+        assert!(!responses_request_has_compaction_trigger(&json!({
+            "input": [
+                {"type":"compaction_trigger"},
+                {"type":"message","role":"user","content":"not a compaction boundary"}
+            ]
+        })));
+        assert!(confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            true,
+            true,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            false,
+            true,
+            true,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            false,
+            true,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            true,
+            false,
+            true
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Responses,
+            true,
+            true,
+            true,
+            false
+        ));
+        assert!(!confirmed_responses_compaction(
+            &Channel::Chat,
+            true,
+            true,
+            true,
+            true
+        ));
+        assert_eq!(generation_cache_status(true, true, true, false), "compact");
+        assert_eq!(generation_cache_status(false, true, true, false), "bypass");
+        assert_eq!(generation_cache_status(false, true, false, true), "miss");
+        assert_eq!(generation_cache_status(false, false, false, true), "error");
+    }
+
+    #[test]
+    fn codex_turn_metadata_isolates_identity_without_mutating_the_request() {
+        let original = json!({
+            "model": "gpt-5.5",
+            "instructions": "stable",
+            "input": [{"type":"message","role":"user","content":"same opening"}]
+        });
+        let mut thread_a_headers = HeaderMap::new();
+        thread_a_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"turn"}"#,
+            ),
+        );
+        let metadata_a = trusted_codex_request_metadata(&thread_a_headers, true).unwrap();
+        assert_eq!(metadata_a.thread_id.as_deref(), Some("thread-a"));
+        assert!(!metadata_a.compaction_requested);
+        assert!(trusted_codex_request_metadata(&thread_a_headers, false).is_none());
+
+        let projected_a = identity_request_with_codex_metadata(&original, Some(&metadata_a));
+        assert_eq!(original.get("thread_id"), None);
+        assert_eq!(projected_a["thread_id"], "thread-a");
+
+        let mut thread_b_headers = HeaderMap::new();
+        thread_b_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"session-b","thread_id":"thread-b","request_kind":"turn"}"#,
+            ),
+        );
+        let metadata_b = trusted_codex_request_metadata(&thread_b_headers, true).unwrap();
+        let projected_b = identity_request_with_codex_metadata(&original, Some(&metadata_b));
+
+        let mut config = AppConfig::default();
+        config.workspace_fingerprint = "workspace".to_string();
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://example.test/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let session_a = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &projected_a,
+            &original,
+            Some("codex"),
+        )
+        .unwrap();
+        let session_b = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &projected_b,
+            &original,
+            Some("codex"),
+        )
+        .unwrap();
+        assert_eq!(session_a.source, "thread-id");
+        assert_ne!(session_a.anchor_key, session_b.anchor_key);
+        assert_ne!(session_a.provider_cache_key, session_b.provider_cache_key);
+
+        let selected_key = SelectedProviderKey {
+            secret: "secret".to_string(),
+            key_id: Some("key-record".to_string()),
+        };
+        let affinity_a = affinity_identity::derive(
+            &config,
+            &decision,
+            &projected_a,
+            &original,
+            Some("codex"),
+            &selected_key,
+        );
+        let affinity_b = affinity_identity::derive(
+            &config,
+            &decision,
+            &projected_b,
+            &original,
+            Some("codex"),
+            &selected_key,
+        );
+        assert_ne!(
+            affinity_a.trusted_conversation_id,
+            affinity_b.trusted_conversation_id
+        );
+
+        let mut compact_headers = HeaderMap::new();
+        compact_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"compaction"}"#,
+            ),
+        );
+        let compact_metadata = trusted_codex_request_metadata(&compact_headers, true).unwrap();
+        assert!(compact_metadata.compaction_requested);
+        let compact_request = json!({
+            "model": "gpt-5.5",
+            "instructions": "stable",
+            "input": [{"type":"compaction_trigger"}]
+        });
+        let compact_identity_request =
+            identity_request_with_codex_metadata(&compact_request, Some(&compact_metadata));
+        let compact_session = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &compact_identity_request,
+            &compact_request,
+            Some("codex"),
+        )
+        .unwrap();
+        assert_eq!(session_a.anchor_key, compact_session.anchor_key);
+        assert_eq!(
+            session_a.provider_cache_key,
+            compact_session.provider_cache_key
+        );
+        assert_eq!(original.get("thread_id"), None);
+    }
+
+    #[test]
     fn response_session_update_does_not_replace_longer_prefix_with_older_shorter_input() {
         let shorter = json!([
             { "type": "message", "role": "user", "content": "one" }
@@ -18682,6 +19163,7 @@ mod tests {
             decision: "assigned".to_string(),
             skip_reason: None,
             policy_compute_ms: 0,
+            validation_run_id: None,
         };
         assert!(cache_affinity::apply_static_cohort_canary(
             &mut decision,
@@ -19399,6 +19881,197 @@ mod tests {
         assert_eq!(log.downstream_disconnected, Some(false));
         assert_eq!(log.sse_completed_event_seen, Some(true));
         assert_eq!(log.sse_done_marker_seen, Some(true));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_v2_compaction_resets_old_prefix_and_session_state_after_success() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-compaction-boundary-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let prefix_key = "compaction-prefix-state".to_string();
+        let family_key = "compaction-prefix-family".to_string();
+        let session_key = "compaction-session".to_string();
+        state.prefix_states.lock().await.extend([
+            (prefix_key.clone(), prefix_state(310_000, 300_000, 10_000)),
+            (family_key.clone(), prefix_state(310_000, 300_000, 10_000)),
+        ]);
+        state.response_sessions.lock().await.insert(
+            session_key.clone(),
+            ResponseSessionState {
+                response_id: "resp_before_compaction".to_string(),
+                input: json!([{"type":"message","role":"user","content":"old history"}]),
+                scope_key: Some("compaction-scope".to_string()),
+                finished_at: Instant::now(),
+            },
+        );
+        let shadow_identity = affinity_identity::AffinityIdentity {
+            realm_id: "compaction-realm".to_string(),
+            cohort_id: "compaction-cohort".to_string(),
+            stable_prefix_digest: "compaction-prefix".to_string(),
+            trusted_conversation_id: Some("trusted-compaction-thread".to_string()),
+            trusted_identity_source: Some("thread-id".to_string()),
+        };
+        let shadow_decision = {
+            let mut shadow_affinity = state.shadow_affinity.lock().await;
+            cache_affinity::compute_shadow_affinity(
+                &mut shadow_affinity,
+                &shadow_identity,
+                None,
+                Utc::now(),
+                0,
+                0,
+            )
+        };
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compaction\",\"usage\":{\"input_tokens\":311117,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":6912}}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let compaction_input = json!([
+            {"type":"message","role":"user","content":"old history"},
+            {"type":"compaction_trigger"}
+        ]);
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "compaction-request".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            Some("provider-cache-key-must-stay-stable".to_string()),
+            Some("provider-prefix-fingerprint".to_string()),
+            Some(family_key.clone()),
+            None,
+            AppConfig::default(),
+            None,
+            Some(prefix_key.clone()),
+            None,
+            Some(session_key.clone()),
+            Some("compaction-scope".to_string()),
+            Some(compaction_input.clone()),
+            false,
+            false,
+            body_diagnostics(
+                &Channel::Responses,
+                &json!({"input": compaction_input}),
+                &json!({"input": [{"type":"compaction_trigger"}]}),
+                false,
+            ),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+            None,
+            Some(shadow_decision),
+            false,
+        )
+        .await;
+
+        drop(response);
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the compaction owner must finalize after downstream disconnect");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let prefix_states = state.prefix_states.lock().await;
+        assert!(!prefix_states.contains_key(&prefix_key));
+        assert!(!prefix_states.contains_key(&family_key));
+        drop(prefix_states);
+        assert!(!state
+            .response_sessions
+            .lock()
+            .await
+            .contains_key(&session_key));
+        let shadow_affinity = state.shadow_affinity.lock().await;
+        let assignment = shadow_affinity
+            .assignments
+            .get("trusted-compaction-thread")
+            .unwrap();
+        assert_eq!(assignment.anchor_epoch, 1);
+        assert_eq!(
+            assignment.lane,
+            cache_affinity::ShadowCacheLane::CompactedAnchor
+        );
+        drop(shadow_affinity);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_requests[0].cache_status, "compact");
+        assert_eq!(
+            metrics.recent_requests[0].downstream_disconnected,
+            Some(true)
+        );
+        assert_eq!(
+            metrics.recent_requests[0].upstream_call_source.as_deref(),
+            Some("responses-compaction-v2")
+        );
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -25823,6 +26496,11 @@ mod tests {
         let mut config = AppConfig::default();
         config.local_key = "local-test-key".to_string();
         config.workspace_fingerprint = "workspace-test".to_string();
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        config.cache.enabled = true;
+        config.cache.exact_enabled = true;
+        config.cache.semantic_enabled = true;
+        config.cache.prewarm_enabled = true;
         config.active_provider_id = Some("mock-responses".to_string());
         config.default_channel = Channel::Responses;
         config.providers = vec![ProviderConfig {
@@ -26083,11 +26761,31 @@ mod tests {
             )
             .unwrap(),
         );
+        state
+            .cache_validation
+            .lock()
+            .await
+            .configure(
+                cache_validation::CacheValidationControlInput {
+                    mode: cache_validation::CacheValidationMode::Candidate,
+                    provider_id: Some("mock-responses".to_string()),
+                    model: Some("gpt-5.5".to_string()),
+                },
+                Some("Mock Responses".to_string()),
+                Utc::now(),
+            )
+            .unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer local-test-key"),
+        );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"native-session","thread_id":"native-thread","request_kind":"turn"}"#,
+            ),
         );
         let body = Bytes::from(
             serde_json::to_vec(&json!({
@@ -26124,6 +26822,8 @@ mod tests {
         let captured = captured_responses_body.lock().await.clone();
         assert_eq!(captured["stream"], true);
         assert!(captured.get("input").is_some());
+        assert!(captured.get("thread_id").is_none());
+        assert!(captured.get("session_id").is_none());
         let forwarded_cache_key = captured
             .get("prompt_cache_key")
             .and_then(Value::as_str)
@@ -26146,6 +26846,33 @@ mod tests {
         );
 
         let metrics = state.metrics.snapshot().await;
+        assert_eq!(
+            metrics.recent_requests[0]
+                .shadow_affinity_decision
+                .as_deref(),
+            Some("validation_candidate_applied")
+        );
+        assert_eq!(
+            metrics.recent_requests[0].shadow_affinity_trusted_identity,
+            Some(true)
+        );
+        assert_eq!(
+            metrics.recent_requests[0].provider_prefix_key.as_deref(),
+            metrics.recent_requests[0]
+                .shadow_affinity_cohort_id
+                .as_deref()
+        );
+        assert_eq!(
+            metrics.recent_requests[0].provider_prefix_key.as_deref(),
+            Some(forwarded_cache_key)
+        );
+        let validation = state.cache_validation.lock().await.status(Utc::now());
+        assert_eq!(
+            validation.mode,
+            cache_validation::CacheValidationMode::Candidate
+        );
+        assert_eq!(validation.successful_requests, 1);
+        assert_eq!(validation.candidate_applied_requests, 1);
         assert_eq!(
             metrics.recent_requests[0].upstream_call_kind.as_deref(),
             Some("stream")

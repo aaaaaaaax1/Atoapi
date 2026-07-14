@@ -10,6 +10,7 @@ pub(crate) const SHADOW_POLICY_EPOCH: u64 = 1;
 pub(super) const SHADOW_ASSIGNMENT_LIMIT: usize = 4096;
 pub(super) const SHADOW_ASSIGNMENT_TTL_HOURS: i64 = 24;
 pub(super) const STATIC_COHORT_CANARY_PERCENT: u8 = 5;
+const AUTOMATIC_STATIC_COHORT_ADMISSION_ENABLED: bool = false;
 const GIANT_TAIL_CHARS: u64 = 80_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +84,8 @@ pub(super) struct ShadowAffinityDecision {
     pub decision: String,
     pub skip_reason: Option<String>,
     pub policy_compute_ms: u64,
+    #[serde(default)]
+    pub validation_run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -92,6 +95,7 @@ pub(super) struct ShadowObservationInput {
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub giant_tail: bool,
+    pub compaction_boundary: bool,
 }
 
 pub(super) fn compute_shadow_affinity(
@@ -131,6 +135,7 @@ pub(super) fn compute_shadow_affinity(
                 decision: "stateless_assigned".to_string(),
                 skip_reason: None,
                 policy_compute_ms: started.elapsed().as_millis() as u64,
+                validation_run_id: None,
             };
         }
         return ShadowAffinityDecision {
@@ -147,6 +152,7 @@ pub(super) fn compute_shadow_affinity(
             decision: "transparent".to_string(),
             skip_reason: Some("missing_trusted_conversation_identity".to_string()),
             policy_compute_ms: started.elapsed().as_millis() as u64,
+            validation_run_id: None,
         };
     };
 
@@ -204,6 +210,7 @@ pub(super) fn compute_shadow_affinity(
         decision: "assigned".to_string(),
         skip_reason: None,
         policy_compute_ms: started.elapsed().as_millis() as u64,
+        validation_run_id: None,
     }
 }
 
@@ -232,8 +239,30 @@ pub(super) fn apply_static_cohort_canary(
     true
 }
 
+pub(super) fn apply_automatic_static_cohort_canary(
+    decision: &mut ShadowAffinityDecision,
+    smart_hit_enabled: bool,
+) -> bool {
+    if !AUTOMATIC_STATIC_COHORT_ADMISSION_ENABLED {
+        if smart_hit_enabled
+            && decision.lane == ShadowCacheLane::Steady
+            && matches!(
+                decision.decision.as_str(),
+                "assigned" | "stateless_assigned"
+            )
+            && decision.arm == ShadowAffinityArm::Candidate
+        {
+            decision.decision = "candidate_shadow_only".to_string();
+            decision.skip_reason = Some("awaiting_efficacy_evidence".to_string());
+        }
+        return false;
+    }
+    apply_static_cohort_canary(decision, smart_hit_enabled)
+}
+
 pub(super) fn static_cohort_prompt_cache_key(decision: &ShadowAffinityDecision) -> Option<&str> {
-    (decision.mode == "applied").then_some(decision.cohort_id.as_str())
+    matches!(decision.mode.as_str(), "applied" | "validation_applied")
+        .then_some(decision.cohort_id.as_str())
 }
 
 fn canary_arm_for_conversation(conversation_id: &str, percent: u8) -> ShadowAffinityArm {
@@ -275,6 +304,17 @@ pub(super) fn observe_shadow_affinity(
     }
     if input.giant_tail {
         assignment.inconclusive_observations += 1;
+    }
+    if decision.lane == ShadowCacheLane::CompactedAnchor
+        && input.success
+        && input.has_usage
+        && !input.compaction_boundary
+    {
+        assignment.lane = if input.giant_tail {
+            ShadowCacheLane::ToolBurstQuarantine
+        } else {
+            ShadowCacheLane::Steady
+        };
     }
 }
 
@@ -438,6 +478,58 @@ mod tests {
     }
 
     #[test]
+    fn automatic_admission_stays_shadow_only_until_manual_validation_wins() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut saw_candidate = false;
+
+        for index in 0..200 {
+            let mut decision = compute_shadow_affinity(
+                &mut store,
+                &identity(&format!("auto-thread-{index}")),
+                None,
+                now,
+                0,
+                0,
+            );
+            saw_candidate |= decision.arm == ShadowAffinityArm::Candidate;
+            assert!(!apply_automatic_static_cohort_canary(&mut decision, true));
+            assert_ne!(decision.mode, "applied");
+            if decision.arm == ShadowAffinityArm::Candidate {
+                assert_eq!(decision.decision, "candidate_shadow_only");
+                assert_eq!(
+                    decision.skip_reason.as_deref(),
+                    Some("awaiting_efficacy_evidence")
+                );
+            }
+        }
+        assert!(saw_candidate);
+
+        let mut smart_cache_disabled = ShadowAffinityDecision {
+            arm: ShadowAffinityArm::Candidate,
+            ..compute_shadow_affinity(
+                &mut store,
+                &identity("disabled-smart-cache"),
+                None,
+                now,
+                0,
+                0,
+            )
+        };
+        smart_cache_disabled.decision = "assigned".to_string();
+        assert!(!apply_automatic_static_cohort_canary(
+            &mut smart_cache_disabled,
+            false
+        ));
+        assert_eq!(smart_cache_disabled.decision, "assigned");
+
+        let mut nonsteady = smart_cache_disabled.clone();
+        nonsteady.lane = ShadowCacheLane::CompactedAnchor;
+        assert!(!apply_automatic_static_cohort_canary(&mut nonsteady, true));
+        assert_eq!(nonsteady.decision, "assigned");
+    }
+
+    #[test]
     fn failed_missing_usage_and_giant_tail_never_create_positive_learning() {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
@@ -457,6 +549,135 @@ mod tests {
         assert_eq!(assignment.successful_observations, 0);
         assert_eq!(assignment.usage_observations, 0);
         assert_eq!(assignment.inconclusive_observations, 2);
+    }
+
+    #[test]
+    fn compacted_anchor_returns_to_steady_after_first_successful_followup() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let identity = identity("thread-after-compaction");
+        let initial = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
+        let assignment_key = initial.assignment_key.clone().unwrap();
+        reset_anchor(&mut store, &assignment_key, now + Duration::seconds(1));
+
+        let boundary = compute_shadow_affinity(
+            &mut store,
+            &identity,
+            None,
+            now + Duration::seconds(2),
+            0,
+            0,
+        );
+        assert_eq!(boundary.lane, ShadowCacheLane::CompactedAnchor);
+        observe_shadow_affinity(
+            &mut store,
+            &boundary,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 30_000,
+                cache_read_tokens: 11_000,
+                giant_tail: false,
+                compaction_boundary: true,
+            },
+            now + Duration::seconds(3),
+        );
+        assert_eq!(
+            store.assignments[&assignment_key].lane,
+            ShadowCacheLane::CompactedAnchor
+        );
+
+        let followup = compute_shadow_affinity(
+            &mut store,
+            &identity,
+            None,
+            now + Duration::seconds(4),
+            0,
+            0,
+        );
+        observe_shadow_affinity(
+            &mut store,
+            &followup,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 30_500,
+                cache_read_tokens: 29_500,
+                giant_tail: false,
+                compaction_boundary: false,
+            },
+            now + Duration::seconds(5),
+        );
+
+        assert_eq!(
+            store.assignments[&assignment_key].lane,
+            ShadowCacheLane::Steady
+        );
+    }
+
+    #[test]
+    fn compacted_anchor_waits_for_usage_and_quarantines_a_giant_followup() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let identity = identity("thread-after-compaction-with-tool-burst");
+        let initial = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
+        let assignment_key = initial.assignment_key.clone().unwrap();
+        reset_anchor(&mut store, &assignment_key, now + Duration::seconds(1));
+
+        for (seconds, success, has_usage) in [(2, false, true), (3, true, false)] {
+            let decision = compute_shadow_affinity(
+                &mut store,
+                &identity,
+                None,
+                now + Duration::seconds(seconds),
+                0,
+                0,
+            );
+            observe_shadow_affinity(
+                &mut store,
+                &decision,
+                ShadowObservationInput {
+                    success,
+                    has_usage,
+                    input_tokens: has_usage.then_some(30_000).unwrap_or_default(),
+                    cache_read_tokens: has_usage.then_some(11_000).unwrap_or_default(),
+                    giant_tail: false,
+                    compaction_boundary: false,
+                },
+                now + Duration::seconds(seconds),
+            );
+            assert_eq!(
+                store.assignments[&assignment_key].lane,
+                ShadowCacheLane::CompactedAnchor
+            );
+        }
+
+        let giant_followup = compute_shadow_affinity(
+            &mut store,
+            &identity,
+            None,
+            now + Duration::seconds(4),
+            GIANT_TAIL_CHARS,
+            GIANT_TAIL_CHARS,
+        );
+        observe_shadow_affinity(
+            &mut store,
+            &giant_followup,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 120_000,
+                cache_read_tokens: 11_000,
+                giant_tail: true,
+                compaction_boundary: false,
+            },
+            now + Duration::seconds(4),
+        );
+
+        assert_eq!(
+            store.assignments[&assignment_key].lane,
+            ShadowCacheLane::ToolBurstQuarantine
+        );
     }
 
     #[test]
