@@ -1998,7 +1998,8 @@ button:disabled {
 }
 
 .request-row .request-channel-badge,
-.request-row .request-agent-badge {
+.request-row .request-agent-badge,
+.request-row .request-affinity-badge {
   display: inline-flex;
   align-items: center;
   min-width: 0;
@@ -2023,6 +2024,18 @@ button:disabled {
   border-color: rgba(126, 236, 176, 0.3);
   color: #d4f7dc;
   background: rgba(47, 96, 66, 0.42);
+}
+
+.request-row .request-affinity-badge {
+  border-color: rgba(142, 151, 145, 0.3);
+  color: #c3c9c4;
+  background: rgba(74, 80, 76, 0.34);
+}
+
+.request-row .request-affinity-badge.candidate {
+  border-color: rgba(255, 202, 94, 0.48);
+  color: #ffe09a;
+  background: rgba(129, 91, 22, 0.34);
 }
 
 .request-row .request-call-badge {
@@ -3399,6 +3412,7 @@ button:disabled {
 
   .request-row .request-channel-badge,
   .request-row .request-agent-badge,
+  .request-row .request-affinity-badge,
   .request-row .request-call-badge {
     min-width: 0;
     max-width: 100%;

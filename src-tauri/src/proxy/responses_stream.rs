@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::metrics::UsageRecord;
+use crate::{config::Channel, metrics::UsageRecord};
 
 use super::{provider_usage_from_value, response_id_from_value, sse};
 
@@ -16,6 +16,75 @@ pub(super) struct StreamSummary {
     pub completed_event_seen: bool,
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum TerminalCompatibility {
+    #[default]
+    Strict,
+    ResponsesDoneAtEof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StreamEnd {
+    CleanEof,
+    TransportError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalFailure {
+    ErrorEvent,
+    IncompleteEof,
+    TransportErrorBeforeTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct TerminalVerdict {
+    pub success: bool,
+    pub failure: Option<TerminalFailure>,
+    pub trailing_transport_anomaly: bool,
+}
+
+pub(super) fn evaluate_terminal(
+    channel: &Channel,
+    compatibility: TerminalCompatibility,
+    summary: &StreamSummary,
+    end: StreamEnd,
+) -> TerminalVerdict {
+    if summary.error_event_seen {
+        return terminal_failure(TerminalFailure::ErrorEvent);
+    }
+
+    let strict_terminal_seen = match channel {
+        Channel::Responses | Channel::Anthropic => summary.completed_event_seen,
+        Channel::Chat => summary.done_marker_seen,
+    };
+    let compatible_terminal_seen = strict_terminal_seen
+        || (matches!(channel, Channel::Responses)
+            && compatibility == TerminalCompatibility::ResponsesDoneAtEof
+            && end == StreamEnd::CleanEof
+            && summary.done_marker_seen);
+
+    if !compatible_terminal_seen {
+        return terminal_failure(match end {
+            StreamEnd::CleanEof => TerminalFailure::IncompleteEof,
+            StreamEnd::TransportError => TerminalFailure::TransportErrorBeforeTerminal,
+        });
+    }
+
+    TerminalVerdict {
+        success: true,
+        failure: None,
+        trailing_transport_anomaly: end == StreamEnd::TransportError,
+    }
+}
+
+fn terminal_failure(failure: TerminalFailure) -> TerminalVerdict {
+    TerminalVerdict {
+        success: false,
+        failure: Some(failure),
+        trailing_transport_anomaly: false,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -197,5 +266,149 @@ mod tests {
         let second = state.ingest(&event.as_bytes()[split_at..]);
 
         assert!(second.model_output_started);
+    }
+
+    #[test]
+    fn native_responses_requires_completed_event() {
+        let done_only = StreamSummary {
+            done_marker_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &done_only,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::IncompleteEof)
+        );
+
+        let completed = StreamSummary {
+            completed_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &completed,
+                StreamEnd::CleanEof,
+            ),
+            TerminalVerdict {
+                success: true,
+                failure: None,
+                trailing_transport_anomaly: false,
+            }
+        );
+    }
+
+    #[test]
+    fn responses_done_at_eof_compatibility_requires_clean_eof() {
+        let summary = StreamSummary {
+            done_marker_seen: true,
+            ..StreamSummary::default()
+        };
+        assert!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::ResponsesDoneAtEof,
+                &summary,
+                StreamEnd::CleanEof,
+            )
+            .success
+        );
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::ResponsesDoneAtEof,
+                &summary,
+                StreamEnd::TransportError,
+            ),
+            terminal_failure(TerminalFailure::TransportErrorBeforeTerminal)
+        );
+    }
+
+    #[test]
+    fn chat_and_anthropic_use_their_native_terminal_markers() {
+        let chat = StreamSummary {
+            done_marker_seen: true,
+            ..StreamSummary::default()
+        };
+        assert!(
+            evaluate_terminal(
+                &Channel::Chat,
+                TerminalCompatibility::Strict,
+                &chat,
+                StreamEnd::CleanEof,
+            )
+            .success
+        );
+
+        let anthropic = StreamSummary {
+            completed_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert!(
+            evaluate_terminal(
+                &Channel::Anthropic,
+                TerminalCompatibility::Strict,
+                &anthropic,
+                StreamEnd::CleanEof,
+            )
+            .success
+        );
+    }
+
+    #[test]
+    fn error_event_fails_even_when_a_terminal_marker_is_present() {
+        let summary = StreamSummary {
+            completed_event_seen: true,
+            error_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::ErrorEvent)
+        );
+    }
+
+    #[test]
+    fn transport_error_after_terminal_is_a_successful_trailing_anomaly() {
+        let summary = StreamSummary {
+            completed_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::TransportError,
+            ),
+            TerminalVerdict {
+                success: true,
+                failure: None,
+                trailing_transport_anomaly: true,
+            }
+        );
+    }
+
+    #[test]
+    fn transport_error_before_terminal_is_a_failure() {
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Anthropic,
+                TerminalCompatibility::Strict,
+                &StreamSummary::default(),
+                StreamEnd::TransportError,
+            ),
+            terminal_failure(TerminalFailure::TransportErrorBeforeTerminal)
+        );
     }
 }

@@ -222,6 +222,28 @@ export interface MetricsSnapshot {
   gap_buckets?: GapBucketStats[];
   request_body_buckets?: RequestBodyBucketStats[];
   provider_stats: ProviderTrafficStats[];
+  agent_generation?: {
+    inbound_requests: number;
+    successful_inbounds: number;
+    failed_inbounds: number;
+    generation_attempts: number;
+    multi_attempt_inbounds: number;
+    max_attempts_per_inbound: number;
+    active_inbounds: number;
+    active_attempts: number;
+  };
+  shadow_affinity?: {
+    decisions: number;
+    assigned_decisions: number;
+    transparent_decisions: number;
+    applied_decisions: number;
+    candidate_decisions: number;
+    observations: number;
+    successful_observations: number;
+    usage_observations: number;
+    inconclusive_observations: number;
+    policy_compute_ms_total: number;
+  };
   recent_upstream_calls?: Array<{
     id: string;
     at: string;
@@ -285,6 +307,18 @@ export interface MetricsSnapshot {
     cache_avoidable_gap_tokens?: number | null;
     cache_provider_unstable_gap_tokens?: number | null;
     provider_cache_token_ratio?: number | null;
+    shadow_affinity_mode?: string | null;
+    shadow_affinity_arm?: string | null;
+    shadow_affinity_realm_id?: string | null;
+    shadow_affinity_cohort_id?: string | null;
+    shadow_affinity_lane?: string | null;
+    shadow_affinity_shard?: number | null;
+    shadow_affinity_policy_epoch?: number | null;
+    shadow_affinity_anchor_epoch?: number | null;
+    shadow_affinity_trusted_identity?: boolean | null;
+    shadow_affinity_decision?: string | null;
+    shadow_affinity_skip_reason?: string | null;
+    shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
@@ -363,6 +397,18 @@ export interface MetricsSnapshot {
     cache_avoidable_gap_tokens?: number | null;
     cache_provider_unstable_gap_tokens?: number | null;
     provider_cache_token_ratio?: number | null;
+    shadow_affinity_mode?: string | null;
+    shadow_affinity_arm?: string | null;
+    shadow_affinity_realm_id?: string | null;
+    shadow_affinity_cohort_id?: string | null;
+    shadow_affinity_lane?: string | null;
+    shadow_affinity_shard?: number | null;
+    shadow_affinity_policy_epoch?: number | null;
+    shadow_affinity_anchor_epoch?: number | null;
+    shadow_affinity_trusted_identity?: boolean | null;
+    shadow_affinity_decision?: string | null;
+    shadow_affinity_skip_reason?: string | null;
+    shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;

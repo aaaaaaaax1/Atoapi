@@ -159,8 +159,10 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.3";
+const appVersion = "v0.2.5";
 const appVersionNotes = [
+  "v0.2.5: 修复无可信会话 ID 时 Stage 2 全部落入 transparent 的问题，改用稳定内容锚点完成无状态 5% 分组；请求记录直接显示 candidate、baseline 或未应用状态。",
+  "v0.2.4: 流式 relay 由唯一 owner 完成上游读取、实时转发、usage、缓存和收尾；Agent 默认一次入站一次上游，并加入 Stage 2 5% 缓存亲和候选灰度与诊断。",
   "v0.2.3: 思考强度上游返回 HTML 502 时执行一次受控降档探测，仅在下一档成功后持久化降档。",
   "v0.2.2: 网络路径诊断支持一键应用较快的成功路径；会话复用未验证原因更精确显示。",
   "v0.2.1: 新增上游网络路径诊断；推理强度按 high → medium → low 严格降档；流式交接不再被 Key 成功状态写入阻塞。",
@@ -2888,6 +2890,25 @@ function CachePanel({
                 request.configured_reasoning_effort?.trim() ||
                 request.agent_reasoning_effort?.trim() ||
                 null;
+              const affinityArm = request.shadow_affinity_arm?.trim().toLowerCase() ?? "";
+              const affinityDecision = request.shadow_affinity_decision?.trim().toLowerCase() ?? "";
+              const candidateApplied = affinityDecision === "candidate_applied" ||
+                affinityDecision === "stateless_candidate_applied";
+              const affinityLabel = candidateApplied
+                ? "candidate"
+                : affinityArm === "baseline"
+                  ? "baseline"
+                  : affinityArm === "candidate"
+                    ? "candidate 未应用"
+                    : "";
+              const affinityTitle = affinityLabel
+                ? [
+                    `缓存实验：${affinityLabel}`,
+                    request.shadow_affinity_lane ? `lane ${request.shadow_affinity_lane}` : "",
+                    request.shadow_affinity_trusted_identity === false ? "stateless" : "",
+                    affinityDecision ? `decision ${affinityDecision}` : ""
+                  ].filter(Boolean).join(" · ")
+                : "";
               const priorityMetricItems = [
                 { label: "首字", value: formatDurationMs(request.ttft_ms) },
                 { label: "用时", value: formatDurationMs(request.total_ms) }
@@ -2909,7 +2930,9 @@ function CachePanel({
               ].filter(Boolean);
               const requestKey = `${request.feed_kind}-${request.id}`;
               const detailsId = `request-details-${requestKey}`;
-              const hasRequestDetails = Boolean(timingDetail || sessionDiagnostic || cacheDisplay.secondary || traceItems.length);
+              const hasRequestDetails = Boolean(
+                timingDetail || sessionDiagnostic || cacheDisplay.secondary || traceItems.length || affinityLabel
+              );
               const isExpanded = expandedRequestKey === requestKey;
               const metricTitle = [
                 `首字 ${formatDurationMs(request.ttft_ms)}`,
@@ -2970,6 +2993,14 @@ function CachePanel({
                             {request.agent_id}
                           </span>
                         ) : null}
+                        {affinityLabel ? (
+                          <span
+                            className={`request-affinity-badge ${candidateApplied ? "candidate" : affinityArm}`}
+                            title={affinityTitle}
+                          >
+                            {affinityLabel}
+                          </span>
+                        ) : null}
                       </div>
                     </div>
                     <div className="request-metrics" title={metricTitle}>
@@ -3009,6 +3040,12 @@ function CachePanel({
                         <div className="request-detail-line">
                           <span>缓存细节</span>
                           <b title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>{cacheDisplay.secondary}</b>
+                        </div>
+                      ) : null}
+                      {affinityLabel ? (
+                        <div className="request-detail-line">
+                          <span>缓存实验</span>
+                          <b title={affinityTitle}>{affinityTitle}</b>
                         </div>
                       ) : null}
                       {sessionDiagnostic ? (

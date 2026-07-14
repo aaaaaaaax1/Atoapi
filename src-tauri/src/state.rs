@@ -22,7 +22,7 @@ use crate::{
         PublicConfig,
     },
     metrics::MetricsStore,
-    proxy::{self, TransportClients},
+    proxy::{self, cache_affinity::ShadowAffinityStore, TransportClients},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +57,7 @@ pub struct AppState {
     pub response_sessions: Mutex<HashMap<String, ResponseSessionState>>,
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
+    pub shadow_affinity: Mutex<ShadowAffinityStore>,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
 }
@@ -103,6 +104,8 @@ struct PersistedRuntimeState {
     response_sessions: HashMap<String, PersistedResponseSessionState>,
     #[serde(default)]
     response_session_error_cooldowns: HashMap<String, PersistedResponseSessionCooldownState>,
+    #[serde(default)]
+    shadow_affinity: ShadowAffinityStore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ impl AppState {
             response_sessions: Mutex::new(runtime_state.response_sessions),
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
+            shadow_affinity: Mutex::new(runtime_state.shadow_affinity),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })
@@ -209,6 +213,7 @@ impl AppState {
             response_sessions: Mutex::new(HashMap::new()),
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
+            shadow_affinity: Mutex::new(ShadowAffinityStore::default()),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })
@@ -386,11 +391,13 @@ impl AppState {
         let response_sessions = self.response_sessions.lock().await.clone();
         let response_session_error_cooldowns =
             self.response_session_error_cooldowns.lock().await.clone();
+        let shadow_affinity = self.shadow_affinity.lock().await.clone();
         save_runtime_state(
             &self.runtime_state_path,
             &prefix_states,
             &response_sessions,
             &response_session_error_cooldowns,
+            &shadow_affinity,
         )
     }
 }
@@ -535,6 +542,7 @@ fn save_runtime_state(
     prefix_states: &HashMap<String, PrefixWarmState>,
     response_sessions: &HashMap<String, ResponseSessionState>,
     response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
+    shadow_affinity: &ShadowAffinityStore,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -543,6 +551,7 @@ fn save_runtime_state(
         prefix_states,
         response_sessions,
         response_session_error_cooldowns,
+        shadow_affinity,
     );
     let raw = serde_json::to_string_pretty(&persisted)?;
     fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
@@ -554,6 +563,7 @@ struct RuntimeStateMaps {
     prefix_states: HashMap<String, PrefixWarmState>,
     response_sessions: HashMap<String, ResponseSessionState>,
     response_session_error_cooldowns: HashMap<String, ResponseSessionCooldownState>,
+    shadow_affinity: ShadowAffinityStore,
 }
 
 impl PersistedRuntimeState {
@@ -561,6 +571,7 @@ impl PersistedRuntimeState {
         prefix_states: &HashMap<String, PrefixWarmState>,
         response_sessions: &HashMap<String, ResponseSessionState>,
         response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
+        shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
         let now = Utc::now();
         let prefix_states = prefix_states
@@ -644,6 +655,7 @@ impl PersistedRuntimeState {
             prefix_states,
             response_sessions,
             response_session_error_cooldowns,
+            shadow_affinity: shadow_affinity.clone(),
         }
     }
 
@@ -731,10 +743,13 @@ impl PersistedRuntimeState {
                 ))
             })
             .collect();
+        let mut shadow_affinity = self.shadow_affinity;
+        crate::proxy::cache_affinity::evict_assignments(&mut shadow_affinity, now);
         RuntimeStateMaps {
             prefix_states,
             response_sessions,
             response_session_error_cooldowns,
+            shadow_affinity,
         }
     }
 }
@@ -743,6 +758,9 @@ impl PersistedRuntimeState {
 mod tests {
     use super::*;
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
+    use crate::proxy::cache_affinity::{
+        ShadowAffinityAssignment, ShadowCacheLane, SHADOW_POLICY_EPOCH,
+    };
     use serde_json::json;
     use std::fs;
     use uuid::Uuid;
@@ -892,6 +910,27 @@ mod tests {
                 unsupported: true,
             },
         );
+        state.shadow_affinity.lock().await.assignments.insert(
+            "conversation-a".to_string(),
+            ShadowAffinityAssignment {
+                conversation_id: "conversation-a".to_string(),
+                cohort_id: "cohort-a".to_string(),
+                realm_id: "realm-a".to_string(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                lane: ShadowCacheLane::Steady,
+                arm: crate::proxy::cache_affinity::ShadowAffinityArm::Baseline,
+                shard: 0,
+                anchor_epoch: 2,
+                created_at: Utc::now(),
+                last_seen_at: Utc::now(),
+                observations: 4,
+                successful_observations: 3,
+                usage_observations: 3,
+                inconclusive_observations: 1,
+                input_tokens: 12_000,
+                cache_read_tokens: 10_000,
+            },
+        );
 
         state.persist_runtime_state().await.unwrap();
         let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
@@ -909,6 +948,18 @@ mod tests {
         assert_eq!(cooldown.failures, 2);
         assert!(cooldown.unsupported);
         assert!(cooldown.until > Instant::now());
+        let shadow = loaded
+            .shadow_affinity
+            .assignments
+            .get("conversation-a")
+            .unwrap();
+        assert_eq!(shadow.cohort_id, "cohort-a");
+        assert_eq!(
+            shadow.arm,
+            crate::proxy::cache_affinity::ShadowAffinityArm::Baseline
+        );
+        assert_eq!(shadow.anchor_epoch, 2);
+        assert_eq!(shadow.usage_observations, 3);
 
         fs::remove_dir_all(dir).ok();
     }

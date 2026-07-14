@@ -509,6 +509,10 @@ mod tests {
         assert!(text.contains("gpt-5\\\\.6-(?:sol|terra|luna)"));
         assert!(text.contains("API Key Fast UI"));
         assert!(text.contains("Max and Ultra reasoning"));
+        assert!(text.contains("Metadata generation context isolation"));
+        assert!(text.contains("Metadata generation workspace isolation"));
+        assert!(text.contains("Metadata generation feature isolation"));
+        assert!(text.contains("thread_title`||r===`thread_description"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 use tokio::sync::RwLock;
@@ -47,6 +47,139 @@ pub struct MetricsSnapshot {
     pub recent_requests: Vec<RequestLog>,
     pub recent_failed_requests: Vec<RequestLog>,
     pub recent_errors: Vec<ErrorLog>,
+    #[serde(default)]
+    pub agent_generation: AgentGenerationStats,
+    #[serde(default)]
+    pub shadow_affinity: ShadowAffinityMetrics,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_agent_inbound_outcomes: Vec<AgentInboundOutcomeLog>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recent_agent_upstream_attempts: Vec<AgentUpstreamAttemptLog>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentGenerationStats {
+    pub inbound_requests: u64,
+    pub successful_inbounds: u64,
+    pub failed_inbounds: u64,
+    pub generation_attempts: u64,
+    pub multi_attempt_inbounds: u64,
+    pub max_attempts_per_inbound: u64,
+    pub active_inbounds: u64,
+    pub active_attempts: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowAffinityMetrics {
+    pub decisions: u64,
+    pub assigned_decisions: u64,
+    pub transparent_decisions: u64,
+    pub applied_decisions: u64,
+    pub candidate_decisions: u64,
+    pub observations: u64,
+    pub successful_observations: u64,
+    pub usage_observations: u64,
+    pub inconclusive_observations: u64,
+    pub policy_compute_ms_total: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInboundOutcome {
+    Success,
+    HttpError,
+    TransportError,
+    StreamError,
+    Incomplete,
+    RelayAborted,
+}
+
+impl AgentInboundOutcome {
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAttemptOutcome {
+    HttpSuccess,
+    HttpError,
+    TransportError,
+    StreamError,
+    RelayAborted,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentInboundStart {
+    pub inbound_request_id: String,
+    pub at: DateTime<Utc>,
+    pub attempt_policy: String,
+    pub attempt_budget: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentAttemptStart {
+    pub inbound_request_id: String,
+    pub attempt_id: String,
+    pub at: DateTime<Utc>,
+    pub attempt_reason: String,
+    pub provider: String,
+    pub model: String,
+    pub upstream_channel: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentAttemptFinish {
+    pub finished_at: DateTime<Utc>,
+    pub outcome: AgentAttemptOutcome,
+    pub status: Option<u16>,
+    pub error_scope: Option<String>,
+    pub terminal_state: Option<String>,
+    pub total_ms: u64,
+    pub upstream_headers_ms: Option<u64>,
+    pub upstream_network_path: Option<String>,
+    pub request_body_bytes: Option<u64>,
+    pub sent_body_bytes: Option<u64>,
+    pub gzip_attempted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInboundOutcomeLog {
+    #[serde(flatten)]
+    pub request: RequestLog,
+    pub started_at: DateTime<Utc>,
+    pub attempt_policy: String,
+    pub attempt_count: u64,
+    pub attempt_budget: u64,
+    pub final_attempt_id: Option<String>,
+    pub outcome: AgentInboundOutcome,
+    pub terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentUpstreamAttemptLog {
+    pub inbound_request_id: String,
+    pub attempt_id: String,
+    pub attempt_index: u64,
+    pub attempt_budget: u64,
+    pub attempt_policy: String,
+    pub attempt_reason: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub provider: String,
+    pub model: String,
+    pub upstream_channel: String,
+    pub outcome: AgentAttemptOutcome,
+    pub status: Option<u16>,
+    pub error_scope: Option<String>,
+    pub terminal_state: Option<String>,
+    pub total_ms: u64,
+    pub upstream_headers_ms: Option<u64>,
+    pub upstream_network_path: Option<String>,
+    pub request_body_bytes: Option<u64>,
+    pub sent_body_bytes: Option<u64>,
+    pub gzip_attempted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -238,6 +371,30 @@ pub struct RequestLog {
     pub provider_prefix_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_cache_diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_arm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_cohort_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_lane: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_shard: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_policy_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_anchor_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_trusted_identity: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_skip_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_affinity_policy_compute_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_guard_wait_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -455,6 +612,39 @@ struct MetricsInner {
     recent_requests: VecDeque<RequestLog>,
     recent_failed_requests: VecDeque<RequestLog>,
     recent_errors: VecDeque<ErrorLog>,
+    agent_generation: AgentGenerationStats,
+    shadow_affinity: ShadowAffinityMetrics,
+    active_agent_inbounds: HashMap<String, ActiveAgentInbound>,
+    active_agent_attempts: HashMap<String, ActiveAgentAttempt>,
+    completed_agent_inbound_ids: HashSet<String>,
+    completed_agent_inbound_order: VecDeque<String>,
+    completed_agent_attempt_ids: HashSet<String>,
+    completed_agent_attempt_order: VecDeque<String>,
+    recent_agent_inbound_outcomes: VecDeque<AgentInboundOutcomeLog>,
+    recent_agent_upstream_attempts: VecDeque<AgentUpstreamAttemptLog>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAgentInbound {
+    at: DateTime<Utc>,
+    attempt_policy: String,
+    attempt_budget: u64,
+    attempt_count: u64,
+    last_attempt_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveAgentAttempt {
+    inbound_request_id: String,
+    attempt_id: String,
+    attempt_index: u64,
+    attempt_budget: u64,
+    attempt_policy: String,
+    attempt_reason: String,
+    started_at: DateTime<Utc>,
+    provider: String,
+    model: String,
+    upstream_channel: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -569,8 +759,294 @@ impl MetricsStore {
                 recent_requests: VecDeque::new(),
                 recent_failed_requests: VecDeque::new(),
                 recent_errors: VecDeque::new(),
+                agent_generation: AgentGenerationStats::default(),
+                shadow_affinity: ShadowAffinityMetrics::default(),
+                active_agent_inbounds: HashMap::new(),
+                active_agent_attempts: HashMap::new(),
+                completed_agent_inbound_ids: HashSet::new(),
+                completed_agent_inbound_order: VecDeque::new(),
+                completed_agent_attempt_ids: HashSet::new(),
+                completed_agent_attempt_order: VecDeque::new(),
+                recent_agent_inbound_outcomes: VecDeque::new(),
+                recent_agent_upstream_attempts: VecDeque::new(),
             })),
         }
+    }
+
+    pub async fn begin_agent_inbound(&self, mut start: AgentInboundStart) -> bool {
+        start.inbound_request_id = start.inbound_request_id.trim().to_string();
+        if start.inbound_request_id.is_empty() {
+            return false;
+        }
+        if start.attempt_policy.trim().is_empty() {
+            start.attempt_policy = "single".to_string();
+        }
+        start.attempt_budget = start.attempt_budget.max(1);
+
+        let mut inner = self.inner.write().await;
+        if inner
+            .active_agent_inbounds
+            .contains_key(&start.inbound_request_id)
+            || inner
+                .completed_agent_inbound_ids
+                .contains(&start.inbound_request_id)
+        {
+            return false;
+        }
+        inner.active_agent_inbounds.insert(
+            start.inbound_request_id,
+            ActiveAgentInbound {
+                at: start.at,
+                attempt_policy: start.attempt_policy,
+                attempt_budget: start.attempt_budget,
+                attempt_count: 0,
+                last_attempt_id: None,
+            },
+        );
+        inner.agent_generation.inbound_requests += 1;
+        inner.agent_generation.active_inbounds += 1;
+        true
+    }
+
+    pub async fn record_shadow_decision(&self, assigned: bool, policy_compute_ms: u64) {
+        let mut inner = self.inner.write().await;
+        inner.shadow_affinity.decisions += 1;
+        inner.shadow_affinity.policy_compute_ms_total += policy_compute_ms;
+        if assigned {
+            inner.shadow_affinity.assigned_decisions += 1;
+        } else {
+            inner.shadow_affinity.transparent_decisions += 1;
+        }
+    }
+
+    pub async fn record_shadow_application(&self, candidate: bool) {
+        let mut inner = self.inner.write().await;
+        inner.shadow_affinity.applied_decisions += 1;
+        if candidate {
+            inner.shadow_affinity.candidate_decisions += 1;
+        }
+    }
+
+    pub async fn record_shadow_observation(
+        &self,
+        success: bool,
+        has_usage: bool,
+        inconclusive: bool,
+    ) {
+        let mut inner = self.inner.write().await;
+        inner.shadow_affinity.observations += 1;
+        if success {
+            inner.shadow_affinity.successful_observations += 1;
+        }
+        if has_usage {
+            inner.shadow_affinity.usage_observations += 1;
+        }
+        if inconclusive {
+            inner.shadow_affinity.inconclusive_observations += 1;
+        }
+    }
+
+    /// Registers one real upstream POST immediately before transport I/O.
+    /// Returns the assigned one-based attempt index, or `None` for a duplicate,
+    /// unknown inbound, or exhausted attempt budget.
+    pub async fn begin_agent_attempt(&self, mut start: AgentAttemptStart) -> Option<u64> {
+        start.inbound_request_id = start.inbound_request_id.trim().to_string();
+        start.attempt_id = start.attempt_id.trim().to_string();
+        if start.inbound_request_id.is_empty() || start.attempt_id.is_empty() {
+            return None;
+        }
+
+        let mut inner = self.inner.write().await;
+        if inner.active_agent_attempts.contains_key(&start.attempt_id)
+            || inner
+                .completed_agent_attempt_ids
+                .contains(&start.attempt_id)
+        {
+            return None;
+        }
+        let (attempt_index, attempt_budget, attempt_policy) = {
+            let inbound = inner
+                .active_agent_inbounds
+                .get_mut(&start.inbound_request_id)?;
+            if inbound.attempt_count >= inbound.attempt_budget {
+                return None;
+            }
+            inbound.attempt_count += 1;
+            inbound.last_attempt_id = Some(start.attempt_id.clone());
+            (
+                inbound.attempt_count,
+                inbound.attempt_budget,
+                inbound.attempt_policy.clone(),
+            )
+        };
+        let provider = start.provider.trim().to_string();
+        inner.active_agent_attempts.insert(
+            start.attempt_id.clone(),
+            ActiveAgentAttempt {
+                inbound_request_id: start.inbound_request_id,
+                attempt_id: start.attempt_id,
+                attempt_index,
+                attempt_budget,
+                attempt_policy,
+                attempt_reason: if start.attempt_reason.trim().is_empty() {
+                    "primary".to_string()
+                } else {
+                    start.attempt_reason
+                },
+                started_at: start.at,
+                provider: provider.clone(),
+                model: start.model,
+                upstream_channel: start.upstream_channel,
+            },
+        );
+        inner.agent_generation.generation_attempts += 1;
+        inner.agent_generation.active_attempts += 1;
+        inner.upstream_requests += 1;
+        increment_provider_upstream_attempt(&mut inner.provider_stats, &provider);
+        Some(attempt_index)
+    }
+
+    pub async fn finish_agent_attempt(&self, attempt_id: &str, finish: AgentAttemptFinish) -> bool {
+        let attempt_id = attempt_id.trim();
+        if attempt_id.is_empty() {
+            return false;
+        }
+
+        let mut inner = self.inner.write().await;
+        if inner.completed_agent_attempt_ids.contains(attempt_id) {
+            return false;
+        }
+        let Some(active) = inner.active_agent_attempts.remove(attempt_id) else {
+            return false;
+        };
+        {
+            let MetricsInner {
+                completed_agent_attempt_ids,
+                completed_agent_attempt_order,
+                ..
+            } = &mut *inner;
+            remember_completed_id(
+                completed_agent_attempt_ids,
+                completed_agent_attempt_order,
+                attempt_id,
+            );
+        }
+        inner.agent_generation.active_attempts =
+            inner.agent_generation.active_attempts.saturating_sub(1);
+        push_limited(
+            &mut inner.recent_agent_upstream_attempts,
+            AgentUpstreamAttemptLog {
+                inbound_request_id: active.inbound_request_id,
+                attempt_id: active.attempt_id,
+                attempt_index: active.attempt_index,
+                attempt_budget: active.attempt_budget,
+                attempt_policy: active.attempt_policy,
+                attempt_reason: active.attempt_reason,
+                started_at: active.started_at,
+                finished_at: finish.finished_at,
+                provider: active.provider,
+                model: active.model,
+                upstream_channel: active.upstream_channel,
+                outcome: finish.outcome,
+                status: finish.status,
+                error_scope: finish.error_scope,
+                terminal_state: finish.terminal_state,
+                total_ms: finish.total_ms,
+                upstream_headers_ms: finish.upstream_headers_ms,
+                upstream_network_path: finish.upstream_network_path,
+                request_body_bytes: finish.request_body_bytes,
+                sent_body_bytes: finish.sent_body_bytes,
+                gzip_attempted: finish.gzip_attempted,
+            },
+            400,
+        );
+        true
+    }
+
+    pub async fn finish_agent_inbound(
+        &self,
+        inbound_request_id: &str,
+        mut request: RequestLog,
+        mut outcome: AgentInboundOutcome,
+        terminal_state: Option<String>,
+    ) -> bool {
+        let inbound_request_id = inbound_request_id.trim();
+        if inbound_request_id.is_empty() {
+            return false;
+        }
+
+        let mut inner = self.inner.write().await;
+        if inner
+            .completed_agent_inbound_ids
+            .contains(inbound_request_id)
+            || inner
+                .active_agent_attempts
+                .values()
+                .any(|attempt| attempt.inbound_request_id == inbound_request_id)
+        {
+            return false;
+        }
+        let Some(active) = inner.active_agent_inbounds.remove(inbound_request_id) else {
+            return false;
+        };
+        {
+            let MetricsInner {
+                completed_agent_inbound_ids,
+                completed_agent_inbound_order,
+                ..
+            } = &mut *inner;
+            remember_completed_id(
+                completed_agent_inbound_ids,
+                completed_agent_inbound_order,
+                inbound_request_id,
+            );
+        }
+        inner.agent_generation.active_inbounds =
+            inner.agent_generation.active_inbounds.saturating_sub(1);
+        inner.agent_generation.max_attempts_per_inbound = inner
+            .agent_generation
+            .max_attempts_per_inbound
+            .max(active.attempt_count);
+        if active.attempt_count > 1 {
+            inner.agent_generation.multi_attempt_inbounds += 1;
+        }
+
+        request.id = inbound_request_id.to_string();
+        request.inbound_request_id = Some(inbound_request_id.to_string());
+        request.upstream_request_id = active.last_attempt_id.clone();
+        request.upstream_attempt_index = (active.attempt_count > 0).then_some(active.attempt_count);
+        request.upstream_attempt_total = Some(active.attempt_count);
+        let successful = outcome.is_success() && request_log_is_successful_history(&request);
+        if successful {
+            inner.agent_generation.successful_inbounds += 1;
+        } else {
+            if outcome.is_success() {
+                outcome = AgentInboundOutcome::HttpError;
+            }
+            request.cache_status = "error".to_string();
+            inner.agent_generation.failed_inbounds += 1;
+        }
+
+        let projection = request.clone();
+        record_request_inner(&mut inner, projection.clone(), false);
+        if successful {
+            push_limited(&mut inner.recent_upstream_calls, projection, 400);
+        }
+        push_limited(
+            &mut inner.recent_agent_inbound_outcomes,
+            AgentInboundOutcomeLog {
+                request,
+                started_at: active.at,
+                attempt_policy: active.attempt_policy,
+                attempt_count: active.attempt_count,
+                attempt_budget: active.attempt_budget,
+                final_attempt_id: active.last_attempt_id,
+                outcome,
+                terminal_state,
+            },
+            200,
+        );
+        true
     }
 
     pub async fn record_upstream_call(&self, log: RequestLog) {
@@ -583,54 +1059,7 @@ impl MetricsStore {
 
     pub async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
-        inner.total_requests += 1;
-        if request_log_is_successful_history(&log) {
-            inner.successful_requests += 1;
-        }
-        if upstream {
-            inner.upstream_requests += 1;
-        }
-        match log.cache_status.as_str() {
-            "exact" => inner.response_cache_hits += 1,
-            "semantic" => inner.semantic_cache_hits += 1,
-            "miss" => inner.cache_misses += 1,
-            _ => {}
-        }
-
-        let cache_hit = matches!(log.cache_status.as_str(), "exact" | "semantic");
-        let cache_miss = log.cache_status == "miss";
-        if cache_hit || cache_miss {
-            inner.eligible_cache_lookups += 1;
-            if cache_hit {
-                inner.eligible_cache_hits += 1;
-            }
-
-            let was_seen = log
-                .cache_key
-                .as_deref()
-                .map(|key| remember_seen_cache_key(&mut inner, key))
-                .unwrap_or(false);
-            let repeatable = cache_hit || was_seen;
-            if repeatable {
-                inner.repeatable_eligible_lookups += 1;
-                if cache_hit {
-                    inner.repeatable_eligible_hits += 1;
-                }
-            } else if cache_miss {
-                inner.first_seen_eligible_misses += 1;
-            }
-        }
-
-        push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
-        push_limited(&mut inner.total_samples, log.total_ms, 512);
-        upsert_gap_bucket(&mut inner.gap_buckets, &log);
-        upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
-        upsert_provider_traffic(&mut inner.provider_stats, &log, upstream);
-        if request_log_is_successful_history(&log) {
-            push_limited(&mut inner.recent_requests, log, 200);
-        } else {
-            push_limited(&mut inner.recent_failed_requests, log, 200);
-        }
+        record_request_inner(&mut inner, log, upstream);
     }
 
     pub async fn record_upstream_observation(&self, log: RequestLog) {
@@ -775,7 +1204,70 @@ impl MetricsStore {
             recent_requests: inner.recent_requests.iter().cloned().collect(),
             recent_failed_requests: inner.recent_failed_requests.iter().cloned().collect(),
             recent_errors: inner.recent_errors.iter().cloned().collect(),
+            agent_generation: inner.agent_generation.clone(),
+            shadow_affinity: inner.shadow_affinity.clone(),
+            recent_agent_inbound_outcomes: inner
+                .recent_agent_inbound_outcomes
+                .iter()
+                .cloned()
+                .collect(),
+            recent_agent_upstream_attempts: inner
+                .recent_agent_upstream_attempts
+                .iter()
+                .cloned()
+                .collect(),
         }
+    }
+}
+
+fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: bool) {
+    inner.total_requests += 1;
+    if request_log_is_successful_history(&log) {
+        inner.successful_requests += 1;
+    }
+    if upstream {
+        inner.upstream_requests += 1;
+    }
+    match log.cache_status.as_str() {
+        "exact" => inner.response_cache_hits += 1,
+        "semantic" => inner.semantic_cache_hits += 1,
+        "miss" => inner.cache_misses += 1,
+        _ => {}
+    }
+
+    let cache_hit = matches!(log.cache_status.as_str(), "exact" | "semantic");
+    let cache_miss = log.cache_status == "miss";
+    if cache_hit || cache_miss {
+        inner.eligible_cache_lookups += 1;
+        if cache_hit {
+            inner.eligible_cache_hits += 1;
+        }
+
+        let was_seen = log
+            .cache_key
+            .as_deref()
+            .map(|key| remember_seen_cache_key(inner, key))
+            .unwrap_or(false);
+        let repeatable = cache_hit || was_seen;
+        if repeatable {
+            inner.repeatable_eligible_lookups += 1;
+            if cache_hit {
+                inner.repeatable_eligible_hits += 1;
+            }
+        } else if cache_miss {
+            inner.first_seen_eligible_misses += 1;
+        }
+    }
+
+    push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
+    push_limited(&mut inner.total_samples, log.total_ms, 512);
+    upsert_gap_bucket(&mut inner.gap_buckets, &log);
+    upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
+    upsert_provider_traffic(&mut inner.provider_stats, &log, upstream);
+    if request_log_is_successful_history(&log) {
+        push_limited(&mut inner.recent_requests, log, 200);
+    } else {
+        push_limited(&mut inner.recent_failed_requests, log, 200);
     }
 }
 
@@ -936,6 +1428,28 @@ fn upsert_provider_traffic(
     upsert_request_body_bucket(&mut group.request_body_buckets, log);
     push_limited(&mut group.ttft_samples, log.ttft_ms, 512);
     push_limited(&mut group.total_samples, log.total_ms, 512);
+}
+
+fn increment_provider_upstream_attempt(
+    groups: &mut Vec<ProviderTrafficAccumulator>,
+    provider: &str,
+) {
+    let provider = if provider.trim().is_empty() {
+        "unknown"
+    } else {
+        provider.trim()
+    };
+    let index = groups
+        .iter()
+        .position(|group| group.provider == provider)
+        .unwrap_or_else(|| {
+            groups.push(ProviderTrafficAccumulator {
+                provider: provider.to_string(),
+                ..ProviderTrafficAccumulator::default()
+            });
+            groups.len() - 1
+        });
+    groups[index].upstream_requests += 1;
 }
 
 fn sorted_provider_stats(
@@ -1183,6 +1697,21 @@ fn request_log_is_successful_history(log: &RequestLog) -> bool {
     (200..300).contains(&log.status) && log.cache_status != "error"
 }
 
+fn remember_completed_id(ids: &mut HashSet<String>, order: &mut VecDeque<String>, id: &str) {
+    const COMPLETED_LIFECYCLE_ID_LIMIT: usize = 4096;
+
+    let id = id.to_string();
+    if !ids.insert(id.clone()) {
+        return;
+    }
+    order.push_front(id);
+    while order.len() > COMPLETED_LIFECYCLE_ID_LIMIT {
+        if let Some(oldest) = order.pop_back() {
+            ids.remove(&oldest);
+        }
+    }
+}
+
 fn remember_seen_cache_key(inner: &mut MetricsInner, key: &str) -> bool {
     const SEEN_CACHE_KEY_LIMIT: usize = 300_000;
 
@@ -1248,6 +1777,18 @@ mod tests {
             provider_prefix_key: None,
             provider_prefix_fingerprint: None,
             provider_cache_diagnostic: None,
+            shadow_affinity_mode: None,
+            shadow_affinity_arm: None,
+            shadow_affinity_realm_id: None,
+            shadow_affinity_cohort_id: None,
+            shadow_affinity_lane: None,
+            shadow_affinity_shard: None,
+            shadow_affinity_policy_epoch: None,
+            shadow_affinity_anchor_epoch: None,
+            shadow_affinity_trusted_identity: None,
+            shadow_affinity_decision: None,
+            shadow_affinity_skip_reason: None,
+            shadow_affinity_policy_compute_ms: None,
             prefix_guard_wait_ms: None,
             prefix_guard_wait_reason: None,
             prefix_guard_wait_source: None,
@@ -1336,6 +1877,72 @@ mod tests {
             sse_completed_event_seen: None,
             sse_done_marker_seen: None,
             sse_chunks: None,
+        }
+    }
+
+    #[test]
+    fn request_log_shadow_fields_default_for_legacy_metrics() {
+        let log = request_log("miss", Some("cache-key"));
+        let mut value = serde_json::to_value(log).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "shadow_affinity_mode",
+            "shadow_affinity_arm",
+            "shadow_affinity_realm_id",
+            "shadow_affinity_cohort_id",
+            "shadow_affinity_lane",
+            "shadow_affinity_shard",
+            "shadow_affinity_policy_epoch",
+            "shadow_affinity_anchor_epoch",
+            "shadow_affinity_trusted_identity",
+            "shadow_affinity_decision",
+            "shadow_affinity_skip_reason",
+            "shadow_affinity_policy_compute_ms",
+        ] {
+            object.remove(key);
+        }
+        let restored: RequestLog = serde_json::from_value(value).unwrap();
+        assert!(restored.shadow_affinity_mode.is_none());
+        assert!(restored.shadow_affinity_policy_compute_ms.is_none());
+    }
+
+    fn agent_inbound_start(id: &str, policy: &str, budget: u64) -> AgentInboundStart {
+        AgentInboundStart {
+            inbound_request_id: id.to_string(),
+            at: Utc::now(),
+            attempt_policy: policy.to_string(),
+            attempt_budget: budget,
+        }
+    }
+
+    fn agent_attempt_start(inbound_id: &str, attempt_id: &str, reason: &str) -> AgentAttemptStart {
+        AgentAttemptStart {
+            inbound_request_id: inbound_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            at: Utc::now(),
+            attempt_reason: reason.to_string(),
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            upstream_channel: "responses".to_string(),
+        }
+    }
+
+    fn agent_attempt_finish(
+        outcome: AgentAttemptOutcome,
+        status: Option<u16>,
+    ) -> AgentAttemptFinish {
+        AgentAttemptFinish {
+            finished_at: Utc::now(),
+            outcome,
+            status,
+            error_scope: None,
+            terminal_state: None,
+            total_ms: 10,
+            upstream_headers_ms: Some(5),
+            upstream_network_path: Some("direct".to_string()),
+            request_body_bytes: Some(128),
+            sent_body_bytes: Some(128),
+            gzip_attempted: Some(false),
         }
     }
 
@@ -1503,5 +2110,266 @@ mod tests {
         assert_eq!(rollback.new_tail_gap_tokens, 640);
         assert_eq!(rollback.avoidable_gap_tokens, 0);
         assert_eq!(rollback.provider_unstable_gap_tokens, 3072);
+    }
+
+    #[tokio::test]
+    async fn agent_generation_records_one_inbound_and_one_attempt_idempotently() {
+        let metrics = MetricsStore::new();
+        assert!(
+            metrics
+                .begin_agent_inbound(agent_inbound_start("inbound-1", "single", 1))
+                .await
+        );
+        assert!(
+            !metrics
+                .begin_agent_inbound(agent_inbound_start("inbound-1", "single", 1))
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start("inbound-1", "attempt-1", "primary"))
+                .await,
+            Some(1)
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "inbound-1",
+                    "attempt-over-budget",
+                    "primary"
+                ))
+                .await,
+            None
+        );
+        assert!(
+            metrics
+                .finish_agent_attempt(
+                    "attempt-1",
+                    agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200))
+                )
+                .await
+        );
+        assert!(
+            !metrics
+                .finish_agent_attempt(
+                    "attempt-1",
+                    agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200))
+                )
+                .await
+        );
+
+        let log = request_log("miss", Some("agent-success"));
+        assert!(
+            metrics
+                .finish_agent_inbound(
+                    "inbound-1",
+                    log.clone(),
+                    AgentInboundOutcome::Success,
+                    Some("response_completed".to_string())
+                )
+                .await
+        );
+        assert!(
+            !metrics
+                .finish_agent_inbound(
+                    "inbound-1",
+                    log,
+                    AgentInboundOutcome::Success,
+                    Some("response_completed".to_string())
+                )
+                .await
+        );
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.agent_generation.inbound_requests, 1);
+        assert_eq!(snapshot.agent_generation.successful_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 0);
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(snapshot.recent_requests[0].id, "inbound-1");
+        assert_eq!(snapshot.recent_upstream_calls[0].id, "inbound-1");
+        assert_eq!(
+            snapshot.recent_requests[0].upstream_request_id.as_deref(),
+            Some("attempt-1")
+        );
+        assert_eq!(snapshot.recent_requests[0].upstream_attempt_index, Some(1));
+        assert_eq!(snapshot.recent_requests[0].upstream_attempt_total, Some(1));
+    }
+
+    #[tokio::test]
+    async fn reasoning_compatibility_counts_two_attempts_as_one_successful_inbound() {
+        let metrics = MetricsStore::new();
+        assert!(
+            metrics
+                .begin_agent_inbound(agent_inbound_start(
+                    "reasoning-inbound",
+                    "reasoning_compatibility",
+                    2
+                ))
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "reasoning-inbound",
+                    "reasoning-attempt-1",
+                    "primary"
+                ))
+                .await,
+            Some(1)
+        );
+        assert!(
+            metrics
+                .finish_agent_attempt(
+                    "reasoning-attempt-1",
+                    agent_attempt_finish(AgentAttemptOutcome::HttpError, Some(502))
+                )
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "reasoning-inbound",
+                    "reasoning-attempt-2",
+                    "reasoning_explicit"
+                ))
+                .await,
+            Some(2)
+        );
+        assert!(
+            metrics
+                .finish_agent_attempt(
+                    "reasoning-attempt-2",
+                    agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200))
+                )
+                .await
+        );
+
+        assert!(
+            metrics
+                .finish_agent_inbound(
+                    "reasoning-inbound",
+                    request_log("miss", Some("reasoning-success")),
+                    AgentInboundOutcome::Success,
+                    Some("response_completed".to_string())
+                )
+                .await
+        );
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.agent_generation.inbound_requests, 1);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 2);
+        assert_eq!(snapshot.agent_generation.multi_attempt_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.max_attempts_per_inbound, 2);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 0);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(snapshot.provider_stats[0].total_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].successful_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].upstream_requests, 2);
+        assert_eq!(snapshot.recent_requests[0].upstream_attempt_index, Some(2));
+        assert_eq!(snapshot.recent_requests[0].upstream_attempt_total, Some(2));
+        assert_eq!(
+            snapshot.recent_requests[0].upstream_request_id.as_deref(),
+            Some("reasoning-attempt-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_transport_failure_finishes_once_without_success_history() {
+        let metrics = MetricsStore::new();
+        assert!(
+            metrics
+                .begin_agent_inbound(agent_inbound_start("failed-inbound", "single", 1))
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "failed-inbound",
+                    "failed-attempt",
+                    "primary"
+                ))
+                .await,
+            Some(1)
+        );
+        assert!(
+            !metrics
+                .finish_agent_inbound(
+                    "failed-inbound",
+                    request_log("error", None),
+                    AgentInboundOutcome::TransportError,
+                    Some("transport_error".to_string())
+                )
+                .await
+        );
+        assert!(
+            metrics
+                .finish_agent_attempt(
+                    "failed-attempt",
+                    agent_attempt_finish(AgentAttemptOutcome::TransportError, None)
+                )
+                .await
+        );
+        let mut failed_log = request_log("error", None);
+        failed_log.status = 0;
+        assert!(
+            metrics
+                .finish_agent_inbound(
+                    "failed-inbound",
+                    failed_log,
+                    AgentInboundOutcome::TransportError,
+                    Some("transport_error".to_string())
+                )
+                .await
+        );
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 0);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::TransportError
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_affinity_metrics_keep_decisions_and_observation_coverage() {
+        let metrics = MetricsStore::new();
+        metrics.record_shadow_decision(true, 3).await;
+        metrics.record_shadow_decision(false, 1).await;
+        metrics.record_shadow_observation(true, true, false).await;
+        metrics.record_shadow_observation(false, false, true).await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.shadow_affinity.decisions, 2);
+        assert_eq!(snapshot.shadow_affinity.assigned_decisions, 1);
+        assert_eq!(snapshot.shadow_affinity.transparent_decisions, 1);
+        assert_eq!(snapshot.shadow_affinity.applied_decisions, 0);
+        assert_eq!(snapshot.shadow_affinity.candidate_decisions, 0);
+        assert_eq!(snapshot.shadow_affinity.observations, 2);
+        assert_eq!(snapshot.shadow_affinity.successful_observations, 1);
+        assert_eq!(snapshot.shadow_affinity.usage_observations, 1);
+        assert_eq!(snapshot.shadow_affinity.inconclusive_observations, 1);
+        assert_eq!(snapshot.shadow_affinity.policy_compute_ms_total, 4);
     }
 }

@@ -8,7 +8,10 @@ use crate::{
         ProviderConfig, ProviderResponseSessionReuseProbeResult,
         ProviderResponseSessionReuseStatus, SelectedProviderKey, REASONING_EFFORT_VALUES,
     },
-    metrics::{RequestLog, UsageRecord},
+    metrics::{
+        AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
+        AgentInboundStart, RequestLog, UsageRecord,
+    },
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
 };
 use anyhow::{anyhow, Context, Result};
@@ -26,9 +29,10 @@ use flate2::{write::GzEncoder, Compression};
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::convert::Infallible;
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
     io::Write,
     pin::Pin,
     sync::Arc,
@@ -39,6 +43,10 @@ use tokio::{
     time::{sleep, Duration as TokioDuration},
 };
 use uuid::Uuid;
+pub(crate) mod affinity_identity;
+mod attempt_gate;
+pub(crate) mod cache_affinity;
+mod cache_directed_relay;
 mod codex_chat_common;
 mod json_canonical;
 mod prefix_control;
@@ -48,11 +56,15 @@ mod sse;
 mod streaming_codex_chat;
 mod transform_codex_chat;
 mod transport;
+use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken, ReasoningEvidence};
+use cache_affinity::{ShadowAffinityDecision, ShadowObservationInput};
 use prefix_control::{
     PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
     ProviderCacheGapBreakdown,
 };
-use responses_stream::ResponsesStreamState;
+use responses_stream::{
+    evaluate_terminal, ResponsesStreamState, StreamEnd, TerminalCompatibility, TerminalFailure,
+};
 use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
 pub(crate) use transport::TransportClients;
 #[cfg(test)]
@@ -151,6 +163,13 @@ impl UpstreamRequestDiagnostics {
 struct UpstreamSendOutcome {
     response: reqwest::Response,
     diagnostics: UpstreamRequestDiagnostics,
+}
+
+#[derive(Debug)]
+struct AgentAttemptDispatch {
+    token: AttemptToken,
+    provider: String,
+    model: String,
 }
 struct UpstreamBodyReadOutcome {
     bytes: Vec<u8>,
@@ -634,6 +653,7 @@ async fn handle_responses_compact_for_agent(
         decision.provider.custom_user_agent.as_deref(),
         None,
         decision.provider.request_body_gzip_enabled,
+        None,
     )
     .await
     {
@@ -685,6 +705,7 @@ async fn handle_responses_compact_for_agent(
             decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
+            None,
         )
         .await
         {
@@ -763,6 +784,7 @@ async fn handle_responses_compact_for_agent(
             decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
+            None,
         )
         .await
         {
@@ -842,6 +864,7 @@ async fn handle_responses_compact_for_agent(
             decision.provider.custom_user_agent.as_deref(),
             None,
             decision.provider.request_body_gzip_enabled,
+            None,
         )
         .await
         {
@@ -930,6 +953,27 @@ async fn handle_responses_compact_for_agent(
             &bytes,
         )
         .await;
+        if authorized_agent.is_some() {
+            let identity = affinity_identity::derive(
+                &config,
+                &decision,
+                &client_request,
+                &upstream_body,
+                authorized_agent.as_deref(),
+                &selected_provider_key,
+            );
+            if let Some(conversation_id) = identity.trusted_conversation_id.as_deref() {
+                let mut shadow_affinity = state.shadow_affinity.lock().await;
+                cache_affinity::reset_anchor(&mut shadow_affinity, conversation_id, Utc::now());
+                drop(shadow_affinity);
+                if let Err(err) = state.persist_runtime_state().await {
+                    state
+                        .metrics
+                        .record_error("shadow_affinity_state_save", &err.to_string())
+                        .await;
+                }
+            }
+        }
     }
     let gap_breakdown = provider_cache_gap_breakdown(
         &state,
@@ -1000,6 +1044,18 @@ async fn handle_responses_compact_for_agent(
         provider_prefix_key,
         provider_prefix_fingerprint,
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+        shadow_affinity_mode: None,
+        shadow_affinity_arm: None,
+        shadow_affinity_realm_id: None,
+        shadow_affinity_cohort_id: None,
+        shadow_affinity_lane: None,
+        shadow_affinity_shard: None,
+        shadow_affinity_policy_epoch: None,
+        shadow_affinity_anchor_epoch: None,
+        shadow_affinity_trusted_identity: None,
+        shadow_affinity_decision: None,
+        shadow_affinity_skip_reason: None,
+        shadow_affinity_policy_compute_ms: None,
         prefix_guard_wait_ms: None,
         prefix_guard_wait_reason: None,
         prefix_guard_wait_source: None,
@@ -1154,6 +1210,57 @@ async fn handle_generation_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
+
+    if is_agent_generation_request(authorized_agent.as_deref()) {
+        let owner_state = state.clone();
+        let owner = async move {
+            run_generation_for_authorized_agent(
+                owner_state,
+                headers,
+                body,
+                client_channel,
+                authorized_agent,
+                forced_agent_id,
+                started,
+                request_id,
+            )
+            .await
+        };
+        return match cache_directed_relay::dispatch_owned(owner).await {
+            Ok(response) => response,
+            Err(err) => {
+                state
+                    .metrics
+                    .record_error("agent_generation_owner", &err.to_string())
+                    .await;
+                json_error(StatusCode::BAD_GATEWAY, &err.to_string())
+            }
+        };
+    }
+
+    run_generation_for_authorized_agent(
+        state,
+        headers,
+        body,
+        client_channel,
+        authorized_agent,
+        forced_agent_id,
+        started,
+        request_id,
+    )
+    .await
+}
+
+async fn run_generation_for_authorized_agent(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    client_channel: Channel,
+    authorized_agent: Option<String>,
+    forced_agent_id: Option<&'static str>,
+    started: Instant,
+    request_id: String,
+) -> Response {
     // Agent calls must preserve their retry semantics at the client boundary:
     // one inbound turn gets one generation attempt upstream. The client can
     // decide whether to issue another turn after seeing the original error.
@@ -1286,7 +1393,7 @@ async fn handle_generation_for_agent(
     if cross_protocol_stream {
         set_stream_flag(&mut upstream_body, false);
     }
-    let provider_prefix_key = openai_prompt_cache_key(&provider_prefix_body);
+    let mut provider_prefix_key = openai_prompt_cache_key(&provider_prefix_body);
     let provider_prefix_fingerprint = session_identity
         .as_ref()
         .map(|identity| identity.control_fingerprint.clone())
@@ -1683,43 +1790,194 @@ async fn handle_generation_for_agent(
         client_requested_stream,
         &active_upstream_body,
     );
-    let send_outcome = match send_main_upstream_request(
-        &state,
-        decision.provider.use_system_proxy,
-        &active_url,
-        &api_key,
-        &active_request_channel,
-        &active_upstream_body,
-        &headers,
-        decision.provider.custom_user_agent.as_deref(),
-        skip_prefix_guard_for_sync_responses,
-        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-        !client_requested_stream,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(err) => {
-            record_upstream_transport_failure(
-                &state,
-                &request_id,
-                &started,
-                &client_channel,
-                &active_request_channel,
-                &decision,
-                eligible.then_some(metrics_cache_key.as_str()),
-                provider_prefix_key.as_deref(),
-                provider_prefix_fingerprint.as_deref(),
-                &prefix_guard_wait,
-                local_prepare_ms,
-                &diagnostics,
-                &active_upstream_body,
-                active_used_response_session,
-                &response_session_reuse_diagnostics,
-                requested_model_for_log.clone(),
-                "main-transport",
+    let agent_generation = is_agent_generation_request(authorized_agent.as_deref());
+    let explicit_client_prompt_cache_key = client_request
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(provider_prompt_cache_key_is_valid);
+    let mut shadow_affinity_decision = if agent_generation {
+        let identity = affinity_identity::derive(
+            &config,
+            &decision,
+            &client_request,
+            &upstream_body,
+            authorized_agent.as_deref(),
+            &selected_provider_key,
+        );
+        let mut shadow_affinity = state.shadow_affinity.lock().await;
+        Some(cache_affinity::compute_shadow_affinity(
+            &mut shadow_affinity,
+            &identity,
+            session_identity
+                .as_ref()
+                .map(|identity| identity.anchor_key.as_str()),
+            Utc::now(),
+            tail_input_diagnostics.tool_output_chars,
+            tail_input_diagnostics.largest_tool_output_chars,
+        ))
+    } else {
+        None
+    };
+    let static_cohort_canary_applied = shadow_affinity_decision.as_mut().and_then(|decision| {
+        let can_apply = matches!(active_request_channel, Channel::Responses | Channel::Chat)
+            && !explicit_client_prompt_cache_key
+            && cache_affinity::apply_static_cohort_canary(decision, smart_hit_enabled(&config));
+        if !can_apply
+            && explicit_client_prompt_cache_key
+            && decision.arm == cache_affinity::ShadowAffinityArm::Candidate
+        {
+            decision.decision = "candidate_skipped_explicit_cache_key".to_string();
+            decision.skip_reason = Some("explicit_client_prompt_cache_key".to_string());
+        }
+        if can_apply {
+            cache_affinity::static_cohort_prompt_cache_key(decision).map(|key| {
+                if let Some(object) = active_upstream_body.as_object_mut() {
+                    object.insert(
+                        "prompt_cache_key".to_string(),
+                        Value::String(key.to_string()),
+                    );
+                }
+                provider_prefix_key = Some(key.to_string());
+                key.to_string()
+            })
+        } else {
+            None
+        }
+    });
+    if let Some(decision) = shadow_affinity_decision.as_ref() {
+        state
+            .metrics
+            .record_shadow_decision(
+                decision.lane != cache_affinity::ShadowCacheLane::Transparent,
+                decision.policy_compute_ms,
             )
             .await;
+    }
+    if static_cohort_canary_applied.is_some() {
+        state.metrics.record_shadow_application(true).await;
+    }
+    let agent_policy = agent_attempt_policy(diagnostics.reasoning.effective.as_deref());
+    let mut agent_attempt_gate = if agent_generation {
+        let gate = AttemptGate::new(request_id.clone(), agent_policy)
+            .expect("a generated request id must be valid for the attempt gate");
+        let began = state
+            .metrics
+            .begin_agent_inbound(AgentInboundStart {
+                inbound_request_id: request_id.clone(),
+                at: Utc::now(),
+                attempt_policy: agent_attempt_policy_label(gate.policy()).to_string(),
+                attempt_budget: gate.budget() as u64,
+            })
+            .await;
+        assert!(began, "a fresh Agent inbound id must begin exactly once");
+        Some(gate)
+    } else {
+        None
+    };
+    let primary_agent_token = if let Some(gate) = agent_attempt_gate.as_mut() {
+        Some(
+            gate.primary()
+                .expect("a fresh Agent attempt gate must issue its primary token"),
+        )
+    } else {
+        None
+    };
+    let mut active_agent_attempt_id = primary_agent_token
+        .as_ref()
+        .map(|token| token.attempt_id().to_string());
+    let initial_send = match primary_agent_token {
+        Some(token) => {
+            send_agent_upstream_request(
+                &state,
+                decision.provider.use_system_proxy,
+                &active_url,
+                &api_key,
+                &active_request_channel,
+                &active_upstream_body,
+                &headers,
+                decision.provider.custom_user_agent.as_deref(),
+                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+                &decision,
+                token,
+            )
+            .await
+        }
+        None => {
+            send_main_upstream_request(
+                &state,
+                decision.provider.use_system_proxy,
+                &active_url,
+                &api_key,
+                &active_request_channel,
+                &active_upstream_body,
+                &headers,
+                decision.provider.custom_user_agent.as_deref(),
+                skip_prefix_guard_for_sync_responses,
+                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+                !client_requested_stream,
+            )
+            .await
+        }
+    };
+    let send_outcome = match initial_send {
+        Ok(response) => response,
+        Err(err) => {
+            if agent_generation {
+                let log = upstream_transport_failure_log(
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &active_request_channel,
+                    &decision,
+                    None,
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &active_upstream_body,
+                    active_used_response_session,
+                    &response_session_reuse_diagnostics,
+                    requested_model_for_log.clone(),
+                    "main-transport",
+                );
+                finalize_agent_generation(
+                    &state,
+                    &request_id,
+                    active_agent_attempt_id.take(),
+                    log,
+                    AgentAttemptOutcome::TransportError,
+                    AgentInboundOutcome::TransportError,
+                    None,
+                    Some("upstream_transport".to_string()),
+                    "transport_error",
+                    shadow_affinity_decision.clone(),
+                    None,
+                )
+                .await;
+            } else {
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &active_request_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &active_upstream_body,
+                    active_used_response_session,
+                    &response_session_reuse_diagnostics,
+                    requested_model_for_log.clone(),
+                    "main-transport",
+                )
+                .await;
+            }
             state
                 .metrics
                 .record_error("upstream_transport", &err.to_string())
@@ -2501,6 +2759,38 @@ async fn handle_generation_for_agent(
                 {
                     Ok(outcome) => outcome,
                     Err(err) => {
+                        let log = upstream_transport_failure_log(
+                            &request_id,
+                            &started,
+                            &client_channel,
+                            &active_request_channel,
+                            &decision,
+                            None,
+                            provider_prefix_key.as_deref(),
+                            provider_prefix_fingerprint.as_deref(),
+                            &prefix_guard_wait,
+                            local_prepare_ms,
+                            &diagnostics,
+                            &active_upstream_body,
+                            active_used_response_session,
+                            &response_session_reuse_diagnostics,
+                            requested_model_for_log.clone(),
+                            "reasoning-effort-error-body",
+                        );
+                        finalize_agent_generation(
+                            &state,
+                            &request_id,
+                            active_agent_attempt_id.take(),
+                            log,
+                            AgentAttemptOutcome::StreamError,
+                            AgentInboundOutcome::StreamError,
+                            Some(status),
+                            Some("reasoning_effort_error_body".to_string()),
+                            "reasoning_error_body",
+                            shadow_affinity_decision.clone(),
+                            Some(&current_send_diagnostics),
+                        )
+                        .await;
                         state
                             .metrics
                             .record_error("reasoning_effort_error_body", &err.to_string())
@@ -2543,32 +2833,26 @@ async fn handle_generation_for_agent(
                                 .await;
                         }
                     }
-                    record_upstream_response_observation(
+                    finish_agent_attempt_lifecycle(
                         &state,
-                        &request_id,
-                        &started,
-                        &client_channel,
-                        &active_request_channel,
-                        &decision,
-                        eligible.then_some(metrics_cache_key.as_str()),
-                        provider_prefix_key.as_deref(),
-                        provider_prefix_fingerprint.as_deref(),
-                        &prefix_guard_wait,
-                        local_prepare_ms,
-                        &diagnostics,
-                        &active_upstream_body,
-                        active_used_response_session,
-                        &response_session_reuse_diagnostics,
-                        requested_model_for_log.clone(),
+                        active_agent_attempt_id.take(),
+                        AgentAttemptOutcome::HttpError,
+                        Some(status),
+                        Some(
+                            if explicit_reasoning_rejection {
+                                "reasoning_effort_rejected"
+                            } else {
+                                "reasoning_effort_opaque_502"
+                            }
+                            .to_string(),
+                        ),
                         if explicit_reasoning_rejection {
-                            "reasoning-effort-rejected"
+                            "reasoning_rejected"
                         } else {
-                            "reasoning-effort-opaque-502-probe"
+                            "reasoning_opaque_502"
                         },
-                        status,
-                        &current_send_diagnostics,
-                        agent_log_id.clone(),
-                        agent_log_label.clone(),
+                        started.elapsed().as_millis() as u64,
+                        Some(&current_send_diagnostics),
                     )
                     .await;
                     state
@@ -2606,7 +2890,18 @@ async fn handle_generation_for_agent(
                     prefix_state_update_key = None;
                     eligible = false;
 
-                    let send_outcome = match send_main_upstream_request(
+                    let evidence = if explicit_reasoning_rejection {
+                        ReasoningEvidence::ExplicitRejection
+                    } else {
+                        ReasoningEvidence::Opaque502Probe
+                    };
+                    let fallback_token = agent_attempt_gate
+                        .as_mut()
+                        .expect("Agent reasoning fallback requires an attempt gate")
+                        .reasoning_compatibility(evidence)
+                        .expect("classified reasoning fallback must fit the attempt budget");
+                    active_agent_attempt_id = Some(fallback_token.attempt_id().to_string());
+                    let send_outcome = match send_agent_upstream_request(
                         &state,
                         decision.provider.use_system_proxy,
                         &active_url,
@@ -2615,16 +2910,15 @@ async fn handle_generation_for_agent(
                         &active_upstream_body,
                         &headers,
                         decision.provider.custom_user_agent.as_deref(),
-                        skip_prefix_guard_for_sync_responses,
                         decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-                        !client_requested_stream,
+                        &decision,
+                        fallback_token,
                     )
                     .await
                     {
                         Ok(response) => response,
                         Err(err) => {
-                            record_upstream_transport_failure(
-                                &state,
+                            let log = upstream_transport_failure_log(
                                 &request_id,
                                 &started,
                                 &client_channel,
@@ -2641,6 +2935,19 @@ async fn handle_generation_for_agent(
                                 &response_session_reuse_diagnostics,
                                 requested_model_for_log.clone(),
                                 "reasoning-effort-fallback-transport",
+                            );
+                            finalize_agent_generation(
+                                &state,
+                                &request_id,
+                                active_agent_attempt_id.take(),
+                                log,
+                                AgentAttemptOutcome::TransportError,
+                                AgentInboundOutcome::TransportError,
+                                None,
+                                Some("upstream_transport".to_string()),
+                                "reasoning_fallback_transport_error",
+                                shadow_affinity_decision.clone(),
+                                Some(&current_send_diagnostics),
                             )
                             .await;
                             state
@@ -2712,6 +3019,38 @@ async fn handle_generation_for_agent(
                         {
                             Ok(outcome) => outcome,
                             Err(err) => {
+                                let log = upstream_transport_failure_log(
+                                    &request_id,
+                                    &started,
+                                    &client_channel,
+                                    &active_request_channel,
+                                    &decision,
+                                    None,
+                                    provider_prefix_key.as_deref(),
+                                    provider_prefix_fingerprint.as_deref(),
+                                    &prefix_guard_wait,
+                                    local_prepare_ms,
+                                    &diagnostics,
+                                    &active_upstream_body,
+                                    false,
+                                    &response_session_reuse_diagnostics,
+                                    requested_model_for_log.clone(),
+                                    "reasoning-effort-fallback-error-body",
+                                );
+                                finalize_agent_generation(
+                                    &state,
+                                    &request_id,
+                                    active_agent_attempt_id.take(),
+                                    log,
+                                    AgentAttemptOutcome::StreamError,
+                                    AgentInboundOutcome::StreamError,
+                                    Some(status),
+                                    Some("reasoning_effort_error_body".to_string()),
+                                    "reasoning_fallback_error_body",
+                                    shadow_affinity_decision.clone(),
+                                    Some(&current_send_diagnostics),
+                                )
+                                .await;
                                 state
                                     .metrics
                                     .record_error("reasoning_effort_error_body", &err.to_string())
@@ -2822,6 +3161,9 @@ async fn handle_generation_for_agent(
             local_prepare_ms,
             upstream_request_diagnostics.clone(),
             upstream_response_headers_at_ms,
+            active_agent_attempt_id.take(),
+            shadow_affinity_decision,
+            agent_generation,
         )
         .await;
 
@@ -2850,6 +3192,40 @@ async fn handle_generation_for_agent(
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                if agent_generation {
+                    let log = upstream_transport_failure_log(
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &active_request_channel,
+                        &decision,
+                        None,
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
+                        "upstream-body",
+                    );
+                    finalize_agent_generation(
+                        &state,
+                        &request_id,
+                        active_agent_attempt_id.take(),
+                        log,
+                        AgentAttemptOutcome::StreamError,
+                        AgentInboundOutcome::StreamError,
+                        Some(status),
+                        Some("upstream_body".to_string()),
+                        "body_read_error",
+                        shadow_affinity_decision.clone(),
+                        Some(&upstream_request_diagnostics),
+                    )
+                    .await;
+                }
                 state
                     .metrics
                     .record_error("upstream_body", &err.to_string())
@@ -3288,6 +3664,18 @@ async fn handle_generation_for_agent(
         provider_prefix_key: provider_prefix_key.clone(),
         provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+        shadow_affinity_mode: None,
+        shadow_affinity_arm: None,
+        shadow_affinity_realm_id: None,
+        shadow_affinity_cohort_id: None,
+        shadow_affinity_lane: None,
+        shadow_affinity_shard: None,
+        shadow_affinity_policy_epoch: None,
+        shadow_affinity_anchor_epoch: None,
+        shadow_affinity_trusted_identity: None,
+        shadow_affinity_decision: None,
+        shadow_affinity_skip_reason: None,
+        shadow_affinity_policy_compute_ms: None,
         prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
         prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
         prefix_guard_wait_source: prefix_guard_wait.source.clone(),
@@ -3393,11 +3781,44 @@ async fn handle_generation_for_agent(
     apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
     apply_body_diagnostics(&mut request_log, &diagnostics);
     apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
-    state
-        .metrics
-        .record_upstream_call(request_log.clone())
+    if agent_generation {
+        let (attempt_outcome, inbound_outcome, error_scope, terminal_state) = if is_success_status {
+            (
+                AgentAttemptOutcome::HttpSuccess,
+                AgentInboundOutcome::Success,
+                None,
+                "response_completed",
+            )
+        } else {
+            let summary = upstream_error_summary(&bytes_for_client);
+            (
+                AgentAttemptOutcome::HttpError,
+                AgentInboundOutcome::HttpError,
+                Some(upstream_error_scope(status, &summary).to_string()),
+                "http_error",
+            )
+        };
+        finalize_agent_generation(
+            &state,
+            &request_id,
+            active_agent_attempt_id.take(),
+            request_log,
+            attempt_outcome,
+            inbound_outcome,
+            Some(status),
+            error_scope,
+            terminal_state,
+            shadow_affinity_decision.clone(),
+            Some(&upstream_request_diagnostics),
+        )
         .await;
-    state.metrics.record_request(request_log, true).await;
+    } else {
+        state
+            .metrics
+            .record_upstream_call(request_log.clone())
+            .await;
+        state.metrics.record_request(request_log, true).await;
+    }
 
     if eligible && is_success_status {
         insert_cache_entries(
@@ -6728,6 +7149,240 @@ fn is_agent_generation_request(authorized_agent_id: Option<&str>) -> bool {
     authorized_agent_id.is_some()
 }
 
+fn agent_attempt_policy_label(policy: AttemptPolicy) -> &'static str {
+    match policy {
+        AttemptPolicy::Single => "single",
+        AttemptPolicy::ReasoningCompatibility => "reasoning_compatibility",
+    }
+}
+
+fn agent_attempt_policy(effective_reasoning: Option<&str>) -> AttemptPolicy {
+    effective_reasoning
+        .and_then(reasoning_effort_rank)
+        .filter(|rank| *rank > 0)
+        .map(|_| AttemptPolicy::ReasoningCompatibility)
+        .unwrap_or(AttemptPolicy::Single)
+}
+
+fn agent_attempt_reason_label(reason: AttemptReason) -> &'static str {
+    match reason {
+        AttemptReason::Primary => "primary",
+        AttemptReason::ReasoningExplicit => "reasoning_explicit",
+        AttemptReason::ReasoningOpaque502 => "reasoning_opaque_502",
+    }
+}
+
+async fn begin_agent_upstream_attempt(
+    state: &AppState,
+    token: &AttemptToken,
+    provider: &str,
+    model: &str,
+    upstream_channel: &Channel,
+) -> bool {
+    state
+        .metrics
+        .begin_agent_attempt(AgentAttemptStart {
+            inbound_request_id: token.inbound_request_id().to_string(),
+            attempt_id: token.attempt_id().to_string(),
+            at: Utc::now(),
+            attempt_reason: agent_attempt_reason_label(token.reason()).to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            upstream_channel: upstream_channel.label().to_string(),
+        })
+        .await
+        == Some(token.index() as u64)
+}
+
+fn agent_attempt_finish(
+    outcome: AgentAttemptOutcome,
+    status: Option<u16>,
+    error_scope: Option<String>,
+    terminal_state: Option<String>,
+    total_ms: u64,
+    diagnostics: Option<&UpstreamRequestDiagnostics>,
+) -> AgentAttemptFinish {
+    AgentAttemptFinish {
+        finished_at: Utc::now(),
+        outcome,
+        status,
+        error_scope,
+        terminal_state,
+        total_ms,
+        upstream_headers_ms: diagnostics.map(|item| item.headers_ms),
+        upstream_network_path: diagnostics.map(|item| item.network_path.to_string()),
+        request_body_bytes: diagnostics.map(|item| item.request_body_bytes),
+        sent_body_bytes: diagnostics.map(|item| item.sent_body_bytes),
+        gzip_attempted: diagnostics.map(|item| item.gzip_attempted),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_agent_attempt_lifecycle(
+    state: &AppState,
+    attempt_id: Option<String>,
+    outcome: AgentAttemptOutcome,
+    status: Option<u16>,
+    error_scope: Option<String>,
+    terminal_state: &str,
+    total_ms: u64,
+    diagnostics: Option<&UpstreamRequestDiagnostics>,
+) -> bool {
+    let Some(attempt_id) = attempt_id else {
+        state
+            .metrics
+            .record_error(
+                "agent_lifecycle",
+                "Agent generation reached attempt finalization without an active attempt",
+            )
+            .await;
+        return false;
+    };
+    let finished = state
+        .metrics
+        .finish_agent_attempt(
+            &attempt_id,
+            agent_attempt_finish(
+                outcome,
+                status,
+                error_scope,
+                Some(terminal_state.to_string()),
+                total_ms,
+                diagnostics,
+            ),
+        )
+        .await;
+    if !finished {
+        state
+            .metrics
+            .record_error(
+                "agent_lifecycle",
+                &format!("Agent attempt {attempt_id} was not active during finalization"),
+            )
+            .await;
+    }
+    finished
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_agent_generation(
+    state: &AppState,
+    inbound_request_id: &str,
+    attempt_id: Option<String>,
+    mut request_log: RequestLog,
+    attempt_outcome: AgentAttemptOutcome,
+    inbound_outcome: AgentInboundOutcome,
+    status: Option<u16>,
+    error_scope: Option<String>,
+    terminal_state: &str,
+    shadow_affinity: Option<ShadowAffinityDecision>,
+    diagnostics: Option<&UpstreamRequestDiagnostics>,
+) {
+    apply_shadow_affinity_log_fields(&mut request_log, shadow_affinity.as_ref());
+    let shadow_observation = shadow_affinity.as_ref().map(|_| ShadowObservationInput {
+        success: matches!(inbound_outcome, AgentInboundOutcome::Success),
+        has_usage: request_log.input_tokens.unwrap_or_default() > 0,
+        input_tokens: request_log.input_tokens.unwrap_or_default(),
+        cache_read_tokens: request_log.cache_read_tokens.unwrap_or_default(),
+        giant_tail: request_log.tail_tool_output_chars.unwrap_or_default() >= 80_000
+            || request_log
+                .tail_largest_tool_output_chars
+                .unwrap_or_default()
+                >= 80_000,
+    });
+    if !finish_agent_attempt_lifecycle(
+        state,
+        attempt_id,
+        attempt_outcome,
+        status,
+        error_scope,
+        terminal_state,
+        request_log.total_ms,
+        diagnostics,
+    )
+    .await
+    {
+        return;
+    }
+    let inbound_finished = state
+        .metrics
+        .finish_agent_inbound(
+            inbound_request_id,
+            request_log,
+            inbound_outcome,
+            Some(terminal_state.to_string()),
+        )
+        .await;
+    if !inbound_finished {
+        state
+            .metrics
+            .record_error(
+                "agent_lifecycle",
+                &format!("Agent inbound {inbound_request_id} could not be finalized"),
+            )
+            .await;
+        return;
+    }
+    if let (Some(decision), Some(observation)) = (shadow_affinity.as_ref(), shadow_observation) {
+        let mut store = state.shadow_affinity.lock().await;
+        cache_affinity::observe_shadow_affinity(&mut store, decision, observation, Utc::now());
+        drop(store);
+        state
+            .metrics
+            .record_shadow_observation(
+                observation.success,
+                observation.has_usage,
+                !observation.has_usage || observation.giant_tail,
+            )
+            .await;
+        if let Err(err) = state.persist_runtime_state().await {
+            state
+                .metrics
+                .record_error("shadow_affinity_state_save", &err.to_string())
+                .await;
+        }
+    }
+}
+
+fn apply_shadow_affinity_log_fields(
+    request_log: &mut RequestLog,
+    decision: Option<&ShadowAffinityDecision>,
+) {
+    let Some(decision) = decision else {
+        return;
+    };
+    request_log.shadow_affinity_mode = Some(decision.mode.clone());
+    request_log.shadow_affinity_arm = Some(shadow_affinity_arm_label(decision.arm));
+    request_log.shadow_affinity_realm_id = Some(decision.realm_id.clone());
+    request_log.shadow_affinity_cohort_id = Some(decision.cohort_id.clone());
+    request_log.shadow_affinity_lane = Some(shadow_cache_lane_label(decision.lane));
+    request_log.shadow_affinity_shard = Some(decision.shard);
+    request_log.shadow_affinity_policy_epoch = Some(decision.policy_epoch);
+    request_log.shadow_affinity_anchor_epoch = Some(decision.anchor_epoch);
+    request_log.shadow_affinity_trusted_identity = Some(decision.trusted_identity);
+    request_log.shadow_affinity_decision = Some(decision.decision.clone());
+    request_log.shadow_affinity_skip_reason = decision.skip_reason.clone();
+    request_log.shadow_affinity_policy_compute_ms = Some(decision.policy_compute_ms);
+}
+
+fn shadow_cache_lane_label(lane: cache_affinity::ShadowCacheLane) -> String {
+    match lane {
+        cache_affinity::ShadowCacheLane::Steady => "steady",
+        cache_affinity::ShadowCacheLane::ToolBurstQuarantine => "tool_burst_quarantine",
+        cache_affinity::ShadowCacheLane::CompactedAnchor => "compacted_anchor",
+        cache_affinity::ShadowCacheLane::Transparent => "transparent",
+    }
+    .to_string()
+}
+
+fn shadow_affinity_arm_label(arm: cache_affinity::ShadowAffinityArm) -> String {
+    match arm {
+        cache_affinity::ShadowAffinityArm::Baseline => "baseline",
+        cache_affinity::ShadowAffinityArm::Candidate => "candidate",
+    }
+    .to_string()
+}
+
 fn local_response_cache_eligible(
     config: &AppConfig,
     no_store: bool,
@@ -7302,6 +7957,18 @@ async fn record_upstream_response_observation(
             provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
             provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
             provider_cache_diagnostic: None,
+            shadow_affinity_mode: None,
+            shadow_affinity_arm: None,
+            shadow_affinity_realm_id: None,
+            shadow_affinity_cohort_id: None,
+            shadow_affinity_lane: None,
+            shadow_affinity_shard: None,
+            shadow_affinity_policy_epoch: None,
+            shadow_affinity_anchor_epoch: None,
+            shadow_affinity_trusted_identity: None,
+            shadow_affinity_decision: None,
+            shadow_affinity_skip_reason: None,
+            shadow_affinity_policy_compute_ms: None,
             prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
             prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
             prefix_guard_wait_source: prefix_guard_wait.source.clone(),
@@ -7428,6 +8095,47 @@ async fn record_upstream_transport_failure(
     requested_model: Option<String>,
     source: &str,
 ) {
+    let log = upstream_transport_failure_log(
+        request_id,
+        started,
+        client_channel,
+        upstream_channel,
+        decision,
+        cache_key,
+        provider_prefix_key,
+        provider_prefix_fingerprint,
+        prefix_guard_wait,
+        local_prepare_ms,
+        body_diagnostics,
+        body,
+        used_response_session,
+        response_session_reuse_diagnostics,
+        requested_model,
+        source,
+    );
+    state.metrics.record_upstream_call(log.clone()).await;
+    state.metrics.record_request(log, true).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upstream_transport_failure_log(
+    request_id: &str,
+    started: &Instant,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+    decision: &RouteDecision,
+    cache_key: Option<&str>,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_fingerprint: Option<&str>,
+    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
+    local_prepare_ms: u64,
+    body_diagnostics: &BodyDiagnostics,
+    body: &Value,
+    used_response_session: bool,
+    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    requested_model: Option<String>,
+    source: &str,
+) -> RequestLog {
     let elapsed = started.elapsed().as_millis() as u64;
     let body_bytes = serialized_body_len(upstream_channel, body);
     let original_body_bytes = if body_diagnostics.original_body_bytes > 0 {
@@ -7441,7 +8149,7 @@ async fn record_upstream_transport_failure(
         body_bytes
     };
 
-    let log = RequestLog {
+    RequestLog {
         id: request_id.to_string(),
         at: Utc::now(),
         inbound_request_id: Some(request_id.to_string()),
@@ -7473,6 +8181,18 @@ async fn record_upstream_transport_failure(
         provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
         provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
         provider_cache_diagnostic: None,
+        shadow_affinity_mode: None,
+        shadow_affinity_arm: None,
+        shadow_affinity_realm_id: None,
+        shadow_affinity_cohort_id: None,
+        shadow_affinity_lane: None,
+        shadow_affinity_shard: None,
+        shadow_affinity_policy_epoch: None,
+        shadow_affinity_anchor_epoch: None,
+        shadow_affinity_trusted_identity: None,
+        shadow_affinity_decision: None,
+        shadow_affinity_skip_reason: None,
+        shadow_affinity_policy_compute_ms: None,
         prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
         prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
         prefix_guard_wait_source: prefix_guard_wait.source.clone(),
@@ -7574,9 +8294,7 @@ async fn record_upstream_transport_failure(
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: None,
-    };
-    state.metrics.record_upstream_call(log.clone()).await;
-    state.metrics.record_request(log, true).await;
+    }
 }
 
 async fn lookup_cache(
@@ -7656,6 +8374,18 @@ async fn cache_hit_response(
                 provider_prefix_key: None,
                 provider_prefix_fingerprint: None,
                 provider_cache_diagnostic: Some("local-replay".to_string()),
+                shadow_affinity_mode: None,
+                shadow_affinity_arm: None,
+                shadow_affinity_realm_id: None,
+                shadow_affinity_cohort_id: None,
+                shadow_affinity_lane: None,
+                shadow_affinity_shard: None,
+                shadow_affinity_policy_epoch: None,
+                shadow_affinity_anchor_epoch: None,
+                shadow_affinity_trusted_identity: None,
+                shadow_affinity_decision: None,
+                shadow_affinity_skip_reason: None,
+                shadow_affinity_policy_compute_ms: None,
                 prefix_guard_wait_ms: None,
                 prefix_guard_wait_reason: None,
                 prefix_guard_wait_source: None,
@@ -8207,7 +8937,7 @@ async fn send_main_upstream_request(
     sync_responses_main: bool,
     request_body_gzip_enabled: bool,
     no_internal_retry: bool,
-) -> reqwest::Result<UpstreamSendOutcome> {
+) -> Result<UpstreamSendOutcome> {
     let _ = (sync_responses_main, no_internal_retry);
     let max_attempts = Some(1);
     send_upstream_request_to_url_with_diagnostics(
@@ -8221,6 +8951,40 @@ async fn send_main_upstream_request(
         custom_user_agent,
         max_attempts,
         request_body_gzip_enabled,
+        None,
+    )
+    .await
+}
+
+async fn send_agent_upstream_request(
+    state: &AppState,
+    use_system_proxy: bool,
+    url: &str,
+    api_key: &str,
+    channel: &Channel,
+    body: &Value,
+    inbound_headers: &HeaderMap,
+    custom_user_agent: Option<&str>,
+    request_body_gzip_enabled: bool,
+    decision: &RouteDecision,
+    token: AttemptToken,
+) -> Result<UpstreamSendOutcome> {
+    send_upstream_request_to_url_with_diagnostics(
+        state,
+        use_system_proxy,
+        url,
+        api_key,
+        channel,
+        body,
+        inbound_headers,
+        custom_user_agent,
+        Some(1),
+        request_body_gzip_enabled,
+        Some(AgentAttemptDispatch {
+            token,
+            provider: decision.provider.name.clone(),
+            model: decision.model.clone(),
+        }),
     )
     .await
 }
@@ -8555,11 +9319,17 @@ async fn send_upstream_request_to_url_with_diagnostics(
     custom_user_agent: Option<&str>,
     max_attempts_override: Option<usize>,
     request_body_gzip_enabled: bool,
-) -> reqwest::Result<UpstreamSendOutcome> {
+    agent_attempt: Option<AgentAttemptDispatch>,
+) -> Result<UpstreamSendOutcome> {
     const MAX_ATTEMPTS: usize = 3;
-    let max_attempts = max_attempts_override
-        .unwrap_or(MAX_ATTEMPTS)
-        .clamp(1, MAX_ATTEMPTS);
+    let agent_transport = agent_attempt.is_some();
+    let max_attempts = if agent_transport {
+        1
+    } else {
+        max_attempts_override
+            .unwrap_or(MAX_ATTEMPTS)
+            .clamp(1, MAX_ATTEMPTS)
+    };
     let body_encode_started = Instant::now();
     let original_body = upstream_request_body_bytes(channel, body);
     let request_body_encode_ms = body_encode_started.elapsed().as_millis() as u64;
@@ -8598,6 +9368,7 @@ async fn send_upstream_request_to_url_with_diagnostics(
         ..UpstreamRequestDiagnostics::default()
     };
     let mut gzip_disabled_after_fallback = false;
+    let mut agent_attempt = agent_attempt;
 
     for attempt in 0..max_attempts {
         diagnostics.attempts += 1;
@@ -8614,10 +9385,12 @@ async fn send_upstream_request_to_url_with_diagnostics(
             custom_user_agent,
             sending_gzip,
         );
-        let request = state
-            .upstream_client(use_system_proxy)
-            .post(url)
-            .headers(outbound_headers);
+        let client = if agent_transport {
+            state.transport_clients.agent_client(use_system_proxy)
+        } else {
+            state.upstream_client(use_system_proxy)
+        };
+        let request = client.post(url).headers(outbound_headers);
         let request = if sending_gzip {
             request.body(
                 compressed_body
@@ -8630,6 +9403,22 @@ async fn send_upstream_request_to_url_with_diagnostics(
             request.body(original_body.clone())
         };
 
+        if let Some(dispatch) = agent_attempt.take() {
+            let began = begin_agent_upstream_attempt(
+                state,
+                &dispatch.token,
+                &dispatch.provider,
+                &dispatch.model,
+                channel,
+            )
+            .await;
+            if !began {
+                return Err(anyhow!(
+                    "Agent attempt {} was not authorized for upstream dispatch",
+                    dispatch.token.attempt_id()
+                ));
+            }
+        }
         let send_started = Instant::now();
         match request.send().await {
             Ok(response) => {
@@ -8681,7 +9470,7 @@ async fn send_upstream_request_to_url_with_diagnostics(
                 diagnostics.reported_processing_ms = None;
                 diagnostics.non_processing_ms = None;
                 if attempt + 1 >= max_attempts {
-                    return Err(err);
+                    return Err(err.into());
                 }
                 let delay = network_retry_delay(attempt);
                 diagnostics.retry_wait_ms += delay.as_millis() as u64;
@@ -8916,6 +9705,9 @@ async fn stream_upstream(
     local_prepare_ms: u64,
     upstream_request_diagnostics: UpstreamRequestDiagnostics,
     upstream_response_headers_at_ms: u64,
+    agent_attempt_id: Option<String>,
+    shadow_affinity_decision: Option<ShadowAffinityDecision>,
+    agent_generation: bool,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
     // for the whole SSE response. The guarded section has already covered request
@@ -8933,7 +9725,7 @@ async fn stream_upstream(
     };
     let content_type_for_cache = response_content_type.clone();
     let (downstream_sender, mut downstream_receiver) =
-        mpsc::channel::<Result<Bytes, Infallible>>(STREAM_RELAY_CHANNEL_CAPACITY);
+        mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_RELAY_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
         let raw_stream = upstream.bytes_stream();
@@ -8960,6 +9752,8 @@ async fn stream_upstream(
         let mut stream_upstream_wait_ms = 0u64;
         let mut stream_client_backpressure_ms = 0u64;
         let mut downstream_disconnected = false;
+        let mut stream_end = StreamEnd::CleanEof;
+        let mut stream_transport_error = None;
         let state_for_stream = state.clone();
         loop {
             let upstream_wait_started = Instant::now();
@@ -8977,6 +9771,8 @@ async fn stream_upstream(
                         .record_error("upstream_stream", &err)
                         .await;
                     sse_end_reason = "upstream_stream_error".to_string();
+                    stream_end = StreamEnd::TransportError;
+                    stream_transport_error = Some(err);
                     break;
                 }
             };
@@ -8988,7 +9784,7 @@ async fn stream_upstream(
             if !downstream_disconnected {
                 let client_backpressure_started = Instant::now();
                 if downstream_sender
-                    .send(Ok::<Bytes, Infallible>(chunk.clone()))
+                    .send(Ok::<Bytes, std::io::Error>(chunk.clone()))
                     .await
                     .is_err()
                 {
@@ -9010,8 +9806,39 @@ async fn stream_upstream(
             }
         }
         let stream_metadata = stream_state.finish();
-        if stream_metadata.error_event_seen && sse_end_reason == "upstream_eof" {
-            sse_end_reason = "upstream_sse_error".to_string();
+        let terminal_verdict = evaluate_terminal(
+            &client_channel,
+            TerminalCompatibility::Strict,
+            &stream_metadata,
+            stream_end,
+        );
+        if terminal_verdict.trailing_transport_anomaly {
+            sse_end_reason = "upstream_trailing_transport_anomaly".to_string();
+        } else if let Some(failure) = terminal_verdict.failure {
+            sse_end_reason = match failure {
+                TerminalFailure::ErrorEvent => "upstream_sse_error",
+                TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
+                TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
+            }
+            .to_string();
+        }
+        if !downstream_disconnected && !terminal_verdict.success {
+            let relay_error = match terminal_verdict.failure {
+                Some(TerminalFailure::TransportErrorBeforeTerminal) => stream_transport_error
+                    .unwrap_or_else(|| "upstream stream failed before completion".to_string()),
+                Some(TerminalFailure::IncompleteEof) => {
+                    "upstream stream ended before a completion event".to_string()
+                }
+                Some(TerminalFailure::ErrorEvent) | None => String::new(),
+            };
+            if !relay_error.is_empty()
+                && downstream_sender
+                    .send(Err(std::io::Error::other(relay_error)))
+                    .await
+                    .is_err()
+            {
+                downstream_disconnected = true;
+            }
         }
         if used_response_session
             && is_verified_third_party_response_session_reuse(&config, &decision)
@@ -9055,9 +9882,13 @@ async fn stream_upstream(
                 .await;
             }
         }
-        let stream_success_for_cache =
-            (200..300).contains(&status) && sse_end_reason == "upstream_eof";
-        if !stream_success_for_cache && sse_end_reason == "upstream_sse_error" {
+        let stream_success_for_cache = (200..300).contains(&status) && terminal_verdict.success;
+        if !stream_success_for_cache
+            && matches!(
+                terminal_verdict.failure,
+                Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof)
+            )
+        {
             state_for_stream
                 .metrics
                 .record_error("upstream_sse_error", &sse_end_reason)
@@ -9167,6 +9998,18 @@ async fn stream_upstream(
             provider_prefix_key: provider_prefix_key.clone(),
             provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
             provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+            shadow_affinity_mode: None,
+            shadow_affinity_arm: None,
+            shadow_affinity_realm_id: None,
+            shadow_affinity_cohort_id: None,
+            shadow_affinity_lane: None,
+            shadow_affinity_shard: None,
+            shadow_affinity_policy_epoch: None,
+            shadow_affinity_anchor_epoch: None,
+            shadow_affinity_trusted_identity: None,
+            shadow_affinity_decision: None,
+            shadow_affinity_skip_reason: None,
+            shadow_affinity_policy_compute_ms: None,
             prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
             prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
             prefix_guard_wait_source: prefix_guard_wait.source.clone(),
@@ -9278,14 +10121,71 @@ async fn stream_upstream(
         apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
         apply_body_diagnostics(&mut request_log, &diagnostics);
         apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
-        state_for_stream
-            .metrics
-            .record_upstream_call(request_log.clone())
+        if agent_generation {
+            let (attempt_outcome, inbound_outcome, error_scope, terminal_state) =
+                if terminal_verdict.success {
+                    (
+                        AgentAttemptOutcome::HttpSuccess,
+                        AgentInboundOutcome::Success,
+                        None,
+                        if terminal_verdict.trailing_transport_anomaly {
+                            "response_completed_with_trailing_transport_anomaly"
+                        } else {
+                            "response_completed"
+                        },
+                    )
+                } else {
+                    match terminal_verdict.failure {
+                        Some(TerminalFailure::IncompleteEof) => (
+                            AgentAttemptOutcome::StreamError,
+                            AgentInboundOutcome::Incomplete,
+                            Some("upstream_incomplete_eof".to_string()),
+                            "incomplete_eof",
+                        ),
+                        Some(TerminalFailure::ErrorEvent) => (
+                            AgentAttemptOutcome::StreamError,
+                            AgentInboundOutcome::StreamError,
+                            Some("upstream_sse_error".to_string()),
+                            "sse_error",
+                        ),
+                        Some(TerminalFailure::TransportErrorBeforeTerminal) => (
+                            AgentAttemptOutcome::StreamError,
+                            AgentInboundOutcome::TransportError,
+                            Some("upstream_stream_error".to_string()),
+                            "transport_error_before_terminal",
+                        ),
+                        None => (
+                            AgentAttemptOutcome::HttpError,
+                            AgentInboundOutcome::HttpError,
+                            Some("upstream_stream".to_string()),
+                            "stream_failed",
+                        ),
+                    }
+                };
+            finalize_agent_generation(
+                &state_for_stream,
+                &request_id,
+                agent_attempt_id,
+                request_log,
+                attempt_outcome,
+                inbound_outcome,
+                Some(status),
+                error_scope,
+                terminal_state,
+                shadow_affinity_decision,
+                Some(&upstream_request_diagnostics),
+            )
             .await;
-        state_for_stream
-            .metrics
-            .record_request(request_log, true)
-            .await;
+        } else {
+            state_for_stream
+                .metrics
+                .record_upstream_call(request_log.clone())
+                .await;
+            state_for_stream
+                .metrics
+                .record_request(request_log, true)
+                .await;
+        }
         if eligible && stream_success_for_cache {
             insert_cache_entries(
                 &state_for_stream,
@@ -13285,6 +14185,63 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    async fn stream_test_response(
+        state: Arc<AppState>,
+        upstream: reqwest::Response,
+        request_id: &str,
+        agent_attempt_id: Option<String>,
+        agent_generation: bool,
+    ) -> Response {
+        stream_upstream(
+            state,
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            request_id.to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider("http://127.0.0.1/v1".to_string()),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+            agent_attempt_id,
+            None,
+            agent_generation,
+        )
+        .await
     }
 
     #[test]
@@ -17710,6 +18667,83 @@ mod tests {
     }
 
     #[test]
+    fn stage2_candidate_wire_changes_only_prompt_cache_key() {
+        let mut decision = cache_affinity::ShadowAffinityDecision {
+            mode: "shadow".to_string(),
+            assignment_key: Some("conversation-a".to_string()),
+            realm_id: "realm-a".to_string(),
+            cohort_id: "cohort-candidate".to_string(),
+            lane: cache_affinity::ShadowCacheLane::Steady,
+            arm: cache_affinity::ShadowAffinityArm::Candidate,
+            shard: 0,
+            policy_epoch: cache_affinity::SHADOW_POLICY_EPOCH,
+            anchor_epoch: 0,
+            trusted_identity: true,
+            decision: "assigned".to_string(),
+            skip_reason: None,
+            policy_compute_ms: 0,
+        };
+        assert!(cache_affinity::apply_static_cohort_canary(
+            &mut decision,
+            true
+        ));
+        let candidate_key = cache_affinity::static_cohort_prompt_cache_key(&decision)
+            .expect("applied candidate must have a cache key")
+            .to_string();
+
+        let baseline = json!({
+            "model": "gpt-5.5",
+            "prompt_cache_key": "cohort-baseline",
+            "instructions": "stable system",
+            "tools": [{ "type": "function", "name": "read_file" }],
+            "input": [{ "type": "message", "role": "user", "content": "fresh" }],
+            "reasoning": { "effort": "high" },
+            "stream": true
+        });
+        let mut candidate = baseline.clone();
+        candidate
+            .as_object_mut()
+            .expect("request body must be an object")
+            .insert(
+                "prompt_cache_key".to_string(),
+                Value::String(candidate_key.clone()),
+            );
+
+        let baseline_wire = upstream_request_body_bytes(&Channel::Responses, &baseline);
+        let candidate_wire = upstream_request_body_bytes(&Channel::Responses, &candidate);
+        assert_ne!(baseline_wire, candidate_wire);
+        assert!(String::from_utf8_lossy(&candidate_wire).contains(&candidate_key));
+
+        let without_key = |wire: &[u8]| {
+            let mut value: Value = serde_json::from_slice(wire).expect("wire JSON");
+            value
+                .as_object_mut()
+                .expect("wire JSON object")
+                .remove("prompt_cache_key");
+            value
+        };
+        assert_eq!(without_key(&baseline_wire), without_key(&candidate_wire));
+
+        let baseline_headers = build_upstream_request_headers(
+            &HeaderMap::new(),
+            "upstream-key",
+            &Channel::Responses,
+            true,
+            None,
+            false,
+        );
+        let candidate_headers = build_upstream_request_headers(
+            &HeaderMap::new(),
+            "upstream-key",
+            &Channel::Responses,
+            true,
+            None,
+            false,
+        );
+        assert_eq!(baseline_headers, candidate_headers);
+    }
+
+    #[test]
     fn stream_usage_extracts_provider_cached_tokens() {
         let sse = concat!(
             "event: message_start\n",
@@ -18343,6 +19377,9 @@ mod tests {
             0,
             UpstreamRequestDiagnostics::default(),
             0,
+            None,
+            None,
+            false,
         )
         .await;
 
@@ -18478,6 +19515,9 @@ mod tests {
             0,
             UpstreamRequestDiagnostics::default(),
             0,
+            None,
+            None,
+            false,
         )
         .await;
 
@@ -18503,6 +19543,478 @@ mod tests {
             metrics.recent_upstream_calls[0].downstream_disconnected,
             Some(true)
         );
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_drains_more_than_channel_capacity_before_delayed_consumption() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-relay-capacity-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let stream_chunks = STREAM_RELAY_CHANNEL_CAPACITY + 8;
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        for index in 0..stream_chunks {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk-{index}\"}}\n\n"
+                            )));
+                            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                        }
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_capacity\",\"usage\":{\"input_tokens\":40,\"output_tokens\":8,\"input_tokens_details\":{\"cached_tokens\":32}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "capacity-request".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let body = response.into_body();
+
+        tokio::time::sleep(std::time::Duration::from_millis(45)).await;
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "delayed downstream consumption must not issue another upstream POST"
+        );
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("the owner must resume after delayed downstream consumption")
+        .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text.matches("response.output_text.delta").count(),
+            stream_chunks,
+            "the bounded relay must not drop buffered SSE chunks"
+        );
+        assert_eq!(text.matches("response.completed").count(), 1);
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(
+            metrics.recent_requests[0].downstream_disconnected,
+            Some(false)
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_finishes_after_downstream_receiver_is_dropped() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-relay-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        for index in 0..(STREAM_RELAY_CHANNEL_CAPACITY + 4) {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"drop-{index}\"}}\n\n"
+                            )));
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_drop\",\"usage\":{\"input_tokens\":20,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "drop-request".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics::default(),
+            0,
+            None,
+            None,
+            false,
+        )
+        .await;
+        drop(response);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_upstream_calls.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached owner must finish after downstream disconnect");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(
+            snapshot.recent_requests[0].downstream_disconnected,
+            Some(true)
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_stream_success_finishes_one_inbound_and_one_attempt() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-stream-success-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            state
+                .metrics
+                .begin_agent_inbound(AgentInboundStart {
+                    inbound_request_id: "agent-stream-success".to_string(),
+                    at: Utc::now(),
+                    attempt_policy: "single".to_string(),
+                    attempt_budget: 1,
+                })
+                .await
+        );
+        assert_eq!(
+            state
+                .metrics
+                .begin_agent_attempt(AgentAttemptStart {
+                    inbound_request_id: "agent-stream-success".to_string(),
+                    attempt_id: "agent-stream-success-attempt".to_string(),
+                    at: Utc::now(),
+                    attempt_reason: "primary".to_string(),
+                    provider: "provider".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    upstream_channel: "responses".to_string(),
+                })
+                .await,
+            Some(1)
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"agent-success\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                    ));
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "agent-stream-success",
+            Some("agent-stream-success-attempt".to_string()),
+            true,
+        )
+        .await;
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let snapshot = state.metrics.snapshot().await;
+        assert_eq!(snapshot.agent_generation.inbound_requests, 1);
+        assert_eq!(snapshot.agent_generation.successful_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::HttpSuccess
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_stream_incomplete_finishes_failed_inbound_without_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-stream-incomplete-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            state
+                .metrics
+                .begin_agent_inbound(AgentInboundStart {
+                    inbound_request_id: "agent-stream-incomplete".to_string(),
+                    at: Utc::now(),
+                    attempt_policy: "single".to_string(),
+                    attempt_budget: 1,
+                })
+                .await
+        );
+        assert_eq!(
+            state
+                .metrics
+                .begin_agent_attempt(AgentAttemptStart {
+                    inbound_request_id: "agent-stream-incomplete".to_string(),
+                    attempt_id: "agent-stream-incomplete-attempt".to_string(),
+                    at: Utc::now(),
+                    attempt_reason: "primary".to_string(),
+                    provider: "provider".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    upstream_channel: "responses".to_string(),
+                })
+                .await,
+            Some(1)
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                    ));
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "agent-stream-incomplete",
+            Some("agent-stream-incomplete-attempt".to_string()),
+            true,
+        )
+        .await;
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_inbound_outcomes.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the incomplete stream must still finish Agent lifecycle accounting");
+        assert_eq!(snapshot.agent_generation.inbound_requests, 1);
+        assert_eq!(snapshot.agent_generation.successful_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::StreamError
+        );
+
         fs::remove_dir_all(config_dir).ok();
     }
 
@@ -18665,6 +20177,9 @@ mod tests {
             0,
             UpstreamRequestDiagnostics::default(),
             0,
+            None,
+            None,
+            false,
         )
         .await;
 
@@ -22916,21 +24431,57 @@ mod tests {
         );
         let request = Bytes::from(
             serde_json::to_vec(&json!({
-                "thread_id": "single-attempt-session",
                 "model": "gpt-5.5",
+                "instructions": "stable Codex instructions",
                 "reasoning": { "effort": "high" },
                 "input": [{ "type": "message", "role": "user", "content": "hello" }]
             }))
             .unwrap(),
         );
 
-        let response =
-            handle_generation_for_agent(state, headers, request, Channel::Responses, Some("codex"))
-                .await;
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.shadow_affinity.decisions, 1);
+        assert_eq!(metrics.shadow_affinity.assigned_decisions, 1);
+        assert_eq!(metrics.shadow_affinity.observations, 1);
+        assert_eq!(metrics.shadow_affinity.successful_observations, 0);
+        let outcome = metrics.recent_agent_inbound_outcomes.first().unwrap();
+        assert_eq!(
+            outcome.request.shadow_affinity_mode.as_deref(),
+            Some("shadow")
+        );
+        assert_eq!(
+            outcome.request.shadow_affinity_decision.as_deref(),
+            Some("stateless_assigned")
+        );
+        assert_eq!(
+            outcome.request.shadow_affinity_trusted_identity,
+            Some(false)
+        );
+        assert!(outcome.request.shadow_affinity_arm.is_some());
+        assert_eq!(
+            outcome.request.shadow_affinity_lane.as_deref(),
+            Some("steady")
+        );
+        assert!(outcome.request.shadow_affinity_realm_id.is_some());
+        assert!(outcome.request.shadow_affinity_cohort_id.is_some());
+        assert!(outcome.request.shadow_affinity_policy_compute_ms.is_some());
+        assert!(outcome
+            .request
+            .shadow_affinity_realm_id
+            .as_deref()
+            .is_some_and(|value| !value.contains("local-test-key")));
         fs::remove_dir_all(dir).ok();
     }
 
@@ -23149,13 +24700,14 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.total_requests, 3);
+        assert_eq!(metrics.total_requests, 2);
         assert_eq!(metrics.successful_requests, 1);
         assert_eq!(metrics.upstream_requests, 3);
         assert_eq!(metrics.retries, 1);
         assert_eq!(metrics.recent_upstream_calls.len(), 1);
         assert_eq!(metrics.recent_requests.len(), 1);
-        assert_eq!(metrics.recent_failed_requests.len(), 2);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -23460,8 +25012,17 @@ mod tests {
         drop(config);
         let metrics = state.metrics.snapshot().await;
         assert_eq!(metrics.retries, 1);
-        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert_eq!(metrics.recent_failed_requests.len(), 0);
         assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(
+            metrics.recent_agent_upstream_attempts[1].outcome,
+            AgentAttemptOutcome::HttpError
+        );
+        assert_eq!(
+            metrics.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::HttpSuccess
+        );
         assert_eq!(
             metrics.recent_requests[0]
                 .reasoning_effort_source

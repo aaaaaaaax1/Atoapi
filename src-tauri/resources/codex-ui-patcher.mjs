@@ -5616,6 +5616,7 @@ function argument(name) {
   return process.argv[index + 1];
 }
 async function findAsset(assetsPath, prefix, feature) {
+  const features = Array.isArray(feature) ? feature : [feature];
   const entries = await readdir(assetsPath, { withFileTypes: true });
   const candidates = [];
   for (const entry of entries) {
@@ -5624,22 +5625,22 @@ async function findAsset(assetsPath, prefix, feature) {
     }
     const path6 = join(assetsPath, entry.name);
     const content = await readFile(path6, "utf8");
-    if (content.includes(feature)) {
+    if (features.some((candidate) => content.includes(candidate))) {
       candidates.push({ path: path6, content });
     }
   }
   if (candidates.length !== 1) {
     throw new Error(
-      `Expected one ${prefix} asset containing ${JSON.stringify(feature)}, found ${candidates.length}`
+      `Expected one ${prefix} asset containing ${JSON.stringify(features)}, found ${candidates.length}`
     );
   }
   return candidates[0];
 }
 async function replaceFeature(asset, before, after, label) {
-  const matches = asset.content.split(before).length - 1;
-  if (matches === 0 && asset.content.includes(after)) {
+  if (asset.content.includes(after)) {
     return;
   }
+  const matches = asset.content.split(before).length - 1;
   if (matches !== 1) {
     throw new Error(
       `${label}: expected one source match in ${basename(asset.path)}, found ${matches}`
@@ -5654,8 +5655,13 @@ var workPath = await mkdtemp(join(tmpdir(), "atoapi-codex-ui-"));
 try {
   extractAll(input, workPath);
   const assetsPath = join(workPath, "webview", "assets");
+  const viteBuildPath = join(workPath, ".vite", "build");
   const modelFilter = await findAsset(assetsPath, "model-list-filter", "useHiddenModels");
-  const modelQueries = await findAsset(assetsPath, "model-queries", "1186680773");
+  const modelQueries = await findAsset(assetsPath, "model-queries", [
+    "1186680773",
+    "l=i"
+  ]);
+  const metadataGeneration = await findAsset(viteBuildPath, "src", "feature:`thread_title`");
   const serviceTierUi = await findAsset(
     assetsPath,
     "use-service-tier-settings",
@@ -5683,6 +5689,24 @@ try {
     "l=i&&s(D,`1186680773`)",
     "l=i",
     "Ultra display gate"
+  );
+  await replaceFeature(
+    metadataGeneration,
+    "prompt:a,cwd:t,model:bD",
+    "prompt:a,cwd:r===`thread_title`||r===`thread_description`?null:t,model:bD",
+    "Metadata generation workspace isolation"
+  );
+  await replaceFeature(
+    metadataGeneration,
+    'config:{"features.enable_fanout":!1,"features.hooks":!1,"features.multi_agent":!1,"features.multi_agent_v2":!1,web_search:`disabled`}',
+    'config:{"features.enable_fanout":!1,"features.hooks":!1,"features.multi_agent":!1,"features.multi_agent_v2":!1,web_search:`disabled`,include_permissions_instructions:!1,include_apps_instructions:!1,include_environment_context:!1,project_doc_max_bytes:0,skills:{bundled:{enabled:!1},config:[]},memories:{use_memories:!1,generate_memories:!1}}',
+    "Metadata generation feature isolation"
+  );
+  await replaceFeature(
+    metadataGeneration,
+    "sourceThreadId:u,fallbackToFreshThread:n",
+    "sourceThreadId:r===`thread_title`||r===`thread_description`?null:u,fallbackToFreshThread:n",
+    "Metadata generation context isolation"
   );
   await replaceFeature(
     serviceTierUi,
