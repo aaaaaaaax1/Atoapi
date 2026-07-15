@@ -15,6 +15,13 @@ export type AgentInjectionKind =
 export type KeyLoadBalanceStrategy = "round-robin" | "priority" | "least-used" | "random" | "sequential";
 export type ProviderKeyStatus = "unknown" | "healthy" | "unhealthy";
 export type ProviderResponseSessionReuseStatus = "unverified" | "verified" | "unsupported" | "error";
+export type ProviderCacheCapabilityField =
+  | "prompt-cache-key"
+  | "prompt-cache-retention"
+  | "prompt-cache-options"
+  | "prompt-cache-breakpoint";
+export type ProviderCacheCapabilityStatus = "unverified" | "verified" | "unsupported" | "error";
+export type ProviderCacheEffectStatus = "unverified" | "promoted" | "no-benefit" | "error";
 
 export interface ModelConfig {
   id: string;
@@ -44,6 +51,7 @@ export interface ProviderConfig {
   use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
   response_session_reuse_models?: ProviderResponseSessionReuseConfig[];
+  cache_capabilities?: ProviderCacheCapabilityConfig[];
   has_api_key: boolean;
   key_pool?: PublicProviderKeyPool | null;
   models: ModelConfig[];
@@ -1309,6 +1317,51 @@ export interface ProviderResponseSessionReuseProbeResult {
 export interface ProviderResponseSessionReuseProbeInput {
   provider_id: string;
   model_id: string;
+}
+
+export interface ProviderCacheCapabilityConfig {
+  provider_id: string;
+  model_id: string;
+  channel: Channel;
+  key_id?: string | null;
+  field: ProviderCacheCapabilityField;
+  enabled: boolean;
+  status: ProviderCacheCapabilityStatus;
+  effect_status: ProviderCacheEffectStatus;
+  checked_at?: string | null;
+  effect_checked_at?: string | null;
+  effect_message?: string | null;
+  baseline_cache_read_tokens?: number | null;
+  candidate_cache_read_tokens?: number | null;
+  baseline_ttft_ms?: number | null;
+  candidate_ttft_ms?: number | null;
+  last_error?: string | null;
+  updated_at: string;
+}
+
+export interface ProviderCacheCapabilityProbeFieldResult {
+  field: ProviderCacheCapabilityField;
+  status: ProviderCacheCapabilityStatus;
+  enabled: boolean;
+  effect_status: ProviderCacheEffectStatus;
+  message: string;
+  http_status?: number | null;
+}
+
+export interface ProviderCacheCapabilityProbeResult {
+  provider_id: string;
+  model_id: string;
+  channel: Channel;
+  key_id?: string | null;
+  baseline_status?: number | null;
+  fields: ProviderCacheCapabilityProbeFieldResult[];
+  checked_at: string;
+}
+
+export interface ProviderCacheCapabilityProbeInput {
+  provider_id: string;
+  model_id: string;
+  channel?: Channel | null;
 }
 
 function injectionResult(id: string): AgentInjectionResult {

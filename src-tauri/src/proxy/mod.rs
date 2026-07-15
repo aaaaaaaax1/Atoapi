@@ -4,7 +4,10 @@ use crate::{
     config::{
         codex_model_alias, codex_model_display_name, model_request_alias,
         normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
-        AgentInjectionKind, AppConfig, CacheMode, Channel, ModelConfig, ProviderChannelMode,
+        AgentInjectionKind, AppConfig, CacheMode, Channel, ModelConfig,
+        ProviderCacheCapabilityField, ProviderCacheCapabilityProbeFieldResult,
+        ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
+        ProviderCacheCapabilityStatus, ProviderCacheEffectStatus, ProviderChannelMode,
         ProviderConfig, ProviderResponseSessionReuseProbeResult,
         ProviderResponseSessionReuseStatus, SelectedProviderKey, REASONING_EFFORT_VALUES,
     },
@@ -46,6 +49,7 @@ use uuid::Uuid;
 pub(crate) mod affinity_identity;
 mod attempt_gate;
 pub(crate) mod cache_affinity;
+mod cache_capability;
 mod cache_directed_relay;
 pub(crate) mod cache_validation;
 mod codex_chat_common;
@@ -89,6 +93,9 @@ const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
+const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
+const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
 #[derive(Debug, Clone)]
 struct RouteDecision {
     provider: ProviderConfig,
@@ -321,6 +328,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/metrics", get(admin_metrics))
         .route("/admin/cache-validation", get(admin_cache_validation))
         .route("/admin/cache-affinity", get(admin_cache_affinity))
+        .route("/admin/cache-capabilities", get(admin_cache_capabilities))
+        .route(
+            "/admin/cache-capabilities/probe",
+            post(admin_probe_cache_capabilities),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -364,6 +376,36 @@ async fn admin_cache_affinity(AxumState(state): AxumState<Arc<AppState>>) -> imp
         &mut store,
         Utc::now(),
     ))
+}
+async fn admin_cache_capabilities(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(
+        state
+            .config
+            .read()
+            .await
+            .provider_cache_capabilities
+            .clone(),
+    )
+}
+async fn admin_probe_cache_capabilities(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<ProviderCacheCapabilityProbeInput>,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    match probe_and_record_provider_cache_capabilities(
+        &state,
+        input.provider_id.trim(),
+        input.model_id.trim(),
+        input.channel,
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    }
 }
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
     list_models_for_agent(state, headers, None).await
@@ -1877,8 +1919,16 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
+    let provider_prompt_cache_key_allowed = config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        &active_request_channel,
+        selected_provider_key.key_id.as_deref(),
+        ProviderCacheCapabilityField::PromptCacheKey,
+    ) != ProviderCacheCapabilityStatus::Unsupported;
     let static_cohort_canary_applied = shadow_affinity_decision.as_mut().and_then(|decision| {
-        let channel_eligible = matches!(active_request_channel, Channel::Responses | Channel::Chat);
+        let channel_eligible = matches!(active_request_channel, Channel::Responses | Channel::Chat)
+            && provider_prompt_cache_key_allowed;
         let can_apply = if let Some(selection) = validation_selection.as_ref() {
             cache_validation::apply_controlled_selection(
                 decision,
@@ -1928,6 +1978,25 @@ async fn run_generation_for_authorized_agent(
     }
     if static_cohort_canary_applied.is_some() {
         state.metrics.record_shadow_application(true).await;
+    }
+    if agent_generation
+        && smart_hit_enabled(&config)
+        && matches!(config.cache.mode, CacheMode::PrefixPrewarm)
+        && matches!(active_request_channel, Channel::Responses | Channel::Chat)
+    {
+        let native_cache_plan = cache_capability::plan(
+            &config,
+            &decision.provider,
+            &decision.model,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        );
+        cache_capability::apply(
+            &mut active_upstream_body,
+            &active_request_channel,
+            native_cache_plan,
+        );
+        provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
     }
     let agent_policy = agent_attempt_policy(diagnostics.reasoning.effective.as_deref());
     let mut agent_attempt_gate = if agent_generation {
@@ -3192,6 +3261,13 @@ async fn run_generation_for_authorized_agent(
 
     if is_stream {
         let selected_provider_id = decision.provider.id.clone();
+        let automatic_cache_probe_scope = agent_generation.then(|| AutomaticCacheProbeScope {
+            provider_id: decision.provider.id.clone(),
+            provider_revision: decision.provider.updated_at.timestamp_millis(),
+            model_id: decision.model.clone(),
+            channel: active_request_channel.clone(),
+            selected_key: selected_provider_key.clone(),
+        });
         let response = stream_upstream(
             state.clone(),
             pending_upstream
@@ -3236,6 +3312,7 @@ async fn run_generation_for_authorized_agent(
             active_agent_attempt_id.take(),
             shadow_affinity_decision,
             agent_generation,
+            automatic_cache_probe_scope,
         )
         .await;
 
@@ -3907,6 +3984,18 @@ async fn run_generation_for_authorized_agent(
             Some(&upstream_request_diagnostics),
         )
         .await;
+        if is_success_status {
+            spawn_automatic_cache_capability_probe(
+                state.clone(),
+                AutomaticCacheProbeScope {
+                    provider_id: decision.provider.id.clone(),
+                    provider_revision: decision.provider.updated_at.timestamp_millis(),
+                    model_id: decision.model.clone(),
+                    channel: active_request_channel.clone(),
+                    selected_key: selected_provider_key.clone(),
+                },
+            );
+        }
     } else {
         state
             .metrics
@@ -9326,6 +9415,642 @@ struct ResponseSessionReuseProbeResponse {
     status: u16,
     content_type: String,
     bytes: Vec<u8>,
+    ttft_ms: u64,
+}
+
+pub(crate) async fn probe_and_record_provider_cache_capabilities(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+    requested_channel: Option<Channel>,
+) -> Result<ProviderCacheCapabilityProbeResult> {
+    probe_and_record_provider_cache_capabilities_with_key(
+        state,
+        provider_id,
+        model_id,
+        requested_channel,
+        None,
+    )
+    .await
+}
+
+async fn probe_and_record_provider_cache_capabilities_with_key(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+    requested_channel: Option<Channel>,
+    selected_key: Option<SelectedProviderKey>,
+) -> Result<ProviderCacheCapabilityProbeResult> {
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err(anyhow!(
+            "provider and actual upstream model are required for cache capability verification"
+        ));
+    }
+    let (provider, probe_target) = {
+        let config = state.config.read().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+        let probe_target = config
+            .cache_capability_probe_target(provider_id)
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+        (provider, probe_target)
+    };
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    let probe_channel = requested_channel.unwrap_or_else(|| provider.channel.clone());
+    if !matches!(probe_channel, Channel::Responses | Channel::Chat) {
+        return Err(anyhow!(
+            "native OpenAI cache capability verification requires a Chat or Responses provider"
+        ));
+    }
+    let selected_key = match selected_key {
+        Some(selected_key) => selected_key,
+        None => select_provider_api_key(state, provider_id, None, None).await?,
+    };
+    if selected_key.secret.trim().is_empty() {
+        return Err(anyhow!("provider API key is not configured"));
+    }
+
+    let nonce = Uuid::new_v4().simple().to_string();
+    let baseline_body = cache_capability::baseline_probe_body(&probe_channel, model_id, &nonce);
+    let baseline = send_provider_management_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &probe_channel,
+        &baseline_body,
+        CACHE_CAPABILITY_PROBE_REQUEST_KIND,
+    )
+    .await?;
+    let baseline_status = Some(baseline.status);
+    let mut fields = Vec::with_capacity(ProviderCacheCapabilityField::ALL.len());
+    if !is_successful_probe_response(&baseline) {
+        let message = format!(
+            "baseline request returned HTTP {}: {}",
+            baseline.status,
+            upstream_error_summary(&baseline.bytes)
+        );
+        fields.extend(ProviderCacheCapabilityField::ALL.into_iter().map(|field| {
+            ProviderCacheCapabilityProbeFieldResult {
+                field,
+                status: ProviderCacheCapabilityStatus::Error,
+                enabled: false,
+                effect_status: ProviderCacheEffectStatus::Unverified,
+                message: message.clone(),
+                http_status: Some(baseline.status),
+            }
+        }));
+    } else {
+        for field in ProviderCacheCapabilityField::ALL {
+            let body = cache_capability::field_probe_body(&probe_channel, model_id, &nonce, field);
+            let response = send_provider_management_probe_request(
+                state,
+                &provider,
+                &selected_key.secret,
+                &probe_channel,
+                &body,
+                CACHE_CAPABILITY_PROBE_REQUEST_KIND,
+            )
+            .await?;
+            let summary = upstream_error_summary(&response.bytes);
+            let status = if is_successful_probe_response(&response) {
+                ProviderCacheCapabilityStatus::Verified
+            } else if explicit_cache_field_rejection(response.status, &summary, field) {
+                ProviderCacheCapabilityStatus::Unsupported
+            } else {
+                ProviderCacheCapabilityStatus::Error
+            };
+            let message = match status {
+                ProviderCacheCapabilityStatus::Verified => {
+                    format!("{} accepted by upstream", field.json_name())
+                }
+                ProviderCacheCapabilityStatus::Unsupported => {
+                    format!("{} rejected by upstream: {}", field.json_name(), summary)
+                }
+                ProviderCacheCapabilityStatus::Error => format!(
+                    "{} probe returned HTTP {} without field-specific rejection evidence: {}",
+                    field.json_name(),
+                    response.status,
+                    summary
+                ),
+                ProviderCacheCapabilityStatus::Unverified => unreachable!(),
+            };
+            fields.push(ProviderCacheCapabilityProbeFieldResult {
+                field,
+                enabled: false,
+                effect_status: ProviderCacheEffectStatus::Unverified,
+                status,
+                message,
+                http_status: Some(response.status),
+            });
+        }
+    }
+
+    {
+        let mut config = state.config.write().await;
+        if config.cache_capability_probe_target(provider_id).as_ref() != Some(&probe_target) {
+            return Err(anyhow!(
+                "provider settings changed while cache capability verification was running; verify again"
+            ));
+        }
+        for result in &fields {
+            config.record_cache_capability_probe_for_key(
+                provider_id,
+                model_id,
+                probe_channel.clone(),
+                selected_key.key_id.as_deref(),
+                result.field,
+                result.status.clone(),
+                (result.status != ProviderCacheCapabilityStatus::Verified)
+                    .then(|| result.message.clone()),
+            );
+        }
+        for result in &mut fields {
+            if let Some(saved) = config.cache_capability_for_key(
+                provider_id,
+                model_id,
+                &probe_channel,
+                selected_key.key_id.as_deref(),
+                result.field,
+            ) {
+                result.enabled = saved.enabled;
+                result.effect_status = saved.effect_status.clone();
+            }
+        }
+        config.save(&state.config_path)?;
+    }
+
+    Ok(ProviderCacheCapabilityProbeResult {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        channel: probe_channel,
+        key_id: selected_key.key_id,
+        baseline_status,
+        fields,
+        checked_at: Utc::now(),
+    })
+}
+
+fn explicit_cache_field_rejection(
+    status: u16,
+    summary: &str,
+    field: ProviderCacheCapabilityField,
+) -> bool {
+    if !matches!(status, 400 | 422) {
+        return false;
+    }
+    let lower = summary.to_ascii_lowercase();
+    lower.contains(field.json_name())
+        && [
+            "unsupported",
+            "not supported",
+            "unknown",
+            "unrecognized",
+            "not permitted",
+            "extra inputs are not permitted",
+            "invalid parameter",
+            "invalid_request",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+const AUTOMATIC_CACHE_PROBE_RUNTIME_COOLDOWN: std::time::Duration =
+    std::time::Duration::from_secs(5 * 60);
+const AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES: i64 = 30;
+const AUTOMATIC_CACHE_NO_BENEFIT_RECHECK_HOURS: i64 = 24;
+const AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS: i64 = 7;
+const CACHE_EFFECT_MIN_INPUT_TOKENS: u64 = 1_024;
+const CACHE_EFFECT_MIN_DELTA_TOKENS: u64 = 128;
+const CACHE_EFFECT_MIN_DELTA_BPS: u64 = 50;
+
+#[derive(Clone)]
+struct AutomaticCacheProbeScope {
+    provider_id: String,
+    provider_revision: i64,
+    model_id: String,
+    channel: Channel,
+    selected_key: SelectedProviderKey,
+}
+
+impl AutomaticCacheProbeScope {
+    fn key(&self) -> String {
+        let credential_scope = self.selected_key.key_id.clone().unwrap_or_else(|| {
+            let digest = Sha256::digest(self.selected_key.secret.as_bytes());
+            format!("{digest:x}")[..16].to_string()
+        });
+        format!(
+            "{}\0{}\0{}\0{}\0{}",
+            self.provider_id,
+            self.provider_revision,
+            self.model_id,
+            self.channel.label(),
+            credential_scope
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticCacheProbeAction {
+    None,
+    Compatibility,
+    Effect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheEffectObservation {
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    ttft_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheEffectEvaluation {
+    status: ProviderCacheEffectStatus,
+    baseline: CacheEffectObservation,
+    candidate: CacheEffectObservation,
+}
+
+fn spawn_automatic_cache_capability_probe(state: Arc<AppState>, scope: AutomaticCacheProbeScope) {
+    tokio::spawn(async move {
+        let scope_key = scope.key();
+        if !state
+            .try_begin_cache_capability_probe(&scope_key, AUTOMATIC_CACHE_PROBE_RUNTIME_COOLDOWN)
+            .await
+        {
+            return;
+        }
+        let result = run_automatic_cache_capability_probe(&state, &scope).await;
+        state.finish_cache_capability_probe(&scope_key).await;
+        if let Err(err) = result {
+            eprintln!("automatic cache capability probe failed: {err}");
+        }
+    });
+}
+
+async fn run_automatic_cache_capability_probe(
+    state: &AppState,
+    scope: &AutomaticCacheProbeScope,
+) -> Result<()> {
+    let action = {
+        let config = state.config.read().await;
+        if !smart_hit_enabled(&config)
+            || !matches!(config.cache.mode, CacheMode::PrefixPrewarm)
+            || !matches!(scope.channel, Channel::Responses | Channel::Chat)
+        {
+            return Ok(());
+        }
+        let Some(provider) = config.providers.iter().find(|provider| {
+            provider.id == scope.provider_id
+                && provider.enabled
+                && provider.updated_at.timestamp_millis() == scope.provider_revision
+        }) else {
+            return Ok(());
+        };
+        if cache_capability::is_official_openai(provider) {
+            return Ok(());
+        }
+        automatic_cache_probe_action(&config, scope, Utc::now())
+    };
+
+    if action == AutomaticCacheProbeAction::Compatibility {
+        probe_and_record_provider_cache_capabilities_with_key(
+            state,
+            &scope.provider_id,
+            &scope.model_id,
+            Some(scope.channel.clone()),
+            Some(scope.selected_key.clone()),
+        )
+        .await?;
+    }
+
+    let should_probe_effect = {
+        let config = state.config.read().await;
+        matches!(
+            automatic_cache_probe_action(&config, scope, Utc::now()),
+            AutomaticCacheProbeAction::Effect
+        )
+    };
+    if should_probe_effect {
+        probe_and_record_provider_cache_effect(state, scope).await?;
+    }
+    Ok(())
+}
+
+fn automatic_cache_probe_action(
+    config: &AppConfig,
+    scope: &AutomaticCacheProbeScope,
+    now: chrono::DateTime<Utc>,
+) -> AutomaticCacheProbeAction {
+    let records = cache_capability::EFFECT_FIELDS.map(|field| {
+        config.cache_capability_for_key(
+            &scope.provider_id,
+            &scope.model_id,
+            &scope.channel,
+            scope.selected_key.key_id.as_deref(),
+            field,
+        )
+    });
+
+    if records.iter().any(|record| {
+        let Some(record) = record else {
+            return true;
+        };
+        let cooldown = match record.status {
+            ProviderCacheCapabilityStatus::Unverified | ProviderCacheCapabilityStatus::Error => {
+                Duration::minutes(AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES)
+            }
+            ProviderCacheCapabilityStatus::Verified
+            | ProviderCacheCapabilityStatus::Unsupported => {
+                Duration::days(AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS)
+            }
+        };
+        timestamp_is_due(record.checked_at, now, cooldown)
+    }) {
+        return AutomaticCacheProbeAction::Compatibility;
+    }
+
+    let compatible = records
+        .iter()
+        .flatten()
+        .filter(|record| record.status == ProviderCacheCapabilityStatus::Verified)
+        .collect::<Vec<_>>();
+    if compatible.is_empty() {
+        return AutomaticCacheProbeAction::None;
+    }
+    if compatible.iter().any(|record| {
+        let cooldown = match record.effect_status {
+            ProviderCacheEffectStatus::Unverified => return true,
+            ProviderCacheEffectStatus::Error => {
+                Duration::minutes(AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES)
+            }
+            ProviderCacheEffectStatus::NoBenefit => {
+                Duration::hours(AUTOMATIC_CACHE_NO_BENEFIT_RECHECK_HOURS)
+            }
+            ProviderCacheEffectStatus::Promoted => {
+                Duration::days(AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS)
+            }
+        };
+        timestamp_is_due(record.effect_checked_at, now, cooldown)
+    }) {
+        AutomaticCacheProbeAction::Effect
+    } else {
+        AutomaticCacheProbeAction::None
+    }
+}
+
+fn timestamp_is_due(
+    checked_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    cooldown: Duration,
+) -> bool {
+    checked_at
+        .map(|checked_at| now.signed_duration_since(checked_at) >= cooldown)
+        .unwrap_or(true)
+}
+
+async fn probe_and_record_provider_cache_effect(
+    state: &AppState,
+    scope: &AutomaticCacheProbeScope,
+) -> Result<()> {
+    let (provider, probe_target, effect_fields, include_prompt_cache_key) = {
+        let config = state.config.read().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == scope.provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("provider {} was not found", scope.provider_id))?;
+        let probe_target = config
+            .cache_capability_probe_target(&scope.provider_id)
+            .ok_or_else(|| anyhow!("provider {} was not found", scope.provider_id))?;
+        let effect_fields = cache_capability::EFFECT_FIELDS
+            .into_iter()
+            .filter(|field| {
+                config.cache_capability_status_for_key(
+                    &scope.provider_id,
+                    &scope.model_id,
+                    &scope.channel,
+                    scope.selected_key.key_id.as_deref(),
+                    *field,
+                ) == ProviderCacheCapabilityStatus::Verified
+            })
+            .collect::<Vec<_>>();
+        let include_prompt_cache_key = config.cache_capability_status_for_key(
+            &scope.provider_id,
+            &scope.model_id,
+            &scope.channel,
+            scope.selected_key.key_id.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheKey,
+        ) == ProviderCacheCapabilityStatus::Verified;
+        (
+            provider,
+            probe_target,
+            effect_fields,
+            include_prompt_cache_key,
+        )
+    };
+    if effect_fields.is_empty() {
+        return Ok(());
+    }
+
+    let baseline_group = Uuid::new_v4().simple().to_string();
+    let candidate_group = Uuid::new_v4().simple().to_string();
+    let result = async {
+        let baseline = run_cache_effect_pair(
+            state,
+            &provider,
+            &scope.selected_key.secret,
+            &scope.channel,
+            &scope.model_id,
+            &baseline_group,
+            include_prompt_cache_key,
+            false,
+            false,
+        )
+        .await?;
+        let candidate = run_cache_effect_pair(
+            state,
+            &provider,
+            &scope.selected_key.secret,
+            &scope.channel,
+            &scope.model_id,
+            &candidate_group,
+            include_prompt_cache_key,
+            effect_fields.contains(&ProviderCacheCapabilityField::PromptCacheOptions),
+            effect_fields.contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint),
+        )
+        .await?;
+        evaluate_cache_effect(baseline, candidate)
+    }
+    .await;
+
+    let (effect_status, message, baseline, candidate) = match result {
+        Ok(evaluation) => {
+            let baseline_ratio = cache_effect_ratio_bps(evaluation.baseline);
+            let candidate_ratio = cache_effect_ratio_bps(evaluation.candidate);
+            let message = format!(
+                "baseline cached={} ({} bps), candidate cached={} ({} bps), TTFT {}ms -> {}ms",
+                evaluation.baseline.cache_read_tokens,
+                baseline_ratio,
+                evaluation.candidate.cache_read_tokens,
+                candidate_ratio,
+                evaluation.baseline.ttft_ms,
+                evaluation.candidate.ttft_ms,
+            );
+            (
+                evaluation.status,
+                message,
+                Some(evaluation.baseline),
+                Some(evaluation.candidate),
+            )
+        }
+        Err(err) => (
+            ProviderCacheEffectStatus::Error,
+            err.to_string(),
+            None,
+            None,
+        ),
+    };
+
+    {
+        let mut config = state.config.write().await;
+        if config
+            .cache_capability_probe_target(&scope.provider_id)
+            .as_ref()
+            != Some(&probe_target)
+        {
+            return Err(anyhow!(
+                "provider settings changed while cache effect verification was running"
+            ));
+        }
+        config.record_cache_capability_effect_for_key(
+            &scope.provider_id,
+            &scope.model_id,
+            &scope.channel,
+            scope.selected_key.key_id.as_deref(),
+            &effect_fields,
+            effect_status.clone(),
+            Some(message.clone()),
+            baseline.map(|item| item.cache_read_tokens),
+            candidate.map(|item| item.cache_read_tokens),
+            baseline.map(|item| item.ttft_ms),
+            candidate.map(|item| item.ttft_ms),
+        );
+        config.save(&state.config_path)?;
+    }
+    if effect_status == ProviderCacheEffectStatus::Error {
+        return Err(anyhow!(message));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_cache_effect_pair(
+    state: &AppState,
+    provider: &ProviderConfig,
+    api_key: &str,
+    channel: &Channel,
+    model_id: &str,
+    group_nonce: &str,
+    include_prompt_cache_key: bool,
+    enable_modern_options: bool,
+    enable_explicit_breakpoint: bool,
+) -> Result<CacheEffectObservation> {
+    let mut read_response = None;
+    for phase in ["write", "read"] {
+        let body = cache_capability::effect_probe_body(
+            channel,
+            model_id,
+            group_nonce,
+            phase,
+            include_prompt_cache_key,
+            enable_modern_options,
+            enable_explicit_breakpoint,
+        );
+        let response = send_provider_management_probe_request(
+            state,
+            provider,
+            api_key,
+            channel,
+            &body,
+            CACHE_CAPABILITY_PROBE_REQUEST_KIND,
+        )
+        .await?;
+        if !is_successful_probe_response(&response) {
+            return Err(anyhow!(
+                "cache effect {phase} returned HTTP {}: {}",
+                response.status,
+                upstream_error_summary(&response.bytes)
+            ));
+        }
+        if phase == "read" {
+            read_response = Some(response);
+        }
+    }
+    let response = read_response.expect("the two-phase probe must retain its read response");
+    let usage = provider_usage_from_bytes(&response.bytes);
+    if usage.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS {
+        return Err(anyhow!(
+            "cache effect usage reported {} input tokens; at least {} are required",
+            usage.input_tokens,
+            CACHE_EFFECT_MIN_INPUT_TOKENS
+        ));
+    }
+    Ok(CacheEffectObservation {
+        input_tokens: usage.input_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        ttft_ms: response.ttft_ms,
+    })
+}
+
+fn evaluate_cache_effect(
+    baseline: CacheEffectObservation,
+    candidate: CacheEffectObservation,
+) -> Result<CacheEffectEvaluation> {
+    if baseline.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS
+        || candidate.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS
+    {
+        return Err(anyhow!(
+            "cache effect samples did not meet the minimum input size"
+        ));
+    }
+    let token_gain = candidate
+        .cache_read_tokens
+        .saturating_sub(baseline.cache_read_tokens);
+    let ratio_gain =
+        cache_effect_ratio_bps(candidate).saturating_sub(cache_effect_ratio_bps(baseline));
+    let benefit =
+        token_gain >= CACHE_EFFECT_MIN_DELTA_TOKENS || ratio_gain >= CACHE_EFFECT_MIN_DELTA_BPS;
+    let ttft_allowance = 250u64.max(baseline.ttft_ms / 4);
+    let ttft_not_degraded = candidate.ttft_ms <= baseline.ttft_ms.saturating_add(ttft_allowance);
+    Ok(CacheEffectEvaluation {
+        status: if benefit && ttft_not_degraded {
+            ProviderCacheEffectStatus::Promoted
+        } else {
+            ProviderCacheEffectStatus::NoBenefit
+        },
+        baseline,
+        candidate,
+    })
+}
+
+fn cache_effect_ratio_bps(observation: CacheEffectObservation) -> u64 {
+    if observation.input_tokens == 0 {
+        return 0;
+    }
+    observation
+        .cache_read_tokens
+        .min(observation.input_tokens)
+        .saturating_mul(10_000)
+        / observation.input_tokens
 }
 
 pub(crate) async fn probe_provider_response_session_reuse(
@@ -9461,15 +10186,39 @@ async fn send_response_session_reuse_probe_request(
     api_key: &str,
     body: &Value,
 ) -> Result<ResponseSessionReuseProbeResponse> {
-    let started = Instant::now();
-    let outcome = send_main_upstream_request(
+    send_provider_management_probe_request(
         state,
-        provider.use_system_proxy,
-        &upstream_url(&provider.base_url, &Channel::Responses),
+        provider,
         api_key,
         &Channel::Responses,
         body,
-        &HeaderMap::new(),
+        RESPONSE_SESSION_PROBE_REQUEST_KIND,
+    )
+    .await
+}
+
+async fn send_provider_management_probe_request(
+    state: &AppState,
+    provider: &ProviderConfig,
+    api_key: &str,
+    channel: &Channel,
+    body: &Value,
+    request_kind: &'static str,
+) -> Result<ResponseSessionReuseProbeResponse> {
+    let started = Instant::now();
+    let mut management_headers = HeaderMap::new();
+    management_headers.insert(
+        X_ATOAPI_REQUEST_KIND_HEADER,
+        HeaderValue::from_static(request_kind),
+    );
+    let outcome = send_main_upstream_request(
+        state,
+        provider.use_system_proxy,
+        &upstream_url(&provider.base_url, channel),
+        api_key,
+        channel,
+        body,
+        &management_headers,
         provider.custom_user_agent.as_deref(),
         false,
         false,
@@ -9496,6 +10245,10 @@ async fn send_response_session_reuse_probe_request(
         status,
         content_type,
         bytes: body.bytes,
+        ttft_ms: body
+            .first_chunk_ms
+            .map(|first_chunk_ms| headers_at_ms.saturating_add(first_chunk_ms))
+            .unwrap_or(body.aggregate_done_ms),
     })
 }
 
@@ -9893,10 +10646,11 @@ fn network_retry_delay(attempt: usize) -> TokioDuration {
 }
 
 fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
-    const ORDERED_KEYS: [&str; 22] = [
+    const ORDERED_KEYS: [&str; 23] = [
         "model",
         "prompt_cache_key",
         "prompt_cache_retention",
+        "prompt_cache_options",
         "instructions",
         "tools",
         "tool_choice",
@@ -9944,10 +10698,11 @@ fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
 }
 
 fn serialize_chat_body_for_provider_prefix(body: &Value) -> String {
-    const ORDERED_KEYS: [&str; 20] = [
+    const ORDERED_KEYS: [&str; 21] = [
         "model",
         "prompt_cache_key",
         "prompt_cache_retention",
+        "prompt_cache_options",
         "messages",
         "tools",
         "tool_choice",
@@ -10040,6 +10795,7 @@ async fn stream_upstream(
     agent_attempt_id: Option<String>,
     mut shadow_affinity_decision: Option<ShadowAffinityDecision>,
     agent_generation: bool,
+    automatic_cache_probe_scope: Option<AutomaticCacheProbeScope>,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
     // for the whole SSE response. The guarded section has already covered request
@@ -10553,6 +11309,11 @@ async fn stream_upstream(
                 Some(&upstream_request_diagnostics),
             )
             .await;
+            if terminal_verdict.success {
+                if let Some(scope) = automatic_cache_probe_scope {
+                    spawn_automatic_cache_capability_probe(state_for_stream.clone(), scope);
+                }
+            }
         } else {
             state_for_stream
                 .metrics
@@ -10650,6 +11411,31 @@ async fn authorize_for_agent(
         Err(json_error(
             StatusCode::UNAUTHORIZED,
             "invalid local proxy key",
+        ))
+    }
+}
+
+async fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    let config = state.config.read().await;
+    if config.local_key.trim().is_empty() {
+        return Ok(());
+    }
+    let presented_key = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim);
+    if presented_key == Some(config.local_key.as_str()) {
+        Ok(())
+    } else {
+        Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid local administration key",
         ))
     }
 }
@@ -12524,21 +13310,7 @@ fn normalize_chat_content_for_prefix(value: &mut Value) {
 }
 
 fn strip_provider_cache_key_fields(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("prompt_cache_key");
-            map.remove("prompt_cache_retention");
-            for child in map.values_mut() {
-                strip_provider_cache_key_fields(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                strip_provider_cache_key_fields(item);
-            }
-        }
-        _ => {}
-    }
+    cache_capability::strip_all(value);
 }
 
 fn apply_openai_prompt_cache_retention(request: &mut Value, decision: &RouteDecision) {
@@ -14617,6 +15389,7 @@ mod tests {
             agent_attempt_id,
             None,
             agent_generation,
+            None,
         )
         .await
     }
@@ -19977,6 +20750,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -20143,6 +20917,7 @@ mod tests {
             None,
             Some(shadow_decision),
             false,
+            None,
         )
         .await;
 
@@ -20308,6 +21083,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -20436,6 +21212,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         let body = response.into_body();
@@ -20572,6 +21349,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
         drop(response);
@@ -21067,6 +21845,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .await;
 
@@ -25125,6 +25904,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_capability_probe_is_field_scoped_and_uses_exactly_five_management_requests() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                    );
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let has_breakpoint = serde_json::to_string(&body)
+                        .unwrap_or_default()
+                        .contains("prompt_cache_breakpoint");
+                    if has_breakpoint {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "type": "invalid_request_error",
+                                    "message": "unknown parameter prompt_cache_breakpoint"
+                                }
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp_cache_capability_probe",
+                                "error": null,
+                                "output": [{
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "ACK"}]
+                                }]
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "cache-capability-provider".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cache-capability-probe-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result = probe_and_record_provider_cache_capabilities(
+            &state,
+            "cache-capability-provider",
+            "gpt-5.6-luna",
+            Some(Channel::Responses),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(result.fields.len(), 4);
+        assert_eq!(
+            result
+                .fields
+                .iter()
+                .find(|item| { item.field == ProviderCacheCapabilityField::PromptCacheBreakpoint })
+                .map(|item| item.status.clone()),
+            Some(ProviderCacheCapabilityStatus::Unsupported)
+        );
+        assert!(result
+            .fields
+            .iter()
+            .filter(|item| item.field != ProviderCacheCapabilityField::PromptCacheBreakpoint)
+            .all(|item| item.status == ProviderCacheCapabilityStatus::Verified));
+        let saved = state.config.read().await;
+        assert!(!saved.cache_capability_verified_for(
+            "cache-capability-provider",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert_eq!(
+            saved.cache_capability_status(
+                "cache-capability-provider",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ),
+            ProviderCacheCapabilityStatus::Unsupported
+        );
+        drop(saved);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn automatic_cache_probe_promotes_only_after_measured_effect_gain() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                    );
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let serialized = serde_json::to_string(&body).unwrap_or_default();
+                    let effect_read = serialized.contains("effect sample read");
+                    let candidate = serialized.contains("prompt_cache_options")
+                        || serialized.contains("prompt_cache_breakpoint");
+                    let measured_gain = body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .is_some_and(|model| model == "gpt-5.6-luna");
+                    let cached_tokens = if effect_read && candidate && measured_gain {
+                        512
+                    } else {
+                        0
+                    };
+                    Json(json!({
+                        "id": "resp_cache_auto_probe",
+                        "model": "gpt-5.6-luna",
+                        "usage": {
+                            "input_tokens": 2048,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": cached_tokens}
+                        },
+                        "output": [{
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "ACK"}]
+                        }]
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "cache-auto-provider".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cache-auto-probe-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
+        let scope = AutomaticCacheProbeScope {
+            provider_id: "cache-auto-provider".to_string(),
+            provider_revision: state.config.read().await.providers[0]
+                .updated_at
+                .timestamp_millis(),
+            model_id: "gpt-5.6-luna".to_string(),
+            channel: Channel::Responses,
+            selected_key: SelectedProviderKey {
+                secret: "test-key".to_string(),
+                key_id: None,
+            },
+        };
+
+        spawn_automatic_cache_capability_probe(state.clone(), scope.clone());
+        spawn_automatic_cache_capability_probe(state.clone(), scope.clone());
+        for _ in 0..100 {
+            let promoted = state.config.read().await.cache_capability_verified_for(
+                "cache-auto-provider",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            );
+            if promoted {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(hits.load(Ordering::SeqCst), 9);
+        let saved = state.config.read().await;
+        for field in cache_capability::EFFECT_FIELDS {
+            let record = saved
+                .cache_capability_for_key(
+                    "cache-auto-provider",
+                    "gpt-5.6-luna",
+                    &Channel::Responses,
+                    None,
+                    field,
+                )
+                .expect("effect field should be persisted");
+            assert_eq!(record.status, ProviderCacheCapabilityStatus::Verified);
+            assert_eq!(record.effect_status, ProviderCacheEffectStatus::Promoted);
+            assert!(record.enabled);
+            assert_eq!(record.baseline_cache_read_tokens, Some(0));
+            assert_eq!(record.candidate_cache_read_tokens, Some(512));
+        }
+        drop(saved);
+
+        run_automatic_cache_capability_probe(&state, &scope)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 9);
+
+        let no_gain_scope = AutomaticCacheProbeScope {
+            model_id: "gpt-5.6-flat".to_string(),
+            ..scope.clone()
+        };
+        run_automatic_cache_capability_probe(&state, &no_gain_scope)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 18);
+        let saved = state.config.read().await;
+        for field in cache_capability::EFFECT_FIELDS {
+            let record = saved
+                .cache_capability_for_key(
+                    "cache-auto-provider",
+                    "gpt-5.6-flat",
+                    &Channel::Responses,
+                    None,
+                    field,
+                )
+                .expect("no-gain effect field should be persisted");
+            assert_eq!(record.effect_status, ProviderCacheEffectStatus::NoBenefit);
+            assert!(!record.enabled);
+        }
+        drop(saved);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cache_effect_gate_requires_gain_without_ttft_regression() {
+        let baseline = CacheEffectObservation {
+            input_tokens: 2_048,
+            cache_read_tokens: 256,
+            ttft_ms: 1_000,
+        };
+        let promoted = evaluate_cache_effect(
+            baseline,
+            CacheEffectObservation {
+                input_tokens: 2_048,
+                cache_read_tokens: 384,
+                ttft_ms: 1_200,
+            },
+        )
+        .unwrap();
+        assert_eq!(promoted.status, ProviderCacheEffectStatus::Promoted);
+
+        let ttft_regressed = evaluate_cache_effect(
+            baseline,
+            CacheEffectObservation {
+                input_tokens: 2_048,
+                cache_read_tokens: 768,
+                ttft_ms: 1_251,
+            },
+        )
+        .unwrap();
+        assert_eq!(ttft_regressed.status, ProviderCacheEffectStatus::NoBenefit);
+
+        let no_gain = evaluate_cache_effect(
+            baseline,
+            CacheEffectObservation {
+                input_tokens: 2_048,
+                cache_read_tokens: 260,
+                ttft_ms: 900,
+            },
+        )
+        .unwrap();
+        assert_eq!(no_gain.status, ProviderCacheEffectStatus::NoBenefit);
+    }
+
+    #[test]
+    fn automatic_cache_probe_scope_isolates_root_key_rotations_without_leaking_secrets() {
+        let scope = AutomaticCacheProbeScope {
+            provider_id: "provider-a".to_string(),
+            provider_revision: 1,
+            model_id: "gpt-5.6-luna".to_string(),
+            channel: Channel::Responses,
+            selected_key: SelectedProviderKey {
+                secret: "root-secret-a".to_string(),
+                key_id: None,
+            },
+        };
+        let rotated = AutomaticCacheProbeScope {
+            selected_key: SelectedProviderKey {
+                secret: "root-secret-b".to_string(),
+                key_id: None,
+            },
+            ..scope.clone()
+        };
+
+        assert_ne!(scope.key(), rotated.key());
+        assert!(!scope.key().contains("root-secret-a"));
+        assert!(!rotated.key().contains("root-secret-b"));
+    }
+
+    #[tokio::test]
+    #[ignore = "sends five explicit management requests to the configured real upstream"]
+    async fn live_provider_cache_capability_probe() {
+        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
+            .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
+        let model_id =
+            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
+        let state = AppState::load().expect("isolated live-probe config should load");
+
+        let requested_channel = match std::env::var("ATOAPI_TEST_CHANNEL")
+            .unwrap_or_else(|_| "responses".to_string())
+            .as_str()
+        {
+            "chat" => Channel::Chat,
+            _ => Channel::Responses,
+        };
+        let result = probe_and_record_provider_cache_capabilities(
+            &state,
+            &provider_id,
+            &model_id,
+            Some(requested_channel),
+        )
+        .await
+        .expect("live cache capability probe should complete");
+
+        println!(
+            "CACHE_CAPABILITY_LIVE_RESULT {}",
+            serde_json::to_string(&result).expect("probe result should serialize")
+        );
+        assert!(result.baseline_status.is_some_and(|status| status < 400));
+        assert_eq!(result.fields.len(), ProviderCacheCapabilityField::ALL.len());
+        assert!(result.fields.iter().all(|item| !item.enabled));
+        assert!(result
+            .fields
+            .iter()
+            .all(|item| item.effect_status == ProviderCacheEffectStatus::Unverified));
+    }
+
+    #[tokio::test]
     async fn third_party_session_reuse_probe_rejects_nonsemantic_continuation() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_route = hits.clone();
@@ -26077,10 +27209,30 @@ mod tests {
         let upstream_app = Router::new()
             .route(
                 "/v1/responses",
-                post(move |Json(body): Json<Value>| {
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
                     let hits = hits_for_route.clone();
                     let captured = captured_for_route.clone();
                     async move {
+                        if headers
+                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            == Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                        {
+                            return Json(json!({
+                                "id": "resp_management_probe",
+                                "model": "gpt-5.5",
+                                "usage": {
+                                    "input_tokens": 2048,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {"cached_tokens": 0}
+                                },
+                                "output": [{
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "ACK"}]
+                                }]
+                            }))
+                            .into_response();
+                        }
                         let attempt = hits.fetch_add(1, Ordering::SeqCst);
                         if attempt == 0 {
                             raw_response(
@@ -27006,6 +28158,26 @@ mod tests {
                     let captured_accept = captured_accept_for_route.clone();
                     let captured_encoding = captured_encoding_for_route.clone();
                     async move {
+                        if headers
+                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                            .and_then(|value| value.to_str().ok())
+                            == Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                        {
+                            return Json(json!({
+                                "id": "resp_management_probe",
+                                "model": "gpt-5.5",
+                                "usage": {
+                                    "input_tokens": 2048,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {"cached_tokens": 0}
+                                },
+                                "output": [{
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": "ACK"}]
+                                }]
+                            }))
+                            .into_response();
+                        }
                         hits.fetch_add(1, Ordering::SeqCst);
                         let should_fail = body
                             .pointer("/metadata/atoapi_test_upstream_502")
@@ -27755,5 +28927,60 @@ mod tests {
         assert_eq!(metrics.upstream_requests, 1);
         assert_eq!(metrics.response_cache_hits, 1);
         assert!(metrics.eligible_cache_hit_rate >= 0.5);
+    }
+
+    #[test]
+    fn cache_capability_rejection_requires_named_field_and_compatible_status() {
+        assert!(explicit_cache_field_rejection(
+            400,
+            "unknown parameter prompt_cache_options",
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert!(!explicit_cache_field_rejection(
+            502,
+            "unknown parameter prompt_cache_options",
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert!(!explicit_cache_field_rejection(
+            400,
+            "unknown parameter prompt_cache_options",
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+        ));
+        assert!(!explicit_cache_field_rejection(
+            400,
+            "invalid request",
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+    }
+
+    #[tokio::test]
+    async fn cache_capability_admin_probe_requires_global_local_key() {
+        let mut config = AppConfig::default();
+        config.local_key = "admin-local-key".to_string();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cache-capability-admin-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let missing = HeaderMap::new();
+        assert_eq!(
+            authorize_admin(&state, &missing)
+                .await
+                .expect_err("missing key must fail")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer admin-local-key"),
+        );
+        authorize_admin(&state, &valid)
+            .await
+            .expect("global local key should authorize the probe");
+        fs::remove_dir_all(dir).ok();
     }
 }

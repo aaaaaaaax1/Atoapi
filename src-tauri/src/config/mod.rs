@@ -105,6 +105,8 @@ pub struct AppConfig {
     pub provider_channel_modes: Vec<ProviderChannelModeConfig>,
     #[serde(default)]
     pub provider_response_session_reuse: Vec<ProviderResponseSessionReuseConfig>,
+    #[serde(default)]
+    pub provider_cache_capabilities: Vec<ProviderCacheCapabilityConfig>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -244,6 +246,138 @@ pub struct ProviderResponseSessionReuseProbeResult {
     pub first_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderCacheCapabilityField {
+    PromptCacheKey,
+    PromptCacheRetention,
+    PromptCacheOptions,
+    PromptCacheBreakpoint,
+}
+
+impl ProviderCacheCapabilityField {
+    pub fn json_name(self) -> &'static str {
+        match self {
+            Self::PromptCacheKey => "prompt_cache_key",
+            Self::PromptCacheRetention => "prompt_cache_retention",
+            Self::PromptCacheOptions => "prompt_cache_options",
+            Self::PromptCacheBreakpoint => "prompt_cache_breakpoint",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [
+        Self::PromptCacheKey,
+        Self::PromptCacheRetention,
+        Self::PromptCacheOptions,
+        Self::PromptCacheBreakpoint,
+    ];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderCacheCapabilityStatus {
+    Unverified,
+    Verified,
+    Unsupported,
+    Error,
+}
+
+impl Default for ProviderCacheCapabilityStatus {
+    fn default() -> Self {
+        Self::Unverified
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderCacheEffectStatus {
+    Unverified,
+    Promoted,
+    NoBenefit,
+    Error,
+}
+
+impl Default for ProviderCacheEffectStatus {
+    fn default() -> Self {
+        Self::Unverified
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCacheCapabilityConfig {
+    pub provider_id: String,
+    pub model_id: String,
+    pub channel: Channel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    pub field: ProviderCacheCapabilityField,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub status: ProviderCacheCapabilityStatus,
+    #[serde(default)]
+    pub effect_status: ProviderCacheEffectStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_checked_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_ttft_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCacheCapabilityProbeFieldResult {
+    pub field: ProviderCacheCapabilityField,
+    pub status: ProviderCacheCapabilityStatus,
+    pub enabled: bool,
+    pub effect_status: ProviderCacheEffectStatus,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCacheCapabilityProbeResult {
+    pub provider_id: String,
+    pub model_id: String,
+    pub channel: Channel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    pub baseline_status: Option<u16>,
+    pub fields: Vec<ProviderCacheCapabilityProbeFieldResult>,
+    pub checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCacheCapabilityProbeInput {
+    pub provider_id: String,
+    pub model_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<Channel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCacheCapabilityProbeTarget {
+    provider_id: String,
+    base_url: String,
+    is_full_url: bool,
+    channel: Channel,
+    channel_mode: ProviderChannelMode,
+    provider_updated_at: DateTime<Utc>,
+    key_pool_updated_at: Option<DateTime<Utc>>,
 }
 
 /// A non-secret snapshot of the provider connection that a manual Responses
@@ -639,6 +773,8 @@ pub struct PublicProvider {
     pub non_sse_compact_compat_enabled: bool,
     #[serde(default)]
     pub response_session_reuse_models: Vec<ProviderResponseSessionReuseConfig>,
+    #[serde(default)]
+    pub cache_capabilities: Vec<ProviderCacheCapabilityConfig>,
     pub has_api_key: bool,
     pub key_pool: Option<PublicProviderKeyPool>,
     pub models: Vec<ModelConfig>,
@@ -753,6 +889,7 @@ impl Default for AppConfig {
             provider_compact_modes: Vec::new(),
             provider_channel_modes: Vec::new(),
             provider_response_session_reuse: Vec::new(),
+            provider_cache_capabilities: Vec::new(),
             updated_at: now,
         }
     }
@@ -775,6 +912,9 @@ impl AppConfig {
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             let mut changed = false;
             config.cache.normalize_fast_forwarding_hit_policy();
+            if config.normalize_provider_cache_capability_effect_state() {
+                changed = true;
+            }
             if !raw.contains("proxy_auto_start") {
                 config.proxy_auto_start = default_proxy_auto_start();
                 changed = true;
@@ -863,6 +1003,7 @@ impl AppConfig {
                         .non_sse_compact_compat_enabled_for_provider(&provider.id),
                     response_session_reuse_models: self
                         .response_session_reuse_for_provider(&provider.id),
+                    cache_capabilities: self.cache_capabilities_for_provider(&provider.id),
                     has_api_key: provider.api_key_encrypted.is_some(),
                     key_pool: self.public_key_pool_for_provider(&provider.id),
                     models: provider.models.clone(),
@@ -1098,6 +1239,275 @@ impl AppConfig {
             .collect()
     }
 
+    pub fn cache_capabilities_for_provider(
+        &self,
+        provider_id: &str,
+    ) -> Vec<ProviderCacheCapabilityConfig> {
+        self.provider_cache_capabilities
+            .iter()
+            .filter(|item| item.provider_id == provider_id)
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn cache_capability_status(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        field: ProviderCacheCapabilityField,
+    ) -> ProviderCacheCapabilityStatus {
+        self.cache_capability_status_for_key(provider_id, model_id, channel, None, field)
+    }
+
+    pub fn cache_capability_status_for_key(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+    ) -> ProviderCacheCapabilityStatus {
+        self.provider_cache_capabilities
+            .iter()
+            .find(|item| {
+                item.provider_id == provider_id
+                    && item.model_id == model_id
+                    && &item.channel == channel
+                    && item.key_id.as_deref() == key_id
+                    && item.field == field
+            })
+            .map(|item| item.status.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn cache_capability_for_key(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+    ) -> Option<&ProviderCacheCapabilityConfig> {
+        self.provider_cache_capabilities.iter().find(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && &item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && item.field == field
+        })
+    }
+
+    #[cfg(test)]
+    pub fn cache_capability_verified_for(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        field: ProviderCacheCapabilityField,
+    ) -> bool {
+        self.cache_capability_verified_for_key(provider_id, model_id, channel, None, field)
+    }
+
+    pub fn cache_capability_verified_for_key(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+    ) -> bool {
+        self.provider_cache_capabilities.iter().any(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && &item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && item.field == field
+                && item.enabled
+                && item.status == ProviderCacheCapabilityStatus::Verified
+        })
+    }
+
+    pub fn cache_capability_probe_target(
+        &self,
+        provider_id: &str,
+    ) -> Option<ProviderCacheCapabilityProbeTarget> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)?;
+        Some(ProviderCacheCapabilityProbeTarget {
+            provider_id: provider.id.clone(),
+            base_url: provider.base_url.clone(),
+            is_full_url: provider.is_full_url,
+            channel: provider.channel.clone(),
+            channel_mode: self.provider_channel_mode_for_provider(provider_id),
+            provider_updated_at: provider.updated_at,
+            key_pool_updated_at: self
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == provider_id)
+                .map(|pool| pool.updated_at),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn record_cache_capability_probe(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        channel: Channel,
+        field: ProviderCacheCapabilityField,
+        status: ProviderCacheCapabilityStatus,
+        message: Option<String>,
+    ) {
+        self.record_cache_capability_probe_for_key(
+            provider_id,
+            model_id,
+            channel,
+            None,
+            field,
+            status,
+            message,
+        );
+    }
+
+    pub fn record_cache_capability_probe_for_key(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        channel: Channel,
+        key_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+        status: ProviderCacheCapabilityStatus,
+        message: Option<String>,
+    ) {
+        let now = Utc::now();
+        if let Some(item) = self.provider_cache_capabilities.iter_mut().find(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && item.field == field
+        }) {
+            if status != ProviderCacheCapabilityStatus::Error {
+                item.status = status;
+                if item.status != ProviderCacheCapabilityStatus::Verified {
+                    item.enabled = false;
+                    item.effect_status = ProviderCacheEffectStatus::Unverified;
+                    item.effect_checked_at = None;
+                    item.effect_message = None;
+                    item.baseline_cache_read_tokens = None;
+                    item.candidate_cache_read_tokens = None;
+                    item.baseline_ttft_ms = None;
+                    item.candidate_ttft_ms = None;
+                } else if item.effect_status != ProviderCacheEffectStatus::Promoted {
+                    item.enabled = false;
+                }
+            }
+            item.checked_at = Some(now);
+            item.last_error = clean_optional_string(message);
+            item.updated_at = now;
+        } else {
+            self.provider_cache_capabilities
+                .push(ProviderCacheCapabilityConfig {
+                    provider_id: provider_id.to_string(),
+                    model_id: model_id.to_string(),
+                    channel,
+                    key_id: clean_optional_string(key_id.map(ToOwned::to_owned)),
+                    field,
+                    enabled: false,
+                    status,
+                    effect_status: ProviderCacheEffectStatus::Unverified,
+                    checked_at: Some(now),
+                    effect_checked_at: None,
+                    effect_message: None,
+                    baseline_cache_read_tokens: None,
+                    candidate_cache_read_tokens: None,
+                    baseline_ttft_ms: None,
+                    candidate_ttft_ms: None,
+                    last_error: clean_optional_string(message),
+                    updated_at: now,
+                });
+        }
+        self.updated_at = now;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_cache_capability_effect_for_key(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        fields: &[ProviderCacheCapabilityField],
+        effect_status: ProviderCacheEffectStatus,
+        message: Option<String>,
+        baseline_cache_read_tokens: Option<u64>,
+        candidate_cache_read_tokens: Option<u64>,
+        baseline_ttft_ms: Option<u64>,
+        candidate_ttft_ms: Option<u64>,
+    ) {
+        let now = Utc::now();
+        for item in self.provider_cache_capabilities.iter_mut().filter(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && &item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && fields.contains(&item.field)
+                && item.status == ProviderCacheCapabilityStatus::Verified
+        }) {
+            let preserve_promoted = effect_status == ProviderCacheEffectStatus::Error
+                && item.effect_status == ProviderCacheEffectStatus::Promoted;
+            item.effect_checked_at = Some(now);
+            if preserve_promoted {
+                item.last_error = clean_optional_string(message.clone());
+                item.updated_at = now;
+                continue;
+            }
+            item.effect_status = effect_status;
+            item.enabled = effect_status == ProviderCacheEffectStatus::Promoted;
+            item.effect_message = clean_optional_string(message.clone());
+            item.baseline_cache_read_tokens = baseline_cache_read_tokens;
+            item.candidate_cache_read_tokens = candidate_cache_read_tokens;
+            item.baseline_ttft_ms = baseline_ttft_ms;
+            item.candidate_ttft_ms = candidate_ttft_ms;
+            if effect_status == ProviderCacheEffectStatus::Error {
+                item.last_error = clean_optional_string(message.clone());
+            } else {
+                item.last_error = None;
+            }
+            item.updated_at = now;
+        }
+        self.updated_at = now;
+    }
+
+    fn normalize_provider_cache_capability_effect_state(&mut self) -> bool {
+        let mut changed = false;
+        for item in &mut self.provider_cache_capabilities {
+            let promoted = item.effect_status == ProviderCacheEffectStatus::Promoted
+                && item.status == ProviderCacheCapabilityStatus::Verified;
+            if item.enabled != promoted {
+                item.enabled = promoted;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn clear_cache_capabilities_for_provider(&mut self, provider_id: &str) {
+        self.provider_cache_capabilities
+            .retain(|item| item.provider_id != provider_id);
+        self.updated_at = Utc::now();
+    }
+
+    pub fn clear_cache_capabilities_for_model(&mut self, provider_id: &str, model_id: &str) {
+        self.provider_cache_capabilities
+            .retain(|item| item.provider_id != provider_id || item.model_id != model_id);
+        self.updated_at = Utc::now();
+    }
+
     pub fn response_session_reuse_verified_for(&self, provider_id: &str, model_id: &str) -> bool {
         self.provider_response_session_reuse.iter().any(|item| {
             item.provider_id == provider_id
@@ -1260,12 +1670,14 @@ impl AppConfig {
         });
         let channel_mode_changed =
             self.provider_channel_mode_for_provider(&id) != input.channel_mode;
-        let mut invalidate_response_session_reuse = false;
+        let mut invalidate_provider_capabilities = false;
 
         if let Some(provider) = self.providers.iter_mut().find(|p| p.id == id) {
-            invalidate_response_session_reuse = provider.base_url != input.base_url
+            invalidate_provider_capabilities = provider.base_url != input.base_url
                 || provider.is_full_url != input.is_full_url
                 || provider.channel != input.channel
+                || provider.custom_user_agent
+                    != clean_optional_string(input.custom_user_agent.clone())
                 || channel_mode_changed
                 || supplied_api_key
                 || key_pool_connection_changed;
@@ -1303,8 +1715,9 @@ impl AppConfig {
             });
         }
 
-        if invalidate_response_session_reuse {
+        if invalidate_provider_capabilities {
             self.clear_response_session_reuse_for_provider(&id);
+            self.clear_cache_capabilities_for_provider(&id);
         }
 
         if let Some(key_pool) = input.key_pool {
@@ -1867,6 +2280,219 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
+    fn cache_capability_records_round_trip_and_remain_field_scoped() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("field rejected".to_string()),
+        );
+
+        let encoded = toml::to_string_pretty(&config).expect("config should serialize");
+        let decoded: AppConfig = toml::from_str(&encoded).expect("config should parse");
+
+        assert!(!decoded.cache_capability_verified_for(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        let compatible = decoded
+            .cache_capability_for_key(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            )
+            .expect("compatibility record should round-trip");
+        assert_eq!(compatible.status, ProviderCacheCapabilityStatus::Verified);
+        assert_eq!(
+            compatible.effect_status,
+            ProviderCacheEffectStatus::Unverified
+        );
+        assert_eq!(
+            decoded.cache_capability_status(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ),
+            ProviderCacheCapabilityStatus::Unsupported
+        );
+        assert_eq!(
+            decoded.cache_capability_status(
+                "provider-a",
+                "other-model",
+                &Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            ),
+            ProviderCacheCapabilityStatus::Unverified
+        );
+    }
+
+    #[test]
+    fn clearing_one_model_does_not_remove_other_cache_capability_records() {
+        let mut config = AppConfig::default();
+        for model in ["gpt-5.6-luna", "gpt-5.6-sol"] {
+            config.record_cache_capability_probe(
+                "provider-a",
+                model,
+                Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheKey,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+        }
+
+        config.clear_cache_capabilities_for_model("provider-a", "gpt-5.6-luna");
+
+        assert_eq!(config.provider_cache_capabilities.len(), 1);
+        assert_eq!(
+            config.provider_cache_capabilities[0].model_id,
+            "gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn generic_probe_error_preserves_previous_verified_capability() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            Some("effect verified".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(110),
+        );
+
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Error,
+            Some("opaque HTTP 502".to_string()),
+        );
+        config.record_cache_capability_effect_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Error,
+            Some("temporary effect HTTP 502".to_string()),
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert!(config.cache_capability_verified_for(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        let record = &config.provider_cache_capabilities[0];
+        assert_eq!(record.status, ProviderCacheCapabilityStatus::Verified);
+        assert!(record.enabled);
+        assert_eq!(record.effect_status, ProviderCacheEffectStatus::Promoted);
+        assert_eq!(record.baseline_cache_read_tokens, Some(0));
+        assert_eq!(record.candidate_cache_read_tokens, Some(512));
+        assert_eq!(
+            record.last_error.as_deref(),
+            Some("temporary effect HTTP 502")
+        );
+    }
+
+    #[test]
+    fn cache_capability_verification_is_key_scoped() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            None,
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+
+        assert!(config.cache_capability_verified_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert!(!config.cache_capability_verified_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-b"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+    }
+
+    #[test]
+    fn legacy_enabled_cache_capability_requires_effect_reverification() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.provider_cache_capabilities[0].enabled = true;
+
+        assert!(config.normalize_provider_cache_capability_effect_state());
+        let record = &config.provider_cache_capabilities[0];
+        assert!(!record.enabled);
+        assert_eq!(record.status, ProviderCacheCapabilityStatus::Verified);
+        assert_eq!(record.effect_status, ProviderCacheEffectStatus::Unverified);
+    }
+
+    #[test]
     fn provider_cache_model_key_uses_real_model_for_request_alias() {
         let provider = ProviderConfig {
             id: "agent-codex-hb".to_string(),
@@ -2169,6 +2795,14 @@ enabled = true
             ProviderResponseSessionReuseStatus::Verified,
             None,
         );
+        config.record_cache_capability_probe(
+            "share",
+            "gpt-5.5",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
         assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));
         let probe_target = config
             .response_session_reuse_probe_target("share")
@@ -2179,6 +2813,15 @@ enabled = true
         config.upsert_provider(changed).unwrap();
 
         assert!(!config.response_session_reuse_verified_for("share", "gpt-5.5"));
+        assert_eq!(
+            config.cache_capability_status(
+                "share",
+                "gpt-5.5",
+                &Channel::Responses,
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            ProviderCacheCapabilityStatus::Unverified
+        );
         assert_ne!(
             config.response_session_reuse_probe_target("share").as_ref(),
             Some(&probe_target)

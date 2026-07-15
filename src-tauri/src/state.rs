@@ -76,8 +76,15 @@ pub struct AppState {
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
     pub shadow_affinity: Mutex<ShadowAffinityStore>,
     pub cache_validation: Mutex<CacheValidationController>,
+    cache_capability_probe_tasks: Mutex<HashMap<String, CacheCapabilityProbeTaskState>>,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CacheCapabilityProbeTaskState {
+    in_flight: bool,
+    last_finished_at: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,6 +218,7 @@ impl AppState {
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity: Mutex::new(runtime_state.shadow_affinity),
             cache_validation: Mutex::new(CacheValidationController::default()),
+            cache_capability_probe_tasks: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })
@@ -240,6 +248,7 @@ impl AppState {
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity: Mutex::new(ShadowAffinityStore::default()),
             cache_validation: Mutex::new(CacheValidationController::default()),
+            cache_capability_probe_tasks: Mutex::new(HashMap::new()),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
         })
@@ -254,6 +263,31 @@ impl AppState {
 
     pub fn upstream_client(&self, use_system_proxy: bool) -> &reqwest::Client {
         self.transport_clients.client(use_system_proxy)
+    }
+
+    pub async fn try_begin_cache_capability_probe(
+        &self,
+        scope_key: &str,
+        cooldown: StdDuration,
+    ) -> bool {
+        let mut tasks = self.cache_capability_probe_tasks.lock().await;
+        let task = tasks.entry(scope_key.to_string()).or_default();
+        if task.in_flight
+            || task
+                .last_finished_at
+                .is_some_and(|finished| finished.elapsed() < cooldown)
+        {
+            return false;
+        }
+        task.in_flight = true;
+        true
+    }
+
+    pub async fn finish_cache_capability_probe(&self, scope_key: &str) {
+        let mut tasks = self.cache_capability_probe_tasks.lock().await;
+        let task = tasks.entry(scope_key.to_string()).or_default();
+        task.in_flight = false;
+        task.last_finished_at = Some(std::time::Instant::now());
     }
 
     pub async fn reload_config(&self) -> Result<PublicConfig> {

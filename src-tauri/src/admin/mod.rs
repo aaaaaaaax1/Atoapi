@@ -678,6 +678,9 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
     config
         .provider_response_session_reuse
         .retain(|item| item.provider_id != provider_id);
+    config
+        .provider_cache_capabilities
+        .retain(|item| item.provider_id != provider_id);
     for agent in &mut config.agent_injections {
         agent
             .hidden_provider_ids
@@ -1227,6 +1230,7 @@ pub async fn delete_model(
         provider.updated_at = Utc::now();
     }
     config.clear_response_session_reuse_for_model(&provider_id, &model_id);
+    config.clear_cache_capabilities_for_model(&provider_id, &model_id);
     config.updated_at = Utc::now();
     config.save(&state.config_path).map_err(to_command_error)?;
     drop(config);
