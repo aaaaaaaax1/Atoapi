@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
     "test:request-state": "node scripts/test-request-record-state.mjs",
     "build:codex-patcher": "node scripts/build-codex-ui-patcher.mjs",
     "soak:metrics": "node scripts/soak-metrics.mjs",
+    "accept:post-burst": "node scripts/accept-post-burst-live.mjs",
     "verify:cache": "node scripts/verify-cache.mjs",
     "verify:real-metrics": "node scripts/verify-real-metrics.mjs",
     "tauri": "tauri",

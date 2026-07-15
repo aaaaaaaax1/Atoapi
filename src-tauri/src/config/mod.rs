@@ -1731,6 +1731,12 @@ pub fn normalize_agent_injections(items: &mut Vec<AgentInjectionConfig>) {
 }
 
 pub fn app_config_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("ATOAPI_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Ok(path);
+    }
     let base = dirs::config_dir()
         .or_else(dirs::data_local_dir)
         .ok_or_else(|| anyhow!("failed to locate user config directory"))?;
@@ -1745,6 +1751,31 @@ pub fn app_config_dir() -> Result<PathBuf> {
         )?;
     }
     Ok(current)
+}
+
+pub fn isolated_test_instance() -> bool {
+    std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+        .ok()
+        .is_some_and(|value| isolated_test_flag_enabled(&value))
+}
+
+pub fn isolated_test_listen_port() -> Option<u16> {
+    parse_isolated_test_listen_port(
+        isolated_test_instance(),
+        std::env::var("ATOAPI_TEST_LISTEN_PORT").ok().as_deref(),
+    )
+}
+
+fn isolated_test_flag_enabled(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "on" | "enabled")
+}
+
+fn parse_isolated_test_listen_port(isolated: bool, value: Option<&str>) -> Option<u16> {
+    isolated
+        .then_some(value)
+        .flatten()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0 && *port < u16::MAX)
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -2231,6 +2262,20 @@ enabled = true
             .unwrap();
 
         assert!(!config.response_session_reuse_verified_for("share", "gpt-5.5"));
+    }
+
+    #[test]
+    fn isolated_test_instance_requires_explicit_flag_and_valid_port() {
+        assert!(isolated_test_flag_enabled("1"));
+        assert!(isolated_test_flag_enabled("enabled"));
+        assert!(!isolated_test_flag_enabled("0"));
+        assert_eq!(
+            parse_isolated_test_listen_port(true, Some("18885")),
+            Some(18885)
+        );
+        assert_eq!(parse_isolated_test_listen_port(false, Some("18885")), None);
+        assert_eq!(parse_isolated_test_listen_port(true, Some("0")), None);
+        assert_eq!(parse_isolated_test_listen_port(true, Some("invalid")), None);
     }
 
     fn provider_input(key_pool: Option<ProviderKeyPoolInput>) -> ProviderInput {

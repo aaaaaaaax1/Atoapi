@@ -337,6 +337,7 @@ export interface MetricsSnapshot {
     stream_client_backpressure_ms?: number | null;
     sse_end_reason?: string | null;
     downstream_disconnected?: boolean | null;
+    downstream_disconnect_stage?: string | null;
     upstream_retry_wait_ms?: number | null;
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;
@@ -428,6 +429,7 @@ export interface MetricsSnapshot {
     stream_client_backpressure_ms?: number | null;
     sse_end_reason?: string | null;
     downstream_disconnected?: boolean | null;
+    downstream_disconnect_stage?: string | null;
     upstream_retry_wait_ms?: number | null;
     upstream_attempts?: number | null;
     request_body_bytes?: number | null;

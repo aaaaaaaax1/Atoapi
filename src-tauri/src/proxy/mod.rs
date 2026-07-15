@@ -320,6 +320,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/admin/metrics", get(admin_metrics))
         .route("/admin/cache-validation", get(admin_cache_validation))
+        .route("/admin/cache-affinity", get(admin_cache_affinity))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -355,6 +356,14 @@ async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoR
 }
 async fn admin_cache_validation(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.cache_validation.lock().await.status(Utc::now()))
+}
+
+async fn admin_cache_affinity(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    let mut store = state.shadow_affinity.lock().await;
+    Json(cache_affinity::post_burst_evidence_status(
+        &mut store,
+        Utc::now(),
+    ))
 }
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
     list_models_for_agent(state, headers, None).await
@@ -1176,6 +1185,7 @@ async fn handle_responses_compact_for_agent(
         payload_too_large_rescue_used: Some(false),
         sse_end_reason: None,
         downstream_disconnected: None,
+        downstream_disconnect_stage: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: body_read.sse_chunks,
@@ -3857,6 +3867,7 @@ async fn run_generation_for_authorized_agent(
         payload_too_large_rescue_used: None,
         sse_end_reason: None,
         downstream_disconnected: None,
+        downstream_disconnect_stage: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: body_read.sse_chunks,
@@ -7443,6 +7454,16 @@ async fn finalize_agent_generation(
                 .unwrap_or_default()
                 >= 80_000,
         compaction_boundary: request_log.cache_status == "compact",
+        status: request_log.status,
+        ttft_ms: request_log.ttft_ms,
+        avoidable_gap_tokens: request_log.cache_avoidable_gap_tokens.unwrap_or_default(),
+        provider_unstable_gap_tokens: request_log
+            .cache_provider_unstable_gap_tokens
+            .unwrap_or_default(),
+        attempt_count: request_log
+            .upstream_attempt_total
+            .or(request_log.upstream_attempts)
+            .unwrap_or(1),
     });
     if !finish_agent_attempt_lifecycle(
         state,
@@ -8376,6 +8397,7 @@ async fn record_upstream_response_observation(
             payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
             sse_end_reason: None,
             downstream_disconnected: None,
+            downstream_disconnect_stage: None,
             sse_completed_event_seen: None,
             sse_done_marker_seen: None,
             sse_chunks: None,
@@ -8599,6 +8621,7 @@ fn upstream_transport_failure_log(
         payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
         sse_end_reason: Some("transport_error".to_string()),
         downstream_disconnected: None,
+        downstream_disconnect_stage: None,
         sse_completed_event_seen: None,
         sse_done_marker_seen: None,
         sse_chunks: None,
@@ -8787,6 +8810,7 @@ async fn cache_hit_response(
                 payload_too_large_rescue_used: None,
                 sse_end_reason: None,
                 downstream_disconnected: None,
+                downstream_disconnect_stage: None,
                 sse_completed_event_seen: None,
                 sse_done_marker_seen: None,
                 sse_chunks: None,
@@ -10060,6 +10084,7 @@ async fn stream_upstream(
         let mut stream_upstream_wait_ms = 0u64;
         let mut stream_client_backpressure_ms = 0u64;
         let mut downstream_disconnected = false;
+        let mut downstream_disconnect_stage = None;
         let mut stream_end = StreamEnd::CleanEof;
         let mut stream_transport_error = None;
         let state_for_stream = state.clone();
@@ -10089,6 +10114,14 @@ async fn stream_upstream(
                 first_chunk_at = Some(chunk_received_at);
             }
             sse_chunks += 1;
+            let observation = stream_state.ingest(&chunk);
+            if first_model_output_at.is_none() && observation.model_output_started {
+                first_model_output_at = Some(chunk_received_at);
+            }
+            let terminal_seen = match client_channel {
+                Channel::Responses | Channel::Anthropic => observation.completed_event_seen,
+                Channel::Chat => observation.done_marker_seen,
+            };
             if !downstream_disconnected {
                 let client_backpressure_started = Instant::now();
                 if downstream_sender
@@ -10097,13 +10130,17 @@ async fn stream_upstream(
                     .is_err()
                 {
                     downstream_disconnected = true;
+                    downstream_disconnect_stage = Some(
+                        if terminal_seen {
+                            "after_terminal"
+                        } else {
+                            "before_terminal"
+                        }
+                        .to_string(),
+                    );
                 }
                 stream_client_backpressure_ms = stream_client_backpressure_ms
                     .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
-            }
-            let observation = stream_state.ingest(&chunk);
-            if first_model_output_at.is_none() && observation.model_output_started {
-                first_model_output_at = Some(chunk_received_at);
             }
             if eligible {
                 cache_body.extend_from_slice(&chunk);
@@ -10146,6 +10183,7 @@ async fn stream_upstream(
                     .is_err()
             {
                 downstream_disconnected = true;
+                downstream_disconnect_stage = Some("before_terminal".to_string());
             }
         }
         if used_response_session
@@ -10451,6 +10489,7 @@ async fn stream_upstream(
             payload_too_large_rescue_used: None,
             sse_end_reason: Some(sse_end_reason),
             downstream_disconnected: Some(downstream_disconnected),
+            downstream_disconnect_stage,
             sse_completed_event_seen: Some(stream_metadata.completed_event_seen),
             sse_done_marker_seen: Some(stream_metadata.done_marker_seen),
             sse_chunks: Some(sse_chunks),
@@ -19238,6 +19277,8 @@ mod tests {
             skip_reason: None,
             policy_compute_ms: 0,
             validation_run_id: None,
+            automatic_canary_status: None,
+            automatic_canary_reason: None,
         };
         assert!(cache_affinity::apply_static_cohort_canary(
             &mut decision,
@@ -20554,6 +20595,103 @@ mod tests {
             snapshot.recent_requests[0].downstream_disconnected,
             Some(true)
         );
+        assert_eq!(
+            snapshot.recent_requests[0]
+                .downstream_disconnect_stage
+                .as_deref(),
+            Some("before_terminal")
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_classifies_disconnect_after_terminal() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-relay-terminal-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(|| async move {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_terminal_drop\",\"usage\":{\"input_tokens\":20,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\n",
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(b": trailing\n\n"));
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "terminal-drop-request",
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        loop {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if String::from_utf8_lossy(&chunk).contains("response.completed") {
+                break;
+            }
+        }
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the relay must finish after a post-terminal downstream close");
+
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("after_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(true));
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -25231,6 +25369,150 @@ mod tests {
             .shadow_affinity_realm_id
             .as_deref()
             .is_some_and(|value| !value.contains("local-test-key")));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_finalization_persists_real_post_burst_observation_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-post-burst-finalize-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(cache_path(&dir)).unwrap(),
+        )
+        .unwrap();
+        let affinity_identity = affinity_identity::AffinityIdentity {
+            realm_id: "post-burst-realm".to_string(),
+            cohort_id: "post-burst-cohort".to_string(),
+            stable_prefix_digest: "post-burst-prefix".to_string(),
+            trusted_conversation_id: Some("post-burst-conversation".to_string()),
+            trusted_identity_source: Some("test".to_string()),
+        };
+        let route = RouteDecision {
+            provider: test_responses_provider("http://127.0.0.1:1/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+
+        for index in 0..4_u64 {
+            let inbound_request_id = format!("post-burst-inbound-{index}");
+            let attempt_id = format!("post-burst-attempt-{index}");
+            assert!(
+                state
+                    .metrics
+                    .begin_agent_inbound(AgentInboundStart {
+                        inbound_request_id: inbound_request_id.clone(),
+                        at: Utc::now(),
+                        attempt_policy: "single".to_string(),
+                        attempt_budget: 1,
+                    })
+                    .await
+            );
+            assert_eq!(
+                state
+                    .metrics
+                    .begin_agent_attempt(AgentAttemptStart {
+                        inbound_request_id: inbound_request_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        at: Utc::now(),
+                        attempt_reason: "primary".to_string(),
+                        provider: route.provider.name.clone(),
+                        model: route.model.clone(),
+                        upstream_channel: "responses".to_string(),
+                    })
+                    .await,
+                Some(1)
+            );
+
+            let mut shadow_decision = {
+                let mut store = state.shadow_affinity.lock().await;
+                cache_affinity::compute_shadow_affinity(
+                    &mut store,
+                    &affinity_identity,
+                    None,
+                    Utc::now(),
+                    if index == 0 { 90_000 } else { 0 },
+                    if index == 0 { 90_000 } else { 0 },
+                )
+            };
+            shadow_decision.arm = cache_affinity::ShadowAffinityArm::Baseline;
+
+            let started = Instant::now();
+            let mut request_log = upstream_transport_failure_log(
+                &inbound_request_id,
+                &started,
+                &Channel::Responses,
+                &Channel::Responses,
+                &route,
+                None,
+                Some("post-burst-prefix"),
+                None,
+                &PrefixGuardWaitDiagnostics::default(),
+                0,
+                &BodyDiagnostics::default(),
+                &json!({"model":"gpt-5.5","stream":true}),
+                false,
+                &ResponseSessionReuseDiagnostics::default(),
+                Some("gpt-5.5".to_string()),
+                "test-post-burst",
+            );
+            request_log.status = 200;
+            request_log.cache_status = "bypass".to_string();
+            request_log.ttft_ms = 1_100 + index;
+            request_log.input_tokens = Some(100_000);
+            request_log.output_tokens = Some(100);
+            request_log.cache_read_tokens = Some(88_000);
+            request_log.cache_avoidable_gap_tokens = Some(1_536 + index);
+            request_log.cache_provider_unstable_gap_tokens = Some(256 + index);
+            request_log.tail_tool_output_chars = Some(if index == 0 { 90_000 } else { 0 });
+            request_log.tail_largest_tool_output_chars = Some(if index == 0 { 90_000 } else { 0 });
+            request_log.upstream_attempt_total = Some(1);
+            request_log.upstream_attempts = Some(1);
+
+            finalize_agent_generation(
+                &state,
+                &inbound_request_id,
+                Some(attempt_id),
+                request_log,
+                AgentAttemptOutcome::HttpSuccess,
+                AgentInboundOutcome::Success,
+                Some(200),
+                None,
+                "response_completed",
+                Some(shadow_decision),
+                None,
+            )
+            .await;
+        }
+
+        let mut store = state.shadow_affinity.lock().await;
+        let status = cache_affinity::post_burst_evidence_status(&mut store, Utc::now());
+        assert_eq!(status.open_windows, 0);
+        assert_eq!(status.evidence_records, 3);
+        let observations = store.post_burst.evidence.iter().collect::<Vec<_>>();
+        assert_eq!(observations[0].followup_index, 1);
+        assert_eq!(observations[2].followup_index, 3);
+        assert_eq!(observations[0].cache_ratio_bps, 8_800);
+        assert_eq!(observations[0].avoidable_gap_tokens, 1_537);
+        assert_eq!(observations[0].provider_unstable_gap_tokens, 257);
+        assert_eq!(observations[0].ttft_ms, 1_101);
+        assert_eq!(observations[0].attempt_count, 1);
+        drop(store);
+
+        let persisted: Value = serde_json::from_str(
+            &fs::read_to_string(&state.runtime_state_path).expect("runtime state must be saved"),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted
+                .pointer("/shadow_affinity/post_burst/evidence")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(3)
+        );
         fs::remove_dir_all(dir).ok();
     }
 

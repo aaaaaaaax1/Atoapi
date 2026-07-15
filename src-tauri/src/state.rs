@@ -18,8 +18,8 @@ use crate::{
     agent_injection,
     cache::{cache_path, CacheStore},
     config::{
-        app_config_dir, config_path, provider_model_cache_key, AppConfig, ProviderConfig,
-        PublicConfig,
+        app_config_dir, config_path, isolated_test_listen_port, provider_model_cache_key,
+        AppConfig, ProviderConfig, PublicConfig,
     },
     metrics::MetricsStore,
     proxy::{
@@ -38,6 +38,20 @@ pub struct ProxyStatus {
 struct ProxyServer {
     address: String,
     shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProxyServer {
+    async fn shutdown(mut self) {
+        let _ = self.shutdown.send(());
+        if tokio::time::timeout(StdDuration::from_secs(2), &mut self.task)
+            .await
+            .is_err()
+        {
+            self.task.abort();
+            let _ = self.task.await;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +178,12 @@ impl AppState {
         let mut config = AppConfig::load_or_create(&config_path)?;
         agent_injection::ensure_defaults(&mut config);
         config.save(&config_path)?;
+        if let Some(port) = isolated_test_listen_port() {
+            config.host = "127.0.0.1".to_string();
+            config.port = port;
+            config.proxy_mode_host = "127.0.0.1".to_string();
+            config.proxy_mode_port = port.saturating_add(1);
+        }
         let cache = CacheStore::load(cache_path(&config_dir))?;
         let runtime_state_path = runtime_state_path(&config_dir);
         let mut runtime_state = load_runtime_state(&runtime_state_path)?;
@@ -277,7 +297,7 @@ impl AppState {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let router = proxy::router(self.clone());
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -295,6 +315,7 @@ impl AppState {
         *server_guard = Some(ProxyServer {
             address: address.clone(),
             shutdown: shutdown_tx,
+            task,
         });
         self.set_proxy_auto_start(true).await?;
         Ok(ProxyStatus {
@@ -321,7 +342,7 @@ impl AppState {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let router = proxy::router(self.clone());
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -339,6 +360,7 @@ impl AppState {
         *server_guard = Some(ProxyServer {
             address: address.clone(),
             shutdown: shutdown_tx,
+            task,
         });
         Ok(ProxyStatus {
             running: true,
@@ -346,9 +368,9 @@ impl AppState {
         })
     }
     pub async fn stop_proxy(&self) -> Result<ProxyStatus> {
-        let mut server_guard = self.server.lock().await;
-        if let Some(server) = server_guard.take() {
-            let _ = server.shutdown.send(());
+        let server = self.server.lock().await.take();
+        if let Some(server) = server {
+            server.shutdown().await;
         }
         self.set_proxy_auto_start(false).await?;
         Ok(ProxyStatus {
@@ -358,15 +380,34 @@ impl AppState {
     }
 
     pub async fn stop_proxy_mode_proxy(&self) -> Result<ProxyStatus> {
-        let mut server_guard = self.proxy_mode_server.lock().await;
-        if let Some(server) = server_guard.take() {
-            let _ = server.shutdown.send(());
+        let server = self.proxy_mode_server.lock().await.take();
+        if let Some(server) = server {
+            server.shutdown().await;
         }
         Ok(ProxyStatus {
             running: false,
             address: None,
         })
     }
+
+    pub async fn shutdown_for_exit(&self) -> Result<()> {
+        let main_server = self.server.lock().await.take();
+        let proxy_mode_server = self.proxy_mode_server.lock().await.take();
+        tokio::join!(
+            async move {
+                if let Some(server) = main_server {
+                    server.shutdown().await;
+                }
+            },
+            async move {
+                if let Some(server) = proxy_mode_server {
+                    server.shutdown().await;
+                }
+            }
+        );
+        self.persist_runtime_state().await
+    }
+
     pub async fn proxy_status(&self) -> ProxyStatus {
         let server_guard = self.server.lock().await;
         ProxyStatus {
@@ -765,11 +806,55 @@ mod tests {
     use super::*;
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
     use crate::proxy::cache_affinity::{
-        ShadowAffinityAssignment, ShadowCacheLane, SHADOW_POLICY_EPOCH,
+        PostBurstEvidence, PostBurstWindow, ShadowAffinityArm, ShadowAffinityAssignment,
+        ShadowCacheLane, SHADOW_POLICY_EPOCH,
     };
     use serde_json::json;
     use std::fs;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn exit_shutdown_releases_both_ports_without_disabling_auto_start() {
+        let dir =
+            std::env::temp_dir().join(format!("atoapi-exit-shutdown-{}", Uuid::new_v4().simple()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.host = "127.0.0.1".to_string();
+        config.port = 0;
+        config.proxy_mode_host = "127.0.0.1".to_string();
+        config.proxy_mode_port = 0;
+        config.proxy_auto_start = true;
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let main = state.start_proxy().await.unwrap();
+        let proxy_mode = state.start_proxy_mode_proxy().await.unwrap();
+        let main_address: SocketAddr = main.address.unwrap().parse().unwrap();
+        let proxy_mode_address: SocketAddr = proxy_mode.address.unwrap().parse().unwrap();
+        assert!(tokio::net::TcpStream::connect(main_address).await.is_ok());
+        assert!(tokio::net::TcpStream::connect(proxy_mode_address)
+            .await
+            .is_ok());
+
+        state.shutdown_for_exit().await.unwrap();
+
+        assert!(!state.proxy_status().await.running);
+        assert!(!state.proxy_mode_status().await.running);
+        assert!(state.config.read().await.proxy_auto_start);
+        let main_rebind = tokio::net::TcpListener::bind(main_address).await.unwrap();
+        let proxy_mode_rebind = tokio::net::TcpListener::bind(proxy_mode_address)
+            .await
+            .unwrap();
+        drop(main_rebind);
+        drop(proxy_mode_rebind);
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[tokio::test]
     async fn startup_reapplies_enabled_agent_injection_route() {
@@ -916,7 +1001,9 @@ mod tests {
                 unsupported: true,
             },
         );
-        state.shadow_affinity.lock().await.assignments.insert(
+        let shadow_now = Utc::now();
+        let mut shadow_affinity = state.shadow_affinity.lock().await;
+        shadow_affinity.assignments.insert(
             "conversation-a".to_string(),
             ShadowAffinityAssignment {
                 conversation_id: "conversation-a".to_string(),
@@ -924,11 +1011,11 @@ mod tests {
                 realm_id: "realm-a".to_string(),
                 policy_epoch: SHADOW_POLICY_EPOCH,
                 lane: ShadowCacheLane::Steady,
-                arm: crate::proxy::cache_affinity::ShadowAffinityArm::Baseline,
+                arm: ShadowAffinityArm::Baseline,
                 shard: 0,
                 anchor_epoch: 2,
-                created_at: Utc::now(),
-                last_seen_at: Utc::now(),
+                created_at: shadow_now,
+                last_seen_at: shadow_now,
                 observations: 4,
                 successful_observations: 3,
                 usage_observations: 3,
@@ -937,6 +1024,44 @@ mod tests {
                 cache_read_tokens: 10_000,
             },
         );
+        shadow_affinity.post_burst.next_window_id = 7;
+        shadow_affinity.post_burst.windows.insert(
+            "conversation-a".to_string(),
+            PostBurstWindow {
+                window_id: 7,
+                conversation_id: "conversation-a".to_string(),
+                opened_at: shadow_now,
+                expires_at: shadow_now + chrono::Duration::hours(1),
+                remaining_requests: 2,
+                captured_requests: 1,
+            },
+        );
+        shadow_affinity
+            .post_burst
+            .evidence
+            .push_back(PostBurstEvidence {
+                window_id: 6,
+                conversation_id: "conversation-a".to_string(),
+                observed_at: shadow_now,
+                followup_index: 1,
+                realm_id: "realm-a".to_string(),
+                lane: ShadowCacheLane::ToolBurstQuarantine,
+                arm: ShadowAffinityArm::Baseline,
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 2,
+                success: true,
+                status: 200,
+                has_usage: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 90_000,
+                cache_ratio_bps: 9_000,
+                avoidable_gap_tokens: 1_024,
+                provider_unstable_gap_tokens: 0,
+                ttft_ms: 1_200,
+                attempt_count: 1,
+                candidate_applied: false,
+            });
+        drop(shadow_affinity);
 
         state.persist_runtime_state().await.unwrap();
         let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
@@ -966,6 +1091,12 @@ mod tests {
         );
         assert_eq!(shadow.anchor_epoch, 2);
         assert_eq!(shadow.usage_observations, 3);
+        assert_eq!(loaded.shadow_affinity.post_burst.next_window_id, 7);
+        assert_eq!(loaded.shadow_affinity.post_burst.windows.len(), 1);
+        assert_eq!(loaded.shadow_affinity.post_burst.evidence.len(), 1);
+        let evidence = loaded.shadow_affinity.post_burst.evidence.front().unwrap();
+        assert_eq!(evidence.cache_ratio_bps, 9_000);
+        assert_eq!(evidence.attempt_count, 1);
 
         fs::remove_dir_all(dir).ok();
     }

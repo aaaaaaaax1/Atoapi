@@ -430,6 +430,8 @@ mod tests {
             skip_reason: None,
             policy_compute_ms: 0,
             validation_run_id: None,
+            automatic_canary_status: None,
+            automatic_canary_reason: None,
         }
     }
 

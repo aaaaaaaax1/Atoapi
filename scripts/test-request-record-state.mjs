@@ -7,13 +7,14 @@ const sourceUrl = new URL("../src/lib/request-record-state.ts", import.meta.url)
 const source = await readFile(sourceUrl, "utf8");
 const compiled = await transform(source, { loader: "ts", format: "esm" });
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString("base64")}`;
-const { requestRecordState } = await import(moduleUrl);
+const { requestAffinityDisplay, requestRecordState } = await import(moduleUrl);
 
 const state = (overrides = {}) => requestRecordState({
   status: 200,
   cacheStatus: "bypass",
   upstreamCallSource: "main",
   downstreamDisconnected: false,
+  downstreamDisconnectStage: null,
   shadowAffinityLane: "steady",
   prefixLagClassification: "none",
   inputTokens: 30_000,
@@ -64,6 +65,31 @@ assert.deepEqual(
 assert.deepEqual(
   state({ status: 502, cacheStatus: "error" }),
   { label: "error 502", tone: "error" }
+);
+assert.equal(
+  state({ downstreamDisconnected: true, downstreamDisconnectStage: "after_terminal" }),
+  null,
+  "a downstream close after the terminal event is an expected stream teardown"
+);
+assert.deepEqual(
+  state({ downstreamDisconnected: true, downstreamDisconnectStage: "before_terminal" }),
+  { label: "下游已断开", tone: "disconnect" },
+  "a downstream close before the terminal event remains a primary warning"
+);
+assert.deepEqual(
+  requestAffinityDisplay({ arm: "baseline", decision: "assigned" }),
+  { primaryLabel: null, detailLabel: "baseline shadow", applied: false }
+);
+assert.deepEqual(
+  requestAffinityDisplay({
+    arm: "candidate",
+    decision: "candidate_skipped_explicit_cache_key"
+  }),
+  { primaryLabel: null, detailLabel: "candidate shadow 未应用", applied: false }
+);
+assert.deepEqual(
+  requestAffinityDisplay({ arm: "candidate", decision: "candidate_applied" }),
+  { primaryLabel: "candidate", detailLabel: "candidate 已应用", applied: true }
 );
 
 console.log("request record state regression tests passed");

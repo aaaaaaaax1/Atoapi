@@ -563,6 +563,8 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub downstream_disconnected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub downstream_disconnect_stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_completed_event_seen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_done_marker_seen: Option<bool>,
@@ -1874,6 +1876,7 @@ mod tests {
             payload_too_large_rescue_used: None,
             sse_end_reason: None,
             downstream_disconnected: None,
+            downstream_disconnect_stage: None,
             sse_completed_event_seen: None,
             sse_done_marker_seen: None,
             sse_chunks: None,

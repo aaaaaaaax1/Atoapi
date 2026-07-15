@@ -19,8 +19,12 @@ use admin::{
     set_provider_response_session_reuse_enabled, start_proxy, stop_proxy, test_provider_key,
     test_provider_key_pool, update_agent_injection_route,
 };
+use config::isolated_test_instance;
 use state::AppState;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +33,7 @@ pub fn run() {
         AppState::load()
             .unwrap_or_else(|err| panic!("failed to initialize application state: {err:?}")),
     );
+    let exiting = Arc::new(AtomicBool::new(false));
 
     tauri::Builder::default()
         .manage(state)
@@ -69,24 +74,28 @@ pub fn run() {
         .setup(|app| {
             let state = app.state::<Arc<AppState>>().inner().clone();
             tauri::async_runtime::spawn(async move {
+                let isolated_test_instance = isolated_test_instance();
                 if let Err(err) = state.cache.load_from_disk().await {
                     state
                         .metrics
                         .record_error("cache_load", &err.to_string())
                         .await;
                 }
-                if let Err(err) = state.apply_enabled_agent_injections_on_startup().await {
-                    state
-                        .metrics
-                        .record_error("startup_agent_injection", &err.to_string())
-                        .await;
+                if !isolated_test_instance {
+                    if let Err(err) = state.apply_enabled_agent_injections_on_startup().await {
+                        state
+                            .metrics
+                            .record_error("startup_agent_injection", &err.to_string())
+                            .await;
+                    }
                 }
                 let (should_start_main_proxy, should_start_proxy_mode) = {
                     let config = state.config.read().await;
-                    let proxy_mode_enabled = config
-                        .agent_injections
-                        .iter()
-                        .any(|item| item.enabled && item.id == "proxy-mode");
+                    let proxy_mode_enabled = !isolated_test_instance
+                        && config
+                            .agent_injections
+                            .iter()
+                            .any(|item| item.enabled && item.id == "proxy-mode");
                     let non_proxy_agent_enabled = config
                         .agent_injections
                         .iter()
@@ -114,6 +123,29 @@ pub fn run() {
                 }
             });
             Ok(())
+        })
+        .on_window_event({
+            let exiting = exiting.clone();
+            move |window, event| {
+                let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                    return;
+                };
+                api.prevent_close();
+                if exiting.swap(true, Ordering::AcqRel) {
+                    return;
+                }
+                let state = window.state::<Arc<AppState>>().inner().clone();
+                let app_handle = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(err) = state.shutdown_for_exit().await {
+                        state
+                            .metrics
+                            .record_error("shutdown", &err.to_string())
+                            .await;
+                    }
+                    app_handle.exit(0);
+                });
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running Atoapi");

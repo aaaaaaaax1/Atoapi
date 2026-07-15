@@ -7,6 +7,8 @@ use super::{provider_usage_from_value, response_id_from_value, sse};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct StreamObservation {
     pub model_output_started: bool,
+    pub completed_event_seen: bool,
+    pub done_marker_seen: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -112,6 +114,8 @@ impl ResponsesStreamState {
         }
         StreamObservation {
             model_output_started: !output_seen_before && self.summary.model_output_seen,
+            completed_event_seen: self.summary.completed_event_seen,
+            done_marker_seen: self.summary.done_marker_seen,
         }
     }
 
@@ -302,6 +306,20 @@ mod tests {
                 .model_output_started
         );
         assert!(state.finish().model_output_seen);
+    }
+
+    #[test]
+    fn stream_observation_reports_terminal_events_immediately() {
+        let mut responses = ResponsesStreamState::default();
+        let completed = responses
+            .ingest(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp\"}}\n\n");
+        assert!(completed.completed_event_seen);
+        assert!(!completed.done_marker_seen);
+
+        let mut chat = ResponsesStreamState::default();
+        let done = chat.ingest(b"data: [DONE]\n\n");
+        assert!(!done.completed_event_seen);
+        assert!(done.done_marker_seen);
     }
 
     #[test]

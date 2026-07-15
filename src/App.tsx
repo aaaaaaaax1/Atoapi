@@ -56,7 +56,7 @@ import {
   ProviderResponseSessionReuseProbeResult,
   ProxyModeConfigInput
 } from "./lib/api";
-import { requestRecordState } from "./lib/request-record-state";
+import { requestAffinityDisplay, requestRecordState } from "./lib/request-record-state";
 
 const CACHE_VALIDATION_TOOLS_ENABLED = import.meta.env.DEV;
 
@@ -165,8 +165,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.9";
+const appVersion = "v0.2.10";
 const appVersionNotes = [
+  "v0.2.10: 完成 Stage 3 post-burst 证据账本、同期 baseline、效果晋升门槛与自动回滚；无可优化缺口时自动停止 canary，并保持 Agent 一次入站只发送一次上游。",
   "v0.2.9: 修复本地压缩状态识别与请求记录优先级；新增大工具输出的 shadow 分类和黏性观测。本版未启用 Stage 3 wire canary，不修改上游请求、缓存键或重试次数。",
   "v0.2.8: 修复 Codex 自动/手动本地摘要压缩未显示“实际压缩”；可信 compaction 请求在普通摘要输出完成后正确落账，并清理旧前缀与会话状态。",
   "v0.2.7: 确认 Responses 压缩边界后清理旧前缀状态；压缩后首个后续请求安全冷启动，下一次成功请求恢复稳定命中；未通过效益门的 candidate 仅保留 shadow 观测，正式包隐藏受控验证面板。",
@@ -3067,6 +3068,7 @@ function CachePanel({
                 cacheStatus: request.cache_status,
                 upstreamCallSource: request.upstream_call_source,
                 downstreamDisconnected: request.downstream_disconnected,
+                downstreamDisconnectStage: request.downstream_disconnect_stage,
                 shadowAffinityLane: request.shadow_affinity_lane,
                 prefixLagClassification: request.prefix_lag_classification,
                 inputTokens: request.input_tokens ?? 0,
@@ -3090,19 +3092,13 @@ function CachePanel({
                 null;
               const affinityArm = request.shadow_affinity_arm?.trim().toLowerCase() ?? "";
               const affinityDecision = request.shadow_affinity_decision?.trim().toLowerCase() ?? "";
-              const candidateApplied = affinityDecision === "candidate_applied" ||
-                affinityDecision === "stateless_candidate_applied" ||
-                affinityDecision === "validation_candidate_applied";
-              const affinityLabel = candidateApplied
-                ? "candidate"
-                : affinityArm === "baseline"
-                  ? "baseline"
-                  : affinityArm === "candidate"
-                    ? "candidate 未应用"
-                    : "";
-              const affinityTitle = affinityLabel
+              const affinityDisplay = requestAffinityDisplay({
+                arm: affinityArm,
+                decision: affinityDecision
+              });
+              const affinityTitle = affinityDisplay.detailLabel
                 ? [
-                    `缓存实验：${affinityLabel}`,
+                    `缓存实验：${affinityDisplay.detailLabel}`,
                     request.shadow_affinity_lane ? `lane ${request.shadow_affinity_lane}` : "",
                     request.shadow_affinity_trusted_identity === false ? "stateless" : "",
                     affinityDecision ? `decision ${affinityDecision}` : ""
@@ -3121,6 +3117,13 @@ function CachePanel({
               const cacheRatioLabel = inputTokens > 0 ? percent(cacheHitRatio) : "—";
               const rawCacheDetailLabel = cacheDisplay.secondary || cacheDisplay.primary || "—";
               const cacheDetailLabel = rawCacheDetailLabel.replace(/^.+? \/ .+? · /, "");
+              const downstreamDisconnectDetail = request.downstream_disconnected
+                ? request.downstream_disconnect_stage === "after_terminal"
+                  ? "完成后关闭（正常收尾）"
+                  : request.downstream_disconnect_stage === "before_terminal"
+                    ? "完成前断开"
+                    : "断开阶段未知"
+                : "";
               const timingDetail = requestTimingDetail(request);
               const traceItems = [
                 request.inbound_request_id ? `入站 ${shortTraceId(request.inbound_request_id)}` : "",
@@ -3130,7 +3133,8 @@ function CachePanel({
               const requestKey = `${request.feed_kind}-${request.id}`;
               const detailsId = `request-details-${requestKey}`;
               const hasRequestDetails = Boolean(
-                timingDetail || sessionDiagnostic || cacheDisplay.secondary || traceItems.length || affinityLabel
+                timingDetail || sessionDiagnostic || cacheDisplay.secondary || traceItems.length ||
+                affinityDisplay.detailLabel || downstreamDisconnectDetail
               );
               const isExpanded = expandedRequestKey === requestKey;
               const metricTitle = [
@@ -3192,12 +3196,12 @@ function CachePanel({
                             {request.agent_id}
                           </span>
                         ) : null}
-                        {affinityLabel ? (
+                        {affinityDisplay.primaryLabel ? (
                           <span
-                            className={`request-affinity-badge ${candidateApplied ? "candidate" : affinityArm}`}
+                            className="request-affinity-badge candidate"
                             title={affinityTitle}
                           >
-                            {affinityLabel}
+                            {affinityDisplay.primaryLabel}
                           </span>
                         ) : null}
                       </div>
@@ -3244,10 +3248,16 @@ function CachePanel({
                           <b title={cacheDisplay.secondaryTitle ?? cacheDisplay.secondary}>{cacheDisplay.secondary}</b>
                         </div>
                       ) : null}
-                      {affinityLabel ? (
+                      {affinityDisplay.detailLabel ? (
                         <div className="request-detail-line">
                           <span>缓存实验</span>
                           <b title={affinityTitle}>{affinityTitle}</b>
+                        </div>
+                      ) : null}
+                      {downstreamDisconnectDetail ? (
+                        <div className="request-detail-line muted">
+                          <span>下游连接</span>
+                          <b>{downstreamDisconnectDetail}</b>
                         </div>
                       ) : null}
                       {sessionDiagnostic ? (
