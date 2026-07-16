@@ -1,6 +1,29 @@
 # Atoapi Current Workflow Checkpoint
 
-Last updated: 2026-06-30
+Last updated: 2026-07-16
+
+## 2026-07-16 Cache Mainline V3
+
+- Current source and packaged baseline: `v0.2.13-cache-options-fallback-parity-20260716` under `G:\Atoapi\releases`.
+- v0.2.13 keeps verified `prompt_cache_options` consistent after Responses compatibility, session rescue, payload rescue, and previous-response fallback body rebuilds. The native Responses route regression test captures the actual outbound JSON and confirms `mode=implicit`, `ttl=30m`; unverified providers remain unchanged.
+- Packaged v0.2.13 isolated correct-upstream Luna observe run passed: `30` inbound = `30` attempts = `30` upstream, `807,603` input tokens, `0` failures, baseline `65.37%` vs candidate shadow `65.74%`; TTFT p50/p95 were `2317/8144ms` baseline and `2148/2587ms` candidate. This is shadow evidence only, not a promotion decision.
+- Corrected Responses cache accounting is now the measurement baseline. Compatible cached-token fields are reconciled before metrics classification; do not compare new results with older runs that lost `input_tokens_details.cached_tokens`.
+- Isolated sheapi `gpt-5.6-sol` post-burst evidence: baseline `98.93%`, candidate shadow `98.44%`; both average avoidable gap and provider-unstable gap were `0`.
+- Isolated sheapi `gpt-5.6-terra` evidence: baseline `99.20%`, candidate shadow `99.16%`; both addressable gaps were `0`.
+- Powered sheapi `gpt-5.5` shadow A/B: `51` observations per arm and more than `6.2M` input tokens per arm. Baseline was `99.75%`; candidate shadow was `99.69%`.
+- Applied `gpt-5.5` canary: contemporaneous baseline `99.70%`, candidate `99.82%`, TTFT p50 improved from `2811ms` to `2233ms`, and TTFT p95 improved from `6682ms` to `5096ms`. The corrected efficacy rule accepts any strict improvement once the candidate is at least `99.5%`; it no longer requires a fixed `0.50` percentage-point gain. The current `9` paired observations remain below the `18`-observation promotion safety gate.
+- Every acceptance run preserved one inbound request = one generation attempt = one upstream request. No prewarm, companion request, hidden retry, or package replacement was used.
+- After correcting the promotion rule, a fresh isolated gpt-5.5 shadow run completed `30` inbound = `30` attempts = `30` upstream calls. Baseline and candidate both measured `99.75%`, with no addressable gap; this run correctly produced no canary application and no false promotion.
+- A test-only isolated force-canary path (guarded by `ATOAPI_ISOLATED_TEST_INSTANCE`, never enabled by normal production defaults) completed `18` candidate-applied and `18` contemporaneous baseline observations. Candidate hit `99.72%` exceeded baseline `99.61%` and the `99.5%` target, with `90` inbound = `90` attempts = `90` upstream and no failures; promotion stayed blocked solely by candidate TTFT p95 `5367ms` versus baseline `4206ms`.
+- A repeat of the same isolated applied canary reproduced the issue at `3` applied observations: candidate hit `99.71%` exceeded baseline `99.53%`, but TTFT p95 `3583ms` exceeded baseline `2038ms`, triggering rollback-required. This is a repeatable latency safety failure, not a reason to relax the hit-rate gate.
+- After the user's upstream correction, Luna was verified through the Codex-bound `agent-codex-apiaiaiiaiia` provider at `api.aiaiai001.com` (HTTP 200 smoke). The 4-shard candidate failed on that real scope at `3` applied observations: hit `99.56%` below baseline `99.69%`, TTFT p95 `4263ms` above `2513ms`, rollback-required. Do not promote or broaden this shard variant.
+- The same Luna shard candidate in `compacted_anchor` completed `20` applied observations with overall hit `75.66%` versus baseline `75.54%`; stable follow-ups were `99.11%` versus `98.93%`. The first post-compaction summary prefix remains a genuine cold read, so the candidate is still far below the `99.5%` promotion target.
+- Compaction replaces the historical input prefix with a new summary prefix, so the first post-compaction request is a real cold prefix. From the second follow-up onward the prefix remained stable and cache recovered; measured avoidable and provider-unstable gaps stayed `0`.
+- sheapi `gpt-5.6-sol` semantic continuation probe returned `200 -> 400`; Responses WebSocket handshake returned `404`. Do not enable either mechanism for this provider/model scope.
+- Current decision: treat the applied cohort-key result as a positive optimization, but keep the existing stable session-anchored `prompt_cache_key` strategy until at least `18` clean paired applied observations confirm cache hit `>=99.5%`, strict improvement over baseline, non-inferior errors, non-inferior TTFT, and one inbound request = one upstream request.
+- Next trigger: extend the same isolated gpt-5.5 applied canary from `9` to at least `18` paired observations. Promote only for the verified upstream/model scope when all safety gates still pass, then continue iterating toward `100%` instead of imposing an arbitrary minimum gain per iteration.
+- Next trigger: abandon the current single-key and 4-shard cohort candidates for this provider/model scope and design a different cache-affinity mechanism; rerun the same 18-pair gate only after a new candidate has a discriminating hypothesis. Do not promote either failed variant.
+- Next trigger: keep the stable session-anchored baseline for this provider/model. A new candidate must specifically improve the real post-compaction cold prefix without falsifying cache accounting, then pass the same hit/error/TTFT gate.
 
 ## 2026-06-30 Active Rules
 
@@ -21,13 +44,13 @@ Last updated: 2026-06-30
 
 Current source/package candidate:
 
-`v0.1.35-atoapi-compact-diagnostics-cache-error-isolation-20260628`
+`v0.2.12-cache-accounting-compaction-recovery-20260716`
 
 Current release folder:
 
-`G:\Flutter\ccs++\releases\v0.1.35-atoapi-compact-diagnostics-cache-error-isolation-20260628`
+`G:\Atoapi\releases\v0.2.12-cache-accounting-compaction-recovery-20260716`
 
-Current package is v0.1.35 with two lines. Compression line: it keeps v0.1.32 sync-main gzip/cooldown, v0.1.33 old-chat Chat compatibility, and v0.1.34 Chat stream aggregation for large old Responses compact requests. It adds backend-only compression phase diagnostics (`upstream_headers_ms`, `upstream_first_chunk_ms`, `aggregate_done_ms`, `sse_chunks`) and a conservative Chat non-stream fast path only for small/low-risk compact compatibility bodies. Hit-rate line: it isolates SSE/body errors from prefix learning and cache writes so failed/incomplete upstream responses do not pollute waterlines. Large old conversations still use `stream=true` aggregation and return non-stream Responses JSON to ZCode. This remains one upstream request and does not add active prewarm, companion sync requests, or normal main session-delta.
+Current package is v0.2.12. It keeps the historical compression/error-isolation protections, fixes cached-token accounting, and makes cache affinity, compaction recovery, and upstream capability decisions evidence-gated. The older v0.1.35 description below remains historical implementation context.
 
 Response cache/TTFT/tail optimization has a separate baseline set: v0.1.27 / v0.1.28 / v0.1.29. v0.1.27 protects same-prefix cold-read isolation, v0.1.28 adds bounded stale large-tool-output catch-up, and v0.1.29 adds early-anchor/small-context large-tool-output catch-up. Future Response hit-rate changes must compare against these three first, while keeping v0.1.0 forwarding feel and the v0.0.52/v0.0.58/v0.0.64 zero-extra-request cost line. v0.1.30 is a negative live candidate, not a baseline. v0.1.16 is a failed cache-hit experiment and must not be used as a baseline.
 

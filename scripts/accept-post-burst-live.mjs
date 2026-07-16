@@ -56,6 +56,7 @@ const maxInputTokens = boundedNumber(
 );
 const requestedPort = boundedNumber(args.port ?? 18_885, 1_024, 65_533);
 const keepRunDir = booleanArg(args["keep-run-dir"]);
+const forceCanary = booleanArg(args["force-canary"]);
 const fixedWindows = args["fixed-windows"] === undefined
   ? null
   : boundedNumber(args["fixed-windows"], 1, 20);
@@ -67,6 +68,9 @@ if (!new Set(["observe", "full"]).has(mode)) {
 }
 if (fixedWindows !== null && mode !== "observe") {
   failUsage("--fixed-windows is diagnostic-only and requires --mode observe.");
+}
+if (forceCanary && mode !== "full") {
+  failUsage("--force-canary requires --mode full.");
 }
 if (!lane) failUsage("--lane must be tool_burst_quarantine or compacted_anchor.");
 if (booleanArg(args["self-test"])) {
@@ -103,7 +107,10 @@ try {
 
   if (
     mode === "full" &&
-    observeResult.readiness?.status === "ready_for_canary"
+    (observeResult.readiness?.status === "ready_for_canary" ||
+      (forceCanary &&
+        observeResult.readiness?.status === "canary_healthy" &&
+        observeResult.readiness?.reason === "no_addressable_post_burst_gap"))
   ) {
     if (!runtime.managed) {
       throw new Error(
@@ -175,7 +182,8 @@ async function createIsolatedRuntime(canaryEnabled, existing = null) {
       ATOAPI_ISOLATED_TEST_INSTANCE: "1",
       ATOAPI_TEST_LISTEN_PORT: String(port),
       ATOAPI_PREFIX_DIAGNOSTICS: "1",
-      ATOAPI_AUTOMATIC_CACHE_CANARY: canaryEnabled ? "1" : "0"
+      ATOAPI_AUTOMATIC_CACHE_CANARY: canaryEnabled ? "1" : "0",
+      ATOAPI_FORCE_CACHE_CANARY: canaryEnabled && forceCanary ? "1" : "0"
     }
   });
   await waitForHealth(baseUrl, child);
@@ -639,6 +647,7 @@ function buildResult(finalAffinity) {
       })),
       ...exact
     },
+    timingSummary: summarizeTiming(responses),
     compactionProfile: classifyCompactionPrefixDrift(
       responses
         .filter((item) => compactionPhase(item.phase) !== null)
@@ -660,6 +669,48 @@ function buildResult(finalAffinity) {
   };
 }
 
+function summarizeTiming(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const metric = entry.metric;
+    if (!metric || entry.phase === "seed") continue;
+    const key = `${entry.arm ?? "unknown"}:${metric.shadow_affinity_decision ?? "unknown"}`;
+    const bucket = groups.get(key) ?? [];
+    bucket.push({
+      ttft: number(metric.ttft_ms),
+      elapsed: number(entry.elapsedMs),
+      headers: number(metric.upstream_headers_ms),
+      processing: number(metric.upstream_reported_processing_ms),
+      nonProcessing: number(metric.upstream_non_processing_ms),
+      firstChunk: number(metric.upstream_first_chunk_ms)
+    });
+    groups.set(key, bucket);
+  }
+  return Object.fromEntries(
+    [...groups.entries()].map(([key, samples]) => [key, {
+      observations: samples.length,
+      ttft_p50_ms: percentile(samples.map((sample) => sample.ttft), 50),
+      ttft_p95_ms: percentile(samples.map((sample) => sample.ttft), 95),
+      elapsed_p50_ms: percentile(samples.map((sample) => sample.elapsed), 50),
+      elapsed_p95_ms: percentile(samples.map((sample) => sample.elapsed), 95),
+      upstream_headers_p95_ms: percentile(samples.map((sample) => sample.headers), 95),
+      upstream_processing_p95_ms: percentile(samples.map((sample) => sample.processing), 95),
+      upstream_non_processing_p95_ms: percentile(samples.map((sample) => sample.nonProcessing), 95),
+      upstream_first_chunk_p95_ms: percentile(samples.map((sample) => sample.firstChunk), 95)
+    }])
+  );
+}
+
+function percentile(values, percentileValue) {
+  const sorted = values.filter((value) => value > 0).sort((left, right) => left - right);
+  if (sorted.length === 0) return 0;
+  const index = Math.min(
+    sorted.length - 1,
+    Math.max(0, Math.ceil(sorted.length * percentileValue / 100) - 1)
+  );
+  return sorted[index];
+}
+
 function shadowTargetsReached(readiness) {
   return armReachedTarget(readiness?.baseline) &&
     armReachedTarget(readiness?.candidate_shadow);
@@ -677,6 +728,13 @@ function armInputTokens(summary) {
 
 function canaryReachedTerminalGate(readiness) {
   const status = String(readiness?.status ?? "");
+  if (
+    forceCanary &&
+    status === "canary_healthy" &&
+    number(readiness?.candidate_applied?.observations) < 18
+  ) {
+    return false;
+  }
   return new Set([
     "canary_healthy",
     "ready_for_promotion",
@@ -743,6 +801,7 @@ function compactMetric(metric) {
     upstream_reported_processing_ms: number(metric.upstream_reported_processing_ms),
     upstream_non_processing_ms: number(metric.upstream_non_processing_ms),
     upstream_headers_ms: number(metric.upstream_headers_ms),
+    upstream_first_chunk_ms: number(metric.upstream_first_chunk_ms),
     outbound_prefix_fingerprints: compactPrefixFingerprints(
       metric.outbound_prefix_fingerprints
     )

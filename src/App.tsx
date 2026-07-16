@@ -165,8 +165,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.11";
+const appVersion = "v0.2.13";
 const appVersionNotes = [
+  "v0.2.13: 已验证的 prompt_cache_options 在兼容与救援回退路径保持一致；缓存能力继续按上游、模型、通道和密钥严格门控。",
   "v0.2.11: 新增第三方缓存能力自动闭环；兼容性与实际收益分别验证，只有命中提升且首字未明显退化时才启用，并在上游、模型、通道或密钥变化后自动重新探测。",
   "v0.2.10: 完成 Stage 3 post-burst 证据账本、同期 baseline、效果晋升门槛与自动回滚；无可优化缺口时自动停止 canary，并保持 Agent 一次入站只发送一次上游。",
   "v0.2.9: 修复本地压缩状态识别与请求记录优先级；新增大工具输出的 shadow 分类和黏性观测。本版未启用 Stage 3 wire canary，不修改上游请求、缓存键或重试次数。",

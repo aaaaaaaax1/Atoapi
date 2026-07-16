@@ -2070,22 +2070,13 @@ async fn run_generation_for_authorized_agent(
     if static_cohort_canary_applied.is_some() {
         state.metrics.record_shadow_application(true).await;
     }
-    if agent_generation
-        && smart_hit_enabled(&config)
-        && matches!(config.cache.mode, CacheMode::PrefixPrewarm)
-        && matches!(active_request_channel, Channel::Responses | Channel::Chat)
-    {
-        let native_cache_plan = cache_capability::plan(
+    if agent_generation {
+        apply_native_cache_controls(
+            &mut active_upstream_body,
             &config,
-            &decision.provider,
-            &decision.model,
+            &decision,
             &active_request_channel,
             selected_provider_key.key_id.as_deref(),
-        );
-        cache_capability::apply(
-            &mut active_upstream_body,
-            &active_request_channel,
-            native_cache_plan,
         );
         provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
     }
@@ -2429,6 +2420,13 @@ async fn run_generation_for_authorized_agent(
             &active_request_channel,
             responses_non_stream_upstream_sse_compat,
         );
+        apply_native_cache_controls(
+            &mut active_upstream_body,
+            &config,
+            &decision,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        );
         if chat_compat_fast_json {
             set_stream_flag(&mut active_upstream_body, false);
         }
@@ -2543,6 +2541,13 @@ async fn run_generation_for_authorized_agent(
             &decision,
             &Channel::Chat,
             false,
+        );
+        apply_native_cache_controls(
+            &mut active_upstream_body,
+            &config,
+            &decision,
+            &Channel::Chat,
+            selected_provider_key.key_id.as_deref(),
         );
         let chat_fallback_fast_json = should_use_chat_non_stream_compact_fast_path(
             &tail_input_diagnostics,
@@ -2674,6 +2679,13 @@ async fn run_generation_for_authorized_agent(
             &active_request_channel,
             responses_non_stream_upstream_sse_compat,
         );
+        apply_native_cache_controls(
+            &mut active_upstream_body,
+            &config,
+            &decision,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        );
         active_used_response_session = false;
         diagnostics.send_body_bytes =
             serialized_body_len(&active_request_channel, &active_upstream_body);
@@ -2774,6 +2786,13 @@ async fn run_generation_for_authorized_agent(
             apply_responses_non_stream_upstream_sse_compat(
                 &mut active_upstream_body,
                 responses_non_stream_upstream_sse_compat,
+            );
+            apply_native_cache_controls(
+                &mut active_upstream_body,
+                &config,
+                &decision,
+                &decision.upstream_channel,
+                selected_provider_key.key_id.as_deref(),
             );
             active_used_response_session =
                 response_session_delta_request(&active_upstream_body, &upstream_body);
@@ -2896,6 +2915,13 @@ async fn run_generation_for_authorized_agent(
                 apply_responses_non_stream_upstream_sse_compat(
                     &mut active_upstream_body,
                     responses_non_stream_upstream_sse_compat,
+                );
+                apply_native_cache_controls(
+                    &mut active_upstream_body,
+                    &config,
+                    &decision,
+                    &decision.upstream_channel,
+                    selected_provider_key.key_id.as_deref(),
                 );
                 active_used_response_session = false;
                 diagnostics.payload_too_large_rescue_used = false;
@@ -3584,6 +3610,13 @@ async fn run_generation_for_authorized_agent(
                 apply_responses_non_stream_upstream_sse_compat(
                     &mut active_upstream_body,
                     responses_non_stream_upstream_sse_compat,
+                );
+                apply_native_cache_controls(
+                    &mut active_upstream_body,
+                    &config,
+                    &decision,
+                    &active_request_channel,
+                    selected_provider_key.key_id.as_deref(),
                 );
                 active_used_response_session = false;
                 diagnostics.send_body_bytes =
@@ -12629,6 +12662,34 @@ fn request_agent_log_fields(
         .map(|agent| agent.label.clone())
         .unwrap_or_else(|| agent_id.to_string());
     (Some(agent_id.to_string()), Some(agent_label))
+}
+
+/// Reapplies verified provider-native cache controls after a compatibility or
+/// rescue path rebuilds the outbound request body.  The initial request and
+/// every one-shot fallback must use the same capability decision; otherwise a
+/// promoted `prompt_cache_options` record would silently disappear on the
+/// fallback body and make the cache result depend on the error path.
+fn apply_native_cache_controls(
+    request: &mut Value,
+    config: &AppConfig,
+    decision: &RouteDecision,
+    active_channel: &Channel,
+    key_id: Option<&str>,
+) {
+    if !smart_hit_enabled(config)
+        || !matches!(config.cache.mode, CacheMode::PrefixPrewarm)
+        || !matches!(active_channel, Channel::Responses | Channel::Chat)
+    {
+        return;
+    }
+    let native_cache_plan = cache_capability::plan(
+        config,
+        &decision.provider,
+        &decision.model,
+        active_channel,
+        key_id,
+    );
+    cache_capability::apply(request, active_channel, native_cache_plan);
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
@@ -29167,6 +29228,27 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }];
+        config.record_cache_capability_probe(
+            "mock-responses",
+            "gpt-5.5",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_key(
+            "mock-responses",
+            "gpt-5.5",
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            Some("mock outbound options verified".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(90),
+        );
         config.agent_injections = vec![AgentInjectionConfig {
             id: "codex".to_string(),
             label: "Codex".to_string(),
@@ -29269,6 +29351,18 @@ mod tests {
             None
         );
         assert_eq!(
+            captured
+                .pointer("/prompt_cache_options/mode")
+                .and_then(Value::as_str),
+            Some("implicit")
+        );
+        assert_eq!(
+            captured
+                .pointer("/prompt_cache_options/ttl")
+                .and_then(Value::as_str),
+            Some("30m")
+        );
+        assert_eq!(
             captured_responses_accept.lock().await.as_deref(),
             Some("text/event-stream")
         );
@@ -29288,7 +29382,7 @@ mod tests {
             metrics.recent_requests[0].shadow_affinity_trusted_identity,
             Some(true)
         );
-        assert_eq!(
+        assert_ne!(
             metrics.recent_requests[0].provider_prefix_key.as_deref(),
             metrics.recent_requests[0]
                 .shadow_affinity_cohort_id

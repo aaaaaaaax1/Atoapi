@@ -10,6 +10,7 @@ pub(crate) const SHADOW_POLICY_EPOCH: u64 = 1;
 pub(super) const SHADOW_ASSIGNMENT_LIMIT: usize = 4096;
 pub(super) const SHADOW_ASSIGNMENT_TTL_HOURS: i64 = 24;
 pub(super) const STATIC_COHORT_CANARY_PERCENT: u8 = 5;
+const STATIC_COHORT_CACHE_KEY_SHARDS: u8 = 4;
 #[cfg(not(test))]
 const AUTOMATIC_STATIC_COHORT_ADMISSION_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
 const GIANT_TAIL_CHARS: u64 = 80_000;
@@ -21,7 +22,7 @@ const POST_BURST_WINDOW_LIMIT: usize = 512;
 const POST_BURST_EVIDENCE_LIMIT: usize = 1536;
 const POST_BURST_MIN_ARM_OBSERVATIONS: u64 = 9;
 const POST_BURST_MIN_CANARY_OBSERVATIONS: u64 = 3;
-const POST_BURST_MIN_PROMOTION_OBSERVATIONS: u64 = 9;
+const POST_BURST_MIN_PROMOTION_OBSERVATIONS: u64 = 18;
 const POST_BURST_MIN_USAGE_COVERAGE_BPS: u64 = 8_000;
 const POST_BURST_MAX_PROVIDER_UNSTABLE_BPS: u64 = 2_500;
 const POST_BURST_MAX_INPUT_IMBALANCE_BPS: u64 = 5_000;
@@ -29,7 +30,7 @@ const POST_BURST_ROLLBACK_SUCCESS_DELTA_BPS: u64 = 1_000;
 const POST_BURST_ROLLBACK_CACHE_DELTA_BPS: u64 = 500;
 const POST_BURST_ROLLBACK_AVOIDABLE_DELTA: u64 = 2_048;
 const POST_BURST_ROLLBACK_TTFT_DELTA_MS: u64 = 1_000;
-const POST_BURST_PROMOTION_CACHE_GAIN_BPS: u64 = 50;
+const POST_BURST_PROMOTION_TARGET_BPS: u64 = 9_950;
 const POST_BURST_PROMOTION_MAX_ERROR_DELTA_BPS: u64 = 50;
 const POST_BURST_PROMOTION_TTFT_P50_DELTA_MS: u64 = 200;
 const POST_BURST_PROMOTION_TTFT_P95_DELTA_MS: u64 = 300;
@@ -431,8 +432,11 @@ fn post_burst_promotion_blocker(
     {
         return Some("candidate_error_not_non_inferior");
     }
-    if candidate.cache_ratio_bps < baseline.cache_ratio_bps {
-        return Some("candidate_cache_not_non_inferior");
+    if candidate.cache_ratio_bps < POST_BURST_PROMOTION_TARGET_BPS {
+        return Some("candidate_cache_below_target");
+    }
+    if candidate.cache_ratio_bps <= baseline.cache_ratio_bps {
+        return Some("candidate_cache_not_improved");
     }
     if candidate.provider_unstable_ratio_bps > baseline.provider_unstable_ratio_bps {
         return Some("candidate_provider_unstable_not_non_inferior");
@@ -456,16 +460,6 @@ fn post_burst_promotion_blocker(
         return Some("candidate_ttft_p95_not_non_inferior");
     }
 
-    let cache_gain = candidate.cache_ratio_bps
-        >= baseline
-            .cache_ratio_bps
-            .saturating_add(POST_BURST_PROMOTION_CACHE_GAIN_BPS);
-    let provider_unstable_gain = baseline.provider_unstable_ratio_bps > 0
-        && candidate.provider_unstable_ratio_bps.saturating_mul(5)
-            <= baseline.provider_unstable_ratio_bps.saturating_mul(4);
-    if !cache_gain && !provider_unstable_gain {
-        return Some("canary_no_efficacy_gain");
-    }
     None
 }
 
@@ -1004,6 +998,23 @@ fn automatic_static_cohort_admission_enabled() -> bool {
     }
 }
 
+fn automatic_static_cohort_force_no_gap_enabled() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        let isolated = std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"));
+        isolated
+            && std::env::var("ATOAPI_FORCE_CACHE_CANARY")
+                .ok()
+                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+    }
+}
+
 fn apply_automatic_static_cohort_canary_with_switch(
     decision: &mut ShadowAffinityDecision,
     smart_hit_enabled: bool,
@@ -1031,11 +1042,14 @@ fn apply_automatic_static_cohort_canary_with_switch(
     let readiness = decision
         .automatic_canary_status
         .unwrap_or(PostBurstReadinessStatus::InsufficientEvidence);
+    let force_no_gap_canary = automatic_static_cohort_force_no_gap_enabled()
+        && readiness == PostBurstReadinessStatus::CanaryHealthy
+        && decision.automatic_canary_reason.as_deref() == Some("no_addressable_post_burst_gap");
     if readiness == PostBurstReadinessStatus::RollbackRequired {
         decision.skip_reason = Some("automatic_canary_rolled_back".to_string());
         return false;
     }
-    if readiness == PostBurstReadinessStatus::CanaryHealthy {
+    if readiness == PostBurstReadinessStatus::CanaryHealthy && !force_no_gap_canary {
         decision.skip_reason = Some("canary_not_promotable".to_string());
         return false;
     }
@@ -1044,7 +1058,7 @@ fn apply_automatic_static_cohort_canary_with_switch(
         PostBurstReadinessStatus::ReadyForCanary
             | PostBurstReadinessStatus::CanaryCollecting
             | PostBurstReadinessStatus::ReadyForPromotion
-    );
+    ) || force_no_gap_canary;
     if !ready {
         decision.skip_reason = Some("awaiting_efficacy_evidence".to_string());
         return false;
@@ -1060,9 +1074,18 @@ fn apply_automatic_static_cohort_canary_with_switch(
     true
 }
 
-pub(super) fn static_cohort_prompt_cache_key(decision: &ShadowAffinityDecision) -> Option<&str> {
-    matches!(decision.mode.as_str(), "applied" | "validation_applied")
-        .then_some(decision.cohort_id.as_str())
+pub(super) fn static_cohort_prompt_cache_key(decision: &ShadowAffinityDecision) -> Option<String> {
+    if !matches!(decision.mode.as_str(), "applied" | "validation_applied") {
+        return None;
+    }
+    let assignment_key = decision.assignment_key.as_deref().unwrap_or_default();
+    let shard_material = format!(
+        "cache-cohort-shard-v1\0{}\0{}",
+        decision.cohort_id, assignment_key
+    );
+    let shard = Sha256::digest(shard_material.as_bytes())[0] % STATIC_COHORT_CACHE_KEY_SHARDS;
+    let key_material = format!("cache-cohort-key-v2\0{}\0{}", decision.cohort_id, shard);
+    Some(format!("{:x}", Sha256::digest(key_material.as_bytes())))
 }
 
 fn canary_arm_for_conversation(conversation_id: &str, percent: u8) -> ShadowAffinityArm {
@@ -1804,9 +1827,15 @@ mod tests {
         assert!(apply_static_cohort_canary(&mut decision, true));
         assert_eq!(decision.mode, "applied");
         assert_eq!(decision.decision, "candidate_applied");
+        let candidate_key = static_cohort_prompt_cache_key(&decision)
+            .expect("applied candidate must have a sharded cache key");
+        assert_eq!(candidate_key.len(), 64);
+        assert_ne!(candidate_key, decision.cohort_id);
+        let mut same_decision = decision.clone();
+        same_decision.mode = "validation_applied".to_string();
         assert_eq!(
-            static_cohort_prompt_cache_key(&decision),
-            Some(decision.cohort_id.as_str())
+            static_cohort_prompt_cache_key(&same_decision),
+            Some(candidate_key)
         );
 
         let mut again = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
@@ -2302,7 +2331,7 @@ mod tests {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
         let baseline_ttft = [1_000, 1_100, 1_200];
-        let candidate_ttft = [1_050, 1_150, 1_250];
+        let candidate_ttft = [1_050, 1_150, 1_250, 1_050, 1_150, 1_250];
         let mut realm_id = String::new();
 
         for (index, ttft_ms) in baseline_ttft.into_iter().enumerate() {
@@ -2368,12 +2397,12 @@ mod tests {
             post_burst_comparison_key(&realm_id, ShadowCacheLane::ToolBurstQuarantine);
         let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
         assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryHealthy);
-        assert_eq!(readiness.reason, "canary_no_efficacy_gain");
-        assert_eq!(readiness.baseline.observations, 18);
-        assert_eq!(readiness.candidate_applied.observations, 9);
+        assert_eq!(readiness.reason, "candidate_cache_below_target");
+        assert_eq!(readiness.baseline.observations, 27);
+        assert_eq!(readiness.candidate_applied.observations, 18);
         assert_eq!(readiness.candidate_applied.ttft_p50_ms, 1_150);
         assert_eq!(readiness.candidate_applied.ttft_p95_ms, 1_250);
-        assert_eq!(readiness.canary_baseline.observations, 9);
+        assert_eq!(readiness.canary_baseline.observations, 18);
         assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_750);
         assert_eq!(readiness.canary_baseline.ttft_p50_ms, 1_150);
         assert_eq!(readiness.canary_baseline.ttft_p95_ms, 1_250);
@@ -2404,7 +2433,7 @@ mod tests {
         let now = Utc::now();
         let mut realm_id = String::new();
 
-        for index in 0..3 {
+        for index in 0..6 {
             realm_id = record_post_burst_window(
                 &mut store,
                 &format!("promotion-baseline-{index}"),
@@ -2412,8 +2441,8 @@ mod tests {
                 now + Duration::seconds(index * 10),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_700,
+                300,
                 0,
                 1_000,
                 1,
@@ -2425,8 +2454,8 @@ mod tests {
                 now + Duration::seconds(40 + index * 10),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_700,
+                300,
                 0,
                 1_000,
                 1,
@@ -2438,8 +2467,8 @@ mod tests {
                 now + Duration::seconds(80 + index * 20),
                 true,
                 true,
-                97_600,
-                2_400,
+                99_820,
+                180,
                 0,
                 1_050,
                 1,
@@ -2451,8 +2480,8 @@ mod tests {
                 now + Duration::seconds(90 + index * 20),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_700,
+                300,
                 0,
                 1_000,
                 1,
@@ -2467,6 +2496,10 @@ mod tests {
             PostBurstReadinessStatus::ReadyForPromotion
         );
         assert_eq!(readiness.reason, "canary_efficacy_gate_passed");
+        assert_eq!(readiness.canary_baseline.observations, 18);
+        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_970);
+        assert_eq!(readiness.candidate_applied.observations, 18);
+        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_982);
         assert_eq!(readiness.canary_baseline.provider_unstable_ratio_bps, 0);
         assert_eq!(readiness.candidate_applied.provider_unstable_ratio_bps, 0);
 
@@ -2487,6 +2520,161 @@ mod tests {
     }
 
     #[test]
+    fn positive_high_hit_canary_keeps_collecting_before_eighteen_observations() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut realm_id = String::new();
+
+        for index in 0..3 {
+            realm_id = record_post_burst_window(
+                &mut store,
+                &format!("collecting-baseline-{index}"),
+                ShadowAffinityArm::Baseline,
+                now + Duration::seconds(index * 10),
+                false,
+                true,
+                99_700,
+                300,
+                0,
+                2_811,
+                1,
+            );
+            record_post_burst_window(
+                &mut store,
+                &format!("collecting-shadow-{index}"),
+                ShadowAffinityArm::Candidate,
+                now + Duration::seconds(40 + index * 10),
+                false,
+                true,
+                99_700,
+                300,
+                0,
+                2_811,
+                1,
+            );
+            record_post_burst_window(
+                &mut store,
+                &format!("collecting-applied-{index}"),
+                ShadowAffinityArm::Candidate,
+                now + Duration::seconds(80 + index * 20),
+                true,
+                true,
+                99_820,
+                180,
+                0,
+                2_233,
+                1,
+            );
+            record_post_burst_window(
+                &mut store,
+                &format!("collecting-canary-baseline-{index}"),
+                ShadowAffinityArm::Baseline,
+                now + Duration::seconds(90 + index * 20),
+                false,
+                true,
+                99_700,
+                300,
+                0,
+                2_811,
+                1,
+            );
+        }
+
+        let comparison_key =
+            post_burst_comparison_key(&realm_id, ShadowCacheLane::ToolBurstQuarantine);
+        let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
+        assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryCollecting);
+        assert_eq!(readiness.reason, "collecting_promotion_evidence");
+        assert_eq!(readiness.candidate_applied.observations, 9);
+    }
+
+    #[test]
+    fn promotion_requires_target_and_strict_baseline_improvement() {
+        let baseline = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_949,
+            ..PostBurstArmSummary::default()
+        };
+        let below_target = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_949,
+            ..PostBurstArmSummary::default()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline, &below_target),
+            Some("candidate_cache_below_target")
+        );
+
+        let baseline = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_950,
+            ..PostBurstArmSummary::default()
+        };
+        let equal = baseline.clone();
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline, &equal),
+            Some("candidate_cache_not_improved")
+        );
+
+        let lower = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_949,
+            ..PostBurstArmSummary::default()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline, &lower),
+            Some("candidate_cache_below_target")
+        );
+
+        let below_target_baseline = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_940,
+            ..PostBurstArmSummary::default()
+        };
+        let positive_but_below_target = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_949,
+            ..PostBurstArmSummary::default()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&below_target_baseline, &positive_but_below_target),
+            Some("candidate_cache_below_target")
+        );
+
+        let baseline = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_950,
+            ..PostBurstArmSummary::default()
+        };
+        let one_basis_point_better = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_951,
+            ..PostBurstArmSummary::default()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline, &one_basis_point_better),
+            None
+        );
+
+        let provider_gap_only = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_950,
+            provider_unstable_ratio_bps: 0,
+            ..PostBurstArmSummary::default()
+        };
+        let baseline_with_provider_gap = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: 9_950,
+            provider_unstable_ratio_bps: 1_000,
+            ..PostBurstArmSummary::default()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline_with_provider_gap, &provider_gap_only),
+            Some("candidate_cache_not_improved")
+        );
+    }
+
+    #[test]
     fn ttft_long_tail_blocks_promotion_without_triggering_rollback() {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
@@ -2500,8 +2688,8 @@ mod tests {
                 now + Duration::seconds(index * 10),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_500,
+                500,
                 0,
                 1_000,
                 1,
@@ -2513,14 +2701,17 @@ mod tests {
                 now + Duration::seconds(40 + index * 10),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_500,
+                500,
                 0,
                 1_000,
                 1,
             );
         }
-        for (index, ttft_ms) in [1_000, 1_000, 1_600].into_iter().enumerate() {
+        for (index, ttft_ms) in [1_000, 1_000, 1_600, 1_000, 1_000, 1_600]
+            .into_iter()
+            .enumerate()
+        {
             record_post_burst_window(
                 &mut store,
                 &format!("ttft-applied-{index}"),
@@ -2528,8 +2719,8 @@ mod tests {
                 now + Duration::seconds(80 + index as i64 * 20),
                 true,
                 true,
-                97_600,
-                2_400,
+                99_600,
+                400,
                 0,
                 ttft_ms,
                 1,
@@ -2541,8 +2732,8 @@ mod tests {
                 now + Duration::seconds(90 + index as i64 * 20),
                 false,
                 true,
-                97_000,
-                3_000,
+                99_500,
+                500,
                 0,
                 1_000,
                 1,
@@ -2595,7 +2786,10 @@ mod tests {
             );
         }
 
-        for (index, candidate_ttft_ms) in [1_446, 1_446, 5_900].into_iter().enumerate() {
+        for (index, candidate_ttft_ms) in [1_446, 1_446, 5_900, 1_446, 1_446, 5_900]
+            .into_iter()
+            .enumerate()
+        {
             record_post_burst_window(
                 &mut store,
                 &format!("phase-applied-{index}"),
@@ -2603,8 +2797,8 @@ mod tests {
                 now + Duration::seconds(80 + index as i64 * 20),
                 true,
                 true,
-                97_510,
-                2_490,
+                99_520,
+                480,
                 0,
                 candidate_ttft_ms,
                 1,
@@ -2622,10 +2816,10 @@ mod tests {
                 now + Duration::seconds(90 + index as i64 * 20),
                 false,
                 true,
-                97_510,
-                2_490,
+                99_510,
+                490,
                 0,
-                [1_432, 1_432, 3_643][index],
+                [1_432, 1_432, 3_643, 1_432, 1_432, 3_643][index],
                 1,
             );
         }
@@ -2635,9 +2829,9 @@ mod tests {
         let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
         assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryHealthy);
         assert_eq!(readiness.reason, "candidate_ttft_p95_not_non_inferior");
-        assert_eq!(readiness.baseline.cache_ratio_bps, 9_209);
-        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_751);
-        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_751);
+        assert_eq!(readiness.baseline.cache_ratio_bps, 9_523);
+        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_951);
+        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_952);
         assert!(!store.post_burst.rollbacks.contains_key(&comparison_key));
     }
 
