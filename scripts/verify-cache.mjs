@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 const TOTAL_BUDGET = readTotal();
 const SCENARIO_COUNT = 7;
 const SCENARIO_TOTAL = Math.max(10_000, Math.floor(TOTAL_BUDGET / SCENARIO_COUNT));
+const MAX_SCENARIO_SAMPLES = readMaxScenarioSamples();
 const WORKLOAD_LABEL = `${Math.round(TOTAL_BUDGET / 1000)}k_budget_${Math.round(SCENARIO_TOTAL / 1000)}k_each`;
 const PROVIDER_ID = "provider-a";
 const MODEL = "model-a";
@@ -57,7 +58,9 @@ console.log(
       syntheticBudget: {
         requestedTotal: TOTAL_BUDGET,
         scenarioCount: SCENARIO_COUNT,
-        perScenario: SCENARIO_TOTAL
+        perScenario: SCENARIO_TOTAL,
+        maxSamplesPerScenario: MAX_SCENARIO_SAMPLES,
+        sampling: SCENARIO_TOTAL > MAX_SCENARIO_SAMPLES ? "deterministic-stratified" : "exhaustive"
       },
       warmReplay,
       cacheModeAcceptance: {
@@ -97,9 +100,36 @@ function readTotal() {
   return value;
 }
 
+function readMaxScenarioSamples() {
+  const raw = process.env.CCS_VERIFY_MAX_SAMPLES ?? "250000";
+  const value = Number.parseInt(String(raw).replace(/_/g, ""), 10);
+  if (!Number.isFinite(value) || value < 10_000) {
+    throw new Error(`Invalid cache verification sample limit: ${raw}`);
+  }
+  return value;
+}
+
+function verificationSamples(total) {
+  const sampleCount = Math.min(total, MAX_SCENARIO_SAMPLES);
+  if (sampleCount === total) {
+    return Array.from({ length: total }, (_, index) => ({ index, weight: 1 }));
+  }
+
+  return Array.from({ length: sampleCount }, (_, sampleIndex) => {
+    const start = Math.floor(sampleIndex * total / sampleCount);
+    const end = Math.floor((sampleIndex + 1) * total / sampleCount);
+    const width = Math.max(1, end - start);
+    return {
+      index: start + (sampleIndex % width),
+      weight: width
+    };
+  });
+}
+
 function runWarmReplay(total) {
+  const verificationPlan = verificationSamples(total);
   const cache = new Map();
-  for (let index = 0; index < total; index += 1) {
+  for (const { index } of verificationPlan) {
     const request = stableRequest(index);
     for (const key of cacheKeysForMode(request, "passive-warm")) {
       cache.set(key.value, { status: 200, contentType: "application/json", body: "{\"ok\":true}" });
@@ -108,19 +138,26 @@ function runWarmReplay(total) {
 
   let hits = 0;
   const samples = [];
-  for (let index = 0; index < total; index += 1) {
+  for (const { index, weight } of verificationPlan) {
     const request = stableRequest(index);
     const started = performance.now();
     if (lookup(cache, request, "passive-warm")) {
-      hits += 1;
+      hits += weight;
     }
     samples.push(performance.now() - started);
   }
 
-  return summarize(`warm_replay_exact_${WORKLOAD_LABEL}`, total, hits, samples);
+  return summarize(
+    `warm_replay_exact_${WORKLOAD_LABEL}`,
+    total,
+    hits,
+    samples,
+    verificationPlan.length
+  );
 }
 
 function runRealisticMixedWorkload(total, mode) {
+  const verificationPlan = verificationSamples(total);
   const cache = new Map();
   const warmedCorpus = 48_000;
   for (let index = 0; index < warmedCorpus; index += 1) {
@@ -133,6 +170,7 @@ function runRealisticMixedWorkload(total, mode) {
   const samples = [];
   const counts = {
     total,
+    executedSamples: verificationPlan.length,
     bypassedIneligible: 0,
     firstSeenNovelEligible: 0,
     repeatableEligible: 0,
@@ -142,11 +180,11 @@ function runRealisticMixedWorkload(total, mode) {
     sessionKeyHits: 0
   };
 
-  for (let index = 0; index < total; index += 1) {
+  for (const { index, weight } of verificationPlan) {
     const request = realisticRequest(index, warmedCorpus);
     const eligible = isCacheEligible(request);
     if (!eligible) {
-      counts.bypassedIneligible += 1;
+      counts.bypassedIneligible += weight;
       continue;
     }
 
@@ -154,9 +192,9 @@ function runRealisticMixedWorkload(total, mode) {
       request.metadata?.workload === "first-seen-novel" ||
       request.metadata?.no_store_after_miss === true;
     if (firstSeenNovel) {
-      counts.firstSeenNovelEligible += 1;
+      counts.firstSeenNovelEligible += weight;
     } else {
-      counts.repeatableEligible += 1;
+      counts.repeatableEligible += weight;
     }
 
     const started = performance.now();
@@ -164,14 +202,14 @@ function runRealisticMixedWorkload(total, mode) {
     samples.push(performance.now() - started);
 
     if (hit) {
-      counts.eligibleHits += 1;
+      counts.eligibleHits += weight;
       if (!firstSeenNovel) {
-        counts.repeatableEligibleHits += 1;
+        counts.repeatableEligibleHits += weight;
       }
       if (hit.kind === "session") {
-        counts.sessionKeyHits += 1;
+        counts.sessionKeyHits += weight;
       } else {
-        counts.exactOrNearExactHits += 1;
+        counts.exactOrNearExactHits += weight;
       }
     } else if (!request.metadata?.no_store_after_miss) {
       for (const key of cacheKeysForMode(request, mode)) {
@@ -204,6 +242,7 @@ function runRealisticMixedWorkload(total, mode) {
 }
 
 function runAgentTraceReplay(total, mode) {
+  const verificationPlan = verificationSamples(total);
   const cache = new Map();
   const warmedCorpus = 64_000;
   for (let index = 0; index < warmedCorpus; index += 1) {
@@ -220,6 +259,7 @@ function runAgentTraceReplay(total, mode) {
   const samples = [];
   const counts = {
     total,
+    executedSamples: verificationPlan.length,
     bypassedIneligible: 0,
     firstSeenNovelEligible: 0,
     repeatableEligible: 0,
@@ -233,11 +273,11 @@ function runAgentTraceReplay(total, mode) {
     firstSeenShapeEligible: 0
   };
 
-  for (let index = 0; index < total; index += 1) {
+  for (const { index, weight } of verificationPlan) {
     const request = agentTraceReplayRequest(index, warmedCorpus);
     const eligible = isCacheEligible(request);
     if (!eligible) {
-      counts.bypassedIneligible += 1;
+      counts.bypassedIneligible += weight;
       continue;
     }
 
@@ -245,9 +285,9 @@ function runAgentTraceReplay(total, mode) {
       request.metadata?.workload === "first-seen-novel" ||
       request.metadata?.no_store_after_miss === true;
     const workload = request.metadata?.workload;
-    if (workload === "dynamic-exact-session") counts.dynamicBypass += 1;
-    if (workload === "code-exact-session") counts.codeBypass += 1;
-    if (workload === "tool-exact-session") counts.toolExactSessionEligible += 1;
+    if (workload === "dynamic-exact-session") counts.dynamicBypass += weight;
+    if (workload === "code-exact-session") counts.codeBypass += weight;
+    if (workload === "tool-exact-session") counts.toolExactSessionEligible += weight;
 
     const started = performance.now();
     const hit = lookup(cache, request, mode);
@@ -257,26 +297,26 @@ function runAgentTraceReplay(total, mode) {
       !hit && (workload === "code-exact-session" || workload === "tool-exact-session");
     const firstSeen = firstSeenNovel || firstSeenShape;
     if (firstSeenNovel) {
-      counts.firstSeenNovelEligible += 1;
+      counts.firstSeenNovelEligible += weight;
     }
     if (firstSeenShape) {
-      counts.firstSeenShapeEligible += 1;
+      counts.firstSeenShapeEligible += weight;
     }
     if (firstSeen) {
       // First appearances can warm cache, but they are not repeatable hits yet.
     } else {
-      counts.repeatableEligible += 1;
+      counts.repeatableEligible += weight;
     }
 
     if (hit) {
-      counts.eligibleHits += 1;
+      counts.eligibleHits += weight;
       if (!firstSeen) {
-        counts.repeatableEligibleHits += 1;
+        counts.repeatableEligibleHits += weight;
       }
       if (hit.kind === "session") {
-        counts.sessionKeyHits += 1;
+        counts.sessionKeyHits += weight;
       } else {
-        counts.exactOrNearExactHits += 1;
+        counts.exactOrNearExactHits += weight;
       }
     } else if (!request.metadata?.no_store_after_miss) {
       for (const key of cacheKeysForMode(request, mode)) {
@@ -371,6 +411,7 @@ function runSafetyGuards() {
 }
 
 function runToolArgumentOrderReplay(total, mode) {
+  const verificationPlan = verificationSamples(total);
   const cache = new Map();
   const warmedCorpus = 32_000;
   for (let index = 0; index < warmedCorpus; index += 1) {
@@ -387,24 +428,25 @@ function runToolArgumentOrderReplay(total, mode) {
   const samples = [];
   const counts = {
     total,
+    executedSamples: verificationPlan.length,
     repeatableEligible: 0,
     repeatableEligibleHits: 0,
     exactOrNearExactHits: 0,
     sessionKeyHits: 0
   };
 
-  for (let index = 0; index < total; index += 1) {
+  for (const { index, weight } of verificationPlan) {
     const request = toolRequestWithReorderedArguments(index % warmedCorpus, index);
-    counts.repeatableEligible += 1;
+    counts.repeatableEligible += weight;
     const started = performance.now();
     const hit = lookup(cache, request, mode);
     samples.push(performance.now() - started);
     if (hit) {
-      counts.repeatableEligibleHits += 1;
+      counts.repeatableEligibleHits += weight;
       if (hit.kind === "session") {
-        counts.sessionKeyHits += 1;
+        counts.sessionKeyHits += weight;
       } else {
-        counts.exactOrNearExactHits += 1;
+        counts.exactOrNearExactHits += weight;
       }
     }
   }
@@ -428,6 +470,7 @@ function runToolArgumentOrderReplay(total, mode) {
 }
 
 function runResponsesNormalizerReplay(total, mode) {
+  const verificationPlan = verificationSamples(total);
   const warmedCorpus = 48_000;
   const normalizedCache = new Map();
   const rawCache = new Map();
@@ -449,6 +492,7 @@ function runResponsesNormalizerReplay(total, mode) {
   const samples = [];
   const counts = {
     total,
+    executedSamples: verificationPlan.length,
     repeatableEligible: 0,
     repeatableEligibleHits: 0,
     rawEquivalentHits: 0,
@@ -462,27 +506,27 @@ function runResponsesNormalizerReplay(total, mode) {
     nullEmptyDropped: 0
   };
 
-  for (let index = 0; index < total; index += 1) {
+  for (const { index, weight } of verificationPlan) {
     const request = responsesVariantRequest(index % warmedCorpus, index);
     const normalized = normalizeResponsesRequest(request);
     const started = performance.now();
     const hit = lookup(normalizedCache, normalized, mode, "responses");
     samples.push(performance.now() - started);
-    counts.repeatableEligible += 1;
-    counts.rawEquivalentHits += lookup(rawCache, request, mode, "responses") ? 1 : 0;
+    counts.repeatableEligible += weight;
+    counts.rawEquivalentHits += lookup(rawCache, request, mode, "responses") ? weight : 0;
     const variant = request.metadata?.variant;
-    if (variant === "prompt-to-input") counts.promptToInput += 1;
-    if (variant === "max-token-alias") counts.maxTokenAlias += 1;
-    if (variant === "tool-schema-order") counts.toolSchemaOrder += 1;
-    if (variant === "function-argument-order") counts.functionArgumentOrder += 1;
-    if (variant === "volatile-ids") counts.volatileIds += 1;
-    if (variant === "null-empty-dropped") counts.nullEmptyDropped += 1;
+    if (variant === "prompt-to-input") counts.promptToInput += weight;
+    if (variant === "max-token-alias") counts.maxTokenAlias += weight;
+    if (variant === "tool-schema-order") counts.toolSchemaOrder += weight;
+    if (variant === "function-argument-order") counts.functionArgumentOrder += weight;
+    if (variant === "volatile-ids") counts.volatileIds += weight;
+    if (variant === "null-empty-dropped") counts.nullEmptyDropped += weight;
     if (hit) {
-      counts.repeatableEligibleHits += 1;
+      counts.repeatableEligibleHits += weight;
       if (hit.kind === "session") {
-        counts.sessionKeyHits += 1;
+        counts.sessionKeyHits += weight;
       } else {
-        counts.exactOrNearExactHits += 1;
+        counts.exactOrNearExactHits += weight;
       }
     }
   }
@@ -1628,10 +1672,11 @@ function canonicalJson(value) {
   return JSON.stringify(value);
 }
 
-function summarize(name, total, hits, samples) {
+function summarize(name, total, hits, samples, executedSamples = total) {
   return {
     name,
     total,
+    executedSamples,
     hits,
     hitRate: ratio(hits, total),
     p95Ms: percentile(samples, 0.95),

@@ -13,14 +13,14 @@ use crate::{
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
-        AgentInboundStart, RequestLog, UsageRecord,
+        AgentInboundStart, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
     },
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
-    body::Body,
-    extract::{DefaultBodyLimit, Path, State as AxumState},
+    body::{to_bytes, Body},
+    extract::{DefaultBodyLimit, Path, Request, State as AxumState},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -30,6 +30,7 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{Stream, StreamExt};
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -38,7 +39,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 use tokio::{
@@ -56,6 +57,7 @@ mod codex_chat_common;
 mod json_canonical;
 mod prefix_control;
 mod responses_stream;
+mod responses_websocket_probe;
 mod session_identity;
 mod sse;
 mod streaming_codex_chat;
@@ -96,6 +98,15 @@ const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
 const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
+const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
+const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, Deserialize)]
+struct ResponseSessionReuseProbeHttpInput {
+    provider_id: String,
+    model_id: String,
+}
+
 #[derive(Debug, Clone)]
 struct RouteDecision {
     provider: ProviderConfig,
@@ -150,6 +161,7 @@ struct UpstreamRequestDiagnostics {
     gzip_fallback_used: bool,
     gzip_skipped_cold_stream: bool,
     sent_body_bytes: u64,
+    outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
@@ -178,6 +190,7 @@ impl UpstreamRequestDiagnostics {
         self.gzip_fallback_used |= next.gzip_fallback_used;
         self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
         self.sent_body_bytes = next.sent_body_bytes;
+        self.outbound_prefix_fingerprints = next.outbound_prefix_fingerprints.clone();
     }
 }
 struct UpstreamSendOutcome {
@@ -333,6 +346,14 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/cache-capabilities/probe",
             post(admin_probe_cache_capabilities),
         )
+        .route(
+            "/admin/response-session-reuse/probe",
+            post(admin_probe_response_session_reuse),
+        )
+        .route(
+            "/admin/responses-websocket/probe",
+            post(admin_probe_responses_websocket),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -389,12 +410,13 @@ async fn admin_cache_capabilities(AxumState(state): AxumState<Arc<AppState>>) ->
 }
 async fn admin_probe_cache_capabilities(
     AxumState(state): AxumState<Arc<AppState>>,
-    headers: HeaderMap,
-    Json(input): Json<ProviderCacheCapabilityProbeInput>,
+    request: Request,
 ) -> Response {
-    if let Err(response) = authorize_admin(&state, &headers).await {
-        return response;
-    }
+    let input: ProviderCacheCapabilityProbeInput =
+        match authorize_and_parse_admin_json(&state, request).await {
+            Ok(input) => input,
+            Err(response) => return response,
+        };
     match probe_and_record_provider_cache_capabilities(
         &state,
         input.provider_id.trim(),
@@ -407,6 +429,72 @@ async fn admin_probe_cache_capabilities(
         Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
     }
 }
+
+async fn admin_probe_response_session_reuse(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let input: ResponseSessionReuseProbeHttpInput =
+        match authorize_and_parse_admin_json(&state, request).await {
+            Ok(input) => input,
+            Err(response) => return response,
+        };
+    match probe_and_record_provider_response_session_reuse(
+        &state,
+        input.provider_id.trim(),
+        input.model_id.trim(),
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    }
+}
+
+async fn admin_probe_responses_websocket(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    let input: ResponseSessionReuseProbeHttpInput =
+        match authorize_and_parse_admin_json(&state, request).await {
+            Ok(input) => input,
+            Err(response) => return response,
+        };
+    match probe_provider_responses_websocket(
+        &state,
+        input.provider_id.trim(),
+        input.model_id.trim(),
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
+    }
+}
+
+async fn authorize_and_parse_admin_json<T: DeserializeOwned>(
+    state: &AppState,
+    request: Request,
+) -> Result<T, Response> {
+    if let Err(response) = authorize_admin(state, request.headers()).await {
+        return Err(response);
+    }
+    let bytes = to_bytes(request.into_body(), ADMIN_PROBE_BODY_LIMIT)
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "admin probe body exceeds the 16 KiB limit",
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON body: {err}"),
+        )
+    })
+}
+
 async fn list_models(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
     list_models_for_agent(state, headers, None).await
 }
@@ -1117,6 +1205,9 @@ async fn handle_responses_compact_for_agent(
         cache_key: None,
         provider_prefix_key,
         provider_prefix_fingerprint,
+        outbound_prefix_fingerprints: upstream_request_diagnostics
+            .outbound_prefix_fingerprints
+            .clone(),
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
@@ -3834,6 +3925,9 @@ async fn run_generation_for_authorized_agent(
             .then(|| metrics_cache_key.clone()),
         provider_prefix_key: provider_prefix_key.clone(),
         provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
+        outbound_prefix_fingerprints: upstream_request_diagnostics
+            .outbound_prefix_fingerprints
+            .clone(),
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
@@ -8374,6 +8468,9 @@ async fn record_upstream_response_observation(
             cache_key: cache_key.map(ToOwned::to_owned),
             provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
             provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
+            outbound_prefix_fingerprints: upstream_request_diagnostics
+                .outbound_prefix_fingerprints
+                .clone(),
             provider_cache_diagnostic: None,
             shadow_affinity_mode: None,
             shadow_affinity_arm: None,
@@ -8599,6 +8696,10 @@ fn upstream_transport_failure_log(
         cache_key: cache_key.map(ToOwned::to_owned),
         provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
         provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
+        outbound_prefix_fingerprints: maybe_responses_wire_prefix_fingerprints(
+            upstream_channel,
+            body,
+        ),
         provider_cache_diagnostic: None,
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
@@ -8793,6 +8894,7 @@ async fn cache_hit_response(
                 cache_key: Some(cache_key),
                 provider_prefix_key: None,
                 provider_prefix_fingerprint: None,
+                outbound_prefix_fingerprints: None,
                 provider_cache_diagnostic: Some("local-replay".to_string()),
                 shadow_affinity_mode: None,
                 shadow_affinity_arm: None,
@@ -10180,6 +10282,110 @@ pub(crate) async fn probe_provider_response_session_reuse(
     }
 }
 
+pub(crate) async fn probe_provider_responses_websocket(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<responses_websocket_probe::ResponsesWebSocketProbeResult> {
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err(anyhow!(
+            "provider and actual upstream model are required for WebSocket verification"
+        ));
+    }
+    let provider = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?
+    };
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    let selected_key = select_provider_api_key(state, provider_id, None, None).await?;
+    if selected_key.secret.trim().is_empty() {
+        return Err(anyhow!("provider API key is not configured"));
+    }
+
+    Ok(responses_websocket_probe::probe_responses_websocket(
+        responses_websocket_probe::ResponsesWebSocketProbeTarget {
+            provider_id: provider.id.clone(),
+            model_id: model_id.to_string(),
+            responses_url: upstream_url(&provider.base_url, &Channel::Responses),
+            api_key: selected_key.secret,
+            use_system_proxy: provider.use_system_proxy,
+            custom_user_agent: provider.custom_user_agent.clone(),
+        },
+    )
+    .await)
+}
+
+pub(crate) async fn probe_and_record_provider_response_session_reuse(
+    state: &AppState,
+    provider_id: &str,
+    model_id: &str,
+) -> Result<ProviderResponseSessionReuseProbeResult> {
+    let provider_id = provider_id.trim();
+    let model_id = model_id.trim();
+    if provider_id.is_empty() || model_id.is_empty() {
+        return Err(anyhow!(
+            "provider and actual upstream model are required for verification"
+        ));
+    }
+    let (probe_target, probe_record_snapshot) = {
+        let config = state.config.read().await;
+        (
+            config
+                .response_session_reuse_probe_target(provider_id)
+                .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?,
+            config.response_session_reuse_record_snapshot(provider_id, model_id),
+        )
+    };
+
+    let mut result = match probe_provider_response_session_reuse(state, provider_id, model_id).await
+    {
+        Ok(result) => result,
+        Err(err) => response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            ProviderResponseSessionReuseStatus::Error,
+            err.to_string(),
+            None,
+            None,
+        ),
+    };
+
+    let mut config = state.config.write().await;
+    if config
+        .response_session_reuse_probe_target(provider_id)
+        .as_ref()
+        != Some(&probe_target)
+        || config.response_session_reuse_record_snapshot(provider_id, model_id)
+            != probe_record_snapshot
+    {
+        result.status = ProviderResponseSessionReuseStatus::Error;
+        result.enabled = false;
+        result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
+            .to_string();
+        result.checked_at = Some(Utc::now());
+        return Ok(result);
+    }
+    config.record_response_session_reuse_probe(
+        provider_id,
+        model_id,
+        result.status.clone(),
+        (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
+            .then(|| result.message.clone()),
+    );
+    config.save(&state.config_path)?;
+    result.checked_at = Some(Utc::now());
+    Ok(result)
+}
+
 async fn send_response_session_reuse_probe_request(
     state: &AppState,
     provider: &ProviderConfig,
@@ -10302,7 +10508,7 @@ fn build_upstream_request_headers(
             || name == header::CONTENT_TYPE
             || name == header::CONTENT_ENCODING
             || name == header::ACCEPT_ENCODING
-            || (name == header::USER_AGENT && custom_user_agent.is_some())
+            || name == header::USER_AGENT
         {
             continue;
         }
@@ -10319,13 +10525,12 @@ fn build_upstream_request_headers(
     if let Ok(value) = HeaderValue::from_str(api_key) {
         outbound.insert("x-api-key", value);
     }
-    if let Some(user_agent) = custom_user_agent
+    let user_agent = custom_user_agent
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        outbound.insert(header::USER_AGENT, user_agent);
-    }
+        .unwrap_or_else(|| HeaderValue::from_static(crate::ATOAPI_USER_AGENT));
+    outbound.insert(header::USER_AGENT, user_agent);
     if stream {
         outbound.insert(
             header::ACCEPT,
@@ -10388,6 +10593,7 @@ fn upstream_header_is_blocked(name: &str) -> bool {
             | "b3"
             | "traceparent"
             | "tracestate"
+            | X_CODEX_TURN_METADATA_HEADER
     ) || name.starts_with("x-forwarded-")
         || name.starts_with("cf-")
         || name.starts_with("x-b3-")
@@ -10416,6 +10622,7 @@ async fn send_upstream_request_to_url_with_diagnostics(
             .clamp(1, MAX_ATTEMPTS)
     };
     let body_encode_started = Instant::now();
+    let outbound_prefix_fingerprints = maybe_responses_wire_prefix_fingerprints(channel, body);
     let original_body = upstream_request_body_bytes(channel, body);
     let request_body_encode_ms = body_encode_started.elapsed().as_millis() as u64;
     let original_body_len = original_body.len() as u64;
@@ -10450,6 +10657,7 @@ async fn send_upstream_request_to_url_with_diagnostics(
             .as_ref()
             .map(|body| body.len() as u64)
             .unwrap_or(original_body_len),
+        outbound_prefix_fingerprints,
         ..UpstreamRequestDiagnostics::default()
     };
     let mut gzip_disabled_after_fallback = false;
@@ -10643,6 +10851,176 @@ fn upstream_retry_delay(
 
 fn network_retry_delay(attempt: usize) -> TokioDuration {
     TokioDuration::from_millis(350 * (attempt as u64 + 1))
+}
+
+fn responses_wire_prefix_fingerprints(
+    channel: &Channel,
+    body: &Value,
+) -> Option<ResponsesWirePrefixFingerprints> {
+    if !matches!(channel, Channel::Responses) {
+        return None;
+    }
+
+    let pre_input_wire = responses_wire_pre_input(body);
+    let input = body.get("input").cloned().unwrap_or(Value::Null);
+    let (input_history, input_full, input_item_count, input_prefixes) =
+        responses_wire_input_fingerprints(&input);
+
+    Some(ResponsesWirePrefixFingerprints {
+        version: 2,
+        cache_metadata: truncated_wire_segment_hash(
+            "cache_metadata",
+            responses_wire_selected_members(
+                body,
+                &[
+                    "prompt_cache_key",
+                    "prompt_cache_retention",
+                    "prompt_cache_options",
+                ],
+            )
+            .as_bytes(),
+        ),
+        instructions: truncated_wire_segment_hash(
+            "instructions",
+            responses_wire_selected_members(body, &["instructions"]).as_bytes(),
+        ),
+        tools_schema: truncated_wire_segment_hash(
+            "tools_schema",
+            responses_wire_selected_members(
+                body,
+                &[
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                    "text",
+                    "response_format",
+                ],
+            )
+            .as_bytes(),
+        ),
+        input_history,
+        input_full,
+        input_item_count,
+        input_prefixes,
+        pre_input_wire: truncated_wire_segment_hash("pre_input_wire", pre_input_wire.as_bytes()),
+    })
+}
+
+fn maybe_responses_wire_prefix_fingerprints(
+    channel: &Channel,
+    body: &Value,
+) -> Option<ResponsesWirePrefixFingerprints> {
+    if !prefix_diagnostics_enabled() {
+        return None;
+    }
+    responses_wire_prefix_fingerprints(channel, body)
+}
+
+fn prefix_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(PREFIX_DIAGNOSTICS_ENV)
+            .ok()
+            .is_some_and(|value| prefix_diagnostics_enabled_value(Some(&value)))
+    })
+}
+
+fn prefix_diagnostics_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+fn responses_wire_input_fingerprints(input: &Value) -> (String, String, u64, Vec<String>) {
+    const PREFIX_WINDOW: usize = 32;
+
+    let Value::Array(items) = input else {
+        return (
+            truncated_wire_segment_hash("input", b"null"),
+            truncated_wire_segment_hash(
+                "input",
+                serde_json::to_string(input)
+                    .unwrap_or_else(|_| "null".to_string())
+                    .as_bytes(),
+            ),
+            0,
+            Vec::new(),
+        );
+    };
+
+    let mut hasher = wire_segment_hasher("input");
+    hasher.update(b"[");
+    let mut prefixes = Vec::with_capacity(items.len().min(PREFIX_WINDOW));
+    for (index, item) in items.iter().enumerate() {
+        let mut prefix_hasher = hasher.clone();
+        prefix_hasher.update(b"]");
+        if prefixes.len() == PREFIX_WINDOW {
+            prefixes.remove(0);
+        }
+        prefixes.push(truncated_wire_segment_digest(prefix_hasher));
+        if index > 0 {
+            hasher.update(b",");
+        }
+        hasher.update(serde_json::to_vec(item).unwrap_or_else(|_| b"null".to_vec()));
+    }
+    hasher.update(b"]");
+    let input_full = truncated_wire_segment_digest(hasher);
+    let input_history = prefixes
+        .last()
+        .cloned()
+        .unwrap_or_else(|| input_full.clone());
+    (input_history, input_full, items.len() as u64, prefixes)
+}
+
+fn responses_wire_selected_members(body: &Value, keys: &[&str]) -> String {
+    let Some(object) = body.as_object() else {
+        return "null".to_string();
+    };
+    let members = keys
+        .iter()
+        .filter_map(|key| object.get(*key).map(|value| format_json_member(key, value)))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", members.join(","))
+}
+
+fn responses_wire_pre_input(body: &Value) -> String {
+    let Some(object) = body.as_object() else {
+        return "null".to_string();
+    };
+    let members = [
+        "model",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+    ]
+    .iter()
+    .filter_map(|key| object.get(*key).map(|value| format_json_member(key, value)))
+    .collect::<Vec<_>>();
+    let mut prefix = format!("{{{}", members.join(","));
+    if object.contains_key("input") && !members.is_empty() {
+        prefix.push(',');
+    }
+    prefix
+}
+
+fn truncated_wire_segment_hash(label: &str, bytes: &[u8]) -> String {
+    let mut hasher = wire_segment_hasher(label);
+    hasher.update(bytes);
+    truncated_wire_segment_digest(hasher)
+}
+
+fn wire_segment_hasher(label: &str) -> Sha256 {
+    let mut hasher = Sha256::new();
+    hasher.update(label.as_bytes());
+    hasher.update(b"\0");
+    hasher
+}
+
+fn truncated_wire_segment_digest(hasher: Sha256) -> String {
+    let digest = format!("{:x}", hasher.finalize());
+    format!("sha256-128:{}", &digest[..32])
 }
 
 fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
@@ -11129,6 +11507,9 @@ async fn stream_upstream(
             },
             provider_prefix_key: provider_prefix_key.clone(),
             provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
+            outbound_prefix_fingerprints: upstream_request_diagnostics
+                .outbound_prefix_fingerprints
+                .clone(),
             provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
             shadow_affinity_mode: None,
             shadow_affinity_arm: None,
@@ -14888,10 +15269,7 @@ fn normalize_usage(value: Option<&Value>) -> Option<Value> {
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_u64);
-    let cached_tokens = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .or_else(|| usage.get("cache_read_input_tokens"))
-        .and_then(Value::as_u64);
+    let cached_tokens = provider_cached_tokens(usage);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_u64)
@@ -14912,6 +15290,10 @@ fn normalize_usage(value: Option<&Value>) -> Option<Value> {
     }
     if let Some(value) = cached_tokens {
         object.insert("cached_tokens".to_string(), Value::Number(value.into()));
+        object.insert(
+            "input_tokens_details".to_string(),
+            json!({ "cached_tokens": value }),
+        );
     }
     if object.is_empty() {
         None
@@ -15233,13 +15615,7 @@ fn provider_usage_from_value(value: &Value) -> UsageRecord {
         .or_else(|| usage.and_then(|usage| usage.get("prompt_tokens")))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let cached_tokens = usage
-        .and_then(|usage| usage.pointer("/prompt_tokens_details/cached_tokens"))
-        .or_else(|| usage.and_then(|usage| usage.pointer("/input_tokens_details/cached_tokens")))
-        .or_else(|| usage.and_then(|usage| usage.get("cache_read_input_tokens")))
-        .or_else(|| usage.and_then(|usage| usage.get("cached_input_tokens")))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let cached_tokens = usage.and_then(provider_cached_tokens).unwrap_or(0);
     let output_tokens = usage
         .and_then(|usage| usage.get("output_tokens"))
         .or_else(|| usage.and_then(|usage| usage.get("completion_tokens")))
@@ -15265,6 +15641,19 @@ fn provider_usage_from_value(value: &Value) -> UsageRecord {
         cache_read_tokens: cached_tokens,
         cache_creation_tokens,
     }
+}
+
+fn provider_cached_tokens(usage: &Value) -> Option<u64> {
+    [
+        usage.pointer("/prompt_tokens_details/cached_tokens"),
+        usage.pointer("/input_tokens_details/cached_tokens"),
+        usage.get("cache_read_input_tokens"),
+        usage.get("cached_input_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_u64)
+    .max()
 }
 
 fn raw_response(status: u16, content_type: &str, body: Vec<u8>) -> Response {
@@ -15334,6 +15723,28 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn admin_probe_request(provider_id: &str, model_id: &str, local_key: Option<&str>) -> Request {
+        admin_request_with_body(
+            json!({ "provider_id": provider_id, "model_id": model_id }).to_string(),
+            local_key,
+        )
+    }
+
+    fn admin_request_with_body(body: String, local_key: Option<&str>) -> Request {
+        let mut request = Request::new(Body::from(body));
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        if let Some(local_key) = local_key {
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {local_key}")).unwrap(),
+            );
+        }
+        request
     }
 
     async fn stream_test_response(
@@ -16762,6 +17173,12 @@ mod tests {
         );
         inbound.insert("openai-beta", HeaderValue::from_static("responses=v1"));
         inbound.insert("x-openai-client-version", HeaderValue::from_static("1.2.3"));
+        inbound.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"compaction"}"#,
+            ),
+        );
 
         let outbound = build_upstream_request_headers(
             &inbound,
@@ -16788,7 +17205,7 @@ mod tests {
             outbound
                 .get(header::USER_AGENT)
                 .and_then(|value| value.to_str().ok()),
-            Some("codex-desktop/1.2.3")
+            Some(crate::ATOAPI_USER_AGENT)
         );
         assert_eq!(
             outbound
@@ -16820,12 +17237,53 @@ mod tests {
             header::CONNECTION.as_str(),
             "x-request-id",
             "traceparent",
+            X_CODEX_TURN_METADATA_HEADER,
         ] {
             assert!(
                 outbound.get(blocked).is_none(),
                 "{blocked} must not be forwarded"
             );
         }
+    }
+
+    #[test]
+    fn default_upstream_user_agent_identifies_atoapi_without_changing_cache_identity() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "stable-session-key",
+            "instructions": "stable system context",
+            "input": [{ "type": "message", "role": "user", "content": "continue" }]
+        });
+        let cache_identity = provider_prefix_fingerprint(&body, &Channel::Responses);
+        let mut codex_headers = HeaderMap::new();
+        codex_headers.insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("Codex Desktop/0.144.0-alpha.4"),
+        );
+
+        let outbound = build_upstream_request_headers(
+            &codex_headers,
+            "real-upstream-key",
+            &Channel::Responses,
+            true,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            outbound
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::ATOAPI_USER_AGENT)
+        );
+        assert_eq!(
+            crate::ATOAPI_USER_AGENT,
+            concat!("Atoapi/", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(
+            provider_prefix_fingerprint(&body, &Channel::Responses),
+            cache_identity
+        );
     }
 
     #[test]
@@ -20034,6 +20492,230 @@ mod tests {
     }
 
     #[test]
+    fn responses_compaction_wire_preserves_existing_prefix_across_model_families() {
+        for model in [
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.5",
+            "gpt-5.5-codex",
+            "claude-sonnet-4.5",
+        ] {
+            let baseline = json!({
+                "model": model,
+                "prompt_cache_key": "stable-session-key",
+                "prompt_cache_retention": "24h",
+                "instructions": "stable system context",
+                "tools": [{ "type": "function", "name": "read_file" }],
+                "input": [
+                    { "type": "message", "role": "user", "content": "long stable history" },
+                    { "type": "message", "role": "user", "content": "continue" }
+                ],
+                "reasoning": { "effort": "high" },
+                "stream": true
+            });
+            let mut compaction = baseline.clone();
+            compaction
+                .get_mut("input")
+                .and_then(Value::as_array_mut)
+                .expect("Responses input must be an array")
+                .push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "summarize for the next turn"
+                }));
+
+            let baseline_wire = upstream_request_body_bytes(&Channel::Responses, &baseline);
+            let compaction_wire = upstream_request_body_bytes(&Channel::Responses, &compaction);
+            let shared_bytes = baseline_wire
+                .iter()
+                .zip(&compaction_wire)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let baseline_text = String::from_utf8(baseline_wire).expect("wire JSON must be UTF-8");
+            let existing_input_end = baseline_text
+                .find("],\"reasoning\"")
+                .expect("ordered Responses wire must place reasoning after input");
+
+            assert_eq!(
+                shared_bytes, existing_input_end,
+                "{model} must preserve every existing wire byte until the new input tail"
+            );
+            assert_eq!(
+                &baseline_text[..shared_bytes],
+                String::from_utf8_lossy(&compaction_wire[..shared_bytes]),
+                "{model} must use the same Responses wire prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_wire_prefix_fingerprints_track_final_prefix_segments_across_models() {
+        for model in ["gpt-5.6-luna", "gpt-5.5-codex", "claude-sonnet-4.5"] {
+            let first = json!({
+                "model": model,
+                "prompt_cache_key": "stable-session-key",
+                "prompt_cache_retention": "24h",
+                "instructions": "stable system context",
+                "tools": [{
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": { "type": "object", "properties": {} }
+                }],
+                "input": [
+                    { "type": "message", "role": "user", "content": "stable history" },
+                    { "type": "message", "role": "user", "content": "first follow-up" }
+                ],
+                "stream": true
+            });
+            let mut second = first.clone();
+            second
+                .get_mut("input")
+                .and_then(Value::as_array_mut)
+                .expect("Responses input must be an array")
+                .push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "second follow-up"
+                }));
+
+            let first_hashes = responses_wire_prefix_fingerprints(&Channel::Responses, &first)
+                .expect("Responses requests have wire diagnostics");
+            let second_hashes = responses_wire_prefix_fingerprints(&Channel::Responses, &second)
+                .expect("Responses requests have wire diagnostics");
+
+            assert_eq!(first_hashes.version, 2);
+            assert_eq!(first_hashes.cache_metadata, second_hashes.cache_metadata);
+            assert_eq!(first_hashes.instructions, second_hashes.instructions);
+            assert_eq!(first_hashes.tools_schema, second_hashes.tools_schema);
+            assert_eq!(first_hashes.pre_input_wire, second_hashes.pre_input_wire);
+            assert_eq!(first_hashes.input_full, second_hashes.input_history);
+            assert!(second_hashes
+                .input_prefixes
+                .contains(&first_hashes.input_full));
+            assert_ne!(first_hashes.input_full, second_hashes.input_full);
+            for hash in [
+                &first_hashes.cache_metadata,
+                &first_hashes.instructions,
+                &first_hashes.tools_schema,
+                &first_hashes.input_history,
+                &first_hashes.input_full,
+                &first_hashes.pre_input_wire,
+            ] {
+                assert!(hash.starts_with("sha256-128:"));
+                assert!(!hash.contains("stable history"));
+            }
+
+            let mut multiple_new_items = first.clone();
+            multiple_new_items
+                .get_mut("input")
+                .and_then(Value::as_array_mut)
+                .expect("Responses input must be an array")
+                .extend([
+                    json!({ "type": "message", "role": "assistant", "content": "tool call" }),
+                    json!({ "type": "function_call_output", "output": "tool result" }),
+                ]);
+            let multiple_hashes =
+                responses_wire_prefix_fingerprints(&Channel::Responses, &multiple_new_items)
+                    .expect("Responses requests have wire diagnostics");
+            assert!(multiple_hashes
+                .input_prefixes
+                .contains(&first_hashes.input_full));
+        }
+
+        assert!(responses_wire_prefix_fingerprints(&Channel::Chat, &json!({})).is_none());
+    }
+
+    #[test]
+    fn prefix_diagnostics_require_an_explicit_process_opt_in() {
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off")] {
+            assert!(!prefix_diagnostics_enabled_value(disabled));
+        }
+        for enabled in [Some("1"), Some("true"), Some("on"), Some("enabled")] {
+            assert!(prefix_diagnostics_enabled_value(enabled));
+        }
+    }
+
+    #[test]
+    fn responses_wire_prefix_fingerprints_isolate_cache_instruction_and_tool_drift() {
+        let baseline = json!({
+            "model": "gpt-5.6-luna",
+            "prompt_cache_key": "cache-a",
+            "instructions": "stable instruction",
+            "tools": [{ "type": "function", "name": "read_file" }],
+            "input": [{ "type": "message", "role": "user", "content": "history" }]
+        });
+        let baseline_hashes = responses_wire_prefix_fingerprints(&Channel::Responses, &baseline)
+            .expect("Responses requests have wire diagnostics");
+
+        let mut changed_cache = baseline.clone();
+        changed_cache["prompt_cache_key"] = json!("cache-b");
+        let changed_cache = responses_wire_prefix_fingerprints(&Channel::Responses, &changed_cache)
+            .expect("Responses requests have wire diagnostics");
+        assert_ne!(baseline_hashes.cache_metadata, changed_cache.cache_metadata);
+        assert_eq!(baseline_hashes.instructions, changed_cache.instructions);
+        assert_eq!(baseline_hashes.tools_schema, changed_cache.tools_schema);
+
+        let mut changed_instructions = baseline.clone();
+        changed_instructions["instructions"] = json!("changed instruction");
+        let changed_instructions =
+            responses_wire_prefix_fingerprints(&Channel::Responses, &changed_instructions)
+                .expect("Responses requests have wire diagnostics");
+        assert_eq!(
+            baseline_hashes.cache_metadata,
+            changed_instructions.cache_metadata
+        );
+        assert_ne!(
+            baseline_hashes.instructions,
+            changed_instructions.instructions
+        );
+        assert_eq!(
+            baseline_hashes.tools_schema,
+            changed_instructions.tools_schema
+        );
+
+        let mut changed_tools = baseline;
+        changed_tools["tools"] = json!([{ "type": "function", "name": "write_file" }]);
+        let changed_tools = responses_wire_prefix_fingerprints(&Channel::Responses, &changed_tools)
+            .expect("Responses requests have wire diagnostics");
+        assert_eq!(baseline_hashes.cache_metadata, changed_tools.cache_metadata);
+        assert_eq!(baseline_hashes.instructions, changed_tools.instructions);
+        assert_ne!(baseline_hashes.tools_schema, changed_tools.tools_schema);
+    }
+
+    #[test]
+    fn upstream_request_diagnostics_keep_the_final_attempt_prefix_hashes() {
+        let first_body = json!({
+            "model": "gpt-5.5",
+            "input": [{ "type": "message", "role": "user", "content": "first" }]
+        });
+        let final_body = json!({
+            "model": "gpt-5.5",
+            "input": [{ "type": "message", "role": "user", "content": "final" }]
+        });
+        let mut diagnostics = UpstreamRequestDiagnostics {
+            outbound_prefix_fingerprints: responses_wire_prefix_fingerprints(
+                &Channel::Responses,
+                &first_body,
+            ),
+            ..UpstreamRequestDiagnostics::default()
+        };
+        let final_attempt = UpstreamRequestDiagnostics {
+            outbound_prefix_fingerprints: responses_wire_prefix_fingerprints(
+                &Channel::Responses,
+                &final_body,
+            ),
+            ..UpstreamRequestDiagnostics::default()
+        };
+
+        diagnostics.absorb(&final_attempt);
+
+        assert_eq!(
+            diagnostics.outbound_prefix_fingerprints,
+            final_attempt.outbound_prefix_fingerprints
+        );
+    }
+
+    #[test]
     fn stage2_candidate_wire_changes_only_prompt_cache_key() {
         let mut decision = cache_affinity::ShadowAffinityDecision {
             mode: "shadow".to_string(),
@@ -20953,6 +21635,18 @@ mod tests {
             assignment.lane,
             cache_affinity::ShadowCacheLane::CompactedAnchor
         );
+        let window = shadow_affinity
+            .post_burst
+            .windows
+            .get("trusted-compaction-thread")
+            .unwrap();
+        assert_eq!(window.remaining_requests, 4);
+        assert_eq!(window.captured_requests, 0);
+        assert_eq!(
+            window.lane,
+            cache_affinity::ShadowCacheLane::CompactedAnchor
+        );
+        assert!(shadow_affinity.post_burst.evidence.is_empty());
         drop(shadow_affinity);
         assert_eq!(metrics.recent_requests.len(), 1);
         assert_eq!(metrics.recent_requests[0].cache_status, "compact");
@@ -22375,6 +23069,30 @@ mod tests {
             transform_response_value(&Channel::Responses, "gpt-5.5", &plain_chat_response);
         assert_eq!(transformed["object"], "response");
         assert_eq!(transformed["output_text"], "summary");
+        assert_eq!(transformed["usage"]["cached_tokens"], 8);
+        assert_eq!(
+            transformed["usage"]["input_tokens_details"]["cached_tokens"],
+            8
+        );
+
+        let responses_usage = normalize_usage(Some(&json!({
+            "prompt_tokens": 0,
+            "prompt_tokens_details": {
+                "cached_tokens": 0
+            },
+            "input_tokens": 5_135,
+            "output_tokens": 47,
+            "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 4_608
+            }
+        })))
+        .expect("Responses usage should normalize");
+        assert_eq!(responses_usage["cached_tokens"], 4_608);
+        assert_eq!(
+            responses_usage["input_tokens_details"]["cached_tokens"],
+            4_608
+        );
     }
 
     #[test]
@@ -25834,7 +26552,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn third_party_session_reuse_probe_requires_semantic_continuation() {
+    async fn admin_probe_auth_precedes_json_parsing_and_body_is_bounded() {
+        let mut config = AppConfig::default();
+        config.local_key = "admin-local-key".to_string();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-admin-probe-body-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
+        let oversized_invalid = "x".repeat(ADMIN_PROBE_BODY_LIMIT + 1);
+
+        let unauthorized = admin_probe_response_session_reuse(
+            AxumState(state.clone()),
+            admin_request_with_body(oversized_invalid.clone(), None),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized_oversized = admin_probe_response_session_reuse(
+            AxumState(state.clone()),
+            admin_request_with_body(oversized_invalid, Some("admin-local-key")),
+        )
+        .await;
+        assert_eq!(authorized_oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let authorized_invalid = admin_probe_response_session_reuse(
+            AxumState(state),
+            admin_request_with_body("not-json".to_string(), Some("admin-local-key")),
+        )
+        .await;
+        assert_eq!(authorized_invalid.status(), StatusCode::BAD_REQUEST);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn response_session_reuse_admin_probe_requires_auth_and_semantic_continuation() {
         let hits = Arc::new(AtomicUsize::new(0));
         let nonce = Arc::new(tokio::sync::Mutex::new(String::new()));
         let hits_for_route = hits.clone();
@@ -25885,21 +26638,110 @@ mod tests {
         });
 
         let mut config = AppConfig::default();
+        config.local_key = "admin-local-key".to_string();
         let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "probe-provider".to_string();
         config.providers = vec![provider];
         let dir =
             std::env::temp_dir().join(format!("atoapi-session-probe-{}", Uuid::new_v4().simple()));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
 
-        let result = probe_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
+        let unauthorized = admin_probe_response_session_reuse(
+            AxumState(state.clone()),
+            admin_probe_request("probe-provider", "gpt-5.5", None),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let response = admin_probe_response_session_reuse(
+            AxumState(state.clone()),
+            admin_probe_request("probe-provider", "gpt-5.5", Some("admin-local-key")),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-
+        let result: ProviderResponseSessionReuseProbeResult =
+            serde_json::from_slice(&response_body).unwrap();
         assert_eq!(result.status, ProviderResponseSessionReuseStatus::Verified);
         assert!(result.enabled);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(state
+            .config
+            .read()
+            .await
+            .response_session_reuse_verified_for("probe-provider", "gpt-5.5"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_websocket_admin_probe_requires_auth_before_handshake() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            get(move || {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "admin-local-key".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "websocket-probe-provider".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-websocket-admin-probe-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
+        let input = || ResponseSessionReuseProbeHttpInput {
+            provider_id: "websocket-probe-provider".to_string(),
+            model_id: "gpt-5.6-luna".to_string(),
+        };
+
+        let unauthorized = admin_probe_responses_websocket(
+            AxumState(state.clone()),
+            admin_probe_request(&input().provider_id, &input().model_id, None),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let response = admin_probe_responses_websocket(
+            AxumState(state),
+            admin_probe_request(
+                &input().provider_id,
+                &input().model_id,
+                Some("admin-local-key"),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let result: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(result["status"], "unsupported");
+        assert_eq!(result["connection_attempts"], 1);
+        assert_eq!(result["messages_sent"], 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        server.abort();
+        let _ = server.await;
         fs::remove_dir_all(dir).ok();
     }
 
@@ -26257,6 +27099,47 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "sends two explicit semantic continuation requests to the configured real upstream"]
+    async fn live_provider_response_session_reuse_probe() {
+        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
+            .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
+        let model_id =
+            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
+        let state = AppState::load().expect("live-probe config should load");
+
+        let result = probe_provider_response_session_reuse(&state, &provider_id, &model_id)
+            .await
+            .expect("live response-session probe should complete");
+
+        println!(
+            "RESPONSE_SESSION_LIVE_RESULT status={:?} enabled={} first_status={:?} continuation_status={:?}",
+            result.status, result.enabled, result.first_status, result.continuation_status
+        );
+        assert!(result.first_status.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "opens one explicit WebSocket capability probe to the configured real upstream"]
+    async fn live_provider_responses_websocket_probe() {
+        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
+            .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
+        let model_id =
+            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
+        let state = AppState::load().expect("isolated live-probe config should load");
+
+        let result = probe_provider_responses_websocket(&state, &provider_id, &model_id)
+            .await
+            .expect("live WebSocket capability probe should complete");
+
+        println!(
+            "RESPONSES_WEBSOCKET_LIVE_RESULT {}",
+            serde_json::to_string(&result).expect("probe result should serialize")
+        );
+        assert_eq!(result.connection_attempts, 1);
+        assert!(result.messages_sent <= 2);
+    }
+
+    #[tokio::test]
     async fn third_party_session_reuse_probe_rejects_nonsemantic_continuation() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_route = hits.clone();
@@ -26296,17 +27179,31 @@ mod tests {
         let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "probe-provider-nonsemantic".to_string();
         config.providers = vec![provider];
+        config.record_response_session_reuse_probe(
+            "probe-provider-nonsemantic",
+            "gpt-5.5",
+            ProviderResponseSessionReuseStatus::Verified,
+            None,
+        );
         let dir = std::env::temp_dir().join(format!(
             "atoapi-session-probe-nonsemantic-{}",
             Uuid::new_v4().simple()
         ));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        assert!(state
+            .config
+            .read()
+            .await
+            .response_session_reuse_verified_for("probe-provider-nonsemantic", "gpt-5.5"));
 
-        let result =
-            probe_provider_response_session_reuse(&state, "probe-provider-nonsemantic", "gpt-5.5")
-                .await
-                .unwrap();
+        let result = probe_and_record_provider_response_session_reuse(
+            &state,
+            "probe-provider-nonsemantic",
+            "gpt-5.5",
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             result.status,
@@ -26314,6 +27211,11 @@ mod tests {
         );
         assert!(!result.enabled);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(!state
+            .config
+            .read()
+            .await
+            .response_session_reuse_verified_for("probe-provider-nonsemantic", "gpt-5.5"));
         fs::remove_dir_all(dir).ok();
     }
 

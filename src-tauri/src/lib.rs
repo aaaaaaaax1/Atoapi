@@ -8,6 +8,8 @@ mod metrics;
 mod proxy;
 mod state;
 
+pub(crate) const ATOAPI_USER_AGENT: &str = concat!("Atoapi/", env!("CARGO_PKG_VERSION"));
+
 use admin::{
     add_or_update_model, add_or_update_provider, apply_agent_injection,
     apply_enabled_agent_injections, clear_cache, clone_provider_for_agent, delete_model,

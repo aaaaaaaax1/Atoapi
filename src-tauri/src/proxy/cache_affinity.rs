@@ -14,6 +14,7 @@ pub(super) const STATIC_COHORT_CANARY_PERCENT: u8 = 5;
 const AUTOMATIC_STATIC_COHORT_ADMISSION_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
 const GIANT_TAIL_CHARS: u64 = 80_000;
 const POST_BURST_FOLLOWUP_REQUESTS: u8 = 3;
+const POST_COMPACTION_FOLLOWUP_REQUESTS: u8 = 4;
 const POST_BURST_WINDOW_TTL_HOURS: i64 = 4;
 const POST_BURST_EVIDENCE_TTL_HOURS: i64 = 24;
 const POST_BURST_WINDOW_LIMIT: usize = 512;
@@ -91,6 +92,12 @@ pub(crate) struct PostBurstWindow {
     pub(crate) expires_at: DateTime<Utc>,
     pub(crate) remaining_requests: u8,
     pub(crate) captured_requests: u8,
+    #[serde(default = "default_post_burst_window_lane")]
+    pub(crate) lane: ShadowCacheLane,
+}
+
+fn default_post_burst_window_lane() -> ShadowCacheLane {
+    ShadowCacheLane::ToolBurstQuarantine
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +126,27 @@ pub(crate) struct PostBurstEvidence {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub(crate) struct PostBurstPhaseSummary {
+    pub(crate) observations: u64,
+    pub(crate) successful_observations: u64,
+    pub(crate) usage_observations: u64,
+    pub(crate) applied_observations: u64,
+    pub(crate) multi_attempt_observations: u64,
+    pub(crate) provider_unstable_observations: u64,
+    pub(crate) success_rate_bps: u64,
+    pub(crate) usage_coverage_bps: u64,
+    pub(crate) cache_ratio_bps: u64,
+    pub(crate) average_input_tokens: u64,
+    pub(crate) average_avoidable_gap_tokens: u64,
+    pub(crate) average_provider_unstable_gap_tokens: u64,
+    pub(crate) provider_unstable_ratio_bps: u64,
+    pub(crate) average_ttft_ms: u64,
+    pub(crate) ttft_p50_ms: u64,
+    pub(crate) ttft_p95_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub(crate) struct PostBurstArmSummary {
     pub(crate) observations: u64,
     pub(crate) successful_observations: u64,
@@ -136,6 +164,8 @@ pub(crate) struct PostBurstArmSummary {
     pub(crate) average_ttft_ms: u64,
     pub(crate) ttft_p50_ms: u64,
     pub(crate) ttft_p95_ms: u64,
+    pub(crate) first_followup: PostBurstPhaseSummary,
+    pub(crate) stable_followups: PostBurstPhaseSummary,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,7 +328,46 @@ fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime
 fn summarize_post_burst_arm<'a>(
     observations: impl Iterator<Item = &'a PostBurstEvidence>,
 ) -> PostBurstArmSummary {
-    let mut summary = PostBurstArmSummary::default();
+    let observations = observations.collect::<Vec<_>>();
+    let aggregate = summarize_post_burst_phase(observations.iter().copied());
+    let first_followup = summarize_post_burst_phase(
+        observations
+            .iter()
+            .copied()
+            .filter(|observation| observation.followup_index == 1),
+    );
+    let stable_followups = summarize_post_burst_phase(
+        observations
+            .iter()
+            .copied()
+            .filter(|observation| observation.followup_index > 1),
+    );
+    PostBurstArmSummary {
+        observations: aggregate.observations,
+        successful_observations: aggregate.successful_observations,
+        usage_observations: aggregate.usage_observations,
+        applied_observations: aggregate.applied_observations,
+        multi_attempt_observations: aggregate.multi_attempt_observations,
+        provider_unstable_observations: aggregate.provider_unstable_observations,
+        success_rate_bps: aggregate.success_rate_bps,
+        usage_coverage_bps: aggregate.usage_coverage_bps,
+        cache_ratio_bps: aggregate.cache_ratio_bps,
+        average_input_tokens: aggregate.average_input_tokens,
+        average_avoidable_gap_tokens: aggregate.average_avoidable_gap_tokens,
+        average_provider_unstable_gap_tokens: aggregate.average_provider_unstable_gap_tokens,
+        provider_unstable_ratio_bps: aggregate.provider_unstable_ratio_bps,
+        average_ttft_ms: aggregate.average_ttft_ms,
+        ttft_p50_ms: aggregate.ttft_p50_ms,
+        ttft_p95_ms: aggregate.ttft_p95_ms,
+        first_followup,
+        stable_followups,
+    }
+}
+
+fn summarize_post_burst_phase<'a>(
+    observations: impl Iterator<Item = &'a PostBurstEvidence>,
+) -> PostBurstPhaseSummary {
+    let mut summary = PostBurstPhaseSummary::default();
     let mut input_tokens = 0_u64;
     let mut cache_read_tokens = 0_u64;
     let mut avoidable_gap_tokens = 0_u64;
@@ -653,23 +722,28 @@ fn observe_post_burst_evidence(
         return;
     };
 
-    let captured = ledger.windows.get_mut(conversation_id).map(|window| {
-        window.captured_requests = window.captured_requests.saturating_add(1);
-        window.remaining_requests = window.remaining_requests.saturating_sub(1);
-        (
-            window.window_id,
-            window.captured_requests,
-            window.remaining_requests == 0,
-        )
-    });
-    if let Some((window_id, followup_index, finished)) = captured {
+    let captured = (!input.compaction_boundary)
+        .then(|| {
+            ledger.windows.get_mut(conversation_id).map(|window| {
+                window.captured_requests = window.captured_requests.saturating_add(1);
+                window.remaining_requests = window.remaining_requests.saturating_sub(1);
+                (
+                    window.window_id,
+                    window.captured_requests,
+                    window.remaining_requests == 0,
+                    window.lane,
+                )
+            })
+        })
+        .flatten();
+    if let Some((window_id, followup_index, finished, evidence_lane)) = captured {
         ledger.evidence.push_back(PostBurstEvidence {
             window_id,
             conversation_id: conversation_id.to_string(),
             observed_at: now,
             followup_index,
             realm_id: decision.realm_id.clone(),
-            lane: decision.lane,
+            lane: evidence_lane,
             arm: decision.arm,
             policy_epoch: decision.policy_epoch,
             anchor_epoch: decision.anchor_epoch,
@@ -692,7 +766,7 @@ fn observe_post_burst_evidence(
         while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
             ledger.evidence.pop_front();
         }
-        refresh_post_burst_readiness(ledger, &decision.realm_id, decision.lane, now);
+        refresh_post_burst_readiness(ledger, &decision.realm_id, evidence_lane, now);
     }
 
     if input.giant_tail {
@@ -706,6 +780,7 @@ fn observe_post_burst_evidence(
                 expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
                 remaining_requests: POST_BURST_FOLLOWUP_REQUESTS,
                 captured_requests: 0,
+                lane: ShadowCacheLane::ToolBurstQuarantine,
             },
         );
     }
@@ -809,7 +884,7 @@ pub(super) fn compute_shadow_affinity(
         };
     };
 
-    let (realm_id, cohort_id, lane, arm, shard, policy_epoch, anchor_epoch) = {
+    let (realm_id, cohort_id, assignment_lane, arm, shard, policy_epoch, anchor_epoch) = {
         let assignment = store
             .assignments
             .entry(conversation_id.clone())
@@ -851,6 +926,12 @@ pub(super) fn compute_shadow_affinity(
             assignment.anchor_epoch,
         )
     };
+    let lane = store
+        .post_burst
+        .windows
+        .get(&conversation_id)
+        .map(|window| window.lane)
+        .unwrap_or(assignment_lane);
     evict_assignments(store, now);
     evict_post_burst_evidence(&mut store.post_burst, now);
     let readiness = refresh_post_burst_readiness(&mut store.post_burst, &realm_id, lane, now);
@@ -934,7 +1015,9 @@ fn apply_automatic_static_cohort_canary_with_switch(
     );
     let lane_eligible = matches!(
         decision.lane,
-        ShadowCacheLane::Steady | ShadowCacheLane::ToolBurstQuarantine
+        ShadowCacheLane::Steady
+            | ShadowCacheLane::ToolBurstQuarantine
+            | ShadowCacheLane::CompactedAnchor
     );
     if !smart_hit_enabled
         || !assigned
@@ -1043,10 +1126,28 @@ pub(super) fn reset_anchor(
     conversation_id: &str,
     now: DateTime<Utc>,
 ) {
-    if let Some(assignment) = store.assignments.get_mut(conversation_id) {
+    let opened = if let Some(assignment) = store.assignments.get_mut(conversation_id) {
         assignment.anchor_epoch = assignment.anchor_epoch.saturating_add(1);
         assignment.lane = ShadowCacheLane::CompactedAnchor;
         assignment.last_seen_at = now;
+        true
+    } else {
+        false
+    };
+    if opened {
+        store.post_burst.next_window_id = store.post_burst.next_window_id.saturating_add(1).max(1);
+        store.post_burst.windows.insert(
+            conversation_id.to_string(),
+            PostBurstWindow {
+                window_id: store.post_burst.next_window_id,
+                conversation_id: conversation_id.to_string(),
+                opened_at: now,
+                expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
+                remaining_requests: POST_COMPACTION_FOLLOWUP_REQUESTS,
+                captured_requests: 0,
+                lane: ShadowCacheLane::CompactedAnchor,
+            },
+        );
     }
 }
 
@@ -1184,6 +1285,55 @@ mod tests {
             );
         }
         realm_id
+    }
+
+    fn phase_evidence(
+        followup_index: u8,
+        cache_read_tokens: u64,
+        ttft_ms: u64,
+    ) -> PostBurstEvidence {
+        PostBurstEvidence {
+            window_id: 1,
+            conversation_id: "phase-test".to_string(),
+            observed_at: Utc::now(),
+            followup_index,
+            realm_id: "realm".to_string(),
+            lane: ShadowCacheLane::CompactedAnchor,
+            arm: ShadowAffinityArm::Baseline,
+            policy_epoch: 1,
+            anchor_epoch: 1,
+            success: true,
+            status: 200,
+            has_usage: true,
+            input_tokens: 100_000,
+            cache_read_tokens,
+            cache_ratio_bps: ratio_bps(cache_read_tokens, 100_000),
+            avoidable_gap_tokens: 0,
+            provider_unstable_gap_tokens: 0,
+            ttft_ms,
+            attempt_count: 1,
+            candidate_applied: false,
+        }
+    }
+
+    #[test]
+    fn post_burst_summary_separates_first_cold_followup_from_stable_recovery() {
+        let evidence = [
+            phase_evidence(1, 20_000, 9_000),
+            phase_evidence(2, 90_000, 3_000),
+            phase_evidence(3, 95_000, 2_000),
+        ];
+
+        let summary = summarize_post_burst_arm(evidence.iter());
+
+        assert_eq!(summary.observations, 3);
+        assert_eq!(summary.cache_ratio_bps, 6_833);
+        assert_eq!(summary.first_followup.observations, 1);
+        assert_eq!(summary.first_followup.cache_ratio_bps, 2_000);
+        assert_eq!(summary.first_followup.average_ttft_ms, 9_000);
+        assert_eq!(summary.stable_followups.observations, 2);
+        assert_eq!(summary.stable_followups.cache_ratio_bps, 9_250);
+        assert_eq!(summary.stable_followups.average_ttft_ms, 2_500);
     }
 
     #[test]
@@ -1357,10 +1507,22 @@ mod tests {
         ));
         assert_eq!(smart_cache_disabled.decision, "assigned");
 
-        let mut nonsteady = smart_cache_disabled.clone();
-        nonsteady.lane = ShadowCacheLane::CompactedAnchor;
-        assert!(!apply_automatic_static_cohort_canary(&mut nonsteady, true));
-        assert_eq!(nonsteady.decision, "assigned");
+        let mut compacted = smart_cache_disabled.clone();
+        compacted.lane = ShadowCacheLane::CompactedAnchor;
+        assert!(!apply_automatic_static_cohort_canary(&mut compacted, true));
+        assert_eq!(compacted.decision, "candidate_shadow_only");
+        assert_eq!(
+            compacted.skip_reason.as_deref(),
+            Some("awaiting_efficacy_evidence")
+        );
+
+        let mut transparent = smart_cache_disabled;
+        transparent.lane = ShadowCacheLane::Transparent;
+        assert!(!apply_automatic_static_cohort_canary(
+            &mut transparent,
+            true
+        ));
+        assert_eq!(transparent.decision, "assigned");
     }
 
     #[test]
@@ -1516,6 +1678,103 @@ mod tests {
             store.assignments[&assignment_key].lane,
             ShadowCacheLane::ToolBurstQuarantine
         );
+    }
+
+    #[test]
+    fn compaction_boundary_opens_a_four_request_recovery_window() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let identity = identity("thread-compaction-window");
+        let initial = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
+        let assignment_key = initial.assignment_key.clone().unwrap();
+
+        reset_anchor(&mut store, &assignment_key, now + Duration::seconds(1));
+        assert_eq!(store.post_burst.windows.len(), 1);
+
+        let boundary = compute_shadow_affinity(
+            &mut store,
+            &identity,
+            None,
+            now + Duration::seconds(2),
+            0,
+            0,
+        );
+        observe_shadow_affinity(
+            &mut store,
+            &boundary,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 30_000,
+                cache_read_tokens: 11_000,
+                compaction_boundary: true,
+                ..ShadowObservationInput::default()
+            },
+            now + Duration::seconds(2),
+        );
+        assert!(store.post_burst.evidence.is_empty());
+
+        for index in 1..=4 {
+            let decision = compute_shadow_affinity(
+                &mut store,
+                &identity,
+                None,
+                now + Duration::seconds(index + 2),
+                0,
+                0,
+            );
+            assert_eq!(decision.lane, ShadowCacheLane::CompactedAnchor);
+            observe_shadow_affinity(
+                &mut store,
+                &decision,
+                ShadowObservationInput {
+                    success: true,
+                    has_usage: true,
+                    input_tokens: 30_000 + index as u64 * 100,
+                    cache_read_tokens: 20_000 + index as u64 * 1_000,
+                    ..ShadowObservationInput::default()
+                },
+                now + Duration::seconds(index + 2),
+            );
+        }
+
+        assert!(!store.post_burst.windows.contains_key(&assignment_key));
+        let evidence = store.post_burst.evidence.iter().collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 4);
+        assert!(evidence
+            .iter()
+            .all(|item| item.lane == ShadowCacheLane::CompactedAnchor));
+        assert_eq!(evidence[0].followup_index, 1);
+        assert_eq!(evidence[3].followup_index, 4);
+    }
+
+    #[test]
+    fn automatic_candidate_canary_can_apply_to_compaction_recovery() {
+        let mut decision = ShadowAffinityDecision {
+            mode: "shadow".to_string(),
+            assignment_key: Some("conversation".to_string()),
+            realm_id: "realm".to_string(),
+            cohort_id: "cohort".to_string(),
+            lane: ShadowCacheLane::CompactedAnchor,
+            arm: ShadowAffinityArm::Candidate,
+            shard: 0,
+            policy_epoch: SHADOW_POLICY_EPOCH,
+            anchor_epoch: 1,
+            trusted_identity: true,
+            decision: "assigned".to_string(),
+            skip_reason: None,
+            policy_compute_ms: 0,
+            validation_run_id: None,
+            automatic_canary_status: Some(PostBurstReadinessStatus::ReadyForCanary),
+            automatic_canary_reason: Some("comparable_shadow_evidence_ready".to_string()),
+        };
+
+        assert!(apply_automatic_static_cohort_canary_with_switch(
+            &mut decision,
+            true,
+            true
+        ));
+        assert_eq!(decision.decision, "automatic_candidate_applied");
     }
 
     #[test]
@@ -2391,6 +2650,16 @@ mod tests {
         let restored: ShadowAffinityStore =
             serde_json::from_value(json!({"assignments": {}})).unwrap();
         assert!(restored.post_burst.evidence.is_empty());
+        let restored_window: PostBurstWindow = serde_json::from_value(json!({
+            "window_id": 1,
+            "conversation_id": "legacy-window",
+            "opened_at": Utc::now(),
+            "expires_at": Utc::now() + Duration::hours(1),
+            "remaining_requests": 2,
+            "captured_requests": 1
+        }))
+        .unwrap();
+        assert_eq!(restored_window.lane, ShadowCacheLane::ToolBurstQuarantine);
 
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();

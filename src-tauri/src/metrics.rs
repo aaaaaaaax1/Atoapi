@@ -328,6 +328,19 @@ pub struct BackgroundPrewarmStats {
     pub cache_read_tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponsesWirePrefixFingerprints {
+    pub version: u8,
+    pub cache_metadata: String,
+    pub instructions: String,
+    pub tools_schema: String,
+    pub input_history: String,
+    pub input_full: String,
+    pub input_item_count: u64,
+    pub input_prefixes: Vec<String>,
+    pub pre_input_wire: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     pub id: String,
@@ -369,6 +382,8 @@ pub struct RequestLog {
     pub provider_prefix_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_prefix_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_cache_diagnostic: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1778,6 +1793,7 @@ mod tests {
             cache_key: cache_key.map(ToOwned::to_owned),
             provider_prefix_key: None,
             provider_prefix_fingerprint: None,
+            outbound_prefix_fingerprints: None,
             provider_cache_diagnostic: None,
             shadow_affinity_mode: None,
             shadow_affinity_arm: None,

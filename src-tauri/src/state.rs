@@ -201,7 +201,7 @@ impl AppState {
             runtime_state_path,
             cache,
             metrics: MetricsStore::new(),
-            transport_clients: TransportClients::new("Atoapi/0.1")?,
+            transport_clients: TransportClients::new(crate::ATOAPI_USER_AGENT)?,
             prefix_locks: Mutex::new(HashMap::new()),
             prefix_states: Mutex::new(runtime_state.prefix_states),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
@@ -1068,6 +1068,7 @@ mod tests {
                 expires_at: shadow_now + chrono::Duration::hours(1),
                 remaining_requests: 2,
                 captured_requests: 1,
+                lane: ShadowCacheLane::ToolBurstQuarantine,
             },
         );
         shadow_affinity

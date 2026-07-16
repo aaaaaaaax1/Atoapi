@@ -15,7 +15,7 @@ use crate::{
     codex_ui_patch,
     config::{
         AgentInjectionConfig, AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput,
-        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus, PublicConfig,
+        ProviderResponseSessionReuseProbeResult, PublicConfig,
     },
     metrics::MetricsSnapshot,
     proxy::{
@@ -460,70 +460,13 @@ pub async fn probe_provider_response_session_reuse(
     state: State<'_, Arc<AppState>>,
     input: ProviderResponseSessionReuseProbeInput,
 ) -> CommandResult<ProviderResponseSessionReuseProbeResult> {
-    let provider_id = input.provider_id.trim();
-    let model_id = input.model_id.trim();
-    if provider_id.is_empty() || model_id.is_empty() {
-        return Err("provider and actual upstream model are required for verification".to_string());
-    }
-    let (probe_target, probe_record_snapshot) = {
-        let config = state.config.read().await;
-        if !config
-            .providers
-            .iter()
-            .any(|provider| provider.id == provider_id)
-        {
-            return Err(format!("provider {provider_id} was not found"));
-        }
-        (
-            config
-                .response_session_reuse_probe_target(provider_id)
-                .ok_or_else(|| format!("provider {provider_id} was not found"))?,
-            config.response_session_reuse_record_snapshot(provider_id, model_id),
-        )
-    };
-
-    let mut result =
-        match proxy::probe_provider_response_session_reuse(&state, provider_id, model_id).await {
-            Ok(result) => result,
-            Err(err) => ProviderResponseSessionReuseProbeResult {
-                provider_id: provider_id.to_string(),
-                model_id: model_id.to_string(),
-                status: ProviderResponseSessionReuseStatus::Error,
-                enabled: false,
-                message: err.to_string(),
-                checked_at: Some(Utc::now()),
-                first_status: None,
-                continuation_status: None,
-            },
-        };
-
-    {
-        let mut config = state.config.write().await;
-        if config
-            .response_session_reuse_probe_target(provider_id)
-            .as_ref()
-            != Some(&probe_target)
-            || config.response_session_reuse_record_snapshot(provider_id, model_id)
-                != probe_record_snapshot
-        {
-            result.status = ProviderResponseSessionReuseStatus::Error;
-            result.enabled = false;
-            result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
-                .to_string();
-            result.checked_at = Some(Utc::now());
-            return Ok(result);
-        }
-        config.record_response_session_reuse_probe(
-            provider_id,
-            model_id,
-            result.status.clone(),
-            (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
-                .then(|| result.message.clone()),
-        );
-        config.save(&state.config_path).map_err(to_command_error)?;
-    }
-    result.checked_at = Some(Utc::now());
-    Ok(result)
+    proxy::probe_and_record_provider_response_session_reuse(
+        &state,
+        input.provider_id.trim(),
+        input.model_id.trim(),
+    )
+    .await
+    .map_err(to_command_error)
 }
 
 #[tauri::command]

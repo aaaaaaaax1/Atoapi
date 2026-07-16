@@ -266,6 +266,20 @@ mod tests {
     }
 
     #[test]
+    fn prefers_nonzero_responses_cached_tokens_over_zero_chat_compatibility_field() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            br#"data: {"type":"response.completed","response":{"id":"resp_real_shape","usage":{"prompt_tokens":0,"prompt_tokens_details":{"cached_tokens":0},"input_tokens":11261,"output_tokens":5,"input_tokens_details":{"cached_tokens":10752}}}}"#,
+        );
+        state.ingest(b"\n\n");
+
+        let summary = state.finish();
+        assert_eq!(summary.usage.input_tokens, 11_261);
+        assert_eq!(summary.usage.cache_read_tokens, 10_752);
+        assert_eq!(summary.usage.output_tokens, 5);
+    }
+
+    #[test]
     fn detects_compaction_output_in_output_item_event() {
         let mut state = ResponsesStreamState::default();
         state.ingest(
