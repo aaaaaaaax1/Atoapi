@@ -19,6 +19,7 @@ const runId = String(args["run-id"] ?? randomUUID()).trim();
 const model = String(args.model ?? process.env.ATOAPI_TEST_MODEL ?? "gpt-5.6-luna").trim();
 const mode = String(args.mode ?? "full").trim().toLowerCase();
 const lane = normalizeLane(args.lane ?? "tool_burst_quarantine");
+const candidateVariant = normalizeCandidateVariant(args.candidate ?? "auto");
 const evidencePerWindow = lane === "compacted_anchor" ? 4 : 3;
 const targetSuccessfulPerArm = boundedNumber(
   args["target-successes"] ?? 50,
@@ -33,6 +34,7 @@ const targetInputTokensPerArm = boundedNumber(
 const maxProbes = boundedNumber(args["max-probes"] ?? 120, 2, 2_000);
 const maxProbeFailures = boundedNumber(args["max-probe-failures"] ?? 5, 0, 50);
 const maxExperimentFailures = boundedNumber(args["max-experiment-failures"] ?? 3, 0, 20);
+const interRequestDelayMs = boundedNumber(args["inter-request-delay-ms"] ?? 0, 0, 60_000);
 const toolChars = boundedNumber(args["tool-chars"] ?? 280_000, 80_000, 600_000);
 const stableInstructionChars = boundedNumber(
   args["stable-instruction-chars"] ?? 24_000,
@@ -54,6 +56,13 @@ const maxInputTokens = boundedNumber(
   targetInputTokensPerArm * 2,
   100_000_000
 );
+const longLivedRequests = boundedNumber(args["long-lived-requests"] ?? 50, 10, 200);
+const longLivedToolEvery = boundedNumber(args["long-lived-tool-every"] ?? 10, 0, 50);
+const longLivedToolChars = boundedNumber(
+  args["long-lived-tool-chars"] ?? 12_000,
+  1_024,
+  100_000
+);
 const requestedPort = boundedNumber(args.port ?? 18_885, 1_024, 65_533);
 const keepRunDir = booleanArg(args["keep-run-dir"]);
 const forceCanary = booleanArg(args["force-canary"]);
@@ -63,8 +72,8 @@ const fixedWindows = args["fixed-windows"] === undefined
 
 if (!runId) failUsage("--run-id must not be empty.");
 if (!model) failUsage("Set ATOAPI_TEST_MODEL or pass --model.");
-if (!new Set(["observe", "full"]).has(mode)) {
-  failUsage("--mode must be observe or full.");
+if (!new Set(["observe", "full", "long_lived"]).has(mode)) {
+  failUsage("--mode must be observe, full, or long_lived.");
 }
 if (fixedWindows !== null && mode !== "observe") {
   failUsage("--fixed-windows is diagnostic-only and requires --mode observe.");
@@ -73,6 +82,9 @@ if (forceCanary && mode !== "full") {
   failUsage("--force-canary requires --mode full.");
 }
 if (!lane) failUsage("--lane must be tool_burst_quarantine or compacted_anchor.");
+if (!candidateVariant) {
+  failUsage("--candidate must be auto, cohort_key, cohort_two_shard, or provider_native.");
+}
 if (booleanArg(args["self-test"])) {
   runSelfTest();
   process.exit(0);
@@ -85,6 +97,7 @@ const selectedSessions = { baseline: [], candidate: [] };
 const selected = { baseline: 0, candidate: 0 };
 let requestCount = 0;
 let probeFailures = 0;
+let predictorMismatches = 0;
 let experimentFailures = 0;
 let runtime = null;
 let beforeAffinity = null;
@@ -93,6 +106,7 @@ let canaryWindows = 0;
 let phase = "observe";
 let runError = null;
 let cohortPredictor = null;
+let capabilityProbe = null;
 const stableInstructions = buildStableInstructions(stableInstructionChars);
 
 try {
@@ -100,31 +114,41 @@ try {
     ? await useExternalRuntime()
     : await createIsolatedRuntime(false);
   beforeAffinity = await getJson(`${runtime.baseUrl}/admin/cache-affinity`);
-
-  await findCohortSessions();
-  const observeResult = await collectShadowEvidence();
-  let finalAffinity = observeResult.affinity;
-
-  if (
-    mode === "full" &&
-    (observeResult.readiness?.status === "ready_for_canary" ||
-      (forceCanary &&
-        observeResult.readiness?.status === "canary_healthy" &&
-        observeResult.readiness?.reason === "no_addressable_post_burst_gap"))
-  ) {
-    if (!runtime.managed) {
-      throw new Error(
-        "full mode requires a managed isolated instance so canary admission cannot affect a live proxy"
-      );
-    }
-    await restartIsolatedRuntimeWithCanary();
-    phase = "canary";
-    finalAffinity = await collectCanaryEvidence();
+  if (booleanArg(args["probe-capabilities"])) {
+    capabilityProbe = await probeCapabilities();
   }
 
-  const result = buildResult(finalAffinity);
-  console.log(JSON.stringify(result, null, 2));
-  if (!result.pass) process.exitCode = 1;
+  if (mode === "long_lived") {
+    await runLongLivedSession();
+    const result = buildLongLivedResult();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.pass) process.exitCode = 1;
+  } else {
+    await findCohortSessions();
+    const observeResult = await collectShadowEvidence();
+    let finalAffinity = observeResult.affinity;
+
+    if (
+      mode === "full" &&
+      (observeResult.readiness?.status === "ready_for_canary" ||
+        (forceCanary &&
+          observeResult.readiness?.status === "canary_healthy" &&
+          observeResult.readiness?.reason === "no_addressable_post_burst_gap"))
+    ) {
+      if (!runtime.managed) {
+        throw new Error(
+          "full mode requires a managed isolated instance so canary admission cannot affect a live proxy"
+        );
+      }
+      await restartIsolatedRuntimeWithCanary();
+      phase = "canary";
+      finalAffinity = await collectCanaryEvidence();
+    }
+
+    const result = buildResult(finalAffinity);
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.pass) process.exitCode = 1;
+  }
 } catch (error) {
   runError = error;
   throw error;
@@ -157,6 +181,61 @@ async function useExternalRuntime() {
   };
 }
 
+async function probeCapabilities() {
+  const configPath = join(
+    runtime.configDir ?? configuredSourceConfigDir(),
+    "config.toml"
+  );
+  const configText = await readFile(configPath, "utf8");
+  const providerId = codexProviderId(configText);
+  if (!providerId) {
+    return { ok: false, error: "codex provider id missing from config.toml" };
+  }
+  const response = await fetch(
+    `${runtime.baseUrl}/admin/cache-capabilities/probe`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${runtime.localKey}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        provider_id: providerId,
+        model_id: model,
+        channel: "responses"
+      }),
+      signal: AbortSignal.timeout(180_000)
+    }
+  );
+  const body = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return {
+      ok: false,
+      providerId,
+      model,
+      status: response.status,
+      error: body.slice(0, 400)
+    };
+  }
+  return {
+    ok: response.ok && Number(parsed.errors ?? 0) === 0,
+    providerId,
+    model,
+    status: response.status,
+    fields: (parsed.fields ?? []).map((field) => ({
+      field: field.field,
+      status: field.status,
+      enabled: Boolean(field.enabled),
+      effectStatus: field.effect_status ?? "unverified",
+      httpStatus: field.http_status ?? null,
+      message: field.message ?? null
+    }))
+  };
+}
+
 async function createIsolatedRuntime(canaryEnabled, existing = null) {
   const sourceConfigDir = configuredSourceConfigDir();
   const configDir = existing?.configDir ??
@@ -183,7 +262,10 @@ async function createIsolatedRuntime(canaryEnabled, existing = null) {
       ATOAPI_TEST_LISTEN_PORT: String(port),
       ATOAPI_PREFIX_DIAGNOSTICS: "1",
       ATOAPI_AUTOMATIC_CACHE_CANARY: canaryEnabled ? "1" : "0",
-      ATOAPI_FORCE_CACHE_CANARY: canaryEnabled && forceCanary ? "1" : "0"
+      ATOAPI_FORCE_CACHE_CANARY: canaryEnabled && forceCanary ? "1" : "0",
+      ...(candidateVariant === "auto"
+        ? {}
+        : { ATOAPI_FORCE_CACHE_CANDIDATE: candidateVariant })
     }
   });
   await waitForHealth(baseUrl, child);
@@ -232,10 +314,8 @@ async function findCohortSessions() {
   });
   const arm = String(seed.metric?.shadow_affinity_arm ?? "");
   if (cohortPredictor(calibration.threadId) !== arm) {
-    throw new Error(
-      `offline cohort predictor disagreed with the proxy: ` +
-      `predicted=${cohortPredictor(calibration.threadId)}, actual=${arm}`
-    );
+    predictorMismatches += 1;
+    cohortPredictor = null;
   }
   selectSession(calibration, arm, true);
   for (const requiredArm of ["baseline", "candidate"]) {
@@ -259,8 +339,9 @@ async function collectShadowEvidence() {
     const pair = index % 2 === 0
       ? [baseline, candidate]
       : [candidate, baseline];
+    const fixtureId = `observe-${index + 1}-${randomUUID().replaceAll("-", "")}`;
     for (const session of pair) {
-      await runAffinityWindow(session, index + 1);
+      await runAffinityWindow(session, index + 1, fixtureId);
     }
     observeWindows += 1;
     affinity = await getJson(`${runtime.baseUrl}/admin/cache-affinity`);
@@ -284,8 +365,12 @@ async function collectCanaryEvidence() {
     if (canaryReachedTerminalGate(readiness)) break;
     const candidate = await createVerifiedSession("candidate");
     const baseline = await createVerifiedSession("baseline");
-    for (const session of [candidate, baseline]) {
-      await runAffinityWindow(session, observeWindows + index + 1);
+    const pair = index % 2 === 0
+      ? [candidate, baseline]
+      : [baseline, candidate];
+    const fixtureId = `canary-${index + 1}-${randomUUID().replaceAll("-", "")}`;
+    for (const session of pair) {
+      await runAffinityWindow(session, observeWindows + index + 1, fixtureId);
     }
     canaryWindows += 1;
     affinity = await getJson(`${runtime.baseUrl}/admin/cache-affinity`);
@@ -299,7 +384,6 @@ async function takeVerifiedSession(arm) {
 }
 
 async function createVerifiedSession(desiredArm) {
-  if (!cohortPredictor) throw new Error("cohort predictor is not initialized");
   for (;;) {
     if (probes.length >= maxProbes) {
       throw new Error(`verified seed requests exceeded the ${maxProbes} limit`);
@@ -307,7 +391,7 @@ async function createVerifiedSession(desiredArm) {
     let session;
     do {
       session = newSession(desiredArm);
-    } while (cohortPredictor(session.threadId) !== desiredArm);
+    } while (cohortPredictor && cohortPredictor(session.threadId) !== desiredArm);
     const seed = await verifySessionSeed(session, desiredArm);
     if (!seed) continue;
     selectSession(session, desiredArm, false);
@@ -318,7 +402,7 @@ async function createVerifiedSession(desiredArm) {
 function newSession(label) {
   const sessionRunId = randomUUID();
   const seedInput = [
-    message(`Acceptance ${runId}, ${label} session ${sessionRunId}. Reply with OK only.`)
+    message(`Acceptance ${runId}. Reply with OK only.`)
   ];
   return {
     sessionId: `atoapi-accept-${runId}-${sessionRunId}`,
@@ -334,8 +418,8 @@ async function verifySessionSeed(session, expectedArm) {
   const arm = String(seed.metric?.shadow_affinity_arm ?? "");
   const hasUsage = number(seed.metric?.input_tokens) > 0;
   const validArm = new Set(["baseline", "candidate"]).has(arm);
-  const selectable = seed.completed && hasUsage && validArm &&
-    (expectedArm === null || arm === expectedArm);
+  const successfulSeed = seed.completed && hasUsage && validArm;
+  const selectable = successfulSeed && (expectedArm === null || arm === expectedArm);
   probes.push({
     index: probes.length + 1,
     arm: validArm ? arm : null,
@@ -345,9 +429,17 @@ async function verifySessionSeed(session, expectedArm) {
     selected: selectable,
     error: seed.error
   });
+  if (successfulSeed && cohortPredictor && cohortPredictor(session.threadId) !== arm) {
+    predictorMismatches += 1;
+    cohortPredictor = null;
+  }
   if (selectable) {
     session.arm = arm;
     return seed;
+  }
+  if (successfulSeed) {
+    selectSession(session, arm, true);
+    return null;
   }
   probeFailures += 1;
   if (probeFailures > maxProbeFailures) {
@@ -370,15 +462,15 @@ function selectSession(session, arm, enqueue) {
   }
 }
 
-async function runAffinityWindow(session, windowIndex) {
+async function runAffinityWindow(session, windowIndex, fixtureId) {
   if (lane === "compacted_anchor") {
-    return runCompactionWindow(session, windowIndex);
+    return runCompactionWindow(session, windowIndex, fixtureId);
   }
-  return runPostBurstWindow(session, windowIndex);
+  return runPostBurstWindow(session, windowIndex, fixtureId);
 }
 
-async function runPostBurstWindow(session, windowIndex) {
-  const suffix = `${phase}-${windowIndex}-${session.arm}-${randomUUID().replaceAll("-", "")}`;
+async function runPostBurstWindow(session, windowIndex, fixtureId) {
+  const suffix = fixtureId ?? `${phase}-${windowIndex}`;
   const toolCallId = `call_${suffix}`;
   session.input = [
     ...session.seedInput,
@@ -400,17 +492,15 @@ async function runPostBurstWindow(session, windowIndex) {
   }
 }
 
-async function runCompactionWindow(session, windowIndex) {
-  const suffix = `${phase}-${windowIndex}-${session.arm}-${randomUUID().replaceAll("-", "")}`;
+async function runCompactionWindow(session, windowIndex, fixtureId) {
+  const suffix = fixtureId ?? `${phase}-${windowIndex}`;
   session.input = [
     message(buildCompactionHistory(compactionHistoryChars, suffix)),
     message("Continue from this history and reply with OK only.")
   ];
   await sendExperimentRequest(session, `${phase}_${session.arm}_pre_compaction`);
 
-  session.input.push(
-    message("Summarize the conversation state for the next turn, then reply with OK only.")
-  );
+  session.input.push({ type: "compaction_trigger" });
   const compacted = await sendExperimentRequest(
     session,
     `${phase}_${session.arm}_compaction`,
@@ -422,8 +512,13 @@ async function runCompactionWindow(session, windowIndex) {
       `${compacted.metric?.cache_status ?? "missing"}`
     );
   }
+  if (compacted.completed && compacted.compactedInput.length === 0) {
+    throw new Error(
+      `upstream did not return a reusable compaction item for ${session.arm}`
+    );
+  }
 
-  session.input = [message(buildCompactedSummary(compactionSummaryChars, suffix))];
+  session.input = compacted.compactedInput;
   for (let followup = 1; followup <= evidencePerWindow; followup += 1) {
     session.input.push(message(`Post-compaction follow-up ${followup}: reply with OK only.`));
     await sendExperimentRequest(
@@ -445,6 +540,141 @@ async function sendExperimentRequest(session, requestPhase, requestKind = "turn"
     }
   }
   return result;
+}
+
+async function runLongLivedSession() {
+  const session = newSession("long-lived");
+  session.arm = "long_lived";
+  session.input = [...session.seedInput];
+  await sendRequest(session, "long_lived_seed", false);
+  for (let turn = 1; turn < longLivedRequests; turn += 1) {
+    if (longLivedToolEvery > 0 && turn % longLivedToolEvery === 0) {
+      const suffix = `long-lived-${turn}`;
+      const callId = `call_${suffix}`;
+      session.input.push(
+        { type: "function_call", call_id: callId, name: "read_test_log", arguments: "{}" },
+        {
+          type: "function_call_output",
+          call_id: callId,
+          output: buildToolOutput(longLivedToolChars, suffix)
+        }
+      );
+    }
+    session.input.push(message(`Long-lived turn ${turn}: reply with OK only.`));
+    await sendExperimentRequest(session, `long_lived_turn_${turn}`);
+  }
+}
+
+function buildLongLivedResult() {
+  const turnResponses = responses.filter((item) => item.phase !== "long_lived_seed");
+  const completed = responses.filter((item) => item.completed && item.metric);
+  const cacheableTokens = completed.reduce(
+    (sum, item) => sum + cacheableInputTokens128(number(item.metric.input_tokens)),
+    0
+  );
+  const cacheReadTokens = completed.reduce(
+    (sum, item) => sum + number(item.metric.cache_read_tokens),
+    0
+  );
+  const inputTokens = completed.reduce(
+    (sum, item) => sum + number(item.metric.input_tokens),
+    0
+  );
+  const ratio = (cached, total) => total > 0 ? Math.round(cached * 10_000 / total) : 0;
+  const gapRows = completed.map((item) => ({
+    phase: item.phase,
+    input_tokens: number(item.metric.input_tokens),
+    cache_read_tokens: number(item.metric.cache_read_tokens),
+    cacheable_tokens_128: cacheableInputTokens128(number(item.metric.input_tokens)),
+    cache_shortfall_tokens: number(item.metric.cache_shortfall_tokens),
+    cache_new_tail_gap_tokens: number(item.metric.cache_new_tail_gap_tokens),
+    cache_avoidable_gap_tokens: number(item.metric.cache_avoidable_gap_tokens),
+    cache_provider_unstable_gap_tokens: number(
+      item.metric.cache_provider_unstable_gap_tokens
+    ),
+    cache_status: item.metric.cache_status,
+    prefix_guard_wait_ms: number(item.metric.prefix_guard_wait_ms),
+    prefix_guard_wait_reason: item.metric.prefix_guard_wait_reason,
+    prefix_guard_wait_source: item.metric.prefix_guard_wait_source,
+    prefix_guard_skip_reason: item.metric.prefix_guard_skip_reason,
+    prefix_lag_classification: item.metric.prefix_lag_classification,
+    prefix_cache_instability_score: number(item.metric.prefix_cache_instability_score),
+    prefix_seen_bucket_tokens: number(item.metric.prefix_seen_bucket_tokens),
+    tail_source: item.metric.tail_source,
+    tail_tool_output_chars: number(item.metric.tail_tool_output_chars),
+    tail_largest_tool_output_chars: number(item.metric.tail_largest_tool_output_chars),
+    ttft_ms: number(item.metric.ttft_ms),
+    upstream_attempts: number(item.metric.upstream_attempts),
+    shadow_affinity_decision: item.metric.shadow_affinity_decision
+  }));
+  const avoidable = gapRows.map((row) => row.cache_avoidable_gap_tokens);
+  const providerUnstable = gapRows.map(
+    (row) => row.cache_provider_unstable_gap_tokens
+  );
+  const exact = responses.reduce(
+    (sum, item) => ({
+      inboundRequests: sum.inboundRequests + item.counters.inboundRequests,
+      generationAttempts: sum.generationAttempts + item.counters.generationAttempts,
+      upstreamRequests: sum.upstreamRequests + item.counters.upstreamRequests,
+      inputTokens: sum.inputTokens + number(item.metric?.input_tokens)
+    }),
+    { inboundRequests: 0, generationAttempts: 0, upstreamRequests: 0, inputTokens: 0 }
+  );
+  const usageCoverage = responses.length > 0
+    ? completed.length * 10_000 / responses.length
+    : 0;
+  const checks = {
+    managedIsolatedRun: runtime.managed,
+    requestCountReached: requestCount === longLivedRequests,
+    everyRequestCompleted: responses.length === longLivedRequests &&
+      responses.every((item) => item.completed),
+    usageCoverageReached: usageCoverage >= 8_000,
+    oneInboundPerRequest: exact.inboundRequests === requestCount,
+    oneAttemptPerInbound: exact.generationAttempts === requestCount,
+    oneUpstreamPerInbound: exact.upstreamRequests === requestCount,
+    stayedWithinTokenBudget: exact.inputTokens <= maxInputTokens
+  };
+  return {
+    runId,
+    isolated: runtime.managed,
+    port: runtime.port,
+    executable: runtime.executable,
+    model,
+    mode,
+    longLived: {
+      requests: requestCount,
+      turns: turnResponses.length,
+      sameSession: new Set(responses.map((item) => item.session_id)).size === 1,
+      cacheRatioBps: ratio(cacheReadTokens, cacheableTokens),
+      inputRatioBps: ratio(cacheReadTokens, inputTokens),
+      cacheableTokens128: cacheableTokens,
+      cacheReadTokens,
+      averageAvoidableGapTokens: avoidable.length > 0
+        ? Math.round(avoidable.reduce((sum, value) => sum + value, 0) / avoidable.length)
+        : 0,
+      maxAvoidableGapTokens: Math.max(0, ...avoidable),
+      averageProviderUnstableGapTokens: providerUnstable.length > 0
+        ? Math.round(providerUnstable.reduce((sum, value) => sum + value, 0) /
+          providerUnstable.length)
+        : 0,
+      coldStarts: gapRows.filter((row) => row.cache_status === "provider-cold-start").length,
+      gaps: gapRows
+    },
+    requestSummary: {
+      total: requestCount,
+      completed: responses.filter((item) => item.completed).length,
+      failed: responses.filter((item) => !item.completed).map((item) => ({
+        phase: item.phase,
+        status: item.status,
+        error: item.error
+      })),
+      ...exact
+    },
+    timingSummary: summarizeTiming(responses),
+    capabilityProbe,
+    checks,
+    pass: Object.values(checks).every(Boolean)
+  };
 }
 
 async function sendRequest(
@@ -499,6 +729,9 @@ async function sendRequest(
       : null;
   const completed = !caughtError && responseStatus >= 200 && responseStatus < 300 &&
     (responseBody.includes("response.completed") || responseBody.includes("[DONE]"));
+  const compactedInput = requestKind === "compaction"
+    ? extractCompactionItems(responseBody)
+    : [];
   const result = {
     phase: requestPhase,
     arm: session.arm ?? null,
@@ -506,6 +739,7 @@ async function sendRequest(
     status: responseStatus,
     elapsedMs: Date.now() - startedAt,
     completed,
+    compactedInput,
     counters,
     metric: compactMetric(metric),
     error: caughtError
@@ -513,6 +747,7 @@ async function sendRequest(
       : completed ? null : responseBody.slice(0, 240)
   };
   responses.push(result);
+  if (interRequestDelayMs > 0) await delay(interRequestDelayMs);
   if (!completed && !allowFailure) {
     throw new Error(
       `${requestPhase} failed: HTTP ${responseStatus}; ` +
@@ -520,6 +755,40 @@ async function sendRequest(
     );
   }
   return result;
+}
+
+function extractCompactionItems(responseBody) {
+  const items = [];
+  const seen = new Set();
+  const collect = (value) => {
+    if (Array.isArray(value)) {
+      for (const item of value) collect(item);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    if (value.type === "compaction" && typeof value.encrypted_content === "string") {
+      const fingerprint = JSON.stringify(value);
+      if (!seen.has(fingerprint)) {
+        seen.add(fingerprint);
+        items.push(value);
+      }
+      return;
+    }
+    for (const key of ["item", "output", "response", "data"]) {
+      if (value[key] !== undefined) collect(value[key]);
+    }
+  };
+
+  for (const line of String(responseBody).split(/\r?\n/u)) {
+    const payload = line.trimStart().startsWith("data:")
+      ? line.trimStart().slice(5).trim()
+      : line.trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      collect(JSON.parse(payload));
+    } catch {}
+  }
+  return items;
 }
 
 async function waitForRequestFinalization(before) {
@@ -615,6 +884,7 @@ function buildResult(finalAffinity) {
     model,
     mode,
     lane,
+    candidateVariant,
     limits: {
       targetSuccessfulPerArm,
       targetInputTokensPerArm,
@@ -622,6 +892,7 @@ function buildResult(finalAffinity) {
       maxProbes,
       maxProbeFailures,
       maxExperimentFailures,
+      interRequestDelayMs,
       toolChars,
       stableInstructionChars,
       compactionHistoryChars,
@@ -634,6 +905,7 @@ function buildResult(finalAffinity) {
       baseline: probes.filter((item) => item.arm === "baseline").length,
       candidate: probes.filter((item) => item.arm === "candidate").length,
       failuresOrMissingUsage: probeFailures,
+      predictorMismatches,
       selectedAt: selectedSeeds.map((item) => ({ index: item.index, arm: item.arm }))
     },
     windows: { observe: observeWindows, canary: canaryWindows },
@@ -648,6 +920,7 @@ function buildResult(finalAffinity) {
       ...exact
     },
     timingSummary: summarizeTiming(responses),
+    cacheGapSummary: summarizeCacheGaps(responses),
     compactionProfile: classifyCompactionPrefixDrift(
       responses
         .filter((item) => compactionPhase(item.phase) !== null)
@@ -667,6 +940,43 @@ function buildResult(finalAffinity) {
     checks,
     pass
   };
+}
+
+function summarizeCacheGaps(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const metric = entry.metric;
+    if (!metric || entry.phase === "seed" || !entry.completed) continue;
+    const cacheable = cacheableInputTokens128(number(metric.input_tokens));
+    const gap = Math.max(0, cacheable - number(metric.cache_read_tokens));
+    const key = `${entry.arm ?? "unknown"}:${metric.shadow_affinity_decision ?? "unknown"}`;
+    const bucket = groups.get(key) ?? [];
+    bucket.push({ phase: entry.phase, cacheable, gap });
+    groups.set(key, bucket);
+  }
+  return Object.fromEntries([...groups.entries()].map(([key, samples]) => {
+    const gaps = samples.map((sample) => sample.gap).sort((left, right) => left - right);
+    const byPhase = Object.groupBy(samples, (sample) => sample.phase);
+    return [key, {
+      observations: samples.length,
+      zero_gap: gaps.filter((gap) => gap === 0).length,
+      gap_p50_tokens: percentile(gaps, 50),
+      gap_p95_tokens: percentile(gaps, 95),
+      max_gap_tokens: gaps.at(-1) ?? 0,
+      by_phase: Object.fromEntries(
+        Object.entries(byPhase).map(([phase, phaseSamples]) => [
+          phase,
+          phaseSamples.map((sample) => sample.gap)
+        ])
+      )
+    }];
+  }));
+}
+
+function cacheableInputTokens128(inputTokens) {
+  return inputTokens < 1024
+    ? 0
+    : 1024 + Math.floor((inputTokens - 1024) / 128) * 128;
 }
 
 function summarizeTiming(entries) {
@@ -743,9 +1053,38 @@ function canaryReachedTerminalGate(readiness) {
 }
 
 function targetReadiness(affinity) {
-  return (affinity.readiness ?? []).find(
-    (item) => item.lane === lane
-  ) ?? null;
+  const matches = (affinity.readiness ?? []).filter((item) => item.lane === lane);
+  if (candidateVariant !== "auto") {
+    return matches.find((item) => item.candidate_variant === candidateVariant) ?? null;
+  }
+  const cohort = matches.find((item) => item.candidate_variant === "cohort_key");
+  if (!candidateIsExhausted(cohort) || !baselineHasAddressableGap(cohort)) {
+    return cohort ?? matches[0] ?? null;
+  }
+  const twoShard = matches.find(
+    (item) => item.candidate_variant === "cohort_two_shard"
+  );
+  if (!candidateIsExhausted(twoShard) || !baselineHasAddressableGap(twoShard)) {
+    return twoShard ?? matches[0] ?? null;
+  }
+  return matches.find(
+    (item) => item.candidate_variant === "provider_native"
+  ) ?? matches[0] ?? null;
+}
+
+function candidateIsExhausted(readiness) {
+  return readiness && (
+    readiness.status === "rollback_required" ||
+    (readiness.status === "canary_healthy" &&
+      readiness.reason !== "no_addressable_post_burst_gap")
+  );
+}
+
+function baselineHasAddressableGap(readiness) {
+  const baseline = readiness?.baseline ?? {};
+  return number(baseline.average_avoidable_gap_tokens) > 0 ||
+    number(baseline.provider_unstable_ratio_bps) > 0 ||
+    number(baseline.cache_ratio_bps) < 9_995;
 }
 
 function printProgress(label, readiness) {
@@ -783,12 +1122,28 @@ function compactMetric(metric) {
     status: number(metric.status),
     input_tokens: number(metric.input_tokens),
     cache_read_tokens: number(metric.cache_read_tokens),
+    cache_shortfall_tokens: number(metric.cache_shortfall_tokens),
+    cache_new_tail_gap_tokens: number(metric.cache_new_tail_gap_tokens),
+    cache_avoidable_gap_tokens: number(metric.cache_avoidable_gap_tokens),
+    cache_provider_unstable_gap_tokens: number(
+      metric.cache_provider_unstable_gap_tokens
+    ),
     ttft_ms: number(metric.ttft_ms),
     upstream_attempts: number(metric.upstream_attempts),
     shadow_affinity_arm: metric.shadow_affinity_arm ?? null,
     shadow_affinity_lane: metric.shadow_affinity_lane ?? null,
     shadow_affinity_decision: metric.shadow_affinity_decision ?? null,
     cache_status: metric.cache_status ?? null,
+    prefix_guard_wait_ms: number(metric.prefix_guard_wait_ms),
+    prefix_guard_wait_reason: metric.prefix_guard_wait_reason ?? null,
+    prefix_guard_wait_source: metric.prefix_guard_wait_source ?? null,
+    prefix_guard_skip_reason: metric.prefix_guard_skip_reason ?? null,
+    prefix_lag_classification: metric.prefix_lag_classification ?? null,
+    prefix_cache_instability_score: number(metric.prefix_cache_instability_score),
+    prefix_seen_bucket_tokens: number(metric.prefix_seen_bucket_tokens),
+    tail_source: metric.tail_source ?? null,
+    tail_tool_output_chars: number(metric.tail_tool_output_chars),
+    tail_largest_tool_output_chars: number(metric.tail_largest_tool_output_chars),
     upstream_call_source: metric.upstream_call_source ?? null,
     shadow_affinity_realm_id: metric.shadow_affinity_realm_id ?? null,
     upstream_http_version: metric.upstream_http_version ?? null,
@@ -998,6 +1353,53 @@ function runSelfTest() {
   assert.equal(normalizeLane("tool-burst"), "tool_burst_quarantine");
   assert.equal(normalizeLane("compacted-anchor"), "compacted_anchor");
   assert.equal(normalizeLane("unknown"), null);
+  assert.equal(normalizeCandidateVariant("provider-native"), "provider_native");
+  assert.equal(normalizeCandidateVariant("cohort_key"), "cohort_key");
+  assert.equal(normalizeCandidateVariant("cohort-two-shard"), "cohort_two_shard");
+  assert.equal(normalizeCandidateVariant("unknown"), null);
+  if (candidateVariant === "auto") {
+    const readinessChain = {
+      readiness: [
+        {
+          lane,
+          candidate_variant: "cohort_key",
+          status: "rollback_required",
+          reason: "candidate_cache_regression",
+          baseline: { cache_ratio_bps: 9_900 }
+        },
+        {
+          lane,
+          candidate_variant: "cohort_two_shard",
+          status: "insufficient_evidence",
+          reason: "insufficient_arm_observations",
+          baseline: { cache_ratio_bps: 9_900 }
+        },
+        {
+          lane,
+          candidate_variant: "provider_native",
+          status: "insufficient_evidence",
+          reason: "insufficient_arm_observations",
+          baseline: { cache_ratio_bps: 9_900 }
+        }
+      ]
+    };
+    assert.equal(
+      targetReadiness(readinessChain).candidate_variant,
+      "cohort_two_shard"
+    );
+    readinessChain.readiness[1].status = "rollback_required";
+    readinessChain.readiness[1].reason = "candidate_ttft_regression";
+    assert.equal(
+      targetReadiness(readinessChain).candidate_variant,
+      "provider_native"
+    );
+    readinessChain.readiness[0].status = "canary_healthy";
+    readinessChain.readiness[0].reason = "no_addressable_post_burst_gap";
+    assert.equal(targetReadiness(readinessChain).candidate_variant, "cohort_key");
+    readinessChain.readiness[0].reason = "candidate_has_no_net_benefit";
+    readinessChain.readiness[0].baseline.cache_ratio_bps = 9_995;
+    assert.equal(targetReadiness(readinessChain).candidate_variant, "cohort_key");
+  }
   assert.equal(isCompactionBoundaryPhase("observe_baseline_compaction"), true);
   assert.equal(isCompactionBoundaryPhase("canary_candidate_compaction"), true);
   assert.equal(isCompactionBoundaryPhase("observe_baseline_pre_compaction"), false);
@@ -1005,6 +1407,14 @@ function runSelfTest() {
   assert.equal(compactionPhase("observe_baseline_compaction"), "compaction");
   assert.equal(compactionPhase("observe_baseline_post_compaction_1"), "post_compaction");
   assert.equal(compactionPhase("seed"), null);
+  assert.deepEqual(
+    extractCompactionItems([
+      'data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"opaque"}}',
+      'data: {"type":"response.completed","response":{"output":[{"type":"compaction","encrypted_content":"opaque"}]}}',
+      "data: [DONE]"
+    ].join("\n\n")),
+    [{ type: "compaction", encrypted_content: "opaque" }]
+  );
   const fingerprints = {
     version: 2,
     cache_metadata: "cache",
@@ -1042,6 +1452,31 @@ function runSelfTest() {
   assert.equal(prefixProfile[0].prefix_drift, "initial_phase");
   assert.equal(prefixProfile[1].prefix_drift, "stable_prefix_preserved");
   assert.equal(prefixProfile[2].prefix_drift, "history_prefix_changed");
+  assert.deepEqual(
+    summarizeCacheGaps([
+      {
+        arm: "baseline",
+        phase: "followup",
+        completed: true,
+        metric: {
+          input_tokens: 2_048,
+          cache_read_tokens: 1_920,
+          shadow_affinity_decision: "assigned"
+        }
+      },
+      {
+        arm: "baseline",
+        phase: "followup",
+        completed: true,
+        metric: {
+          input_tokens: 2_176,
+          cache_read_tokens: 1_920,
+          shadow_affinity_decision: "assigned"
+        }
+      }
+    ])["baseline:assigned"].by_phase,
+    { followup: [128, 256] }
+  );
   console.log(JSON.stringify({ selfTest: "passed" }));
 }
 
@@ -1207,6 +1642,18 @@ function normalizeLane(value) {
     return "compacted_anchor";
   }
   return null;
+}
+
+function normalizeCandidateVariant(value) {
+  const normalized = String(value).trim().toLowerCase().replaceAll("-", "_");
+  return new Set([
+    "auto",
+    "cohort_key",
+    "cohort_two_shard",
+    "provider_native"
+  ]).has(normalized)
+    ? normalized
+    : null;
 }
 
 function isCompactionBoundaryPhase(value) {

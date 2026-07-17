@@ -661,14 +661,15 @@ async fn handle_responses_compact_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
-    let trusted_codex_metadata = trusted_codex_request_metadata(
-        &headers,
-        forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
-    );
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
     };
+    let trusted_codex_metadata = trusted_codex_request_metadata_for_request(
+        &headers,
+        &client_request,
+        forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
+    );
     if let Some(response_id) = response_id.as_deref() {
         compact_request_set_response_id(&mut client_request, response_id);
     }
@@ -1100,7 +1101,15 @@ async fn handle_responses_compact_for_agent(
     let usage_record = if compact_success_for_cache {
         let usage = collect_provider_usage_for_diagnostics(&bytes, &decision);
         if let Some(record) = usage.as_ref() {
-            state.metrics.record_usage(record.clone()).await;
+            state
+                .metrics
+                .record_usage_with_cold_start_key(
+                    record.clone(),
+                    response_session_key
+                        .as_deref()
+                        .or(session_anchor_diagnostics.hash.as_deref()),
+                )
+                .await;
         }
         usage
     } else {
@@ -1436,8 +1445,9 @@ async fn run_generation_for_authorized_agent(
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
     };
-    let trusted_codex_metadata = trusted_codex_request_metadata(
+    let trusted_codex_metadata = trusted_codex_request_metadata_for_request(
         &headers,
+        &client_request,
         forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
     );
     let config = state.config.read().await.clone();
@@ -1817,6 +1827,9 @@ async fn run_generation_for_authorized_agent(
             provider_prefix_control_key.as_deref(),
             provider_prefix_family_key.as_deref(),
             &tail_input_diagnostics,
+            trusted_codex_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.compaction_requested),
             prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
         )
         .await
@@ -2018,47 +2031,46 @@ async fn run_generation_for_authorized_agent(
         selected_provider_key.key_id.as_deref(),
         ProviderCacheCapabilityField::PromptCacheKey,
     ) != ProviderCacheCapabilityStatus::Unsupported;
-    let static_cohort_canary_applied = shadow_affinity_decision.as_mut().and_then(|decision| {
-        let channel_eligible = matches!(active_request_channel, Channel::Responses | Channel::Chat)
-            && provider_prompt_cache_key_allowed;
-        let can_apply = if let Some(selection) = validation_selection.as_ref() {
-            cache_validation::apply_controlled_selection(
-                decision,
-                selection,
-                smart_hit_enabled(&config),
-                channel_eligible,
-            )
-        } else {
-            channel_eligible
-                && !explicit_client_prompt_cache_key
-                && cache_affinity::apply_automatic_static_cohort_canary(
+    let candidate_cache_routing_applied =
+        shadow_affinity_decision.as_mut().is_some_and(|decision| {
+            let provider_native_candidate = validation_selection.is_none()
+                && decision.candidate_variant
+                    == cache_affinity::ShadowCacheCandidateVariant::ProviderNative;
+            let channel_eligible =
+                matches!(active_request_channel, Channel::Responses | Channel::Chat)
+                    && (provider_native_candidate || provider_prompt_cache_key_allowed);
+            let can_apply = if let Some(selection) = validation_selection.as_ref() {
+                cache_validation::apply_controlled_selection(
                     decision,
+                    selection,
                     smart_hit_enabled(&config),
+                    channel_eligible,
                 )
-        };
-        if validation_selection.is_none()
-            && !can_apply
-            && explicit_client_prompt_cache_key
-            && decision.arm == cache_affinity::ShadowAffinityArm::Candidate
-        {
-            decision.decision = "candidate_skipped_explicit_cache_key".to_string();
-            decision.skip_reason = Some("explicit_client_prompt_cache_key".to_string());
-        }
-        if can_apply {
-            cache_affinity::static_cohort_prompt_cache_key(decision).map(|key| {
-                if let Some(object) = active_upstream_body.as_object_mut() {
-                    object.insert(
-                        "prompt_cache_key".to_string(),
-                        Value::String(key.to_string()),
-                    );
-                }
-                provider_prefix_key = Some(key.to_string());
-                key.to_string()
-            })
-        } else {
-            None
-        }
-    });
+            } else {
+                channel_eligible
+                    && !explicit_client_prompt_cache_key
+                    && cache_affinity::apply_automatic_static_cohort_canary(
+                        decision,
+                        smart_hit_enabled(&config),
+                    )
+            };
+            if validation_selection.is_none()
+                && !can_apply
+                && explicit_client_prompt_cache_key
+                && decision.arm == cache_affinity::ShadowAffinityArm::Candidate
+            {
+                decision.decision = "candidate_skipped_explicit_cache_key".to_string();
+                decision.skip_reason = Some("explicit_client_prompt_cache_key".to_string());
+            }
+            if !can_apply {
+                return false;
+            }
+            let applied = apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
+            if applied {
+                provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
+            }
+            applied
+        });
     if let Some(decision) = shadow_affinity_decision.as_ref() {
         state
             .metrics
@@ -2068,7 +2080,7 @@ async fn run_generation_for_authorized_agent(
             )
             .await;
     }
-    if static_cohort_canary_applied.is_some() {
+    if candidate_cache_routing_applied {
         state.metrics.record_shadow_application(true).await;
     }
     if agent_generation {
@@ -3061,8 +3073,11 @@ async fn run_generation_for_authorized_agent(
                     }
                 };
                 let error_summary = upstream_error_summary(&body_read.bytes);
-                let explicit_reasoning_rejection =
-                    is_explicit_reasoning_effort_rejection(status, &body_read.bytes);
+                let explicit_reasoning_rejection = is_explicit_reasoning_effort_rejection(
+                    status,
+                    &body_read.bytes,
+                    &current_effort,
+                );
                 let opaque_reasoning_probe = !explicit_reasoning_rejection
                     && should_probe_opaque_reasoning_fallback(
                         status,
@@ -3324,6 +3339,7 @@ async fn run_generation_for_authorized_agent(
                             && is_explicit_reasoning_effort_rejection(
                                 status,
                                 &fallback_body_read.bytes,
+                                &next_effort,
                             )
                         {
                             note_reasoning_effort_rejection(
@@ -3760,7 +3776,15 @@ async fn run_generation_for_authorized_agent(
     let usage_observation = if is_success_status && sync_compact_diagnostic_only {
         let raw = collect_provider_usage_for_diagnostics(&bytes, &decision);
         if let Some(record) = raw.as_ref() {
-            state.metrics.record_usage(record.clone()).await;
+            state
+                .metrics
+                .record_usage_with_cold_start_key(
+                    record.clone(),
+                    response_session_key
+                        .as_deref()
+                        .or(session_anchor_diagnostics.hash.as_deref()),
+                )
+                .await;
         }
         raw.map(|raw| ProviderUsageObservation {
             effective: raw.clone(),
@@ -3772,6 +3796,9 @@ async fn run_generation_for_authorized_agent(
             &bytes,
             &decision,
             prefix_state_update_key.as_deref(),
+            response_session_key
+                .as_deref()
+                .or(session_anchor_diagnostics.hash.as_deref()),
             active_used_response_session,
         )
         .await
@@ -4200,6 +4227,7 @@ async fn wait_for_provider_prefix_settle(
     provider_prefix_key: Option<&str>,
     provider_prefix_family_key: Option<&str>,
     current_tail: &TailInputDiagnostics,
+    compaction_requested: bool,
     max_wait: Option<TokioDuration>,
 ) -> PrefixGuardWaitDiagnostics {
     if provider_prefix_key.is_none() && provider_prefix_family_key.is_none() {
@@ -4233,6 +4261,8 @@ async fn wait_for_provider_prefix_settle(
                 avoidable_tokens,
                 avoidable_shortfall_streak: state.avoidable_shortfall_streak,
                 cache_instability_score: state.cache_instability_score,
+                settle_after_cold_read: state.settle_after_cold_read,
+                compaction_requested,
                 state_age,
                 request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
             });
@@ -5047,7 +5077,7 @@ fn prefix_lag_diagnostics_from_previous(
 
     let previous_seen = provider_prefix_raw_seen_bucket(previous);
     let classification = if record.cache_read_tokens == 0 && real_provider_shortfall >= 1024 {
-        if previous_seen >= 32_000 {
+        if previous_seen >= 32_000 || current_provider_unstable > 0 {
             "cold_read_after_warm"
         } else {
             "cold_start"
@@ -7898,14 +7928,56 @@ fn trusted_codex_request_metadata(
         .to_str()
         .ok()?
         .trim();
+    trusted_codex_request_metadata_from_raw(raw)
+}
+
+fn trusted_codex_request_metadata_for_request(
+    headers: &HeaderMap,
+    request: &Value,
+    authorized_codex_route: bool,
+) -> Option<TrustedCodexRequestMetadata> {
+    trusted_codex_request_metadata(headers, authorized_codex_route).or_else(|| {
+        trusted_codex_request_metadata_from_client_metadata(request, authorized_codex_route)
+    })
+}
+
+fn trusted_codex_request_metadata_from_client_metadata(
+    request: &Value,
+    authorized_codex_route: bool,
+) -> Option<TrustedCodexRequestMetadata> {
+    if !authorized_codex_route {
+        return None;
+    }
+    let client_metadata = request.get("client_metadata")?;
+    let client_metadata = match client_metadata {
+        Value::Object(_) => client_metadata.clone(),
+        Value::String(raw) if raw.len() <= 32 * 1024 => serde_json::from_str(raw).ok()?,
+        _ => return None,
+    };
+    let turn_metadata = client_metadata
+        .as_object()?
+        .get(X_CODEX_TURN_METADATA_HEADER)?;
+    match turn_metadata {
+        Value::String(raw) => trusted_codex_request_metadata_from_raw(raw),
+        Value::Object(_) => trusted_codex_request_metadata_from_value(turn_metadata),
+        _ => None,
+    }
+}
+
+fn trusted_codex_request_metadata_from_raw(raw: &str) -> Option<TrustedCodexRequestMetadata> {
     if raw.is_empty() || raw.len() > 32 * 1024 {
         return None;
     }
     let value = serde_json::from_str::<Value>(raw).ok()?;
-    let thread_id = value.get("thread_id").and_then(bounded_metadata_id);
-    let session_id = value.get("session_id").and_then(bounded_metadata_id);
+    trusted_codex_request_metadata_from_value(&value)
+}
+
+fn trusted_codex_request_metadata_from_value(value: &Value) -> Option<TrustedCodexRequestMetadata> {
+    let object = value.as_object()?;
+    let thread_id = object.get("thread_id").and_then(bounded_metadata_id);
+    let session_id = object.get("session_id").and_then(bounded_metadata_id);
     let compaction_requested =
-        value.get("request_kind").and_then(Value::as_str) == Some("compaction");
+        object.get("request_kind").and_then(Value::as_str) == Some("compaction");
     (thread_id.is_some() || session_id.is_some() || compaction_requested).then_some(
         TrustedCodexRequestMetadata {
             thread_id,
@@ -11429,6 +11501,9 @@ async fn stream_upstream(
                 stream_metadata.usage.clone(),
                 &decision,
                 prefix_state_key.as_deref(),
+                response_session_key
+                    .as_deref()
+                    .or(session_anchor_diagnostics.hash.as_deref()),
                 used_response_session,
             )
             .await
@@ -12530,7 +12605,11 @@ fn should_probe_opaque_reasoning_fallback(
     error.contains("<html") || error.contains("<!doctype html") || error.contains("502 bad gateway")
 }
 
-fn is_explicit_reasoning_effort_rejection(status: u16, error_body: &[u8]) -> bool {
+fn is_explicit_reasoning_effort_rejection(
+    status: u16,
+    error_body: &[u8],
+    current_effort: &str,
+) -> bool {
     if !(400..=599).contains(&status) {
         return false;
     }
@@ -12539,6 +12618,17 @@ fn is_explicit_reasoning_effort_rejection(status: u16, error_body: &[u8]) -> boo
     // in logs. For JSON responses, inspect the declared error message rather
     // than arbitrary echoed request fields.
     let error = upstream_error_text_for_reasoning_classification(error_body).to_ascii_lowercase();
+    let normalized_effort = normalize_request_reasoning_effort(current_effort);
+    let level_list_rejection = normalized_effort.is_some_and(|effort| {
+        error.contains("level")
+            && error.contains("valid levels")
+            && (error.contains(&format!("\"{effort}\""))
+                || error.contains(&format!("'{effort}'"))
+                || error.contains(&format!("level {effort}")))
+    });
+    if level_list_rejection {
+        return true;
+    }
     const PARAMETER_TERMS: &[&str] = &[
         "reasoning.effort",
         "reasoning_effort",
@@ -12750,6 +12840,24 @@ fn apply_session_provider_cache_key(
         "prompt_cache_key".to_string(),
         Value::String(identity.provider_cache_key.clone()),
     );
+}
+
+fn apply_candidate_prompt_cache_routing(
+    request: &mut Value,
+    decision: &ShadowAffinityDecision,
+) -> bool {
+    let Some(object) = request.as_object_mut() else {
+        return false;
+    };
+    if cache_affinity::provider_native_candidate_applied(decision) {
+        object.remove("prompt_cache_key");
+        return true;
+    }
+    let Some(cache_key) = cache_affinity::static_cohort_prompt_cache_key(decision) else {
+        return false;
+    };
+    object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
+    true
 }
 
 fn copy_responses_prefix_cache_fields_for_native_stream(
@@ -15446,6 +15554,7 @@ async fn collect_provider_usage(
     bytes: &[u8],
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
+    cold_start_key: Option<&str>,
     used_response_session: bool,
 ) -> Option<ProviderUsageObservation> {
     let mut record = provider_usage_from_bytes(bytes);
@@ -15464,7 +15573,10 @@ async fn collect_provider_usage(
     )
     .await;
     let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
-    state.metrics.record_usage(record.clone()).await;
+    state
+        .metrics
+        .record_usage_with_cold_start_key(record.clone(), cold_start_key.or(prefix_state_key))
+        .await;
     Some(ProviderUsageObservation {
         raw: record,
         effective,
@@ -15476,6 +15588,7 @@ async fn collect_provider_usage_from_record(
     mut record: UsageRecord,
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
+    cold_start_key: Option<&str>,
     used_response_session: bool,
 ) -> Option<ProviderUsageObservation> {
     if !record.has_usage() {
@@ -15493,7 +15606,10 @@ async fn collect_provider_usage_from_record(
     )
     .await;
     let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
-    state.metrics.record_usage(record.clone()).await;
+    state
+        .metrics
+        .record_usage_with_cold_start_key(record.clone(), cold_start_key.or(prefix_state_key))
+        .await;
     Some(ProviderUsageObservation {
         raw: record,
         effective,
@@ -16293,6 +16409,7 @@ mod tests {
             avoidable_shortfall_tokens_128: shortfall_tokens,
             small_gap_recovery_streak: u32::from(shortfall_tokens > 0 && shortfall_tokens <= 2048),
             cache_instability_score: 0,
+            settle_after_cold_read: false,
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
@@ -18852,6 +18969,48 @@ mod tests {
     }
 
     #[test]
+    fn codex_body_turn_metadata_is_projected_for_identity() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "client_metadata": {
+                "x-codex-turn-metadata":
+                    "{\"session_id\":\"session-body\",\"thread_id\":\"thread-body\",\"request_kind\":\"turn\"}"
+            }
+        });
+        let metadata =
+            trusted_codex_request_metadata_for_request(&HeaderMap::new(), &request, true)
+                .expect("Codex body metadata should be accepted");
+        assert_eq!(metadata.session_id.as_deref(), Some("session-body"));
+        assert_eq!(metadata.thread_id.as_deref(), Some("thread-body"));
+        let projected = identity_request_with_codex_metadata(&request, Some(&metadata));
+        assert_eq!(projected["session_id"], "session-body");
+        assert_eq!(projected["thread_id"], "thread-body");
+        assert!(request.get("session_id").is_none());
+        assert!(request.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn codex_body_turn_metadata_requires_authorized_route_and_supports_object_form() {
+        let request = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "session_id": "session-object",
+                    "thread_id": "thread-object"
+                }
+            }
+        });
+        assert!(
+            trusted_codex_request_metadata_for_request(&HeaderMap::new(), &request, false,)
+                .is_none()
+        );
+        let metadata =
+            trusted_codex_request_metadata_for_request(&HeaderMap::new(), &request, true)
+                .expect("object-form Codex metadata should be accepted");
+        assert_eq!(metadata.session_id.as_deref(), Some("session-object"));
+        assert_eq!(metadata.thread_id.as_deref(), Some("thread-object"));
+    }
+
+    #[test]
     fn response_session_update_does_not_replace_longer_prefix_with_older_shorter_input() {
         let shorter = json!([
             { "type": "message", "role": "user", "content": "one" }
@@ -20814,6 +20973,7 @@ mod tests {
             realm_id: "realm-a".to_string(),
             cohort_id: "cohort-candidate".to_string(),
             lane: cache_affinity::ShadowCacheLane::Steady,
+            candidate_variant: cache_affinity::ShadowCacheCandidateVariant::CohortKey,
             arm: cache_affinity::ShadowAffinityArm::Candidate,
             shard: 0,
             policy_epoch: cache_affinity::SHADOW_POLICY_EPOCH,
@@ -20884,6 +21044,34 @@ mod tests {
             false,
         );
         assert_eq!(baseline_headers, candidate_headers);
+
+        decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::CohortTwoShard;
+        let mut two_shard = baseline.clone();
+        assert!(apply_candidate_prompt_cache_routing(
+            &mut two_shard,
+            &decision
+        ));
+        let two_shard_key = two_shard
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .expect("two-shard candidate must have a cache key");
+        assert_ne!(two_shard_key, candidate_key);
+        assert_eq!(
+            without_key(&baseline_wire),
+            without_key(&upstream_request_body_bytes(
+                &Channel::Responses,
+                &two_shard,
+            ))
+        );
+
+        decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::ProviderNative;
+        let mut provider_native = baseline.clone();
+        assert!(apply_candidate_prompt_cache_routing(
+            &mut provider_native,
+            &decision
+        ));
+        assert!(provider_native.get("prompt_cache_key").is_none());
+        assert_eq!(without_key(&baseline_wire), provider_native);
     }
 
     #[test]
@@ -21058,6 +21246,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn small_context_single_bucket_rollback_is_provider_unstable() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-small-context-provider-rollback-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            input_tokens: 22_935,
+            cache_read_tokens: 22_528,
+            ..UsageRecord::default()
+        };
+        let one_bucket_rollback = UsageRecord {
+            input_tokens: 22_747,
+            cache_read_tokens: 22_016,
+            ..UsageRecord::default()
+        };
+
+        update_provider_prefix_state(
+            &state,
+            Some("small-context-prefix"),
+            Some(&warm),
+            false,
+            false,
+        )
+        .await;
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("small-context-prefix"),
+            None,
+            Some(&one_bucket_rollback),
+            Some(&TailInputDiagnostics::default()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gap.total_tokens, 512);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, 512);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn small_context_cold_read_after_warm_is_provider_unstable() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-small-context-cold-read-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let warm = UsageRecord {
+            input_tokens: 16_000,
+            cache_read_tokens: 15_872,
+            ..UsageRecord::default()
+        };
+        let cold_read = UsageRecord {
+            input_tokens: 16_384,
+            cache_read_tokens: 0,
+            ..UsageRecord::default()
+        };
+
+        update_provider_prefix_state(
+            &state,
+            Some("small-context-cold-prefix"),
+            Some(&warm),
+            false,
+            false,
+        )
+        .await;
+
+        let gap = provider_cache_gap_breakdown(
+            &state,
+            Some("small-context-cold-prefix"),
+            None,
+            Some(&cold_read),
+            Some(&TailInputDiagnostics::default()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gap.total_tokens, 16_384);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, 16_384);
+
+        let lag = prefix_lag_diagnostics(
+            &state,
+            Some("small-context-cold-prefix"),
+            Some(&cold_read),
+            Some(&gap),
+            &PrefixGuardWaitDiagnostics::default(),
+            &TailInputDiagnostics::default(),
+        )
+        .await;
+        assert_eq!(lag.classification.as_deref(), Some("cold_read_after_warm"));
+
+        update_provider_prefix_state(
+            &state,
+            Some("small-context-cold-prefix"),
+            Some(&cold_read),
+            false,
+            false,
+        )
+        .await;
+        let states = state.prefix_states.lock().await;
+        assert!(states
+            .get("small-context-cold-prefix")
+            .is_some_and(|state| state.settle_after_cold_read));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn provider_gap_breakdown_does_not_repeat_short_provider_waterline_rollback() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -21133,7 +21439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn huge_new_anchor_cold_read_is_provider_unstable_and_not_learned() {
+    async fn huge_new_anchor_cold_read_only_learns_a_short_settle_signal() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-huge-new-anchor-cold-read-{}",
@@ -21181,13 +21487,31 @@ mod tests {
             false,
         )
         .await;
-        assert!(
-            !state
-                .prefix_states
-                .lock()
-                .await
-                .contains_key("new-session-prefix"),
-            "a huge low-hit new anchor must not become the learned waterline"
+        let states = state.prefix_states.lock().await;
+        let sentinel = states
+            .get("new-session-prefix")
+            .expect("a huge low-hit new anchor must leave a short settle signal");
+        assert!(sentinel.settle_after_cold_read);
+        assert_eq!(sentinel.seen_bucket_tokens, cold_read.cache_read_tokens);
+        assert_eq!(sentinel.seen_bucket_tokens_128, cold_read.cache_read_tokens);
+        assert_eq!(sentinel.avoidable_shortfall_tokens, 0);
+        assert_eq!(sentinel.avoidable_shortfall_tokens_128, 0);
+        drop(states);
+
+        let wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some("new-session-prefix"),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(500)),
+        )
+        .await;
+        assert!(wait.wait_ms > 0 && wait.wait_ms <= 500);
+        assert_eq!(
+            wait.reason.as_deref(),
+            Some("responses_recent_cold_read_settle")
         );
 
         fs::remove_dir_all(dir).ok();
@@ -22742,6 +23066,7 @@ mod tests {
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
             cache_instability_score: 0,
+            settle_after_cold_read: false,
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
@@ -22806,6 +23131,7 @@ mod tests {
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
             cache_instability_score: 0,
+            settle_after_cold_read: false,
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
@@ -22857,6 +23183,7 @@ mod tests {
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
                 cache_instability_score: 0,
+                settle_after_cold_read: false,
                 tail_tool_output_chars: 0,
                 tail_largest_tool_output_chars: 0,
                 tail_tool_output_noise_hint: None,
@@ -22873,6 +23200,7 @@ mod tests {
                 source: Some("message".to_string()),
                 ..TailInputDiagnostics::default()
             },
+            false,
             None,
         )
         .await;
@@ -23612,6 +23940,7 @@ mod tests {
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
             cache_instability_score: 0,
+            settle_after_cold_read: false,
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
@@ -25252,6 +25581,7 @@ mod tests {
             Some(sibling_key),
             Some(family_key),
             &TailInputDiagnostics::default(),
+            false,
             None,
         )
         .await;
@@ -25347,6 +25677,7 @@ mod tests {
             Some(sibling_key),
             Some(family_key),
             &tail,
+            false,
             None,
         )
         .await;
@@ -25386,6 +25717,7 @@ mod tests {
             Some(key),
             None,
             &TailInputDiagnostics::default(),
+            false,
             Some(responses_foreground_wait_cap()),
         )
         .await;
@@ -25409,6 +25741,7 @@ mod tests {
             Some(key),
             None,
             &TailInputDiagnostics::default(),
+            false,
             Some(responses_foreground_wait_cap()),
         )
         .await;
@@ -25502,6 +25835,7 @@ mod tests {
             Some(api_key),
             None,
             &TailInputDiagnostics::default(),
+            false,
             None,
         )
         .await;
@@ -25811,6 +26145,7 @@ mod tests {
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
                 cache_instability_score: 8,
+                settle_after_cold_read: false,
                 tail_tool_output_chars: 11_356,
                 tail_largest_tool_output_chars: 11_356,
                 tail_tool_output_noise_hint: Some("path_like".to_string()),
@@ -27661,13 +27996,10 @@ mod tests {
                         .to_string();
                     attempted_efforts.lock().await.push(effort.clone());
                     if matches!(effort.as_str(), "ultra" | "max") {
-                        // Keep the decisive words beyond the log truncation
-                        // boundary. Classification must still see the full body.
                         let rejection = json!({
                             "error": {
                                 "message": format!(
-                                    "{} unsupported_parameter: reasoning.effort {effort} is not supported",
-                                    "x".repeat(720)
+                                    "level \"{effort}\" not supported, valid levels: low, medium, high, xhigh"
                                 )
                             }
                         });
@@ -29828,6 +30160,22 @@ mod tests {
                 ..diagnostics
             },
         ));
+    }
+
+    #[test]
+    fn level_list_reasoning_rejection_is_explicit_and_downgrades_ultra_to_max() {
+        let body = serde_json::to_vec(&json!({
+            "error": {
+                "message": "level \"ultra\" not supported, valid levels: low, medium, high, xhigh, max"
+            }
+        }))
+        .unwrap();
+
+        assert!(is_explicit_reasoning_effort_rejection(400, &body, "ultra"));
+        assert_eq!(
+            next_lower_reasoning_effort("ultra", &HashSet::new()).as_deref(),
+            Some("max")
+        );
     }
 
     #[test]

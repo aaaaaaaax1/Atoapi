@@ -620,6 +620,8 @@ struct MetricsInner {
     seen_eligible_cache_key_order: VecDeque<String>,
     usage: UsageAccumulator,
     recent_usage: VecDeque<TimedUsageRecord>,
+    cold_start_keys: HashSet<String>,
+    request_cold_start_keys: HashSet<String>,
     provider_stats: Vec<ProviderTrafficAccumulator>,
     gap_buckets: Vec<GapBucketAccumulator>,
     request_body_buckets: Vec<RequestBodyBucketAccumulator>,
@@ -681,6 +683,7 @@ struct UsageAccumulator {
 struct TimedUsageRecord {
     at: DateTime<Utc>,
     record: UsageRecord,
+    cold_start_counted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -767,6 +770,8 @@ impl MetricsStore {
                 seen_eligible_cache_key_order: VecDeque::new(),
                 usage: UsageAccumulator::default(),
                 recent_usage: VecDeque::new(),
+                cold_start_keys: HashSet::new(),
+                request_cold_start_keys: HashSet::new(),
                 provider_stats: Vec::new(),
                 gap_buckets: Vec::new(),
                 request_body_buckets: Vec::new(),
@@ -1090,7 +1095,11 @@ impl MetricsStore {
         push_limited(&mut inner.total_samples, log.total_ms, 512);
         upsert_gap_bucket(&mut inner.gap_buckets, &log);
         upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
-        upsert_provider_traffic(&mut inner.provider_stats, &log, true);
+        let count_cold_start = request_log_is_provider_cold_start(&log)
+            && request_log_cold_start_key(&log)
+                .map(|key| remember_bounded_cold_start_key(&mut inner.request_cold_start_keys, key))
+                .unwrap_or(true);
+        upsert_provider_traffic(&mut inner.provider_stats, &log, true, count_cold_start);
         if request_log_is_successful_history(&log) {
             push_limited(&mut inner.recent_upstream_calls, log.clone(), 400);
             push_limited(&mut inner.recent_requests, log, 200);
@@ -1105,6 +1114,14 @@ impl MetricsStore {
     }
 
     pub async fn record_usage(&self, record: UsageRecord) {
+        self.record_usage_with_cold_start_key(record, None).await;
+    }
+
+    pub async fn record_usage_with_cold_start_key(
+        &self,
+        record: UsageRecord,
+        cold_start_key: Option<&str>,
+    ) {
         let mut inner = self.inner.write().await;
         inner.provider_input_tokens += record.input_tokens;
         inner.provider_cached_tokens += record.cache_read_tokens;
@@ -1118,18 +1135,33 @@ impl MetricsStore {
         inner.usage.output_tokens += record.output_tokens;
         inner.usage.cache_read_tokens += record.cache_read_tokens;
         inner.usage.cache_creation_tokens += record.cache_creation_tokens;
-        if provider_usage_is_cold_start(&record) {
+        let count_cold_start = provider_usage_is_cold_start(&record)
+            && cold_start_key
+                .map(|key| remember_bounded_cold_start_key(&mut inner.cold_start_keys, key))
+                .unwrap_or(true);
+        if count_cold_start {
             inner.usage.cold_start_requests += 1;
             inner.usage.cold_start_input_tokens += record.input_tokens;
             inner.usage.cold_start_output_tokens += record.output_tokens;
         }
-        upsert_usage_group(&mut inner.usage.by_provider, &record.provider, &record);
-        upsert_usage_group(&mut inner.usage.by_model, &record.model, &record);
+        upsert_usage_group(
+            &mut inner.usage.by_provider,
+            &record.provider,
+            &record,
+            count_cold_start,
+        );
+        upsert_usage_group(
+            &mut inner.usage.by_model,
+            &record.model,
+            &record,
+            count_cold_start,
+        );
         push_recent_usage(
             &mut inner.recent_usage,
             TimedUsageRecord {
                 at: Utc::now(),
                 record,
+                cold_start_counted: count_cold_start,
             },
         );
     }
@@ -1280,7 +1312,11 @@ fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: boo
     push_limited(&mut inner.total_samples, log.total_ms, 512);
     upsert_gap_bucket(&mut inner.gap_buckets, &log);
     upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
-    upsert_provider_traffic(&mut inner.provider_stats, &log, upstream);
+    let count_cold_start = request_log_is_provider_cold_start(&log)
+        && request_log_cold_start_key(&log)
+            .map(|key| remember_bounded_cold_start_key(&mut inner.request_cold_start_keys, key))
+            .unwrap_or(true);
+    upsert_provider_traffic(&mut inner.provider_stats, &log, upstream, count_cold_start);
     if request_log_is_successful_history(&log) {
         push_limited(&mut inner.recent_requests, log, 200);
     } else {
@@ -1334,20 +1370,24 @@ impl UsageAccumulator {
     }
 }
 
-fn upsert_usage_group(groups: &mut Vec<UsageGroup>, key: &str, record: &UsageRecord) {
+fn upsert_usage_group(
+    groups: &mut Vec<UsageGroup>,
+    key: &str,
+    record: &UsageRecord,
+    count_cold_start: bool,
+) {
     let key = if key.trim().is_empty() {
         "unknown"
     } else {
         key
     };
-    let is_cold_start = provider_usage_is_cold_start(record);
-    let cold_start_requests = u64::from(is_cold_start);
-    let cold_start_input_tokens = if is_cold_start {
+    let cold_start_requests = u64::from(count_cold_start);
+    let cold_start_input_tokens = if count_cold_start {
         record.input_tokens
     } else {
         0
     };
-    let cold_start_output_tokens = if is_cold_start {
+    let cold_start_output_tokens = if count_cold_start {
         record.output_tokens
     } else {
         0
@@ -1396,6 +1436,7 @@ fn upsert_provider_traffic(
     groups: &mut Vec<ProviderTrafficAccumulator>,
     log: &RequestLog,
     upstream: bool,
+    count_cold_start: bool,
 ) {
     let provider = if log.provider.trim().is_empty() {
         "unknown"
@@ -1436,7 +1477,7 @@ fn upsert_provider_traffic(
     if log.status >= 400 {
         group.error_statuses += 1;
     }
-    if request_log_is_provider_cold_start(log) {
+    if count_cold_start {
         group.cold_start_requests += 1;
         group.cold_start_input_tokens += log.input_tokens.unwrap_or_default();
         group.cold_start_output_tokens += 0;
@@ -1690,7 +1731,7 @@ fn recent_usage_stats(
         stats.output_tokens += item.record.output_tokens;
         stats.cache_read_tokens += item.record.cache_read_tokens;
         stats.cache_creation_tokens += item.record.cache_creation_tokens;
-        if provider_usage_is_cold_start(&item.record) {
+        if item.cold_start_counted {
             stats.cold_start_requests += 1;
             stats.cold_start_input_tokens += item.record.input_tokens;
             stats.cold_start_output_tokens += item.record.output_tokens;
@@ -1708,6 +1749,23 @@ fn provider_usage_is_cold_start(record: &UsageRecord) -> bool {
 
 fn request_log_is_provider_cold_start(log: &RequestLog) -> bool {
     log.input_tokens.unwrap_or_default() >= 1024 && log.cache_read_tokens.unwrap_or_default() == 0
+}
+
+fn request_log_cold_start_key(log: &RequestLog) -> Option<&str> {
+    log.session_anchor_hash
+        .as_deref()
+        .or(log.provider_prefix_key.as_deref())
+}
+
+fn remember_bounded_cold_start_key(keys: &mut HashSet<String>, key: &str) -> bool {
+    const COLD_START_KEY_LIMIT: usize = 100_000;
+    if keys.len() >= COLD_START_KEY_LIMIT {
+        keys.clear();
+    }
+    if !keys.insert(key.to_string()) {
+        return false;
+    }
+    true
 }
 
 fn request_log_is_successful_history(log: &RequestLog) -> bool {
@@ -2013,6 +2071,32 @@ mod tests {
         assert_eq!(snapshot.upstream_requests, 1);
         assert_eq!(snapshot.provider_cache_hit_requests, 1);
         assert_eq!(snapshot.provider_cache_request_hit_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn cold_start_is_counted_once_per_provider_prefix() {
+        let metrics = MetricsStore::new();
+        for key in [Some("prefix-a"), Some("prefix-a"), Some("prefix-b")] {
+            metrics
+                .record_usage_with_cold_start_key(
+                    UsageRecord {
+                        provider: "provider".to_string(),
+                        model: "model".to_string(),
+                        input_tokens: 30_000,
+                        output_tokens: 100,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                    key,
+                )
+                .await;
+        }
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.usage.cold_start_requests, 2);
+        assert_eq!(snapshot.recent_usage.cold_start_requests, 2);
+        assert_eq!(snapshot.usage.by_provider[0].cold_start_requests, 2);
+        assert_eq!(snapshot.usage.by_model[0].cold_start_requests, 2);
     }
 
     #[tokio::test]

@@ -25,6 +25,8 @@ pub(super) struct PrefixControlInput {
     pub avoidable_tokens: u64,
     pub avoidable_shortfall_streak: u32,
     pub cache_instability_score: u32,
+    pub settle_after_cold_read: bool,
+    pub compaction_requested: bool,
     pub state_age: Duration,
     pub request_budget: Duration,
 }
@@ -89,6 +91,37 @@ impl PrefixController {
         if !input.source_is_exact {
             return skip("non_exact_prefix_state", false);
         }
+        if input.settle_after_cold_read && input.state_age < MAX_FOREGROUND_WAIT {
+            let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
+            if request_budget.is_zero() {
+                return skip("local_guard_budget_exhausted", true);
+            }
+            let requested = MAX_FOREGROUND_WAIT.saturating_sub(input.state_age);
+            let wait = requested.min(request_budget);
+            return PrefixControlDecision {
+                wait,
+                reason: Some("responses_recent_cold_read_settle"),
+                skip_reason: None,
+                budget_exhausted: wait < requested,
+            };
+        }
+        if input.compaction_requested
+            && input.state_age < MAX_FOREGROUND_WAIT
+            && input.cache_instability_score > 0
+        {
+            let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
+            if request_budget.is_zero() {
+                return skip("local_guard_budget_exhausted", true);
+            }
+            let requested = MAX_FOREGROUND_WAIT.saturating_sub(input.state_age);
+            let wait = requested.min(request_budget);
+            return PrefixControlDecision {
+                wait,
+                reason: Some("responses_compaction_prefix_settle"),
+                skip_reason: None,
+                budget_exhausted: wait < requested,
+            };
+        }
         if input.avoidable_tokens == 0 {
             return skip("no_avoidable_gap", false);
         }
@@ -134,17 +167,17 @@ impl PrefixController {
                 || responses_tool_tail_burst(input.tail)
                 || input.tail.tool_output_chars >= 80_000
                 || input.tail.message_chars >= 80_000;
-        let cold_read_after_warm =
-            provider_prefix_break_after_warm_state(input.previous_exact, record)
-                || (provider_prefix_break_after_warm_state(input.previous_best, record)
-                    && cold_read_has_unreliable_dynamic_tail)
-                || (input.previous_exact.is_none()
-                    && input.previous_best.is_none()
-                    && provider_prefix_break_after_warm_state(input.previous_family, record)
-                    && cold_read_has_unreliable_dynamic_tail)
-                || (input.previous_exact.is_none()
-                    && input.previous_best.is_none()
-                    && responses_huge_dynamic_history_cold_read(record, input.tail));
+        let cold_read_after_warm = small_context_cold_read_after_warm(input.previous_exact, record)
+            || provider_prefix_break_after_warm_state(input.previous_exact, record)
+            || (provider_prefix_break_after_warm_state(input.previous_best, record)
+                && cold_read_has_unreliable_dynamic_tail)
+            || (input.previous_exact.is_none()
+                && input.previous_best.is_none()
+                && provider_prefix_break_after_warm_state(input.previous_family, record)
+                && cold_read_has_unreliable_dynamic_tail)
+            || (input.previous_exact.is_none()
+                && input.previous_best.is_none()
+                && responses_huge_dynamic_history_cold_read(record, input.tail));
         if cold_read_after_warm {
             return ProviderCacheGapBreakdown {
                 total_tokens,
@@ -190,8 +223,9 @@ impl PrefixController {
             };
         }
 
-        let prefix_break_after_warm =
-            provider_prefix_break_after_warm_state(input.previous, record)
+        let small_context_cold_read = small_context_cold_read_after_warm(input.previous, record);
+        let prefix_break_after_warm = small_context_cold_read
+            || provider_prefix_break_after_warm_state(input.previous, record)
                 && (record.input_tokens >= 32_000 || responses_tool_tail_burst(input.tail));
         let huge_dynamic_history_cold_read =
             responses_huge_dynamic_history_cold_read(record, input.tail);
@@ -205,12 +239,24 @@ impl PrefixController {
             || weak_full_retry_after_session_delta
             || huge_dynamic_history_cold_read
         {
-            let Some(mut preserved) = input.previous.cloned() else {
-                return PrefixStateObservation {
-                    next: None,
-                    learn_family: false,
-                };
-            };
+            let mut preserved = input.previous.cloned().unwrap_or_else(|| PrefixWarmState {
+                finished_at: Instant::now(),
+                input_tokens: record.input_tokens,
+                cache_read_tokens: record.cache_read_tokens,
+                shortfall_tokens: provider_cache_shortfall(record),
+                seen_bucket_tokens: record.cache_read_tokens,
+                avoidable_shortfall_tokens: 0,
+                avoidable_shortfall_streak: 0,
+                shortfall_tokens_128: provider_cache_shortfall_128(record),
+                seen_bucket_tokens_128: record.cache_read_tokens,
+                avoidable_shortfall_tokens_128: 0,
+                small_gap_recovery_streak: 0,
+                cache_instability_score: 0,
+                settle_after_cold_read: true,
+                tail_tool_output_chars: input.tail.tool_output_chars,
+                tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
+                tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
+            });
             preserved.finished_at = Instant::now();
             let instability_bump = if prefix_break_after_warm || huge_dynamic_history_cold_read {
                 2
@@ -221,6 +267,8 @@ impl PrefixController {
                 .cache_instability_score
                 .saturating_add(instability_bump)
                 .min(8);
+            preserved.settle_after_cold_read =
+                prefix_break_after_warm || huge_dynamic_history_cold_read;
             preserved.shortfall_tokens = provider_cache_shortfall(record);
             preserved.shortfall_tokens_128 = provider_cache_shortfall_128(record);
             preserved.avoidable_shortfall_tokens = 0;
@@ -286,7 +334,8 @@ impl PrefixController {
             .unwrap_or(0);
         let large_avoidable = evidence.avoidable_tokens.max(evidence.avoidable_tokens_128);
         let severe_cold_read = record.cache_read_tokens == 0
-            && provider_cache_bucket_max(record.input_tokens) >= 32_000;
+            && (provider_cache_bucket_max(record.input_tokens) >= 32_000
+                || small_context_cold_read);
         let cache_instability_score = if severe_cold_read {
             previous_instability.saturating_add(3).min(8)
         } else if evidence.provider_rollback {
@@ -349,6 +398,7 @@ impl PrefixController {
             avoidable_shortfall_tokens_128: evidence.avoidable_tokens_128,
             small_gap_recovery_streak,
             cache_instability_score,
+            settle_after_cold_read: severe_cold_read,
             tail_tool_output_chars: input.tail.tool_output_chars,
             tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
             tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
@@ -385,7 +435,12 @@ fn gap_evidence(
         direct_avoidable_tokens_128,
         tail,
     );
-    let provider_rollback = responses_cap_exhausted_provider_waterline_rollback(
+    let provider_rollback = small_context_provider_waterline_jitter(
+        previous,
+        record,
+        provider_cache_shortfall_128(record),
+        direct_avoidable_tokens_128,
+    ) || responses_cap_exhausted_provider_waterline_rollback(
         previous,
         record,
         provider_cache_shortfall_128(record),
@@ -408,6 +463,65 @@ fn gap_evidence(
         tail_granularity,
         provider_rollback,
     }
+}
+
+fn small_context_provider_waterline_jitter(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    current_shortfall_128: u64,
+    direct_avoidable_tokens_128: u64,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens)
+        .max(previous.cache_read_tokens);
+    let current_bucket = provider_cache_bucket_max_128(record.input_tokens);
+    if previous_seen < 1024
+        || previous_seen >= 32_000
+        || current_bucket < 1024
+        || current_bucket >= 32_000
+        || direct_avoidable_tokens_128 == 0
+        || direct_avoidable_tokens_128 > 512
+        || current_shortfall_128 == 0
+        || current_shortfall_128 > 1024
+    {
+        return false;
+    }
+    if current_bucket.saturating_add(1024) < previous_seen
+        || record.cache_read_tokens.saturating_add(1024) < previous_seen
+    {
+        return false;
+    }
+
+    // One small-context bucket can move between otherwise equivalent provider
+    // reads. A single observation is not evidence that a local wait was useful.
+    record.cache_read_tokens.saturating_mul(10) >= current_bucket.saturating_mul(9)
+}
+
+fn small_context_cold_read_after_warm(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let previous_seen = previous
+        .seen_bucket_tokens_128
+        .max(previous.seen_bucket_tokens)
+        .max(previous.cache_read_tokens);
+    let current_bucket = provider_cache_bucket_max(record.input_tokens);
+    if previous_seen < 1024
+        || previous_seen >= 32_000
+        || current_bucket < 1024
+        || current_bucket >= 32_000
+        || record.cache_read_tokens != 0
+    {
+        return false;
+    }
+    current_bucket.saturating_add(1024) >= previous_seen
 }
 
 fn requested_wait(avoidable_tokens: u64, avoidable_shortfall_streak: u32) -> Duration {
@@ -443,6 +557,8 @@ mod tests {
             avoidable_tokens,
             avoidable_shortfall_streak: 0,
             cache_instability_score: 0,
+            settle_after_cold_read: false,
+            compaction_requested: false,
             state_age: Duration::ZERO,
             request_budget: MAX_FOREGROUND_WAIT,
         }
@@ -460,6 +576,43 @@ mod tests {
         let decision = PrefixController::before_request(input(0));
         assert_eq!(decision.wait, Duration::ZERO);
         assert_eq!(decision.skip_reason, Some("no_avoidable_gap"));
+    }
+
+    #[test]
+    fn recent_cold_read_waits_only_for_remaining_settle_window() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            settle_after_cold_read: true,
+            state_age: Duration::from_millis(138),
+            ..input(0)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(362));
+        assert_eq!(decision.reason, Some("responses_recent_cold_read_settle"));
+
+        let settled = PrefixController::before_request(PrefixControlInput {
+            settle_after_cold_read: true,
+            state_age: MAX_FOREGROUND_WAIT,
+            ..input(0)
+        });
+        assert_eq!(settled.wait, Duration::ZERO);
+    }
+
+    #[test]
+    fn compaction_waits_for_recent_unstable_prefix_only() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: 2,
+            compaction_requested: true,
+            state_age: Duration::from_millis(364),
+            ..input(0)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(136));
+        assert_eq!(decision.reason, Some("responses_compaction_prefix_settle"));
+
+        let stable = PrefixController::before_request(PrefixControlInput {
+            compaction_requested: true,
+            state_age: Duration::from_millis(364),
+            ..input(0)
+        });
+        assert_eq!(stable.wait, Duration::ZERO);
     }
 
     #[test]

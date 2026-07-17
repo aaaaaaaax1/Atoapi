@@ -1,6 +1,21 @@
 # Atoapi Current Workflow Checkpoint
 
-Last updated: 2026-07-16
+Last updated: 2026-07-17
+
+## 2026-07-17 Codex Body Session Metadata
+
+- Formal `18883` metrics showed `167/200` recent requests as `scope-sibling` and `first_prefix_state`, while only `27/200` had trusted identity. The current code accepted `x-codex-turn-metadata` only as an HTTP header.
+- Current Codex Responses clients also flatten turn metadata into the request body as `client_metadata["x-codex-turn-metadata"]`; this was verified from the installed Codex client contract and reproduced with a failing regression test.
+- The proxy now accepts the body form only for an authorized Codex route, supports the documented JSON-string form and a safe object form, preserves header precedence, enforces bounded ID limits, and still falls back safely when metadata is absent or malformed.
+- Regression coverage confirms body metadata projection, unauthorized-route rejection, object-form compatibility, and different-thread isolation. Full Rust `472 passed / 3 ignored`, frontend build, metrics, request-record, and acceptance self-tests pass.
+- The running packaged `18883` process was not restarted. After the next requested package/restart, verify recent logs shift from `scope-sibling/first_prefix_state` to trusted `exact`/stable session anchors before judging hit-rate improvement.
+
+## 2026-07-17 Provider-Native Candidate Rejected
+
+- Isolated `provider_native` canary on the current `sheapi / Codex` route with `gpt-5.5` completed `90` inbound = `90` generation attempts = `90` upstream requests, with `0` failed experiments and no hidden retry.
+- The shadow arms were comparable at `99.85%` baseline and `99.80%` candidate. After forced application, the candidate fell to `11.10%` cache ratio versus `99.96%` contemporaneous baseline, with average avoidable gap `3,413` and provider-unstable ratio `22.20%`; TTFT p50 also rose from `2,082ms` to `3,335ms`. Readiness was `rollback_required:candidate_cache_regression`.
+- `provider_native` is now disabled for normal automatic admission. Its isolated force path remains available only for a future explicitly scoped experiment; normal traffic stays on the stable baseline and must not remove `prompt_cache_key`.
+- Next mainline step: analyze remaining baseline misses as real new-tail, upstream cold-read, or provider instability, and only propose a new candidate with a falsifiable zero-extra-request hypothesis.
 
 ## 2026-07-16 Cache Mainline V3
 
@@ -45,11 +60,11 @@ Last updated: 2026-07-16
 
 Current source/package candidate:
 
-`v0.2.12-cache-accounting-compaction-recovery-20260716`
+`v0.2.15-codex-body-session-metadata-20260717`
 
 Current release folder:
 
-`G:\Atoapi\releases\v0.2.12-cache-accounting-compaction-recovery-20260716`
+`G:\Atoapi\releases\v0.2.15-codex-body-session-metadata-20260717`
 
 Current package is v0.2.12. It keeps the historical compression/error-isolation protections, fixes cached-token accounting, and makes cache affinity, compaction recovery, and upstream capability decisions evidence-gated. The older v0.1.35 description below remains historical implementation context.
 

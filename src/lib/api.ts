@@ -358,6 +358,8 @@ export interface MetricsSnapshot {
     prefix_cache_instability_score?: number | null;
     prefix_seen_bucket_tokens?: number | null;
     prefix_state_cache_read_tokens?: number | null;
+    provider_prefix_key?: string | null;
+    provider_cache_diagnostic?: string | null;
     total_ms: number;
     input_tokens?: number | null;
     output_tokens?: number | null;
@@ -450,6 +452,8 @@ export interface MetricsSnapshot {
     prefix_cache_instability_score?: number | null;
     prefix_seen_bucket_tokens?: number | null;
     prefix_state_cache_read_tokens?: number | null;
+    provider_prefix_key?: string | null;
+    provider_cache_diagnostic?: string | null;
     total_ms: number;
     input_tokens?: number | null;
     output_tokens?: number | null;

@@ -165,8 +165,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.14";
+const appVersion = "v0.2.15";
 const appVersionNotes = [
+  "v0.2.15: Codex Responses 请求体会话元数据解析，恢复可信会话锚点并保持 agent 隔离。",
   "v0.2.14: adaptive Responses prefix guard; first avoidable gaps wait 0ms and repeated stable gaps cap at 500ms.",
   "v0.2.13: 已验证的 prompt_cache_options 在兼容与救援回退路径保持一致；缓存能力继续按上游、模型、通道和密钥严格门控。",
   "v0.2.11: 新增第三方缓存能力自动闭环；兼容性与实际收益分别验证，只有命中提升且首字未明显退化时才启用，并在上游、模型、通道或密钥变化后自动重新探测。",
@@ -258,18 +259,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const fallbackFailures = (metrics?.recent_failed_requests ?? []).filter(
-      isPersistedModelReasoningFallbackFailure
-    );
-    const hasUnseenFailure = fallbackFailures.some(
+    const fallbackRequests = [
+      ...(metrics?.recent_failed_requests ?? []),
+      ...(metrics?.recent_requests ?? [])
+    ].filter(isPersistedModelReasoningFallbackRequest);
+    const hasUnseenFallback = fallbackRequests.some(
       (request) => !seenReasoningFallbackFailures.current.has(request.id)
     );
-    if (!hasUnseenFailure || reasoningFallbackConfigSyncing.current) return;
+    if (!hasUnseenFallback || reasoningFallbackConfigSyncing.current) return;
 
     reasoningFallbackConfigSyncing.current = true;
     void syncPersistedModelReasoningFallback().then(
       () => {
-        fallbackFailures.forEach((request) => {
+        fallbackRequests.forEach((request) => {
           seenReasoningFallbackFailures.current.add(request.id);
         });
       },
@@ -2746,6 +2748,23 @@ function CachePanel({
   const shownRequests = requestFeed.filter((request) =>
     selectedProvider === "all" || request.provider === selectedProvider
   );
+  const coldStartDisplayRequestIds = new Set<string>();
+  const seenColdStartKeys = new Set<string>();
+  for (const request of [...shownRequests].reverse()) {
+    if (request.cache_read_tokens !== 0 || (request.input_tokens ?? 0) < 1024) continue;
+    const classification = request.prefix_lag_classification;
+    if (
+      classification !== "cold_start" &&
+      classification !== "first_prefix_state" &&
+      classification !== "first_prefix_huge_dynamic_history"
+    ) {
+      continue;
+    }
+    const key = request.session_anchor_hash ?? request.provider_prefix_key;
+    if (!key || seenColdStartKeys.has(key)) continue;
+    seenColdStartKeys.add(key);
+    coldStartDisplayRequestIds.add(request.id);
+  }
   const pageableRequests = shownRequests.slice(0, requestPageSize * maxRequestPages);
   const requestPageCount = Math.max(1, Math.ceil(pageableRequests.length / requestPageSize));
   const safeRequestPage = Math.min(requestPage, requestPageCount);
@@ -3066,6 +3085,7 @@ function CachePanel({
                 request.cache_avoidable_gap_tokens ?? 0,
                 request.cache_provider_unstable_gap_tokens ?? 0
               );
+              const coldStartRequest = coldStartDisplayRequestIds.has(request.id);
               const primaryState = requestRecordState({
                 status: request.status,
                 cacheStatus: request.cache_status,
@@ -3075,7 +3095,8 @@ function CachePanel({
                 shadowAffinityLane: request.shadow_affinity_lane,
                 prefixLagClassification: request.prefix_lag_classification,
                 inputTokens: request.input_tokens ?? 0,
-                cacheReadTokens: request.cache_read_tokens ?? 0
+                cacheReadTokens: request.cache_read_tokens ?? 0,
+                coldStart: coldStartRequest
               });
               const primaryStatus = primaryState?.label ?? "";
               const sessionDiagnostic = responseSessionDiagnostics(request);
@@ -3664,11 +3685,13 @@ function normalizeModels(models: ModelConfig[]) {
   return [...byId.values()];
 }
 
-function isPersistedModelReasoningFallbackFailure(request: RequestLogEntry) {
+function isPersistedModelReasoningFallbackRequest(request: RequestLogEntry) {
+  const source = request.reasoning_effort_source?.trim() ?? "";
   return (
-    request.status >= 400 &&
-    request.reasoning_effort_source?.startsWith("model_override") === true &&
-    Boolean(request.configured_reasoning_effort?.trim())
+    (source === "model_override_fallback" ||
+      source === "model_override_opaque_502_fallback") &&
+    Boolean(request.configured_reasoning_effort?.trim()) &&
+    Boolean(request.effective_reasoning_effort?.trim())
   );
 }
 

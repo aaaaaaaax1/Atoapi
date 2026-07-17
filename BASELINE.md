@@ -1,14 +1,26 @@
 # Atoapi Final Baseline
 
-Current packaged candidate: `v0.2.14-adaptive-prefix-guard-20260717`
+Current packaged candidate: `v0.2.15-codex-body-session-metadata-20260717`
 
 Release folder:
 
-`releases/v0.2.12-cache-accounting-compaction-recovery-20260716`
+`releases/v0.2.15-codex-body-session-metadata-20260717`
 
 Current workflow checkpoint:
 
 `CURRENT_WORKFLOW.md`
+
+## 2026-07-17 Codex Session Identity Fix
+
+- Formal metrics exposed a session-identity gap: `167/200` recent requests were `scope-sibling`/`first_prefix_state`, not trusted exact sessions. Codex Responses clients send `x-codex-turn-metadata` inside `client_metadata` in the request body, while the proxy previously read only the HTTP header.
+- Source now parses the body metadata only for authorized Codex routes, supports string and object forms, keeps header precedence and bounded validation, and preserves separate thread/session/agent identities. This is a verified source fix, not yet active in the running packaged process.
+- Verification: Rust `472 passed / 3 ignored`, frontend build, metrics/request-record tests, and acceptance self-test all pass. Next live check is after a normal restart/package: trusted identity should increase and `scope-sibling/first_prefix_state` should fall without adding upstream requests.
+
+## 2026-07-17 Decision
+
+- A forced isolated `provider_native` canary on `sheapi / Codex` + `gpt-5.5` completed `90` inbound = `90` attempts = `90` upstream requests with no hidden retry. The applied candidate cache ratio was `11.10%` versus `99.96%` contemporaneous baseline, and readiness correctly entered `rollback_required:candidate_cache_regression`; TTFT p50 was `3,335ms` versus `2,082ms`.
+- This is a verified negative candidate. Normal automatic admission now rejects `provider_native` with `provider_native_candidate_disabled`; only the isolated force-test environment can apply it. Keep the stable session-anchored baseline and do not remove `prompt_cache_key` in production.
+- The next accepted work is baseline miss classification and a new evidence-backed candidate only if it preserves `>=99.5%` hit rate, non-regressed TTFT/errors, and one inbound = one upstream.
 
 ## Accepted Working Baseline
 

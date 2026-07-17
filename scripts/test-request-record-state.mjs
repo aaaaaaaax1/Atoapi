@@ -53,6 +53,11 @@ assert.deepEqual(
   state({ inputTokens: 8_192, cacheReadTokens: 0 }),
   { label: "冷启动", tone: "cold" }
 );
+assert.equal(
+  state({ inputTokens: 8_192, cacheReadTokens: 0, coldStart: false }),
+  null,
+  "a repeated cold read in the same session is not shown as another cold start"
+);
 assert.deepEqual(
   state({
     cacheStatus: "compact",

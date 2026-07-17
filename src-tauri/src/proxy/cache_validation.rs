@@ -421,6 +421,7 @@ mod tests {
             realm_id: "realm".to_string(),
             cohort_id: "cohort".to_string(),
             lane: ShadowCacheLane::Steady,
+            candidate_variant: crate::proxy::cache_affinity::ShadowCacheCandidateVariant::CohortKey,
             arm: ShadowAffinityArm::Baseline,
             shard: 0,
             policy_epoch: 1,

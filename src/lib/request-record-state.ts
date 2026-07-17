@@ -10,6 +10,7 @@ export interface RequestRecordStateInput {
   prefixLagClassification?: string | null;
   inputTokens: number;
   cacheReadTokens: number;
+  coldStart?: boolean;
 }
 
 export interface RequestRecordState {
@@ -33,7 +34,7 @@ export function requestRecordState(input: RequestRecordStateInput): RequestRecor
   ) {
     return { label: "下游已断开", tone: "disconnect" };
   }
-  if (requestIsColdStart(input)) {
+  if (input.coldStart !== false && requestIsColdStart(input)) {
     const afterCompaction =
       clean(input.shadowAffinityLane) === "compacted_anchor" &&
       clean(input.prefixLagClassification).startsWith("first_prefix");
@@ -84,14 +85,13 @@ function isConfirmedCompactionSource(source?: string | null) {
 
 function requestIsColdStart(input: RequestRecordStateInput) {
   if (input.inputTokens < 1024) return false;
+  if (input.coldStart === false) return false;
   if (input.cacheReadTokens === 0) return true;
-
   const classification = clean(input.prefixLagClassification);
-  if (classification === "cold_start" || classification === "cold_read_after_warm") {
+  if (classification === "cold_start") {
     return true;
   }
   if (!classification.startsWith("first_prefix")) return false;
-
   return input.cacheReadTokens / input.inputTokens < 0.9;
 }
 

@@ -6,11 +6,10 @@ use std::time::Instant;
 
 use super::affinity_identity::AffinityIdentity;
 
-pub(crate) const SHADOW_POLICY_EPOCH: u64 = 1;
+pub(crate) const SHADOW_POLICY_EPOCH: u64 = 2;
 pub(super) const SHADOW_ASSIGNMENT_LIMIT: usize = 4096;
 pub(super) const SHADOW_ASSIGNMENT_TTL_HOURS: i64 = 24;
 pub(super) const STATIC_COHORT_CANARY_PERCENT: u8 = 5;
-const STATIC_COHORT_CACHE_KEY_SHARDS: u8 = 4;
 #[cfg(not(test))]
 const AUTOMATIC_STATIC_COHORT_ADMISSION_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
 const GIANT_TAIL_CHARS: u64 = 80_000;
@@ -22,6 +21,7 @@ const POST_BURST_WINDOW_LIMIT: usize = 512;
 const POST_BURST_EVIDENCE_LIMIT: usize = 1536;
 const POST_BURST_MIN_ARM_OBSERVATIONS: u64 = 9;
 const POST_BURST_MIN_CANARY_OBSERVATIONS: u64 = 3;
+const POST_BURST_MIN_EFFICACY_OBSERVATIONS: u64 = 9;
 const POST_BURST_MIN_PROMOTION_OBSERVATIONS: u64 = 18;
 const POST_BURST_MIN_USAGE_COVERAGE_BPS: u64 = 8_000;
 const POST_BURST_MAX_PROVIDER_UNSTABLE_BPS: u64 = 2_500;
@@ -30,10 +30,10 @@ const POST_BURST_ROLLBACK_SUCCESS_DELTA_BPS: u64 = 1_000;
 const POST_BURST_ROLLBACK_CACHE_DELTA_BPS: u64 = 500;
 const POST_BURST_ROLLBACK_AVOIDABLE_DELTA: u64 = 2_048;
 const POST_BURST_ROLLBACK_TTFT_DELTA_MS: u64 = 1_000;
-const POST_BURST_PROMOTION_TARGET_BPS: u64 = 9_950;
 const POST_BURST_PROMOTION_MAX_ERROR_DELTA_BPS: u64 = 50;
 const POST_BURST_PROMOTION_TTFT_P50_DELTA_MS: u64 = 200;
 const POST_BURST_PROMOTION_TTFT_P95_DELTA_MS: u64 = 300;
+const POST_BURST_RESIDUAL_CACHE_GAP_BPS: u64 = 9_995;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,6 +42,15 @@ pub(crate) enum ShadowCacheLane {
     ToolBurstQuarantine,
     CompactedAnchor,
     Transparent,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ShadowCacheCandidateVariant {
+    #[default]
+    CohortKey,
+    CohortTwoShard,
+    ProviderNative,
 }
 
 impl Default for ShadowCacheLane {
@@ -95,6 +104,8 @@ pub(crate) struct PostBurstWindow {
     pub(crate) captured_requests: u8,
     #[serde(default = "default_post_burst_window_lane")]
     pub(crate) lane: ShadowCacheLane,
+    #[serde(default)]
+    pub(crate) candidate_variant: ShadowCacheCandidateVariant,
 }
 
 fn default_post_burst_window_lane() -> ShadowCacheLane {
@@ -109,6 +120,8 @@ pub(crate) struct PostBurstEvidence {
     pub(crate) followup_index: u8,
     pub(crate) realm_id: String,
     pub(crate) lane: ShadowCacheLane,
+    #[serde(default)]
+    pub(crate) candidate_variant: ShadowCacheCandidateVariant,
     pub(crate) arm: ShadowAffinityArm,
     pub(crate) policy_epoch: u64,
     pub(crate) anchor_epoch: u64,
@@ -186,6 +199,8 @@ pub(crate) struct PostBurstReadiness {
     pub(crate) comparison_key: String,
     pub(crate) realm_id: String,
     pub(crate) lane: ShadowCacheLane,
+    #[serde(default)]
+    pub(crate) candidate_variant: ShadowCacheCandidateVariant,
     pub(crate) status: PostBurstReadinessStatus,
     pub(crate) reason: String,
     pub(crate) baseline: PostBurstArmSummary,
@@ -233,6 +248,7 @@ pub(super) struct ShadowAffinityDecision {
     pub realm_id: String,
     pub cohort_id: String,
     pub lane: ShadowCacheLane,
+    pub candidate_variant: ShadowCacheCandidateVariant,
     pub arm: ShadowAffinityArm,
     pub shard: u32,
     pub policy_epoch: u64,
@@ -271,6 +287,14 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u64 {
     ((numerator as u128 * 10_000) / denominator as u128).min(10_000) as u64
 }
 
+fn cacheable_input_tokens_128(input_tokens: u64) -> u64 {
+    if input_tokens < 1024 {
+        0
+    } else {
+        1024 + ((input_tokens - 1024) / 128) * 128
+    }
+}
+
 fn percentile_ms(samples: &mut [u64], percentile: usize) -> u64 {
     if samples.is_empty() {
         return 0;
@@ -291,8 +315,29 @@ fn shadow_cache_lane_key(lane: ShadowCacheLane) -> &'static str {
     }
 }
 
+fn shadow_cache_candidate_key(candidate: ShadowCacheCandidateVariant) -> &'static str {
+    match candidate {
+        ShadowCacheCandidateVariant::CohortKey => "cohort_key",
+        ShadowCacheCandidateVariant::CohortTwoShard => "cohort_two_shard",
+        ShadowCacheCandidateVariant::ProviderNative => "provider_native",
+    }
+}
+
+#[cfg(test)]
 fn post_burst_comparison_key(realm_id: &str, lane: ShadowCacheLane) -> String {
-    format!("{realm_id}:{}", shadow_cache_lane_key(lane))
+    post_burst_comparison_key_for_candidate(realm_id, lane, ShadowCacheCandidateVariant::CohortKey)
+}
+
+fn post_burst_comparison_key_for_candidate(
+    realm_id: &str,
+    lane: ShadowCacheLane,
+    candidate: ShadowCacheCandidateVariant,
+) -> String {
+    format!(
+        "{realm_id}:{}:{}:epoch-{SHADOW_POLICY_EPOCH}",
+        shadow_cache_lane_key(lane),
+        shadow_cache_candidate_key(candidate)
+    )
 }
 
 fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime<Utc>) {
@@ -313,15 +358,19 @@ fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime
     }
 
     let cutoff = now - Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
-    ledger
-        .evidence
-        .retain(|observation| observation.observed_at >= cutoff);
+    ledger.evidence.retain(|observation| {
+        observation.observed_at >= cutoff && observation.policy_epoch == SHADOW_POLICY_EPOCH
+    });
     while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
         ledger.evidence.pop_front();
     }
     ledger.readiness.retain(|key, _| {
         ledger.evidence.iter().any(|observation| {
-            post_burst_comparison_key(&observation.realm_id, observation.lane) == *key
+            post_burst_comparison_key_for_candidate(
+                &observation.realm_id,
+                observation.lane,
+                observation.candidate_variant,
+            ) == *key
         })
     });
 }
@@ -370,6 +419,7 @@ fn summarize_post_burst_phase<'a>(
 ) -> PostBurstPhaseSummary {
     let mut summary = PostBurstPhaseSummary::default();
     let mut input_tokens = 0_u64;
+    let mut cacheable_input_tokens = 0_u64;
     let mut cache_read_tokens = 0_u64;
     let mut avoidable_gap_tokens = 0_u64;
     let mut provider_unstable_gap_tokens = 0_u64;
@@ -393,6 +443,8 @@ fn summarize_post_burst_phase<'a>(
             .provider_unstable_observations
             .saturating_add(u64::from(observation.provider_unstable_gap_tokens > 0));
         input_tokens = input_tokens.saturating_add(observation.input_tokens);
+        cacheable_input_tokens = cacheable_input_tokens
+            .saturating_add(cacheable_input_tokens_128(observation.input_tokens));
         cache_read_tokens = cache_read_tokens.saturating_add(observation.cache_read_tokens);
         avoidable_gap_tokens =
             avoidable_gap_tokens.saturating_add(observation.avoidable_gap_tokens);
@@ -408,7 +460,7 @@ fn summarize_post_burst_phase<'a>(
     }
     summary.success_rate_bps = ratio_bps(summary.successful_observations, summary.observations);
     summary.usage_coverage_bps = ratio_bps(summary.usage_observations, summary.observations);
-    summary.cache_ratio_bps = ratio_bps(cache_read_tokens, input_tokens);
+    summary.cache_ratio_bps = ratio_bps(cache_read_tokens, cacheable_input_tokens);
     summary.average_input_tokens = input_tokens / summary.observations;
     summary.average_avoidable_gap_tokens = avoidable_gap_tokens / summary.observations;
     summary.average_provider_unstable_gap_tokens =
@@ -432,12 +484,6 @@ fn post_burst_promotion_blocker(
     {
         return Some("candidate_error_not_non_inferior");
     }
-    if candidate.cache_ratio_bps < POST_BURST_PROMOTION_TARGET_BPS {
-        return Some("candidate_cache_below_target");
-    }
-    if candidate.cache_ratio_bps <= baseline.cache_ratio_bps {
-        return Some("candidate_cache_not_improved");
-    }
     if candidate.provider_unstable_ratio_bps > baseline.provider_unstable_ratio_bps {
         return Some("candidate_provider_unstable_not_non_inferior");
     }
@@ -460,7 +506,45 @@ fn post_burst_promotion_blocker(
         return Some("candidate_ttft_p95_not_non_inferior");
     }
 
+    let cache_improved = candidate.cache_ratio_bps > baseline.cache_ratio_bps;
+    let ttft_p50_improved = baseline.ttft_p50_ms > 0
+        && candidate
+            .ttft_p50_ms
+            .saturating_add(POST_BURST_PROMOTION_TTFT_P50_DELTA_MS)
+            <= baseline.ttft_p50_ms
+        && candidate.ttft_p50_ms <= baseline.ttft_p50_ms.saturating_mul(95) / 100;
+    let ttft_p95_improved = baseline.ttft_p95_ms > 0
+        && candidate
+            .ttft_p95_ms
+            .saturating_add(POST_BURST_PROMOTION_TTFT_P95_DELTA_MS)
+            <= baseline.ttft_p95_ms
+        && candidate.ttft_p95_ms <= baseline.ttft_p95_ms.saturating_mul(95) / 100;
+    if !cache_improved
+        && !(candidate.cache_ratio_bps == baseline.cache_ratio_bps
+            && (ttft_p50_improved || ttft_p95_improved))
+    {
+        return Some("candidate_has_no_net_benefit");
+    }
+
     None
+}
+
+fn post_burst_clear_ttft_regression(
+    baseline: &PostBurstArmSummary,
+    candidate: &PostBurstArmSummary,
+) -> bool {
+    baseline.ttft_p50_ms > 0
+        && baseline.ttft_p95_ms > 0
+        && candidate.ttft_p50_ms
+            > baseline
+                .ttft_p50_ms
+                .saturating_add(POST_BURST_ROLLBACK_TTFT_DELTA_MS)
+        && candidate.ttft_p50_ms > baseline.ttft_p50_ms.saturating_mul(3) / 2
+        && candidate.ttft_p95_ms
+            > baseline
+                .ttft_p95_ms
+                .saturating_add(POST_BURST_ROLLBACK_TTFT_DELTA_MS)
+        && candidate.ttft_p95_ms > baseline.ttft_p95_ms.saturating_mul(3) / 2
 }
 
 fn post_burst_has_addressable_gap(
@@ -471,6 +555,14 @@ fn post_burst_has_addressable_gap(
         || candidate.average_avoidable_gap_tokens > 0
         || baseline.provider_unstable_ratio_bps > 0
         || candidate.provider_unstable_ratio_bps > 0
+        || baseline.cache_ratio_bps < POST_BURST_RESIDUAL_CACHE_GAP_BPS
+        || candidate.cache_ratio_bps < POST_BURST_RESIDUAL_CACHE_GAP_BPS
+}
+
+fn post_burst_baseline_has_addressable_gap(baseline: &PostBurstArmSummary) -> bool {
+    baseline.average_avoidable_gap_tokens > 0
+        || baseline.provider_unstable_ratio_bps > 0
+        || baseline.cache_ratio_bps < POST_BURST_RESIDUAL_CACHE_GAP_BPS
 }
 
 fn post_burst_arms_are_comparable(
@@ -529,11 +621,15 @@ fn evaluate_post_burst_readiness(
     ledger: &PostBurstEvidenceLedger,
     realm_id: &str,
     lane: ShadowCacheLane,
+    candidate_variant: ShadowCacheCandidateVariant,
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
-    let comparison_key = post_burst_comparison_key(realm_id, lane);
+    let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
     let matching = |observation: &&PostBurstEvidence| {
-        observation.realm_id == realm_id && observation.lane == lane
+        observation.realm_id == realm_id
+            && observation.lane == lane
+            && observation.candidate_variant == candidate_variant
+            && observation.policy_epoch == SHADOW_POLICY_EPOCH
     };
     let baseline = summarize_post_burst_arm(
         ledger
@@ -634,10 +730,11 @@ fn evaluate_post_burst_readiness(
             PostBurstReadinessStatus::RollbackRequired,
             "candidate_success_regression".to_string(),
         )
-    } else if canary_baseline.cache_ratio_bps
-        > candidate_applied
-            .cache_ratio_bps
-            .saturating_add(POST_BURST_ROLLBACK_CACHE_DELTA_BPS)
+    } else if candidate_applied.observations >= POST_BURST_MIN_EFFICACY_OBSERVATIONS
+        && canary_baseline.cache_ratio_bps
+            > candidate_applied
+                .cache_ratio_bps
+                .saturating_add(POST_BURST_ROLLBACK_CACHE_DELTA_BPS)
         && candidate_applied.average_avoidable_gap_tokens
             > canary_baseline
                 .average_avoidable_gap_tokens
@@ -647,11 +744,8 @@ fn evaluate_post_burst_readiness(
             PostBurstReadinessStatus::RollbackRequired,
             "candidate_cache_regression".to_string(),
         )
-    } else if candidate_applied.average_ttft_ms
-        > canary_baseline
-            .average_ttft_ms
-            .saturating_add(POST_BURST_ROLLBACK_TTFT_DELTA_MS)
-        && candidate_applied.average_ttft_ms > canary_baseline.average_ttft_ms.saturating_mul(3) / 2
+    } else if candidate_applied.observations >= POST_BURST_MIN_EFFICACY_OBSERVATIONS
+        && post_burst_clear_ttft_regression(&canary_baseline, &candidate_applied)
     {
         (
             PostBurstReadinessStatus::RollbackRequired,
@@ -676,6 +770,7 @@ fn evaluate_post_burst_readiness(
         comparison_key,
         realm_id: realm_id.to_string(),
         lane,
+        candidate_variant,
         status,
         reason,
         baseline,
@@ -690,9 +785,10 @@ fn refresh_post_burst_readiness(
     ledger: &mut PostBurstEvidenceLedger,
     realm_id: &str,
     lane: ShadowCacheLane,
+    candidate_variant: ShadowCacheCandidateVariant,
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
-    let readiness = evaluate_post_burst_readiness(ledger, realm_id, lane, now);
+    let readiness = evaluate_post_burst_readiness(ledger, realm_id, lane, candidate_variant, now);
     if readiness.status == PostBurstReadinessStatus::RollbackRequired {
         ledger
             .rollbacks
@@ -726,11 +822,13 @@ fn observe_post_burst_evidence(
                     window.captured_requests,
                     window.remaining_requests == 0,
                     window.lane,
+                    window.candidate_variant,
                 )
             })
         })
         .flatten();
-    if let Some((window_id, followup_index, finished, evidence_lane)) = captured {
+    if let Some((window_id, followup_index, finished, evidence_lane, candidate_variant)) = captured
+    {
         ledger.evidence.push_back(PostBurstEvidence {
             window_id,
             conversation_id: conversation_id.to_string(),
@@ -738,6 +836,7 @@ fn observe_post_burst_evidence(
             followup_index,
             realm_id: decision.realm_id.clone(),
             lane: evidence_lane,
+            candidate_variant,
             arm: decision.arm,
             policy_epoch: decision.policy_epoch,
             anchor_epoch: decision.anchor_epoch,
@@ -760,7 +859,13 @@ fn observe_post_burst_evidence(
         while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
             ledger.evidence.pop_front();
         }
-        refresh_post_burst_readiness(ledger, &decision.realm_id, evidence_lane, now);
+        refresh_post_burst_readiness(
+            ledger,
+            &decision.realm_id,
+            evidence_lane,
+            candidate_variant,
+            now,
+        );
     }
 
     if input.giant_tail {
@@ -775,6 +880,7 @@ fn observe_post_burst_evidence(
                 remaining_requests: POST_BURST_FOLLOWUP_REQUESTS,
                 captured_requests: 0,
                 lane: ShadowCacheLane::ToolBurstQuarantine,
+                candidate_variant: decision.candidate_variant,
             },
         );
     }
@@ -789,10 +895,22 @@ pub(crate) fn post_burst_evidence_status(
         .post_burst
         .evidence
         .iter()
-        .map(|observation| (observation.realm_id.clone(), observation.lane))
+        .map(|observation| {
+            (
+                observation.realm_id.clone(),
+                observation.lane,
+                observation.candidate_variant,
+            )
+        })
         .collect::<Vec<_>>();
-    for (realm_id, lane) in comparison_scopes {
-        refresh_post_burst_readiness(&mut store.post_burst, &realm_id, lane, now);
+    for (realm_id, lane, candidate_variant) in comparison_scopes {
+        refresh_post_burst_readiness(
+            &mut store.post_burst,
+            &realm_id,
+            lane,
+            candidate_variant,
+            now,
+        );
     }
     let mut readiness = store
         .post_burst
@@ -813,6 +931,70 @@ pub(crate) fn post_burst_evidence_status(
         evidence_records: store.post_burst.evidence.len(),
         readiness,
         rollback_keys,
+    }
+}
+
+fn active_candidate_for_realm(
+    ledger: &mut PostBurstEvidenceLedger,
+    realm_id: &str,
+    lane: ShadowCacheLane,
+    now: DateTime<Utc>,
+) -> (ShadowCacheCandidateVariant, PostBurstReadiness) {
+    let cohort = refresh_post_burst_readiness(
+        ledger,
+        realm_id,
+        lane,
+        ShadowCacheCandidateVariant::CohortKey,
+        now,
+    );
+    if !candidate_is_exhausted(&cohort)
+        || !post_burst_baseline_has_addressable_gap(&cohort.baseline)
+    {
+        return (ShadowCacheCandidateVariant::CohortKey, cohort);
+    }
+    let cohort_two_shard = refresh_post_burst_readiness(
+        ledger,
+        realm_id,
+        lane,
+        ShadowCacheCandidateVariant::CohortTwoShard,
+        now,
+    );
+    if !candidate_is_exhausted(&cohort_two_shard)
+        || !post_burst_baseline_has_addressable_gap(&cohort_two_shard.baseline)
+    {
+        return (
+            ShadowCacheCandidateVariant::CohortTwoShard,
+            cohort_two_shard,
+        );
+    }
+    let provider_native = refresh_post_burst_readiness(
+        ledger,
+        realm_id,
+        lane,
+        ShadowCacheCandidateVariant::ProviderNative,
+        now,
+    );
+    (ShadowCacheCandidateVariant::ProviderNative, provider_native)
+}
+
+fn candidate_is_exhausted(readiness: &PostBurstReadiness) -> bool {
+    readiness.status == PostBurstReadinessStatus::RollbackRequired
+        || (readiness.status == PostBurstReadinessStatus::CanaryHealthy
+            && readiness.reason != "no_addressable_post_burst_gap")
+}
+
+fn forced_isolated_candidate_variant() -> Option<ShadowCacheCandidateVariant> {
+    let isolated = std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"));
+    if !isolated {
+        return None;
+    }
+    match std::env::var("ATOAPI_FORCE_CACHE_CANDIDATE").ok()?.trim() {
+        "cohort_key" => Some(ShadowCacheCandidateVariant::CohortKey),
+        "cohort_two_shard" => Some(ShadowCacheCandidateVariant::CohortTwoShard),
+        "provider_native" => Some(ShadowCacheCandidateVariant::ProviderNative),
+        _ => None,
     }
 }
 
@@ -842,6 +1024,7 @@ pub(super) fn compute_shadow_affinity(
                 } else {
                     ShadowCacheLane::Steady
                 },
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
                 arm: canary_arm_for_conversation(
                     stateless_assignment_key,
                     STATIC_COHORT_CANARY_PERCENT,
@@ -864,6 +1047,7 @@ pub(super) fn compute_shadow_affinity(
             realm_id: identity.realm_id.clone(),
             cohort_id: identity.cohort_id.clone(),
             lane: ShadowCacheLane::Transparent,
+            candidate_variant: ShadowCacheCandidateVariant::CohortKey,
             arm: ShadowAffinityArm::Baseline,
             shard: 0,
             policy_epoch: SHADOW_POLICY_EPOCH,
@@ -879,6 +1063,13 @@ pub(super) fn compute_shadow_affinity(
     };
 
     let (realm_id, cohort_id, assignment_lane, arm, shard, policy_epoch, anchor_epoch) = {
+        if store
+            .assignments
+            .get(&conversation_id)
+            .is_some_and(|assignment| assignment.policy_epoch != SHADOW_POLICY_EPOCH)
+        {
+            store.assignments.remove(&conversation_id);
+        }
         let assignment = store
             .assignments
             .entry(conversation_id.clone())
@@ -920,21 +1111,47 @@ pub(super) fn compute_shadow_affinity(
             assignment.anchor_epoch,
         )
     };
-    let lane = store
-        .post_burst
-        .windows
-        .get(&conversation_id)
+    let active_window = store.post_burst.windows.get(&conversation_id);
+    let lane = active_window
         .map(|window| window.lane)
         .unwrap_or(assignment_lane);
+    let window_candidate_variant = active_window.map(|window| window.candidate_variant);
     evict_assignments(store, now);
     evict_post_burst_evidence(&mut store.post_burst, now);
-    let readiness = refresh_post_burst_readiness(&mut store.post_burst, &realm_id, lane, now);
+    let forced_candidate_variant = forced_isolated_candidate_variant();
+    let (candidate_variant, readiness) = if let Some(candidate_variant) = window_candidate_variant {
+        let readiness = refresh_post_burst_readiness(
+            &mut store.post_burst,
+            &realm_id,
+            lane,
+            candidate_variant,
+            now,
+        );
+        (candidate_variant, readiness)
+    } else if let Some(candidate_variant) = forced_candidate_variant {
+        let readiness = refresh_post_burst_readiness(
+            &mut store.post_burst,
+            &realm_id,
+            lane,
+            candidate_variant,
+            now,
+        );
+        (candidate_variant, readiness)
+    } else {
+        active_candidate_for_realm(&mut store.post_burst, &realm_id, lane, now)
+    };
+    let shard = if candidate_variant == ShadowCacheCandidateVariant::CohortTwoShard {
+        cohort_two_shard_index(&conversation_id) as u32
+    } else {
+        shard
+    };
     ShadowAffinityDecision {
         mode: "shadow".to_string(),
         assignment_key: Some(conversation_id),
         realm_id,
         cohort_id,
         lane,
+        candidate_variant,
         arm,
         shard,
         policy_epoch,
@@ -992,9 +1209,9 @@ fn automatic_static_cohort_admission_enabled() -> bool {
     }
     #[cfg(not(test))]
     {
-        std::env::var(AUTOMATIC_STATIC_COHORT_ADMISSION_ENV)
+        !std::env::var(AUTOMATIC_STATIC_COHORT_ADMISSION_ENV)
             .ok()
-            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+            .is_some_and(|value| matches!(value.trim(), "0" | "false" | "off" | "disabled"))
     }
 }
 
@@ -1015,6 +1232,23 @@ fn automatic_static_cohort_force_no_gap_enabled() -> bool {
     }
 }
 
+fn provider_native_candidate_isolation_override_enabled() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        let isolated = std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"));
+        isolated
+            && std::env::var("ATOAPI_FORCE_CACHE_CANDIDATE")
+                .ok()
+                .is_some_and(|value| value.trim() == "provider_native")
+    }
+}
+
 fn apply_automatic_static_cohort_canary_with_switch(
     decision: &mut ShadowAffinityDecision,
     smart_hit_enabled: bool,
@@ -1026,22 +1260,33 @@ fn apply_automatic_static_cohort_canary_with_switch(
     );
     let lane_eligible = matches!(
         decision.lane,
-        ShadowCacheLane::Steady
-            | ShadowCacheLane::ToolBurstQuarantine
-            | ShadowCacheLane::CompactedAnchor
+        ShadowCacheLane::Steady | ShadowCacheLane::ToolBurstQuarantine
     );
-    if !smart_hit_enabled
-        || !assigned
-        || !lane_eligible
-        || decision.arm != ShadowAffinityArm::Candidate
-    {
+    if decision.lane == ShadowCacheLane::CompactedAnchor {
+        decision.decision = "candidate_shadow_only".to_string();
+        decision.skip_reason = Some("compaction_candidate_not_beneficial".to_string());
+        return false;
+    }
+    if !smart_hit_enabled || !assigned || !lane_eligible {
         return false;
     }
 
-    decision.decision = "candidate_shadow_only".to_string();
+    if decision.candidate_variant == ShadowCacheCandidateVariant::ProviderNative
+        && !provider_native_candidate_isolation_override_enabled()
+    {
+        decision.decision = "candidate_shadow_only".to_string();
+        decision.skip_reason = Some("provider_native_candidate_disabled".to_string());
+        return false;
+    }
+
     let readiness = decision
         .automatic_canary_status
         .unwrap_or(PostBurstReadinessStatus::InsufficientEvidence);
+    let promoted = readiness == PostBurstReadinessStatus::ReadyForPromotion;
+    if !promoted && decision.arm != ShadowAffinityArm::Candidate {
+        return false;
+    }
+    decision.decision = "candidate_shadow_only".to_string();
     let force_no_gap_canary = automatic_static_cohort_force_no_gap_enabled()
         && readiness == PostBurstReadinessStatus::CanaryHealthy
         && decision.automatic_canary_reason.as_deref() == Some("no_addressable_post_burst_gap");
@@ -1069,7 +1314,12 @@ fn apply_automatic_static_cohort_canary_with_switch(
     }
 
     decision.mode = "applied".to_string();
-    decision.decision = "automatic_candidate_applied".to_string();
+    decision.decision = if promoted {
+        "automatic_promoted_applied"
+    } else {
+        "automatic_candidate_applied"
+    }
+    .to_string();
     decision.skip_reason = None;
     true
 }
@@ -1078,14 +1328,30 @@ pub(super) fn static_cohort_prompt_cache_key(decision: &ShadowAffinityDecision) 
     if !matches!(decision.mode.as_str(), "applied" | "validation_applied") {
         return None;
     }
-    let assignment_key = decision.assignment_key.as_deref().unwrap_or_default();
-    let shard_material = format!(
-        "cache-cohort-shard-v1\0{}\0{}",
-        decision.cohort_id, assignment_key
-    );
-    let shard = Sha256::digest(shard_material.as_bytes())[0] % STATIC_COHORT_CACHE_KEY_SHARDS;
-    let key_material = format!("cache-cohort-key-v2\0{}\0{}", decision.cohort_id, shard);
+    let key_material = match decision.candidate_variant {
+        ShadowCacheCandidateVariant::CohortKey => {
+            format!("cache-cohort-key-v3\0{}", decision.cohort_id)
+        }
+        ShadowCacheCandidateVariant::CohortTwoShard => {
+            let assignment_key = decision.assignment_key.as_deref()?;
+            let shard = cohort_two_shard_index(assignment_key);
+            format!(
+                "cache-cohort-two-shard-v1\0{}\0{}",
+                decision.cohort_id, shard
+            )
+        }
+        ShadowCacheCandidateVariant::ProviderNative => return None,
+    };
     Some(format!("{:x}", Sha256::digest(key_material.as_bytes())))
+}
+
+fn cohort_two_shard_index(assignment_key: &str) -> u8 {
+    Sha256::digest(assignment_key.as_bytes())[0] % 2
+}
+
+pub(super) fn provider_native_candidate_applied(decision: &ShadowAffinityDecision) -> bool {
+    matches!(decision.mode.as_str(), "applied" | "validation_applied")
+        && decision.candidate_variant == ShadowCacheCandidateVariant::ProviderNative
 }
 
 fn canary_arm_for_conversation(conversation_id: &str, percent: u8) -> ShadowAffinityArm {
@@ -1169,6 +1435,7 @@ pub(super) fn reset_anchor(
                 remaining_requests: POST_COMPACTION_FOLLOWUP_REQUESTS,
                 captured_requests: 0,
                 lane: ShadowCacheLane::CompactedAnchor,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
             },
         );
     }
@@ -1176,9 +1443,9 @@ pub(super) fn reset_anchor(
 
 pub(crate) fn evict_assignments(store: &mut ShadowAffinityStore, now: DateTime<Utc>) {
     let cutoff = now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS);
-    store
-        .assignments
-        .retain(|_, assignment| assignment.last_seen_at >= cutoff);
+    store.assignments.retain(|_, assignment| {
+        assignment.last_seen_at >= cutoff && assignment.policy_epoch == SHADOW_POLICY_EPOCH
+    });
     while store.assignments.len() > SHADOW_ASSIGNMENT_LIMIT {
         let oldest = store
             .assignments
@@ -1322,6 +1589,7 @@ mod tests {
             followup_index,
             realm_id: "realm".to_string(),
             lane: ShadowCacheLane::CompactedAnchor,
+            candidate_variant: ShadowCacheCandidateVariant::CohortKey,
             arm: ShadowAffinityArm::Baseline,
             policy_epoch: 1,
             anchor_epoch: 1,
@@ -1350,12 +1618,12 @@ mod tests {
         let summary = summarize_post_burst_arm(evidence.iter());
 
         assert_eq!(summary.observations, 3);
-        assert_eq!(summary.cache_ratio_bps, 6_833);
+        assert_eq!(summary.cache_ratio_bps, 6_835);
         assert_eq!(summary.first_followup.observations, 1);
         assert_eq!(summary.first_followup.cache_ratio_bps, 2_000);
         assert_eq!(summary.first_followup.average_ttft_ms, 9_000);
         assert_eq!(summary.stable_followups.observations, 2);
-        assert_eq!(summary.stable_followups.cache_ratio_bps, 9_250);
+        assert_eq!(summary.stable_followups.cache_ratio_bps, 9_252);
         assert_eq!(summary.stable_followups.average_ttft_ms, 2_500);
     }
 
@@ -1536,7 +1804,7 @@ mod tests {
         assert_eq!(compacted.decision, "candidate_shadow_only");
         assert_eq!(
             compacted.skip_reason.as_deref(),
-            Some("awaiting_efficacy_evidence")
+            Some("compaction_candidate_not_beneficial")
         );
 
         let mut transparent = smart_cache_disabled;
@@ -1546,6 +1814,30 @@ mod tests {
             true
         ));
         assert_eq!(transparent.decision, "assigned");
+    }
+
+    #[test]
+    fn provider_native_candidate_stays_disabled_outside_isolated_override() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = compute_shadow_affinity(
+            &mut store,
+            &identity("provider-native-disabled"),
+            None,
+            now,
+            0,
+            0,
+        );
+        decision.arm = ShadowAffinityArm::Candidate;
+        decision.candidate_variant = ShadowCacheCandidateVariant::ProviderNative;
+        decision.decision = "assigned".to_string();
+        assert!(!apply_automatic_static_cohort_canary(&mut decision, true));
+        assert_eq!(decision.mode, "shadow");
+        assert_eq!(decision.decision, "candidate_shadow_only");
+        assert_eq!(
+            decision.skip_reason.as_deref(),
+            Some("provider_native_candidate_disabled")
+        );
     }
 
     #[test]
@@ -1772,13 +2064,14 @@ mod tests {
     }
 
     #[test]
-    fn automatic_candidate_canary_can_apply_to_compaction_recovery() {
+    fn automatic_candidate_canary_stays_disabled_for_compaction_recovery() {
         let mut decision = ShadowAffinityDecision {
             mode: "shadow".to_string(),
             assignment_key: Some("conversation".to_string()),
             realm_id: "realm".to_string(),
             cohort_id: "cohort".to_string(),
             lane: ShadowCacheLane::CompactedAnchor,
+            candidate_variant: ShadowCacheCandidateVariant::CohortKey,
             arm: ShadowAffinityArm::Candidate,
             shard: 0,
             policy_epoch: SHADOW_POLICY_EPOCH,
@@ -1792,12 +2085,16 @@ mod tests {
             automatic_canary_reason: Some("comparable_shadow_evidence_ready".to_string()),
         };
 
-        assert!(apply_automatic_static_cohort_canary_with_switch(
+        assert!(!apply_automatic_static_cohort_canary_with_switch(
             &mut decision,
             true,
             true
         ));
-        assert_eq!(decision.decision, "automatic_candidate_applied");
+        assert_eq!(decision.decision, "candidate_shadow_only");
+        assert_eq!(
+            decision.skip_reason.as_deref(),
+            Some("compaction_candidate_not_beneficial")
+        );
     }
 
     #[test]
@@ -1828,7 +2125,7 @@ mod tests {
         assert_eq!(decision.mode, "applied");
         assert_eq!(decision.decision, "candidate_applied");
         let candidate_key = static_cohort_prompt_cache_key(&decision)
-            .expect("applied candidate must have a sharded cache key");
+            .expect("applied candidate must have a stable cohort cache key");
         assert_eq!(candidate_key.len(), 64);
         assert_ne!(candidate_key, decision.cohort_id);
         let mut same_decision = decision.clone();
@@ -1837,6 +2134,34 @@ mod tests {
             static_cohort_prompt_cache_key(&same_decision),
             Some(candidate_key)
         );
+
+        let mut another_conversation = decision.clone();
+        another_conversation.assignment_key = Some("another-conversation".to_string());
+        assert_eq!(
+            static_cohort_prompt_cache_key(&another_conversation),
+            static_cohort_prompt_cache_key(&decision)
+        );
+
+        let mut two_shard = decision.clone();
+        two_shard.candidate_variant = ShadowCacheCandidateVariant::CohortTwoShard;
+        let stable_two_shard_key = static_cohort_prompt_cache_key(&two_shard)
+            .expect("two-shard candidate must have a cache key");
+        assert_eq!(
+            static_cohort_prompt_cache_key(&two_shard),
+            Some(stable_two_shard_key.clone())
+        );
+        let mut observed_keys = Vec::new();
+        for index in 0..128 {
+            two_shard.assignment_key = Some(format!("two-shard-conversation-{index}"));
+            let key = static_cohort_prompt_cache_key(&two_shard).unwrap();
+            if !observed_keys.contains(&key) {
+                observed_keys.push(key);
+            }
+        }
+        assert_eq!(observed_keys.len(), 2);
+
+        two_shard.candidate_variant = ShadowCacheCandidateVariant::ProviderNative;
+        assert_eq!(static_cohort_prompt_cache_key(&two_shard), None);
 
         let mut again = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
         assert_eq!(again.arm, ShadowAffinityArm::Candidate);
@@ -2135,7 +2460,7 @@ mod tests {
                 now + Duration::seconds(index * 10),
                 false,
                 true,
-                97_500,
+                99_968,
                 0,
                 0,
                 1_000,
@@ -2148,7 +2473,7 @@ mod tests {
                 now + Duration::seconds(40 + index * 10),
                 false,
                 true,
-                97_500,
+                99_968,
                 0,
                 0,
                 1_000,
@@ -2180,10 +2505,20 @@ mod tests {
             decision.skip_reason.as_deref(),
             Some("canary_not_promotable")
         );
+        assert_eq!(
+            decision.candidate_variant,
+            ShadowCacheCandidateVariant::CohortKey
+        );
+        let two_shard_key = post_burst_comparison_key_for_candidate(
+            &realm_id,
+            ShadowCacheLane::ToolBurstQuarantine,
+            ShadowCacheCandidateVariant::CohortTwoShard,
+        );
+        assert!(!store.post_burst.readiness.contains_key(&two_shard_key));
     }
 
     #[test]
-    fn regressed_canary_is_rolled_back_and_stays_blocked() {
+    fn regressed_candidates_advance_in_order_with_isolated_evidence() {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
         let realm_id = record_post_burst_window(
@@ -2294,9 +2629,44 @@ mod tests {
         let comparison_key =
             post_burst_comparison_key(&realm_id, ShadowCacheLane::ToolBurstQuarantine);
         let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
+        assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryCollecting);
+        assert_eq!(readiness.reason, "collecting_promotion_evidence");
+        assert_eq!(readiness.candidate_applied.observations, 3);
+        assert!(!store.post_burst.rollbacks.contains_key(&comparison_key));
+
+        for index in 1..3 {
+            record_post_burst_window(
+                &mut store,
+                &format!("rollback-applied-more-{index}"),
+                ShadowAffinityArm::Candidate,
+                now + Duration::seconds(50 + index * 20),
+                true,
+                true,
+                50_000,
+                12_000,
+                0,
+                900,
+                1,
+            );
+            record_post_burst_window(
+                &mut store,
+                &format!("rollback-canary-baseline-more-{index}"),
+                ShadowAffinityArm::Baseline,
+                now + Duration::seconds(55 + index * 20),
+                false,
+                true,
+                92_000,
+                512,
+                0,
+                900,
+                1,
+            );
+        }
+
+        let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
         assert_eq!(readiness.status, PostBurstReadinessStatus::RollbackRequired);
         assert_eq!(readiness.reason, "candidate_cache_regression");
-        assert_eq!(readiness.candidate_applied.observations, 3);
+        assert_eq!(readiness.candidate_applied.observations, 9);
         assert_eq!(
             store
                 .post_burst
@@ -2310,7 +2680,7 @@ mod tests {
             &mut store,
             &identity("rollback-applied"),
             None,
-            now + Duration::seconds(50),
+            now + Duration::seconds(100),
             0,
             0,
         );
@@ -2321,13 +2691,109 @@ mod tests {
             true,
         ));
         assert_eq!(
+            decision.candidate_variant,
+            ShadowCacheCandidateVariant::CohortTwoShard
+        );
+        assert_eq!(
             decision.skip_reason.as_deref(),
-            Some("automatic_canary_rolled_back")
+            Some("awaiting_efficacy_evidence")
+        );
+
+        record_post_burst_window(
+            &mut store,
+            "provider-native-shadow-baseline",
+            ShadowAffinityArm::Baseline,
+            now + Duration::seconds(130),
+            false,
+            true,
+            98_000,
+            2_000,
+            0,
+            1_000,
+            1,
+        );
+        let two_shard_key = post_burst_comparison_key_for_candidate(
+            &realm_id,
+            ShadowCacheLane::ToolBurstQuarantine,
+            ShadowCacheCandidateVariant::CohortTwoShard,
+        );
+        let two_shard = store.post_burst.readiness.get(&two_shard_key).unwrap();
+        assert_eq!(two_shard.baseline.observations, 3);
+        assert_eq!(
+            store
+                .post_burst
+                .readiness
+                .get(&comparison_key)
+                .unwrap()
+                .candidate_applied
+                .observations,
+            9
+        );
+
+        store.post_burst.rollbacks.insert(
+            two_shard_key.clone(),
+            "candidate_cache_regression".to_string(),
+        );
+        let mut provider_decision = compute_shadow_affinity(
+            &mut store,
+            &identity("provider-native-baseline"),
+            None,
+            now + Duration::seconds(160),
+            GIANT_TAIL_CHARS,
+            GIANT_TAIL_CHARS,
+        );
+        provider_decision.arm = ShadowAffinityArm::Baseline;
+        assert_eq!(
+            provider_decision.candidate_variant,
+            ShadowCacheCandidateVariant::ProviderNative
+        );
+        observe_shadow_affinity(
+            &mut store,
+            &provider_decision,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 98_000,
+                giant_tail: true,
+                status: 200,
+                ttft_ms: 1_000,
+                attempt_count: 1,
+                ..ShadowObservationInput::default()
+            },
+            now + Duration::seconds(160),
+        );
+        let provider_native_key = post_burst_comparison_key_for_candidate(
+            &realm_id,
+            ShadowCacheLane::ToolBurstQuarantine,
+            ShadowCacheCandidateVariant::ProviderNative,
+        );
+        assert_ne!(comparison_key, two_shard_key);
+        assert_ne!(two_shard_key, provider_native_key);
+        assert_eq!(
+            store
+                .post_burst
+                .readiness
+                .get(&comparison_key)
+                .unwrap()
+                .candidate_applied
+                .observations,
+            9
+        );
+        assert_eq!(
+            store
+                .post_burst
+                .readiness
+                .get(&two_shard_key)
+                .unwrap()
+                .baseline
+                .observations,
+            3
         );
     }
 
     #[test]
-    fn safe_but_ineffective_canary_is_not_promotable_and_stops_applying() {
+    fn safe_but_ineffective_cohort_canary_advances_to_two_shard() {
         let mut store = ShadowAffinityStore::default();
         let now = Utc::now();
         let baseline_ttft = [1_000, 1_100, 1_200];
@@ -2397,13 +2863,13 @@ mod tests {
             post_burst_comparison_key(&realm_id, ShadowCacheLane::ToolBurstQuarantine);
         let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
         assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryHealthy);
-        assert_eq!(readiness.reason, "candidate_cache_below_target");
+        assert_eq!(readiness.reason, "candidate_has_no_net_benefit");
         assert_eq!(readiness.baseline.observations, 27);
         assert_eq!(readiness.candidate_applied.observations, 18);
         assert_eq!(readiness.candidate_applied.ttft_p50_ms, 1_150);
         assert_eq!(readiness.candidate_applied.ttft_p95_ms, 1_250);
         assert_eq!(readiness.canary_baseline.observations, 18);
-        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_750);
+        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_753);
         assert_eq!(readiness.canary_baseline.ttft_p50_ms, 1_150);
         assert_eq!(readiness.canary_baseline.ttft_p95_ms, 1_250);
 
@@ -2422,8 +2888,12 @@ mod tests {
             true,
         ));
         assert_eq!(
+            decision.candidate_variant,
+            ShadowCacheCandidateVariant::CohortTwoShard
+        );
+        assert_eq!(
             decision.skip_reason.as_deref(),
-            Some("canary_not_promotable")
+            Some("awaiting_efficacy_evidence")
         );
     }
 
@@ -2497,9 +2967,9 @@ mod tests {
         );
         assert_eq!(readiness.reason, "canary_efficacy_gate_passed");
         assert_eq!(readiness.canary_baseline.observations, 18);
-        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_970);
+        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_973);
         assert_eq!(readiness.candidate_applied.observations, 18);
-        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_982);
+        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_985);
         assert_eq!(readiness.canary_baseline.provider_unstable_ratio_bps, 0);
         assert_eq!(readiness.candidate_applied.provider_unstable_ratio_bps, 0);
 
@@ -2517,6 +2987,23 @@ mod tests {
             true,
             true,
         ));
+        assert_eq!(decision.decision, "automatic_promoted_applied");
+
+        let mut promoted_baseline = compute_shadow_affinity(
+            &mut store,
+            &identity("promotion-baseline-0"),
+            None,
+            now + Duration::seconds(121),
+            0,
+            0,
+        );
+        promoted_baseline.arm = ShadowAffinityArm::Baseline;
+        assert!(apply_automatic_static_cohort_canary_with_switch(
+            &mut promoted_baseline,
+            true,
+            true,
+        ));
+        assert_eq!(promoted_baseline.decision, "automatic_promoted_applied");
     }
 
     #[test]
@@ -2589,7 +3076,19 @@ mod tests {
     }
 
     #[test]
-    fn promotion_requires_target_and_strict_baseline_improvement() {
+    fn promotion_requires_cache_or_ttft_net_benefit() {
+        assert!(!post_burst_baseline_has_addressable_gap(
+            &PostBurstArmSummary {
+                cache_ratio_bps: POST_BURST_RESIDUAL_CACHE_GAP_BPS,
+                ..PostBurstArmSummary::default()
+            }
+        ));
+        assert!(post_burst_baseline_has_addressable_gap(
+            &PostBurstArmSummary {
+                cache_ratio_bps: POST_BURST_RESIDUAL_CACHE_GAP_BPS - 1,
+                ..PostBurstArmSummary::default()
+            }
+        ));
         let baseline = PostBurstArmSummary {
             success_rate_bps: 10_000,
             cache_ratio_bps: 9_949,
@@ -2602,7 +3101,7 @@ mod tests {
         };
         assert_eq!(
             post_burst_promotion_blocker(&baseline, &below_target),
-            Some("candidate_cache_below_target")
+            Some("candidate_has_no_net_benefit")
         );
 
         let baseline = PostBurstArmSummary {
@@ -2613,7 +3112,7 @@ mod tests {
         let equal = baseline.clone();
         assert_eq!(
             post_burst_promotion_blocker(&baseline, &equal),
-            Some("candidate_cache_not_improved")
+            Some("candidate_has_no_net_benefit")
         );
 
         let lower = PostBurstArmSummary {
@@ -2623,7 +3122,7 @@ mod tests {
         };
         assert_eq!(
             post_burst_promotion_blocker(&baseline, &lower),
-            Some("candidate_cache_below_target")
+            Some("candidate_has_no_net_benefit")
         );
 
         let below_target_baseline = PostBurstArmSummary {
@@ -2638,8 +3137,59 @@ mod tests {
         };
         assert_eq!(
             post_burst_promotion_blocker(&below_target_baseline, &positive_but_below_target),
-            Some("candidate_cache_below_target")
+            None
         );
+
+        let equal_cache_faster_ttft = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: baseline.cache_ratio_bps,
+            average_ttft_ms: 800,
+            ttft_p50_ms: 700,
+            ttft_p95_ms: 1_400,
+            ..PostBurstArmSummary::default()
+        };
+        let baseline_with_slower_ttft = PostBurstArmSummary {
+            average_ttft_ms: 1_200,
+            ttft_p50_ms: 1_000,
+            ttft_p95_ms: 2_000,
+            ..baseline.clone()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&baseline_with_slower_ttft, &equal_cache_faster_ttft),
+            None
+        );
+
+        let equal_cache_faster_average_and_p95 = PostBurstArmSummary {
+            success_rate_bps: 10_000,
+            cache_ratio_bps: baseline.cache_ratio_bps,
+            average_ttft_ms: 2_497,
+            ttft_p50_ms: 2_256,
+            ttft_p95_ms: 4_331,
+            ..PostBurstArmSummary::default()
+        };
+        let long_tail_baseline = PostBurstArmSummary {
+            average_ttft_ms: 2_889,
+            ttft_p50_ms: 2_336,
+            ttft_p95_ms: 8_689,
+            ..baseline.clone()
+        };
+        assert_eq!(
+            post_burst_promotion_blocker(&long_tail_baseline, &equal_cache_faster_average_and_p95),
+            None
+        );
+        assert!(!post_burst_clear_ttft_regression(
+            &long_tail_baseline,
+            &equal_cache_faster_average_and_p95
+        ));
+        let systemic_ttft_regression = PostBurstArmSummary {
+            ttft_p50_ms: 4_000,
+            ttft_p95_ms: 15_000,
+            ..equal_cache_faster_average_and_p95.clone()
+        };
+        assert!(post_burst_clear_ttft_regression(
+            &long_tail_baseline,
+            &systemic_ttft_regression
+        ));
 
         let baseline = PostBurstArmSummary {
             success_rate_bps: 10_000,
@@ -2670,7 +3220,7 @@ mod tests {
         };
         assert_eq!(
             post_burst_promotion_blocker(&baseline_with_provider_gap, &provider_gap_only),
-            Some("candidate_cache_not_improved")
+            Some("candidate_has_no_net_benefit")
         );
     }
 
@@ -2829,9 +3379,9 @@ mod tests {
         let readiness = store.post_burst.readiness.get(&comparison_key).unwrap();
         assert_eq!(readiness.status, PostBurstReadinessStatus::CanaryHealthy);
         assert_eq!(readiness.reason, "candidate_ttft_p95_not_non_inferior");
-        assert_eq!(readiness.baseline.cache_ratio_bps, 9_523);
-        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_951);
-        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_952);
+        assert_eq!(readiness.baseline.cache_ratio_bps, 9_526);
+        assert_eq!(readiness.canary_baseline.cache_ratio_bps, 9_954);
+        assert_eq!(readiness.candidate_applied.cache_ratio_bps, 9_955);
         assert!(!store.post_burst.rollbacks.contains_key(&comparison_key));
     }
 
