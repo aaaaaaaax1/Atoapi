@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use crate::{metrics::UsageRecord, state::PrefixWarmState};
 
 use super::{
-    provider_cache_bucket_max, provider_cache_bucket_max_128, provider_cache_shortfall,
-    provider_cache_shortfall_128, provider_prefix_break_after_warm_state,
+    provider_cache_bucket_max, provider_cache_bucket_max_128, provider_cache_ratio,
+    provider_cache_shortfall, provider_cache_shortfall_128, provider_prefix_break_after_warm_state,
     provider_prefix_calibrated_previous_seen_buckets, provider_prefix_usage_is_safe_to_learn,
     provider_prefix_weak_full_retry_after_session_delta,
     responses_cap_exhausted_provider_waterline_rollback,
@@ -18,6 +18,9 @@ const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
 const MAX_EXACT_EVIDENCE_AGE: Duration = Duration::from_secs(30);
 const MIN_REPEATED_AVOIDABLE_STREAK: u32 = 2;
 const MAX_STABLE_INSTABILITY_SCORE: u32 = 2;
+const STABLE_RECOVERY_MIN_INPUT_TOKENS: u64 = 32_000;
+const STABLE_RECOVERY_MIN_RATIO: f64 = 0.98;
+const STABLE_RECOVERY_MAX_AVOIDABLE_TOKENS: u64 = 1_024;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefixControlInput {
@@ -333,6 +336,18 @@ impl PrefixController {
             .map(|state| state.cache_instability_score)
             .unwrap_or(0);
         let large_avoidable = evidence.avoidable_tokens.max(evidence.avoidable_tokens_128);
+        let stable_recovery = previous_instability > 0
+            && record.input_tokens >= STABLE_RECOVERY_MIN_INPUT_TOKENS
+            && input
+                .previous
+                .is_some_and(|state| state.input_tokens >= STABLE_RECOVERY_MIN_INPUT_TOKENS)
+            && record.cache_read_tokens > 0
+            && provider_cache_ratio(record).unwrap_or_default() >= STABLE_RECOVERY_MIN_RATIO
+            && large_avoidable <= STABLE_RECOVERY_MAX_AVOIDABLE_TOKENS
+            && !evidence.provider_rollback
+            && !evidence.tail_granularity
+            && !responses_current_tail_makes_avoidable_unreliable(input.tail)
+            && !responses_tool_tail_burst(input.tail);
         let severe_cold_read = record.cache_read_tokens == 0
             && (provider_cache_bucket_max(record.input_tokens) >= 32_000
                 || small_context_cold_read);
@@ -340,6 +355,8 @@ impl PrefixController {
             previous_instability.saturating_add(3).min(8)
         } else if evidence.provider_rollback {
             previous_instability.saturating_add(1).min(8)
+        } else if stable_recovery {
+            previous_instability.saturating_sub(1)
         } else if large_avoidable >= 4096 {
             previous_instability.saturating_add(2).min(8)
         } else if large_avoidable > 0 {
@@ -447,6 +464,11 @@ fn gap_evidence(
         direct_avoidable_tokens_128,
         tail,
         guard_budget_exhausted,
+    ) || responses_high_instability_provider_waterline_rollback(
+        previous,
+        record,
+        direct_avoidable_tokens,
+        tail,
     );
     let suppress_avoidable = provider_rollback || tail_granularity || avoidable_unreliable;
 
@@ -463,6 +485,36 @@ fn gap_evidence(
         tail_granularity,
         provider_rollback,
     }
+}
+
+fn responses_high_instability_provider_waterline_rollback(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    direct_avoidable_tokens: u64,
+    tail: &TailInputDiagnostics,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    if previous.cache_instability_score < 6
+        || direct_avoidable_tokens < 8_192
+        || record.input_tokens < 32_000
+        || record.cache_read_tokens < 32_000
+        || record.input_tokens.saturating_sub(previous.input_tokens) > 8_192
+    {
+        return false;
+    }
+    if provider_cache_ratio(record).unwrap_or_default() >= 0.97 {
+        return false;
+    }
+    if responses_tool_tail_burst(tail)
+        || tail.tool_output_chars >= 4_096
+        || tail.tool_call_chars >= 4_096
+        || tail.message_chars >= 4_096
+    {
+        return false;
+    }
+    true
 }
 
 fn small_context_provider_waterline_jitter(
@@ -697,5 +749,196 @@ mod tests {
             assert!(decision.wait <= MAX_FOREGROUND_WAIT);
             assert_eq!(decision.reason, Some("responses_exact_avoidable_gap"));
         }
+    }
+
+    #[test]
+    fn high_instability_waterline_rollback_is_provider_unstable() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 261_591,
+            cache_read_tokens: 251_443,
+            shortfall_tokens: 10_240,
+            seen_bucket_tokens: 251_443,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 10_148,
+            seen_bucket_tokens_128: 251_392,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 261_880,
+            cache_read_tokens: 234_958,
+            ..UsageRecord::default()
+        };
+        let gap = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            guard_budget_exhausted: false,
+        });
+
+        assert_eq!(gap.total_tokens, 26_674);
+        assert_eq!(gap.provider_unstable_tokens, 16_485);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 10_189);
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("successful usage must update state");
+        assert_eq!(next.seen_bucket_tokens, 234_958);
+        assert_eq!(next.seen_bucket_tokens_128, 234_958);
+        assert_eq!(next.avoidable_shortfall_tokens, 0);
+        assert_eq!(next.avoidable_shortfall_tokens_128, 0);
+        assert_eq!(next.avoidable_shortfall_streak, 0);
+        assert!(!observation.learn_family);
+    }
+
+    #[test]
+    fn high_instability_real_tool_tail_is_not_provider_rollback() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 250_000,
+            cache_read_tokens: 240_000,
+            shortfall_tokens: 9_856,
+            seen_bucket_tokens: 240_000,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 9_984,
+            seen_bucket_tokens_128: 240_000,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 40_000,
+            tail_largest_tool_output_chars: 40_000,
+            tail_tool_output_noise_hint: Some("path_like".to_string()),
+        };
+        let record = UsageRecord {
+            input_tokens: 252_000,
+            cache_read_tokens: 220_000,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 3,
+            tool_output_chars: 40_000,
+            largest_tool_output_chars: 40_000,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let gap = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &tail,
+            guard_budget_exhausted: false,
+        });
+
+        assert_eq!(gap.provider_unstable_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, gap.total_tokens);
+    }
+
+    #[test]
+    fn high_instability_score_decays_after_stable_high_hit() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 198_000,
+            cache_read_tokens: 190_000,
+            shortfall_tokens: 8_000,
+            seen_bucket_tokens: 190_000,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 8_000,
+            seen_bucket_tokens_128: 190_000,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 200_048,
+            cache_read_tokens: 198_912,
+            ..UsageRecord::default()
+        };
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("successful usage must update state");
+        assert_eq!(next.cache_instability_score, 7);
+    }
+
+    #[test]
+    fn high_instability_score_does_not_decay_during_tool_burst() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 198_000,
+            cache_read_tokens: 190_000,
+            shortfall_tokens: 8_000,
+            seen_bucket_tokens: 190_000,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 8_000,
+            seen_bucket_tokens_128: 190_000,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 200_048,
+            cache_read_tokens: 198_912,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            tool_output_chars: 4_096,
+            largest_tool_output_chars: 4_096,
+            tool_output_noise_hint: Some("repeated_lines".to_string()),
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &tail,
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("successful usage must update state");
+        assert_eq!(next.cache_instability_score, 8);
     }
 }

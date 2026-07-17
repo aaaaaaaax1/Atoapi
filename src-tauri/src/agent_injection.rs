@@ -4,14 +4,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use toml_edit::{value, DocumentMut};
 
 use crate::config::{
     app_config_dir, codex_model_alias, model_request_alias, normalize_agent_injections,
-    AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig, ProviderConfig,
+    normalize_reasoning_effort, AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig,
+    ProviderConfig, REASONING_EFFORT_VALUES,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
@@ -525,6 +528,8 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
         {
             doc["model_reasoning_effort"] = value(reasoning_effort);
         }
+    } else {
+        repair_unmapped_codex_reasoning_effort(&mut doc, context);
     }
 
     if !doc.as_table().contains_key("model_providers") {
@@ -545,6 +550,99 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     }
 
     write_text(path, &doc.to_string())
+}
+
+fn repair_unmapped_codex_reasoning_effort(doc: &mut DocumentMut, context: &InjectionContext) {
+    let Some(model) = doc
+        .as_table()
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return;
+    };
+    let Some(current) = doc
+        .as_table()
+        .get("model_reasoning_effort")
+        .and_then(|item| item.as_str())
+        .and_then(normalize_reasoning_effort)
+    else {
+        return;
+    };
+    let supported = context
+        .codex_models
+        .iter()
+        .find(|candidate| injection_model_matches(candidate, model))
+        .filter(|candidate| !candidate.supported_reasoning_efforts.is_empty())
+        .map(|candidate| candidate.supported_reasoning_efforts.clone())
+        .or_else(|| official_reasoning_efforts_for_model(model));
+    let Some(supported) = supported else {
+        return;
+    };
+    let Some(next) = strongest_supported_reasoning_effort_at_or_below(&current, &supported) else {
+        return;
+    };
+    if next != current {
+        doc["model_reasoning_effort"] = value(next);
+    }
+}
+
+fn strongest_supported_reasoning_effort_at_or_below(
+    requested: &str,
+    supported: &[String],
+) -> Option<String> {
+    let requested_rank = REASONING_EFFORT_VALUES
+        .iter()
+        .position(|candidate| *candidate == requested)?;
+    supported
+        .iter()
+        .filter_map(|effort| normalize_reasoning_effort(effort))
+        .filter_map(|effort| {
+            REASONING_EFFORT_VALUES
+                .iter()
+                .position(|candidate| *candidate == effort)
+                .filter(|rank| *rank <= requested_rank)
+                .map(|rank| (rank, effort))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, effort)| effort)
+}
+
+pub(crate) fn official_reasoning_efforts_for_model(model: &str) -> Option<Vec<String>> {
+    static CAPABILITIES: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
+    let capabilities = CAPABILITIES.get_or_init(|| {
+        let Ok(catalog) = serde_json::from_str::<Value>(OFFICIAL_CODEX_MODELS_JSON) else {
+            return HashMap::new();
+        };
+        let Some(models) = catalog.get("models").and_then(Value::as_array) else {
+            return HashMap::new();
+        };
+        models
+            .iter()
+            .filter_map(|entry| {
+                let slug = entry.get("slug").and_then(Value::as_str)?.trim();
+                if slug.is_empty() {
+                    return None;
+                }
+                let efforts = entry
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                    .filter_map(normalize_reasoning_effort)
+                    .collect::<Vec<_>>();
+                (!efforts.is_empty()).then_some((slug.to_ascii_lowercase(), efforts))
+            })
+            .collect()
+    });
+
+    let model = model.trim();
+    let alias = model.rsplit('/').next().unwrap_or(model).trim();
+    (!alias.is_empty())
+        .then(|| capabilities.get(&alias.to_ascii_lowercase()).cloned())
+        .flatten()
 }
 
 fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> Result<PathBuf> {
@@ -1426,7 +1524,7 @@ command = "npx"
         let path = dir.join("config.toml");
         write_text(
             &path,
-            r#"model = "gpt-5.5"
+            r#"model = "gpt-5.6-luna"
 model_reasoning_effort = "ultra"
 model_context_window = 888000
 "#,
@@ -1438,13 +1536,13 @@ model_context_window = 888000
 
         assert_eq!(
             parsed.get("model").and_then(toml::Value::as_str),
-            Some("gpt-5.5")
+            Some("gpt-5.6-luna")
         );
         assert_eq!(
             parsed
                 .get("model_reasoning_effort")
                 .and_then(toml::Value::as_str),
-            Some("ultra")
+            Some("max")
         );
         assert_eq!(
             parsed
@@ -1455,6 +1553,22 @@ model_context_window = 888000
         assert_eq!(
             parsed.get("model_provider").and_then(toml::Value::as_str),
             Some(CODEX_PROVIDER_ID)
+        );
+
+        write_text(
+            &path,
+            r#"model = "gpt-5.6-luna"
+model_reasoning_effort = "max"
+"#,
+        )
+        .unwrap();
+        write_codex_config(&path, &context).unwrap();
+        let supported: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            supported
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("max")
         );
         fs::remove_dir_all(dir).ok();
     }

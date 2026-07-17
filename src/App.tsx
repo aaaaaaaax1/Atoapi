@@ -165,8 +165,9 @@ const utilityViews: Array<{ id: ViewId; label: string; icon: ReactNode }> = [
 
 const requestPageSize = 20;
 const maxRequestPages = 10;
-const appVersion = "v0.2.15";
+const appVersion = "v0.2.16";
 const appVersionNotes = [
+  "v0.2.16: 修复高命中后前缀不稳定评分长期卡住；稳定恢复时逐级解除保护，真实回滚和工具突发继续隔离。",
   "v0.2.15: Codex Responses 请求体会话元数据解析，恢复可信会话锚点并保持 agent 隔离。",
   "v0.2.14: adaptive Responses prefix guard; first avoidable gaps wait 0ms and repeated stable gaps cap at 500ms.",
   "v0.2.13: 已验证的 prompt_cache_options 在兼容与救援回退路径保持一致；缓存能力继续按上游、模型、通道和密钥严格门控。",

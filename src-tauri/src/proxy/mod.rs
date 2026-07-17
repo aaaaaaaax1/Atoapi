@@ -130,6 +130,7 @@ struct ReasoningEffortDiagnostics {
     configured: Option<String>,
     effective: Option<String>,
     source: Option<String>,
+    catalog_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -12382,11 +12383,21 @@ fn apply_model_reasoning_effort(
         set_request_reasoning_effort(upstream_request, upstream_channel, effective);
     }
 
+    let catalog_supported = if configured.is_none()
+        && model
+            .map(|model| model.supported_reasoning_efforts.is_empty())
+            .unwrap_or(true)
+    {
+        agent_injection::official_reasoning_efforts_for_model(&decision.model)
+    } else {
+        None
+    };
     ReasoningEffortDiagnostics {
         agent,
         configured,
         effective,
         source,
+        catalog_supported,
     }
 }
 
@@ -12572,11 +12583,11 @@ async fn apply_runtime_reasoning_effort_cap(
 }
 
 /// Some third-party gateways turn an unsupported reasoning value into a bare
-/// HTML 502 and discard the parameter error. That response is not proof by
-/// itself, so probe only when the Agent supplied a lower effort than the
-/// model-level override. The override is persisted only after the next tier
-/// returns a successful response; ordinary 502s without that intent stay
-/// pass-through.
+/// HTML 502 and discard the parameter error. Probe only when either the
+/// configured override is above the agent value or the exact model is known
+/// in the local Codex catalog and the current effort is not supported there.
+/// The override is persisted only after the next tier returns a successful
+/// response; ordinary 502s without that evidence stay pass-through.
 fn should_probe_opaque_reasoning_fallback(
     status: u16,
     error_body: &[u8],
@@ -12585,24 +12596,35 @@ fn should_probe_opaque_reasoning_fallback(
     if status != 502 {
         return false;
     }
-    let Some(configured) = diagnostics.configured.as_deref() else {
-        return false;
-    };
-    let Some(agent) = diagnostics.agent.as_deref() else {
-        return false;
-    };
-    let Some(configured_rank) = reasoning_effort_rank(configured) else {
-        return false;
-    };
-    let Some(agent_rank) = reasoning_effort_rank(agent) else {
-        return false;
-    };
-    if configured_rank <= agent_rank {
+    let error = String::from_utf8_lossy(error_body).to_ascii_lowercase();
+    let opaque = error.contains("<html")
+        || error.contains("<!doctype html")
+        || error.contains("502 bad gateway");
+    if !opaque {
         return false;
     }
 
-    let error = String::from_utf8_lossy(error_body).to_ascii_lowercase();
-    error.contains("<html") || error.contains("<!doctype html") || error.contains("502 bad gateway")
+    if let (Some(configured), Some(agent)) = (
+        diagnostics.configured.as_deref(),
+        diagnostics.agent.as_deref(),
+    ) {
+        let Some(configured_rank) = reasoning_effort_rank(configured) else {
+            return false;
+        };
+        let Some(agent_rank) = reasoning_effort_rank(agent) else {
+            return false;
+        };
+        return configured_rank > agent_rank;
+    }
+
+    let Some(current) = diagnostics.effective.as_deref() else {
+        return false;
+    };
+    let Some(supported) = diagnostics.catalog_supported.as_ref() else {
+        return false;
+    };
+    strongest_supported_reasoning_effort_at_or_below(current, supported, &HashSet::new())
+        .is_some_and(|next| next != current)
 }
 
 fn is_explicit_reasoning_effort_rejection(
@@ -28524,6 +28546,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmapped_luna_opaque_502_retries_once_at_catalog_supported_effort() {
+        let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let attempted_efforts_for_route = attempted_efforts.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let attempted_efforts = attempted_efforts_for_route.clone();
+                async move {
+                    let effort = body
+                        .pointer("/reasoning/effort")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    attempted_efforts.lock().await.push(effort.clone());
+                    if effort == "ultra" {
+                        raw_response(
+                            502,
+                            "text/html",
+                            b"<!DOCTYPE html><title>502 Bad Gateway</title>".to_vec(),
+                        )
+                    } else if effort == "max" {
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_unmapped_luna\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    } else {
+                        raw_response(
+                            400,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": { "message": format!("unexpected effort {effort}") }
+                            }))
+                            .unwrap(),
+                        )
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "unmapped-luna-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("unmapped-luna-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-unmapped-luna-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "unmapped-luna-session",
+                "model": "gpt-5.6-luna",
+                "reasoning": { "effort": "ultra" },
+                "input": [{ "type": "message", "role": "user", "content": "hello" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ready"));
+        assert_eq!(
+            *attempted_efforts.lock().await,
+            vec!["ultra".to_string(), "max".to_string()]
+        );
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.retries, 1);
+        assert_eq!(metrics.recent_failed_requests.len(), 0);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(
+            metrics.recent_requests[0]
+                .reasoning_effort_source
+                .as_deref(),
+            Some("agent_reasoning_opaque_502_fallback")
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn verified_third_party_delta_rejection_never_retries_full_context() {
         let hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
@@ -30133,6 +30288,7 @@ mod tests {
             configured: Some("ultra".to_string()),
             effective: Some("ultra".to_string()),
             source: Some("model_override".to_string()),
+            catalog_supported: None,
         };
         assert!(should_probe_opaque_reasoning_fallback(
             502,
@@ -30159,6 +30315,38 @@ mod tests {
                 configured: Some("high".to_string()),
                 ..diagnostics
             },
+        ));
+    }
+
+    #[test]
+    fn unmapped_luna_preserves_agent_effort_until_opaque_502_proves_fallback_needed() {
+        let client = json!({
+            "model": "gpt-5.6-luna",
+            "reasoning": { "effort": "ultra" }
+        });
+        let mut upstream = client.clone();
+        let mut decision = reasoning_test_decision(None, &[]);
+        decision.provider.models.clear();
+        decision.model = "gpt-5.6-luna".to_string();
+
+        let diagnostics =
+            apply_model_reasoning_effort(&client, &mut upstream, &Channel::Responses, &decision);
+
+        assert_eq!(upstream.pointer("/reasoning/effort"), Some(&json!("ultra")));
+        assert_eq!(diagnostics.effective.as_deref(), Some("ultra"));
+        assert!(diagnostics
+            .catalog_supported
+            .as_ref()
+            .is_some_and(|levels| levels.iter().any(|level| level == "max")));
+        assert!(!should_probe_opaque_reasoning_fallback(
+            502,
+            br#"{"error":{"message":"invalid upstream gateway response"}}"#,
+            &diagnostics,
+        ));
+        assert!(should_probe_opaque_reasoning_fallback(
+            502,
+            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
+            &diagnostics,
         ));
     }
 
