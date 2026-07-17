@@ -1780,6 +1780,7 @@ async fn run_generation_for_authorized_agent(
     let prefix_guard_skip_reason = provider_prefix_guard_skip_reason(
         &config,
         skip_prefix_guard_for_sync_responses,
+        &decision.upstream_channel,
         authorized_agent.as_deref(),
     );
     let prefix_guard = if prefix_guard_skip_reason.is_some() {
@@ -4230,6 +4231,8 @@ async fn wait_for_provider_prefix_settle(
             let policy = PrefixController::before_request(PrefixControlInput {
                 source_is_exact: source == "exact",
                 avoidable_tokens,
+                avoidable_shortfall_streak: state.avoidable_shortfall_streak,
+                cache_instability_score: state.cache_instability_score,
                 state_age,
                 request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
             });
@@ -4915,7 +4918,7 @@ fn provider_prefix_wait_reason_for_channel(
 }
 
 fn responses_foreground_wait_cap() -> TokioDuration {
-    TokioDuration::from_secs(1)
+    TokioDuration::from_millis(500)
 }
 
 fn prefix_guard_wait_budget_for_channel(
@@ -7823,14 +7826,17 @@ fn foreground_cache_wait_enabled(_config: &AppConfig) -> bool {
 fn provider_prefix_guard_skip_reason(
     config: &AppConfig,
     skip_sync_responses_main: bool,
+    channel: &Channel,
     authorized_agent_id: Option<&str>,
 ) -> Option<&'static str> {
-    if is_agent_generation_request(authorized_agent_id) {
-        Some("agent_request")
-    } else if skip_sync_responses_main {
+    if skip_sync_responses_main {
         Some("sync_responses_main")
     } else if !smart_hit_enabled(config) {
         Some("smart_hit_disabled")
+    } else if is_agent_generation_request(authorized_agent_id)
+        && matches!(channel, Channel::Responses)
+    {
+        None
     } else if !foreground_cache_wait_enabled(config) {
         Some("fast_forward_no_foreground_cache_wait")
     } else {
@@ -15919,23 +15925,47 @@ mod tests {
     }
 
     #[test]
-    fn agent_generation_skips_prefix_guard_even_when_smart_hit_is_enabled() {
+    fn agent_generation_uses_bounded_prefix_guard_when_smart_hit_is_enabled() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.prewarm_enabled = true;
         config.cache.mode = CacheMode::PrefixPrewarm;
 
         assert_eq!(
-            provider_prefix_guard_skip_reason(&config, false, None),
+            provider_prefix_guard_skip_reason(&config, false, &Channel::Responses, None),
             Some("fast_forward_no_foreground_cache_wait")
         );
         assert_eq!(
-            provider_prefix_guard_skip_reason(&config, false, Some("codex")),
-            Some("agent_request")
+            provider_prefix_guard_skip_reason(&config, false, &Channel::Responses, Some("codex")),
+            None
         );
         assert_eq!(
-            provider_prefix_guard_skip_reason(&config, true, None),
+            provider_prefix_guard_skip_reason(&config, true, &Channel::Responses, None),
             Some("sync_responses_main")
+        );
+    }
+
+    #[test]
+    fn agent_generation_still_skips_prefix_guard_when_smart_hit_is_disabled() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = false;
+
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, false, &Channel::Responses, Some("codex")),
+            Some("smart_hit_disabled")
+        );
+    }
+
+    #[test]
+    fn agent_generation_keeps_non_responses_paths_on_fast_forward() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+
+        assert_eq!(
+            provider_prefix_guard_skip_reason(&config, false, &Channel::Chat, Some("codex")),
+            Some("fast_forward_no_foreground_cache_wait")
         );
     }
 
@@ -16603,7 +16633,7 @@ mod tests {
         assert!(smart_hit_enabled(&config));
         assert!(!foreground_cache_wait_enabled(&config));
         assert_eq!(
-            provider_prefix_guard_skip_reason(&config, false, None),
+            provider_prefix_guard_skip_reason(&config, false, &Channel::Responses, None),
             Some("fast_forward_no_foreground_cache_wait")
         );
     }
@@ -25342,6 +25372,8 @@ mod tests {
         prefix.seen_bucket_tokens_128 = 64_384;
         prefix.avoidable_shortfall_tokens = 512;
         prefix.avoidable_shortfall_tokens_128 = 512;
+        prefix.avoidable_shortfall_streak = 2;
+        prefix.cache_instability_score = 0;
         state
             .prefix_states
             .lock()
@@ -25357,8 +25389,8 @@ mod tests {
             Some(responses_foreground_wait_cap()),
         )
         .await;
-        assert!(guarded.wait_ms >= 500);
-        assert!(guarded.wait_ms <= 1_000);
+        assert!(guarded.wait_ms > 0);
+        assert!(guarded.wait_ms <= 500);
         assert_eq!(
             guarded.reason.as_deref(),
             Some("responses_exact_avoidable_gap")

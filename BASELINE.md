@@ -1,6 +1,6 @@
 # Atoapi Final Baseline
 
-Current packaged candidate: `v0.2.13-cache-options-fallback-parity-20260716`
+Current packaged candidate: `v0.2.14-adaptive-prefix-guard-20260717`
 
 Release folder:
 
@@ -11,6 +11,8 @@ Current workflow checkpoint:
 `CURRENT_WORKFLOW.md`
 
 ## Accepted Working Baseline
+
+- v0.2.14 keeps v0.2.13's forwarding and cache accounting line, and changes the Responses agent prefix guard to default 0ms with adaptive repeated-stable evidence capped at +0.5s. It is a packaged candidate pending live TTFT and cache-ratio verification.
 
 - v0.2.13 is the current source candidate over the v0.2.12 accepted cache-hit baseline. It preserves the Responses cached-token accounting and one-inbound/one-upstream relay contract, and reapplies only verified provider-native cache controls after compatibility and rescue body rebuilds. The native Responses route test captures the actual outbound `prompt_cache_options`; unverified capabilities remain stripped.
 - v0.2.13 correct-upstream Luna observe evidence passed in an isolated packaged run: `30` inbound = `30` attempts = `30` upstream, `807,603` input tokens, no failures, baseline `65.37%` and candidate shadow `65.74%`; candidate remains shadow-only until the normal applied canary gate is independently satisfied.

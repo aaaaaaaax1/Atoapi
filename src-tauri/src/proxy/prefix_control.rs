@@ -14,13 +14,17 @@ use super::{
     TailInputDiagnostics,
 };
 
-const MAX_FOREGROUND_WAIT: Duration = Duration::from_secs(1);
+const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
 const MAX_EXACT_EVIDENCE_AGE: Duration = Duration::from_secs(30);
+const MIN_REPEATED_AVOIDABLE_STREAK: u32 = 2;
+const MAX_STABLE_INSTABILITY_SCORE: u32 = 2;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefixControlInput {
     pub source_is_exact: bool,
     pub avoidable_tokens: u64,
+    pub avoidable_shortfall_streak: u32,
+    pub cache_instability_score: u32,
     pub state_age: Duration,
     pub request_budget: Duration,
 }
@@ -91,13 +95,19 @@ impl PrefixController {
         if input.state_age >= MAX_EXACT_EVIDENCE_AGE {
             return skip("avoidable_evidence_expired", false);
         }
+        if input.avoidable_shortfall_streak < MIN_REPEATED_AVOIDABLE_STREAK {
+            return skip("avoidable_gap_not_repeated", false);
+        }
+        if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE {
+            return skip("avoidable_gap_unstable", false);
+        }
 
         let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
         if request_budget.is_zero() {
             return skip("local_guard_budget_exhausted", true);
         }
 
-        let requested = requested_wait(input.avoidable_tokens);
+        let requested = requested_wait(input.avoidable_tokens, input.avoidable_shortfall_streak);
         let wait = requested.min(request_budget);
         PrefixControlDecision {
             wait,
@@ -400,9 +410,18 @@ fn gap_evidence(
     }
 }
 
-fn requested_wait(avoidable_tokens: u64) -> Duration {
-    let scaled_ms = avoidable_tokens.saturating_mul(500).saturating_div(2_048);
-    Duration::from_millis(500u64.saturating_add(scaled_ms).min(1_000))
+fn requested_wait(avoidable_tokens: u64, avoidable_shortfall_streak: u32) -> Duration {
+    let gap_ms = avoidable_tokens.min(4_096).saturating_mul(250) / 4_096;
+    let streak_ms = avoidable_shortfall_streak
+        .saturating_sub(MIN_REPEATED_AVOIDABLE_STREAK)
+        .min(5) as u64
+        * 75;
+    Duration::from_millis(
+        100u64
+            .saturating_add(gap_ms)
+            .saturating_add(streak_ms)
+            .min(MAX_FOREGROUND_WAIT.as_millis() as u64),
+    )
 }
 
 fn skip(reason: &'static str, budget_exhausted: bool) -> PrefixControlDecision {
@@ -422,8 +441,17 @@ mod tests {
         PrefixControlInput {
             source_is_exact: true,
             avoidable_tokens,
+            avoidable_shortfall_streak: 0,
+            cache_instability_score: 0,
             state_age: Duration::ZERO,
             request_budget: MAX_FOREGROUND_WAIT,
+        }
+    }
+
+    fn repeated_input(avoidable_tokens: u64, streak: u32) -> PrefixControlInput {
+        PrefixControlInput {
+            avoidable_shortfall_streak: streak,
+            ..input(avoidable_tokens)
         }
     }
 
@@ -445,12 +473,43 @@ mod tests {
     }
 
     #[test]
-    fn nine_second_exact_evidence_remains_actionable() {
+    fn first_exact_avoidable_evidence_does_not_wait() {
         let decision = PrefixController::before_request(PrefixControlInput {
             state_age: Duration::from_secs(9),
             ..input(768)
         });
-        assert!(decision.wait >= Duration::from_millis(500));
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert_eq!(decision.skip_reason, Some("avoidable_gap_not_repeated"));
+    }
+
+    #[test]
+    fn repeated_exact_avoidable_evidence_adapts_within_half_second() {
+        let short = PrefixController::before_request(repeated_input(512, 2));
+        let larger = PrefixController::before_request(repeated_input(4_096, 4));
+
+        assert!(short.wait > Duration::ZERO);
+        assert!(larger.wait > short.wait);
+        assert!(larger.wait <= MAX_FOREGROUND_WAIT);
+        assert_eq!(larger.reason, Some("responses_exact_avoidable_gap"));
+    }
+
+    #[test]
+    fn unstable_repeated_evidence_does_not_wait() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            ..repeated_input(4_096, 3)
+        });
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert_eq!(decision.skip_reason, Some("avoidable_gap_unstable"));
+    }
+
+    #[test]
+    fn repeated_evidence_remains_actionable_after_nine_seconds() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            state_age: Duration::from_secs(9),
+            ..repeated_input(768, 2)
+        });
+        assert!(decision.wait > Duration::ZERO);
         assert!(decision.wait <= MAX_FOREGROUND_WAIT);
         assert_eq!(decision.reason, Some("responses_exact_avoidable_gap"));
     }
@@ -469,7 +528,7 @@ mod tests {
     fn request_budget_is_a_hard_ceiling() {
         let decision = PrefixController::before_request(PrefixControlInput {
             request_budget: Duration::from_millis(120),
-            ..input(64_000)
+            ..repeated_input(64_000, 4)
         });
         assert_eq!(decision.wait, Duration::from_millis(120));
         assert!(decision.budget_exhausted);
@@ -480,8 +539,8 @@ mod tests {
         for tokens in [
             128, 256, 512, 1_024, 4_096, 16_384, 65_536, 262_144, 524_288,
         ] {
-            let decision = PrefixController::before_request(input(tokens));
-            assert!(decision.wait >= Duration::from_millis(500));
+            let decision = PrefixController::before_request(repeated_input(tokens, 2));
+            assert!(decision.wait > Duration::ZERO);
             assert!(decision.wait <= MAX_FOREGROUND_WAIT);
             assert_eq!(decision.reason, Some("responses_exact_avoidable_gap"));
         }

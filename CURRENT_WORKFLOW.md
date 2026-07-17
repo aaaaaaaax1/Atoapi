@@ -4,7 +4,8 @@ Last updated: 2026-07-16
 
 ## 2026-07-16 Cache Mainline V3
 
-- Current source and packaged baseline: `v0.2.13-cache-options-fallback-parity-20260716` under `G:\Atoapi\releases`.
+- Current source and packaged baseline: `v0.2.14-adaptive-prefix-guard-20260717` under `G:\Atoapi\releases`.
+- v0.2.14 changes only the foreground Responses prefix guard: first avoidable evidence waits 0ms; repeated stable exact evidence adapts up to +0.5s. No prewarm, extra upstream request, or normal session-delta is enabled.
 - v0.2.13 keeps verified `prompt_cache_options` consistent after Responses compatibility, session rescue, payload rescue, and previous-response fallback body rebuilds. The native Responses route regression test captures the actual outbound JSON and confirms `mode=implicit`, `ttl=30m`; unverified providers remain unchanged.
 - Packaged v0.2.13 isolated correct-upstream Luna observe run passed: `30` inbound = `30` attempts = `30` upstream, `807,603` input tokens, `0` failures, baseline `65.37%` vs candidate shadow `65.74%`; TTFT p50/p95 were `2317/8144ms` baseline and `2148/2587ms` candidate. This is shadow evidence only, not a promotion decision.
 - Corrected Responses cache accounting is now the measurement baseline. Compatible cached-token fields are reconciled before metrics classification; do not compare new results with older runs that lost `input_tokens_details.cached_tokens`.
@@ -31,7 +32,7 @@ Last updated: 2026-07-16
 - Current line is v0.1.55+ source. Package only after live-log comparison and build checks.
 - Cache-hit optimization hard gate: no active warmup/prewarm, no companion sync request, no extra upstream request, no normal main-path `previous_response_id + delta`.
 - Main Responses session-delta is allowed only for 413 self-rescue or compact/compatibility paths with strict same provider/model/scope/tool-context checks.
-- Foreground Responses guard is demand-driven and capped at +1s; healthy stable prefixes wait 0ms.
+- Foreground Responses guard defaults to 0ms; only repeated stable exact avoidable evidence may adaptively wait, capped at +0.5s.
 - Proxy-added first-token latency versus the upstream dashboard must stay within 2s. Diagnose upload, transport, gateway queueing, and provider processing separately before changing behavior.
 - Do not change, trim, compress, reorder, or summarize tool output content by default.
 - For log analysis, classify first: real new tail, true avoidable, cold read, session/context split, upstream error, or statistics-label issue. Do not tune blindly.
