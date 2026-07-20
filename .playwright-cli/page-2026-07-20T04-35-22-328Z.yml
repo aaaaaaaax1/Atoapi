@@ -1,0 +1,177 @@
+- generic [ref=f7e1]:
+  - generic [ref=f7e2]:
+    - banner [ref=f7e3]:
+      - generic [ref=f7e4]:
+        - button "打开设置" [ref=f7e5] [cursor=pointer]
+        - button "查看版本" [ref=f7e9] [cursor=pointer]:
+          - strong [ref=f7e10]: Atoapi
+          - generic [ref=f7e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=f7e12]:
+        - tab "Codex 已启用" [selected] [ref=f7e13] [cursor=pointer]:
+          - generic [ref=f7e18]:
+            - generic [ref=f7e19]: Codex
+            - generic [ref=f7e20]: 已启用
+        - tab "Claude Code 已启用" [ref=f7e22] [cursor=pointer]:
+          - generic [ref=f7e28]:
+            - generic [ref=f7e29]: Claude Code
+            - generic [ref=f7e30]: 已启用
+        - tab "Gemini 已关闭" [ref=f7e32] [cursor=pointer]:
+          - generic [ref=f7e36]:
+            - generic [ref=f7e37]: Gemini
+            - generic [ref=f7e38]: 已关闭
+        - tab "OpenCode 已启用" [ref=f7e40] [cursor=pointer]:
+          - generic [ref=f7e45]:
+            - generic [ref=f7e46]: OpenCode
+            - generic [ref=f7e47]: 已启用
+        - tab "OpenClaw 已关闭" [ref=f7e49] [cursor=pointer]:
+          - generic [ref=f7e54]:
+            - generic [ref=f7e55]: OpenClaw
+            - generic [ref=f7e56]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=f7e58] [cursor=pointer]:
+          - generic [ref=f7e67]:
+            - generic [ref=f7e68]: Proxy Mode
+            - generic [ref=f7e69]: 已启用
+      - generic [ref=f7e71]:
+        - generic [ref=f7e72]:
+          - generic [ref=f7e73]: 代理运行中
+          - generic [ref=f7e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=f7e75] [cursor=pointer]
+    - main [ref=f7e106]:
+      - text: · · · · · ·
+      - generic [ref=f7e224]:
+        - generic [ref=f7e225]:
+          - generic [ref=f7e226]:
+            - button "返回 Agent" [ref=f7e227] [cursor=pointer]
+            - generic [ref=f7e230]:
+              - heading "缓存统计" [level=2] [ref=f7e231]
+              - paragraph [ref=f7e232]: 成功记录与错误记录分离，详情按需展开。
+          - button "刷新" [ref=f7e233] [cursor=pointer]
+        - generic [ref=f7e239]:
+          - generic [ref=f7e240]:
+            - generic [ref=f7e241]: 历史命中率
+            - generic [ref=f7e242]: 95.8%
+          - generic [ref=f7e243]:
+            - generic [ref=f7e244]: 累计输入
+            - generic [ref=f7e245]: 12,860,000
+          - generic [ref=f7e246]:
+            - generic [ref=f7e247]: 累计命中
+            - generic [ref=f7e248]: 12,320,000
+          - generic [ref=f7e249]:
+            - generic [ref=f7e250]: 成功 / error
+            - generic [ref=f7e251]: 128 / 2
+        - tablist "缓存统计视图" [ref=f7e252]:
+          - tab "概览" [ref=f7e253] [cursor=pointer]
+          - tab "请求记录" [active] [selected] [ref=f7e254] [cursor=pointer]
+          - tab "上游统计" [ref=f7e255] [cursor=pointer]
+        - generic [ref=f7e291]:
+          - generic [ref=f7e292]:
+            - tablist "请求记录上游筛选"
+            - generic "请求记录分页"
+          - generic [ref=f7e293]:
+            - generic [ref=f7e294]: 上游 / Agent
+            - generic [ref=f7e295]: 模型 / 思考
+            - generic [ref=f7e296]: 流
+            - generic [ref=f7e297]: Tokens
+            - generic [ref=f7e298]: 首字 / 耗时
+            - generic [ref=f7e299]: 命中
+          - generic [ref=f7e300]:
+            - article [ref=f7e301] [cursor=pointer]:
+              - generic [ref=f7e302]:
+                - generic [ref=f7e303]: 云舟 / Codex
+                - generic [ref=f7e304]: 12:51:42
+              - generic [ref=f7e305]:
+                - generic [ref=f7e306]: gpt-5.6-luna → gpt-5.6-sol
+                - generic [ref=f7e307]: max
+              - generic [ref=f7e308]:
+                - generic [ref=f7e309]: 流
+                - generic [ref=f7e310]: —
+              - generic [ref=f7e311]:
+                - generic [ref=f7e312]: 90,700 / 690
+                - generic [ref=f7e313]: 缓存 89,300
+              - generic [ref=f7e314]:
+                - generic [ref=f7e315]:
+                  - generic [ref=f7e316]: 首字
+                  - generic [ref=f7e317]: 3.42s
+                - generic [ref=f7e318]:
+                  - generic [ref=f7e319]: 耗时
+                  - generic [ref=f7e320]: 18.7s
+              - generic [ref=f7e321]:
+                - generic [ref=f7e322]: 98.5%
+                - generic [ref=f7e323]: 缺 1,280 · 可 768 · 新 512
+            - article [ref=f7e324] [cursor=pointer]:
+              - generic [ref=f7e325]:
+                - generic [ref=f7e326]: 云舟 / Codex
+                - generic [ref=f7e327]: 12:48:16
+              - generic [ref=f7e328]:
+                - generic [ref=f7e329]: gpt-5.6-luna → gpt-5.6-sol
+                - generic [ref=f7e330]: max
+              - generic [ref=f7e331]:
+                - generic [ref=f7e332]: 流
+                - generic [ref=f7e333]: —
+              - generic [ref=f7e334]:
+                - generic [ref=f7e335]: 89,400 / 812
+                - generic [ref=f7e336]: 缓存 85,600
+              - generic [ref=f7e337]:
+                - generic [ref=f7e338]:
+                  - generic [ref=f7e339]: 首字
+                  - generic [ref=f7e340]: 3.81s
+                - generic [ref=f7e341]:
+                  - generic [ref=f7e342]: 耗时
+                  - generic [ref=f7e343]: 21.2s
+              - generic [ref=f7e344]:
+                - generic [ref=f7e345]: 95.7%
+                - generic [ref=f7e346]: 缺 3,712 · 新 1,536
+            - article [ref=f7e347] [cursor=pointer]:
+              - generic [ref=f7e348]:
+                - generic [ref=f7e349]: api.aiaiaiai / Codex
+                - generic [ref=f7e350]: 12:44:03
+              - generic [ref=f7e351]:
+                - generic [ref=f7e352]: gpt-5.5
+                - generic [ref=f7e353]: xhigh
+              - generic [ref=f7e354]:
+                - generic [ref=f7e355]: 流
+                - generic [ref=f7e356]: —
+              - generic [ref=f7e357]:
+                - generic [ref=f7e358]: 86,200 / 533
+                - generic [ref=f7e359]: 缓存 81,700
+              - generic [ref=f7e360]:
+                - generic [ref=f7e361]:
+                  - generic [ref=f7e362]: 首字
+                  - generic [ref=f7e363]: 4.16s
+                - generic [ref=f7e364]:
+                  - generic [ref=f7e365]: 耗时
+                  - generic [ref=f7e366]: 16.4s
+              - generic [ref=f7e367]:
+                - generic [ref=f7e368]: 94.8%
+                - generic [ref=f7e369]: 缺 4,352 · 可 128
+            - article [ref=f7e370] [cursor=pointer]:
+              - generic [ref=f7e371]:
+                - generic [ref=f7e372]: 云舟 / Codex
+                - generic [ref=f7e373]: 12:36:58
+              - generic [ref=f7e374]:
+                - generic [ref=f7e375]: gpt-5.6-luna → gpt-5.6-sol
+                - generic [ref=f7e376]: max
+              - generic [ref=f7e377]:
+                - generic [ref=f7e378]: 流
+                - generic [ref=f7e379]: —
+              - generic [ref=f7e380]:
+                - generic [ref=f7e381]: 81,100 / 744
+                - generic [ref=f7e382]: 缓存 76,800
+              - generic [ref=f7e383]:
+                - generic [ref=f7e384]:
+                  - generic [ref=f7e385]: 首字
+                  - generic [ref=f7e386]: 5.03s
+                - generic [ref=f7e387]:
+                  - generic [ref=f7e388]: 耗时
+                  - generic [ref=f7e389]: 22.9s
+              - generic [ref=f7e390]:
+                - generic [ref=f7e391]: 94.7%
+                - generic [ref=f7e392]: 压缩后 · 缺 4,224 · 新 2,048
+    - contentinfo [ref=f7e214]:
+      - button "关闭缓存统计与请求记录" [pressed] [ref=f7e290] [cursor=pointer]:
+        - generic [ref=f7e220]: 缓存与记录
+        - generic [ref=f7e221]:
+          - text: 命中率
+          - strong [ref=f7e222]: 95.8%
+        - generic [ref=f7e223]: 128 成功 · 2 error
+  - status

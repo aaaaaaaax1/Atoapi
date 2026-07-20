@@ -313,6 +313,7 @@ export interface MetricsSnapshot {
     client_channel: string;
     upstream_channel: string;
     provider: string;
+    provider_id?: string | null;
     model: string;
     requested_model?: string | null;
     agent_reasoning_effort?: string | null;
@@ -396,6 +397,10 @@ export interface MetricsSnapshot {
     session_anchor_source?: string | null;
     session_anchor_changed?: boolean | null;
     session_anchor_peer_count?: number | null;
+    inbound_body_bytes?: number | null;
+    original_body_bytes?: number | null;
+    send_body_bytes?: number | null;
+    send_body_is_delta?: boolean | null;
   }>;
   recent_requests: Array<{
     id: string;
@@ -407,6 +412,7 @@ export interface MetricsSnapshot {
     client_channel: string;
     upstream_channel: string;
     provider: string;
+    provider_id?: string | null;
     model: string;
     requested_model?: string | null;
     agent_reasoning_effort?: string | null;
@@ -490,6 +496,10 @@ export interface MetricsSnapshot {
     session_anchor_source?: string | null;
     session_anchor_changed?: boolean | null;
     session_anchor_peer_count?: number | null;
+    inbound_body_bytes?: number | null;
+    original_body_bytes?: number | null;
+    send_body_bytes?: number | null;
+    send_body_is_delta?: boolean | null;
   }>;
   recent_failed_requests?: MetricsSnapshot["recent_requests"];
   recent_errors?: Array<{
@@ -646,6 +656,7 @@ export interface ProxyModeConfigInput {
 export interface GeneralConfigInput {
   host: string;
   port: number;
+  proxy_auto_start?: boolean;
   local_key: string;
   default_channel: Channel;
   workspace_fingerprint: string;
@@ -926,19 +937,14 @@ function fallback(name: string, args?: Record<string, unknown>) {
   }
   if (name === "fetch_provider_models") {
     const input = args?.input as FetchModelsInput | undefined;
-    const models = inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
-    if (input?.provider_id) {
-      fallbackConfig = withProvider(input.provider_id, (provider) => ({
-        ...provider,
-        models,
-        updated_at: new Date().toISOString()
-      }));
-    }
-    return models;
+    return inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
   }
   if (name === "test_provider_key") {
     const input = args?.input as { provider_id?: string; key_id?: string; api_key?: string; base_url?: string; channel?: Channel } | undefined;
-    const usable = Boolean(input?.api_key || input?.key_id);
+    const provider = input?.provider_id
+      ? fallbackConfig.providers.find((item) => item.id === input.provider_id)
+      : undefined;
+    const usable = Boolean(input?.api_key || input?.key_id || provider?.has_api_key);
     const models = inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
     return {
       provider_id: input?.provider_id ?? null,
@@ -969,7 +975,12 @@ function fallback(name: string, args?: Record<string, unknown>) {
       message: "预览模式不会向外部上游发送会话复用兼容性探测",
       checked_at: new Date().toISOString(),
       first_status: null,
-      continuation_status: null
+      continuation_status: null,
+      first_input_tokens: null,
+      first_cached_tokens: null,
+      continuation_input_tokens: null,
+      continuation_cached_tokens: null,
+      usage_verified: false
     } satisfies ProviderResponseSessionReuseProbeResult;
   }
   if (name === "set_provider_response_session_reuse_enabled") {
@@ -979,7 +990,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
     fallbackConfig = withProvider(providerId, (provider) => ({
       ...provider,
       response_session_reuse_models: (provider.response_session_reuse_models ?? []).map((item) =>
-        item.model_id === modelId && item.status === "verified"
+        item.model_id === modelId && item.status === "verified" && item.usage_verified === true
           ? { ...item, enabled, updated_at: new Date().toISOString() }
           : item
       )
@@ -1214,6 +1225,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       ...fallbackConfig,
       host: input.host,
       port: input.port,
+      proxy_auto_start: input.proxy_auto_start ?? fallbackConfig.proxy_auto_start,
       local_key: input.local_key,
       default_channel: input.default_channel,
       workspace_fingerprint: input.workspace_fingerprint,
@@ -1302,6 +1314,7 @@ export interface ProviderResponseSessionReuseConfig {
   model_id: string;
   enabled: boolean;
   status: ProviderResponseSessionReuseStatus;
+  usage_verified: boolean;
   checked_at?: string | null;
   last_error?: string | null;
   updated_at: string;
@@ -1316,6 +1329,11 @@ export interface ProviderResponseSessionReuseProbeResult {
   checked_at?: string | null;
   first_status?: number | null;
   continuation_status?: number | null;
+  first_input_tokens?: number | null;
+  first_cached_tokens?: number | null;
+  continuation_input_tokens?: number | null;
+  continuation_cached_tokens?: number | null;
+  usage_verified: boolean;
 }
 
 export interface ProviderResponseSessionReuseProbeInput {

@@ -1,0 +1,56 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - button "查看版本更新" [ref=e11] [cursor=pointer]:
+      - strong [ref=e12]: Atoapi
+      - generic [ref=e13]: Graphite · v0.2.16
+    - navigation "Agent 注入" [ref=e14]:
+      - tab "Claude Code Agent 已关闭" [selected] [ref=e227] [cursor=pointer]:
+        - generic [ref=e20]: Claude Code
+        - generic "Agent 已关闭" [ref=e23]
+      - tab "Codex Agent 已关闭" [ref=e228] [cursor=pointer]:
+        - generic [ref=e38]: Codex
+        - generic "Agent 已关闭" [ref=e41]
+      - tab "Gemini Agent 已关闭" [ref=e229] [cursor=pointer]:
+        - generic [ref=e46]: Gemini
+        - generic "Agent 已关闭" [ref=e49]
+      - tab "OpenCode Agent 已关闭" [ref=e230] [cursor=pointer]:
+        - generic [ref=e56]: OpenCode
+        - generic "Agent 已关闭" [ref=e59]
+      - tab "OpenClaw Agent 已关闭" [ref=e231] [cursor=pointer]:
+        - generic [ref=e66]: OpenClaw
+        - generic "Agent 已关闭" [ref=e69]
+      - button "更多 Agent" [ref=e82] [cursor=pointer]
+    - button "刷新配置和统计" [ref=e91] [cursor=pointer]
+  - region [ref=e97]:
+    - generic [ref=e98]:
+      - switch "启用当前 Agent" [ref=e99] [cursor=pointer]
+      - generic [ref=e101]:
+        - heading "Claude Code" [level=1] [ref=e102]
+        - paragraph [ref=e103]: 未选择上游 · 未命中映射时保留 Agent 原始模型参数
+    - generic [ref=e104]:
+      - generic [ref=e105]:
+        - generic [ref=e106]: Anthropic Base URL
+        - code [ref=e107]: http://127.0.0.1:18883
+        - button "复制 Anthropic Base URL" [ref=e108] [cursor=pointer]
+      - generic [ref=e112]:
+        - generic [ref=e113]: Agent Key
+        - code [ref=e114]: ato-local-preview
+        - button "复制 Agent Key" [ref=e115] [cursor=pointer]
+    - button "新增上游" [ref=e120] [cursor=pointer]
+  - main [ref=e123]:
+    - region "Claude Code 上游路由" [ref=e124]:
+      - generic [ref=e125]:
+        - generic [ref=e126]:
+          - heading "上游路由" [level=2] [ref=e127]
+          - paragraph [ref=e128]: 未命中模型映射时，完整保留 Agent 发来的模型与推理参数。
+        - generic [ref=e129]:
+          - generic [ref=e130]: 0 个可用上游
+          - button "添加上游" [ref=e131] [cursor=pointer]
+      - generic [ref=e134]:
+        - generic [ref=e140]: 当前 Agent 还没有上游。添加后会自动绑定；未映射模型仍会原样透传。
+        - button "添加上游" [ref=e141] [cursor=pointer]
+  - button "缓存与记录 命中率 0.0%" [ref=e232] [cursor=pointer]:
+    - generic [ref=e150]: 缓存与记录
+    - generic [ref=e151]:
+      - text: 命中率
+      - strong [ref=e152]: 0.0%

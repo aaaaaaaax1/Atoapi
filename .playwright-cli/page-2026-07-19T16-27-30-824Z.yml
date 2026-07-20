@@ -1,0 +1,155 @@
+- main [ref=f1e3]:
+  - generic [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - button "查看版本更新" [ref=f1e6] [cursor=pointer]
+      - generic [ref=f1e10]:
+        - generic [ref=f1e11]: Atoapi
+        - generic [ref=f1e12]: Graphite · Relay
+      - button "查看版本更新" [ref=f1e14] [cursor=pointer]: v0.2.16
+    - navigation "Agent 注入" [ref=f1e15]:
+      - button "Claude Code 已关闭 Agent 已关闭" [ref=f1e16] [cursor=pointer]:
+        - generic [ref=f1e21]:
+          - generic [ref=f1e22]: Claude Code
+          - generic "未选择上游" [ref=f1e23]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e24]
+      - button "Claude Desktop 已关闭 Agent 已关闭" [ref=f1e25] [cursor=pointer]:
+        - generic [ref=f1e30]:
+          - generic [ref=f1e31]: Claude Desktop
+          - generic "未选择上游" [ref=f1e32]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e33]
+      - button "Codex 已关闭 Agent 已关闭" [ref=f1e34] [cursor=pointer]:
+        - generic [ref=f1e48]:
+          - generic [ref=f1e49]: Codex
+          - generic "未选择上游" [ref=f1e50]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e51]
+      - button "Gemini 已关闭 Agent 已关闭" [ref=f1e52] [cursor=pointer]:
+        - generic [ref=f1e56]:
+          - generic [ref=f1e57]: Gemini
+          - generic "未选择上游" [ref=f1e58]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e59]
+      - button "OpenCode 已关闭 Agent 已关闭" [ref=f1e60] [cursor=pointer]:
+        - generic [ref=f1e66]:
+          - generic [ref=f1e67]: OpenCode
+          - generic "未选择上游" [ref=f1e68]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e69]
+      - button "OpenClaw 已关闭 Agent 已关闭" [ref=f1e70] [cursor=pointer]:
+        - generic [ref=f1e76]:
+          - generic [ref=f1e77]: OpenClaw
+          - generic "未选择上游" [ref=f1e78]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e79]
+      - button "Hermes 已关闭 Agent 已关闭" [ref=f1e80] [cursor=pointer]:
+        - generic [ref=f1e84]:
+          - generic [ref=f1e85]: Hermes
+          - generic "未选择上游" [ref=f1e86]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e87]
+      - button "本地代理模式 已关闭 Agent 已关闭" [ref=f1e88] [cursor=pointer]:
+        - generic [ref=f1e95]:
+          - generic [ref=f1e96]: 本地代理模式
+          - generic "未选择上游" [ref=f1e97]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e98]
+    - generic [ref=f1e99]:
+      - generic "http://127.0.0.1:18883" [ref=f1e100]:
+        - generic [ref=f1e102]: 本地中转
+        - code [ref=f1e103]: 127.0.0.1:18883
+      - button "刷新配置和统计" [ref=f1e104] [cursor=pointer]
+      - button "查看版本更新" [ref=f1e110] [cursor=pointer]
+  - generic [ref=f1e114]:
+    - generic [ref=f1e115]:
+      - generic [ref=f1e116]:
+        - switch "开启这个 Agent 注入" [ref=f1e117] [cursor=pointer]
+        - generic [ref=f1e123]:
+          - heading "Claude Code" [level=3] [ref=f1e124]
+          - paragraph [ref=f1e125]: 为这个 Agent 选择一个中转上游。模型未命中映射时会直接透传 Agent 请求里的 model。
+      - button "新增上游" [active] [ref=f1e127] [cursor=pointer]
+      - generic [ref=f1e130]:
+        - generic [ref=f1e131]:
+          - generic [ref=f1e132]: Anthropic Base URL
+          - code [ref=f1e133]: http://127.0.0.1:18883
+          - button "复制 Anthropic Base URL" [ref=f1e134] [cursor=pointer]
+        - generic [ref=f1e138]:
+          - generic [ref=f1e139]: Agent Key
+          - code [ref=f1e140]: ato-local-preview
+          - button "复制 Agent Key" [ref=f1e141] [cursor=pointer]
+    - heading "选择这个 Agent 使用的上游" [level=3] [ref=f1e147]
+    - generic [ref=f1e148]:
+      - generic [ref=f1e154]: 还没有上游。先新增一个中转，然后这个 Agent 会自动绑定到它。
+      - button "新增上游" [ref=f1e155] [cursor=pointer]
+  - generic [ref=f1e157]:
+    - button "缓存与记录" [ref=f1e158] [cursor=pointer]
+    - generic [ref=f1e165]:
+      - strong [ref=f1e166]: 命中率 0.0%
+      - generic [ref=f1e167]: 0 成功 · 0 error
+  - dialog "上游配置" [ref=f1e168]:
+    - generic [ref=f1e169]:
+      - generic [ref=f1e170]:
+        - heading "新增中转上游" [level=3] [ref=f1e171]
+        - paragraph [ref=f1e172]: 保存后会回到当前 Agent 页面，并把它绑定到这个上游。
+      - button "关闭" [ref=f1e173] [cursor=pointer]
+    - generic [ref=f1e178]:
+      - generic [ref=f1e179]:
+        - generic [ref=f1e181]:
+          - heading "新增上游" [level=3] [ref=f1e182]
+          - paragraph [ref=f1e183]: 填写真实上游地址。默认自动识别通道，特殊上游再切到手动。
+        - generic [ref=f1e184]:
+          - generic [ref=f1e185]:
+            - generic [ref=f1e186]: 名称
+            - textbox "名称" [ref=f1e187]:
+              - /placeholder: 上游名称
+          - generic [ref=f1e188]:
+            - generic [ref=f1e189]: 通道
+            - combobox "通道" [ref=f1e191]:
+              - option "自动识别（推荐） · 按客户端请求和压缩场景自动选择最合适的上游格式" [selected]
+              - option "手动：Responses · /v1/responses"
+              - option "手动：Chat · /v1/chat/completions"
+              - option "手动：Anthropic · /v1/messages"
+          - generic [ref=f1e194]:
+            - generic [ref=f1e195]: Base URL
+            - textbox "Base URL" [ref=f1e200]:
+              - /placeholder: https://example.com/v1
+          - generic [ref=f1e201]:
+            - generic [ref=f1e202]: API Key
+            - generic [ref=f1e203]:
+              - textbox "API Key" [ref=f1e207]:
+                - /placeholder: 输入上游 API Key
+              - button "显示 Key" [ref=f1e208] [cursor=pointer]
+        - generic [ref=f1e212]:
+          - generic [ref=f1e213]:
+            - heading "? 使用系统代理 默认关闭并直连上游。只有该上游必须通过 Windows 系统代理才能访问时才开启；模型获取、Key 测活、普通转发、压缩和同步都会使用同一网络路径。仪表按钮会用同一个模型列表端点分别探测直连与系统代理，不生成模型内容；闪电按钮只会把探测到的较快成功路径写入未保存草稿。" [level=4] [ref=f1e214]
+            - button "关" [ref=f1e216] [cursor=pointer]
+          - generic [ref=f1e219]:
+            - heading "? prompt_cache_retention 默认开启。仅对 OpenAI Chat / Responses 上游发送 prompt_cache_retention=24h，用来请求更久的前缀缓存保留；上游不支持并报错时关闭。" [level=4] [ref=f1e220]
+            - button "开" [ref=f1e221] [cursor=pointer]
+          - generic [ref=f1e224]:
+            - generic [ref=f1e225]:
+              - generic [ref=f1e226]:
+                - generic [ref=f1e230]: Responses 会话复用
+                - generic [ref=f1e231]: 保存后可验证
+              - paragraph [ref=f1e233]: 验证使用两条独立管理请求和约 2K token 的合成前缀，不读取 Agent 对话；语义、usage 与 128-token 缓存桶全部通过后才启用 previous_response_id 增量。
+            - generic [ref=f1e234]:
+              - textbox "验证范围只覆盖这个实际上游模型" [disabled] [ref=f1e235]:
+                - /placeholder: 实际上游模型 ID
+              - button "验证并启用" [disabled] [ref=f1e236] [cursor=pointer]
+              - button "需先完成兼容性验证" [disabled] [ref=f1e240]
+          - generic [ref=f1e242]:
+            - heading "? 大请求体 gzip 默认关闭。只对超过 600KB 的上游请求体尝试 gzip 发送；上游不支持时会回退普通 JSON，不改变语义。" [level=4] [ref=f1e243]
+            - button "关" [ref=f1e244] [cursor=pointer]
+          - generic [ref=f1e247]:
+            - heading "? 非 SSE 压缩校验兼容 默认关闭即快速压缩模式，按 cc-switch 思路优先走更快的协议转换。只有 ZCode 或类似 Agent 对非 SSE Responses 压缩 JSON 字段校验很严格时才开启。" [level=4] [ref=f1e248]
+            - button "关" [ref=f1e249] [cursor=pointer]
+        - button "多 Key 管理 关闭 · 点击开启" [ref=f1e253] [cursor=pointer]:
+          - generic [ref=f1e258]:
+            - generic [ref=f1e259]: 多 Key 管理
+            - generic [ref=f1e260]: 关闭 · 点击开启
+        - button "保存并绑定当前 Agent" [ref=f1e264] [cursor=pointer]
+      - generic [ref=f1e269]:
+        - generic [ref=f1e270]:
+          - generic [ref=f1e271]:
+            - heading "模型映射" [level=3] [ref=f1e272]
+            - paragraph [ref=f1e273]: 不配置映射也可以直接代理转发；获取模型只是为了快速加入映射。
+          - button "手动添加" [ref=f1e274] [cursor=pointer]
+        - generic [ref=f1e276]:
+          - button "获取模型" [disabled] [ref=f1e277]
+          - combobox [disabled] [ref=f1e284]:
+            - option "等待获取模型列表" [selected]
+          - button "加入" [disabled] [ref=f1e287] [cursor=pointer]
+        - generic [ref=f1e289]: 映射列表为空。Agent 发来的模型会原样发给上游。

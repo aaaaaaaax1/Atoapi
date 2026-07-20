@@ -1,0 +1,123 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - banner [ref=e3]:
+      - generic [ref=e4]:
+        - button "打开设置" [ref=e5] [cursor=pointer]
+        - button "查看版本" [ref=e9] [cursor=pointer]:
+          - strong [ref=e10]: Atoapi
+          - generic [ref=e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=e12]:
+        - tab "Codex 已启用" [selected] [ref=e13] [cursor=pointer]:
+          - generic [ref=e18]:
+            - generic [ref=e19]: Codex
+            - generic [ref=e20]: 已启用
+        - tab "Claude Code 已启用" [ref=e22] [cursor=pointer]:
+          - generic [ref=e28]:
+            - generic [ref=e29]: Claude Code
+            - generic [ref=e30]: 已启用
+        - tab "Gemini 已关闭" [ref=e32] [cursor=pointer]:
+          - generic [ref=e36]:
+            - generic [ref=e37]: Gemini
+            - generic [ref=e38]: 已关闭
+        - tab "OpenCode 已启用" [ref=e40] [cursor=pointer]:
+          - generic [ref=e45]:
+            - generic [ref=e46]: OpenCode
+            - generic [ref=e47]: 已启用
+        - tab "OpenClaw 已关闭" [ref=e49] [cursor=pointer]:
+          - generic [ref=e54]:
+            - generic [ref=e55]: OpenClaw
+            - generic [ref=e56]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=e58] [cursor=pointer]:
+          - generic [ref=e67]:
+            - generic [ref=e68]: Proxy Mode
+            - generic [ref=e69]: 已启用
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: 代理运行中
+          - generic [ref=e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=e75] [cursor=pointer]
+    - region [ref=e81]:
+      - generic [ref=e82]:
+        - switch "启用当前 Agent" [checked] [ref=e83] [cursor=pointer]
+        - generic [ref=e84]:
+          - heading "Codex" [level=1] [ref=e85]
+          - paragraph [ref=e86]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=e87]:
+        - generic [ref=e88]:
+          - generic [ref=e89]: Base URL
+          - code [ref=e90]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=e91] [cursor=pointer]
+        - generic [ref=e95]:
+          - generic [ref=e96]: Local Key
+          - code [ref=e97]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=e98] [cursor=pointer]
+      - button "新增上游" [ref=e103] [cursor=pointer]
+    - main [ref=e106]:
+      - generic [ref=e107]:
+        - generic [ref=e108]:
+          - generic [ref=e109]:
+            - heading "上游路由" [level=2] [ref=e110]
+            - paragraph [ref=e111]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+          - generic [ref=e112]:
+            - generic [ref=e113]: 3 个可用上游
+            - generic [ref=e114]: 一次入站 · 一次上游
+        - generic [ref=e115]:
+          - article [ref=e116]:
+            - generic [ref=e122]:
+              - generic [ref=e123]: 云舟
+              - generic [ref=e124]: https://api.yunzhou.example/v1
+            - generic [ref=e125]:
+              - generic [ref=e126]:
+                - generic [ref=e127]: Responses
+                - generic [ref=e128]: · 3 个映射
+                - generic [ref=e129]: · 2 Key
+              - generic [ref=e130]:
+                - generic [ref=e131]: 最近连通
+                - generic [ref=e132]: 188ms
+            - generic [ref=e133]:
+              - button "当前" [ref=e134] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=e137] [cursor=pointer]
+              - button "编辑 云舟" [ref=e140] [cursor=pointer]
+              - button "删除 云舟" [ref=e144] [cursor=pointer]
+          - article [ref=e148]:
+            - generic [ref=e153]:
+              - generic [ref=e154]: api.aiaiaiai
+              - generic [ref=e155]: https://api.aiaiaiai.example/v1
+            - generic [ref=e156]:
+              - generic [ref=e157]:
+                - generic [ref=e158]: Auto
+                - generic [ref=e159]: · Agent 直传
+                - generic [ref=e160]: · 1 Key
+              - generic [ref=e161]:
+                - generic [ref=e162]: 最近连通
+                - generic [ref=e163]: 241ms
+            - generic [ref=e164]:
+              - button "使用" [ref=e165] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=e170] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=e173] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=e177] [cursor=pointer]
+          - article [ref=e181]:
+            - generic [ref=e186]:
+              - generic [ref=e187]: sheapi
+              - generic [ref=e188]: https://api.sheapi.example/v1
+            - generic [ref=e189]:
+              - generic [ref=e190]:
+                - generic [ref=e191]: Chat
+                - generic [ref=e192]: · 2 个映射
+                - generic [ref=e193]: · 4 Key
+              - generic [ref=e194]:
+                - generic [ref=e195]: 最近连通
+                - generic [ref=e196]: 326ms
+            - generic [ref=e197]:
+              - button "使用" [ref=e198] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=e203] [cursor=pointer]
+              - button "编辑 sheapi" [ref=e206] [cursor=pointer]
+              - button "删除 sheapi" [ref=e210] [cursor=pointer]
+    - contentinfo [ref=e214]:
+      - button "打开缓存统计与请求记录" [ref=e215] [cursor=pointer]:
+        - generic [ref=e220]: 缓存与记录
+        - generic [ref=e221]:
+          - text: 命中率
+          - strong [ref=e222]: 96.4%
+        - generic [ref=e223]: 3 成功
+  - status

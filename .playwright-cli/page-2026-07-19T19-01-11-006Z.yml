@@ -1,0 +1,81 @@
+- iframe [active] [ref=e3]:
+  - generic [active] [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e9] [cursor=pointer]:
+            - strong [ref=f1e10]: Atoapi
+            - generic [ref=f1e11]: Graphite · v0.2.16
+        - tablist "Agent 列表" [ref=f1e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e463] [cursor=pointer]:
+            - generic [ref=f1e469]:
+              - generic [ref=f1e470]: Claude Code
+              - generic [ref=f1e471]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e473] [cursor=pointer]:
+            - generic [ref=f1e477]:
+              - generic [ref=f1e478]: Claude Desktop
+              - generic [ref=f1e479]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e481] [cursor=pointer]:
+            - generic [ref=f1e486]:
+              - generic [ref=f1e487]: Codex
+              - generic [ref=f1e488]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e490] [cursor=pointer]:
+            - generic [ref=f1e494]:
+              - generic [ref=f1e495]: Gemini
+              - generic [ref=f1e496]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e498] [cursor=pointer]:
+            - generic [ref=f1e503]:
+              - generic [ref=f1e504]: OpenCode
+              - generic [ref=f1e505]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e507] [cursor=pointer]:
+            - generic [ref=f1e512]:
+              - generic [ref=f1e513]: OpenClaw
+              - generic [ref=f1e514]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e516] [cursor=pointer]:
+            - generic [ref=f1e524]:
+              - generic [ref=f1e525]: Hermes
+              - generic [ref=f1e526]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e528] [cursor=pointer]:
+            - generic [ref=f1e537]:
+              - generic [ref=f1e538]: 本地代理模式
+              - generic [ref=f1e539]: 已关闭
+        - generic [ref=f1e71]:
+          - generic [ref=f1e72]:
+            - generic [ref=f1e73]: 代理运行中
+            - generic [ref=f1e74]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e75] [cursor=pointer]
+      - region [ref=f1e310]:
+        - generic [ref=f1e82]:
+          - switch "启用当前 Agent" [ref=f1e83] [cursor=pointer]
+          - generic [ref=f1e84]:
+            - heading "Claude Code" [level=1] [ref=f1e311]
+            - paragraph [ref=f1e86]: 未选择上游
+        - generic [ref=f1e87]:
+          - generic [ref=f1e546]:
+            - generic [ref=f1e547]: Base URL
+            - code [ref=f1e548]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f1e549] [cursor=pointer]
+          - generic [ref=f1e553]:
+            - generic [ref=f1e554]: Local Key
+            - code [ref=f1e555]: ato-local-preview
+            - button "复制本地 Key" [ref=f1e556] [cursor=pointer]
+        - button "新增上游" [ref=f1e103] [cursor=pointer]
+      - main [ref=f1e106]:
+        - generic [ref=f1e107]:
+          - generic [ref=f1e108]:
+            - generic [ref=f1e109]:
+              - heading "上游路由" [level=2] [ref=f1e110]
+              - paragraph [ref=f1e111]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f1e112]:
+              - generic [ref=f1e113]: 0 个可用上游
+              - generic [ref=f1e114]: 一次入站 · 一次上游
+          - generic [ref=f1e115]: 当前没有上游配置
+      - contentinfo [ref=f1e214]:
+        - button "打开缓存统计与请求记录" [ref=f1e459] [cursor=pointer]:
+          - generic [ref=f1e220]: 缓存与记录
+          - generic [ref=f1e221]:
+            - text: 命中率
+            - strong [ref=f1e566]: 0.0%
+          - generic [ref=f1e223]: 0 成功 · 0 error
+    - status: 配置和统计已刷新

@@ -47,6 +47,8 @@ const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
 pub struct GeneralConfigInput {
     pub host: String,
     pub port: u16,
+    #[serde(default)]
+    pub proxy_auto_start: Option<bool>,
     pub local_key: String,
     pub default_channel: Channel,
     pub workspace_fingerprint: String,
@@ -154,19 +156,29 @@ pub async fn save_config(
     state: State<'_, Arc<AppState>>,
     input: GeneralConfigInput,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    config.host = input.host;
-    config.port = input.port;
-    config.local_key = input.local_key;
-    config.default_channel = input.default_channel;
-    config.workspace_fingerprint = input.workspace_fingerprint;
-    if let Some(cache) = input.cache {
-        config.cache = cache;
-        config.cache.normalize_fast_forwarding_hit_policy();
-    }
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
+    let version = {
+        let mut config = state.config.write().await;
+        config.host = input.host;
+        config.port = input.port;
+        if let Some(proxy_auto_start) = input.proxy_auto_start {
+            config.proxy_auto_start = proxy_auto_start;
+        }
+        config.local_key = input.local_key;
+        config.default_channel = input.default_channel;
+        config.workspace_fingerprint = input.workspace_fingerprint;
+        if let Some(cache) = input.cache {
+            config.cache = cache;
+            config.cache.normalize_fast_forwarding_hit_policy();
+        }
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     Ok(state.public_config().await)
 }
 
@@ -182,13 +194,19 @@ pub async fn save_proxy_mode_config(
             .await
             .map_err(to_command_error)?;
     }
-    {
+    let version = {
         let mut config = state.config.write().await;
         config.proxy_mode_host = input.host.trim().to_string();
         config.proxy_mode_port = input.port;
         config.updated_at = Utc::now();
-        config.save(&state.config_path).map_err(to_command_error)?;
-    }
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     if was_running {
         state
             .start_proxy_mode_proxy()
@@ -207,18 +225,25 @@ pub async fn select_provider(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    let provider = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == provider_id)
-        .ok_or_else(|| format!("provider {provider_id} was not found"))?
-        .clone();
-    config.active_provider_id = Some(provider.id.clone());
-    config.default_channel = provider.channel.clone();
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
+    let version = {
+        let mut config = state.config.write().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| format!("provider {provider_id} was not found"))?
+            .clone();
+        config.active_provider_id = Some(provider.id.clone());
+        config.default_channel = provider.channel.clone();
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     Ok(state.public_config().await)
 }
 
@@ -229,7 +254,7 @@ pub async fn clone_provider_for_agent(
 ) -> CommandResult<PublicConfig> {
     let agent_id = input.agent_id.trim().to_string();
     let source_provider_id = input.provider_id.trim().to_string();
-    let should_start_proxy = {
+    let (should_start_proxy, version) = {
         let mut config = state.config.write().await;
         clone_provider_for_agent_config(
             &mut config,
@@ -245,9 +270,15 @@ pub async fn clone_provider_for_agent(
             .ok_or_else(|| format!("agent injection {agent_id} was not found"))?;
         let now = Utc::now();
         config.updated_at = now;
-        config.save(&state.config_path).map_err(to_command_error)?;
-        config.agent_injections[agent_index].enabled
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (config.agent_injections[agent_index].enabled, version)
     };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
 
     if should_start_proxy {
         if agent_id == "proxy-mode" {
@@ -334,6 +365,34 @@ fn clone_provider_for_agent_config(
                 channel_mode.updated_at = now;
                 config.provider_channel_modes.push(channel_mode);
             }
+            let response_session_reuse = config
+                .provider_response_session_reuse
+                .iter()
+                .filter(|item| item.provider_id == source_provider.id)
+                .cloned()
+                .map(|mut item| {
+                    item.provider_id = cloned_id.clone();
+                    item.updated_at = now;
+                    item
+                })
+                .collect::<Vec<_>>();
+            config
+                .provider_response_session_reuse
+                .extend(response_session_reuse);
+            let cache_capabilities = config
+                .provider_cache_capabilities
+                .iter()
+                .filter(|item| item.provider_id == source_provider.id)
+                .cloned()
+                .map(|mut item| {
+                    item.provider_id = cloned_id.clone();
+                    item.updated_at = now;
+                    item
+                })
+                .collect::<Vec<_>>();
+            config
+                .provider_cache_capabilities
+                .extend(cache_capabilities);
             cloned_id
         };
 
@@ -444,14 +503,21 @@ pub async fn add_or_update_provider(
     state: State<'_, Arc<AppState>>,
     input: ProviderInput,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    let id = config.upsert_provider(input).map_err(to_command_error)?;
-    if config.active_provider_id.is_none() {
-        config.active_provider_id = Some(id.clone());
-    }
-    refresh_enabled_injections_for_provider(&mut config, &id).map_err(to_command_error)?;
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
+    let version = {
+        let mut config = state.config.write().await;
+        let id = config.upsert_provider(input).map_err(to_command_error)?;
+        if config.active_provider_id.is_none() {
+            config.active_provider_id = Some(id.clone());
+        }
+        refresh_enabled_injections_for_provider(&mut config, &id).map_err(to_command_error)?;
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     Ok(state.public_config().await)
 }
 
@@ -476,12 +542,19 @@ pub async fn set_provider_response_session_reuse_enabled(
     model_id: String,
     enabled: bool,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    config
-        .set_response_session_reuse_enabled(provider_id.trim(), model_id.trim(), enabled)
+    let version = {
+        let mut config = state.config.write().await;
+        config
+            .set_response_session_reuse_enabled(provider_id.trim(), model_id.trim(), enabled)
+            .map_err(to_command_error)?;
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
         .map_err(to_command_error)?;
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
     Ok(state.public_config().await)
 }
 
@@ -491,12 +564,19 @@ pub async fn delete_provider(
     provider_id: String,
     agent_id: Option<String>,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    delete_provider_config(&mut config, &provider_id, agent_id.as_deref())
+    let version = {
+        let mut config = state.config.write().await;
+        delete_provider_config(&mut config, &provider_id, agent_id.as_deref())
+            .map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
         .map_err(to_command_error)?;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
     Ok(state.public_config().await)
 }
 
@@ -649,25 +729,33 @@ pub async fn test_provider_key(
     let result = test_provider_key_inner(&state, &input).await;
     if let Some(provider_id) = input.provider_id.as_deref() {
         if let Some(key_id) = input.key_id.as_deref() {
-            let mut config = state.config.write().await;
-            match &result {
-                Ok(result) if result.ok => {
-                    config.mark_provider_key_success(provider_id, Some(key_id))
+            let version = {
+                let mut config = state.config.write().await;
+                match &result {
+                    Ok(result) if result.ok => {
+                        config.mark_provider_key_success(provider_id, Some(key_id))
+                    }
+                    Ok(result) => config.mark_provider_key_failure(
+                        provider_id,
+                        Some(key_id),
+                        &result.message,
+                        true,
+                    ),
+                    Err(err) => config.mark_provider_key_failure(
+                        provider_id,
+                        Some(key_id),
+                        &err.to_string(),
+                        true,
+                    ),
                 }
-                Ok(result) => config.mark_provider_key_failure(
-                    provider_id,
-                    Some(key_id),
-                    &result.message,
-                    true,
-                ),
-                Err(err) => config.mark_provider_key_failure(
-                    provider_id,
-                    Some(key_id),
-                    &err.to_string(),
-                    true,
-                ),
-            }
-            config.save(&state.config_path).map_err(to_command_error)?;
+                state
+                    .publish_config_snapshot(&config)
+                    .map_err(to_command_error)?
+            };
+            state
+                .wait_for_config_snapshot(version)
+                .await
+                .map_err(to_command_error)?;
         }
     }
     result.map_err(to_command_error)
@@ -717,7 +805,7 @@ pub async fn test_provider_key_pool(
         let result = test_provider_key_inner(&state, &input)
             .await
             .map_err(to_command_error)?;
-        {
+        let version = {
             let mut config = state.config.write().await;
             if result.ok {
                 config.mark_provider_key_success(&provider_id, input.key_id.as_deref());
@@ -729,8 +817,14 @@ pub async fn test_provider_key_pool(
                     true,
                 );
             }
-            config.save(&state.config_path).map_err(to_command_error)?;
-        }
+            state
+                .publish_config_snapshot(&config)
+                .map_err(to_command_error)?
+        };
+        state
+            .wait_for_config_snapshot(version)
+            .await
+            .map_err(to_command_error)?;
         results.push(result);
     }
     Ok(results)
@@ -1039,14 +1133,10 @@ async fn test_provider_key_inner(
         .filter(|key| !key.trim().is_empty())
         .map(ToOwned::to_owned);
     if upstream_secret.is_none() {
-        if let (Some(provider_id), Some(key_id)) =
-            (input.provider_id.as_deref(), input.key_id.as_deref())
-        {
+        if let Some(provider_id) = input.provider_id.as_deref() {
             let config = state.config.read().await;
-            upstream_secret = config
-                .provider_key_secret(provider_id, key_id)
-                .map_err(to_command_error)
-                .map_err(anyhow::Error::msg)?;
+            upstream_secret =
+                configured_provider_test_secret(&config, provider_id, input.key_id.as_deref())?;
         }
     }
     let Some(upstream_secret) = upstream_secret else {
@@ -1086,6 +1176,19 @@ async fn test_provider_key_inner(
     }
 }
 
+fn configured_provider_test_secret(
+    config: &AppConfig,
+    provider_id: &str,
+    key_id: Option<&str>,
+) -> Result<Option<String>> {
+    let secret = if let Some(key_id) = key_id {
+        config.provider_key_secret(provider_id, key_id)
+    } else {
+        config.provider_api_key(provider_id)
+    };
+    secret.map_err(to_command_error).map_err(anyhow::Error::msg)
+}
+
 #[tauri::command]
 pub async fn add_or_update_model(
     state: State<'_, Arc<AppState>>,
@@ -1113,29 +1216,36 @@ pub async fn add_or_update_model(
     {
         return Err("reasoning effort override requires a valid effort".to_string());
     }
-    let mut config = state.config.write().await;
-    {
-        let provider = config
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == input.provider_id)
-            .ok_or_else(|| format!("provider {} was not found", input.provider_id))?;
-        if let Some(model) = provider
-            .models
-            .iter_mut()
-            .find(|item| item.id == normalized_model.id)
+    let version = {
+        let mut config = state.config.write().await;
         {
-            *model = normalized_model.clone();
-        } else {
-            provider.models.push(normalized_model);
+            let provider = config
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == input.provider_id)
+                .ok_or_else(|| format!("provider {} was not found", input.provider_id))?;
+            if let Some(model) = provider
+                .models
+                .iter_mut()
+                .find(|item| item.id == normalized_model.id)
+            {
+                *model = normalized_model.clone();
+            } else {
+                provider.models.push(normalized_model);
+            }
+            provider.updated_at = Utc::now();
         }
-        provider.updated_at = Utc::now();
-    }
-    config.updated_at = Utc::now();
-    refresh_enabled_injections_for_provider(&mut config, &input.provider_id)
+        config.updated_at = Utc::now();
+        refresh_enabled_injections_for_provider(&mut config, &input.provider_id)
+            .map_err(to_command_error)?;
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
         .map_err(to_command_error)?;
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
     Ok(state.public_config().await)
 }
 
@@ -1162,21 +1272,28 @@ pub async fn delete_model(
     provider_id: String,
     model_id: String,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    {
-        let provider = config
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == provider_id)
-            .ok_or_else(|| format!("provider {provider_id} was not found"))?;
-        provider.models.retain(|model| model.id != model_id);
-        provider.updated_at = Utc::now();
-    }
-    config.clear_response_session_reuse_for_model(&provider_id, &model_id);
-    config.clear_cache_capabilities_for_model(&provider_id, &model_id);
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
+    let version = {
+        let mut config = state.config.write().await;
+        {
+            let provider = config
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_id)
+                .ok_or_else(|| format!("provider {provider_id} was not found"))?;
+            provider.models.retain(|model| model.id != model_id);
+            provider.updated_at = Utc::now();
+        }
+        config.clear_response_session_reuse_for_model(&provider_id, &model_id);
+        config.clear_cache_capabilities_for_model(&provider_id, &model_id);
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     Ok(state.public_config().await)
 }
 
@@ -1250,12 +1367,19 @@ pub async fn save_cache_policy(
     state: State<'_, Arc<AppState>>,
     mut input: CacheConfig,
 ) -> CommandResult<PublicConfig> {
-    let mut config = state.config.write().await;
-    input.normalize_fast_forwarding_hit_policy();
-    config.cache = input;
-    config.updated_at = Utc::now();
-    config.save(&state.config_path).map_err(to_command_error)?;
-    drop(config);
+    let version = {
+        let mut config = state.config.write().await;
+        input.normalize_fast_forwarding_hit_policy();
+        config.cache = input;
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     Ok(state.public_config().await)
 }
 
@@ -1268,10 +1392,19 @@ pub async fn clear_cache(state: State<'_, Arc<AppState>>) -> CommandResult<()> {
 pub async fn get_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<crate::config::AgentInjectionConfig>> {
-    let mut config = state.config.write().await;
-    agent_injection::ensure_defaults(&mut config);
-    config.save(&state.config_path).map_err(to_command_error)?;
-    Ok(config.agent_injections.clone())
+    let (injections, version) = {
+        let mut config = state.config.write().await;
+        agent_injection::ensure_defaults(&mut config);
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (config.agent_injections.clone(), version)
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
+    Ok(injections)
 }
 
 #[tauri::command]
@@ -1290,14 +1423,20 @@ pub async fn set_agent_injection_enabled(
             .map(|item| item.enabled)
             .unwrap_or(false)
     };
-    let mut results = {
+    let (mut results, version) = {
         let mut config = state.config.write().await;
         let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
             .map_err(to_command_error)?;
         config.updated_at = Utc::now();
-        config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (results, version)
     };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     if agent_id == "proxy-mode" {
         if enabled {
             state
@@ -1325,14 +1464,20 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let mut results = {
+    let (mut results, version) = {
         let mut config = state.config.write().await;
         let results =
             agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
         config.updated_at = Utc::now();
-        config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (results, version)
     };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     if id == "proxy-mode" {
         state
             .start_proxy_mode_proxy()
@@ -1360,13 +1505,19 @@ pub async fn apply_enabled_agent_injections(
             .any(|item| item.id == "codex" && item.enabled);
         (enabled, enabled || codex_ui_patch::has_managed_patch())
     };
-    let mut results = {
+    let (mut results, version) = {
         let mut config = state.config.write().await;
         let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
         config.updated_at = Utc::now();
-        config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (results, version)
     };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     if results.iter().any(|item| item.id == "proxy-mode") {
         state
             .start_proxy_mode_proxy()
@@ -1434,7 +1585,7 @@ pub async fn update_agent_injection_route(
             .iter()
             .any(|item| item.id == input.id && item.enabled)
     };
-    let results = {
+    let (results, version) = {
         let mut config = state.config.write().await;
         if let Some(provider_id) = input.provider_id.clone() {
             if !provider_belongs_to_agent(&provider_id, &agent_id) {
@@ -1451,9 +1602,15 @@ pub async fn update_agent_injection_route(
         let results =
             agent_injection::update_route(&mut config, input).map_err(to_command_error)?;
         config.updated_at = Utc::now();
-        config.save(&state.config_path).map_err(to_command_error)?;
-        results
+        let version = state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?;
+        (results, version)
     };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
     if should_start_proxy && !results.is_empty() {
         if agent_id == "proxy-mode" {
             state
@@ -1790,6 +1947,19 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn provider_connection_test_uses_saved_primary_key_without_a_key_id() {
+        let mut config = AppConfig::default();
+        let mut provider = test_provider("primary-key-test");
+        provider.api_key_encrypted = Some("primary-test-secret".to_string());
+        config.providers.push(provider);
+
+        let secret = configured_provider_test_secret(&config, "primary-key-test", None)
+            .expect("saved primary key should resolve");
+
+        assert_eq!(secret.as_deref(), Some("primary-test-secret"));
     }
 
     #[test]

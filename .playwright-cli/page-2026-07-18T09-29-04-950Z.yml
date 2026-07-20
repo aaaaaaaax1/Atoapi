@@ -1,0 +1,65 @@
+- generic [active] [ref=f2e1]:
+  - generic [ref=f2e2]:
+    - banner [ref=f2e3]:
+      - button "打开设置" [ref=f2e5] [cursor=pointer]
+      - tablist "Agent 列表" [ref=f2e9]:
+        - tab "Codex" [selected] [ref=f2e10] [cursor=pointer]
+        - tab "Claude Code" [ref=f2e16] [cursor=pointer]
+        - tab "Gemini" [ref=f2e23] [cursor=pointer]
+        - tab "OpenCode" [ref=f2e28] [cursor=pointer]
+        - tab "OpenClaw" [ref=f2e34] [cursor=pointer]
+        - tab "Proxy Mode" [ref=f2e40] [cursor=pointer]
+      - button "查看版本信息" [ref=f2e51] [cursor=pointer]
+    - region [ref=f2e54]:
+      - generic [ref=f2e55]:
+        - switch "启用当前 Agent" [checked] [ref=f2e56] [cursor=pointer]
+        - generic [ref=f2e57]:
+          - heading "Codex" [level=1] [ref=f2e58]
+          - paragraph [ref=f2e59]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=f2e60]:
+        - generic [ref=f2e61]:
+          - generic [ref=f2e62]: Base URL
+          - code [ref=f2e63]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=f2e64] [cursor=pointer]
+        - generic [ref=f2e68]:
+          - generic [ref=f2e69]: Local Key
+          - code [ref=f2e70]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=f2e71] [cursor=pointer]
+      - button "新增上游" [ref=f2e76] [cursor=pointer]
+    - main [ref=f2e78]:
+      - generic [ref=f2e79]:
+        - generic [ref=f2e80]:
+          - heading "上游路由" [level=2] [ref=f2e82]
+          - generic [ref=f2e83]: 3 个可用上游
+        - generic [ref=f2e85]:
+          - article [ref=f2e86]:
+            - generic [ref=f2e92]: 云舟
+            - text: · ·
+            - generic [ref=f2e94]:
+              - button "当前" [ref=f2e95] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=f2e98] [cursor=pointer]
+              - button "编辑 云舟" [ref=f2e101] [cursor=pointer]
+              - button "删除 云舟" [ref=f2e105] [cursor=pointer]
+          - article [ref=f2e109]:
+            - generic [ref=f2e114]: api.aiaiaiai
+            - text: · ·
+            - generic [ref=f2e116]:
+              - button "使用" [ref=f2e117] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=f2e122] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=f2e125] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=f2e129] [cursor=pointer]
+          - article [ref=f2e133]:
+            - generic [ref=f2e138]: sheapi
+            - text: · ·
+            - generic [ref=f2e140]:
+              - button "使用" [ref=f2e141] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=f2e146] [cursor=pointer]
+              - button "编辑 sheapi" [ref=f2e149] [cursor=pointer]
+              - button "删除 sheapi" [ref=f2e153] [cursor=pointer]
+    - contentinfo [ref=f2e157]:
+      - button "打开缓存统计与请求记录" [ref=f2e158] [cursor=pointer]:
+        - generic [ref=f2e163]: 缓存与记录
+        - generic [ref=f2e164]:
+          - text: 命中率
+          - strong [ref=f2e165]: 95.8%
+  - status

@@ -1,0 +1,113 @@
+- generic [active] [ref=f17e1]:
+  - generic [ref=f17e2]:
+    - banner [ref=f17e3]:
+      - button "打开设置" [ref=f17e5] [cursor=pointer]
+      - tablist "Agent 列表" [ref=f17e9]:
+        - tab "Codex 已启用" [selected] [ref=f17e10] [cursor=pointer]:
+          - generic [ref=f17e15]:
+            - generic [ref=f17e16]: Codex
+            - generic [ref=f17e17]: 已启用
+        - tab "Claude Code 已启用" [ref=f17e19] [cursor=pointer]:
+          - generic [ref=f17e25]:
+            - generic [ref=f17e26]: Claude Code
+            - generic [ref=f17e27]: 已启用
+        - tab "Gemini 已关闭" [ref=f17e29] [cursor=pointer]:
+          - generic [ref=f17e33]:
+            - generic [ref=f17e34]: Gemini
+            - generic [ref=f17e35]: 已关闭
+        - tab "OpenCode 已启用" [ref=f17e37] [cursor=pointer]:
+          - generic [ref=f17e42]:
+            - generic [ref=f17e43]: OpenCode
+            - generic [ref=f17e44]: 已启用
+        - tab "OpenClaw 已关闭" [ref=f17e46] [cursor=pointer]:
+          - generic [ref=f17e51]:
+            - generic [ref=f17e52]: OpenClaw
+            - generic [ref=f17e53]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=f17e55] [cursor=pointer]:
+          - generic [ref=f17e64]:
+            - generic [ref=f17e65]: Proxy Mode
+            - generic [ref=f17e66]: 已启用
+      - button "刷新模拟数据" [ref=f17e69] [cursor=pointer]
+    - region [ref=f17e75]:
+      - generic [ref=f17e76]:
+        - switch "启用当前 Agent" [checked] [ref=f17e77] [cursor=pointer]
+        - generic [ref=f17e78]:
+          - heading "Codex" [level=1] [ref=f17e79]
+          - paragraph [ref=f17e80]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=f17e81]:
+        - generic [ref=f17e82]:
+          - generic [ref=f17e83]: Base URL
+          - code [ref=f17e84]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=f17e85] [cursor=pointer]
+        - generic [ref=f17e89]:
+          - generic [ref=f17e90]: Local Key
+          - code [ref=f17e91]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=f17e92] [cursor=pointer]
+      - button "新增上游" [ref=f17e97] [cursor=pointer]
+    - main [ref=f17e100]:
+      - generic [ref=f17e101]:
+        - generic [ref=f17e102]:
+          - heading "上游路由" [level=2] [ref=f17e104]
+          - generic [ref=f17e105]:
+            - generic [ref=f17e106]: 3 个可用上游
+            - generic [ref=f17e107]: 一次入站 · 一次上游
+        - generic [ref=f17e108]:
+          - article [ref=f17e109]:
+            - generic [ref=f17e115]:
+              - generic [ref=f17e116]: 云舟
+              - generic [ref=f17e117]: https://api.yunzhou.example/v1
+            - generic [ref=f17e118]:
+              - generic [ref=f17e119]:
+                - generic [ref=f17e120]: Responses
+                - generic [ref=f17e121]: · 3 个映射
+                - generic [ref=f17e122]: · 2 Key
+              - generic [ref=f17e123]:
+                - generic [ref=f17e124]: 最近连通
+                - generic [ref=f17e125]: 188ms
+            - generic [ref=f17e126]:
+              - button "当前" [ref=f17e127] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=f17e130] [cursor=pointer]
+              - button "编辑 云舟" [ref=f17e133] [cursor=pointer]
+              - button "删除 云舟" [ref=f17e137] [cursor=pointer]
+          - article [ref=f17e141]:
+            - generic [ref=f17e146]:
+              - generic [ref=f17e147]: api.aiaiaiai
+              - generic [ref=f17e148]: https://api.aiaiaiai.example/v1
+            - generic [ref=f17e149]:
+              - generic [ref=f17e150]:
+                - generic [ref=f17e151]: Auto
+                - generic [ref=f17e152]: · Agent 直传
+                - generic [ref=f17e153]: · 1 Key
+              - generic [ref=f17e154]:
+                - generic [ref=f17e155]: 最近连通
+                - generic [ref=f17e156]: 241ms
+            - generic [ref=f17e157]:
+              - button "使用" [ref=f17e158] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=f17e163] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=f17e166] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=f17e170] [cursor=pointer]
+          - article [ref=f17e174]:
+            - generic [ref=f17e179]:
+              - generic [ref=f17e180]: sheapi
+              - generic [ref=f17e181]: https://api.sheapi.example/v1
+            - generic [ref=f17e182]:
+              - generic [ref=f17e183]:
+                - generic [ref=f17e184]: Chat
+                - generic [ref=f17e185]: · 2 个映射
+                - generic [ref=f17e186]: · 4 Key
+              - generic [ref=f17e187]:
+                - generic [ref=f17e188]: 最近连通
+                - generic [ref=f17e189]: 326ms
+            - generic [ref=f17e190]:
+              - button "使用" [ref=f17e191] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=f17e196] [cursor=pointer]
+              - button "编辑 sheapi" [ref=f17e199] [cursor=pointer]
+              - button "删除 sheapi" [ref=f17e203] [cursor=pointer]
+    - contentinfo [ref=f17e207]:
+      - button "打开缓存统计与请求记录" [ref=f17e208] [cursor=pointer]:
+        - generic [ref=f17e213]: 缓存与记录
+        - generic [ref=f17e214]:
+          - text: 命中率
+          - strong [ref=f17e215]: 95.8%
+        - generic [ref=f17e216]: 128 成功 · 2 error
+  - status

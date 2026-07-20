@@ -1,0 +1,262 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - banner [ref=e3]:
+      - generic [ref=e4]:
+        - button "打开设置" [ref=e5] [cursor=pointer]
+        - button "查看版本" [ref=e9] [cursor=pointer]:
+          - strong [ref=e10]: Atoapi
+          - generic [ref=e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=e12]:
+        - tab "Codex 已启用" [selected] [ref=e13] [cursor=pointer]:
+          - generic [ref=e18]:
+            - generic [ref=e19]: Codex
+            - generic [ref=e20]: 已启用
+        - tab "Claude Code 已启用" [ref=e22] [cursor=pointer]:
+          - generic [ref=e28]:
+            - generic [ref=e29]: Claude Code
+            - generic [ref=e30]: 已启用
+        - tab "Gemini 已关闭" [ref=e32] [cursor=pointer]:
+          - generic [ref=e36]:
+            - generic [ref=e37]: Gemini
+            - generic [ref=e38]: 已关闭
+        - tab "OpenCode 已启用" [ref=e40] [cursor=pointer]:
+          - generic [ref=e45]:
+            - generic [ref=e46]: OpenCode
+            - generic [ref=e47]: 已启用
+        - tab "OpenClaw 已关闭" [ref=e49] [cursor=pointer]:
+          - generic [ref=e54]:
+            - generic [ref=e55]: OpenClaw
+            - generic [ref=e56]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=e58] [cursor=pointer]:
+          - generic [ref=e67]:
+            - generic [ref=e68]: Proxy Mode
+            - generic [ref=e69]: 已启用
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: 代理运行中
+          - generic [ref=e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=e75] [cursor=pointer]
+        - button "查看版本信息" [ref=e81] [cursor=pointer]
+    - region [ref=e84]:
+      - generic [ref=e85]:
+        - switch "启用当前 Agent" [checked] [ref=e86] [cursor=pointer]
+        - generic [ref=e87]:
+          - heading "Codex" [level=1] [ref=e88]
+          - paragraph [ref=e89]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=e90]:
+        - generic [ref=e91]:
+          - generic [ref=e92]: Base URL
+          - code [ref=e93]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=e94] [cursor=pointer]
+        - generic [ref=e98]:
+          - generic [ref=e99]: Local Key
+          - code [ref=e100]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=e101] [cursor=pointer]
+      - button "新增上游" [ref=e106] [cursor=pointer]
+    - main [ref=e109]:
+      - generic [ref=e110]:
+        - generic [ref=e111]:
+          - generic [ref=e112]:
+            - heading "上游路由" [level=2] [ref=e113]
+            - paragraph [ref=e114]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+          - generic [ref=e115]:
+            - generic [ref=e116]: 3 个可用上游
+            - generic [ref=e117]: 一次入站 · 一次上游
+        - generic [ref=e118]:
+          - article [ref=e119]:
+            - generic [ref=e125]:
+              - generic [ref=e126]: 云舟
+              - generic [ref=e127]: https://api.yunzhou.example/v1
+            - generic [ref=e128]:
+              - generic [ref=e129]:
+                - generic [ref=e130]: Responses
+                - generic [ref=e131]: · 3 个映射
+                - generic [ref=e132]: · 2 Key
+              - generic [ref=e133]:
+                - generic [ref=e134]: 最近连通
+                - generic [ref=e135]: 188ms
+            - generic [ref=e136]:
+              - button "当前" [ref=e137] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=e140] [cursor=pointer]
+              - button "编辑 云舟" [ref=e143] [cursor=pointer]
+              - button "删除 云舟" [ref=e147] [cursor=pointer]
+          - article [ref=e151]:
+            - generic [ref=e156]:
+              - generic [ref=e157]: api.aiaiaiai
+              - generic [ref=e158]: https://api.aiaiaiai.example/v1
+            - generic [ref=e159]:
+              - generic [ref=e160]:
+                - generic [ref=e161]: Auto
+                - generic [ref=e162]: · Agent 直传
+                - generic [ref=e163]: · 1 Key
+              - generic [ref=e164]:
+                - generic [ref=e165]: 最近连通
+                - generic [ref=e166]: 241ms
+            - generic [ref=e167]:
+              - button "使用" [ref=e168] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=e173] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=e176] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=e180] [cursor=pointer]
+          - article [ref=e184]:
+            - generic [ref=e189]:
+              - generic [ref=e190]: sheapi
+              - generic [ref=e191]: https://api.sheapi.example/v1
+            - generic [ref=e192]:
+              - generic [ref=e193]:
+                - generic [ref=e194]: Chat
+                - generic [ref=e195]: · 2 个映射
+                - generic [ref=e196]: · 4 Key
+              - generic [ref=e197]:
+                - generic [ref=e198]: 最近连通
+                - generic [ref=e199]: 326ms
+            - generic [ref=e200]:
+              - button "使用" [ref=e201] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=e206] [cursor=pointer]
+              - button "编辑 sheapi" [ref=e209] [cursor=pointer]
+              - button "删除 sheapi" [ref=e213] [cursor=pointer]
+    - contentinfo [ref=e217]:
+      - button "打开缓存统计与请求记录" [ref=e218] [cursor=pointer]:
+        - generic [ref=e223]: 缓存与记录
+        - generic [ref=e224]:
+          - text: 命中率
+          - strong [ref=e225]: 95.8%
+        - generic [ref=e226]: 128 成功 · 2 error
+  - dialog [ref=e376]:
+    - banner [ref=e377]:
+      - generic [ref=e378]:
+        - heading "编辑上游" [level=2] [ref=e379]
+        - paragraph [ref=e380]: 云舟 · Responses
+      - button "关闭上游编辑器" [ref=e381] [cursor=pointer]
+    - generic [ref=e386]:
+      - tablist "上游配置分类" [ref=e387]:
+        - tab "连接信息" [ref=e388] [cursor=pointer]
+        - tab "模型映射" [ref=e389] [cursor=pointer]
+        - tab "多 Key" [selected] [ref=e390] [cursor=pointer]
+        - tab "传输与缓存" [ref=e391] [cursor=pointer]
+        - tab "兼容性" [ref=e392] [cursor=pointer]
+      - generic [ref=e538]:
+        - generic [ref=e539]:
+          - generic [ref=e540]:
+            - heading "多 Key 池" [level=3] [ref=e541]
+            - paragraph [ref=e542]: 可编辑名称、优先级与 Key；拖拽或使用箭头调整顺序。
+          - generic [ref=e543]:
+            - button "全部测试" [ref=e544] [cursor=pointer]
+            - button "添加 Key" [ref=e547] [cursor=pointer]
+        - generic [ref=e549]:
+          - generic [ref=e550]:
+            - generic [ref=e551]: 负载均衡
+            - combobox "负载均衡" [ref=e552]:
+              - option "轮询" [selected]
+              - option "优先级"
+              - option "最低使用"
+              - option "顺序"
+          - generic [ref=e553]:
+            - generic [ref=e554]: 失败阈值
+            - textbox "失败阈值" [ref=e555]: "3"
+        - generic [ref=e557]:
+          - generic [ref=e558]: 批量添加 Key
+          - generic [ref=e559]:
+            - textbox "批量添加 Key" [active] [ref=e560]
+            - button "添加" [ref=e561] [cursor=pointer]
+          - generic [ref=e563]: 逗号、分号、空格、回车或换行均可分隔；Shift+Enter 保留换行。
+        - generic "多 Key 列表" [ref=e564]:
+          - article [ref=e1495]:
+            - button "拖拽排序 Key 5" [ref=e1496]
+            - generic [ref=e1504]:
+              - generic [ref=e1505]: 名称
+              - textbox "Key 5 的名称" [ref=e1506]: Key 5
+            - generic [ref=e1507]:
+              - generic [ref=e1508]: Key
+              - generic [ref=e1509]:
+                - textbox "Key 5 的 Key" [ref=e1510]: sk-demo-c
+                - button "显示 Key 5 的 Key" [ref=e1511] [cursor=pointer]
+            - generic [ref=e1515]:
+              - generic [ref=e1516]: 优先级
+              - textbox "Key 5 的优先级" [ref=e1517]: "0"
+            - generic [ref=e1518]: 未测试
+            - generic [ref=e1519]:
+              - button "测试 Key 5" [ref=e1520] [cursor=pointer]
+              - button "Key 5 上移" [disabled] [ref=e1523] [cursor=pointer]
+              - button "Key 5 下移" [ref=e1526] [cursor=pointer]
+              - button "删除 Key 5" [ref=e1529] [cursor=pointer]
+          - article [ref=e1533]:
+            - button "拖拽排序 备用 Key" [ref=e1534]
+            - generic [ref=e1542]:
+              - generic [ref=e1543]: 名称
+              - textbox "备用 Key 的名称" [ref=e1544]: 备用 Key
+            - generic [ref=e1545]:
+              - generic [ref=e1546]: Key
+              - generic [ref=e1547]:
+                - textbox "备用 Key 的 Key" [ref=e1548]: sk-demo-yunzhou-Q9LM
+                - button "显示 备用 Key 的 Key" [ref=e1549] [cursor=pointer]
+            - generic [ref=e1553]:
+              - generic [ref=e1554]: 优先级
+              - textbox "备用 Key 的优先级" [ref=e1555]: "5"
+            - generic [ref=e1556]: 正常
+            - generic [ref=e1557]:
+              - button "测试 备用 Key" [ref=e1558] [cursor=pointer]
+              - button "备用 Key 上移" [ref=e1561] [cursor=pointer]
+              - button "备用 Key 下移" [ref=e1564] [cursor=pointer]
+              - button "删除 备用 Key" [ref=e1567] [cursor=pointer]
+          - article [ref=e1571]:
+            - button "拖拽排序 主用 Key" [ref=e1572]
+            - generic [ref=e1580]:
+              - generic [ref=e1581]: 名称
+              - textbox "主用 Key 的名称" [ref=e1582]: 主用 Key
+            - generic [ref=e1583]:
+              - generic [ref=e1584]: Key
+              - generic [ref=e1585]:
+                - textbox "主用 Key 的 Key" [ref=e1586]: sk-demo-yunzhou-8J2A
+                - button "显示 主用 Key 的 Key" [ref=e1587] [cursor=pointer]
+            - generic [ref=e1591]:
+              - generic [ref=e1592]: 优先级
+              - textbox "主用 Key 的优先级" [ref=e1593]: "90"
+            - generic [ref=e1594]: 正常
+            - generic [ref=e1595]:
+              - button "测试 主用 Key" [ref=e1596] [cursor=pointer]
+              - button "主用 Key 上移" [ref=e1599] [cursor=pointer]
+              - button "主用 Key 下移" [ref=e1602] [cursor=pointer]
+              - button "删除 主用 Key" [ref=e1605] [cursor=pointer]
+          - article [ref=e1609]:
+            - button "拖拽排序 Key 3" [ref=e1610]
+            - generic [ref=e1618]:
+              - generic [ref=e1619]: 名称
+              - textbox "Key 3 的名称" [ref=e1620]: Key 3
+            - generic [ref=e1621]:
+              - generic [ref=e1622]: Key
+              - generic [ref=e1623]:
+                - textbox "Key 3 的 Key" [ref=e1624]: sk-demo-a
+                - button "显示 Key 3 的 Key" [ref=e1625] [cursor=pointer]
+            - generic [ref=e1629]:
+              - generic [ref=e1630]: 优先级
+              - textbox "Key 3 的优先级" [ref=e1631]: "0"
+            - generic [ref=e1632]: 未测试
+            - generic [ref=e1633]:
+              - button "测试 Key 3" [ref=e1634] [cursor=pointer]
+              - button "Key 3 上移" [ref=e1637] [cursor=pointer]
+              - button "Key 3 下移" [ref=e1640] [cursor=pointer]
+              - button "删除 Key 3" [ref=e1643] [cursor=pointer]
+          - article [ref=e1647]:
+            - button "拖拽排序 Key 4" [ref=e1648]
+            - generic [ref=e1656]:
+              - generic [ref=e1657]: 名称
+              - textbox "Key 4 的名称" [ref=e1658]: Key 4
+            - generic [ref=e1659]:
+              - generic [ref=e1660]: Key
+              - generic [ref=e1661]:
+                - textbox "Key 4 的 Key" [ref=e1662]: sk-demo-b
+                - button "显示 Key 4 的 Key" [ref=e1663] [cursor=pointer]
+            - generic [ref=e1667]:
+              - generic [ref=e1668]: 优先级
+              - textbox "Key 4 的优先级" [ref=e1669]: "0"
+            - generic [ref=e1670]: 未测试
+            - generic [ref=e1671]:
+              - button "测试 Key 4" [ref=e1672] [cursor=pointer]
+              - button "Key 4 上移" [ref=e1675] [cursor=pointer]
+              - button "Key 4 下移" [disabled] [ref=e1678] [cursor=pointer]
+              - button "删除 Key 4" [ref=e1681] [cursor=pointer]
+    - contentinfo [ref=e434]:
+      - button "删除" [ref=e435] [cursor=pointer]
+      - button "取消" [ref=e436] [cursor=pointer]
+      - button "保存并绑定" [ref=e437] [cursor=pointer]
+  - status: 已添加 3 个 Key

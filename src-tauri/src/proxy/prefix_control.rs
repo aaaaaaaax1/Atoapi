@@ -9,14 +9,15 @@ use super::{
     provider_prefix_weak_full_retry_after_session_delta,
     responses_cap_exhausted_provider_waterline_rollback,
     responses_current_tail_makes_avoidable_unreliable, responses_huge_dynamic_history_cold_read,
-    responses_small_avoidable_tail_granularity, responses_tool_tail_burst,
-    should_learn_provider_prefix_family_state, should_learn_sent_provider_bucket,
-    TailInputDiagnostics,
+    responses_small_avoidable_tail_granularity, responses_tiny_instability_recovery_tail_is_clean,
+    responses_tool_tail_burst, should_learn_provider_prefix_family_state,
+    should_learn_sent_provider_bucket, TailInputDiagnostics,
 };
 
 const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
 const MAX_EXACT_EVIDENCE_AGE: Duration = Duration::from_secs(30);
 const MIN_REPEATED_AVOIDABLE_STREAK: u32 = 2;
+pub(super) const MIN_CLEAN_TINY_RECOVERY_STREAK: u32 = 2;
 const MAX_STABLE_INSTABILITY_SCORE: u32 = 2;
 const STABLE_RECOVERY_MIN_INPUT_TOKENS: u64 = 32_000;
 const STABLE_RECOVERY_MIN_RATIO: f64 = 0.98;
@@ -26,8 +27,10 @@ const STABLE_RECOVERY_MAX_AVOIDABLE_TOKENS: u64 = 1_024;
 pub(super) struct PrefixControlInput {
     pub source_is_exact: bool,
     pub avoidable_tokens: u64,
+    pub fine_avoidable_tokens: u64,
     pub avoidable_shortfall_streak: u32,
     pub cache_instability_score: u32,
+    pub tiny_instability_recovery_safe: bool,
     pub settle_after_cold_read: bool,
     pub compaction_requested: bool,
     pub state_age: Duration,
@@ -134,16 +137,26 @@ impl PrefixController {
         if input.avoidable_shortfall_streak < MIN_REPEATED_AVOIDABLE_STREAK {
             return skip("avoidable_gap_not_repeated", false);
         }
-        if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE {
-            return skip("avoidable_gap_unstable", false);
-        }
+        let wait_avoidable_tokens = if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE
+        {
+            if !input.tiny_instability_recovery_safe
+                || input.settle_after_cold_read
+                || !matches!(input.avoidable_tokens, 128 | 256)
+                || !matches!(input.fine_avoidable_tokens, 128 | 256)
+            {
+                return skip("avoidable_gap_unstable", false);
+            }
+            input.fine_avoidable_tokens
+        } else {
+            input.avoidable_tokens
+        };
 
         let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
         if request_budget.is_zero() {
             return skip("local_guard_budget_exhausted", true);
         }
 
-        let requested = requested_wait(input.avoidable_tokens, input.avoidable_shortfall_streak);
+        let requested = requested_wait(wait_avoidable_tokens, input.avoidable_shortfall_streak);
         let wait = requested.min(request_budget);
         PrefixControlDecision {
             wait,
@@ -254,6 +267,7 @@ impl PrefixController {
                 seen_bucket_tokens_128: record.cache_read_tokens,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 0,
                 settle_after_cold_read: true,
                 tail_tool_output_chars: input.tail.tool_output_chars,
@@ -278,6 +292,7 @@ impl PrefixController {
             preserved.avoidable_shortfall_tokens_128 = 0;
             preserved.avoidable_shortfall_streak = 0;
             preserved.small_gap_recovery_streak = 0;
+            preserved.recent_clean_tiny_gap_streak = 0;
             preserved.tail_tool_output_chars = input.tail.tool_output_chars;
             preserved.tail_largest_tool_output_chars = input.tail.largest_tool_output_chars;
             preserved.tail_tool_output_noise_hint = input.tail.tool_output_noise_hint.clone();
@@ -366,6 +381,21 @@ impl PrefixController {
         } else {
             previous_instability
         };
+        let clean_tiny_gap_recovery = stable_recovery
+            && matches!(evidence.avoidable_tokens_128, 128 | 256)
+            && matches!(
+                evidence.avoidable_tokens.max(evidence.avoidable_tokens_128),
+                128 | 256
+            )
+            && responses_tiny_instability_recovery_tail_is_clean(input.tail);
+        let recent_clean_tiny_gap_streak = if clean_tiny_gap_recovery {
+            input
+                .previous
+                .map(|state| state.recent_clean_tiny_gap_streak.saturating_add(1))
+                .unwrap_or(1)
+        } else {
+            0
+        };
         let learn_sent_bucket = !evidence.provider_rollback
             && !evidence.tail_granularity
             && should_learn_sent_provider_bucket(
@@ -414,6 +444,7 @@ impl PrefixController {
             seen_bucket_tokens_128,
             avoidable_shortfall_tokens_128: evidence.avoidable_tokens_128,
             small_gap_recovery_streak,
+            recent_clean_tiny_gap_streak,
             cache_instability_score,
             settle_after_cold_read: severe_cold_read,
             tail_tool_output_chars: input.tail.tool_output_chars,
@@ -607,8 +638,10 @@ mod tests {
         PrefixControlInput {
             source_is_exact: true,
             avoidable_tokens,
+            fine_avoidable_tokens: avoidable_tokens,
             avoidable_shortfall_streak: 0,
             cache_instability_score: 0,
+            tiny_instability_recovery_safe: false,
             settle_after_cold_read: false,
             compaction_requested: false,
             state_age: Duration::ZERO,
@@ -709,6 +742,69 @@ mod tests {
     }
 
     #[test]
+    fn unstable_exact_tiny_gap_recovers_only_with_clean_tail_evidence() {
+        for avoidable_tokens in [128, 256] {
+            let recovered = PrefixController::before_request(PrefixControlInput {
+                cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+                tiny_instability_recovery_safe: true,
+                ..repeated_input(avoidable_tokens, 2)
+            });
+            assert!(recovered.wait > Duration::ZERO);
+            assert!(recovered.wait <= MAX_FOREGROUND_WAIT);
+            assert_eq!(recovered.reason, Some("responses_exact_avoidable_gap"));
+        }
+
+        let coarse_512_with_fine_256 = PrefixController::before_request(PrefixControlInput {
+            avoidable_tokens: 512,
+            fine_avoidable_tokens: 256,
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            tiny_instability_recovery_safe: true,
+            ..repeated_input(512, 2)
+        });
+        assert_eq!(coarse_512_with_fine_256.wait, Duration::ZERO);
+        assert_eq!(
+            coarse_512_with_fine_256.skip_reason,
+            Some("avoidable_gap_unstable")
+        );
+
+        let coarse_512 = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            tiny_instability_recovery_safe: true,
+            ..repeated_input(512, 2)
+        });
+        assert_eq!(coarse_512.wait, Duration::ZERO);
+        assert_eq!(coarse_512.skip_reason, Some("avoidable_gap_unstable"));
+
+        let large_coarse_gap = PrefixController::before_request(PrefixControlInput {
+            avoidable_tokens: 4_096,
+            fine_avoidable_tokens: 256,
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            tiny_instability_recovery_safe: true,
+            ..repeated_input(4_096, 2)
+        });
+        assert_eq!(large_coarse_gap.wait, Duration::ZERO);
+        assert_eq!(large_coarse_gap.skip_reason, Some("avoidable_gap_unstable"));
+
+        let unsafe_tail = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            tiny_instability_recovery_safe: false,
+            ..repeated_input(512, 2)
+        });
+        assert_eq!(unsafe_tail.wait, Duration::ZERO);
+        assert_eq!(unsafe_tail.skip_reason, Some("avoidable_gap_unstable"));
+
+        let cold_read = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            tiny_instability_recovery_safe: true,
+            settle_after_cold_read: true,
+            state_age: Duration::from_millis(500),
+            ..repeated_input(512, 2)
+        });
+        assert_eq!(cold_read.wait, Duration::ZERO);
+        assert_eq!(cold_read.skip_reason, Some("avoidable_gap_unstable"));
+    }
+
+    #[test]
     fn repeated_evidence_remains_actionable_after_nine_seconds() {
         let decision = PrefixController::before_request(PrefixControlInput {
             state_age: Duration::from_secs(9),
@@ -765,6 +861,7 @@ mod tests {
             seen_bucket_tokens_128: 251_392,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 8,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -806,7 +903,160 @@ mod tests {
         assert_eq!(next.avoidable_shortfall_tokens, 0);
         assert_eq!(next.avoidable_shortfall_tokens_128, 0);
         assert_eq!(next.avoidable_shortfall_streak, 0);
+        assert_eq!(next.recent_clean_tiny_gap_streak, 0);
         assert!(!observation.learn_family);
+    }
+
+    #[test]
+    fn cold_read_clears_clean_tiny_gap_recovery_evidence() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 64_000,
+            cache_read_tokens: 63_488,
+            shortfall_tokens: 512,
+            seen_bucket_tokens: 63_488,
+            avoidable_shortfall_tokens: 256,
+            avoidable_shortfall_streak: 2,
+            shortfall_tokens_128: 512,
+            seen_bucket_tokens_128: 63_488,
+            avoidable_shortfall_tokens_128: 256,
+            small_gap_recovery_streak: 2,
+            recent_clean_tiny_gap_streak: MIN_CLEAN_TINY_RECOVERY_STREAK,
+            cache_instability_score: 3,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let cold_read = UsageRecord {
+            input_tokens: 64_512,
+            cache_read_tokens: 0,
+            ..UsageRecord::default()
+        };
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &cold_read,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("cold read must preserve a guarded prefix state");
+        assert_eq!(next.recent_clean_tiny_gap_streak, 0);
+    }
+
+    #[test]
+    fn clean_fine_gap_recovery_builds_runtime_only_wait_evidence() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 99_200,
+            cache_read_tokens: 99_008,
+            shortfall_tokens: 192,
+            seen_bucket_tokens: 99_008,
+            avoidable_shortfall_tokens: 256,
+            avoidable_shortfall_streak: 1,
+            shortfall_tokens_128: 192,
+            seen_bucket_tokens_128: 99_008,
+            avoidable_shortfall_tokens_128: 256,
+            small_gap_recovery_streak: 1,
+            recent_clean_tiny_gap_streak: 1,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 100_000,
+            cache_read_tokens: 98_752,
+            ..UsageRecord::default()
+        };
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("clean fine-gap usage must update prefix state");
+        assert_eq!(next.avoidable_shortfall_tokens_128, 256);
+        assert_eq!(next.avoidable_shortfall_streak, 2);
+        assert_eq!(
+            next.recent_clean_tiny_gap_streak,
+            MIN_CLEAN_TINY_RECOVERY_STREAK
+        );
+        assert_eq!(next.cache_instability_score, 7);
+
+        let decision = PrefixController::before_request(PrefixControlInput {
+            source_is_exact: true,
+            avoidable_tokens: next
+                .avoidable_shortfall_tokens
+                .max(next.avoidable_shortfall_tokens_128),
+            fine_avoidable_tokens: next.avoidable_shortfall_tokens_128,
+            avoidable_shortfall_streak: next.avoidable_shortfall_streak,
+            cache_instability_score: next.cache_instability_score,
+            tiny_instability_recovery_safe: next.recent_clean_tiny_gap_streak
+                >= MIN_CLEAN_TINY_RECOVERY_STREAK,
+            settle_after_cold_read: next.settle_after_cold_read,
+            compaction_requested: false,
+            state_age: Duration::ZERO,
+            request_budget: MAX_FOREGROUND_WAIT,
+        });
+        assert!(decision.wait > Duration::ZERO);
+        assert!(decision.wait <= MAX_FOREGROUND_WAIT);
+    }
+
+    #[test]
+    fn tool_call_tail_cannot_build_clean_fine_gap_recovery_evidence() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 99_200,
+            cache_read_tokens: 99_008,
+            shortfall_tokens: 192,
+            seen_bucket_tokens: 99_008,
+            avoidable_shortfall_tokens: 256,
+            avoidable_shortfall_streak: 1,
+            shortfall_tokens_128: 192,
+            seen_bucket_tokens_128: 99_008,
+            avoidable_shortfall_tokens_128: 256,
+            small_gap_recovery_streak: 1,
+            recent_clean_tiny_gap_streak: 1,
+            cache_instability_score: 8,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 100_000,
+            cache_read_tokens: 98_752,
+            ..UsageRecord::default()
+        };
+        let tool_call_tail = TailInputDiagnostics {
+            tool_call_chars: 1,
+            source: Some("tool_call".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &tool_call_tail,
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+        });
+        let next = observation
+            .next
+            .expect("tool-call usage still updates the general prefix state");
+        assert_eq!(next.recent_clean_tiny_gap_streak, 0);
     }
 
     #[test]
@@ -823,6 +1073,7 @@ mod tests {
             seen_bucket_tokens_128: 240_000,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 8,
             settle_after_cold_read: false,
             tail_tool_output_chars: 40_000,
@@ -869,6 +1120,7 @@ mod tests {
             seen_bucket_tokens_128: 190_000,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 8,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -909,6 +1161,7 @@ mod tests {
             seen_bucket_tokens_128: 190_000,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 8,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,

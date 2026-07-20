@@ -61,7 +61,7 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "user",
 ];
 
-const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
+pub(crate) const TOOL_SEARCH_PROXY_NAME: &str = "tool_search";
 const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
@@ -129,7 +129,11 @@ impl CodexToolContext {
             .is_some_and(|spec| matches!(&spec.kind, CodexToolKind::Custom))
     }
 
-    fn chat_name_for_response_function(&self, name: &str, namespace: Option<&str>) -> String {
+    pub(crate) fn chat_name_for_response_function(
+        &self,
+        name: &str,
+        namespace: Option<&str>,
+    ) -> String {
         if let Some(namespace) = namespace.filter(|value| !value.is_empty()) {
             if let Some(chat_name) = self
                 .namespace_name_to_chat_name

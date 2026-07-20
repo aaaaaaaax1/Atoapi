@@ -1,0 +1,99 @@
+- iframe [active] [ref=f12e3]:
+  - generic [ref=f13e1]:
+    - generic [ref=f13e2]:
+      - banner [ref=f13e3]:
+        - button "打开设置" [ref=f13e5] [cursor=pointer]
+        - tablist "Agent 列表" [ref=f13e9]:
+          - tab "Codex" [selected] [ref=f13e10] [cursor=pointer]
+      - main [ref=f13e41]:
+        - text: · ·
+        - generic [ref=f13e81]:
+          - generic [ref=f13e82]:
+            - generic [ref=f13e83]:
+              - button "返回 Agent" [ref=f13e84] [cursor=pointer]
+              - generic [ref=f13e87]:
+                - heading "缓存统计" [level=2] [ref=f13e88]
+                - paragraph [ref=f13e89]: 成功记录与错误记录分离，详情按需展开。
+            - button "刷新" [ref=f13e90] [cursor=pointer]
+          - generic [ref=f13e96]:
+            - generic [ref=f13e97]:
+              - generic [ref=f13e98]: sheapi 命中率
+              - generic [ref=f13e99]: 94.2%
+            - generic [ref=f13e100]:
+              - generic [ref=f13e101]: 累计输入
+              - generic [ref=f13e102]: 291k
+            - generic [ref=f13e103]:
+              - generic [ref=f13e104]: 累计命中
+              - generic [ref=f13e105]: 274k
+            - generic [ref=f13e106]:
+              - generic [ref=f13e107]: 成功请求
+              - generic [ref=f13e108]: "2"
+          - tablist "缓存统计视图" [ref=f13e109]:
+            - tab "概览" [ref=f13e110] [cursor=pointer]
+            - tab "请求记录" [active] [selected] [ref=f13e111] [cursor=pointer]
+            - tab "上游统计" [ref=f13e112] [cursor=pointer]
+          - generic [ref=f13e148]:
+            - generic [ref=f13e149]:
+              - tablist "请求记录上游筛选" [ref=f13e150]:
+                - 'tab "å¨é¨" [ref=f13e151] [cursor=pointer]'
+                - tab "sheapi" [selected] [ref=f13e152] [cursor=pointer]
+              - generic "请求记录分页" [ref=f13e153]:
+                - generic [ref=f13e154]: 2 条 · 第 1 / 1 页
+                - button "1" [ref=f13e155] [cursor=pointer]
+            - generic [ref=f13e156]:
+              - generic [ref=f13e157]: 上游 / Agent
+              - generic [ref=f13e158]: 模型 / 思考
+              - generic [ref=f13e159]: 流
+              - generic [ref=f13e160]: Tokens
+              - generic [ref=f13e161]: 首字 / 耗时
+              - generic [ref=f13e162]: 命中
+            - generic [ref=f13e163]:
+              - article [ref=f13e164] [cursor=pointer]:
+                - generic "sheapi / Codex" [ref=f13e165]: 11:38:39
+                - generic "sheapi · gpt-5.6-terra" [ref=f13e168]:
+                  - generic [ref=f13e169]: gpt-5.6-terra
+                  - generic [ref=f13e170]: high
+                - generic [ref=f13e171]:
+                  - generic [ref=f13e172]: 流
+                  - generic [ref=f13e173]: 50 t/s
+                - generic [ref=f13e174]:
+                  - generic [ref=f13e175]: 146,036 / 314
+                  - generic [ref=f13e176]: 缓存 137,844 (94.4%)
+                - generic [ref=f13e177]:
+                  - generic [ref=f13e178]:
+                    - generic [ref=f13e179]: 首字
+                    - generic [ref=f13e180]: 1.7s
+                  - generic [ref=f13e181]:
+                    - generic [ref=f13e182]: 耗时
+                    - generic [ref=f13e183]: 8.0s
+                - generic [ref=f13e184]:
+                  - generic [ref=f13e185]: 94.4%
+                  - generic [ref=f13e186]: 缺 33,664 · 可 0 · 新 33,664
+              - article [ref=f13e187] [cursor=pointer]:
+                - generic "sheapi / Codex" [ref=f13e188]: 11:37:22
+                - generic "sheapi · gpt-5.6-terra" [ref=f13e191]:
+                  - generic [ref=f13e192]: gpt-5.6-terra
+                  - generic [ref=f13e193]: max
+                - generic [ref=f13e194]:
+                  - generic [ref=f13e195]: 流
+                  - generic [ref=f13e196]: 963 t/s
+                - generic [ref=f13e197]:
+                  - generic [ref=f13e198]: 145,268 / 385
+                  - generic [ref=f13e199]: 缓存 136,564 (94.0%)
+                - generic [ref=f13e200]:
+                  - generic [ref=f13e201]:
+                    - generic [ref=f13e202]: 首字
+                    - generic [ref=f13e203]: 2.6s
+                  - generic [ref=f13e204]:
+                    - generic [ref=f13e205]: 耗时
+                    - generic [ref=f13e206]: 3.0s
+                - generic [ref=f13e207]:
+                  - generic [ref=f13e208]: 94.0%
+                  - generic [ref=f13e209]: 缺 28,000 · 可 320 · 新 768
+      - contentinfo [ref=f13e72]:
+        - button "关闭缓存统计与请求记录" [pressed] [ref=f13e147] [cursor=pointer]:
+          - generic [ref=f13e78]: 缓存与记录
+          - generic [ref=f13e79]:
+            - text: 命中率
+            - strong [ref=f13e80]: 94.2%
+    - status

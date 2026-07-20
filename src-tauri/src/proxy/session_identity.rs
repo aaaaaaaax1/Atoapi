@@ -43,16 +43,10 @@ impl SessionIdentity {
         }
 
         let explicit = explicit_identity(client_request);
-        let anchor_material = fallback_anchor_material(upstream_request);
+        let (identity_material, source) = identity_material_or_fallback(explicit.as_ref(), || {
+            fallback_anchor_material(upstream_request)
+        });
         let scope_material = fallback_scope_material(upstream_request);
-        let identity_material = explicit
-            .as_ref()
-            .map(|identity| format!("{}\0{}", identity.kind, identity.value))
-            .unwrap_or_else(|| anchor_material.clone());
-        let source = explicit
-            .as_ref()
-            .map(|identity| identity.kind)
-            .unwrap_or("content-anchor");
         let model = provider_prefix_model_key(decision);
         let provider_group = provider_prefix_provider_group(decision);
         let agent_scope = agent_identity_scope(agent_id);
@@ -99,6 +93,19 @@ impl SessionIdentity {
 struct ExplicitIdentity {
     kind: &'static str,
     value: String,
+}
+
+fn identity_material_or_fallback(
+    explicit: Option<&ExplicitIdentity>,
+    fallback: impl FnOnce() -> String,
+) -> (String, &'static str) {
+    match explicit {
+        Some(identity) => (
+            format!("{}\0{}", identity.kind, identity.value),
+            identity.kind,
+        ),
+        None => (fallback(), "content-anchor"),
+    }
 }
 
 fn explicit_identity(request: &Value) -> Option<ExplicitIdentity> {
@@ -282,6 +289,21 @@ mod tests {
             review_identity.control_fingerprint
         );
         assert_eq!(main_identity.source, "thread-id");
+    }
+
+    #[test]
+    fn explicit_identity_does_not_evaluate_fallback_anchor() {
+        let explicit = ExplicitIdentity {
+            kind: "thread-id",
+            value: "thread-1".to_string(),
+        };
+
+        let (material, source) = identity_material_or_fallback(Some(&explicit), || {
+            panic!("explicit identities must not build fallback anchor material")
+        });
+
+        assert_eq!(material, "thread-id\0thread-1");
+        assert_eq!(source, "thread-id");
     }
 
     #[test]

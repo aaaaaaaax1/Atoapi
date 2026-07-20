@@ -1,0 +1,89 @@
+- iframe [active] [ref=f2e3]:
+  - generic [ref=f3e1]:
+    - generic [ref=f3e2]:
+      - banner [ref=f3e3]:
+        - generic [ref=f3e4]:
+          - button "打开设置" [ref=f3e5] [cursor=pointer]
+          - button "查看版本" [ref=f3e9] [cursor=pointer]:
+            - strong [ref=f3e10]: Atoapi
+            - generic [ref=f3e11]: Graphite · v1.3.0
+        - tablist "Agent 列表" [ref=f3e12]:
+          - tab "Codex 已启用" [selected] [ref=f3e150] [cursor=pointer]:
+            - generic [ref=f3e155]:
+              - generic [ref=f3e156]: Codex
+              - generic [ref=f3e157]: 已启用
+        - generic [ref=f3e91]:
+          - generic [ref=f3e92]:
+            - generic [ref=f3e93]: 代理运行中
+            - generic [ref=f3e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f3e95] [cursor=pointer]
+      - main [ref=f3e126]:
+        - text: · · · ·
+        - generic [ref=f3e251]:
+          - generic [ref=f3e252]:
+            - generic [ref=f3e253]:
+              - button "返回 Agent" [ref=f3e254] [cursor=pointer]
+              - generic [ref=f3e257]:
+                - heading "缓存统计" [level=2] [ref=f3e258]
+                - paragraph [ref=f3e259]: 成功记录与错误记录分离，详情按需展开。
+            - button "刷新" [ref=f3e260] [cursor=pointer]
+          - generic [ref=f3e266]:
+            - generic [ref=f3e267]:
+              - generic [ref=f3e268]: 云舟 命中率
+              - generic [ref=f3e269]: 94.8%
+            - generic [ref=f3e270]:
+              - generic [ref=f3e271]: 累计输入
+              - generic [ref=f3e272]: 302.5 万
+            - generic [ref=f3e273]:
+              - generic [ref=f3e274]: 累计命中
+              - generic [ref=f3e275]: 286.7 万
+            - generic [ref=f3e276]:
+              - generic [ref=f3e277]: 成功 / error
+              - generic [ref=f3e278]: 21 / 1
+          - tablist "缓存统计视图" [ref=f3e279]:
+            - tab "概览" [selected] [ref=f3e280] [cursor=pointer]
+            - tab "请求记录" [ref=f3e281] [cursor=pointer]
+            - tab "上游统计" [ref=f3e282] [cursor=pointer]
+          - generic [ref=f3e284]:
+            - generic [ref=f3e285]:
+              - text: Provider cache
+              - generic [ref=f3e286]:
+                - strong [ref=f3e287]: 94.8%
+                - generic [ref=f3e288]: 云舟 · 21 条成功记录1 error
+              - progressbar "缓存命中率 94.8%" [ref=f3e289]
+              - generic [ref=f3e290]:
+                - generic [ref=f3e291]:
+                  - generic [ref=f3e292]: 缺口
+                  - generic [ref=f3e293]: 15.4 万
+                - generic [ref=f3e294]:
+                  - generic [ref=f3e295]: 可避免
+                  - generic [ref=f3e296]: 4,096
+                - generic [ref=f3e297]:
+                  - generic [ref=f3e298]: 新尾部
+                  - generic [ref=f3e299]: 12,288
+            - generic [ref=f3e300]:
+              - text: Policy
+              - generic [ref=f3e301]:
+                - generic [ref=f3e302]:
+                  - generic [ref=f3e303]:
+                    - generic [ref=f3e304]: 智能缓存
+                    - generic [ref=f3e305]: 前缀稳定与真实 usage 统计
+                  - switch "智能缓存" [checked] [ref=f3e306] [cursor=pointer]
+                - generic [ref=f3e307]:
+                  - generic [ref=f3e308]:
+                    - generic [ref=f3e309]: 计入冷启动
+                    - generic [ref=f3e310]: 仅影响当前统计视图
+                  - switch "计入冷启动" [checked] [ref=f3e311] [cursor=pointer]
+                - generic [ref=f3e312]:
+                  - generic [ref=f3e313]:
+                    - generic [ref=f3e314]: 提示详细错误
+                    - generic [ref=f3e315]: 主列表保持简洁，详情抽屉保留原文
+                  - switch "提示详细错误" [ref=f3e316] [cursor=pointer]
+      - contentinfo [ref=f3e137]:
+        - button "关闭缓存统计与请求记录" [active] [pressed] [ref=f3e317] [cursor=pointer]:
+          - generic [ref=f3e143]: 缓存与记录
+          - generic [ref=f3e144]:
+            - text: 命中率
+            - strong [ref=f3e250]: 94.8%
+          - generic [ref=f3e146]: 21 成功 · 1 error
+    - status

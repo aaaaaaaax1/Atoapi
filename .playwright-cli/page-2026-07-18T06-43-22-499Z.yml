@@ -1,0 +1,125 @@
+- generic [ref=f1e1]:
+  - generic [ref=f1e2]:
+    - banner [ref=f1e3]:
+      - generic [ref=f1e4]:
+        - button "打开设置" [ref=f1e5] [cursor=pointer]
+        - button "查看版本" [ref=f1e9] [cursor=pointer]:
+          - strong [ref=f1e10]: Atoapi
+          - generic [ref=f1e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=f1e12]:
+        - tab "Codex 已启用" [selected] [ref=f1e13] [cursor=pointer]:
+          - generic [ref=f1e18]:
+            - generic [ref=f1e19]: Codex
+            - generic [ref=f1e20]: 已启用
+        - tab "Claude Code 已启用" [ref=f1e22] [cursor=pointer]:
+          - generic [ref=f1e28]:
+            - generic [ref=f1e29]: Claude Code
+            - generic [ref=f1e30]: 已启用
+        - tab "Gemini 已关闭" [ref=f1e32] [cursor=pointer]:
+          - generic [ref=f1e36]:
+            - generic [ref=f1e37]: Gemini
+            - generic [ref=f1e38]: 已关闭
+        - tab "OpenCode 已启用" [ref=f1e40] [cursor=pointer]:
+          - generic [ref=f1e45]:
+            - generic [ref=f1e46]: OpenCode
+            - generic [ref=f1e47]: 已启用
+        - tab "OpenClaw 已关闭" [ref=f1e49] [cursor=pointer]:
+          - generic [ref=f1e54]:
+            - generic [ref=f1e55]: OpenClaw
+            - generic [ref=f1e56]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=f1e58] [cursor=pointer]:
+          - generic [ref=f1e67]:
+            - generic [ref=f1e68]: Proxy Mode
+            - generic [ref=f1e69]: 已启用
+      - generic [ref=f1e71]:
+        - generic [ref=f1e72]:
+          - generic [ref=f1e73]: 代理运行中
+          - generic [ref=f1e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=f1e75] [cursor=pointer]
+        - button "查看版本信息" [ref=f1e81] [cursor=pointer]
+    - region [ref=f1e84]:
+      - generic [ref=f1e85]:
+        - switch "启用当前 Agent" [checked] [ref=f1e86] [cursor=pointer]
+        - generic [ref=f1e87]:
+          - heading "Codex" [level=1] [ref=f1e88]
+          - paragraph [ref=f1e89]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=f1e90]:
+        - generic [ref=f1e91]:
+          - generic [ref=f1e92]: Base URL
+          - code [ref=f1e93]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=f1e94] [cursor=pointer]
+        - generic [ref=f1e98]:
+          - generic [ref=f1e99]: Local Key
+          - code [ref=f1e100]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=f1e101] [cursor=pointer]
+      - button "新增上游" [ref=f1e106] [cursor=pointer]
+    - main [ref=f1e109]:
+      - text: · · · · · ·
+      - generic [ref=f1e219]:
+        - generic [ref=f1e220]:
+          - generic [ref=f1e221]:
+            - button "返回 Agent" [ref=f1e222] [cursor=pointer]
+            - generic [ref=f1e225]:
+              - heading "缓存统计" [level=2] [ref=f1e226]
+              - paragraph [ref=f1e227]: 成功记录与错误记录分离，详情按需展开。
+          - button "刷新" [ref=f1e228] [cursor=pointer]
+        - generic [ref=f1e234]:
+          - generic [ref=f1e235]:
+            - generic [ref=f1e236]: 历史命中率
+            - generic [ref=f1e237]: 95.8%
+          - generic [ref=f1e238]:
+            - generic [ref=f1e239]: 累计输入
+            - generic [ref=f1e240]: 1,286 万
+          - generic [ref=f1e241]:
+            - generic [ref=f1e242]: 累计命中
+            - generic [ref=f1e243]: 1,232 万
+          - generic [ref=f1e244]:
+            - generic [ref=f1e245]: 成功 / error
+            - generic [ref=f1e246]: 128 / 2
+        - tablist "缓存统计视图" [ref=f1e247]:
+          - tab "概览" [selected] [ref=f1e248] [cursor=pointer]
+          - tab "请求记录" [ref=f1e249] [cursor=pointer]
+          - tab "上游统计" [ref=f1e250] [cursor=pointer]
+        - generic [ref=f1e252]:
+          - generic [ref=f1e253]:
+            - text: Provider cache
+            - generic [ref=f1e254]:
+              - strong [ref=f1e255]: 95.8%
+              - generic [ref=f1e256]: 最近 128 次成功请求冷启动已单独分类
+            - progressbar "缓存命中率 95.8%" [ref=f1e257]
+            - generic [ref=f1e258]:
+              - generic [ref=f1e259]:
+                - generic [ref=f1e260]: 缺口
+                - generic [ref=f1e261]: 5.4 万
+              - generic [ref=f1e262]:
+                - generic [ref=f1e263]: 可避免
+                - generic [ref=f1e264]: "768"
+              - generic [ref=f1e265]:
+                - generic [ref=f1e266]: 新尾部
+                - generic [ref=f1e267]: 1,536
+          - generic [ref=f1e268]:
+            - text: Policy
+            - generic [ref=f1e269]:
+              - generic [ref=f1e270]:
+                - generic [ref=f1e271]:
+                  - generic [ref=f1e272]: 智能缓存
+                  - generic [ref=f1e273]: 前缀稳定与真实 usage 统计
+                - switch "智能缓存" [checked] [ref=f1e274] [cursor=pointer]
+              - generic [ref=f1e275]:
+                - generic [ref=f1e276]:
+                  - generic [ref=f1e277]: 计入冷启动
+                  - generic [ref=f1e278]: 仅影响当前统计视图
+                - switch "计入冷启动" [ref=f1e279] [cursor=pointer]
+              - generic [ref=f1e280]:
+                - generic [ref=f1e281]:
+                  - generic [ref=f1e282]: 提示详细错误
+                  - generic [ref=f1e283]: 主列表保持简洁，详情抽屉保留原文
+                - switch "提示详细错误" [checked] [ref=f1e284] [cursor=pointer]
+    - contentinfo [ref=f1e209]:
+      - button "打开缓存统计与请求记录" [active] [ref=f1e210] [cursor=pointer]:
+        - generic [ref=f1e215]: 缓存与记录
+        - generic [ref=f1e216]:
+          - text: 命中率
+          - strong [ref=f1e217]: 95.8%
+        - generic [ref=f1e218]: 128 成功 · 2 error
+  - status

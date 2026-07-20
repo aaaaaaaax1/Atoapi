@@ -1,0 +1,97 @@
+- iframe [active] [ref=e3]:
+  - generic [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e7] [cursor=pointer]:
+            - strong [ref=f1e8]: Atoapi
+            - generic [ref=f1e9]: Graphite · v1.3.0
+        - tablist "Agent 列表" [ref=f1e10]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e48] [cursor=pointer]:
+            - generic [ref=f1e54]:
+              - generic [ref=f1e55]: Claude Code
+              - generic [ref=f1e56]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e58] [cursor=pointer]:
+            - generic [ref=f1e62]:
+              - generic [ref=f1e63]: Claude Desktop
+              - generic [ref=f1e64]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e66] [cursor=pointer]:
+            - generic [ref=f1e71]:
+              - generic [ref=f1e72]: Codex
+              - generic [ref=f1e73]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e75] [cursor=pointer]:
+            - generic [ref=f1e79]:
+              - generic [ref=f1e80]: Gemini
+              - generic [ref=f1e81]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e83] [cursor=pointer]:
+            - generic [ref=f1e88]:
+              - generic [ref=f1e89]: OpenCode
+              - generic [ref=f1e90]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e92] [cursor=pointer]:
+            - generic [ref=f1e97]:
+              - generic [ref=f1e98]: OpenClaw
+              - generic [ref=f1e99]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e101] [cursor=pointer]:
+            - generic [ref=f1e109]:
+              - generic [ref=f1e110]: Hermes
+              - generic [ref=f1e111]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e113] [cursor=pointer]:
+            - generic [ref=f1e122]:
+              - generic [ref=f1e123]: 本地代理模式
+              - generic [ref=f1e124]: 已关闭
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]:
+            - generic [ref=f1e13]: 代理运行中
+            - generic [ref=f1e14]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e15] [cursor=pointer]
+      - main [ref=f1e28]:
+        - generic [ref=f1e154]:
+          - generic [ref=f1e155]:
+            - generic [ref=f1e156]:
+              - button "返回 Agent" [ref=f1e157] [cursor=pointer]
+              - generic [ref=f1e160]:
+                - heading "缓存统计" [level=2] [ref=f1e161]
+                - paragraph [ref=f1e162]: 成功记录与错误记录分离，详情按需展开。
+            - button "刷新" [ref=f1e163] [cursor=pointer]
+          - generic [ref=f1e169]:
+            - generic [ref=f1e170]:
+              - generic [ref=f1e171]: 历史命中率
+              - generic [ref=f1e172]: —
+            - generic [ref=f1e173]:
+              - generic [ref=f1e174]: 累计输入
+              - generic [ref=f1e175]: "0"
+            - generic [ref=f1e176]:
+              - generic [ref=f1e177]: 累计命中
+              - generic [ref=f1e178]: "0"
+            - generic [ref=f1e179]:
+              - generic [ref=f1e180]: 成功请求
+              - generic [ref=f1e181]: "0"
+          - tablist "缓存统计视图" [ref=f1e182]:
+            - tab "概览" [ref=f1e183] [cursor=pointer]
+            - tab "请求记录" [active] [selected] [ref=f1e184] [cursor=pointer]
+            - tab "上游统计" [ref=f1e185] [cursor=pointer]
+          - generic [ref=f1e221]:
+            - generic [ref=f1e222]:
+              - generic [ref=f1e223]:
+                - tablist "请求记录上游筛选" [ref=f1e224]:
+                  - tab "全部" [selected] [ref=f1e225] [cursor=pointer]
+                - generic "请求记录分页" [ref=f1e226]:
+                  - generic [ref=f1e227]: 0 条 · 第 1 / 1 页
+                  - button "1" [ref=f1e228] [cursor=pointer]
+              - generic [ref=f1e229]:
+                - generic [ref=f1e230]: 上游 / Agent
+                - generic [ref=f1e231]: 模型 / 思考
+                - generic [ref=f1e232]: 流
+                - generic [ref=f1e233]: Tokens
+                - generic [ref=f1e234]: 首字 / 耗时
+                - generic [ref=f1e235]: 命中
+            - generic [ref=f1e236]: 当前筛选下暂无成功请求记录
+      - contentinfo [ref=f1e38]:
+        - button "关闭缓存统计与请求记录" [pressed] [ref=f1e220] [cursor=pointer]:
+          - generic [ref=f1e41]: 缓存与记录
+          - generic [ref=f1e42]:
+            - text: 命中率
+            - strong [ref=f1e153]: —
+          - generic [ref=f1e44]: 0 成功
+    - status

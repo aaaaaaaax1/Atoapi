@@ -1,0 +1,107 @@
+- iframe [active] [ref=f13e3]:
+  - generic [ref=f14e1]:
+    - generic [ref=f14e2]:
+      - banner [ref=f14e3]:
+        - generic [ref=f14e4]:
+          - button "打开设置" [ref=f14e5] [cursor=pointer]
+          - button "查看版本" [ref=f14e9] [cursor=pointer]:
+            - strong [ref=f14e10]: Atoapi
+            - generic [ref=f14e11]: Graphite · v1.3.0
+        - tablist "Agent 列表" [ref=f14e12]:
+          - tab "Codex 已启用" [selected] [ref=f14e150] [cursor=pointer]:
+            - generic [ref=f14e155]:
+              - generic [ref=f14e156]: Codex
+              - generic [ref=f14e157]: 已启用
+        - generic [ref=f14e91]:
+          - generic [ref=f14e92]:
+            - generic [ref=f14e93]: 代理运行中
+            - generic [ref=f14e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f14e95] [cursor=pointer]
+      - region [ref=f14e164]:
+        - generic [ref=f14e102]:
+          - switch "启用当前 Agent" [checked] [ref=f14e103] [cursor=pointer]
+          - generic [ref=f14e104]:
+            - heading "Codex" [level=1] [ref=f14e165]
+            - paragraph [ref=f14e106]: Test · Responses · 1 个映射
+        - generic [ref=f14e107]:
+          - generic [ref=f14e166]:
+            - generic [ref=f14e167]: Base URL
+            - code [ref=f14e168]: http://127.0.0.1:18883/codex/v1
+            - button "复制 Base URL" [ref=f14e169] [cursor=pointer]
+          - generic [ref=f14e173]:
+            - generic [ref=f14e174]: Local Key
+            - code [ref=f14e175]: test
+            - button "复制本地 Key" [ref=f14e176] [cursor=pointer]
+        - button "新增上游" [ref=f14e123] [cursor=pointer]
+      - main [ref=f14e126]:
+        - generic [ref=f14e127]:
+          - generic [ref=f14e128]:
+            - generic [ref=f14e129]:
+              - heading "上游路由" [level=2] [ref=f14e130]
+              - paragraph [ref=f14e131]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f14e132]:
+              - generic [ref=f14e133]: 1 个可用上游
+              - generic [ref=f14e134]: 一次入站 · 一次上游
+          - article [ref=f14e181]:
+            - generic [ref=f14e187]:
+              - generic [ref=f14e188]: Fallback Test
+              - generic [ref=f14e189]: https://example.test/v1
+            - generic [ref=f14e190]:
+              - generic [ref=f14e191]:
+                - generic [ref=f14e192]: Responses
+                - generic [ref=f14e193]: · 1 个映射
+                - generic [ref=f14e194]: · 1 Key
+              - generic [ref=f14e195]:
+                - generic [ref=f14e196]: 最近连通
+                - generic [ref=f14e197]: 测试
+            - generic [ref=f14e198]:
+              - button "当前" [ref=f14e199] [cursor=pointer]
+              - button "测试 Fallback Test 连通性" [ref=f14e202] [cursor=pointer]
+              - button "编辑 Fallback Test" [ref=f14e205] [cursor=pointer]
+              - button "删除 Fallback Test" [ref=f14e209] [cursor=pointer]
+      - contentinfo [ref=f14e137]:
+        - button "打开缓存统计与请求记录" [ref=f14e138] [cursor=pointer]:
+          - generic [ref=f14e143]: 缓存与记录
+          - generic [ref=f14e144]:
+            - text: 命中率
+            - strong [ref=f14e217]: 0.0%
+          - generic [ref=f14e146]: 0 成功 · 0 error
+    - dialog [ref=f14e255]:
+      - banner [ref=f14e256]:
+        - generic [ref=f14e257]:
+          - heading "编辑上游" [level=2] [ref=f14e258]
+          - paragraph [ref=f14e259]: Fallback Test · Responses
+        - button "关闭上游编辑器" [ref=f14e260] [cursor=pointer]
+      - generic [ref=f14e265]:
+        - tablist "上游配置分类" [ref=f14e266]:
+          - tab "连接信息" [ref=f14e267] [cursor=pointer]
+          - tab "模型映射" [active] [selected] [ref=f14e268] [cursor=pointer]
+          - tab "多 Key" [ref=f14e269] [cursor=pointer]
+          - tab "传输与缓存" [ref=f14e270] [cursor=pointer]
+          - tab "兼容性" [ref=f14e271] [cursor=pointer]
+        - generic [ref=f14e318]:
+          - generic [ref=f14e319]:
+            - generic [ref=f14e320]:
+              - heading "模型映射" [level=3] [ref=f14e321]
+              - paragraph [ref=f14e322]: 空映射时跟随 Agent 原始模型与推理参数。
+            - generic [ref=f14e323]:
+              - button "获取模型" [ref=f14e324] [cursor=pointer]
+              - button "添加" [ref=f14e325] [cursor=pointer]
+          - generic [ref=f14e328]:
+            - textbox "请求模型" [ref=f14e329]: gpt-fallback
+            - generic [ref=f14e330]: →
+            - textbox "实际模型" [ref=f14e331]: gpt-fallback
+            - textbox "上下文窗口" [ref=f14e332]
+            - combobox "推理强度" [ref=f14e333]:
+              - option "跟随 Agent"
+              - option "ultra" [selected]
+              - option "low"
+              - option "medium"
+              - option "high"
+              - option "max"
+            - button "删除模型映射" [ref=f14e334] [cursor=pointer]
+      - contentinfo [ref=f14e313]:
+        - button "删除" [ref=f14e314] [cursor=pointer]
+        - button "取消" [ref=f14e315] [cursor=pointer]
+        - button "保存并绑定" [ref=f14e316] [cursor=pointer]
+    - status

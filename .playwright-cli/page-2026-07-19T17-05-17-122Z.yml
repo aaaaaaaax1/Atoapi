@@ -1,0 +1,210 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - button "查看版本更新" [ref=e6] [cursor=pointer]
+      - button "查看版本更新" [ref=e11] [cursor=pointer]:
+        - strong [ref=e12]: Atoapi
+        - generic [ref=e13]: Graphite · v0.2.16
+    - navigation "Agent 注入" [ref=e14]:
+      - tab "Claude Code 已关闭 Agent 已关闭" [selected] [ref=e15] [cursor=pointer]:
+        - generic [ref=e20]:
+          - generic [ref=e21]: Claude Code
+          - generic "未选择上游" [ref=e22]: 已关闭
+        - generic "Agent 已关闭" [ref=e23]
+      - tab "Codex 已关闭 Agent 已关闭" [ref=e24] [cursor=pointer]:
+        - generic [ref=e38]:
+          - generic [ref=e39]: Codex
+          - generic "未选择上游" [ref=e40]: 已关闭
+        - generic "Agent 已关闭" [ref=e41]
+      - tab "Gemini 已关闭 Agent 已关闭" [ref=e42] [cursor=pointer]:
+        - generic [ref=e46]:
+          - generic [ref=e47]: Gemini
+          - generic "未选择上游" [ref=e48]: 已关闭
+        - generic "Agent 已关闭" [ref=e49]
+      - tab "OpenCode 已关闭 Agent 已关闭" [ref=e50] [cursor=pointer]:
+        - generic [ref=e56]:
+          - generic [ref=e57]: OpenCode
+          - generic "未选择上游" [ref=e58]: 已关闭
+        - generic "Agent 已关闭" [ref=e59]
+      - tab "OpenClaw 已关闭 Agent 已关闭" [ref=e60] [cursor=pointer]:
+        - generic [ref=e66]:
+          - generic [ref=e67]: OpenClaw
+          - generic "未选择上游" [ref=e68]: 已关闭
+        - generic "Agent 已关闭" [ref=e69]
+      - tab "本地代理模式 已关闭 Agent 已关闭" [ref=e70] [cursor=pointer]:
+        - generic [ref=e77]:
+          - generic [ref=e78]: 本地代理模式
+          - generic "未选择上游" [ref=e79]: 已关闭
+        - generic "Agent 已关闭" [ref=e80]
+      - button "更多 Agent" [ref=e82] [cursor=pointer]
+    - generic [ref=e87]:
+      - generic "http://127.0.0.1:18883" [ref=e88]:
+        - generic [ref=e89]: 代理运行中
+        - generic [ref=e90]: 127.0.0.1:18883
+      - button "刷新配置和统计" [ref=e91] [cursor=pointer]
+  - main [ref=e123]:
+    - region "缓存与请求记录" [ref=e283]:
+      - generic [ref=e284]:
+        - generic [ref=e285]:
+          - heading "缓存统计" [level=2] [ref=e286]
+          - paragraph [ref=e287]: 成功记录与错误记录分离，详情按需展开。
+        - button "关闭缓存与请求记录" [ref=e288] [cursor=pointer]
+      - generic [ref=e292]:
+        - generic [ref=e293]:
+          - generic [ref=e295]:
+            - heading "缓存策略" [level=3] [ref=e296]
+            - paragraph [ref=e297]: 简单模式：保留主请求内的安全缓存优化，不再额外补发同步热补请求。
+          - generic [ref=e298]:
+            - generic [ref=e302]:
+              - heading "智能最大命中" [level=4] [ref=e303]
+              - paragraph [ref=e304]: 启用上游前缀缓存、稳定 cache key、请求体规范化和安全会话续接；不主动多发热补请求。
+            - button "已开启" [pressed] [ref=e305] [cursor=pointer]
+          - generic [ref=e307]:
+            - generic [ref=e308]:
+              - generic [ref=e313]:
+                - heading "受控命中验证" [level=4] [ref=e314]
+                - generic [ref=e315]: 自动
+              - group "缓存验证模式" [ref=e316]:
+                - button "auto" [ref=e317]
+                - button "baseline" [disabled] [ref=e318]
+                - button "candidate" [disabled] [ref=e319]
+            - generic [ref=e320]:
+              - generic [ref=e321]:
+                - generic [ref=e322]: 上游
+                - combobox "上游" [ref=e323]
+              - generic [ref=e324]:
+                - generic [ref=e325]: 主模型
+                - combobox "主模型" [ref=e326]
+          - generic [ref=e327]:
+            - generic [ref=e328]:
+              - heading "冷启动统计口径" [level=4] [ref=e329]
+              - paragraph [ref=e330]: 默认计入冷启动，按原始上游累计计算；临时关闭只用于排查 warm 命中。
+            - generic [ref=e331]:
+              - generic [ref=e332]: 全部上游冷启动
+              - generic [ref=e333]: 0 次
+              - generic [ref=e334]: 近 30 分钟 0 次
+            - button "计入" [pressed] [ref=e335] [cursor=pointer]
+        - generic [ref=e337]:
+          - generic [ref=e339]:
+            - heading "使用统计" [level=3] [ref=e340]
+            - paragraph [ref=e341]: 查看全部或单个中转的 tokens、成本和缓存命中。
+          - generic [ref=e342]:
+            - button "全部" [ref=e343] [cursor=pointer]
+            - generic [ref=e344]: 自动刷新
+            - button "刷新" [ref=e350] [cursor=pointer]
+          - generic [ref=e356]:
+            - generic [ref=e357]:
+              - generic [ref=e358]:
+                - generic [ref=e359]: 历史 Tokens
+                - strong [ref=e362]: "0"
+                - generic [ref=e364]:
+                  - generic [ref=e365]:
+                    - generic [ref=e366]: 输入
+                    - paragraph [ref=e367]:
+                      - generic [ref=e368]: "0"
+                      - emphasis [ref=e369]: 0.0%
+                  - generic [ref=e370]:
+                    - generic [ref=e371]: 输出
+                    - paragraph [ref=e372]:
+                      - generic [ref=e373]: "0"
+                      - emphasis [ref=e374]: 0.0%
+                  - generic [ref=e375]:
+                    - generic [ref=e376]: 缓存
+                    - paragraph [ref=e377]:
+                      - generic [ref=e378]: 读 0 · 写 0
+                      - emphasis [ref=e379]: 占输入 0.0%
+              - generic [ref=e380]:
+                - generic [ref=e381]: 历史请求数
+                - strong [ref=e384]: "0"
+                - generic [ref=e386]:
+                  - generic [ref=e387]:
+                    - generic [ref=e388]: 单次平均
+                    - paragraph [ref=e389]:
+                      - generic [ref=e390]: "0"
+                      - emphasis [ref=e391]: tokens
+                  - generic [ref=e392]:
+                    - generic [ref=e393]: 平均输入
+                    - paragraph [ref=e394]:
+                      - generic [ref=e395]: "0"
+                      - emphasis [ref=e396]: 0.0%
+                  - generic [ref=e397]:
+                    - generic [ref=e398]: 平均输出
+                    - paragraph [ref=e399]:
+                      - generic [ref=e400]: "0"
+                      - emphasis [ref=e401]: 0.0%
+                  - generic [ref=e402]:
+                    - generic [ref=e403]: 平均缓存
+                    - paragraph [ref=e404]:
+                      - generic [ref=e405]: "0"
+                      - emphasis [ref=e406]: 占输入 0.0%
+            - generic [ref=e407]:
+              - generic [ref=e408]:
+                - generic [ref=e409]: 近 30 分钟 Tokens
+                - strong [ref=e412]: "0"
+                - generic [ref=e414]:
+                  - generic [ref=e415]:
+                    - generic [ref=e416]: 输入
+                    - paragraph [ref=e417]:
+                      - generic [ref=e418]: "0"
+                      - emphasis [ref=e419]: 0.0%
+                  - generic [ref=e420]:
+                    - generic [ref=e421]: 输出
+                    - paragraph [ref=e422]:
+                      - generic [ref=e423]: "0"
+                      - emphasis [ref=e424]: 0.0%
+                  - generic [ref=e425]:
+                    - generic [ref=e426]: 缓存
+                    - paragraph [ref=e427]:
+                      - generic [ref=e428]: 读 0 · 写 0
+                      - emphasis [ref=e429]: 占输入 0.0%
+              - generic [ref=e430]:
+                - generic [ref=e431]: 近 30 分钟 请求数
+                - strong [ref=e434]: "0"
+                - generic [ref=e436]:
+                  - generic [ref=e437]:
+                    - generic [ref=e438]: 单次平均
+                    - paragraph [ref=e439]:
+                      - generic [ref=e440]: "0"
+                      - emphasis [ref=e441]: tokens
+                  - generic [ref=e442]:
+                    - generic [ref=e443]: 平均输入
+                    - paragraph [ref=e444]:
+                      - generic [ref=e445]: "0"
+                      - emphasis [ref=e446]: 0.0%
+                  - generic [ref=e447]:
+                    - generic [ref=e448]: 平均输出
+                    - paragraph [ref=e449]:
+                      - generic [ref=e450]: "0"
+                      - emphasis [ref=e451]: 0.0%
+                  - generic [ref=e452]:
+                    - generic [ref=e453]: 平均缓存
+                    - paragraph [ref=e454]:
+                      - generic [ref=e455]: "0"
+                      - emphasis [ref=e456]: 占输入 0.0%
+          - generic [ref=e458]:
+            - generic [ref=e459]: 上游前缀缓存命中率（近 30 分钟）
+            - generic [ref=e460]: 0.0%
+          - generic [ref=e462]:
+            - generic [ref=e463]:
+              - generic [ref=e464]: 累计前缀命中率
+              - generic [ref=e465]: 0.0%
+            - generic [ref=e466]:
+              - generic [ref=e467]: 创建缓存 token
+              - generic [ref=e468]: "0"
+            - generic [ref=e469]:
+              - generic [ref=e470]: 累计上游命中
+              - generic [ref=e471]: "0"
+          - generic [ref=e472]:
+            - generic [ref=e473]:
+              - heading "请求记录" [level=4] [ref=e474]
+              - generic [ref=e475]: 暂无记录
+            - generic [ref=e476]: 等待第一条代理请求。
+          - generic [ref=e478]:
+            - heading "上游流量统计" [level=4] [ref=e479]
+            - generic [ref=e480]: 还没有上游流量统计。
+  - button "缓存与记录 命中率 0.0% 0 成功 · 0 error" [active] [pressed] [ref=e144] [cursor=pointer]:
+    - generic [ref=e150]: 缓存与记录
+    - generic [ref=e151]:
+      - text: 命中率
+      - strong [ref=e152]: 0.0%
+    - generic [ref=e153]: 0 成功 · 0 error

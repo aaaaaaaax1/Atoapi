@@ -226,6 +226,8 @@ pub struct ProviderResponseSessionReuseConfig {
     pub enabled: bool,
     #[serde(default)]
     pub status: ProviderResponseSessionReuseStatus,
+    #[serde(default)]
+    pub usage_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -246,6 +248,16 @@ pub struct ProviderResponseSessionReuseProbeResult {
     pub first_status: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_cached_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub usage_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -274,6 +286,8 @@ impl ProviderCacheCapabilityField {
         Self::PromptCacheBreakpoint,
     ];
 }
+
+const PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -314,6 +328,8 @@ pub struct ProviderCacheCapabilityConfig {
     pub key_id: Option<String>,
     pub field: ProviderCacheCapabilityField,
     #[serde(default)]
+    pub evidence_version: u32,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub status: ProviderCacheCapabilityStatus,
@@ -336,6 +352,11 @@ pub struct ProviderCacheCapabilityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn provider_cache_capability_evidence_is_current(item: &ProviderCacheCapabilityConfig) -> bool {
+    item.field != ProviderCacheCapabilityField::PromptCacheBreakpoint
+        || item.evidence_version >= PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +423,7 @@ pub struct ProviderResponseSessionReuseProbeTarget {
 pub struct ProviderResponseSessionReuseRecordSnapshot {
     enabled: bool,
     status: ProviderResponseSessionReuseStatus,
+    usage_verified: bool,
     updated_at: DateTime<Utc>,
 }
 
@@ -912,6 +934,9 @@ impl AppConfig {
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             let mut changed = false;
             config.cache.normalize_fast_forwarding_hit_policy();
+            if config.normalize_provider_response_session_reuse_evidence_state() {
+                changed = true;
+            }
             if config.normalize_provider_cache_capability_effect_state() {
                 changed = true;
             }
@@ -1138,6 +1163,11 @@ impl AppConfig {
                     }));
                 }
             }
+
+            // An enabled pool is an explicit routing boundary: its health and
+            // load-balancing rules own key selection. Falling back to the
+            // connection-info key here would silently bypass that boundary.
+            return Ok(None);
         }
 
         self.provider_api_key(provider_id).map(|key| {
@@ -1324,6 +1354,7 @@ impl AppConfig {
                 && &item.channel == channel
                 && item.key_id.as_deref() == key_id
                 && item.field == field
+                && provider_cache_capability_evidence_is_current(item)
                 && item.enabled
                 && item.status == ProviderCacheCapabilityStatus::Verified
         })
@@ -1392,6 +1423,7 @@ impl AppConfig {
                 && item.field == field
         }) {
             if status != ProviderCacheCapabilityStatus::Error {
+                item.evidence_version = PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION;
                 item.status = status;
                 if item.status != ProviderCacheCapabilityStatus::Verified {
                     item.enabled = false;
@@ -1417,6 +1449,7 @@ impl AppConfig {
                     channel,
                     key_id: clean_optional_string(key_id.map(ToOwned::to_owned)),
                     field,
+                    evidence_version: PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION,
                     enabled: false,
                     status,
                     effect_status: ProviderCacheEffectStatus::Unverified,
@@ -1434,6 +1467,7 @@ impl AppConfig {
         self.updated_at = now;
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn record_cache_capability_effect_for_key(
         &mut self,
@@ -1457,6 +1491,7 @@ impl AppConfig {
                 && item.key_id.as_deref() == key_id
                 && fields.contains(&item.field)
                 && item.status == ProviderCacheCapabilityStatus::Verified
+                && provider_cache_capability_evidence_is_current(item)
         }) {
             let preserve_promoted = effect_status == ProviderCacheEffectStatus::Error
                 && item.effect_status == ProviderCacheEffectStatus::Promoted;
@@ -1485,9 +1520,31 @@ impl AppConfig {
 
     fn normalize_provider_cache_capability_effect_state(&mut self) -> bool {
         let mut changed = false;
+        let now = Utc::now();
         for item in &mut self.provider_cache_capabilities {
+            if item.field == ProviderCacheCapabilityField::PromptCacheBreakpoint
+                && item.evidence_version < PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION
+                && item.status == ProviderCacheCapabilityStatus::Verified
+            {
+                item.evidence_version = PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION;
+                item.status = ProviderCacheCapabilityStatus::Unverified;
+                item.enabled = false;
+                item.effect_status = ProviderCacheEffectStatus::Unverified;
+                item.effect_checked_at = None;
+                item.effect_message = None;
+                item.baseline_cache_read_tokens = None;
+                item.candidate_cache_read_tokens = None;
+                item.baseline_ttft_ms = None;
+                item.candidate_ttft_ms = None;
+                item.last_error = Some(
+                    "legacy prompt_cache_breakpoint evidence requires re-verification".to_string(),
+                );
+                item.updated_at = now;
+                changed = true;
+            }
             let promoted = item.effect_status == ProviderCacheEffectStatus::Promoted
-                && item.status == ProviderCacheCapabilityStatus::Verified;
+                && item.status == ProviderCacheCapabilityStatus::Verified
+                && provider_cache_capability_evidence_is_current(item);
             if item.enabled != promoted {
                 item.enabled = promoted;
                 changed = true;
@@ -1514,6 +1571,7 @@ impl AppConfig {
                 && item.model_id == model_id
                 && item.enabled
                 && item.status == ProviderResponseSessionReuseStatus::Verified
+                && item.usage_verified
         })
     }
 
@@ -1528,6 +1586,7 @@ impl AppConfig {
             .map(|item| ProviderResponseSessionReuseRecordSnapshot {
                 enabled: item.enabled,
                 status: item.status.clone(),
+                usage_verified: item.usage_verified,
                 updated_at: item.updated_at,
             })
     }
@@ -1568,9 +1627,11 @@ impl AppConfig {
             .ok_or_else(|| {
                 anyhow!("Responses session reuse has not been verified for {model_id}")
             })?;
-        if enabled && item.status != ProviderResponseSessionReuseStatus::Verified {
+        if enabled
+            && (item.status != ProviderResponseSessionReuseStatus::Verified || !item.usage_verified)
+        {
             return Err(anyhow!(
-                "Responses session reuse must pass compatibility verification before enabling"
+                "Responses session reuse must pass semantic, usage, and cache verification before enabling"
             ));
         }
         item.enabled = enabled;
@@ -1584,10 +1645,13 @@ impl AppConfig {
         provider_id: &str,
         model_id: &str,
         status: ProviderResponseSessionReuseStatus,
+        usage_verified: bool,
         message: Option<String>,
     ) {
         let now = Utc::now();
-        let enabled = status == ProviderResponseSessionReuseStatus::Verified;
+        let usage_verified =
+            usage_verified && status == ProviderResponseSessionReuseStatus::Verified;
+        let enabled = status == ProviderResponseSessionReuseStatus::Verified && usage_verified;
         if let Some(item) = self
             .provider_response_session_reuse
             .iter_mut()
@@ -1595,6 +1659,7 @@ impl AppConfig {
         {
             item.enabled = enabled;
             item.status = status;
+            item.usage_verified = usage_verified;
             item.checked_at = Some(now);
             item.last_error = clean_optional_string(message);
             item.updated_at = now;
@@ -1605,12 +1670,48 @@ impl AppConfig {
                     model_id: model_id.to_string(),
                     enabled,
                     status,
+                    usage_verified,
                     checked_at: Some(now),
                     last_error: clean_optional_string(message),
                     updated_at: now,
                 });
         }
         self.updated_at = now;
+    }
+
+    fn normalize_provider_response_session_reuse_evidence_state(&mut self) -> bool {
+        let now = Utc::now();
+        let mut changed = false;
+        for item in &mut self.provider_response_session_reuse {
+            let mut item_changed = false;
+            if item.status == ProviderResponseSessionReuseStatus::Verified && !item.usage_verified {
+                item.status = ProviderResponseSessionReuseStatus::Unverified;
+                item.last_error = Some(
+                    "Compatibility verification must be run again because this record predates usage and cache verification."
+                        .to_string(),
+                );
+                item_changed = true;
+            }
+            if item.status != ProviderResponseSessionReuseStatus::Verified && item.usage_verified {
+                item.usage_verified = false;
+                item_changed = true;
+            }
+            if item.enabled
+                && (item.status != ProviderResponseSessionReuseStatus::Verified
+                    || !item.usage_verified)
+            {
+                item.enabled = false;
+                item_changed = true;
+            }
+            if item_changed {
+                item.updated_at = now;
+                changed = true;
+            }
+        }
+        if changed {
+            self.updated_at = now;
+        }
+        changed
     }
 
     pub fn clear_response_session_reuse_for_provider(&mut self, provider_id: &str) {
@@ -2493,6 +2594,120 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
+    fn legacy_promoted_breakpoint_requires_reverification_without_disabling_other_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-legacy-breakpoint-evidence-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ] {
+            config.record_cache_capability_probe(
+                "provider-a",
+                "gpt-5.6-terra",
+                Channel::Responses,
+                field,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+            config.record_cache_capability_effect_for_key(
+                "provider-a",
+                "gpt-5.6-terra",
+                &Channel::Responses,
+                None,
+                &[field],
+                ProviderCacheEffectStatus::Promoted,
+                Some("legacy promoted evidence".to_string()),
+                Some(0),
+                Some(512),
+                Some(100),
+                Some(100),
+            );
+        }
+        config.save(&path).unwrap();
+
+        let current = fs::read_to_string(&path).unwrap();
+        assert_eq!(current.matches("evidence_version = 2").count(), 2);
+        let legacy = current
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("evidence_version ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, format!("{legacy}\n")).unwrap();
+
+        let mut loaded = AppConfig::load_or_create(&path).unwrap();
+        let breakpoint = loaded
+            .cache_capability_for_key(
+                "provider-a",
+                "gpt-5.6-terra",
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            )
+            .unwrap();
+        assert_eq!(
+            breakpoint.evidence_version,
+            PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION
+        );
+        assert_eq!(breakpoint.status, ProviderCacheCapabilityStatus::Unverified);
+        assert_eq!(
+            breakpoint.effect_status,
+            ProviderCacheEffectStatus::Unverified
+        );
+        assert!(!breakpoint.enabled);
+        assert!(breakpoint
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("requires re-verification")));
+
+        let options = loaded
+            .cache_capability_for_key(
+                "provider-a",
+                "gpt-5.6-terra",
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            )
+            .unwrap();
+        assert_eq!(options.status, ProviderCacheCapabilityStatus::Verified);
+        assert_eq!(options.effect_status, ProviderCacheEffectStatus::Promoted);
+        assert!(options.enabled);
+
+        loaded.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-terra",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        loaded.record_cache_capability_effect_for_key(
+            "provider-a",
+            "gpt-5.6-terra",
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            ProviderCacheEffectStatus::Promoted,
+            Some("re-verified".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        assert!(loaded.cache_capability_verified_for(
+            "provider-a",
+            "gpt-5.6-terra",
+            &Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+        ));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn provider_cache_model_key_uses_real_model_for_request_alias() {
         let provider = ProviderConfig {
             id: "agent-codex-hb".to_string(),
@@ -2701,6 +2916,68 @@ enabled = true
     }
 
     #[test]
+    fn enabled_provider_key_pool_never_falls_back_to_connection_key() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(Some(ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::RoundRobin,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            keys: vec![key_input("pool-key", Some("sk-pool"), false, 5)],
+        }));
+        input.api_key = Some("sk-connection".to_string());
+        let provider_id = config.upsert_provider(input).expect("provider should save");
+
+        let selected = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("selection should not fail");
+        assert!(
+            selected.is_none(),
+            "an enabled pool with no eligible key must not fall back to the connection key"
+        );
+
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::RoundRobin,
+                    failure_threshold: 1,
+                    recovery_minutes: 5,
+                    keys: vec![key_input("pool-key", Some("sk-pool"), true, 5)],
+                },
+            )
+            .expect("pool should update");
+        let selected = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("selection should work")
+            .expect("the enabled pool key should be used");
+        assert_eq!(selected.key_id.as_deref(), Some("pool-key"));
+        assert_eq!(selected.secret, "sk-pool");
+    }
+
+    #[test]
+    fn disabled_provider_key_pool_uses_connection_key() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(Some(ProviderKeyPoolInput {
+            enabled: false,
+            strategy: KeyLoadBalanceStrategy::RoundRobin,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            keys: vec![key_input("pool-key", Some("sk-pool"), true, 5)],
+        }));
+        input.api_key = Some("sk-connection".to_string());
+        let provider_id = config.upsert_provider(input).expect("provider should save");
+
+        let selected = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("selection should work")
+            .expect("connection key should be available");
+        assert_eq!(selected.key_id, None);
+        assert_eq!(selected.secret, "sk-connection");
+    }
+
+    #[test]
     fn provider_key_pool_prefers_affinity_key_when_available() {
         let mut config = AppConfig::default();
         let provider_id = config
@@ -2737,6 +3014,7 @@ enabled = true
             "provider-a",
             "model-a",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
 
@@ -2757,8 +3035,78 @@ enabled = true
             "provider-a",
             "model-a",
             ProviderResponseSessionReuseStatus::Unsupported,
+            false,
             Some("previous_response_id is not supported".to_string()),
         );
+        assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
+    }
+
+    #[test]
+    fn legacy_verified_response_session_record_requires_reverification_on_load() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-legacy-session-reuse-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        config.record_response_session_reuse_probe(
+            "provider-a",
+            "model-a",
+            ProviderResponseSessionReuseStatus::Verified,
+            true,
+            None,
+        );
+        config.save(&path).unwrap();
+
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(current.contains("usage_verified = true"));
+        fs::write(&path, current.replace("usage_verified = true\n", "")).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        let record = loaded
+            .provider_response_session_reuse
+            .iter()
+            .find(|item| item.provider_id == "provider-a" && item.model_id == "model-a")
+            .unwrap();
+        assert_eq!(
+            record.status,
+            ProviderResponseSessionReuseStatus::Unverified
+        );
+        assert!(!record.enabled);
+        assert!(!record.usage_verified);
+        assert!(record
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("must be run again")));
+        assert!(!loaded.response_session_reuse_verified_for("provider-a", "model-a"));
+
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("usage_verified = false"));
+        assert!(persisted.contains("status = \"unverified\""));
+        assert!(persisted.contains("enabled = false"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn response_session_reuse_cannot_be_reenabled_without_usage_evidence() {
+        let mut config = AppConfig::default();
+        let now = Utc::now();
+        config
+            .provider_response_session_reuse
+            .push(ProviderResponseSessionReuseConfig {
+                provider_id: "provider-a".to_string(),
+                model_id: "model-a".to_string(),
+                enabled: false,
+                status: ProviderResponseSessionReuseStatus::Verified,
+                usage_verified: false,
+                checked_at: Some(now),
+                last_error: None,
+                updated_at: now,
+            });
+
+        assert!(config
+            .set_response_session_reuse_enabled("provider-a", "model-a", true)
+            .is_err());
         assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
     }
 
@@ -2769,6 +3117,7 @@ enabled = true
             "provider-a",
             "model-a",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         let before = config
@@ -2786,6 +3135,28 @@ enabled = true
     }
 
     #[test]
+    fn response_session_reuse_snapshot_includes_usage_evidence() {
+        let mut config = AppConfig::default();
+        config.record_response_session_reuse_probe(
+            "provider-a",
+            "model-a",
+            ProviderResponseSessionReuseStatus::Verified,
+            true,
+            None,
+        );
+        let before = config
+            .response_session_reuse_record_snapshot("provider-a", "model-a")
+            .unwrap();
+
+        config.provider_response_session_reuse[0].usage_verified = false;
+
+        assert_ne!(
+            config.response_session_reuse_record_snapshot("provider-a", "model-a"),
+            Some(before)
+        );
+    }
+
+    #[test]
     fn provider_connection_change_invalidates_session_reuse_verification() {
         let mut config = AppConfig::default();
         config.upsert_provider(provider_input(None)).unwrap();
@@ -2793,6 +3164,7 @@ enabled = true
             "share",
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         config.record_cache_capability_probe(
@@ -2844,6 +3216,7 @@ enabled = true
             "share",
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));
@@ -2887,6 +3260,7 @@ enabled = true
             "share",
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));

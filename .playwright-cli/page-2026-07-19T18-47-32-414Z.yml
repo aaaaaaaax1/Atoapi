@@ -1,0 +1,128 @@
+- iframe [active] [ref=e3]:
+  - generic [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e7] [cursor=pointer]:
+            - strong [ref=f1e8]: Atoapi
+            - generic [ref=f1e9]: Graphite · v0.2.16
+        - tablist "Agent 列表" [ref=f1e10]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e268] [cursor=pointer]:
+            - generic [ref=f1e274]:
+              - generic [ref=f1e275]: Claude Code
+              - generic [ref=f1e276]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e278] [cursor=pointer]:
+            - generic [ref=f1e282]:
+              - generic [ref=f1e283]: Claude Desktop
+              - generic [ref=f1e284]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e286] [cursor=pointer]:
+            - generic [ref=f1e291]:
+              - generic [ref=f1e292]: Codex
+              - generic [ref=f1e293]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e295] [cursor=pointer]:
+            - generic [ref=f1e299]:
+              - generic [ref=f1e300]: Gemini
+              - generic [ref=f1e301]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e303] [cursor=pointer]:
+            - generic [ref=f1e308]:
+              - generic [ref=f1e309]: OpenCode
+              - generic [ref=f1e310]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e312] [cursor=pointer]:
+            - generic [ref=f1e317]:
+              - generic [ref=f1e318]: OpenClaw
+              - generic [ref=f1e319]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e321] [cursor=pointer]:
+            - generic [ref=f1e329]:
+              - generic [ref=f1e330]: Hermes
+              - generic [ref=f1e331]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e333] [cursor=pointer]:
+            - generic [ref=f1e342]:
+              - generic [ref=f1e343]: 本地代理模式
+              - generic [ref=f1e344]: 已关闭
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]:
+            - generic [ref=f1e13]: 代理运行中
+            - generic [ref=f1e14]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e15] [cursor=pointer]
+      - region [ref=f1e131]:
+        - generic [ref=f1e18]:
+          - switch "启用当前 Agent" [ref=f1e19] [cursor=pointer]
+          - generic [ref=f1e20]:
+            - heading "Claude Code" [level=1] [ref=f1e132]
+            - paragraph [ref=f1e22]: Graphite QA Provider · Responses · 模型直传
+        - generic [ref=f1e23]:
+          - generic [ref=f1e351]:
+            - generic [ref=f1e352]: Base URL
+            - code [ref=f1e353]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f1e354] [cursor=pointer]
+          - generic [ref=f1e358]:
+            - generic [ref=f1e359]: Local Key
+            - code [ref=f1e360]: ato-local-preview
+            - button "复制本地 Key" [ref=f1e361] [cursor=pointer]
+        - button "新增上游" [ref=f1e25] [cursor=pointer]
+      - main [ref=f1e28]:
+        - generic [ref=f1e29]:
+          - generic [ref=f1e30]:
+            - generic [ref=f1e31]:
+              - heading "上游路由" [level=2] [ref=f1e32]
+              - paragraph [ref=f1e33]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f1e34]:
+              - generic [ref=f1e35]: 1 个可用上游
+              - generic [ref=f1e36]: 一次入站 · 一次上游
+          - article [ref=f1e366]:
+            - generic [ref=f1e372]:
+              - generic [ref=f1e373]: Graphite QA Provider
+              - generic [ref=f1e374]: https://qa.example/v1
+            - generic [ref=f1e375]:
+              - generic [ref=f1e376]:
+                - generic [ref=f1e377]: Responses
+                - generic [ref=f1e378]: · Agent 直传
+                - generic [ref=f1e379]: · 1 Key
+              - generic [ref=f1e380]:
+                - generic [ref=f1e381]: 最近连通
+                - generic [ref=f1e382]: 未检测
+            - generic [ref=f1e383]:
+              - button "当前" [ref=f1e384] [cursor=pointer]
+              - button "测试 Graphite QA Provider 连通性" [ref=f1e387] [cursor=pointer]
+              - button "编辑 Graphite QA Provider" [ref=f1e390] [cursor=pointer]
+              - button "删除 Graphite QA Provider" [ref=f1e394] [cursor=pointer]
+      - contentinfo [ref=f1e38]:
+        - button "打开缓存统计与请求记录" [ref=f1e39] [cursor=pointer]:
+          - generic [ref=f1e41]: 缓存与记录
+          - generic [ref=f1e42]:
+            - text: 命中率
+            - strong [ref=f1e402]: 0.0%
+          - generic [ref=f1e44]: 0 成功 · 0 error
+    - dialog [ref=f1e566]:
+      - banner [ref=f1e567]:
+        - generic [ref=f1e568]:
+          - heading "设置" [level=2] [ref=f1e569]
+          - paragraph [ref=f1e570]: 全局代理与应用参数
+        - button "关闭设置" [ref=f1e571] [cursor=pointer]
+      - generic [ref=f1e575]:
+        - tablist "设置分类" [ref=f1e576]:
+          - tab "代理" [ref=f1e577] [cursor=pointer]
+          - tab "应用" [active] [selected] [ref=f1e578] [cursor=pointer]
+          - tab "数据" [ref=f1e579] [cursor=pointer]
+        - generic [ref=f1e614]:
+          - generic [ref=f1e615]:
+            - generic [ref=f1e616]: 默认通道
+            - combobox "默认通道" [ref=f1e617]:
+              - option "Auto"
+              - option "Responses"
+              - option "Chat"
+              - option "Anthropic" [selected]
+          - generic [ref=f1e618]:
+            - generic [ref=f1e619]: 统计刷新
+            - combobox "统计刷新" [ref=f1e620]:
+              - option "页面可见时 1 秒" [selected]
+              - option "5 秒"
+              - option "手动"
+          - generic [ref=f1e621]:
+            - generic [ref=f1e622]: 版本
+            - textbox "版本" [ref=f1e623]: vNext UI Prototype
+      - contentinfo [ref=f1e610]:
+        - button "取消" [ref=f1e611] [cursor=pointer]
+        - button "保存设置" [ref=f1e612] [cursor=pointer]
+    - status: 上游配置已保存并绑定到当前 Agent

@@ -1,0 +1,109 @@
+- generic [ref=f1e1]:
+  - generic [ref=f1e2]:
+    - banner [ref=f1e3]:
+      - generic [ref=f1e4]:
+        - button "打开设置" [ref=f1e5] [cursor=pointer]
+        - button "查看版本" [ref=f1e9] [cursor=pointer]:
+          - strong [ref=f1e10]: Atoapi
+          - generic [ref=f1e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=f1e12]:
+        - tab "Codex 已启用" [ref=f1e604] [cursor=pointer]:
+          - generic [ref=f1e609]:
+            - generic [ref=f1e610]: Codex
+            - generic [ref=f1e611]: 已启用
+        - tab "Claude Code 已启用" [ref=f1e613] [cursor=pointer]:
+          - generic [ref=f1e619]:
+            - generic [ref=f1e620]: Claude Code
+            - generic [ref=f1e621]: 已启用
+        - tab "Gemini 已关闭" [ref=f1e623] [cursor=pointer]:
+          - generic [ref=f1e627]:
+            - generic [ref=f1e628]: Gemini
+            - generic [ref=f1e629]: 已关闭
+        - tab "OpenCode 已启用" [ref=f1e631] [cursor=pointer]:
+          - generic [ref=f1e636]:
+            - generic [ref=f1e637]: OpenCode
+            - generic [ref=f1e638]: 已启用
+        - tab "OpenClaw 已关闭" [ref=f1e640] [cursor=pointer]:
+          - generic [ref=f1e645]:
+            - generic [ref=f1e646]: OpenClaw
+            - generic [ref=f1e647]: 已关闭
+        - tab "Proxy Mode 已启用" [selected] [ref=f1e649] [cursor=pointer]:
+          - generic [ref=f1e658]:
+            - generic [ref=f1e659]: Proxy Mode
+            - generic [ref=f1e660]: 已启用
+      - generic [ref=f1e71]:
+        - generic [ref=f1e72]:
+          - generic [ref=f1e73]: 代理运行中
+          - generic [ref=f1e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=f1e75] [cursor=pointer]
+        - button "查看版本信息" [ref=f1e81] [cursor=pointer]
+    - main [ref=f1e109]:
+      - text: · · · · · ·
+      - generic [ref=f1e788]:
+        - generic [ref=f1e789]:
+          - generic [ref=f1e790]:
+            - button "返回 Agent" [ref=f1e791] [cursor=pointer]
+            - generic [ref=f1e794]:
+              - heading "缓存统计" [level=2] [ref=f1e795]
+              - paragraph [ref=f1e796]: 成功记录与错误记录分离，详情按需展开。
+          - button "刷新" [ref=f1e797] [cursor=pointer]
+        - generic [ref=f1e803]:
+          - generic [ref=f1e804]:
+            - generic [ref=f1e805]: 历史命中率
+            - generic [ref=f1e806]: 95.8%
+          - generic [ref=f1e807]:
+            - generic [ref=f1e808]: 累计输入
+            - generic [ref=f1e809]: 1,286 万
+          - generic [ref=f1e810]:
+            - generic [ref=f1e811]: 累计命中
+            - generic [ref=f1e812]: 1,232 万
+          - generic [ref=f1e813]:
+            - generic [ref=f1e814]: 成功 / error
+            - generic [ref=f1e815]: 128 / 2
+        - tablist "缓存统计视图" [ref=f1e816]:
+          - tab "概览" [selected] [ref=f1e817] [cursor=pointer]
+          - tab "请求记录" [ref=f1e818] [cursor=pointer]
+          - tab "上游统计" [ref=f1e819] [cursor=pointer]
+        - generic [ref=f1e821]:
+          - generic [ref=f1e822]:
+            - text: Provider cache
+            - generic [ref=f1e823]:
+              - strong [ref=f1e824]: 95.8%
+              - generic [ref=f1e825]: 最近 128 次成功请求冷启动已单独分类
+            - progressbar "缓存命中率 95.8%" [ref=f1e826]
+            - generic [ref=f1e827]:
+              - generic [ref=f1e828]:
+                - generic [ref=f1e829]: 缺口
+                - generic [ref=f1e830]: 5.4 万
+              - generic [ref=f1e831]:
+                - generic [ref=f1e832]: 可避免
+                - generic [ref=f1e833]: "768"
+              - generic [ref=f1e834]:
+                - generic [ref=f1e835]: 新尾部
+                - generic [ref=f1e836]: 1,536
+          - generic [ref=f1e837]:
+            - text: Policy
+            - generic [ref=f1e838]:
+              - generic [ref=f1e839]:
+                - generic [ref=f1e840]:
+                  - generic [ref=f1e841]: 智能缓存
+                  - generic [ref=f1e842]: 前缀稳定与真实 usage 统计
+                - switch "智能缓存" [checked] [ref=f1e843] [cursor=pointer]
+              - generic [ref=f1e844]:
+                - generic [ref=f1e845]:
+                  - generic [ref=f1e846]: 计入冷启动
+                  - generic [ref=f1e847]: 仅影响当前统计视图
+                - switch "计入冷启动" [ref=f1e848] [cursor=pointer]
+              - generic [ref=f1e849]:
+                - generic [ref=f1e850]:
+                  - generic [ref=f1e851]: 提示详细错误
+                  - generic [ref=f1e852]: 主列表保持简洁，详情抽屉保留原文
+                - switch "提示详细错误" [checked] [ref=f1e853] [cursor=pointer]
+    - contentinfo [ref=f1e217]:
+      - button "关闭缓存统计与请求记录" [active] [pressed] [ref=f1e854] [cursor=pointer]:
+        - generic [ref=f1e223]: 缓存与记录
+        - generic [ref=f1e224]:
+          - text: 命中率
+          - strong [ref=f1e225]: 95.8%
+        - generic [ref=f1e226]: 128 成功 · 2 error
+  - status

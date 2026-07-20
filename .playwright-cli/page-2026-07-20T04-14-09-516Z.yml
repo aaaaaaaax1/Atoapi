@@ -1,0 +1,76 @@
+- iframe [active] [ref=f12e3]:
+  - generic [ref=f13e1]:
+    - generic [ref=f13e2]:
+      - banner [ref=f13e3]:
+        - button "打开设置" [ref=f13e5] [cursor=pointer]
+        - tablist "Agent 列表" [ref=f13e9]:
+          - tab "Codex" [selected] [ref=f13e110] [cursor=pointer]
+      - main [ref=f13e89]:
+        - text: · ·
+        - generic [ref=f13e161]:
+          - generic [ref=f13e162]:
+            - generic [ref=f13e163]:
+              - button "返回 Agent" [ref=f13e164] [cursor=pointer]
+              - generic [ref=f13e167]:
+                - heading "缓存统计" [level=2] [ref=f13e168]
+                - paragraph [ref=f13e169]: 成功记录与错误记录分离，详情按需展开。
+            - button "刷新" [ref=f13e170] [cursor=pointer]
+          - generic [ref=f13e176]:
+            - generic [ref=f13e177]:
+              - generic [ref=f13e178]: sheapi 命中率
+              - generic [ref=f13e179]: 94.2%
+            - generic [ref=f13e180]:
+              - generic [ref=f13e181]: 累计输入
+              - generic [ref=f13e182]: 291k
+            - generic [ref=f13e183]:
+              - generic [ref=f13e184]: 累计命中
+              - generic [ref=f13e185]: 274k
+            - generic [ref=f13e186]:
+              - generic [ref=f13e187]: 成功请求
+              - generic [ref=f13e188]: "2"
+          - tablist "缓存统计视图" [ref=f13e189]:
+            - tab "概览" [selected] [ref=f13e190] [cursor=pointer]
+            - tab "请求记录" [ref=f13e191] [cursor=pointer]
+            - tab "上游统计" [ref=f13e192] [cursor=pointer]
+          - generic [ref=f13e194]:
+            - generic [ref=f13e195]:
+              - text: Provider cache
+              - generic [ref=f13e196]:
+                - strong [ref=f13e197]: 94.2%
+                - generic [ref=f13e198]: sheapi · 2 条成功记录
+              - progressbar "缓存命中率 94.2%" [ref=f13e199]
+              - generic [ref=f13e200]:
+                - generic [ref=f13e201]:
+                  - generic [ref=f13e202]: 缺口
+                  - generic [ref=f13e203]: 61k
+                - generic [ref=f13e204]:
+                  - generic [ref=f13e205]: 可避免
+                  - generic [ref=f13e206]: "320"
+                - generic [ref=f13e207]:
+                  - generic [ref=f13e208]: 新尾部
+                  - generic [ref=f13e209]: 34k
+            - generic [ref=f13e210]:
+              - text: Policy
+              - generic [ref=f13e211]:
+                - generic [ref=f13e212]:
+                  - generic [ref=f13e213]:
+                    - generic [ref=f13e214]: 智能缓存
+                    - generic [ref=f13e215]: 前缀稳定与真实 usage 统计
+                  - switch "智能缓存" [checked] [ref=f13e216] [cursor=pointer]
+                - generic [ref=f13e217]:
+                  - generic [ref=f13e218]:
+                    - generic [ref=f13e219]: 计入冷启动
+                    - generic [ref=f13e220]: 仅影响当前统计视图
+                  - switch "计入冷启动" [checked] [ref=f13e221] [cursor=pointer]
+                - generic [ref=f13e222]:
+                  - generic [ref=f13e223]:
+                    - generic [ref=f13e224]: 提示详细错误
+                    - generic [ref=f13e225]: 主列表保持简洁，详情抽屉保留原文
+                  - switch "提示详细错误" [ref=f13e226] [cursor=pointer]
+      - contentinfo [ref=f13e98]:
+        - button "关闭缓存统计与请求记录" [active] [pressed] [ref=f13e227] [cursor=pointer]:
+          - generic [ref=f13e104]: 缓存与记录
+          - generic [ref=f13e105]:
+            - text: 命中率
+            - strong [ref=f13e160]: 94.2%
+    - status

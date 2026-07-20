@@ -1166,6 +1166,7 @@ pub(super) fn compute_shadow_affinity(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply_static_cohort_canary(
     decision: &mut ShadowAffinityDecision,
     smart_hit_enabled: bool,

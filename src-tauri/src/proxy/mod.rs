@@ -13,7 +13,9 @@ use crate::{
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
-        AgentInboundStart, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
+        AgentInboundStart, AgentOwnerFailureSettlement, AgentTerminalSettlement,
+        MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
+        ResponsesWirePrefixFingerprints, UsageRecord,
     },
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
 };
@@ -43,7 +45,7 @@ use std::{
     time::Instant,
 };
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, OwnedSemaphorePermit, Semaphore},
     time::{sleep, Duration as TokioDuration},
 };
 use uuid::Uuid;
@@ -56,20 +58,36 @@ pub(crate) mod cache_validation;
 mod codex_chat_common;
 mod json_canonical;
 mod prefix_control;
+mod prepared_wire_request;
+mod request_plan;
 mod responses_stream;
 mod responses_websocket_probe;
 mod session_identity;
 mod sse;
+mod streaming_chat_anthropic;
+mod streaming_codex_anthropic;
 mod streaming_codex_chat;
+mod streaming_responses_anthropic;
+mod streaming_responses_chat;
 mod transform_codex_chat;
 mod transport;
-use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken, ReasoningEvidence};
+use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken};
 use cache_affinity::{ShadowAffinityDecision, ShadowObservationInput};
+pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
 use prefix_control::{
     PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
-    ProviderCacheGapBreakdown,
+    ProviderCacheGapBreakdown, MIN_CLEAN_TINY_RECOVERY_STREAK,
 };
+#[cfg(test)]
+use prepared_wire_request::{
+    draft_member_encoding_count, reset_draft_member_encodings, PreparedWireRequest,
+    RESPONSES_WIRE_ORDERED_KEYS,
+};
+use prepared_wire_request::{
+    serialize_responses_body_bytes_for_provider_prefix, PreparedWireDraft,
+};
+use request_plan::{OneShotRequestPlan, RequestPlan};
 use responses_stream::{
     evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
     StreamEnd, TerminalCompatibility, TerminalFailure,
@@ -91,13 +109,17 @@ const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
+const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
+const STREAM_RELAY_BYTE_BUDGET: usize = 2 * 1024 * 1024;
+const STREAM_CACHE_CAPTURE_BYTE_LIMIT: usize = STREAM_RELAY_BYTE_BUDGET;
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
 const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
+const PROVIDER_CACHE_MIN_BUCKET_TOKENS: u64 = 128;
 const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
 const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
 
@@ -113,8 +135,56 @@ struct RouteDecision {
     upstream_channel: Channel,
     model: String,
 }
+
+struct RelayBodyChunk {
+    bytes: Bytes,
+    permit: OwnedSemaphorePermit,
+}
+
+struct BoundedCacheCapture {
+    body: Vec<u8>,
+    complete: bool,
+}
+
+impl BoundedCacheCapture {
+    fn new(enabled: bool) -> Self {
+        Self {
+            body: Vec::new(),
+            complete: enabled,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if !self.complete {
+            return;
+        }
+        if self.body.len().saturating_add(bytes.len()) > STREAM_CACHE_CAPTURE_BYTE_LIMIT {
+            self.body = Vec::new();
+            self.complete = false;
+            return;
+        }
+        self.body.extend_from_slice(bytes);
+    }
+
+    fn finish(self) -> Option<Vec<u8>> {
+        self.complete.then_some(self.body)
+    }
+}
+
+fn relay_chunk_parts(chunk: &Bytes) -> impl Iterator<Item = Bytes> + '_ {
+    (0..chunk.len())
+        .step_by(STREAM_RELAY_BYTE_BUDGET)
+        .map(move |start| {
+            let end = start
+                .saturating_add(STREAM_RELAY_BYTE_BUDGET)
+                .min(chunk.len());
+            chunk.slice(start..end)
+        })
+}
+
 #[derive(Debug, Clone, Default)]
 struct BodyDiagnostics {
+    inbound_body_bytes: u64,
     original_body_bytes: u64,
     send_body_bytes: u64,
     send_body_is_delta: bool,
@@ -122,6 +192,7 @@ struct BodyDiagnostics {
     payload_too_large_rescue_used: bool,
     compaction_trigger_requested: bool,
     trusted_codex_compaction_requested: bool,
+    chat_stream_include_usage: bool,
     reasoning: ReasoningEffortDiagnostics,
 }
 #[derive(Debug, Clone, Default)]
@@ -130,7 +201,6 @@ struct ReasoningEffortDiagnostics {
     configured: Option<String>,
     effective: Option<String>,
     source: Option<String>,
-    catalog_supported: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -163,6 +233,8 @@ struct UpstreamRequestDiagnostics {
     gzip_skipped_cold_stream: bool,
     sent_body_bytes: u64,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
+    sent_cache_capability_fields: Vec<ProviderCacheCapabilityField>,
+    cache_capability_key_id: Option<String>,
 }
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
@@ -192,6 +264,12 @@ impl UpstreamRequestDiagnostics {
         self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
         self.sent_body_bytes = next.sent_body_bytes;
         self.outbound_prefix_fingerprints = next.outbound_prefix_fingerprints.clone();
+        if !next.sent_cache_capability_fields.is_empty() {
+            self.sent_cache_capability_fields = next.sent_cache_capability_fields.clone();
+        }
+        if next.cache_capability_key_id.is_some() {
+            self.cache_capability_key_id = next.cache_capability_key_id.clone();
+        }
     }
 }
 struct UpstreamSendOutcome {
@@ -204,6 +282,41 @@ struct AgentAttemptDispatch {
     token: AttemptToken,
     provider: String,
     model: String,
+}
+
+/// The strict normal data-plane seam. Both the transport and its frozen plan
+/// are consumed by `dispatch`, so callers cannot reuse the same plan for a
+/// second upstream POST. Legacy retry behavior stays outside this interface
+/// until each compatibility path is migrated explicitly.
+struct OneShotTransport<'a> {
+    state: &'a AppState,
+    api_key: &'a str,
+    inbound_headers: &'a HeaderMap,
+}
+
+impl<'a> OneShotTransport<'a> {
+    fn new(state: &'a AppState, api_key: &'a str, inbound_headers: &'a HeaderMap) -> Self {
+        Self {
+            state,
+            api_key,
+            inbound_headers,
+        }
+    }
+
+    async fn dispatch(
+        self,
+        plan: OneShotRequestPlan,
+        agent_attempt: Option<AgentAttemptDispatch>,
+    ) -> Result<UpstreamSendOutcome> {
+        dispatch_prepared_one_shot_with_diagnostics(
+            self.state,
+            self.api_key,
+            plan,
+            self.inbound_headers,
+            agent_attempt,
+        )
+        .await
+    }
 }
 struct UpstreamBodyReadOutcome {
     bytes: Vec<u8>,
@@ -319,11 +432,6 @@ struct SessionAnchorDiagnostics {
 struct ResponseSessionReuseOutcome {
     body: Value,
     diagnostics: ResponseSessionReuseDiagnostics,
-}
-#[derive(Debug, Clone)]
-struct PreviousResponseCompatBody {
-    body: Value,
-    reason: &'static str,
 }
 #[derive(Debug, Clone, Default)]
 struct ResponseSessionReuseDiagnostics {
@@ -662,6 +770,77 @@ async fn handle_responses_compact_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
+    let inbound_body_bytes = body.len() as u64;
+
+    if is_agent_generation_request(authorized_agent.as_deref()) {
+        let owner_state = state.clone();
+        let dispatch_request_id = request_id.clone();
+        let dispatch_agent_id = authorized_agent.clone();
+        let owner = move |response_handoff| async move {
+            let mut settlement_guard = AgentOwnerSettlementGuard::new(
+                owner_state.metrics.clone(),
+                request_id.clone(),
+                started,
+                Channel::Responses,
+                authorized_agent.clone(),
+            );
+            let response = run_responses_compact_for_authorized_agent(
+                owner_state,
+                headers,
+                body,
+                response_id,
+                forced_agent_id,
+                authorized_agent,
+                started,
+                request_id,
+                inbound_body_bytes,
+                Some(response_handoff),
+            )
+            .await;
+            settlement_guard.disarm();
+            response
+        };
+        return dispatch_agent_generation_owner(
+            state.metrics.clone(),
+            state.relay_tasks.clone(),
+            dispatch_request_id,
+            started,
+            Channel::Responses,
+            dispatch_agent_id,
+            owner,
+        )
+        .await;
+    }
+
+    run_responses_compact_for_authorized_agent(
+        state,
+        headers,
+        body,
+        response_id,
+        forced_agent_id,
+        authorized_agent,
+        started,
+        request_id,
+        inbound_body_bytes,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_responses_compact_for_authorized_agent(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    response_id: Option<String>,
+    forced_agent_id: Option<&'static str>,
+    authorized_agent: Option<String>,
+    started: Instant,
+    request_id: String,
+    inbound_body_bytes: u64,
+    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
+) -> Response {
+    let agent_compact = is_agent_generation_request(authorized_agent.as_deref());
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
@@ -686,7 +865,7 @@ async fn handle_responses_compact_for_agent(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
     let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
-    let mut selected_provider_key =
+    let selected_provider_key =
         match select_provider_api_key(&state, &decision.provider.id, None, None).await {
             Ok(selected) => selected,
             Err(err) if err.to_string().contains("not configured") => {
@@ -702,7 +881,7 @@ async fn handle_responses_compact_for_agent(
                 )
             }
         };
-    let mut api_key = selected_provider_key.secret.clone();
+    let api_key = selected_provider_key.secret.clone();
     if api_key.trim().is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -774,18 +953,33 @@ async fn handle_responses_compact_for_agent(
             &tail_input_diagnostics,
             serialized_body_len(&decision.upstream_channel, &upstream_body),
         );
-    let compact_url = response_id
+    let requested_compact_url = response_id
         .as_deref()
         .map(|id| responses_compact_url(&decision.provider.base_url, id));
-    let mut active_request_channel = if compact_url.is_none() && compact_chat_compat {
+    let official_compact_cooled_down = requested_compact_url.is_some()
+        && compact_endpoint_cooldown_active(&state, &compact_chat_compat_cooldown_key).await;
+    let compact_url = if official_compact_cooled_down {
+        None
+    } else {
+        requested_compact_url
+    };
+    let initial_chat_compat = compact_url.is_none()
+        && !compact_chat_compat_cooldown_active
+        && (compact_chat_compat
+            || should_fallback_official_responses_compact_via_chat_compat(
+                &decision.upstream_channel,
+                &tail_input_diagnostics,
+                serialized_body_len(&decision.upstream_channel, &upstream_body),
+            ));
+    let active_request_channel = if initial_chat_compat {
         Channel::Chat
     } else {
         decision.upstream_channel.clone()
     };
-    let mut active_url = compact_url
+    let active_url = compact_url
         .clone()
         .unwrap_or_else(|| upstream_url(&decision.provider.base_url, &active_request_channel));
-    let mut active_upstream_body = if compact_url.is_none() && compact_chat_compat {
+    let mut active_upstream_body = if initial_chat_compat || official_compact_cooled_down {
         build_active_upstream_body_for_compat(
             &upstream_body,
             &upstream_body,
@@ -797,266 +991,180 @@ async fn handle_responses_compact_for_agent(
     } else {
         compact_request_body_for_official_endpoint(&upstream_body)
     };
-    let mut compact_chat_fast_json = compact_chat_compat
+    let compact_chat_fast_json = initial_chat_compat
         && matches!(active_request_channel, Channel::Chat)
-        && should_use_chat_non_stream_compact_fast_path(
-            &tail_input_diagnostics,
-            serialized_body_len(&active_request_channel, &active_upstream_body),
-        );
+        && should_use_chat_non_stream_compact_fast_path();
     if compact_chat_fast_json {
         set_stream_flag(&mut active_upstream_body, false);
     }
-    let send_outcome = match send_upstream_request_to_url_with_diagnostics(
-        &state,
-        decision.provider.use_system_proxy,
-        &active_url,
-        &api_key,
-        &active_request_channel,
+    let mut request_plan = Some(RequestPlan::new(
+        &decision.provider,
+        active_url.clone(),
+        active_request_channel.clone(),
         &active_upstream_body,
-        &headers,
-        decision.provider.custom_user_agent.as_deref(),
-        None,
-        decision.provider.request_body_gzip_enabled,
-        None,
-    )
-    .await
-    {
+    ));
+    let mut compact_metric_errors = Vec::<(String, String)>::new();
+    let compact_prefix_guard_wait = PrefixGuardWaitDiagnostics::default();
+    let compact_response_session_reuse = ResponseSessionReuseDiagnostics::default();
+    let mut active_agent_attempt_id = None;
+    let initial_send = if agent_compact {
+        let mut gate = AttemptGate::new(request_id.clone(), AttemptPolicy::Single)
+            .expect("a generated request id must be valid for the compact attempt gate");
+        let began = state
+            .metrics
+            .begin_agent_inbound(AgentInboundStart {
+                inbound_request_id: request_id.clone(),
+                at: Utc::now(),
+                attempt_policy: agent_attempt_policy_label(gate.policy()).to_string(),
+                attempt_budget: gate.budget() as u64,
+            })
+            .await;
+        assert!(
+            began,
+            "a fresh Agent compact inbound id must begin exactly once"
+        );
+        let token = gate
+            .primary()
+            .expect("a fresh Agent compact attempt gate must issue its primary token");
+        active_agent_attempt_id = Some(token.attempt_id().to_string());
+        send_agent_upstream_request(
+            &state,
+            &api_key,
+            request_plan
+                .take()
+                .expect("the compact Agent plan must be available for its one-shot dispatch")
+                .into_one_shot(),
+            &headers,
+            &decision,
+            token,
+        )
+        .await
+    } else {
+        send_main_upstream_request(
+            &state,
+            &api_key,
+            request_plan
+                .take()
+                .expect("the non-Agent compact plan must be available for one-shot dispatch")
+                .into_one_shot(),
+            &headers,
+        )
+        .await
+    };
+    let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
-            state
-                .metrics
-                .record_error("upstream_transport", &err.to_string())
+            let mut failure_diagnostics = body_diagnostics(
+                &decision.upstream_channel,
+                &upstream_body,
+                &active_upstream_body,
+                false,
+            );
+            failure_diagnostics.reasoning = reasoning_diagnostics.clone();
+            if agent_compact {
+                let mut log = upstream_transport_failure_log(
+                    &request_id,
+                    &started,
+                    &Channel::Responses,
+                    &active_request_channel,
+                    &decision,
+                    None,
+                    None,
+                    None,
+                    &compact_prefix_guard_wait,
+                    0,
+                    &failure_diagnostics,
+                    &active_upstream_body,
+                    false,
+                    &compact_response_session_reuse,
+                    requested_model_for_log.clone(),
+                    "compact-transport",
+                );
+                log.agent_id = authorized_agent.clone();
+                log.agent_label = authorized_agent.clone();
+                log.inbound_body_bytes = Some(inbound_body_bytes);
+                let mut errors = compact_metric_errors.clone();
+                errors.push(("upstream_transport".to_string(), err.to_string()));
+                finalize_agent_generation(
+                    &state,
+                    &request_id,
+                    active_agent_attempt_id.take(),
+                    log,
+                    AgentAttemptOutcome::TransportError,
+                    AgentInboundOutcome::TransportError,
+                    None,
+                    Some("upstream_transport".to_string()),
+                    "transport_error",
+                    None,
+                    None,
+                    errors,
+                    None,
+                    None,
+                )
                 .await;
+            } else {
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &Channel::Responses,
+                    &active_request_channel,
+                    &decision,
+                    None,
+                    None,
+                    None,
+                    &compact_prefix_guard_wait,
+                    0,
+                    &failure_diagnostics,
+                    &active_upstream_body,
+                    false,
+                    &compact_response_session_reuse,
+                    requested_model_for_log.clone(),
+                    authorized_agent.as_deref(),
+                    "compact-transport",
+                    1,
+                    &compact_metric_errors,
+                    "upstream_transport",
+                    &err.to_string(),
+                )
+                .await;
+            }
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream compact request failed: {err}"),
             );
         }
     };
-    let mut upstream_request_diagnostics = send_outcome.diagnostics;
-    let mut upstream = send_outcome.response;
-    let mut upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+    let upstream_request_diagnostics = send_outcome.diagnostics;
+    let upstream = send_outcome.response;
+    let upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
 
-    let mut status = upstream.status().as_u16();
-    let mut content_type = upstream
+    let status = upstream.status().as_u16();
+    let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let mut used_fallback = false;
-
-    if let Some(next_key) = try_retry_with_next_provider_key(
-        &state,
-        &decision.provider.id,
-        &selected_provider_key,
-        status,
-        None,
-    )
-    .await
-    {
-        state.metrics.record_retry().await;
-        selected_provider_key = next_key;
-        api_key = selected_provider_key.secret.clone();
-        let send_outcome = match send_upstream_request_to_url_with_diagnostics(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            None,
-            decision.provider.request_body_gzip_enabled,
-            None,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream compact request failed after key failover: {err}"),
-                );
-            }
-        };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-    }
-
+    let used_fallback = official_compact_cooled_down;
+    // Compact requests share the data-plane one-shot contract: endpoint and
+    // protocol rejections update compatibility state for the next request,
+    // never trigger a second upstream POST for this one.
     if compact_url.is_some() && should_fallback_compact_to_responses(status) {
-        let fallback_bytes = upstream.bytes().await.ok().map(|bytes| bytes.to_vec());
-        if let Some(bytes) = fallback_bytes.as_deref() {
-            let summary = upstream_error_summary(bytes);
-            state
-                .metrics
-                .record_error("upstream_compact_unsupported", &summary)
-                .await;
-        }
-        state.metrics.record_retry().await;
-        let fallback_chat_compat = !compact_chat_compat_cooldown_active
-            && (compact_chat_compat
-                || should_fallback_official_responses_compact_via_chat_compat(
-                    &decision.upstream_channel,
-                    &tail_input_diagnostics,
-                    serialized_body_len(&decision.upstream_channel, &upstream_body),
-                ));
-        active_request_channel = if fallback_chat_compat {
-            Channel::Chat
-        } else {
-            decision.upstream_channel.clone()
-        };
-        active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
-        active_upstream_body = build_active_upstream_body_for_compat(
-            &upstream_body,
-            &upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            false,
-        );
-        compact_chat_fast_json = fallback_chat_compat
-            && matches!(active_request_channel, Channel::Chat)
-            && should_use_chat_non_stream_compact_fast_path(
-                &tail_input_diagnostics,
-                serialized_body_len(&active_request_channel, &active_upstream_body),
-            );
-        if compact_chat_fast_json {
-            set_stream_flag(&mut active_upstream_body, false);
-        }
-        let send_outcome = match send_upstream_request_to_url_with_diagnostics(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            None,
-            decision.provider.request_body_gzip_enabled,
-            None,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream compact fallback failed: {err}"),
-                );
-            }
-        };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        used_fallback = true;
+        note_compact_endpoint_cooldown(&state, &compact_chat_compat_cooldown_key).await;
     }
 
-    if should_fallback_chat_compat_compact_to_responses(
+    // The unified terminal settlement records key health after the original
+    // compact response; a healthy key is selected only on the next inbound.
+
+    let chat_compat_rejected = should_fallback_chat_compat_compact_to_responses(
         status,
         true,
         matches!(active_request_channel, Channel::Chat),
-    ) {
-        let chat_error_body = match read_upstream_body_with_diagnostics(
-            upstream,
-            &content_type,
-            started,
-            upstream_response_headers_at_ms,
-        )
-        .await
-        {
-            Ok(outcome) => outcome.bytes,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_chat_compat_body", &err.to_string())
-                    .await;
-                Vec::new()
-            }
-        };
-        let error_summary = upstream_error_summary(&chat_error_body);
-        state
-            .metrics
-            .record_error(upstream_error_scope(status, &error_summary), &error_summary)
-            .await;
+    );
+    if chat_compat_rejected {
         note_compact_chat_compat_cooldown(&state, &compact_chat_compat_cooldown_key).await;
-        state.metrics.record_retry().await;
-
-        active_request_channel = decision.upstream_channel.clone();
-        active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
-        active_upstream_body = build_active_upstream_body_for_compat(
-            &upstream_body,
-            &upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            false,
-        );
-        let send_outcome = match send_upstream_request_to_url_with_diagnostics(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            None,
-            decision.provider.request_body_gzip_enabled,
-            None,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream compact fallback failed: {err}"),
-                );
-            }
-        };
-        upstream_request_diagnostics.absorb(&send_outcome.diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        used_fallback = true;
     }
-
     let is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
@@ -1070,10 +1178,84 @@ async fn handle_responses_compact_for_agent(
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            state
-                .metrics
-                .record_error("upstream_body", &err.to_string())
+            let mut failure_diagnostics = body_diagnostics(
+                &decision.upstream_channel,
+                &upstream_body,
+                &active_upstream_body,
+                false,
+            );
+            failure_diagnostics.reasoning = reasoning_diagnostics.clone();
+            if agent_compact {
+                let mut log = upstream_transport_failure_log(
+                    &request_id,
+                    &started,
+                    &Channel::Responses,
+                    &active_request_channel,
+                    &decision,
+                    None,
+                    None,
+                    None,
+                    &compact_prefix_guard_wait,
+                    0,
+                    &failure_diagnostics,
+                    &active_upstream_body,
+                    false,
+                    &compact_response_session_reuse,
+                    requested_model_for_log.clone(),
+                    "compact-body",
+                );
+                log.status = status;
+                log.agent_id = authorized_agent.clone();
+                log.agent_label = authorized_agent.clone();
+                log.inbound_body_bytes = Some(inbound_body_bytes);
+                log.upstream_attempt_total = Some(upstream_request_diagnostics.attempts.max(1));
+                log.upstream_attempts = Some(upstream_request_diagnostics.attempts.max(1));
+                let mut errors = compact_metric_errors.clone();
+                errors.push(("upstream_body".to_string(), err.to_string()));
+                finalize_agent_generation(
+                    &state,
+                    &request_id,
+                    active_agent_attempt_id.take(),
+                    log,
+                    AgentAttemptOutcome::StreamError,
+                    AgentInboundOutcome::StreamError,
+                    Some(status),
+                    Some("upstream_body".to_string()),
+                    "body_read_error",
+                    None,
+                    None,
+                    errors,
+                    None,
+                    Some(&upstream_request_diagnostics),
+                )
                 .await;
+            } else {
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &Channel::Responses,
+                    &active_request_channel,
+                    &decision,
+                    None,
+                    None,
+                    None,
+                    &compact_prefix_guard_wait,
+                    0,
+                    &failure_diagnostics,
+                    &active_upstream_body,
+                    false,
+                    &compact_response_session_reuse,
+                    requested_model_for_log.clone(),
+                    authorized_agent.as_deref(),
+                    "compact-body",
+                    upstream_request_diagnostics.attempts.max(1),
+                    &compact_metric_errors,
+                    "upstream_body",
+                    &err.to_string(),
+                )
+                .await;
+            }
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("failed to read upstream compact body: {err}"),
@@ -1100,19 +1282,7 @@ async fn handle_responses_compact_for_agent(
     ));
     let prefix_state_key_for_metrics: Option<&str> = None;
     let usage_record = if compact_success_for_cache {
-        let usage = collect_provider_usage_for_diagnostics(&bytes, &decision);
-        if let Some(record) = usage.as_ref() {
-            state
-                .metrics
-                .record_usage_with_cold_start_key(
-                    record.clone(),
-                    response_session_key
-                        .as_deref()
-                        .or(session_anchor_diagnostics.hash.as_deref()),
-                )
-                .await;
-        }
-        usage
+        collect_provider_usage_for_diagnostics(&bytes, &decision)
     } else {
         None
     };
@@ -1138,15 +1308,61 @@ async fn handle_responses_compact_for_agent(
                 let mut shadow_affinity = state.shadow_affinity.lock().await;
                 cache_affinity::reset_anchor(&mut shadow_affinity, conversation_id, Utc::now());
                 drop(shadow_affinity);
-                if let Err(err) = state.persist_runtime_state().await {
-                    state
-                        .metrics
-                        .record_error("shadow_affinity_state_save", &err.to_string())
-                        .await;
-                }
+                state.journal_runtime_state();
             }
         }
     }
+
+    let bytes_for_client = if is_text_event_stream(&content_type) {
+        match active_request_channel {
+            Channel::Chat => chat_sse_to_non_stream_json(&bytes, &decision.model),
+            Channel::Anthropic => {
+                let context = streaming_codex_anthropic::AnthropicResponsesContext {
+                    tool_context: transform_codex_chat::CodexToolContext::default(),
+                };
+                streaming_codex_anthropic::anthropic_sse_to_responses_json(
+                    &bytes,
+                    context,
+                    decision.model.clone(),
+                )
+                .unwrap_or_else(|error| {
+                    serde_json::to_vec(&json!({
+                        "error": {
+                            "message": format!("failed to convert Anthropic SSE response: {error}"),
+                            "type": "atoapi_anthropic_sse_conversion_error"
+                        }
+                    }))
+                    .unwrap_or_else(|_| bytes.clone())
+                })
+            }
+            _ => responses_sse_to_non_stream_json(
+                &bytes,
+                &decision.model,
+                non_sse_compact_compat_for_decision(&config, &decision),
+            ),
+        }
+    } else {
+        bytes.clone()
+    };
+    let response_bytes = transform_response_bytes(
+        &Channel::Responses,
+        &active_request_channel,
+        &decision.model,
+        &bytes_for_client,
+    );
+    let response_bytes = maybe_normalize_responses_json_for_client(
+        &response_bytes,
+        non_sse_compact_compat_for_decision(&config, &decision),
+    );
+    let response_ready_ms = started.elapsed().as_millis() as u64;
+    let response = raw_response(status, "application/json", response_bytes);
+    let response_for_return = if let Some(handoff) = response_handoff {
+        let _ = handoff.send(response);
+        None
+    } else {
+        Some(response)
+    };
+
     let gap_breakdown = provider_cache_gap_breakdown(
         &state,
         prefix_state_key_for_metrics,
@@ -1166,10 +1382,10 @@ async fn handle_responses_compact_for_agent(
     .await;
     if !compact_success_for_cache {
         let error_summary = upstream_error_summary(&bytes);
-        state
-            .metrics
-            .record_error(upstream_error_scope(status, &error_summary), &error_summary)
-            .await;
+        compact_metric_errors.push((
+            upstream_error_scope(status, &error_summary).to_string(),
+            error_summary,
+        ));
     }
 
     let elapsed = started.elapsed().as_millis() as u64;
@@ -1177,12 +1393,15 @@ async fn handle_responses_compact_for_agent(
         id: request_id.clone(),
         at: Utc::now(),
         inbound_request_id: Some(request_id.clone()),
-        upstream_request_id: Some(Uuid::new_v4().to_string()),
+        upstream_request_id: active_agent_attempt_id
+            .clone()
+            .or_else(|| Some(Uuid::new_v4().to_string())),
         upstream_attempt_index: Some(1),
         upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
         client_channel: "responses".to_string(),
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
+        provider_id: Some(decision.provider.id.clone()),
         model: decision.model.clone(),
         requested_model: requested_model_for_log.clone(),
         agent_reasoning_effort: reasoning_diagnostics.agent.clone(),
@@ -1203,7 +1422,7 @@ async fn handle_responses_compact_for_agent(
         upstream_call_source: Some(
             if used_fallback && matches!(active_request_channel, Channel::Chat) {
                 "compact-fallback-chat-compat"
-            } else if compact_chat_compat {
+            } else if initial_chat_compat {
                 "compact-chat-compat"
             } else if used_fallback {
                 "compact-fallback"
@@ -1245,8 +1464,8 @@ async fn handle_responses_compact_for_agent(
         prefix_seen_bucket_tokens: None,
         prefix_state_cache_read_tokens: None,
         status,
-        ttft_ms: elapsed,
-        upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, None)),
+        ttft_ms: response_ready_ms,
+        upstream_ttft_ms: Some(upstream_ttft_ms(response_ready_ms, None)),
         local_prepare_ms: None,
         upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
         upstream_last_attempt_headers_ms: Some(
@@ -1315,6 +1534,7 @@ async fn handle_responses_compact_for_agent(
         session_anchor_source: None,
         session_anchor_changed: None,
         session_anchor_peer_count: None,
+        inbound_body_bytes: Some(inbound_body_bytes),
         original_body_bytes: Some(serialized_body_len(
             &decision.upstream_channel,
             &upstream_body,
@@ -1336,31 +1556,60 @@ async fn handle_responses_compact_for_agent(
     apply_prefix_lag_diagnostics(&mut request_log, prefix_lag);
     apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
     apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
-    state.metrics.record_upstream_observation(request_log).await;
-
-    let bytes_for_client = if is_text_event_stream(&content_type) {
-        match active_request_channel {
-            Channel::Chat => chat_sse_to_non_stream_json(&bytes, &decision.model),
-            _ => responses_sse_to_non_stream_json(
-                &bytes,
-                &decision.model,
-                non_sse_compact_compat_for_decision(&config, &decision),
-            ),
-        }
+    if agent_compact {
+        let (attempt_outcome, inbound_outcome, error_scope, terminal_state) =
+            if compact_success_for_cache {
+                (
+                    AgentAttemptOutcome::HttpSuccess,
+                    AgentInboundOutcome::Success,
+                    None,
+                    "response_completed",
+                )
+            } else {
+                let summary = upstream_error_summary(&bytes);
+                (
+                    AgentAttemptOutcome::HttpError,
+                    AgentInboundOutcome::HttpError,
+                    Some(upstream_error_scope(status, &summary).to_string()),
+                    "http_error",
+                )
+            };
+        finalize_agent_generation(
+            &state,
+            &request_id,
+            active_agent_attempt_id.take(),
+            request_log,
+            attempt_outcome,
+            inbound_outcome,
+            Some(status),
+            error_scope,
+            terminal_state,
+            usage_record,
+            response_session_key
+                .clone()
+                .or(session_anchor_diagnostics.hash.clone()),
+            compact_metric_errors,
+            None,
+            Some(&upstream_request_diagnostics),
+        )
+        .await;
     } else {
-        bytes.clone()
-    };
-    let response_bytes = transform_response_bytes(
-        &Channel::Responses,
-        &active_request_channel,
-        &decision.model,
-        &bytes_for_client,
-    );
-    let response_bytes = maybe_normalize_responses_json_for_client(
-        &response_bytes,
-        non_sse_compact_compat_for_decision(&config, &decision),
-    );
-    raw_response(status, "application/json", response_bytes)
+        let mut transaction = MetricsTransaction::upstream(request_log);
+        if let Some(usage_record) = usage_record {
+            transaction.observe_usage(
+                usage_record,
+                response_session_key
+                    .as_deref()
+                    .or(session_anchor_diagnostics.hash.as_deref()),
+            );
+        }
+        for (scope, message) in compact_metric_errors {
+            transaction.observe_error(scope, message);
+        }
+        state.metrics.commit(transaction).await;
+    }
+
+    response_for_return.unwrap_or_else(|| Response::new(Body::empty()))
 }
 
 async fn handle_generation(
@@ -1389,8 +1638,19 @@ async fn handle_generation_for_agent(
 
     if is_agent_generation_request(authorized_agent.as_deref()) {
         let owner_state = state.clone();
-        let owner = async move {
-            run_generation_for_authorized_agent(
+        let dispatch_request_id = request_id.clone();
+        let dispatch_client_channel = client_channel.clone();
+        let dispatch_agent_id = authorized_agent.clone();
+        let inbound_body_bytes = body.len() as u64;
+        let owner = move |response_handoff| async move {
+            let mut settlement_guard = AgentOwnerSettlementGuard::new(
+                owner_state.metrics.clone(),
+                request_id.clone(),
+                started,
+                client_channel.clone(),
+                authorized_agent.clone(),
+            );
+            let response = run_generation_for_authorized_agent(
                 owner_state,
                 headers,
                 body,
@@ -1399,21 +1659,26 @@ async fn handle_generation_for_agent(
                 forced_agent_id,
                 started,
                 request_id,
+                inbound_body_bytes,
+                Some(response_handoff),
             )
-            .await
+            .await;
+            settlement_guard.disarm();
+            response
         };
-        return match cache_directed_relay::dispatch_owned(owner).await {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("agent_generation_owner", &err.to_string())
-                    .await;
-                json_error(StatusCode::BAD_GATEWAY, &err.to_string())
-            }
-        };
+        return dispatch_agent_generation_owner(
+            state.metrics.clone(),
+            state.relay_tasks.clone(),
+            dispatch_request_id,
+            started,
+            dispatch_client_channel,
+            dispatch_agent_id,
+            owner,
+        )
+        .await;
     }
 
+    let inbound_body_bytes = body.len() as u64;
     run_generation_for_authorized_agent(
         state,
         headers,
@@ -1423,8 +1688,125 @@ async fn handle_generation_for_agent(
         forced_agent_id,
         started,
         request_id,
+        inbound_body_bytes,
+        None,
     )
     .await
+}
+
+struct AgentOwnerSettlementGuard {
+    metrics: MetricsStore,
+    request_id: String,
+    started: Instant,
+    client_channel: Channel,
+    agent_id: Option<String>,
+    armed: bool,
+}
+
+impl AgentOwnerSettlementGuard {
+    fn new(
+        metrics: MetricsStore,
+        request_id: String,
+        started: Instant,
+        client_channel: Channel,
+        agent_id: Option<String>,
+    ) -> Self {
+        Self {
+            metrics,
+            request_id,
+            started,
+            client_channel,
+            agent_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AgentOwnerSettlementGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let transaction = agent_owner_failure_transaction(
+            &self.request_id,
+            self.started,
+            &self.client_channel,
+            self.agent_id.clone(),
+            "owner_dropped",
+            "agent generation owner was dropped before settlement completed",
+        );
+        let _ = self.metrics.commit_detached(transaction);
+    }
+}
+
+fn agent_owner_failure_transaction(
+    request_id: &str,
+    started: Instant,
+    client_channel: &Channel,
+    agent_id: Option<String>,
+    terminal_state: &str,
+    message: &str,
+) -> MetricsTransaction {
+    let elapsed = started.elapsed().as_millis() as u64;
+    let request_id = request_id.to_string();
+    let mut transaction = MetricsTransaction::agent_owner_failure(AgentOwnerFailureSettlement {
+        inbound_request_id: request_id.clone(),
+        request: RequestLog {
+            id: request_id.clone(),
+            at: Utc::now(),
+            inbound_request_id: Some(request_id),
+            client_channel: client_channel.label().to_string(),
+            upstream_channel: "unknown".to_string(),
+            provider: "unknown".to_string(),
+            provider_id: None,
+            model: "unknown".to_string(),
+            cache_status: "error".to_string(),
+            agent_id: agent_id.clone(),
+            agent_label: agent_id,
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            ttft_ms: elapsed,
+            total_ms: elapsed,
+            sse_end_reason: Some(terminal_state.to_string()),
+            ..RequestLog::default()
+        },
+        terminal_state: Some(terminal_state.to_string()),
+    });
+    transaction.observe_error("agent_generation_owner", message.to_string());
+    transaction
+}
+
+async fn dispatch_agent_generation_owner<F, Fut>(
+    metrics: MetricsStore,
+    tracker: DispatchTracker,
+    request_id: String,
+    started: Instant,
+    client_channel: Channel,
+    agent_id: Option<String>,
+    owner: F,
+) -> Response
+where
+    F: FnOnce(cache_directed_relay::DispatchHandoff<Response>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Response> + Send + 'static,
+{
+    match cache_directed_relay::dispatch_owned_tracked(tracker, owner).await {
+        Ok(response) => response,
+        Err(err) => {
+            let transaction = agent_owner_failure_transaction(
+                &request_id,
+                started,
+                &client_channel,
+                agent_id,
+                "owner_stopped",
+                &err.to_string(),
+            );
+            metrics.commit(transaction).await;
+            json_error(StatusCode::BAD_GATEWAY, &err.to_string())
+        }
+    }
 }
 
 async fn run_generation_for_authorized_agent(
@@ -1436,12 +1818,9 @@ async fn run_generation_for_authorized_agent(
     forced_agent_id: Option<&'static str>,
     started: Instant,
     request_id: String,
+    inbound_body_bytes: u64,
+    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
 ) -> Response {
-    // Agent calls must preserve their retry semantics at the client boundary:
-    // one inbound turn gets one generation attempt upstream. The client can
-    // decide whether to issue another turn after seeing the original error.
-    let allow_automatic_upstream_retry = !is_agent_generation_request(authorized_agent.as_deref());
-
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
@@ -1452,15 +1831,20 @@ async fn run_generation_for_authorized_agent(
         forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
     );
     let config = state.config.read().await.clone();
-    let route_affinity_key = provider_route_affinity_key(&config, &client_request, &client_channel);
-    let route_affinity_provider_id =
-        lookup_provider_route_affinity(&state, &config, route_affinity_key.as_deref()).await;
     let route_is_agent_bound = route_is_agent_provider_bound(
         &config,
         &client_request,
         &client_channel,
         authorized_agent.as_deref(),
     );
+    let (route_affinity_key, route_affinity_provider_id) = provider_route_affinity_for_request(
+        &state,
+        &config,
+        &client_request,
+        &client_channel,
+        route_is_agent_bound,
+    )
+    .await;
     let mut decision = match decide_route(
         &config,
         &client_request,
@@ -1488,12 +1872,24 @@ async fn run_generation_for_authorized_agent(
     if codex_responses_chat_compat {
         decision.upstream_channel = Channel::Chat;
     }
+    if matches!(client_channel, Channel::Anthropic)
+        && matches!(
+            decision.upstream_channel,
+            Channel::Responses | Channel::Chat
+        )
+    {
+        if let Err(error) = validate_anthropic_tool_history(&client_request) {
+            return json_error(StatusCode::BAD_REQUEST, &error);
+        }
+    }
     let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
     set_request_model(&mut client_request, &decision.model);
 
     let request_had_stream_field = client_request.get("stream").is_some();
     let client_requested_stream =
         infer_client_requested_stream(&mut client_request, &client_channel, forced_agent_id);
+    let chat_stream_include_usage =
+        chat_stream_include_usage_requested(&client_request, &client_channel);
     let codex_defaulted_responses_stream = forced_agent_id == Some("codex")
         && matches!(client_channel, Channel::Responses)
         && !request_had_stream_field
@@ -1505,8 +1901,16 @@ async fn run_generation_for_authorized_agent(
         && !codex_responses_chat_compat;
     let (agent_log_id, agent_log_label) =
         request_agent_log_fields(&config, authorized_agent.as_deref());
-    let codex_chat_tool_context = codex_responses_chat_compat
-        .then(|| transform_codex_chat::build_codex_tool_context_from_request(&client_request));
+    let responses_from_incremental_cross_protocol_stream = client_requested_stream
+        && route_supports_incremental_cross_protocol_stream(&client_channel, &decision);
+    // Every incremental cross-protocol bridge has one owning relay. This is
+    // already covered by the data-plane-wide no-retry policy above.
+    let cross_protocol_tool_context = (matches!(client_channel, Channel::Responses)
+        && matches!(
+            decision.upstream_channel,
+            Channel::Chat | Channel::Anthropic
+        ))
+    .then(|| transform_codex_chat::build_codex_tool_context_from_request(&client_request));
     let mut upstream_body = if codex_responses_chat_compat {
         match transform_codex_chat::responses_to_chat_completions(client_request.clone()) {
             Ok(body) => body,
@@ -1517,6 +1921,13 @@ async fn run_generation_for_authorized_agent(
                 )
             }
         }
+    } else if matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Anthropic)
+    {
+        let tool_context = cross_protocol_tool_context
+            .as_ref()
+            .expect("Responses to Anthropic conversion must have a tool context");
+        responses_to_anthropic_request_with_context(&client_request, tool_context)
     } else {
         transform_request_for_channel(&client_request, &client_channel, &decision.upstream_channel)
     };
@@ -1570,11 +1981,14 @@ async fn run_generation_for_authorized_agent(
         );
     }
 
-    let cross_protocol_stream = client_requested_stream
-        && client_channel != decision.upstream_channel
-        && !codex_responses_chat_compat;
-    if cross_protocol_stream {
+    let cross_protocol_stream =
+        client_requested_stream && client_channel != decision.upstream_channel;
+    let buffered_cross_protocol_stream =
+        cross_protocol_stream && !responses_from_incremental_cross_protocol_stream;
+    if buffered_cross_protocol_stream {
         set_stream_flag(&mut upstream_body, false);
+    } else if responses_from_incremental_cross_protocol_stream {
+        set_stream_flag(&mut upstream_body, true);
     }
     let mut provider_prefix_key = openai_prompt_cache_key(&provider_prefix_body);
     let provider_prefix_fingerprint = session_identity
@@ -1623,116 +2037,119 @@ async fn run_generation_for_authorized_agent(
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_ascii_lowercase().contains("no-store"))
         .unwrap_or(false);
-    let mut eligible = local_response_cache_eligible(
+    let eligible = local_response_cache_eligible(
         &config,
         no_store,
         &client_request,
         authorized_agent.as_deref(),
     );
-    let key_material = json!({
-        "client_channel": client_channel.label(),
-        "upstream_channel": decision.upstream_channel.label(),
-        "client_stream": client_requested_stream,
-        "request": upstream_body.clone()
-    });
-    let key = cache::cache_key(
-        &key_material,
-        &decision.provider.id,
-        &decision.model,
-        &config.workspace_fingerprint,
+    let local_cache_material = local_response_cache_material(
+        eligible,
+        &client_channel,
+        &decision.upstream_channel,
+        client_requested_stream,
+        chat_stream_include_usage,
+        &upstream_body,
     );
-
-    if eligible {
-        if let Some(hit) =
-            lookup_cache(&state, &[key.as_str()], None, None, &decision, &config).await
-        {
-            return cache_hit_response(
-                &state,
-                hit,
-                started,
-                request_id,
-                &client_channel,
-                &decision,
-                requested_model_for_log.clone(),
-                non_sse_compact_compat_for_decision(&config, &decision),
-            )
-            .await;
-        }
-    }
-
-    let mut cache_keys = vec![key.clone()];
-    let fuzzy_safe = cache::is_fuzzy_cache_safe(&client_request);
-    if fuzzy_safe {
-        let near_exact_key = cache::near_exact_cache_key(
-            &key_material,
-            &decision.provider.id,
-            &decision.model,
-            &config.workspace_fingerprint,
-        );
-        cache_keys.push(near_exact_key.clone());
-    }
-    if local_session_keys_enabled(&config) {
-        let session_key = cache::session_cache_key(
-            &key_material,
-            &decision.provider.id,
-            &decision.model,
-            &config.workspace_fingerprint,
-        );
-        if !cache_keys.contains(&session_key) {
-            cache_keys.push(session_key);
-        }
-        if fuzzy_safe {
-            let session_near_exact_key = cache::session_near_exact_cache_key(
+    let (cache_keys, metrics_cache_key, semantic_text, semantic_shape) =
+        if let Some(key_material) = local_cache_material {
+            let key = cache::cache_key(
                 &key_material,
                 &decision.provider.id,
                 &decision.model,
                 &config.workspace_fingerprint,
             );
-            if !cache_keys.contains(&session_near_exact_key) {
-                cache_keys.push(session_near_exact_key);
+            if let Some(hit) =
+                lookup_cache(&state, &[key.as_str()], None, None, &decision, &config).await
+            {
+                return cache_hit_response(
+                    &state,
+                    hit,
+                    started,
+                    request_id,
+                    &client_channel,
+                    &decision,
+                    requested_model_for_log.clone(),
+                    non_sse_compact_compat_for_decision(&config, &decision),
+                )
+                .await;
             }
-        }
-    }
-    let metrics_cache_key = metrics_cache_key(&cache_keys);
-    let semantic_text = if eligible && config.cache.semantic_enabled && fuzzy_safe {
-        cache::semantic_text(&client_request)
-    } else {
-        None
-    };
-    let semantic_shape = if semantic_text.is_some() {
-        cache::semantic_shape(&client_request)
-    } else {
-        None
-    };
 
-    if eligible {
-        let lookup_keys = cache_keys.iter().map(String::as_str).collect::<Vec<_>>();
-        if let Some(hit) = lookup_cache(
-            &state,
-            &lookup_keys,
-            semantic_text.as_deref().filter(|_| fuzzy_safe),
-            semantic_shape.as_deref(),
-            &decision,
-            &config,
-        )
-        .await
-        {
-            return cache_hit_response(
+            let mut cache_keys = vec![key];
+            let fuzzy_safe = cache::is_fuzzy_cache_safe(&client_request);
+            if fuzzy_safe {
+                let near_exact_key = cache::near_exact_cache_key(
+                    &key_material,
+                    &decision.provider.id,
+                    &decision.model,
+                    &config.workspace_fingerprint,
+                );
+                cache_keys.push(near_exact_key);
+            }
+            if local_session_keys_enabled(&config) {
+                let session_key = cache::session_cache_key(
+                    &key_material,
+                    &decision.provider.id,
+                    &decision.model,
+                    &config.workspace_fingerprint,
+                );
+                if !cache_keys.contains(&session_key) {
+                    cache_keys.push(session_key);
+                }
+                if fuzzy_safe {
+                    let session_near_exact_key = cache::session_near_exact_cache_key(
+                        &key_material,
+                        &decision.provider.id,
+                        &decision.model,
+                        &config.workspace_fingerprint,
+                    );
+                    if !cache_keys.contains(&session_near_exact_key) {
+                        cache_keys.push(session_near_exact_key);
+                    }
+                }
+            }
+            let metrics_cache_key = metrics_cache_key(&cache_keys);
+            let semantic_text = if config.cache.semantic_enabled && fuzzy_safe {
+                cache::semantic_text(&client_request)
+            } else {
+                None
+            };
+            let semantic_shape = if semantic_text.is_some() {
+                cache::semantic_shape(&client_request)
+            } else {
+                None
+            };
+
+            let lookup_keys = cache_keys.iter().map(String::as_str).collect::<Vec<_>>();
+            if let Some(hit) = lookup_cache(
                 &state,
-                hit,
-                started,
-                request_id,
-                &client_channel,
+                &lookup_keys,
+                semantic_text.as_deref().filter(|_| fuzzy_safe),
+                semantic_shape.as_deref(),
                 &decision,
-                requested_model_for_log.clone(),
-                non_sse_compact_compat_for_decision(&config, &decision),
+                &config,
             )
-            .await;
-        }
-    }
+            .await
+            {
+                return cache_hit_response(
+                    &state,
+                    hit,
+                    started,
+                    request_id,
+                    &client_channel,
+                    &decision,
+                    requested_model_for_log.clone(),
+                    non_sse_compact_compat_for_decision(&config, &decision),
+                )
+                .await;
+            }
 
-    let url = upstream_url(&decision.provider.base_url, &decision.upstream_channel);
-    let mut selected_provider_key = match select_provider_api_key(
+            (cache_keys, metrics_cache_key, semantic_text, semantic_shape)
+        } else {
+            (Vec::new(), "missing-cache-key".to_string(), None, None)
+        };
+
+    let selected_provider_key = match select_provider_api_key(
         &state,
         &decision.provider.id,
         None,
@@ -1754,7 +2171,7 @@ async fn run_generation_for_authorized_agent(
             )
         }
     };
-    let mut api_key = selected_provider_key.secret.clone();
+    let api_key = selected_provider_key.secret.clone();
     if api_key.trim().is_empty() {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -1776,13 +2193,44 @@ async fn run_generation_for_authorized_agent(
     )
     .await
     {
-        state
-            .metrics
-            .record_error(
-                "responses_sync_main_prefix_error_cooldown",
-                "skip sync main request after recent upstream sync failure for same prefix",
-            )
-            .await;
+        let mut local_diagnostics = body_diagnostics(
+            &decision.upstream_channel,
+            &upstream_body,
+            &upstream_body,
+            false,
+        );
+        local_diagnostics.reasoning = reasoning_diagnostics.clone();
+        let mut request_log = upstream_transport_failure_log(
+            &request_id,
+            &started,
+            &client_channel,
+            &decision.upstream_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &PrefixGuardWaitDiagnostics::default(),
+            started.elapsed().as_millis() as u64,
+            &local_diagnostics,
+            &upstream_body,
+            false,
+            &ResponseSessionReuseDiagnostics::default(),
+            requested_model_for_log.clone(),
+            "responses-sync-main-prefix-error-cooldown",
+        );
+        request_log.status = StatusCode::SERVICE_UNAVAILABLE.as_u16();
+        request_log.agent_id = authorized_agent.clone();
+        request_log.agent_label = authorized_agent.clone();
+        request_log.upstream_request_id = None;
+        request_log.upstream_attempt_index = None;
+        request_log.upstream_attempt_total = None;
+        request_log.upstream_attempts = None;
+        let mut transaction = MetricsTransaction::local_rejection(request_log);
+        transaction.observe_error(
+            "responses_sync_main_prefix_error_cooldown",
+            "skip sync main request after recent upstream sync failure for same prefix",
+        );
+        state.metrics.commit(transaction).await;
         return json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream is cooling down after recent sync failure; retry shortly",
@@ -1851,12 +2299,15 @@ async fn run_generation_for_authorized_agent(
         None
     };
     let response_session_cooldown_key = response_session_error_cooldown_key(&decision);
-    let response_session_cooldown_active =
-        response_session_cooldown_active(&state, response_session_cooldown_key.as_deref()).await;
+    let mut response_session_delta_body_sizes = None;
+    let mut selected_wire_draft = None;
     let (upstream_send_body, mut response_session_reuse_diagnostics) =
         if matches!(decision.upstream_channel, Channel::Responses) {
             let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-            let main_delta_skip_reason = main_response_session_delta_skip_reason(
+            let MainResponseSessionDeltaEvaluation {
+                skip_reason: main_delta_skip_reason,
+                mut original_wire_draft,
+            } = evaluate_main_response_session_delta(
                 &config,
                 &decision,
                 client_requested_stream,
@@ -1870,15 +2321,12 @@ async fn run_generation_for_authorized_agent(
             )
             .await
             {
+                selected_wire_draft = original_wire_draft.take();
                 diagnostics.cooldown_active = true;
-                if cooldown_skip_reason == "provider_session_delta_unsupported" {
-                    diagnostics.skip_reason = Some(cooldown_skip_reason);
-                    (upstream_body.clone(), diagnostics)
-                } else {
-                    diagnostics.skip_reason = Some(cooldown_skip_reason);
-                    (upstream_body.clone(), diagnostics)
-                }
+                diagnostics.skip_reason = Some(cooldown_skip_reason);
+                (upstream_body.clone(), diagnostics)
             } else if !main_response_session_delta_enabled_for_agent(forced_agent_id) {
+                selected_wire_draft = original_wire_draft.take();
                 diagnostics.skip_reason = Some("codex_main_session_delta_disabled".to_string());
                 (upstream_body.clone(), diagnostics)
             } else if main_delta_skip_reason.is_none() {
@@ -1892,20 +2340,27 @@ async fn run_generation_for_authorized_agent(
                     false,
                 )
                 .await;
-                if response_session_delta_request(&outcome.body, &upstream_body)
-                    && response_session_delta_is_beneficial(
-                        &upstream_body,
-                        &outcome.body,
-                        &tail_input_diagnostics,
-                    )
-                {
+                let original_body_bytes = original_wire_draft
+                    .as_ref()
+                    .map(|draft| draft.len() as u64)
+                    .expect("an eligible session delta must retain its measured full-body wire");
+                if let Some(prepared_delta) = response_session_delta_benefit(
+                    &upstream_body,
+                    &outcome.body,
+                    original_body_bytes,
+                    &tail_input_diagnostics,
+                ) {
+                    response_session_delta_body_sizes = Some(prepared_delta.body_sizes);
+                    selected_wire_draft = Some(prepared_delta.wire_draft);
                     (outcome.body, outcome.diagnostics)
                 } else {
+                    selected_wire_draft = original_wire_draft.take();
                     diagnostics = outcome.diagnostics;
                     diagnostics.skip_reason = Some("main_session_delta_not_beneficial".to_string());
                     (upstream_body.clone(), diagnostics)
                 }
             } else {
+                selected_wire_draft = original_wire_draft.take();
                 diagnostics.skip_reason = main_delta_skip_reason.map(str::to_string);
                 (upstream_body.clone(), diagnostics)
             }
@@ -1919,18 +2374,32 @@ async fn run_generation_for_authorized_agent(
     if used_response_session {
         response_session_reuse_diagnostics.skip_reason = None;
     }
-    let mut active_used_response_session = used_response_session;
-    let mut diagnostics = body_diagnostics(
-        &decision.upstream_channel,
-        &upstream_body,
-        &upstream_send_body,
-        active_used_response_session,
-    );
+    let active_used_response_session = used_response_session;
+    let agent_generation = is_agent_generation_request(authorized_agent.as_deref());
+    let mut diagnostics = if agent_generation {
+        body_diagnostics_with_known_inbound_length(
+            &decision.upstream_channel,
+            &upstream_body,
+            inbound_body_bytes,
+            active_used_response_session,
+        )
+    } else {
+        body_diagnostics_without_send_length(
+            &decision.upstream_channel,
+            &upstream_body,
+            active_used_response_session,
+        )
+    };
+    if let Some(body_sizes) = response_session_delta_body_sizes {
+        diagnostics.original_body_bytes = body_sizes.original_body_bytes;
+        diagnostics.send_body_bytes = body_sizes.delta_body_bytes;
+    }
     diagnostics.trusted_codex_compaction_requested = trusted_codex_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.compaction_requested);
+    diagnostics.chat_stream_include_usage = chat_stream_include_usage;
     diagnostics.reasoning = reasoning_diagnostics;
-    let mut retried_full_response = false;
+    let retried_full_response = false;
     let mut prefix_state_update_key =
         provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
     let responses_non_stream_upstream_sse_compat = should_send_responses_non_stream_as_upstream_sse(
@@ -1942,6 +2411,11 @@ async fn run_generation_for_authorized_agent(
     let compact_chat_compat_cooldown_active =
         compact_chat_compat_cooldown_active(&state, &compact_chat_compat_cooldown_key).await;
     let responses_non_stream_chat_compat = !compact_chat_compat_cooldown_active
+        && responses_sync_main_skips_prefix_guard(
+            &client_channel,
+            &decision.upstream_channel,
+            client_requested_stream,
+        )
         && should_route_responses_non_stream_compact_via_chat(
             &client_channel,
             &decision.upstream_channel,
@@ -1949,14 +2423,13 @@ async fn run_generation_for_authorized_agent(
             &tail_input_diagnostics,
             serialized_body_len(&decision.upstream_channel, &upstream_body),
         );
-    let mut active_request_channel = if responses_non_stream_chat_compat {
+    let active_request_channel = if responses_non_stream_chat_compat {
         Channel::Chat
     } else {
         decision.upstream_channel.clone()
     };
-    let mut active_responses_non_stream_chat_compat = responses_non_stream_chat_compat;
-    let mut responses_sync_main_chat_compat_fallback = false;
-    let mut active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
+    let active_responses_non_stream_chat_compat = responses_non_stream_chat_compat;
+    let active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
 
     let mut active_upstream_body = build_active_upstream_body_for_compat(
         &upstream_body,
@@ -1966,28 +2439,26 @@ async fn run_generation_for_authorized_agent(
         &active_request_channel,
         responses_non_stream_upstream_sse_compat,
     );
-    let chat_compat_fast_json = responses_non_stream_chat_compat
-        && should_use_chat_non_stream_compact_fast_path(
-            &tail_input_diagnostics,
-            serialized_body_len(&active_request_channel, &active_upstream_body),
-        );
+    let mut prepared_wire_changed_fields = Vec::new();
+    if !matches!(active_request_channel, Channel::Responses) {
+        selected_wire_draft = None;
+    } else if selected_wire_draft.is_some()
+        && upstream_send_body.get("stream") != active_upstream_body.get("stream")
+    {
+        record_prepared_wire_changed_field(&mut prepared_wire_changed_fields, "stream");
+    }
+    let chat_compat_fast_json =
+        responses_non_stream_chat_compat && should_use_chat_non_stream_compact_fast_path();
     if chat_compat_fast_json {
         set_stream_flag(&mut active_upstream_body, false);
     }
-    diagnostics.send_body_bytes =
-        serialized_body_len(&active_request_channel, &active_upstream_body);
     diagnostics.send_body_is_delta =
         response_session_delta_request(&active_upstream_body, &upstream_body);
     if responses_non_stream_chat_compat {
         prefix_state_update_key = None;
     }
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
-    let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
-        &active_request_channel,
-        client_requested_stream,
-        &active_upstream_body,
-    );
-    let agent_generation = is_agent_generation_request(authorized_agent.as_deref());
+    let mut request_metric_errors = Vec::<(String, String)>::new();
     let explicit_client_prompt_cache_key = client_request
         .get("prompt_cache_key")
         .and_then(Value::as_str)
@@ -2032,6 +2503,7 @@ async fn run_generation_for_authorized_agent(
         selected_provider_key.key_id.as_deref(),
         ProviderCacheCapabilityField::PromptCacheKey,
     ) != ProviderCacheCapabilityStatus::Unsupported;
+    let mut candidate_prompt_cache_key_changed = false;
     let candidate_cache_routing_applied =
         shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let provider_native_candidate = validation_selection.is_none()
@@ -2066,12 +2538,16 @@ async fn run_generation_for_authorized_agent(
             if !can_apply {
                 return false;
             }
-            let applied = apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
-            if applied {
+            let outcome = apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
+            candidate_prompt_cache_key_changed = outcome.changed;
+            if outcome.applied {
                 provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
             }
-            applied
+            outcome.applied
         });
+    if candidate_prompt_cache_key_changed {
+        record_prepared_wire_changed_field(&mut prepared_wire_changed_fields, "prompt_cache_key");
+    }
     if let Some(decision) = shadow_affinity_decision.as_ref() {
         state
             .metrics
@@ -2085,16 +2561,63 @@ async fn run_generation_for_authorized_agent(
         state.metrics.record_shadow_application(true).await;
     }
     if agent_generation {
-        apply_native_cache_controls(
+        let native_cache_changed_fields = apply_native_cache_controls(
             &mut active_upstream_body,
             &config,
             &decision,
             &active_request_channel,
             selected_provider_key.key_id.as_deref(),
         );
+        extend_prepared_wire_changed_fields(
+            &mut prepared_wire_changed_fields,
+            native_cache_changed_fields,
+        );
         provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
     }
-    let agent_policy = agent_attempt_policy(diagnostics.reasoning.effective.as_deref());
+    let mut request_plan = Some(if let Some(wire_draft) = selected_wire_draft.take() {
+        RequestPlan::from_prepared(
+            &decision.provider,
+            active_url.clone(),
+            wire_draft.freeze(&active_upstream_body, &prepared_wire_changed_fields),
+        )
+    } else {
+        RequestPlan::new(
+            &decision.provider,
+            active_url.clone(),
+            active_request_channel.clone(),
+            &active_upstream_body,
+        )
+    });
+    apply_prepared_body_lengths(
+        &mut diagnostics,
+        request_plan
+            .as_ref()
+            .expect("the initial request plan must be available"),
+    );
+    let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
+        &active_request_channel,
+        client_requested_stream,
+        request_plan
+            .as_ref()
+            .expect("the initial request plan must be available")
+            .body_len(),
+    );
+    request_plan = Some(
+        request_plan
+            .take()
+            .expect("the initial request plan must be available")
+            .with_gzip_enabled(
+                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+            ),
+    );
+    // Coordination guards protect request preparation only.  Once the wire
+    // request is frozen, release them before any upstream network await so a
+    // slow response header cannot serialize the next turn for this prefix.
+    drop(prefix_guard);
+    drop(response_session_guard);
+    // A compatibility downgrade is durable state for the next independent
+    // Agent request, never an authorization to repeat this inbound request.
+    let agent_policy = AttemptPolicy::Single;
     let mut agent_attempt_gate = if agent_generation {
         let gate = AttemptGate::new(request_id.clone(), agent_policy)
             .expect("a generated request id must be valid for the attempt gate");
@@ -2127,14 +2650,12 @@ async fn run_generation_for_authorized_agent(
         Some(token) => {
             send_agent_upstream_request(
                 &state,
-                decision.provider.use_system_proxy,
-                &active_url,
                 &api_key,
-                &active_request_channel,
-                &active_upstream_body,
+                request_plan
+                    .take()
+                    .expect("the Agent request plan must be available for one-shot dispatch")
+                    .into_one_shot(),
                 &headers,
-                decision.provider.custom_user_agent.as_deref(),
-                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
                 &decision,
                 token,
             )
@@ -2143,16 +2664,12 @@ async fn run_generation_for_authorized_agent(
         None => {
             send_main_upstream_request(
                 &state,
-                decision.provider.use_system_proxy,
-                &active_url,
                 &api_key,
-                &active_request_channel,
-                &active_upstream_body,
+                request_plan
+                    .take()
+                    .expect("the non-Agent request plan must be available for one-shot dispatch")
+                    .into_one_shot(),
                 &headers,
-                decision.provider.custom_user_agent.as_deref(),
-                skip_prefix_guard_for_sync_responses,
-                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-                !client_requested_stream,
             )
             .await
         }
@@ -2189,6 +2706,9 @@ async fn run_generation_for_authorized_agent(
                     None,
                     Some("upstream_transport".to_string()),
                     "transport_error",
+                    None,
+                    None,
+                    vec![("upstream_transport".to_string(), err.to_string())],
                     shadow_affinity_decision.clone(),
                     None,
                 )
@@ -2211,28 +2731,29 @@ async fn run_generation_for_authorized_agent(
                     active_used_response_session,
                     &response_session_reuse_diagnostics,
                     requested_model_for_log.clone(),
+                    None,
                     "main-transport",
+                    upstream_request_diagnostics.attempts.saturating_add(1),
+                    &request_metric_errors,
+                    "upstream_transport",
+                    &err.to_string(),
                 )
                 .await;
             }
-            state
-                .metrics
-                .record_error("upstream_transport", &err.to_string())
-                .await;
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 &format!("upstream request failed: {err}"),
             );
         }
     };
-    let mut current_send_diagnostics = send_outcome.diagnostics.clone();
+    let current_send_diagnostics = send_outcome.diagnostics.clone();
     upstream_request_diagnostics.absorb(&current_send_diagnostics);
     upstream_request_diagnostics.gzip_skipped_cold_stream |= skip_gzip_for_cold_stream;
-    let mut upstream = send_outcome.response;
-    let mut upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+    let upstream = send_outcome.response;
+    let upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
 
     let mut status = upstream.status().as_u16();
-    let mut content_type = upstream
+    let content_type = upstream
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2241,773 +2762,26 @@ async fn run_generation_for_authorized_agent(
     let mut is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
-    // A verified third-party delta is deliberately a one-shot request. Do
-    // not turn an upstream rejection into a second generation attempt with a
-    // different key, a full body, or another protocol.  The manual probe is
-    // the only allowed multi-request operation for this capability.
+    // A session-delta request is deliberately one-shot.  Its `previous_response_id`
+    // changes the semantic context at the provider, so a retry with another
+    // key, a full body, or another protocol would be a second generation for
+    // the same inbound request.  Invalidate the anchor during settlement and
+    // let the next independent inbound request use its full body instead.
     let verified_third_party_delta_in_flight = active_used_response_session
         && is_verified_third_party_response_session_reuse(&config, &decision);
-    if allow_automatic_upstream_retry && !verified_third_party_delta_in_flight {
-        if let Some(next_key) = try_retry_with_next_provider_key(
-            &state,
-            &decision.provider.id,
-            &selected_provider_key,
-            status,
-            provider_prefix_control_key.as_deref(),
-        )
-        .await
-        {
-            record_upstream_response_observation(
-                &state,
-                &request_id,
-                &started,
-                &client_channel,
-                &active_request_channel,
-                &decision,
-                eligible.then_some(metrics_cache_key.as_str()),
-                provider_prefix_key.as_deref(),
-                provider_prefix_fingerprint.as_deref(),
-                &prefix_guard_wait,
-                local_prepare_ms,
-                &diagnostics,
-                &active_upstream_body,
-                active_used_response_session,
-                &response_session_reuse_diagnostics,
-                requested_model_for_log.clone(),
-                current_non_stream_upstream_call_source(
-                    skip_prefix_guard_for_sync_responses,
-                    active_responses_non_stream_chat_compat,
-                    responses_sync_main_chat_compat_fallback,
-                ),
-                status,
-                &current_send_diagnostics,
-                agent_log_id.clone(),
-                agent_log_label.clone(),
-            )
-            .await;
-            state.metrics.record_retry().await;
-            selected_provider_key = next_key;
-            api_key = selected_provider_key.secret.clone();
-            let send_outcome = match send_main_upstream_request(
-                &state,
-                decision.provider.use_system_proxy,
-                &active_url,
-                &api_key,
-                &active_request_channel,
-                &active_upstream_body,
-                &headers,
-                decision.provider.custom_user_agent.as_deref(),
-                skip_prefix_guard_for_sync_responses,
-                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-                !client_requested_stream,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    record_upstream_transport_failure(
-                        &state,
-                        &request_id,
-                        &started,
-                        &client_channel,
-                        &active_request_channel,
-                        &decision,
-                        eligible.then_some(metrics_cache_key.as_str()),
-                        provider_prefix_key.as_deref(),
-                        provider_prefix_fingerprint.as_deref(),
-                        &prefix_guard_wait,
-                        local_prepare_ms,
-                        &diagnostics,
-                        &active_upstream_body,
-                        active_used_response_session,
-                        &response_session_reuse_diagnostics,
-                        requested_model_for_log.clone(),
-                        "provider-key-failover-transport",
-                    )
-                    .await;
-                    state
-                        .metrics
-                        .record_error("upstream_transport", &err.to_string())
-                        .await;
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("upstream request failed after key failover: {err}"),
-                    );
-                }
-            };
-            current_send_diagnostics = send_outcome.diagnostics.clone();
-            upstream_request_diagnostics.absorb(&current_send_diagnostics);
-            upstream = send_outcome.response;
-            upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-            status = upstream.status().as_u16();
-            content_type = upstream
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            is_success_status = StatusCode::from_u16(status)
-                .map(|status| status.is_success())
-                .unwrap_or(false);
-        }
-    }
-    let allow_full_session_retry =
-        allow_automatic_upstream_retry && !verified_third_party_delta_in_flight;
-    if should_retry_full_response_after_session_error(
+    // Key status is settled from this original response below. A later
+    // inbound naturally selects a healthy key; this inbound owns no retry.
+    // Protocol compatibility is learned by an explicit diagnostic or a future
+    // capability route; this inbound returns the original upstream result.
+    if should_fallback_chat_compat_compact_to_responses(
         status,
-        used_response_session,
-        allow_full_session_retry,
+        skip_prefix_guard_for_sync_responses,
+        active_responses_non_stream_chat_compat,
     ) {
-        record_upstream_response_observation(
-            &state,
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            &active_upstream_body,
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            current_non_stream_upstream_call_source(
-                skip_prefix_guard_for_sync_responses,
-                active_responses_non_stream_chat_compat,
-                responses_sync_main_chat_compat_fallback,
-            ),
-            status,
-            &current_send_diagnostics,
-            agent_log_id.clone(),
-            agent_log_label.clone(),
-        )
-        .await;
-        let session_error_summary = match read_upstream_body_with_diagnostics(
-            upstream,
-            &content_type,
-            started,
-            upstream_response_headers_at_ms,
-        )
-        .await
-        {
-            Ok(outcome) => upstream_error_summary(&outcome.bytes),
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("response_session_delta_error_body", &err.to_string())
-                    .await;
-                String::new()
-            }
-        };
-        if !session_error_summary.is_empty() {
-            state
-                .metrics
-                .record_error("response_session_delta_rejected", &session_error_summary)
-                .await;
-        }
-        note_response_session_error_cooldown_for_rejection(
-            &state,
-            response_session_cooldown_key.as_deref(),
-            status,
-            &session_error_summary,
-        )
-        .await;
-        response_session_reuse_diagnostics.rejected_status = Some(status);
-        let stale_response_id = previous_response_id_from_request(&active_upstream_body);
-        clear_response_session_reference(
-            &state,
-            response_session_key.as_deref(),
-            stale_response_id.as_deref(),
-        )
-        .await;
-        state.metrics.record_retry().await;
-        retried_full_response = true;
-        active_upstream_body = build_active_upstream_body_for_compat(
-            &upstream_body,
-            &upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            responses_non_stream_upstream_sse_compat,
-        );
-        apply_native_cache_controls(
-            &mut active_upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            selected_provider_key.key_id.as_deref(),
-        );
-        if chat_compat_fast_json {
-            set_stream_flag(&mut active_upstream_body, false);
-        }
-        active_used_response_session = false;
-        diagnostics.send_body_bytes =
-            serialized_body_len(&active_request_channel, &active_upstream_body);
-        diagnostics.send_body_is_delta = false;
-        prefix_state_update_key =
-            provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
-        let send_outcome = match send_main_upstream_request(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            skip_prefix_guard_for_sync_responses,
-            decision.provider.request_body_gzip_enabled,
-            !client_requested_stream,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                record_upstream_transport_failure(
-                    &state,
-                    &request_id,
-                    &started,
-                    &client_channel,
-                    &active_request_channel,
-                    &decision,
-                    eligible.then_some(metrics_cache_key.as_str()),
-                    provider_prefix_key.as_deref(),
-                    provider_prefix_fingerprint.as_deref(),
-                    &prefix_guard_wait,
-                    local_prepare_ms,
-                    &diagnostics,
-                    &active_upstream_body,
-                    active_used_response_session,
-                    &response_session_reuse_diagnostics,
-                    requested_model_for_log.clone(),
-                    "session-delta-full-retry-transport",
-                )
-                .await;
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream request failed: {err}"),
-                );
-            }
-        };
-        current_send_diagnostics = send_outcome.diagnostics.clone();
-        upstream_request_diagnostics.absorb(&current_send_diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        is_success_status = StatusCode::from_u16(status)
-            .map(|status| status.is_success())
-            .unwrap_or(false);
-    }
-    if should_fallback_responses_sync_main_to_chat_compat(
-        status,
-        responses_main_retry_guard,
-        responses_non_stream_chat_compat,
-    ) && allow_automatic_upstream_retry
-        && !verified_third_party_delta_in_flight
-    {
-        record_upstream_response_observation(
-            &state,
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            &active_upstream_body,
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            current_non_stream_upstream_call_source(
-                skip_prefix_guard_for_sync_responses,
-                active_responses_non_stream_chat_compat,
-                responses_sync_main_chat_compat_fallback,
-            ),
-            status,
-            &current_send_diagnostics,
-            agent_log_id.clone(),
-            agent_log_label.clone(),
-        )
-        .await;
-        state.metrics.record_retry().await;
-        active_upstream_body = build_active_upstream_body_for_compat(
-            &upstream_body,
-            &upstream_body,
-            &config,
-            &decision,
-            &Channel::Chat,
-            false,
-        );
-        apply_native_cache_controls(
-            &mut active_upstream_body,
-            &config,
-            &decision,
-            &Channel::Chat,
-            selected_provider_key.key_id.as_deref(),
-        );
-        let chat_fallback_fast_json = should_use_chat_non_stream_compact_fast_path(
-            &tail_input_diagnostics,
-            serialized_body_len(&Channel::Chat, &active_upstream_body),
-        );
-        if chat_fallback_fast_json {
-            set_stream_flag(&mut active_upstream_body, false);
-        }
-        active_request_channel = Channel::Chat;
-        active_responses_non_stream_chat_compat = true;
-        responses_sync_main_chat_compat_fallback = true;
-        active_used_response_session = false;
-        diagnostics.send_body_bytes = serialized_body_len(&Channel::Chat, &active_upstream_body);
-        diagnostics.send_body_is_delta = false;
-        prefix_state_update_key = None;
-        let chat_url = upstream_url(&decision.provider.base_url, &Channel::Chat);
-        let send_outcome = match send_main_upstream_request(
-            &state,
-            decision.provider.use_system_proxy,
-            &chat_url,
-            &api_key,
-            &Channel::Chat,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            skip_prefix_guard_for_sync_responses,
-            decision.provider.request_body_gzip_enabled,
-            true,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream request failed: {err}"),
-                );
-            }
-        };
-        current_send_diagnostics = send_outcome.diagnostics.clone();
-        upstream_request_diagnostics.absorb(&current_send_diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        is_success_status = StatusCode::from_u16(status)
-            .map(|status| status.is_success())
-            .unwrap_or(false);
-    }
-    if allow_automatic_upstream_retry
-        && !responses_sync_main_chat_compat_fallback
-        && should_fallback_chat_compat_compact_to_responses(
-            status,
-            skip_prefix_guard_for_sync_responses,
-            active_responses_non_stream_chat_compat,
-        )
-    {
-        record_upstream_response_observation(
-            &state,
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            &active_upstream_body,
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            current_non_stream_upstream_call_source(
-                skip_prefix_guard_for_sync_responses,
-                active_responses_non_stream_chat_compat,
-                responses_sync_main_chat_compat_fallback,
-            ),
-            status,
-            &current_send_diagnostics,
-            agent_log_id.clone(),
-            agent_log_label.clone(),
-        )
-        .await;
-        let chat_error_body = match read_upstream_body_with_diagnostics(
-            upstream,
-            &content_type,
-            started,
-            upstream_response_headers_at_ms,
-        )
-        .await
-        {
-            Ok(outcome) => outcome.bytes,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_chat_compat_body", &err.to_string())
-                    .await;
-                Vec::new()
-            }
-        };
-        let error_summary = upstream_error_summary(&chat_error_body);
-        state
-            .metrics
-            .record_error(upstream_error_scope(status, &error_summary), &error_summary)
-            .await;
         note_compact_chat_compat_cooldown(&state, &compact_chat_compat_cooldown_key).await;
-        state.metrics.record_retry().await;
-
-        active_request_channel = decision.upstream_channel.clone();
-        active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
-        active_responses_non_stream_chat_compat = false;
-        responses_sync_main_chat_compat_fallback = false;
-        active_upstream_body = build_active_upstream_body_for_compat(
-            &upstream_body,
-            &upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            responses_non_stream_upstream_sse_compat,
-        );
-        apply_native_cache_controls(
-            &mut active_upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            selected_provider_key.key_id.as_deref(),
-        );
-        active_used_response_session = false;
-        diagnostics.send_body_bytes =
-            serialized_body_len(&active_request_channel, &active_upstream_body);
-        diagnostics.send_body_is_delta = false;
-
-        let send_outcome = match send_main_upstream_request(
-            &state,
-            decision.provider.use_system_proxy,
-            &active_url,
-            &api_key,
-            &active_request_channel,
-            &active_upstream_body,
-            &headers,
-            decision.provider.custom_user_agent.as_deref(),
-            skip_prefix_guard_for_sync_responses,
-            decision.provider.request_body_gzip_enabled,
-            true,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                state
-                    .metrics
-                    .record_error("upstream_transport", &err.to_string())
-                    .await;
-                return json_error(
-                    StatusCode::BAD_GATEWAY,
-                    &format!("upstream request failed: {err}"),
-                );
-            }
-        };
-        current_send_diagnostics = send_outcome.diagnostics.clone();
-        upstream_request_diagnostics.absorb(&current_send_diagnostics);
-        upstream = send_outcome.response;
-        upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-        status = upstream.status().as_u16();
-        content_type = upstream
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("application/json")
-            .to_string();
-        is_success_status = StatusCode::from_u16(status)
-            .map(|status| status.is_success())
-            .unwrap_or(false);
     }
-    if allow_automatic_upstream_retry
-        && should_attempt_response_session_rescue_after_413(
-            status,
-            active_used_response_session,
-            active_responses_non_stream_chat_compat,
-            &decision.upstream_channel,
-            response_session_cooldown_active,
-        )
-    {
-        record_upstream_response_observation(
-            &state,
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            &active_upstream_body,
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            current_non_stream_upstream_call_source(
-                skip_prefix_guard_for_sync_responses,
-                active_responses_non_stream_chat_compat,
-                responses_sync_main_chat_compat_fallback,
-            ),
-            status,
-            &current_send_diagnostics,
-            agent_log_id.clone(),
-            agent_log_label.clone(),
-        )
-        .await;
-        diagnostics.payload_too_large_rescue_attempted = true;
-        let rescue_outcome = maybe_rescue_response_session_after_413(
-            &state,
-            &upstream_body,
-            response_session_key.as_deref(),
-            response_session_scope_key.as_deref(),
-            &decision,
-        )
-        .await;
-        response_session_reuse_diagnostics = rescue_outcome.diagnostics.clone();
-        if response_session_delta_request(&rescue_outcome.body, &upstream_body) {
-            state.metrics.record_retry().await;
-            active_upstream_body = rescue_outcome.body;
-            apply_responses_non_stream_upstream_sse_compat(
-                &mut active_upstream_body,
-                responses_non_stream_upstream_sse_compat,
-            );
-            apply_native_cache_controls(
-                &mut active_upstream_body,
-                &config,
-                &decision,
-                &decision.upstream_channel,
-                selected_provider_key.key_id.as_deref(),
-            );
-            active_used_response_session =
-                response_session_delta_request(&active_upstream_body, &upstream_body);
-            diagnostics.payload_too_large_rescue_used = active_used_response_session;
-            diagnostics.send_body_bytes =
-                serialized_body_len(&decision.upstream_channel, &active_upstream_body);
-            diagnostics.send_body_is_delta = active_used_response_session;
-            let send_outcome = match send_main_upstream_request(
-                &state,
-                decision.provider.use_system_proxy,
-                &url,
-                &api_key,
-                &decision.upstream_channel,
-                &active_upstream_body,
-                &headers,
-                decision.provider.custom_user_agent.as_deref(),
-                skip_prefix_guard_for_sync_responses,
-                decision.provider.request_body_gzip_enabled,
-                !client_requested_stream,
-            )
-            .await
-            {
-                Ok(response) => response,
-                Err(err) => {
-                    record_upstream_transport_failure(
-                        &state,
-                        &request_id,
-                        &started,
-                        &client_channel,
-                        &decision.upstream_channel,
-                        &decision,
-                        eligible.then_some(metrics_cache_key.as_str()),
-                        provider_prefix_key.as_deref(),
-                        provider_prefix_fingerprint.as_deref(),
-                        &prefix_guard_wait,
-                        local_prepare_ms,
-                        &diagnostics,
-                        &active_upstream_body,
-                        active_used_response_session,
-                        &response_session_reuse_diagnostics,
-                        requested_model_for_log.clone(),
-                        "payload-too-large-rescue-transport",
-                    )
-                    .await;
-                    state
-                        .metrics
-                        .record_error("upstream_transport", &err.to_string())
-                        .await;
-                    return json_error(
-                        StatusCode::BAD_GATEWAY,
-                        &format!("upstream request failed: {err}"),
-                    );
-                }
-            };
-            current_send_diagnostics = send_outcome.diagnostics.clone();
-            upstream_request_diagnostics.absorb(&current_send_diagnostics);
-            upstream = send_outcome.response;
-            upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-            status = upstream.status().as_u16();
-            content_type = upstream
-                .headers()
-                .get(header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or("application/json")
-                .to_string();
-            is_success_status = StatusCode::from_u16(status)
-                .map(|status| status.is_success())
-                .unwrap_or(false);
-            if should_retry_full_response_after_session_error(
-                status,
-                active_used_response_session,
-                allow_full_session_retry,
-            ) {
-                record_upstream_response_observation(
-                    &state,
-                    &request_id,
-                    &started,
-                    &client_channel,
-                    &decision.upstream_channel,
-                    &decision,
-                    eligible.then_some(metrics_cache_key.as_str()),
-                    provider_prefix_key.as_deref(),
-                    provider_prefix_fingerprint.as_deref(),
-                    &prefix_guard_wait,
-                    local_prepare_ms,
-                    &diagnostics,
-                    &active_upstream_body,
-                    active_used_response_session,
-                    &response_session_reuse_diagnostics,
-                    requested_model_for_log.clone(),
-                    current_non_stream_upstream_call_source(
-                        skip_prefix_guard_for_sync_responses,
-                        active_responses_non_stream_chat_compat,
-                        responses_sync_main_chat_compat_fallback,
-                    ),
-                    status,
-                    &current_send_diagnostics,
-                    agent_log_id.clone(),
-                    agent_log_label.clone(),
-                )
-                .await;
-                note_response_session_error_cooldown_for_rejection(
-                    &state,
-                    response_session_cooldown_key.as_deref(),
-                    status,
-                    "",
-                )
-                .await;
-                response_session_reuse_diagnostics.rejected_status = Some(status);
-                let stale_response_id = previous_response_id_from_request(&active_upstream_body);
-                clear_response_session_reference(
-                    &state,
-                    response_session_key.as_deref(),
-                    stale_response_id.as_deref(),
-                )
-                .await;
-                state.metrics.record_retry().await;
-                retried_full_response = true;
-                active_upstream_body = upstream_body.clone();
-                apply_responses_non_stream_upstream_sse_compat(
-                    &mut active_upstream_body,
-                    responses_non_stream_upstream_sse_compat,
-                );
-                apply_native_cache_controls(
-                    &mut active_upstream_body,
-                    &config,
-                    &decision,
-                    &decision.upstream_channel,
-                    selected_provider_key.key_id.as_deref(),
-                );
-                active_used_response_session = false;
-                diagnostics.payload_too_large_rescue_used = false;
-                diagnostics.send_body_bytes =
-                    serialized_body_len(&decision.upstream_channel, &active_upstream_body);
-                diagnostics.send_body_is_delta = false;
-                prefix_state_update_key =
-                    provider_prefix_state_update_key(provider_prefix_control_key.as_deref());
-                let send_outcome = match send_main_upstream_request(
-                    &state,
-                    decision.provider.use_system_proxy,
-                    &url,
-                    &api_key,
-                    &decision.upstream_channel,
-                    &active_upstream_body,
-                    &headers,
-                    decision.provider.custom_user_agent.as_deref(),
-                    skip_prefix_guard_for_sync_responses,
-                    decision.provider.request_body_gzip_enabled,
-                    !client_requested_stream,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(err) => {
-                        record_upstream_transport_failure(
-                            &state,
-                            &request_id,
-                            &started,
-                            &client_channel,
-                            &decision.upstream_channel,
-                            &decision,
-                            eligible.then_some(metrics_cache_key.as_str()),
-                            provider_prefix_key.as_deref(),
-                            provider_prefix_fingerprint.as_deref(),
-                            &prefix_guard_wait,
-                            local_prepare_ms,
-                            &diagnostics,
-                            &active_upstream_body,
-                            active_used_response_session,
-                            &response_session_reuse_diagnostics,
-                            requested_model_for_log.clone(),
-                            "payload-too-large-full-retry-transport",
-                        )
-                        .await;
-                        state
-                            .metrics
-                            .record_error("upstream_transport", &err.to_string())
-                            .await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("upstream request failed: {err}"),
-                        );
-                    }
-                };
-                current_send_diagnostics = send_outcome.diagnostics.clone();
-                upstream_request_diagnostics.absorb(&current_send_diagnostics);
-                upstream = send_outcome.response;
-                upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-                status = upstream.status().as_u16();
-                content_type = upstream
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("application/json")
-                    .to_string();
-                is_success_status = StatusCode::from_u16(status)
-                    .map(|status| status.is_success())
-                    .unwrap_or(false);
-            }
-        }
-    }
+    // A 413 is returned as-is. Session rescue is a future inbound decision,
+    // never an extra request hidden behind this one.
     let mut pending_upstream = Some(upstream);
     let mut pre_read_body = None;
     if is_agent_generation_request(authorized_agent.as_deref())
@@ -3016,393 +2790,119 @@ async fn run_generation_for_authorized_agent(
         && !is_success_status
     {
         if let Some(current_effort) = diagnostics.reasoning.effective.clone() {
-            let rejected =
-                rejected_reasoning_efforts(&state, &decision, &active_request_channel).await;
-            if let Some(next_effort) = next_lower_reasoning_effort(&current_effort, &rejected) {
-                let body_read = match read_upstream_body_with_diagnostics(
-                    pending_upstream
-                        .take()
-                        .expect("the pending upstream response must exist before fallback"),
-                    &content_type,
-                    started,
-                    upstream_response_headers_at_ms,
-                )
-                .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        let log = upstream_transport_failure_log(
-                            &request_id,
-                            &started,
-                            &client_channel,
-                            &active_request_channel,
-                            &decision,
-                            None,
-                            provider_prefix_key.as_deref(),
-                            provider_prefix_fingerprint.as_deref(),
-                            &prefix_guard_wait,
-                            local_prepare_ms,
-                            &diagnostics,
-                            &active_upstream_body,
-                            active_used_response_session,
-                            &response_session_reuse_diagnostics,
-                            requested_model_for_log.clone(),
-                            "reasoning-effort-error-body",
-                        );
-                        finalize_agent_generation(
-                            &state,
-                            &request_id,
-                            active_agent_attempt_id.take(),
-                            log,
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::StreamError,
-                            Some(status),
-                            Some("reasoning_effort_error_body".to_string()),
-                            "reasoning_error_body",
-                            shadow_affinity_decision.clone(),
-                            Some(&current_send_diagnostics),
-                        )
-                        .await;
-                        state
-                            .metrics
-                            .record_error("reasoning_effort_error_body", &err.to_string())
-                            .await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("failed to read upstream error body: {err}"),
-                        );
-                    }
-                };
-                let error_summary = upstream_error_summary(&body_read.bytes);
-                let explicit_reasoning_rejection = is_explicit_reasoning_effort_rejection(
-                    status,
-                    &body_read.bytes,
-                    &current_effort,
-                );
-                let opaque_reasoning_probe = !explicit_reasoning_rejection
-                    && should_probe_opaque_reasoning_fallback(
-                        status,
-                        &body_read.bytes,
-                        &diagnostics.reasoning,
+            let body_read = match read_upstream_body_with_diagnostics(
+                pending_upstream
+                    .take()
+                    .expect("the pending upstream response must exist before reasoning settlement"),
+                &content_type,
+                started,
+                upstream_response_headers_at_ms,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let log = upstream_transport_failure_log(
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &active_request_channel,
+                        &decision,
+                        None,
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
+                        "reasoning-effort-error-body",
                     );
-                if explicit_reasoning_rejection || opaque_reasoning_probe {
-                    if explicit_reasoning_rejection {
-                        note_reasoning_effort_rejection(
-                            &state,
-                            &decision,
-                            &active_request_channel,
-                            &current_effort,
-                        )
-                        .await;
-                        if let Err(err) = persist_model_reasoning_effort_fallback(
-                            &state,
-                            &decision,
-                            &current_effort,
-                            &next_effort,
-                        )
-                        .await
-                        {
-                            state
-                                .metrics
-                                .record_error("reasoning_effort_persist", &err.to_string())
-                                .await;
-                        }
-                    }
-                    finish_agent_attempt_lifecycle(
+                    finalize_agent_generation(
                         &state,
+                        &request_id,
                         active_agent_attempt_id.take(),
-                        AgentAttemptOutcome::HttpError,
+                        log,
+                        AgentAttemptOutcome::StreamError,
+                        AgentInboundOutcome::StreamError,
                         Some(status),
-                        Some(
-                            if explicit_reasoning_rejection {
-                                "reasoning_effort_rejected"
-                            } else {
-                                "reasoning_effort_opaque_502"
-                            }
-                            .to_string(),
-                        ),
-                        if explicit_reasoning_rejection {
-                            "reasoning_rejected"
-                        } else {
-                            "reasoning_opaque_502"
-                        },
-                        started.elapsed().as_millis() as u64,
+                        Some("reasoning_effort_error_body".to_string()),
+                        "reasoning_error_body",
+                        None,
+                        None,
+                        vec![("reasoning_effort_error_body".to_string(), err.to_string())],
+                        shadow_affinity_decision.clone(),
                         Some(&current_send_diagnostics),
                     )
                     .await;
-                    state
-                        .metrics
-                        .record_error(
-                            if explicit_reasoning_rejection {
-                                "reasoning_effort_rejected"
-                            } else {
-                                "reasoning_effort_opaque_502"
-                            },
-                            &error_summary,
-                        )
-                        .await;
-                    state.metrics.record_retry().await;
-                    set_request_reasoning_effort(
-                        &mut active_upstream_body,
-                        &active_request_channel,
-                        &next_effort,
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("failed to read upstream error body: {err}"),
                     );
-                    let original_reasoning_diagnostics = diagnostics.reasoning.clone();
-                    diagnostics.reasoning.effective = Some(next_effort.clone());
-                    if explicit_reasoning_rejection {
-                        diagnostics.reasoning.source = Some(
-                            if diagnostics.reasoning.configured.is_some() {
-                                "model_override_fallback"
-                            } else {
-                                "agent_reasoning_fallback"
-                            }
-                            .to_string(),
-                        );
-                    }
-                    diagnostics.send_body_bytes =
-                        serialized_body_len(&active_request_channel, &active_upstream_body);
-                    diagnostics.send_body_is_delta = false;
-                    prefix_state_update_key = None;
-                    eligible = false;
+                }
+            };
 
-                    let evidence = if explicit_reasoning_rejection {
-                        ReasoningEvidence::ExplicitRejection
-                    } else {
-                        ReasoningEvidence::Opaque502Probe
-                    };
-                    let fallback_token = agent_attempt_gate
-                        .as_mut()
-                        .expect("Agent reasoning fallback requires an attempt gate")
-                        .reasoning_compatibility(evidence)
-                        .expect("classified reasoning fallback must fit the attempt budget");
-                    active_agent_attempt_id = Some(fallback_token.attempt_id().to_string());
-                    let send_outcome = match send_agent_upstream_request(
+            if is_explicit_reasoning_effort_rejection(status, &body_read.bytes, &current_effort) {
+                let rejected =
+                    rejected_reasoning_efforts(&state, &decision, &active_request_channel).await;
+                if let Some(next_effort) = next_lower_reasoning_effort(&current_effort, &rejected) {
+                    note_reasoning_effort_rejection(
                         &state,
-                        decision.provider.use_system_proxy,
-                        &active_url,
-                        &api_key,
-                        &active_request_channel,
-                        &active_upstream_body,
-                        &headers,
-                        decision.provider.custom_user_agent.as_deref(),
-                        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
                         &decision,
-                        fallback_token,
+                        &active_request_channel,
+                        &current_effort,
                     )
-                    .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => {
-                            let log = upstream_transport_failure_log(
-                                &request_id,
-                                &started,
-                                &client_channel,
-                                &active_request_channel,
-                                &decision,
-                                None,
-                                provider_prefix_key.as_deref(),
-                                provider_prefix_fingerprint.as_deref(),
-                                &prefix_guard_wait,
-                                local_prepare_ms,
-                                &diagnostics,
-                                &active_upstream_body,
-                                false,
-                                &response_session_reuse_diagnostics,
-                                requested_model_for_log.clone(),
-                                "reasoning-effort-fallback-transport",
-                            );
-                            finalize_agent_generation(
-                                &state,
-                                &request_id,
-                                active_agent_attempt_id.take(),
-                                log,
-                                AgentAttemptOutcome::TransportError,
-                                AgentInboundOutcome::TransportError,
-                                None,
-                                Some("upstream_transport".to_string()),
-                                "reasoning_fallback_transport_error",
-                                shadow_affinity_decision.clone(),
-                                Some(&current_send_diagnostics),
-                            )
-                            .await;
-                            state
-                                .metrics
-                                .record_error("upstream_transport", &err.to_string())
-                                .await;
-                            return json_error(
-                                StatusCode::BAD_GATEWAY,
-                                &format!("upstream reasoning fallback failed: {err}"),
-                            );
-                        }
-                    };
-                    current_send_diagnostics = send_outcome.diagnostics.clone();
-                    upstream_request_diagnostics.absorb(&current_send_diagnostics);
-                    pending_upstream = Some(send_outcome.response);
-                    upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-                    let retried_upstream = pending_upstream.as_ref().expect(
-                        "the pending upstream response must exist after reasoning fallback",
-                    );
-                    status = retried_upstream.status().as_u16();
-                    content_type = retried_upstream
-                        .headers()
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or("application/json")
-                        .to_string();
-                    is_success_status = StatusCode::from_u16(status)
-                        .map(|status| status.is_success())
-                        .unwrap_or(false);
-                    if is_success_status && opaque_reasoning_probe {
-                        note_reasoning_effort_rejection(
-                            &state,
-                            &decision,
-                            &active_request_channel,
-                            &current_effort,
-                        )
-                        .await;
-                        if let Err(err) = persist_model_reasoning_effort_fallback(
-                            &state,
-                            &decision,
-                            &current_effort,
-                            &next_effort,
-                        )
-                        .await
-                        {
-                            state
-                                .metrics
-                                .record_error("reasoning_effort_persist", &err.to_string())
-                                .await;
-                        }
-                        diagnostics.reasoning.source = Some(
-                            if diagnostics.reasoning.configured.is_some() {
-                                "model_override_opaque_502_fallback"
-                            } else {
-                                "agent_reasoning_opaque_502_fallback"
-                            }
-                            .to_string(),
-                        );
-                    } else if !is_success_status {
-                        let fallback_body_read = match read_upstream_body_with_diagnostics(
-                            pending_upstream.take().expect(
-                                "the pending upstream response must exist after reasoning fallback",
-                            ),
-                            &content_type,
-                            started,
-                            upstream_response_headers_at_ms,
-                        )
-                        .await
-                        {
-                            Ok(outcome) => outcome,
-                            Err(err) => {
-                                let log = upstream_transport_failure_log(
-                                    &request_id,
-                                    &started,
-                                    &client_channel,
-                                    &active_request_channel,
-                                    &decision,
-                                    None,
-                                    provider_prefix_key.as_deref(),
-                                    provider_prefix_fingerprint.as_deref(),
-                                    &prefix_guard_wait,
-                                    local_prepare_ms,
-                                    &diagnostics,
-                                    &active_upstream_body,
-                                    false,
-                                    &response_session_reuse_diagnostics,
-                                    requested_model_for_log.clone(),
-                                    "reasoning-effort-fallback-error-body",
-                                );
-                                finalize_agent_generation(
-                                    &state,
-                                    &request_id,
-                                    active_agent_attempt_id.take(),
-                                    log,
-                                    AgentAttemptOutcome::StreamError,
-                                    AgentInboundOutcome::StreamError,
-                                    Some(status),
-                                    Some("reasoning_effort_error_body".to_string()),
-                                    "reasoning_fallback_error_body",
-                                    shadow_affinity_decision.clone(),
-                                    Some(&current_send_diagnostics),
-                                )
-                                .await;
-                                state
-                                    .metrics
-                                    .record_error("reasoning_effort_error_body", &err.to_string())
-                                    .await;
-                                return json_error(
-                                    StatusCode::BAD_GATEWAY,
-                                    &format!("failed to read upstream reasoning fallback error body: {err}"),
-                                );
-                            }
-                        };
-                        if explicit_reasoning_rejection
-                            && is_explicit_reasoning_effort_rejection(
-                                status,
-                                &fallback_body_read.bytes,
-                                &next_effort,
-                            )
-                        {
-                            note_reasoning_effort_rejection(
-                                &state,
-                                &decision,
-                                &active_request_channel,
-                                &next_effort,
-                            )
-                            .await;
-                            let rejected_after_fallback = rejected_reasoning_efforts(
-                                &state,
-                                &decision,
-                                &active_request_channel,
-                            )
-                            .await;
-                            if let Some(next_after_fallback) =
-                                next_lower_reasoning_effort(&next_effort, &rejected_after_fallback)
-                            {
-                                if let Err(err) = persist_model_reasoning_effort_fallback(
-                                    &state,
-                                    &decision,
-                                    &next_effort,
-                                    &next_after_fallback,
-                                )
-                                .await
-                                {
-                                    state
-                                        .metrics
-                                        .record_error("reasoning_effort_persist", &err.to_string())
-                                        .await;
-                                }
-                            }
-                        }
-                        if opaque_reasoning_probe {
-                            diagnostics.reasoning = original_reasoning_diagnostics;
-                        }
-                        pre_read_body = Some(fallback_body_read);
-                    }
-                } else {
-                    pre_read_body = Some(body_read);
+                    .await;
+                    let _ = journal_model_reasoning_effort_fallback(
+                        &state,
+                        &decision,
+                        &current_effort,
+                        &next_effort,
+                    )
+                    .await;
+                    // The next independent Agent turn has a known compatible
+                    // request shape. Do not let this parameter-specific 5xx
+                    // suppress that turn through the generic prefix cooldown.
+                    prefix_state_update_key = None;
+                    request_metric_errors.push((
+                        "reasoning_effort_rejected".to_string(),
+                        upstream_error_summary(&body_read.bytes),
+                    ));
                 }
             }
+            // Preserve the original upstream failure for this inbound turn.
+            // A reasoning downgrade changes only the exact model's next turn;
+            // it must never authorize another POST for the same Agent request.
+            pre_read_body = Some(body_read);
         }
     }
 
+    upstream_request_diagnostics.sent_cache_capability_fields =
+        cache_capability::present_fields(&active_upstream_body);
+    upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
     let is_stream = should_proxy_upstream_as_stream(
         is_success_status,
         client_requested_stream,
-        cross_protocol_stream,
+        buffered_cross_protocol_stream,
+        responses_from_incremental_cross_protocol_stream,
         &active_upstream_body,
         &content_type,
     );
 
     if is_stream {
         let selected_provider_id = decision.provider.id.clone();
-        let automatic_cache_probe_scope = agent_generation.then(|| AutomaticCacheProbeScope {
-            provider_id: decision.provider.id.clone(),
-            provider_revision: decision.provider.updated_at.timestamp_millis(),
-            model_id: decision.model.clone(),
-            channel: active_request_channel.clone(),
-            selected_key: selected_provider_key.clone(),
-        });
+        // This only schedules bookkeeping. Start it before the owned relay can
+        // wait through a long stream so concurrent key selection sees success
+        // promptly without blocking the response handoff.
+        let _ = spawn_selected_provider_key_success(
+            state.clone(),
+            selected_provider_id,
+            &selected_provider_key,
+        );
+        let mut relay_decision = decision;
+        relay_decision.upstream_channel = active_request_channel.clone();
         let response = stream_upstream(
             state.clone(),
             pending_upstream
@@ -3413,7 +2913,7 @@ async fn run_generation_for_authorized_agent(
             started,
             request_id,
             client_channel,
-            decision,
+            relay_decision,
             eligible,
             cache_keys,
             metrics_cache_key.clone(),
@@ -3423,20 +2923,20 @@ async fn run_generation_for_authorized_agent(
             provider_prefix_fingerprint.clone(),
             provider_prefix_family_key.clone(),
             route_affinity_key.clone(),
-            config,
-            prefix_guard,
+            config.clone(),
+            None,
             prefix_state_update_key.clone(),
-            response_session_guard,
+            None,
             response_session_key.clone(),
             response_session_scope_key.clone(),
-            full_response_input.clone(),
+            full_response_input,
             active_used_response_session,
             retried_full_response,
             diagnostics.clone(),
             tail_input_diagnostics.clone(),
             session_anchor_diagnostics.clone(),
             response_session_reuse_diagnostics.clone(),
-            codex_chat_tool_context.clone(),
+            cross_protocol_tool_context.clone(),
             agent_log_id.clone(),
             agent_log_label.clone(),
             requested_model_for_log.clone(),
@@ -3447,22 +2947,13 @@ async fn run_generation_for_authorized_agent(
             active_agent_attempt_id.take(),
             shadow_affinity_decision,
             agent_generation,
-            automatic_cache_probe_scope,
+            response_handoff,
         )
         .await;
-
-        // A successful multi-key status update takes the config write lock.
-        // The relay is already running before that bookkeeping is scheduled,
-        // so a concurrent settings save cannot delay the first SSE packet.
-        let _ = spawn_selected_provider_key_success(
-            state,
-            selected_provider_id,
-            &selected_provider_key,
-        );
         return response;
     }
 
-    let mut body_read = match pre_read_body {
+    let body_read = match pre_read_body {
         Some(outcome) => outcome,
         None => match read_upstream_body_with_diagnostics(
             pending_upstream
@@ -3477,6 +2968,8 @@ async fn run_generation_for_authorized_agent(
             Ok(outcome) => outcome,
             Err(err) => {
                 if agent_generation {
+                    let mut terminal_errors = request_metric_errors.clone();
+                    terminal_errors.push(("upstream_body".to_string(), err.to_string()));
                     let log = upstream_transport_failure_log(
                         &request_id,
                         &started,
@@ -3505,15 +2998,42 @@ async fn run_generation_for_authorized_agent(
                         Some(status),
                         Some("upstream_body".to_string()),
                         "body_read_error",
+                        None,
+                        None,
+                        terminal_errors,
                         shadow_affinity_decision.clone(),
                         Some(&upstream_request_diagnostics),
                     )
                     .await;
+                } else {
+                    let mut log = upstream_transport_failure_log(
+                        &request_id,
+                        &started,
+                        &client_channel,
+                        &active_request_channel,
+                        &decision,
+                        eligible.then_some(metrics_cache_key.as_str()),
+                        provider_prefix_key.as_deref(),
+                        provider_prefix_fingerprint.as_deref(),
+                        &prefix_guard_wait,
+                        local_prepare_ms,
+                        &diagnostics,
+                        &active_upstream_body,
+                        active_used_response_session,
+                        &response_session_reuse_diagnostics,
+                        requested_model_for_log.clone(),
+                        "upstream-body",
+                    );
+                    log.status = status;
+                    log.upstream_attempt_total = Some(upstream_request_diagnostics.attempts.max(1));
+                    log.upstream_attempts = Some(upstream_request_diagnostics.attempts.max(1));
+                    let mut transaction = MetricsTransaction::upstream(log);
+                    for (scope, message) in &request_metric_errors {
+                        transaction.observe_error(scope.clone(), message.clone());
+                    }
+                    transaction.observe_error("upstream_body", err.to_string());
+                    state.metrics.commit(transaction).await;
                 }
-                state
-                    .metrics
-                    .record_error("upstream_body", &err.to_string())
-                    .await;
                 return json_error(
                     StatusCode::BAD_GATEWAY,
                     &format!("failed to read upstream body: {err}"),
@@ -3521,8 +3041,9 @@ async fn run_generation_for_authorized_agent(
             }
         },
     };
-    let mut bytes = body_read.bytes;
-    let automatic_verified_third_party_delta = active_used_response_session
+    let bytes = body_read.bytes;
+    let automatic_response_session_delta = active_used_response_session;
+    let automatic_verified_third_party_delta = automatic_response_session_delta
         && is_verified_third_party_response_session_reuse(&config, &decision);
     if !is_success_status
         && matches!(active_request_channel, Channel::Responses)
@@ -3530,26 +3051,49 @@ async fn run_generation_for_authorized_agent(
     {
         let error_summary = upstream_error_summary(&bytes);
         let rejection = response_session_rejection_classification(status, &error_summary);
-        if automatic_verified_third_party_delta {
+        let defer_session_to_next_inbound = should_defer_response_session_rejection_to_next_inbound(
+            status,
+            automatic_response_session_delta,
+        );
+        if automatic_verified_third_party_delta || defer_session_to_next_inbound {
             response_session_reuse_diagnostics.rejected_status = Some(status);
             if !error_summary.is_empty() {
-                state
-                    .metrics
-                    .record_error("verified_response_session_delta_rejected", &error_summary)
-                    .await;
+                request_metric_errors.push((
+                    if automatic_verified_third_party_delta {
+                        "verified_response_session_delta_rejected"
+                    } else {
+                        "response_session_delta_rejected"
+                    }
+                    .to_string(),
+                    error_summary.clone(),
+                ));
             }
-            note_response_session_error_cooldown_for_rejection(
-                &state,
-                response_session_cooldown_key.as_deref(),
-                status,
-                &error_summary,
-            )
-            .await;
-            if matches!(
-                rejection,
-                ResponseSessionRejectionClass::StaleReference
-                    | ResponseSessionRejectionClass::Unsupported
-            ) {
+            if defer_session_to_next_inbound {
+                defer_response_session_delta_to_next_inbound(
+                    &state,
+                    response_session_cooldown_key.as_deref(),
+                    response_session_key.as_deref(),
+                    &active_upstream_body,
+                    status,
+                    &error_summary,
+                )
+                .await;
+            } else {
+                note_response_session_error_cooldown_for_rejection(
+                    &state,
+                    response_session_cooldown_key.as_deref(),
+                    status,
+                    &error_summary,
+                )
+                .await;
+            }
+            if !defer_session_to_next_inbound
+                && matches!(
+                    rejection,
+                    ResponseSessionRejectionClass::StaleReference
+                        | ResponseSessionRejectionClass::Unsupported
+                )
+            {
                 let stale_response_id = previous_response_id_from_request(&active_upstream_body);
                 clear_response_session_reference(
                     &state,
@@ -3558,7 +3102,9 @@ async fn run_generation_for_authorized_agent(
                 )
                 .await;
             }
-            if rejection == ResponseSessionRejectionClass::Unsupported {
+            if automatic_verified_third_party_delta
+                && rejection == ResponseSessionRejectionClass::Unsupported
+            {
                 invalidate_verified_third_party_response_session_reuse(
                     &state,
                     &decision.provider.id,
@@ -3567,37 +3113,9 @@ async fn run_generation_for_authorized_agent(
                 )
                 .await;
             }
-        } else if allow_automatic_upstream_retry
+        } else if !active_used_response_session
             && rejection == ResponseSessionRejectionClass::Unsupported
         {
-            record_upstream_response_observation(
-                &state,
-                &request_id,
-                &started,
-                &client_channel,
-                &active_request_channel,
-                &decision,
-                eligible.then_some(metrics_cache_key.as_str()),
-                provider_prefix_key.as_deref(),
-                provider_prefix_fingerprint.as_deref(),
-                &prefix_guard_wait,
-                local_prepare_ms,
-                &diagnostics,
-                &active_upstream_body,
-                active_used_response_session,
-                &response_session_reuse_diagnostics,
-                requested_model_for_log.clone(),
-                current_non_stream_upstream_call_source(
-                    skip_prefix_guard_for_sync_responses,
-                    active_responses_non_stream_chat_compat,
-                    responses_sync_main_chat_compat_fallback,
-                ),
-                status,
-                &current_send_diagnostics,
-                agent_log_id.clone(),
-                agent_log_label.clone(),
-            )
-            .await;
             note_response_session_error_cooldown_for_rejection(
                 &state,
                 response_session_cooldown_key.as_deref(),
@@ -3605,133 +3123,63 @@ async fn run_generation_for_authorized_agent(
                 &error_summary,
             )
             .await;
-            if let Some(compat) =
-                maybe_prepare_previous_response_compat_body(&state, &active_upstream_body)
-                    .await
-                    .or_else(|| {
-                        strip_previous_response_id_for_compat(
-                            &active_upstream_body,
-                            "client_previous_response_id_unsupported_retry",
-                        )
-                    })
-            {
-                if !error_summary.is_empty() {
-                    state
-                        .metrics
-                        .record_error("client_previous_response_id_unsupported", &error_summary)
-                        .await;
-                }
-                state.metrics.record_retry().await;
-                response_session_reuse_diagnostics.rejected_status = Some(status);
-                response_session_reuse_diagnostics.skip_reason = Some(compat.reason.to_string());
-                active_upstream_body = compat.body;
-                apply_responses_non_stream_upstream_sse_compat(
-                    &mut active_upstream_body,
-                    responses_non_stream_upstream_sse_compat,
-                );
-                apply_native_cache_controls(
-                    &mut active_upstream_body,
-                    &config,
-                    &decision,
-                    &active_request_channel,
-                    selected_provider_key.key_id.as_deref(),
-                );
-                active_used_response_session = false;
-                diagnostics.send_body_bytes =
-                    serialized_body_len(&active_request_channel, &active_upstream_body);
-                diagnostics.send_body_is_delta = false;
-
-                let send_outcome = match send_main_upstream_request(
-                    &state,
-                    decision.provider.use_system_proxy,
-                    &active_url,
-                    &api_key,
-                    &active_request_channel,
-                    &active_upstream_body,
-                    &headers,
-                    decision.provider.custom_user_agent.as_deref(),
-                    skip_prefix_guard_for_sync_responses,
-                    decision.provider.request_body_gzip_enabled,
-                    !client_requested_stream,
-                )
-                .await
-                {
-                    Ok(response) => response,
-                    Err(err) => {
-                        record_upstream_transport_failure(
-                            &state,
-                            &request_id,
-                            &started,
-                            &client_channel,
-                            &active_request_channel,
-                            &decision,
-                            eligible.then_some(metrics_cache_key.as_str()),
-                            provider_prefix_key.as_deref(),
-                            provider_prefix_fingerprint.as_deref(),
-                            &prefix_guard_wait,
-                            local_prepare_ms,
-                            &diagnostics,
-                            &active_upstream_body,
-                            active_used_response_session,
-                            &response_session_reuse_diagnostics,
-                            requested_model_for_log.clone(),
-                            "previous-response-id-compat-transport",
-                        )
-                        .await;
-                        state
-                            .metrics
-                            .record_error("upstream_transport", &err.to_string())
-                            .await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("upstream request failed: {err}"),
-                        );
-                    }
-                };
-                current_send_diagnostics = send_outcome.diagnostics.clone();
-                upstream_request_diagnostics.absorb(&current_send_diagnostics);
-                upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
-                status = send_outcome.response.status().as_u16();
-                content_type = send_outcome
-                    .response
-                    .headers()
-                    .get(header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("application/json")
-                    .to_string();
-                is_success_status = StatusCode::from_u16(status)
-                    .map(|status| status.is_success())
-                    .unwrap_or(false);
-                body_read = match read_upstream_body_with_diagnostics(
-                    send_outcome.response,
-                    &content_type,
-                    started,
-                    upstream_response_headers_at_ms,
-                )
-                .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(err) => {
-                        state
-                            .metrics
-                            .record_error("upstream_body", &err.to_string())
-                            .await;
-                        return json_error(
-                            StatusCode::BAD_GATEWAY,
-                            &format!("failed to read upstream body: {err}"),
-                        );
-                    }
-                };
-                bytes = body_read.bytes;
+            if !error_summary.is_empty() {
+                request_metric_errors.push((
+                    "client_previous_response_id_unsupported".to_string(),
+                    error_summary,
+                ));
             }
+            response_session_reuse_diagnostics.rejected_status = Some(status);
+            response_session_reuse_diagnostics.skip_reason =
+                Some("client_previous_response_id_unsupported_next_inbound".to_string());
         }
     }
+
+    // Buffered Responses -> Anthropic fallbacks can still receive an SSE body
+    // from a non-streaming upstream.  Settle from the canonical Responses JSON,
+    // not the raw upstream SSE: otherwise an HTTP 200 `event: error` or a
+    // truncated stream reaches the client as `response.failed` but is recorded
+    // as a successful upstream call.
+    let anthropic_responses_json = if matches!(client_channel, Channel::Responses)
+        && matches!(active_request_channel, Channel::Anthropic)
+    {
+        let context = streaming_codex_anthropic::AnthropicResponsesContext {
+            tool_context: cross_protocol_tool_context.clone().unwrap_or_default(),
+        };
+        let converted = if is_text_event_stream(&content_type) {
+            streaming_codex_anthropic::anthropic_sse_to_responses_json(
+                &bytes,
+                context,
+                decision.model.clone(),
+            )
+        } else {
+            streaming_codex_anthropic::anthropic_json_to_responses_json(
+                &bytes,
+                context,
+                decision.model.clone(),
+            )
+        };
+        Some(converted.unwrap_or_else(|error| {
+            serde_json::to_vec(&json!({
+                "error": {
+                    "message": format!("failed to convert Anthropic response: {error}"),
+                    "type": "atoapi_anthropic_conversion_error"
+                }
+            }))
+            .unwrap_or_else(|_| bytes.clone())
+        }))
+    } else {
+        None
+    };
     let bytes_for_client = if matches!(client_channel, Channel::Responses)
         && !client_requested_stream
         && is_text_event_stream(&content_type)
     {
         match active_request_channel {
             Channel::Chat => chat_sse_to_non_stream_json(&bytes, &decision.model),
+            Channel::Anthropic => anthropic_responses_json
+                .clone()
+                .unwrap_or_else(|| bytes.clone()),
             _ => responses_sse_to_non_stream_json(
                 &bytes,
                 &decision.model,
@@ -3741,16 +3189,31 @@ async fn run_generation_for_authorized_agent(
     } else {
         bytes.clone()
     };
-    if is_success_status && json_body_has_error(&bytes_for_client) {
-        let error_summary = upstream_error_summary(&bytes_for_client);
-        state
-            .metrics
-            .record_error("upstream_sse_error", &error_summary)
-            .await;
+    let settlement_bytes = anthropic_responses_json
+        .as_deref()
+        .unwrap_or(&bytes_for_client);
+    let upstream_status_for_cache_capability = status;
+    if is_success_status && json_body_has_error(settlement_bytes) {
+        let error_summary = upstream_error_summary(settlement_bytes);
+        request_metric_errors.push(("upstream_sse_error".to_string(), error_summary));
         status = StatusCode::BAD_GATEWAY.as_u16();
         is_success_status = false;
     }
-    let key_error_summary = (!is_success_status).then(|| upstream_error_summary(&bytes_for_client));
+    let key_error_summary = (!is_success_status).then(|| upstream_error_summary(settlement_bytes));
+    let cache_capability_rejection_summary = (!is_success_status)
+        .then(|| structured_upstream_error_summary(settlement_bytes))
+        .flatten();
+    if let Some(error_summary) = cache_capability_rejection_summary.as_deref() {
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &active_request_channel,
+            &upstream_request_diagnostics,
+            upstream_status_for_cache_capability,
+            error_summary,
+        )
+        .await;
+    }
     note_selected_provider_key_status(
         &state,
         &decision.provider.id,
@@ -3774,19 +3237,18 @@ async fn run_generation_for_authorized_agent(
     }
     let sync_compact_diagnostic_only =
         skip_prefix_guard_for_sync_responses || active_responses_non_stream_chat_compat;
+    let anthropic_usage_bytes = if matches!(client_channel, Channel::Responses)
+        && matches!(active_request_channel, Channel::Anthropic)
+        && is_success_status
+    {
+        anthropic_responses_json
+            .clone()
+            .unwrap_or_else(|| bytes.clone())
+    } else {
+        bytes.clone()
+    };
     let usage_observation = if is_success_status && sync_compact_diagnostic_only {
-        let raw = collect_provider_usage_for_diagnostics(&bytes, &decision);
-        if let Some(record) = raw.as_ref() {
-            state
-                .metrics
-                .record_usage_with_cold_start_key(
-                    record.clone(),
-                    response_session_key
-                        .as_deref()
-                        .or(session_anchor_diagnostics.hash.as_deref()),
-                )
-                .await;
-        }
+        let raw = collect_provider_usage_for_diagnostics(&anthropic_usage_bytes, &decision);
         raw.map(|raw| ProviderUsageObservation {
             effective: raw.clone(),
             raw,
@@ -3794,12 +3256,9 @@ async fn run_generation_for_authorized_agent(
     } else if is_success_status {
         collect_provider_usage(
             &state,
-            &bytes,
+            &anthropic_usage_bytes,
             &decision,
             prefix_state_update_key.as_deref(),
-            response_session_key
-                .as_deref()
-                .or(session_anchor_diagnostics.hash.as_deref()),
             active_used_response_session,
         )
         .await
@@ -3872,17 +3331,17 @@ async fn run_generation_for_authorized_agent(
         .await;
     }
     if !is_success_status {
-        let error_summary = upstream_error_summary(&bytes);
+        let error_summary = upstream_error_summary(settlement_bytes);
         if should_cooldown_prefix_after_status(status)
             || (responses_main_retry_guard
                 && should_cooldown_responses_sync_main_after_status(status))
         {
             note_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
         }
-        state
-            .metrics
-            .record_error(upstream_error_scope(status, &error_summary), &error_summary)
-            .await;
+        request_metric_errors.push((
+            upstream_error_scope(status, &error_summary).to_string(),
+            error_summary,
+        ));
     } else if !active_responses_non_stream_chat_compat {
         clear_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
     }
@@ -3892,20 +3351,24 @@ async fn run_generation_for_authorized_agent(
         } else {
             content_type.clone()
         };
-    let mut response_bytes = if matches!(client_channel, Channel::Responses)
+    let mut response_bytes = if let Some(anthropic_response) = anthropic_responses_json.as_ref() {
+        anthropic_response.clone()
+    } else if matches!(client_channel, Channel::Responses)
         && matches!(active_request_channel, Channel::Chat)
         && codex_responses_chat_compat
     {
         serde_json::from_slice::<Value>(&bytes_for_client)
             .ok()
             .and_then(|value| {
-                codex_chat_tool_context.as_ref().and_then(|tool_context| {
-                    transform_codex_chat::chat_completion_to_response_with_context(
-                        value,
-                        tool_context,
-                    )
-                    .ok()
-                })
+                cross_protocol_tool_context
+                    .as_ref()
+                    .and_then(|tool_context| {
+                        transform_codex_chat::chat_completion_to_response_with_context(
+                            value,
+                            tool_context,
+                        )
+                        .ok()
+                    })
             })
             .and_then(|value| serde_json::to_vec(&value).ok())
             .unwrap_or_else(|| {
@@ -3931,7 +3394,29 @@ async fn run_generation_for_authorized_agent(
     }
     if cross_protocol_stream {
         response_content_type = "text/event-stream".to_string();
-        response_bytes = response_json_to_sse(&client_channel, &response_bytes);
+        response_bytes = if matches!(client_channel, Channel::Responses)
+            && matches!(active_request_channel, Channel::Anthropic)
+        {
+            let context = streaming_codex_anthropic::AnthropicResponsesContext {
+                tool_context: cross_protocol_tool_context.clone().unwrap_or_default(),
+            };
+            let converted = if is_text_event_stream(&content_type) {
+                streaming_codex_anthropic::anthropic_sse_to_responses_sse(
+                    &bytes,
+                    context,
+                    decision.model.clone(),
+                )
+            } else {
+                streaming_codex_anthropic::anthropic_json_to_responses_sse(
+                    &bytes,
+                    context,
+                    decision.model.clone(),
+                )
+            };
+            converted.unwrap_or_else(|_| response_json_to_sse(&client_channel, &response_bytes))
+        } else {
+            response_json_to_sse(&client_channel, &response_bytes)
+        };
     }
     let elapsed = started.elapsed().as_millis() as u64;
     let mut request_log = RequestLog {
@@ -3944,6 +3429,7 @@ async fn run_generation_for_authorized_agent(
         client_channel: client_channel.label().to_string(),
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
+        provider_id: Some(decision.provider.id.clone()),
         model: decision.model.clone(),
         requested_model: requested_model_for_log.clone(),
         agent_reasoning_effort: None,
@@ -3971,11 +3457,7 @@ async fn run_generation_for_authorized_agent(
             if confirmed_compaction {
                 "responses-compaction-v2"
             } else if active_responses_non_stream_chat_compat {
-                if responses_sync_main_chat_compat_fallback {
-                    "responses-sync-main-chat-compat-fallback"
-                } else {
-                    "responses-sync-main-chat-compat"
-                }
+                "responses-sync-main-chat-compat"
             } else if skip_prefix_guard_for_sync_responses {
                 "responses-sync-main"
             } else {
@@ -4093,6 +3575,7 @@ async fn run_generation_for_authorized_agent(
         session_anchor_source: None,
         session_anchor_changed: None,
         session_anchor_peer_count: None,
+        inbound_body_bytes: None,
         original_body_bytes: None,
         send_body_bytes: None,
         send_body_is_delta: None,
@@ -4118,7 +3601,7 @@ async fn run_generation_for_authorized_agent(
                 "response_completed",
             )
         } else {
-            let summary = upstream_error_summary(&bytes_for_client);
+            let summary = upstream_error_summary(settlement_bytes);
             (
                 AgentAttemptOutcome::HttpError,
                 AgentInboundOutcome::HttpError,
@@ -4136,28 +3619,29 @@ async fn run_generation_for_authorized_agent(
             Some(status),
             error_scope,
             terminal_state,
+            usage_record.clone(),
+            response_session_key
+                .clone()
+                .or(session_anchor_diagnostics.hash.clone()),
+            request_metric_errors.clone(),
             shadow_affinity_decision.clone(),
             Some(&upstream_request_diagnostics),
         )
         .await;
-        if is_success_status {
-            spawn_automatic_cache_capability_probe(
-                state.clone(),
-                AutomaticCacheProbeScope {
-                    provider_id: decision.provider.id.clone(),
-                    provider_revision: decision.provider.updated_at.timestamp_millis(),
-                    model_id: decision.model.clone(),
-                    channel: active_request_channel.clone(),
-                    selected_key: selected_provider_key.clone(),
-                },
+    } else {
+        let mut transaction = MetricsTransaction::upstream(request_log);
+        if let Some(usage_record) = usage_record {
+            transaction.observe_usage(
+                usage_record,
+                response_session_key
+                    .as_deref()
+                    .or(session_anchor_diagnostics.hash.as_deref()),
             );
         }
-    } else {
-        state
-            .metrics
-            .record_upstream_call(request_log.clone())
-            .await;
-        state.metrics.record_request(request_log, true).await;
+        for (scope, message) in request_metric_errors {
+            transaction.observe_error(scope, message);
+        }
+        state.metrics.commit(transaction).await;
     }
 
     if eligible && is_success_status && !confirmed_compaction {
@@ -4260,8 +3744,12 @@ async fn wait_for_provider_prefix_settle(
             let policy = PrefixController::before_request(PrefixControlInput {
                 source_is_exact: source == "exact",
                 avoidable_tokens,
+                fine_avoidable_tokens: state.avoidable_shortfall_tokens_128,
                 avoidable_shortfall_streak: state.avoidable_shortfall_streak,
                 cache_instability_score: state.cache_instability_score,
+                tiny_instability_recovery_safe: state.recent_clean_tiny_gap_streak
+                    >= MIN_CLEAN_TINY_RECOVERY_STREAK
+                    && responses_tiny_instability_recovery_tail_is_clean(current_tail),
                 settle_after_cold_read: state.settle_after_cold_read,
                 compaction_requested,
                 state_age,
@@ -4423,6 +3911,25 @@ async fn note_compact_chat_compat_cooldown(state: &AppState, key: &str) {
     );
 }
 
+async fn compact_endpoint_cooldown_active(state: &AppState, key: &str) -> bool {
+    let mut cooldowns = state.compact_endpoint_cooldowns.lock().await;
+    match cooldowns.get(key).copied() {
+        Some(until) if until > Instant::now() => true,
+        Some(_) => {
+            cooldowns.remove(key);
+            false
+        }
+        None => false,
+    }
+}
+
+async fn note_compact_endpoint_cooldown(state: &AppState, key: &str) {
+    state.compact_endpoint_cooldowns.lock().await.insert(
+        key.to_string(),
+        Instant::now() + std::time::Duration::from_secs(COMPACT_ENDPOINT_COOLDOWN_SECS),
+    );
+}
+
 fn response_session_error_cooldown_key(decision: &RouteDecision) -> Option<String> {
     matches!(decision.upstream_channel, Channel::Responses).then(|| {
         format!(
@@ -4434,6 +3941,7 @@ fn response_session_error_cooldown_key(decision: &RouteDecision) -> Option<Strin
     })
 }
 
+#[cfg(test)]
 async fn response_session_cooldown_active(state: &AppState, key: Option<&str>) -> bool {
     response_session_cooldown_skip_reason(state, key)
         .await
@@ -4502,16 +4010,10 @@ async fn invalidate_verified_third_party_response_session_reuse(
         provider_id,
         model_id,
         ProviderResponseSessionReuseStatus::Unsupported,
+        false,
         Some(message),
     );
-    let save_error = config.save(&state.config_path).err();
-    drop(config);
-    if let Some(err) = save_error {
-        state
-            .metrics
-            .record_error("response_session_reuse_capability_save", &err.to_string())
-            .await;
-    }
+    state.journal_config(&config);
 }
 
 async fn note_response_session_error_cooldown_internal(
@@ -4537,12 +4039,7 @@ async fn note_response_session_error_cooldown_internal(
         },
     );
     drop(cooldowns);
-    if let Err(err) = state.persist_runtime_state().await {
-        state
-            .metrics
-            .record_error("runtime_state_save", &err.to_string())
-            .await;
-    }
+    state.journal_runtime_state();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4779,14 +4276,6 @@ fn should_send_responses_non_stream_as_upstream_sse(
     )
 }
 
-fn should_fallback_responses_sync_main_to_chat_compat(
-    status: u16,
-    sync_main: bool,
-    already_chat_compat: bool,
-) -> bool {
-    sync_main && !already_chat_compat && matches!(status, 400 | 401 | 405 | 500..=504 | 520 | 524)
-}
-
 fn should_fallback_chat_compat_compact_to_responses(
     status: u16,
     sync_main: bool,
@@ -4867,10 +4356,7 @@ fn should_fallback_official_responses_compact_via_chat_compat(
         || body_bytes >= 8_192
 }
 
-fn should_use_chat_non_stream_compact_fast_path(
-    _tail: &TailInputDiagnostics,
-    _chat_body_bytes: u64,
-) -> bool {
+fn should_use_chat_non_stream_compact_fast_path() -> bool {
     false
 }
 
@@ -5131,7 +4617,8 @@ fn upstream_ttft_ms(ttft_ms: u64, prefix_guard_wait_ms: Option<u64>) -> u64 {
     ttft_ms.saturating_sub(prefix_guard_wait_ms.unwrap_or_default())
 }
 
-fn upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
+#[cfg(test)]
+fn legacy_upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
     if matches!(channel, Channel::Responses) {
         serialize_responses_body_for_provider_prefix(body).into_bytes()
     } else {
@@ -5142,12 +4629,12 @@ fn upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
 fn should_skip_request_body_gzip_for_cold_stream(
     channel: &Channel,
     client_requested_stream: bool,
-    body: &Value,
+    body_bytes: usize,
 ) -> bool {
     if !client_requested_stream || !matches!(channel, Channel::Responses) {
         return false;
     }
-    if upstream_request_body_bytes(channel, body).len() < REQUEST_BODY_GZIP_MIN_BYTES {
+    if body_bytes < REQUEST_BODY_GZIP_MIN_BYTES {
         return false;
     }
     false
@@ -5155,7 +4642,10 @@ fn should_skip_request_body_gzip_for_cold_stream(
 
 fn request_body_gzip_compression(body_bytes: usize) -> Compression {
     if body_bytes >= 1_048_576 {
-        Compression::best()
+        // Large request bodies are on the TTFT-critical path. Level 9 adds
+        // tens of milliseconds of CPU for multi-megabyte tool histories while
+        // saving only a small number of bytes versus level 1 on measured data.
+        Compression::fast()
     } else if body_bytes >= REQUEST_BODY_GZIP_MIN_BYTES {
         Compression::default()
     } else {
@@ -5176,14 +4666,6 @@ fn should_retry_without_gzip(status: reqwest::StatusCode) -> bool {
             | reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
             | reqwest::StatusCode::NOT_IMPLEMENTED
     )
-}
-
-fn should_fallback_to_uncompressed(
-    status: reqwest::StatusCode,
-    attempt: usize,
-    max_attempts: usize,
-) -> bool {
-    should_retry_without_gzip(status) && attempt + 1 < max_attempts
 }
 
 fn request_body_gzip_scope_key(url: &str, channel: &Channel) -> String {
@@ -5561,6 +5043,8 @@ async fn observe_provider_prefix_usage(
     learn_state: bool,
 ) -> ProviderPrefixUsageObservation {
     let Some(raw) = raw_usage else {
+        let mut states = state.prefix_states.lock().await;
+        clear_recent_clean_tiny_gap_evidence(&mut states, provider_prefix_key);
         return ProviderPrefixUsageObservation::default();
     };
     let (previous_exact, previous_best, previous_family, next, learn_family) = {
@@ -5599,6 +5083,8 @@ async fn observe_provider_prefix_usage(
                     states.insert(family_key.to_string(), next.clone());
                 }
             }
+        } else if next.is_none() {
+            clear_recent_clean_tiny_gap_evidence(&mut states, key);
         }
         (
             previous_exact,
@@ -5617,16 +5103,28 @@ async fn observe_provider_prefix_usage(
         guard_budget_exhausted,
     }));
     if next.is_some() || learn_family {
-        if let Err(err) = state.persist_runtime_state().await {
-            state
-                .metrics
-                .record_error("runtime_state_save", &err.to_string())
-                .await;
-        }
+        state.journal_runtime_state();
     }
     ProviderPrefixUsageObservation {
         gap,
         previous: previous_best,
+    }
+}
+
+fn clear_recent_clean_tiny_gap_evidence(
+    states: &mut HashMap<String, PrefixWarmState>,
+    provider_prefix_key: Option<&str>,
+) {
+    let Some(key) = provider_prefix_key else {
+        return;
+    };
+    if let Some(prefix) = states.get_mut(key) {
+        prefix.recent_clean_tiny_gap_streak = 0;
+    }
+    if let Some(alias_key) = provider_prefix_state_alias_key(key) {
+        if let Some(prefix) = states.get_mut(&alias_key) {
+            prefix.recent_clean_tiny_gap_streak = 0;
+        }
     }
 }
 
@@ -6451,6 +5949,22 @@ fn responses_tool_tail_burst(current_tail: &TailInputDiagnostics) -> bool {
             && current_tail.tool_output_noise_hint.is_some())
 }
 
+fn responses_tiny_instability_recovery_tail_is_clean(current_tail: &TailInputDiagnostics) -> bool {
+    !responses_tool_tail_burst(current_tail)
+        && !responses_current_tail_makes_avoidable_unreliable(current_tail)
+        && !responses_tail_has_tool_activity(current_tail)
+}
+
+fn responses_tail_has_tool_activity(current_tail: &TailInputDiagnostics) -> bool {
+    current_tail.tool_call_chars > 0
+        || current_tail.tool_output_chars > 0
+        || current_tail.largest_tool_output_chars > 0
+        || matches!(
+            current_tail.source.as_deref(),
+            Some("tool_call") | Some("tool_output") | Some("mixed")
+        )
+}
+
 async fn maybe_reuse_response_session(
     state: &AppState,
     request: &Value,
@@ -6541,21 +6055,18 @@ async fn maybe_reuse_response_session(
         diagnostics.append_delta_match = true;
         diagnostics.delta_items = response_input_item_count(&delta_input) as u64;
 
-        let mut optimized = request.clone();
-        let Some(object) = optimized.as_object_mut() else {
+        let Some(optimized) = build_response_session_delta_body(
+            request,
+            delta_input,
+            &session.response_id,
+            &decision.model,
+        ) else {
             diagnostics.skip_reason = Some("request_not_object".to_string());
             return ResponseSessionReuseOutcome {
                 body: request.clone(),
                 diagnostics,
             };
         };
-        object.insert(
-            "previous_response_id".to_string(),
-            Value::String(session.response_id),
-        );
-        object.insert("input".to_string(), delta_input);
-        object.insert("store".to_string(), Value::Bool(true));
-        object.insert("model".to_string(), Value::String(decision.model.clone()));
         diagnostics.skip_reason = None;
         return ResponseSessionReuseOutcome {
             body: optimized,
@@ -6575,31 +6086,31 @@ async fn maybe_reuse_response_session(
     }
 }
 
-async fn maybe_rescue_response_session_after_413(
-    state: &AppState,
+fn build_response_session_delta_body(
     request: &Value,
-    session_key: Option<&str>,
-    session_scope_key: Option<&str>,
-    decision: &RouteDecision,
-) -> ResponseSessionReuseOutcome {
-    if request.get("previous_response_id").is_some() {
-        let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-        diagnostics.skip_reason = Some("already_has_previous_response_id".to_string());
-        return ResponseSessionReuseOutcome {
-            body: request.clone(),
-            diagnostics,
-        };
+    delta_input: Value,
+    response_id: &str,
+    model: &str,
+) -> Option<Value> {
+    let source = request.as_object()?;
+    let mut optimized = Map::new();
+    for (key, value) in source {
+        if matches!(
+            key.as_str(),
+            "input" | "previous_response_id" | "store" | "model"
+        ) {
+            continue;
+        }
+        optimized.insert(key.clone(), value.clone());
     }
-    maybe_reuse_response_session(
-        state,
-        request,
-        session_key,
-        session_scope_key,
-        decision,
-        true,
-        true,
-    )
-    .await
+    optimized.insert("model".to_string(), Value::String(model.to_string()));
+    optimized.insert(
+        "previous_response_id".to_string(),
+        Value::String(response_id.to_string()),
+    );
+    optimized.insert("input".to_string(), delta_input);
+    optimized.insert("store".to_string(), Value::Bool(true));
+    Some(Value::Object(optimized))
 }
 
 #[cfg(test)]
@@ -6611,7 +6122,7 @@ fn should_attempt_main_response_session_delta(
     current_tail: &TailInputDiagnostics,
     session_anchor: &SessionAnchorDiagnostics,
 ) -> bool {
-    main_response_session_delta_skip_reason(
+    evaluate_main_response_session_delta(
         config,
         decision,
         client_requested_stream,
@@ -6619,7 +6130,30 @@ fn should_attempt_main_response_session_delta(
         current_tail,
         session_anchor,
     )
+    .skip_reason
     .is_none()
+}
+
+#[derive(Debug)]
+struct MainResponseSessionDeltaEvaluation {
+    skip_reason: Option<&'static str>,
+    original_wire_draft: Option<PreparedWireDraft>,
+}
+
+impl MainResponseSessionDeltaEvaluation {
+    const fn skipped(skip_reason: &'static str) -> Self {
+        Self {
+            skip_reason: Some(skip_reason),
+            original_wire_draft: None,
+        }
+    }
+
+    fn measured(skip_reason: Option<&'static str>, original_wire_draft: PreparedWireDraft) -> Self {
+        Self {
+            skip_reason,
+            original_wire_draft: Some(original_wire_draft),
+        }
+    }
 }
 
 /// Return the first reason a main Responses request cannot use a session delta.
@@ -6628,6 +6162,69 @@ fn should_attempt_main_response_session_delta(
 /// "guard not eligible" label hides whether the request is paying the full
 /// history upload because the provider is unverified, the session anchor is
 /// missing, or the tail is simply too small to benefit.
+fn evaluate_main_response_session_delta(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    client_requested_stream: bool,
+    request: &Value,
+    current_tail: &TailInputDiagnostics,
+    session_anchor: &SessionAnchorDiagnostics,
+) -> MainResponseSessionDeltaEvaluation {
+    if !responses_session_reuse_enabled(config) {
+        return MainResponseSessionDeltaEvaluation::skipped("session_reuse_disabled");
+    }
+    if !config.cache.prewarm_enabled {
+        return MainResponseSessionDeltaEvaluation::skipped("session_prewarm_disabled");
+    }
+    if !matches!(decision.upstream_channel, Channel::Responses) {
+        return MainResponseSessionDeltaEvaluation::skipped("upstream_channel_not_responses");
+    }
+    if !client_requested_stream {
+        return MainResponseSessionDeltaEvaluation::skipped("client_stream_disabled");
+    }
+    if !supports_main_response_session_delta(config, decision) {
+        return MainResponseSessionDeltaEvaluation::skipped("provider_session_delta_unverified");
+    }
+    if session_anchor.source.as_deref() != Some("exact") {
+        return MainResponseSessionDeltaEvaluation::skipped(
+            match session_anchor.source.as_deref() {
+                Some("scope-sibling") => "session_anchor_scope_sibling",
+                Some("new-anchor") => "session_anchor_missing",
+                _ => "session_anchor_not_exact",
+            },
+        );
+    }
+    if request.get("previous_response_id").is_some() {
+        return MainResponseSessionDeltaEvaluation::skipped("client_previous_response_id_present");
+    }
+
+    let original_wire_draft = PreparedWireDraft::from_responses_value(request)
+        .expect("an eligible Responses request must be a JSON object");
+    let body_bytes = original_wire_draft.len() as u64;
+    if body_bytes >= 96 * 1024 {
+        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
+    }
+    if current_tail.delta_from_session
+        && (current_tail.tool_output_chars >= 512
+            || current_tail.largest_tool_output_chars >= 512
+            || current_tail.message_chars >= 512
+            || current_tail.input_items >= 2)
+    {
+        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
+    }
+    if current_tail.tool_output_chars >= 2_048
+        || current_tail.largest_tool_output_chars >= 2_048
+        || current_tail.message_chars >= 8_192
+    {
+        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
+    }
+    MainResponseSessionDeltaEvaluation::measured(
+        Some("session_delta_tail_not_large_enough"),
+        original_wire_draft,
+    )
+}
+
+#[cfg(test)]
 fn main_response_session_delta_skip_reason(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -6636,51 +6233,15 @@ fn main_response_session_delta_skip_reason(
     current_tail: &TailInputDiagnostics,
     session_anchor: &SessionAnchorDiagnostics,
 ) -> Option<&'static str> {
-    if !responses_session_reuse_enabled(config) {
-        return Some("session_reuse_disabled");
-    }
-    if !config.cache.prewarm_enabled {
-        return Some("session_prewarm_disabled");
-    }
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return Some("upstream_channel_not_responses");
-    }
-    if !client_requested_stream {
-        return Some("client_stream_disabled");
-    }
-    if !supports_main_response_session_delta(config, decision) {
-        return Some("provider_session_delta_unverified");
-    }
-    if session_anchor.source.as_deref() != Some("exact") {
-        return Some(match session_anchor.source.as_deref() {
-            Some("scope-sibling") => "session_anchor_scope_sibling",
-            Some("new-anchor") => "session_anchor_missing",
-            _ => "session_anchor_not_exact",
-        });
-    }
-    if request.get("previous_response_id").is_some() {
-        return Some("client_previous_response_id_present");
-    }
-
-    let body_bytes = serialized_body_len(&Channel::Responses, request);
-    if body_bytes >= 96 * 1024 {
-        return None;
-    }
-    if current_tail.delta_from_session
-        && (current_tail.tool_output_chars >= 512
-            || current_tail.largest_tool_output_chars >= 512
-            || current_tail.message_chars >= 512
-            || current_tail.input_items >= 2)
-    {
-        return None;
-    }
-    if current_tail.tool_output_chars >= 2_048
-        || current_tail.largest_tool_output_chars >= 2_048
-        || current_tail.message_chars >= 8_192
-    {
-        return None;
-    }
-    Some("session_delta_tail_not_large_enough")
+    evaluate_main_response_session_delta(
+        config,
+        decision,
+        client_requested_stream,
+        request,
+        current_tail,
+        session_anchor,
+    )
+    .skip_reason
 }
 
 fn supports_main_response_session_delta(config: &AppConfig, decision: &RouteDecision) -> bool {
@@ -6714,47 +6275,63 @@ fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>)
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResponseSessionDeltaBodySizes {
+    original_body_bytes: u64,
+    delta_body_bytes: u64,
+}
+
+#[derive(Debug)]
+struct PreparedResponseSessionDelta {
+    body_sizes: ResponseSessionDeltaBodySizes,
+    wire_draft: PreparedWireDraft,
+}
+
+fn response_session_delta_benefit(
+    original: &Value,
+    delta: &Value,
+    original_bytes: u64,
+    current_tail: &TailInputDiagnostics,
+) -> Option<PreparedResponseSessionDelta> {
+    if !response_session_delta_request(delta, original) {
+        return None;
+    }
+    let wire_draft = PreparedWireDraft::from_responses_value(delta)?;
+    let delta_bytes = wire_draft.len() as u64;
+    if delta_bytes >= original_bytes {
+        return None;
+    }
+    let beneficial = if original_bytes >= 96 * 1024 {
+        delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4)
+    } else if current_tail.tool_output_chars >= 2_048
+        || current_tail.largest_tool_output_chars >= 2_048
+        || current_tail.message_chars >= 8_192
+    {
+        delta_bytes.saturating_mul(10) <= original_bytes.saturating_mul(9)
+    } else {
+        delta_bytes.saturating_mul(2) <= original_bytes
+    };
+    beneficial.then_some(PreparedResponseSessionDelta {
+        body_sizes: ResponseSessionDeltaBodySizes {
+            original_body_bytes: original_bytes,
+            delta_body_bytes: delta_bytes,
+        },
+        wire_draft,
+    })
+}
+
+#[cfg(test)]
 fn response_session_delta_is_beneficial(
     original: &Value,
     delta: &Value,
     current_tail: &TailInputDiagnostics,
 ) -> bool {
-    if !response_session_delta_request(delta, original) {
-        return false;
-    }
     let original_bytes = serialized_body_len(&Channel::Responses, original);
-    let delta_bytes = serialized_body_len(&Channel::Responses, delta);
-    if delta_bytes >= original_bytes {
-        return false;
-    }
-    if original_bytes >= 96 * 1024 {
-        return delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4);
-    }
-    if current_tail.tool_output_chars >= 2_048
-        || current_tail.largest_tool_output_chars >= 2_048
-        || current_tail.message_chars >= 8_192
-    {
-        return delta_bytes.saturating_mul(10) <= original_bytes.saturating_mul(9);
-    }
-    delta_bytes.saturating_mul(2) <= original_bytes
-}
-
-fn should_attempt_response_session_rescue_after_413(
-    status: u16,
-    active_used_response_session: bool,
-    active_responses_non_stream_chat_compat: bool,
-    upstream_channel: &Channel,
-    response_session_cooldown_active: bool,
-) -> bool {
-    status == 413
-        && !active_used_response_session
-        && !active_responses_non_stream_chat_compat
-        && matches!(upstream_channel, Channel::Responses)
-        && !response_session_cooldown_active
+    response_session_delta_benefit(original, delta, original_bytes, current_tail).is_some()
 }
 
 fn count_response_session_scope_matches(
-    sessions: &HashMap<String, ResponseSessionState>,
+    sessions: &HashMap<String, Arc<ResponseSessionState>>,
     current_key: &str,
     current_scope_key: Option<&str>,
 ) -> usize {
@@ -6807,22 +6384,22 @@ fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionA
 
 #[cfg(test)]
 fn fallback_response_session(
-    sessions: &HashMap<String, ResponseSessionState>,
+    sessions: &HashMap<String, Arc<ResponseSessionState>>,
     current_key: &str,
     current_scope_key: Option<&str>,
     current_input: &Value,
-) -> Option<ResponseSessionState> {
+) -> Option<Arc<ResponseSessionState>> {
     fallback_response_sessions(sessions, current_key, current_scope_key, current_input)
         .into_iter()
         .next()
 }
 
 fn fallback_response_sessions(
-    sessions: &HashMap<String, ResponseSessionState>,
+    sessions: &HashMap<String, Arc<ResponseSessionState>>,
     current_key: &str,
     current_scope_key: Option<&str>,
     current_input: &Value,
-) -> Vec<ResponseSessionState> {
+) -> Vec<Arc<ResponseSessionState>> {
     let Some(current_scope_key) = current_scope_key else {
         return Vec::new();
     };
@@ -6886,15 +6463,11 @@ fn response_session_delta_request(candidate: &Value, original: &Value) -> bool {
         && candidate.get("input") != original.get("input")
 }
 
-fn should_retry_full_response_after_session_error(
+fn should_defer_response_session_rejection_to_next_inbound(
     status: u16,
     used_response_session: bool,
-    allow_full_retry: bool,
 ) -> bool {
-    if !used_response_session || !allow_full_retry {
-        return false;
-    }
-    matches!(status, 400 | 404 | 409 | 410 | 422)
+    used_response_session && matches!(status, 400 | 404 | 409 | 410 | 422)
 }
 
 async fn clear_response_session_reference(
@@ -6910,190 +6483,32 @@ async fn clear_response_session_reference(
         sessions.retain(|_, session| session.response_id != response_id);
     }
     drop(sessions);
-    if let Err(err) = state.persist_runtime_state().await {
-        state
-            .metrics
-            .record_error("runtime_state_save", &err.to_string())
-            .await;
-    }
+    state.journal_runtime_state();
+}
+
+async fn defer_response_session_delta_to_next_inbound(
+    state: &AppState,
+    response_session_cooldown_key: Option<&str>,
+    response_session_key: Option<&str>,
+    request: &Value,
+    status: u16,
+    error_summary: &str,
+) {
+    note_response_session_error_cooldown_for_rejection(
+        state,
+        response_session_cooldown_key,
+        status,
+        error_summary,
+    )
+    .await;
+    let stale_response_id = previous_response_id_from_request(request);
+    clear_response_session_reference(state, response_session_key, stale_response_id.as_deref())
+        .await;
 }
 
 fn previous_response_id_from_request(request: &Value) -> Option<String> {
     request
         .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-async fn maybe_prepare_previous_response_compat_body(
-    state: &AppState,
-    request: &Value,
-) -> Option<PreviousResponseCompatBody> {
-    let previous_response_id = previous_response_id_from_request(request)?;
-    let current_input = request.get("input")?;
-    if previous_response_id.trim().is_empty() {
-        return None;
-    }
-
-    if let Some(previous_input) =
-        response_session_input_for_response_id(state, &previous_response_id).await
-    {
-        if response_input_can_stand_alone_with_previous_session(&previous_input, current_input) {
-            return strip_previous_response_id_for_compat(
-                request,
-                "client_previous_response_id_self_contained_session",
-            );
-        }
-        if let Some(expanded) = expand_previous_response_id_for_compat(
-            request,
-            &previous_input,
-            "client_previous_response_id_expanded_from_local_session",
-        ) {
-            return Some(expanded);
-        }
-    }
-
-    if response_input_looks_self_contained_without_previous_response_id(current_input) {
-        return strip_previous_response_id_for_compat(
-            request,
-            "client_previous_response_id_self_contained_input",
-        );
-    }
-
-    None
-}
-
-async fn response_session_input_for_response_id(
-    state: &AppState,
-    response_id: &str,
-) -> Option<Value> {
-    let sessions = state.response_sessions.lock().await;
-    sessions
-        .values()
-        .filter(|session| {
-            session.response_id == response_id
-                && session.finished_at.elapsed() <= std::time::Duration::from_secs(1800)
-        })
-        .max_by_key(|session| response_input_item_count(&session.input))
-        .map(|session| session.input.clone())
-}
-
-fn strip_previous_response_id_for_compat(
-    request: &Value,
-    reason: &'static str,
-) -> Option<PreviousResponseCompatBody> {
-    let mut body = request.clone();
-    let object = body.as_object_mut()?;
-    object.remove("previous_response_id")?;
-    Some(PreviousResponseCompatBody { body, reason })
-}
-
-fn expand_previous_response_id_for_compat(
-    request: &Value,
-    previous_input: &Value,
-    reason: &'static str,
-) -> Option<PreviousResponseCompatBody> {
-    let mut body = request.clone();
-    let object = body.as_object_mut()?;
-    object.remove("previous_response_id")?;
-    let current_input = object.get("input")?;
-    let (Value::Array(previous_items), Value::Array(current_items)) =
-        (previous_input, current_input)
-    else {
-        return None;
-    };
-    if previous_items.is_empty() || current_items.is_empty() {
-        return None;
-    }
-    if current_items.len() >= previous_items.len()
-        && previous_items
-            .iter()
-            .zip(current_items.iter())
-            .all(|(previous, current)| previous == current)
-    {
-        return Some(PreviousResponseCompatBody { body, reason });
-    }
-    let mut expanded = previous_items.clone();
-    expanded.extend(current_items.iter().cloned());
-    object.insert("input".to_string(), Value::Array(expanded));
-    Some(PreviousResponseCompatBody { body, reason })
-}
-
-fn response_input_can_stand_alone_with_previous_session(
-    previous_input: &Value,
-    current_input: &Value,
-) -> bool {
-    let (Some(previous_items), Some(current_items)) =
-        (previous_input.as_array(), current_input.as_array())
-    else {
-        return false;
-    };
-    response_input_essential_prefix_matches(previous_items, current_items)
-        && response_input_items_have_self_contained_context(current_items)
-}
-
-fn response_input_looks_self_contained_without_previous_response_id(input: &Value) -> bool {
-    input
-        .as_array()
-        .is_some_and(|items| response_input_items_have_self_contained_context(items))
-}
-
-fn response_input_items_have_self_contained_context(items: &[Value]) -> bool {
-    if items.is_empty() {
-        return false;
-    }
-
-    let call_ids = items
-        .iter()
-        .filter(|item| response_input_item_is_call(item))
-        .filter_map(response_input_item_call_id)
-        .collect::<HashSet<_>>();
-    let mut has_prior_output_context = false;
-
-    for item in items {
-        if response_input_item_is_assistant_context(item) || response_input_item_is_call(item) {
-            has_prior_output_context = true;
-        }
-        if response_input_item_is_call_output(item) {
-            let Some(call_id) = response_input_item_call_id(item) else {
-                return false;
-            };
-            if !call_ids.contains(&call_id) {
-                return false;
-            }
-            has_prior_output_context = true;
-        }
-    }
-
-    has_prior_output_context
-}
-
-fn response_input_item_is_assistant_context(item: &Value) -> bool {
-    item.as_object()
-        .and_then(|object| object.get("role"))
-        .and_then(Value::as_str)
-        .is_some_and(|role| matches!(role, "assistant" | "model"))
-}
-
-fn response_input_item_is_call(item: &Value) -> bool {
-    response_input_item_type(item).is_some_and(|item_type| {
-        item_type.ends_with("_call") && !item_type.ends_with("_call_output")
-    })
-}
-
-fn response_input_item_is_call_output(item: &Value) -> bool {
-    response_input_item_type(item).is_some_and(|item_type| item_type.ends_with("_call_output"))
-}
-
-fn response_input_item_type(item: &Value) -> Option<&str> {
-    item.as_object()
-        .and_then(|object| object.get("type"))
-        .and_then(Value::as_str)
-}
-
-fn response_input_item_call_id(item: &Value) -> Option<String> {
-    item.as_object()
-        .and_then(|object| object.get("call_id").or_else(|| object.get("id")))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
 }
@@ -7366,6 +6781,12 @@ async fn update_response_session_with_id(
     else {
         return;
     };
+    let session = Arc::new(ResponseSessionState {
+        response_id,
+        input: input.clone(),
+        scope_key: session_scope_key.map(ToOwned::to_owned),
+        finished_at: Instant::now(),
+    });
     {
         let mut sessions = state.response_sessions.lock().await;
         if let Some(existing) = sessions.get(key) {
@@ -7373,22 +6794,9 @@ async fn update_response_session_with_id(
                 return;
             }
         }
-        sessions.insert(
-            key.to_string(),
-            ResponseSessionState {
-                response_id,
-                input: input.clone(),
-                scope_key: session_scope_key.map(ToOwned::to_owned),
-                finished_at: Instant::now(),
-            },
-        );
+        sessions.insert(key.to_string(), session);
     }
-    if let Err(err) = state.persist_runtime_state().await {
-        state
-            .metrics
-            .record_error("runtime_state_save", &err.to_string())
-            .await;
-    }
+    state.journal_runtime_state();
 }
 
 async fn finalize_confirmed_responses_compaction(
@@ -7435,12 +6843,7 @@ async fn finalize_confirmed_responses_compaction(
         cache_affinity::reset_anchor(&mut shadow_affinity, key, Utc::now());
     }
 
-    if let Err(err) = state.persist_runtime_state().await {
-        state
-            .metrics
-            .record_error("compaction_boundary_state_save", &err.to_string())
-            .await;
-    }
+    state.journal_runtime_state();
 }
 
 fn mark_shadow_compaction_boundary(
@@ -7506,16 +6909,55 @@ fn response_id_from_value(value: &Value) -> Option<String> {
 
 fn upstream_error_summary(bytes: &[u8]) -> String {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        if let Some(message) = value
-            .pointer("/error/message")
-            .or_else(|| value.get("message"))
-            .and_then(Value::as_str)
-        {
-            return truncate_log_message(message);
-        }
-        return truncate_log_message(&value.to_string());
+        return upstream_error_summary_from_value(&value);
     }
     truncate_log_message(&String::from_utf8_lossy(bytes))
+}
+
+fn structured_upstream_error_summary(bytes: &[u8]) -> Option<String> {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return json_value_has_error(&value)
+            .then(|| upstream_error_summary_from_value(&value))
+            .filter(|summary| !summary.is_empty());
+    }
+
+    let mut decoder = sse::SseFrameDecoder::default();
+    let mut frames = decoder.push(bytes);
+    frames.extend(decoder.finish());
+    frames.into_iter().find_map(|frame| {
+        let payload = frame.data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return None;
+        }
+        let value = serde_json::from_str::<Value>(payload).ok()?;
+        json_value_has_error(&value)
+            .then(|| upstream_error_summary_from_value(&value))
+            .filter(|summary| !summary.is_empty())
+    })
+}
+
+pub(super) fn upstream_error_summary_from_value(value: &Value) -> String {
+    if let Some(message) = [
+        "/error/message",
+        "/response/error/message",
+        "/error/detail",
+        "/response/error/detail",
+        "/message",
+        "/detail",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+    {
+        return truncate_log_message(message);
+    }
+    if let Some(message) = value
+        .get("error")
+        .or_else(|| value.pointer("/response/error"))
+        .and_then(Value::as_str)
+    {
+        return truncate_log_message(message);
+    }
+    truncate_log_message(&value.to_string())
 }
 
 fn upstream_error_scope(status: u16, message: &str) -> &'static str {
@@ -7565,23 +7007,12 @@ fn is_agent_generation_request(authorized_agent_id: Option<&str>) -> bool {
 fn agent_attempt_policy_label(policy: AttemptPolicy) -> &'static str {
     match policy {
         AttemptPolicy::Single => "single",
-        AttemptPolicy::ReasoningCompatibility => "reasoning_compatibility",
     }
-}
-
-fn agent_attempt_policy(effective_reasoning: Option<&str>) -> AttemptPolicy {
-    effective_reasoning
-        .and_then(reasoning_effort_rank)
-        .filter(|rank| *rank > 0)
-        .map(|_| AttemptPolicy::ReasoningCompatibility)
-        .unwrap_or(AttemptPolicy::Single)
 }
 
 fn agent_attempt_reason_label(reason: AttemptReason) -> &'static str {
     match reason {
         AttemptReason::Primary => "primary",
-        AttemptReason::ReasoningExplicit => "reasoning_explicit",
-        AttemptReason::ReasoningOpaque502 => "reasoning_opaque_502",
     }
 }
 
@@ -7631,53 +7062,6 @@ fn agent_attempt_finish(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finish_agent_attempt_lifecycle(
-    state: &AppState,
-    attempt_id: Option<String>,
-    outcome: AgentAttemptOutcome,
-    status: Option<u16>,
-    error_scope: Option<String>,
-    terminal_state: &str,
-    total_ms: u64,
-    diagnostics: Option<&UpstreamRequestDiagnostics>,
-) -> bool {
-    let Some(attempt_id) = attempt_id else {
-        state
-            .metrics
-            .record_error(
-                "agent_lifecycle",
-                "Agent generation reached attempt finalization without an active attempt",
-            )
-            .await;
-        return false;
-    };
-    let finished = state
-        .metrics
-        .finish_agent_attempt(
-            &attempt_id,
-            agent_attempt_finish(
-                outcome,
-                status,
-                error_scope,
-                Some(terminal_state.to_string()),
-                total_ms,
-                diagnostics,
-            ),
-        )
-        .await;
-    if !finished {
-        state
-            .metrics
-            .record_error(
-                "agent_lifecycle",
-                &format!("Agent attempt {attempt_id} was not active during finalization"),
-            )
-            .await;
-    }
-    finished
-}
-
-#[allow(clippy::too_many_arguments)]
 async fn finalize_agent_generation(
     state: &AppState,
     inbound_request_id: &str,
@@ -7688,6 +7072,9 @@ async fn finalize_agent_generation(
     status: Option<u16>,
     error_scope: Option<String>,
     terminal_state: &str,
+    usage_record: Option<UsageRecord>,
+    usage_cold_start_key: Option<String>,
+    request_errors: Vec<(String, String)>,
     shadow_affinity: Option<ShadowAffinityDecision>,
     diagnostics: Option<&UpstreamRequestDiagnostics>,
 ) {
@@ -7715,37 +7102,38 @@ async fn finalize_agent_generation(
             .or(request_log.upstream_attempts)
             .unwrap_or(1),
     });
-    if !finish_agent_attempt_lifecycle(
-        state,
-        attempt_id,
-        attempt_outcome,
-        status,
-        error_scope,
-        terminal_state,
-        request_log.total_ms,
-        diagnostics,
-    )
-    .await
-    {
-        return;
-    }
-    let inbound_finished = state
-        .metrics
-        .finish_agent_inbound(
-            inbound_request_id,
-            request_log,
-            inbound_outcome,
-            Some(terminal_state.to_string()),
-        )
-        .await;
-    if !inbound_finished {
+    let Some(attempt_id) = attempt_id else {
         state
             .metrics
             .record_error(
                 "agent_lifecycle",
-                &format!("Agent inbound {inbound_request_id} could not be finalized"),
+                "Agent generation reached terminal commit without an active attempt",
             )
             .await;
+        return;
+    };
+    let mut transaction = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
+        inbound_request_id: inbound_request_id.to_string(),
+        attempt_id,
+        attempt_finish: agent_attempt_finish(
+            attempt_outcome,
+            status,
+            error_scope,
+            Some(terminal_state.to_string()),
+            request_log.total_ms,
+            diagnostics,
+        ),
+        request: request_log,
+        inbound_outcome,
+        terminal_state: Some(terminal_state.to_string()),
+    });
+    if let Some(usage_record) = usage_record {
+        transaction.observe_usage(usage_record, usage_cold_start_key.as_deref());
+    }
+    for (scope, message) in request_errors {
+        transaction.observe_error(scope, message);
+    }
+    if state.metrics.commit(transaction).await != MetricsCommitResult::Applied {
         return;
     }
     if let (Some(decision), Some(observation)) = (shadow_affinity.as_ref(), shadow_observation) {
@@ -7773,12 +7161,7 @@ async fn finalize_agent_generation(
                 !observation.has_usage || observation.giant_tail,
             )
             .await;
-        if let Err(err) = state.persist_runtime_state().await {
-            state
-                .metrics
-                .record_error("shadow_affinity_state_save", &err.to_string())
-                .await;
-        }
+        state.journal_runtime_state();
     }
 }
 
@@ -7831,6 +7214,39 @@ fn local_response_cache_eligible(
         && !no_store
         && !is_agent_generation_request(authorized_agent_id)
         && cache::is_cache_eligible(client_request)
+}
+
+fn local_response_cache_material(
+    eligible: bool,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+    client_requested_stream: bool,
+    chat_stream_include_usage: bool,
+    upstream_body: &Value,
+) -> Option<Value> {
+    eligible.then(|| {
+        let mut material = json!({
+            "client_channel": client_channel.label(),
+            "upstream_channel": upstream_channel.label(),
+            "client_stream": client_requested_stream,
+            "request": upstream_body.clone()
+        });
+        if client_requested_stream
+            && matches!(
+                (client_channel, upstream_channel),
+                (Channel::Chat, Channel::Responses)
+            )
+        {
+            material
+                .as_object_mut()
+                .expect("cache material is always an object")
+                .insert(
+                    "chat_stream_include_usage".to_string(),
+                    Value::Bool(chat_stream_include_usage),
+                );
+        }
+        material
+    })
 }
 
 fn local_session_keys_enabled(config: &AppConfig) -> bool {
@@ -7888,9 +7304,27 @@ fn metrics_cache_key(cache_keys: &[String]) -> String {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static SERIALIZED_BODY_LEN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_serialized_body_len_calls() {
+    SERIALIZED_BODY_LEN_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+fn serialized_body_len_calls() -> u64 {
+    SERIALIZED_BODY_LEN_CALLS.with(std::cell::Cell::get)
+}
+
 fn serialized_body_len(channel: &Channel, body: &Value) -> u64 {
+    #[cfg(test)]
+    SERIALIZED_BODY_LEN_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+
     if matches!(channel, Channel::Responses) {
-        serialize_responses_body_for_provider_prefix(body).len() as u64
+        serialize_responses_body_bytes_for_provider_prefix(body).len() as u64
     } else {
         serde_json::to_vec(body)
             .map(|bytes| bytes.len() as u64)
@@ -7904,17 +7338,59 @@ fn body_diagnostics(
     send_body: &Value,
     send_body_is_delta: bool,
 ) -> BodyDiagnostics {
+    let mut diagnostics =
+        body_diagnostics_without_send_length(channel, original_body, send_body_is_delta);
+    diagnostics.send_body_bytes = serialized_body_len(channel, send_body);
+    diagnostics
+}
+
+fn body_diagnostics_without_send_length(
+    channel: &Channel,
+    original_body: &Value,
+    send_body_is_delta: bool,
+) -> BodyDiagnostics {
     BodyDiagnostics {
+        inbound_body_bytes: 0,
         original_body_bytes: serialized_body_len(channel, original_body),
-        send_body_bytes: serialized_body_len(channel, send_body),
+        send_body_bytes: 0,
         send_body_is_delta,
         payload_too_large_rescue_attempted: false,
         payload_too_large_rescue_used: false,
         compaction_trigger_requested: matches!(channel, Channel::Responses)
             && responses_request_has_compaction_trigger(original_body),
         trusted_codex_compaction_requested: false,
+        chat_stream_include_usage: false,
         reasoning: ReasoningEffortDiagnostics::default(),
     }
+}
+
+fn body_diagnostics_with_known_inbound_length(
+    channel: &Channel,
+    original_body: &Value,
+    inbound_body_bytes: u64,
+    send_body_is_delta: bool,
+) -> BodyDiagnostics {
+    BodyDiagnostics {
+        inbound_body_bytes,
+        original_body_bytes: 0,
+        send_body_bytes: 0,
+        send_body_is_delta,
+        payload_too_large_rescue_attempted: false,
+        payload_too_large_rescue_used: false,
+        compaction_trigger_requested: matches!(channel, Channel::Responses)
+            && responses_request_has_compaction_trigger(original_body),
+        trusted_codex_compaction_requested: false,
+        chat_stream_include_usage: false,
+        reasoning: ReasoningEffortDiagnostics::default(),
+    }
+}
+
+fn apply_prepared_body_lengths(diagnostics: &mut BodyDiagnostics, plan: &RequestPlan) {
+    let body_bytes = plan.body_len() as u64;
+    if diagnostics.original_body_bytes == 0 {
+        diagnostics.original_body_bytes = body_bytes;
+    }
+    diagnostics.send_body_bytes = body_bytes;
 }
 
 fn trusted_codex_request_metadata(
@@ -8035,7 +7511,7 @@ fn response_body_compaction_evidence(bytes: &[u8], content_type: &str) -> (bool,
         return (
             summary.compaction_output_seen,
             summary.model_output_seen,
-            summary.completed_event_seen,
+            summary.responses_completed_event_seen,
         );
     }
     (false, false, false)
@@ -8098,6 +7574,8 @@ fn generation_cache_status(
 }
 
 fn apply_body_diagnostics(log: &mut RequestLog, diagnostics: &BodyDiagnostics) {
+    log.inbound_body_bytes =
+        (diagnostics.inbound_body_bytes > 0).then_some(diagnostics.inbound_body_bytes);
     log.original_body_bytes = Some(diagnostics.original_body_bytes);
     log.send_body_bytes = Some(diagnostics.send_body_bytes);
     log.send_body_is_delta = Some(diagnostics.send_body_is_delta);
@@ -8129,27 +7607,23 @@ async fn tail_input_diagnostics_for_session(
         return TailInputDiagnostics::default();
     }
 
-    let previous_input = if let Some(key) = session_key {
+    let previous_session = if let Some(key) = session_key {
         let sessions = state.response_sessions.lock().await;
-        sessions
-            .get(key)
-            .map(|session| session.input.clone())
-            .or_else(|| {
-                fallback_response_sessions(&sessions, key, session_scope_key, current_input)
-                    .into_iter()
-                    .next()
-                    .map(|session| session.input)
-            })
+        sessions.get(key).cloned().or_else(|| {
+            fallback_response_sessions(&sessions, key, session_scope_key, current_input)
+                .into_iter()
+                .next()
+        })
     } else {
         None
     };
-    let tail_start = previous_input
+    let tail_start = previous_session
         .as_ref()
-        .and_then(Value::as_array)
+        .and_then(|session| session.input.as_array())
         .and_then(|previous_items| response_input_delta_start_index(previous_items, current_items))
         .unwrap_or(0);
     let mut diagnostics = summarize_tail_input_items(&current_items[tail_start..]);
-    diagnostics.delta_from_session = previous_input.is_some() && tail_start > 0;
+    diagnostics.delta_from_session = previous_session.is_some() && tail_start > 0;
     diagnostics
 }
 
@@ -8489,220 +7963,6 @@ fn request_body_stream_flag(body: &Value) -> bool {
     body.get("stream").and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn current_non_stream_upstream_call_source(
-    sync_responses_main: bool,
-    active_responses_non_stream_chat_compat: bool,
-    responses_sync_main_chat_compat_fallback: bool,
-) -> &'static str {
-    if active_responses_non_stream_chat_compat {
-        if responses_sync_main_chat_compat_fallback {
-            "responses-sync-main-chat-compat-fallback"
-        } else {
-            "responses-sync-main-chat-compat"
-        }
-    } else if sync_responses_main {
-        "responses-sync-main"
-    } else {
-        "main"
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn record_upstream_response_observation(
-    state: &AppState,
-    request_id: &str,
-    started: &Instant,
-    client_channel: &Channel,
-    upstream_channel: &Channel,
-    decision: &RouteDecision,
-    cache_key: Option<&str>,
-    provider_prefix_key: Option<&str>,
-    provider_prefix_fingerprint: Option<&str>,
-    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
-    local_prepare_ms: u64,
-    body_diagnostics: &BodyDiagnostics,
-    body: &Value,
-    used_response_session: bool,
-    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
-    requested_model: Option<String>,
-    source: &str,
-    status: u16,
-    upstream_request_diagnostics: &UpstreamRequestDiagnostics,
-    agent_log_id: Option<String>,
-    agent_log_label: Option<String>,
-) {
-    let elapsed = started.elapsed().as_millis() as u64;
-    let body_bytes = serialized_body_len(upstream_channel, body);
-    let original_body_bytes = if body_diagnostics.original_body_bytes > 0 {
-        body_diagnostics.original_body_bytes
-    } else {
-        body_bytes
-    };
-    let send_body_bytes = if body_diagnostics.send_body_bytes > 0 {
-        body_diagnostics.send_body_bytes
-    } else {
-        body_bytes
-    };
-    let is_success_status = StatusCode::from_u16(status)
-        .map(|code| code.is_success())
-        .unwrap_or(false);
-
-    state
-        .metrics
-        .record_upstream_observation(RequestLog {
-            id: Uuid::new_v4().to_string(),
-            at: Utc::now(),
-            inbound_request_id: Some(request_id.to_string()),
-            upstream_request_id: Some(Uuid::new_v4().to_string()),
-            upstream_attempt_index: Some(1),
-            upstream_attempt_total: Some(1),
-            client_channel: client_channel.label().to_string(),
-            upstream_channel: upstream_channel.label().to_string(),
-            provider: decision.provider.name.clone(),
-            model: decision.model.clone(),
-            requested_model,
-            agent_reasoning_effort: body_diagnostics.reasoning.agent.clone(),
-            configured_reasoning_effort: body_diagnostics.reasoning.configured.clone(),
-            effective_reasoning_effort: body_diagnostics.reasoning.effective.clone(),
-            reasoning_effort_source: body_diagnostics.reasoning.source.clone(),
-            cache_status: if is_success_status { "miss" } else { "error" }.to_string(),
-            agent_id: agent_log_id,
-            agent_label: agent_log_label,
-            upstream_call_kind: Some(
-                if request_body_stream_flag(body) {
-                    "stream"
-                } else {
-                    "sync"
-                }
-                .to_string(),
-            ),
-            upstream_call_source: Some(source.to_string()),
-            cache_key: cache_key.map(ToOwned::to_owned),
-            provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
-            provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
-            outbound_prefix_fingerprints: upstream_request_diagnostics
-                .outbound_prefix_fingerprints
-                .clone(),
-            provider_cache_diagnostic: None,
-            shadow_affinity_mode: None,
-            shadow_affinity_arm: None,
-            shadow_affinity_realm_id: None,
-            shadow_affinity_cohort_id: None,
-            shadow_affinity_lane: None,
-            shadow_affinity_shard: None,
-            shadow_affinity_policy_epoch: None,
-            shadow_affinity_anchor_epoch: None,
-            shadow_affinity_trusted_identity: None,
-            shadow_affinity_decision: None,
-            shadow_affinity_skip_reason: None,
-            shadow_affinity_policy_compute_ms: None,
-            prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
-            prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
-            prefix_guard_wait_source: prefix_guard_wait.source.clone(),
-            prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
-            prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
-            prefix_guard_wait_effect: None,
-            prefix_lag_classification: None,
-            prefix_lag_input_delta_tokens: None,
-            prefix_lag_cache_delta_tokens: None,
-            prefix_lag_previous_gap_tokens: None,
-            prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
-            prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
-            prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
-            status,
-            ttft_ms: elapsed,
-            upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
-            local_prepare_ms: Some(local_prepare_ms),
-            upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
-            upstream_last_attempt_headers_ms: Some(
-                upstream_request_diagnostics.last_attempt_headers_ms,
-            ),
-            upstream_http_version: upstream_request_diagnostics.http_version.clone(),
-            upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
-            upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
-            upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
-            upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
-            upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
-            upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
-            upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
-            upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
-            upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
-            upstream_first_chunk_ms: None,
-            stream_upstream_wait_ms: None,
-            stream_client_backpressure_ms: None,
-            aggregate_done_ms: None,
-            upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
-            upstream_attempts: Some(upstream_request_diagnostics.attempts),
-            request_body_bytes: Some(body_bytes),
-            sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes.max(body_bytes)),
-            request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
-            gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
-            gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
-            gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
-            upstream_header_wait_class: Some(upstream_header_wait_class(
-                upstream_request_diagnostics,
-            )),
-            total_ms: elapsed,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_shortfall_tokens: None,
-            cache_new_tail_gap_tokens: None,
-            cache_avoidable_gap_tokens: None,
-            cache_provider_unstable_gap_tokens: None,
-            provider_cache_token_ratio: None,
-            tail_input_items: None,
-            tail_message_chars: None,
-            tail_tool_call_chars: None,
-            tail_tool_output_chars: None,
-            tail_largest_tool_output_chars: None,
-            tail_tool_output_lines: None,
-            tail_tool_output_repeated_line_chars: None,
-            tail_tool_output_timestamp_like_count: None,
-            tail_tool_output_path_like_count: None,
-            tail_tool_output_url_like_count: None,
-            tail_tool_output_hash_like_count: None,
-            tail_tool_output_json_like_chars: None,
-            tail_tool_output_noise_hint: None,
-            tail_source: None,
-            response_session_reused: Some(used_response_session),
-            response_session_candidate_count: Some(
-                response_session_reuse_diagnostics.candidate_count,
-            ),
-            response_session_skip_reason: response_session_reuse_diagnostics.skip_reason.clone(),
-            response_session_exact_key_hit: Some(response_session_reuse_diagnostics.exact_key_hit),
-            response_session_scope_match_count: Some(
-                response_session_reuse_diagnostics.scope_match_count,
-            ),
-            response_session_append_delta_match: Some(
-                response_session_reuse_diagnostics.append_delta_match,
-            ),
-            response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
-            response_session_cooldown_active: Some(
-                response_session_reuse_diagnostics.cooldown_active,
-            ),
-            response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
-            session_anchor_hash: None,
-            session_anchor_source: None,
-            session_anchor_changed: None,
-            session_anchor_peer_count: None,
-            original_body_bytes: Some(original_body_bytes),
-            send_body_bytes: Some(send_body_bytes),
-            send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
-            payload_too_large_rescue_attempted: Some(
-                body_diagnostics.payload_too_large_rescue_attempted,
-            ),
-            payload_too_large_rescue_used: Some(body_diagnostics.payload_too_large_rescue_used),
-            sse_end_reason: None,
-            downstream_disconnected: None,
-            downstream_disconnect_stage: None,
-            sse_completed_event_seen: None,
-            sse_done_marker_seen: None,
-            sse_chunks: None,
-        })
-        .await;
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn record_upstream_transport_failure(
     state: &AppState,
@@ -8721,9 +7981,14 @@ async fn record_upstream_transport_failure(
     used_response_session: bool,
     response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
     requested_model: Option<String>,
+    agent_id: Option<&str>,
     source: &str,
+    upstream_attempt_total: u64,
+    request_errors: &[(String, String)],
+    error_scope: &str,
+    error_message: &str,
 ) {
-    let log = upstream_transport_failure_log(
+    let mut log = upstream_transport_failure_log(
         request_id,
         started,
         client_channel,
@@ -8741,8 +8006,17 @@ async fn record_upstream_transport_failure(
         requested_model,
         source,
     );
-    state.metrics.record_upstream_call(log.clone()).await;
-    state.metrics.record_request(log, true).await;
+    let upstream_attempt_total = upstream_attempt_total.max(1);
+    log.upstream_attempt_total = Some(upstream_attempt_total);
+    log.upstream_attempts = Some(upstream_attempt_total);
+    log.agent_id = agent_id.map(str::to_string);
+    log.agent_label = agent_id.map(str::to_string);
+    let mut transaction = MetricsTransaction::upstream(log);
+    for (scope, message) in request_errors {
+        transaction.observe_error(scope.clone(), message.clone());
+    }
+    transaction.observe_error(error_scope, error_message);
+    state.metrics.commit(transaction).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8787,6 +8061,7 @@ fn upstream_transport_failure_log(
         client_channel: client_channel.label().to_string(),
         upstream_channel: upstream_channel.label().to_string(),
         provider: decision.provider.name.clone(),
+        provider_id: Some(decision.provider.id.clone()),
         model: decision.model.clone(),
         requested_model,
         agent_reasoning_effort: body_diagnostics.reasoning.agent.clone(),
@@ -8914,6 +8189,8 @@ fn upstream_transport_failure_log(
         session_anchor_source: None,
         session_anchor_changed: None,
         session_anchor_peer_count: None,
+        inbound_body_bytes: (body_diagnostics.inbound_body_bytes > 0)
+            .then_some(body_diagnostics.inbound_body_bytes),
         original_body_bytes: Some(original_body_bytes),
         send_body_bytes: Some(send_body_bytes),
         send_body_is_delta: Some(body_diagnostics.send_body_is_delta),
@@ -8978,148 +8255,147 @@ async fn cache_hit_response(
         .input_tokens
         .saturating_add(cached_usage.output_tokens);
     let cache_key = hit.entry.key.clone();
-    state.metrics.record_local_proxy_hit(saved_tokens).await;
+    let request_log = RequestLog {
+        id: request_id,
+        at: Utc::now(),
+        inbound_request_id: None,
+        upstream_request_id: None,
+        upstream_attempt_index: None,
+        upstream_attempt_total: None,
+        client_channel: client_channel.label().to_string(),
+        upstream_channel: decision.upstream_channel.label().to_string(),
+        provider: decision.provider.name.clone(),
+        provider_id: Some(decision.provider.id.clone()),
+        model: decision.model.clone(),
+        requested_model,
+        agent_reasoning_effort: None,
+        configured_reasoning_effort: None,
+        effective_reasoning_effort: None,
+        reasoning_effort_source: None,
+        cache_status: cache_status.to_string(),
+        agent_id: None,
+        agent_label: None,
+        upstream_call_kind: Some("cache".to_string()),
+        upstream_call_source: Some("local_cache".to_string()),
+        cache_key: Some(cache_key),
+        provider_prefix_key: None,
+        provider_prefix_fingerprint: None,
+        outbound_prefix_fingerprints: None,
+        provider_cache_diagnostic: Some("local-replay".to_string()),
+        shadow_affinity_mode: None,
+        shadow_affinity_arm: None,
+        shadow_affinity_realm_id: None,
+        shadow_affinity_cohort_id: None,
+        shadow_affinity_lane: None,
+        shadow_affinity_shard: None,
+        shadow_affinity_policy_epoch: None,
+        shadow_affinity_anchor_epoch: None,
+        shadow_affinity_trusted_identity: None,
+        shadow_affinity_decision: None,
+        shadow_affinity_skip_reason: None,
+        shadow_affinity_policy_compute_ms: None,
+        prefix_guard_wait_ms: None,
+        prefix_guard_wait_reason: None,
+        prefix_guard_wait_source: None,
+        prefix_guard_state_age_ms: None,
+        prefix_guard_skip_reason: None,
+        prefix_guard_wait_effect: None,
+        prefix_lag_classification: None,
+        prefix_lag_input_delta_tokens: None,
+        prefix_lag_cache_delta_tokens: None,
+        prefix_lag_previous_gap_tokens: None,
+        prefix_cache_instability_score: None,
+        prefix_seen_bucket_tokens: None,
+        prefix_state_cache_read_tokens: None,
+        status: hit.entry.status,
+        ttft_ms: elapsed,
+        upstream_ttft_ms: Some(0),
+        local_prepare_ms: None,
+        upstream_headers_ms: None,
+        upstream_last_attempt_headers_ms: None,
+        upstream_http_version: None,
+        upstream_network_path: None,
+        upstream_remote_addr: None,
+        upstream_pool_diagnostic: None,
+        upstream_trace_id: None,
+        upstream_trace_source: None,
+        upstream_server_timing: None,
+        upstream_timing_source: None,
+        upstream_reported_processing_ms: None,
+        upstream_non_processing_ms: None,
+        upstream_first_chunk_ms: None,
+        stream_upstream_wait_ms: None,
+        stream_client_backpressure_ms: None,
+        aggregate_done_ms: None,
+        upstream_retry_wait_ms: None,
+        upstream_attempts: None,
+        request_body_bytes: None,
+        sent_body_bytes: None,
+        request_body_encode_ms: None,
+        gzip_encode_ms: None,
+        gzip_attempted: None,
+        gzip_fallback_used: None,
+        upstream_header_wait_class: None,
+        total_ms: elapsed,
+        input_tokens: cached_usage
+            .has_usage()
+            .then_some(cached_usage.input_tokens),
+        output_tokens: cached_usage
+            .has_usage()
+            .then_some(cached_usage.output_tokens),
+        cache_read_tokens: cached_usage
+            .has_usage()
+            .then_some(cached_usage.cache_read_tokens),
+        cache_shortfall_tokens: cached_usage
+            .has_usage()
+            .then_some(provider_cache_shortfall(&cached_usage)),
+        cache_new_tail_gap_tokens: None,
+        cache_avoidable_gap_tokens: None,
+        cache_provider_unstable_gap_tokens: None,
+        provider_cache_token_ratio: provider_cache_ratio(&cached_usage),
+        tail_input_items: None,
+        tail_message_chars: None,
+        tail_tool_call_chars: None,
+        tail_tool_output_chars: None,
+        tail_largest_tool_output_chars: None,
+        tail_tool_output_lines: None,
+        tail_tool_output_repeated_line_chars: None,
+        tail_tool_output_timestamp_like_count: None,
+        tail_tool_output_path_like_count: None,
+        tail_tool_output_url_like_count: None,
+        tail_tool_output_hash_like_count: None,
+        tail_tool_output_json_like_chars: None,
+        tail_tool_output_noise_hint: None,
+        tail_source: None,
+        response_session_reused: None,
+        response_session_candidate_count: None,
+        response_session_skip_reason: None,
+        response_session_exact_key_hit: None,
+        response_session_scope_match_count: None,
+        response_session_append_delta_match: None,
+        response_session_delta_items: None,
+        response_session_cooldown_active: None,
+        response_session_rejected_status: None,
+        session_anchor_hash: None,
+        session_anchor_source: None,
+        session_anchor_changed: None,
+        session_anchor_peer_count: None,
+        inbound_body_bytes: None,
+        original_body_bytes: None,
+        send_body_bytes: None,
+        send_body_is_delta: None,
+        payload_too_large_rescue_attempted: None,
+        payload_too_large_rescue_used: None,
+        sse_end_reason: None,
+        downstream_disconnected: None,
+        downstream_disconnect_stage: None,
+        sse_completed_event_seen: None,
+        sse_done_marker_seen: None,
+        sse_chunks: None,
+    };
     state
         .metrics
-        .record_request(
-            RequestLog {
-                id: request_id,
-                at: Utc::now(),
-                inbound_request_id: None,
-                upstream_request_id: None,
-                upstream_attempt_index: None,
-                upstream_attempt_total: None,
-                client_channel: client_channel.label().to_string(),
-                upstream_channel: decision.upstream_channel.label().to_string(),
-                provider: decision.provider.name.clone(),
-                model: decision.model.clone(),
-                requested_model,
-                agent_reasoning_effort: None,
-                configured_reasoning_effort: None,
-                effective_reasoning_effort: None,
-                reasoning_effort_source: None,
-                cache_status: cache_status.to_string(),
-                agent_id: None,
-                agent_label: None,
-                upstream_call_kind: Some("cache".to_string()),
-                upstream_call_source: Some("local_cache".to_string()),
-                cache_key: Some(cache_key),
-                provider_prefix_key: None,
-                provider_prefix_fingerprint: None,
-                outbound_prefix_fingerprints: None,
-                provider_cache_diagnostic: Some("local-replay".to_string()),
-                shadow_affinity_mode: None,
-                shadow_affinity_arm: None,
-                shadow_affinity_realm_id: None,
-                shadow_affinity_cohort_id: None,
-                shadow_affinity_lane: None,
-                shadow_affinity_shard: None,
-                shadow_affinity_policy_epoch: None,
-                shadow_affinity_anchor_epoch: None,
-                shadow_affinity_trusted_identity: None,
-                shadow_affinity_decision: None,
-                shadow_affinity_skip_reason: None,
-                shadow_affinity_policy_compute_ms: None,
-                prefix_guard_wait_ms: None,
-                prefix_guard_wait_reason: None,
-                prefix_guard_wait_source: None,
-                prefix_guard_state_age_ms: None,
-                prefix_guard_skip_reason: None,
-                prefix_guard_wait_effect: None,
-                prefix_lag_classification: None,
-                prefix_lag_input_delta_tokens: None,
-                prefix_lag_cache_delta_tokens: None,
-                prefix_lag_previous_gap_tokens: None,
-                prefix_cache_instability_score: None,
-                prefix_seen_bucket_tokens: None,
-                prefix_state_cache_read_tokens: None,
-                status: hit.entry.status,
-                ttft_ms: elapsed,
-                upstream_ttft_ms: Some(0),
-                local_prepare_ms: None,
-                upstream_headers_ms: None,
-                upstream_last_attempt_headers_ms: None,
-                upstream_http_version: None,
-                upstream_network_path: None,
-                upstream_remote_addr: None,
-                upstream_pool_diagnostic: None,
-                upstream_trace_id: None,
-                upstream_trace_source: None,
-                upstream_server_timing: None,
-                upstream_timing_source: None,
-                upstream_reported_processing_ms: None,
-                upstream_non_processing_ms: None,
-                upstream_first_chunk_ms: None,
-                stream_upstream_wait_ms: None,
-                stream_client_backpressure_ms: None,
-                aggregate_done_ms: None,
-                upstream_retry_wait_ms: None,
-                upstream_attempts: None,
-                request_body_bytes: None,
-                sent_body_bytes: None,
-                request_body_encode_ms: None,
-                gzip_encode_ms: None,
-                gzip_attempted: None,
-                gzip_fallback_used: None,
-                upstream_header_wait_class: None,
-                total_ms: elapsed,
-                input_tokens: cached_usage
-                    .has_usage()
-                    .then_some(cached_usage.input_tokens),
-                output_tokens: cached_usage
-                    .has_usage()
-                    .then_some(cached_usage.output_tokens),
-                cache_read_tokens: cached_usage
-                    .has_usage()
-                    .then_some(cached_usage.cache_read_tokens),
-                cache_shortfall_tokens: cached_usage
-                    .has_usage()
-                    .then_some(provider_cache_shortfall(&cached_usage)),
-                cache_new_tail_gap_tokens: None,
-                cache_avoidable_gap_tokens: None,
-                cache_provider_unstable_gap_tokens: None,
-                provider_cache_token_ratio: provider_cache_ratio(&cached_usage),
-                tail_input_items: None,
-                tail_message_chars: None,
-                tail_tool_call_chars: None,
-                tail_tool_output_chars: None,
-                tail_largest_tool_output_chars: None,
-                tail_tool_output_lines: None,
-                tail_tool_output_repeated_line_chars: None,
-                tail_tool_output_timestamp_like_count: None,
-                tail_tool_output_path_like_count: None,
-                tail_tool_output_url_like_count: None,
-                tail_tool_output_hash_like_count: None,
-                tail_tool_output_json_like_chars: None,
-                tail_tool_output_noise_hint: None,
-                tail_source: None,
-                response_session_reused: None,
-                response_session_candidate_count: None,
-                response_session_skip_reason: None,
-                response_session_exact_key_hit: None,
-                response_session_scope_match_count: None,
-                response_session_append_delta_match: None,
-                response_session_delta_items: None,
-                response_session_cooldown_active: None,
-                response_session_rejected_status: None,
-                session_anchor_hash: None,
-                session_anchor_source: None,
-                session_anchor_changed: None,
-                session_anchor_peer_count: None,
-                original_body_bytes: None,
-                send_body_bytes: None,
-                send_body_is_delta: None,
-                payload_too_large_rescue_attempted: None,
-                payload_too_large_rescue_used: None,
-                sse_end_reason: None,
-                downstream_disconnected: None,
-                downstream_disconnect_stage: None,
-                sse_completed_event_seen: None,
-                sse_done_marker_seen: None,
-                sse_chunks: None,
-            },
-            false,
-        )
+        .commit(MetricsTransaction::local_cache(request_log, saved_tokens))
         .await;
     let body = normalize_response_body_for_client(
         client_channel,
@@ -9141,8 +8417,11 @@ async fn insert_cache_entries(
     decision: &RouteDecision,
     config: &AppConfig,
 ) {
-    for key in keys {
-        let entry = CacheEntry {
+    let now = Utc::now();
+    let expires_at = now + Duration::seconds(config.cache.max_age_seconds as i64);
+    let entries = keys
+        .into_iter()
+        .map(|key| CacheEntry {
             key,
             semantic_text: semantic_text.clone(),
             semantic_shape: semantic_shape.clone(),
@@ -9150,18 +8429,18 @@ async fn insert_cache_entries(
             content_type: content_type.clone(),
             status,
             body: body.clone(),
-            created_at: Utc::now(),
-            expires_at: Utc::now() + Duration::seconds(config.cache.max_age_seconds as i64),
+            created_at: now,
+            expires_at,
             provider_id: decision.provider.id.clone(),
             model: decision.model.clone(),
             workspace_fingerprint: Some(config.workspace_fingerprint.clone()),
-        };
-        if let Err(err) = state.cache.insert(entry, &config.cache).await {
-            state
-                .metrics
-                .record_error("cache_insert", &err.to_string())
-                .await;
-        }
+        })
+        .collect();
+    if let Err(err) = state.cache.insert_many(entries, &config.cache).await {
+        state
+            .metrics
+            .record_error("cache_insert", &err.to_string())
+            .await;
     }
 }
 
@@ -9419,29 +8698,6 @@ fn provider_key_affinity_map_key(provider_id: &str, affinity_key: &str) -> Strin
     format!("{provider_id}\0{affinity_key}")
 }
 
-async fn clear_provider_key_affinity(
-    state: &AppState,
-    provider_id: &str,
-    affinity_key: Option<&str>,
-    key_id: Option<&str>,
-) {
-    let Some(affinity_key) = affinity_key else {
-        return;
-    };
-    let Some(key_id) = key_id else {
-        return;
-    };
-    let map_key = provider_key_affinity_map_key(provider_id, affinity_key);
-    let mut affinities = state.provider_key_affinity.lock().await;
-    if affinities
-        .get(&map_key)
-        .map(|current| current == key_id)
-        .unwrap_or(false)
-    {
-        affinities.remove(&map_key);
-    }
-}
-
 async fn note_selected_provider_key_status(
     state: &AppState,
     provider_id: &str,
@@ -9473,18 +8729,14 @@ async fn note_selected_provider_key_status(
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("upstream returned HTTP {status_code}"));
         config.mark_provider_key_failure(provider_id, selected.key_id.as_deref(), &message, true);
-        if let Err(err) = config.save(&state.config_path) {
-            state
-                .metrics
-                .record_error("multi_key_save", &err.to_string())
-                .await;
-        }
+        state.journal_config(&config);
     }
 }
 
 async fn mark_selected_provider_key_success(state: &AppState, provider_id: &str, key_id: &str) {
     let mut config = state.config.write().await;
     config.mark_provider_key_success(provider_id, Some(key_id));
+    state.journal_config(&config);
 }
 
 fn spawn_selected_provider_key_success(
@@ -9493,9 +8745,12 @@ fn spawn_selected_provider_key_success(
     selected: &SelectedProviderKey,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let key_id = selected.key_id.clone()?;
-    Some(tokio::spawn(async move {
-        mark_selected_provider_key_success(&state, &provider_id, &key_id).await;
-    }))
+    let tracker = state.relay_tasks.clone();
+    tracker
+        .spawn(async move {
+            mark_selected_provider_key_success(&state, &provider_id, &key_id).await;
+        })
+        .ok()
 }
 
 fn is_provider_key_failure_status(status: StatusCode) -> bool {
@@ -9525,103 +8780,35 @@ fn is_provider_key_failure_message(message: &str) -> bool {
         || message.contains("\u{4f59}\u{989d}")
 }
 
-async fn try_retry_with_next_provider_key(
-    state: &AppState,
-    provider_id: &str,
-    selected: &SelectedProviderKey,
-    status: u16,
-    affinity_key: Option<&str>,
-) -> Option<SelectedProviderKey> {
-    let status = StatusCode::from_u16(status).ok()?;
-    if selected.key_id.is_none() || !is_provider_key_failure_status(status) {
-        return None;
-    }
-    {
-        let mut config = state.config.write().await;
-        config.mark_provider_key_failure(
-            provider_id,
-            selected.key_id.as_deref(),
-            &format!("upstream returned HTTP {status}"),
-            true,
-        );
-        if let Err(err) = config.save(&state.config_path) {
-            state
-                .metrics
-                .record_error("multi_key_save", &err.to_string())
-                .await;
-        }
-    }
-    clear_provider_key_affinity(state, provider_id, affinity_key, selected.key_id.as_deref()).await;
-    match select_provider_api_key(state, provider_id, selected.key_id.as_deref(), affinity_key)
-        .await
-    {
-        Ok(next) if next.key_id != selected.key_id => Some(next),
-        _ => None,
-    }
-}
-
 async fn send_main_upstream_request(
     state: &AppState,
-    use_system_proxy: bool,
-    url: &str,
     api_key: &str,
-    channel: &Channel,
-    body: &Value,
+    plan: OneShotRequestPlan,
     inbound_headers: &HeaderMap,
-    custom_user_agent: Option<&str>,
-    sync_responses_main: bool,
-    request_body_gzip_enabled: bool,
-    no_internal_retry: bool,
 ) -> Result<UpstreamSendOutcome> {
-    let _ = (sync_responses_main, no_internal_retry);
-    let max_attempts = Some(1);
-    send_upstream_request_to_url_with_diagnostics(
-        state,
-        use_system_proxy,
-        url,
-        api_key,
-        channel,
-        body,
-        inbound_headers,
-        custom_user_agent,
-        max_attempts,
-        request_body_gzip_enabled,
-        None,
-    )
-    .await
+    OneShotTransport::new(state, api_key, inbound_headers)
+        .dispatch(plan, None)
+        .await
 }
 
 async fn send_agent_upstream_request(
     state: &AppState,
-    use_system_proxy: bool,
-    url: &str,
     api_key: &str,
-    channel: &Channel,
-    body: &Value,
+    plan: OneShotRequestPlan,
     inbound_headers: &HeaderMap,
-    custom_user_agent: Option<&str>,
-    request_body_gzip_enabled: bool,
     decision: &RouteDecision,
     token: AttemptToken,
 ) -> Result<UpstreamSendOutcome> {
-    send_upstream_request_to_url_with_diagnostics(
-        state,
-        use_system_proxy,
-        url,
-        api_key,
-        channel,
-        body,
-        inbound_headers,
-        custom_user_agent,
-        Some(1),
-        request_body_gzip_enabled,
-        Some(AgentAttemptDispatch {
-            token,
-            provider: decision.provider.name.clone(),
-            model: decision.model.clone(),
-        }),
-    )
-    .await
+    OneShotTransport::new(state, api_key, inbound_headers)
+        .dispatch(
+            plan,
+            Some(AgentAttemptDispatch {
+                token,
+                provider: decision.provider.name.clone(),
+                model: decision.model.clone(),
+            }),
+        )
+        .await
 }
 
 #[derive(Debug)]
@@ -9629,7 +8816,6 @@ struct ResponseSessionReuseProbeResponse {
     status: u16,
     content_type: String,
     bytes: Vec<u8>,
-    ttft_ms: u64,
 }
 
 pub(crate) async fn probe_and_record_provider_cache_capabilities(
@@ -9733,10 +8919,17 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
                 CACHE_CAPABILITY_PROBE_REQUEST_KIND,
             )
             .await?;
-            let summary = upstream_error_summary(&response.bytes);
+            let structured_summary = structured_upstream_error_summary(&response.bytes);
+            let summary = structured_summary
+                .clone()
+                .unwrap_or_else(|| upstream_error_summary(&response.bytes));
             let status = if is_successful_probe_response(&response) {
                 ProviderCacheCapabilityStatus::Verified
-            } else if explicit_cache_field_rejection(response.status, &summary, field) {
+            } else if explicit_cache_field_rejection(
+                response.status,
+                structured_summary.as_deref(),
+                field,
+            ) {
                 ProviderCacheCapabilityStatus::Unsupported
             } else {
                 ProviderCacheCapabilityStatus::Error
@@ -9767,7 +8960,7 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
         }
     }
 
-    {
+    let persist_version = {
         let mut config = state.config.write().await;
         if config.cache_capability_probe_target(provider_id).as_ref() != Some(&probe_target) {
             return Err(anyhow!(
@@ -9798,8 +8991,9 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
                 result.effect_status = saved.effect_status.clone();
             }
         }
-        config.save(&state.config_path)?;
-    }
+        state.publish_config_snapshot(&config)?
+    };
+    state.wait_for_config_snapshot(persist_version).await?;
 
     Ok(ProviderCacheCapabilityProbeResult {
         provider_id: provider_id.to_string(),
@@ -9814,12 +9008,16 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
 
 fn explicit_cache_field_rejection(
     status: u16,
-    summary: &str,
+    summary: Option<&str>,
     field: ProviderCacheCapabilityField,
 ) -> bool {
-    if !matches!(status, 400 | 422) {
+    if !matches!(status, 400 | 422) && !(200..300).contains(&status) {
         return false;
     }
+    summary.is_some_and(|summary| cache_field_rejection_signal(summary, field))
+}
+
+fn cache_field_rejection_signal(summary: &str, field: ProviderCacheCapabilityField) -> bool {
     let lower = summary.to_ascii_lowercase();
     lower.contains(field.json_name())
         && [
@@ -9836,435 +9034,54 @@ fn explicit_cache_field_rejection(
         .any(|marker| lower.contains(marker))
 }
 
-const AUTOMATIC_CACHE_PROBE_RUNTIME_COOLDOWN: std::time::Duration =
-    std::time::Duration::from_secs(5 * 60);
-const AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES: i64 = 30;
-const AUTOMATIC_CACHE_NO_BENEFIT_RECHECK_HOURS: i64 = 24;
-const AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS: i64 = 7;
-const CACHE_EFFECT_MIN_INPUT_TOKENS: u64 = 1_024;
-const CACHE_EFFECT_MIN_DELTA_TOKENS: u64 = 128;
-const CACHE_EFFECT_MIN_DELTA_BPS: u64 = 50;
-
-#[derive(Clone)]
-struct AutomaticCacheProbeScope {
-    provider_id: String,
-    provider_revision: i64,
-    model_id: String,
-    channel: Channel,
-    selected_key: SelectedProviderKey,
-}
-
-impl AutomaticCacheProbeScope {
-    fn key(&self) -> String {
-        let credential_scope = self.selected_key.key_id.clone().unwrap_or_else(|| {
-            let digest = Sha256::digest(self.selected_key.secret.as_bytes());
-            format!("{digest:x}")[..16].to_string()
-        });
-        format!(
-            "{}\0{}\0{}\0{}\0{}",
-            self.provider_id,
-            self.provider_revision,
-            self.model_id,
-            self.channel.label(),
-            credential_scope
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AutomaticCacheProbeAction {
-    None,
-    Compatibility,
-    Effect,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CacheEffectObservation {
-    input_tokens: u64,
-    cache_read_tokens: u64,
-    ttft_ms: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CacheEffectEvaluation {
-    status: ProviderCacheEffectStatus,
-    baseline: CacheEffectObservation,
-    candidate: CacheEffectObservation,
-}
-
-fn spawn_automatic_cache_capability_probe(state: Arc<AppState>, scope: AutomaticCacheProbeScope) {
-    tokio::spawn(async move {
-        let scope_key = scope.key();
-        if !state
-            .try_begin_cache_capability_probe(&scope_key, AUTOMATIC_CACHE_PROBE_RUNTIME_COOLDOWN)
-            .await
-        {
-            return;
-        }
-        let result = run_automatic_cache_capability_probe(&state, &scope).await;
-        state.finish_cache_capability_probe(&scope_key).await;
-        if let Err(err) = result {
-            eprintln!("automatic cache capability probe failed: {err}");
-        }
-    });
-}
-
-async fn run_automatic_cache_capability_probe(
+async fn note_runtime_cache_capability_rejection(
     state: &AppState,
-    scope: &AutomaticCacheProbeScope,
-) -> Result<()> {
-    let action = {
-        let config = state.config.read().await;
-        if !smart_hit_enabled(&config)
-            || !matches!(config.cache.mode, CacheMode::PrefixPrewarm)
-            || !matches!(scope.channel, Channel::Responses | Channel::Chat)
-        {
-            return Ok(());
-        }
-        let Some(provider) = config.providers.iter().find(|provider| {
-            provider.id == scope.provider_id
-                && provider.enabled
-                && provider.updated_at.timestamp_millis() == scope.provider_revision
-        }) else {
-            return Ok(());
-        };
-        if cache_capability::is_official_openai(provider) {
-            return Ok(());
-        }
-        automatic_cache_probe_action(&config, scope, Utc::now())
-    };
-
-    if action == AutomaticCacheProbeAction::Compatibility {
-        probe_and_record_provider_cache_capabilities_with_key(
-            state,
-            &scope.provider_id,
-            &scope.model_id,
-            Some(scope.channel.clone()),
-            Some(scope.selected_key.clone()),
-        )
-        .await?;
-    }
-
-    let should_probe_effect = {
-        let config = state.config.read().await;
-        matches!(
-            automatic_cache_probe_action(&config, scope, Utc::now()),
-            AutomaticCacheProbeAction::Effect
-        )
-    };
-    if should_probe_effect {
-        probe_and_record_provider_cache_effect(state, scope).await?;
-    }
-    Ok(())
-}
-
-fn automatic_cache_probe_action(
-    config: &AppConfig,
-    scope: &AutomaticCacheProbeScope,
-    now: chrono::DateTime<Utc>,
-) -> AutomaticCacheProbeAction {
-    let records = cache_capability::EFFECT_FIELDS.map(|field| {
-        config.cache_capability_for_key(
-            &scope.provider_id,
-            &scope.model_id,
-            &scope.channel,
-            scope.selected_key.key_id.as_deref(),
-            field,
-        )
-    });
-
-    if records.iter().any(|record| {
-        let Some(record) = record else {
-            return true;
-        };
-        let cooldown = match record.status {
-            ProviderCacheCapabilityStatus::Unverified | ProviderCacheCapabilityStatus::Error => {
-                Duration::minutes(AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES)
-            }
-            ProviderCacheCapabilityStatus::Verified
-            | ProviderCacheCapabilityStatus::Unsupported => {
-                Duration::days(AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS)
-            }
-        };
-        timestamp_is_due(record.checked_at, now, cooldown)
-    }) {
-        return AutomaticCacheProbeAction::Compatibility;
-    }
-
-    let compatible = records
+    decision: &RouteDecision,
+    active_channel: &Channel,
+    diagnostics: &UpstreamRequestDiagnostics,
+    status: u16,
+    error_summary: &str,
+) {
+    let rejected = diagnostics
+        .sent_cache_capability_fields
         .iter()
-        .flatten()
-        .filter(|record| record.status == ProviderCacheCapabilityStatus::Verified)
+        .copied()
+        .filter(|field| explicit_cache_field_rejection(status, Some(error_summary), *field))
         .collect::<Vec<_>>();
-    if compatible.is_empty() {
-        return AutomaticCacheProbeAction::None;
-    }
-    if compatible.iter().any(|record| {
-        let cooldown = match record.effect_status {
-            ProviderCacheEffectStatus::Unverified => return true,
-            ProviderCacheEffectStatus::Error => {
-                Duration::minutes(AUTOMATIC_CACHE_COMPATIBILITY_RETRY_MINUTES)
-            }
-            ProviderCacheEffectStatus::NoBenefit => {
-                Duration::hours(AUTOMATIC_CACHE_NO_BENEFIT_RECHECK_HOURS)
-            }
-            ProviderCacheEffectStatus::Promoted => {
-                Duration::days(AUTOMATIC_CACHE_VERIFIED_RECHECK_DAYS)
-            }
-        };
-        timestamp_is_due(record.effect_checked_at, now, cooldown)
-    }) {
-        AutomaticCacheProbeAction::Effect
-    } else {
-        AutomaticCacheProbeAction::None
-    }
-}
-
-fn timestamp_is_due(
-    checked_at: Option<chrono::DateTime<Utc>>,
-    now: chrono::DateTime<Utc>,
-    cooldown: Duration,
-) -> bool {
-    checked_at
-        .map(|checked_at| now.signed_duration_since(checked_at) >= cooldown)
-        .unwrap_or(true)
-}
-
-async fn probe_and_record_provider_cache_effect(
-    state: &AppState,
-    scope: &AutomaticCacheProbeScope,
-) -> Result<()> {
-    let (provider, probe_target, effect_fields, include_prompt_cache_key) = {
-        let config = state.config.read().await;
-        let provider = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == scope.provider_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("provider {} was not found", scope.provider_id))?;
-        let probe_target = config
-            .cache_capability_probe_target(&scope.provider_id)
-            .ok_or_else(|| anyhow!("provider {} was not found", scope.provider_id))?;
-        let effect_fields = cache_capability::EFFECT_FIELDS
-            .into_iter()
-            .filter(|field| {
-                config.cache_capability_status_for_key(
-                    &scope.provider_id,
-                    &scope.model_id,
-                    &scope.channel,
-                    scope.selected_key.key_id.as_deref(),
-                    *field,
-                ) == ProviderCacheCapabilityStatus::Verified
-            })
-            .collect::<Vec<_>>();
-        let include_prompt_cache_key = config.cache_capability_status_for_key(
-            &scope.provider_id,
-            &scope.model_id,
-            &scope.channel,
-            scope.selected_key.key_id.as_deref(),
-            ProviderCacheCapabilityField::PromptCacheKey,
-        ) == ProviderCacheCapabilityStatus::Verified;
-        (
-            provider,
-            probe_target,
-            effect_fields,
-            include_prompt_cache_key,
-        )
-    };
-    if effect_fields.is_empty() {
-        return Ok(());
+    if rejected.is_empty() {
+        return;
     }
 
-    let baseline_group = Uuid::new_v4().simple().to_string();
-    let candidate_group = Uuid::new_v4().simple().to_string();
-    let result = async {
-        let baseline = run_cache_effect_pair(
-            state,
-            &provider,
-            &scope.selected_key.secret,
-            &scope.channel,
-            &scope.model_id,
-            &baseline_group,
-            include_prompt_cache_key,
-            false,
-            false,
-        )
-        .await?;
-        let candidate = run_cache_effect_pair(
-            state,
-            &provider,
-            &scope.selected_key.secret,
-            &scope.channel,
-            &scope.model_id,
-            &candidate_group,
-            include_prompt_cache_key,
-            effect_fields.contains(&ProviderCacheCapabilityField::PromptCacheOptions),
-            effect_fields.contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint),
-        )
-        .await?;
-        evaluate_cache_effect(baseline, candidate)
-    }
-    .await;
-
-    let (effect_status, message, baseline, candidate) = match result {
-        Ok(evaluation) => {
-            let baseline_ratio = cache_effect_ratio_bps(evaluation.baseline);
-            let candidate_ratio = cache_effect_ratio_bps(evaluation.candidate);
-            let message = format!(
-                "baseline cached={} ({} bps), candidate cached={} ({} bps), TTFT {}ms -> {}ms",
-                evaluation.baseline.cache_read_tokens,
-                baseline_ratio,
-                evaluation.candidate.cache_read_tokens,
-                candidate_ratio,
-                evaluation.baseline.ttft_ms,
-                evaluation.candidate.ttft_ms,
-            );
-            (
-                evaluation.status,
-                message,
-                Some(evaluation.baseline),
-                Some(evaluation.candidate),
-            )
-        }
-        Err(err) => (
-            ProviderCacheEffectStatus::Error,
-            err.to_string(),
-            None,
-            None,
-        ),
-    };
-
-    {
-        let mut config = state.config.write().await;
-        if config
-            .cache_capability_probe_target(&scope.provider_id)
-            .as_ref()
-            != Some(&probe_target)
+    let mut config = state.config.write().await;
+    let mut changed = false;
+    for field in rejected {
+        if config.cache_capability_status_for_key(
+            &decision.provider.id,
+            &decision.model,
+            active_channel,
+            diagnostics.cache_capability_key_id.as_deref(),
+            field,
+        ) == ProviderCacheCapabilityStatus::Unsupported
         {
-            return Err(anyhow!(
-                "provider settings changed while cache effect verification was running"
-            ));
+            continue;
         }
-        config.record_cache_capability_effect_for_key(
-            &scope.provider_id,
-            &scope.model_id,
-            &scope.channel,
-            scope.selected_key.key_id.as_deref(),
-            &effect_fields,
-            effect_status.clone(),
-            Some(message.clone()),
-            baseline.map(|item| item.cache_read_tokens),
-            candidate.map(|item| item.cache_read_tokens),
-            baseline.map(|item| item.ttft_ms),
-            candidate.map(|item| item.ttft_ms),
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            active_channel.clone(),
+            diagnostics.cache_capability_key_id.as_deref(),
+            field,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some(format!(
+                "runtime rejection: {}",
+                truncate_log_message(error_summary)
+            )),
         );
-        config.save(&state.config_path)?;
+        changed = true;
     }
-    if effect_status == ProviderCacheEffectStatus::Error {
-        return Err(anyhow!(message));
+    if changed {
+        state.journal_config(&config);
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_cache_effect_pair(
-    state: &AppState,
-    provider: &ProviderConfig,
-    api_key: &str,
-    channel: &Channel,
-    model_id: &str,
-    group_nonce: &str,
-    include_prompt_cache_key: bool,
-    enable_modern_options: bool,
-    enable_explicit_breakpoint: bool,
-) -> Result<CacheEffectObservation> {
-    let mut read_response = None;
-    for phase in ["write", "read"] {
-        let body = cache_capability::effect_probe_body(
-            channel,
-            model_id,
-            group_nonce,
-            phase,
-            include_prompt_cache_key,
-            enable_modern_options,
-            enable_explicit_breakpoint,
-        );
-        let response = send_provider_management_probe_request(
-            state,
-            provider,
-            api_key,
-            channel,
-            &body,
-            CACHE_CAPABILITY_PROBE_REQUEST_KIND,
-        )
-        .await?;
-        if !is_successful_probe_response(&response) {
-            return Err(anyhow!(
-                "cache effect {phase} returned HTTP {}: {}",
-                response.status,
-                upstream_error_summary(&response.bytes)
-            ));
-        }
-        if phase == "read" {
-            read_response = Some(response);
-        }
-    }
-    let response = read_response.expect("the two-phase probe must retain its read response");
-    let usage = provider_usage_from_bytes(&response.bytes);
-    if usage.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS {
-        return Err(anyhow!(
-            "cache effect usage reported {} input tokens; at least {} are required",
-            usage.input_tokens,
-            CACHE_EFFECT_MIN_INPUT_TOKENS
-        ));
-    }
-    Ok(CacheEffectObservation {
-        input_tokens: usage.input_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        ttft_ms: response.ttft_ms,
-    })
-}
-
-fn evaluate_cache_effect(
-    baseline: CacheEffectObservation,
-    candidate: CacheEffectObservation,
-) -> Result<CacheEffectEvaluation> {
-    if baseline.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS
-        || candidate.input_tokens < CACHE_EFFECT_MIN_INPUT_TOKENS
-    {
-        return Err(anyhow!(
-            "cache effect samples did not meet the minimum input size"
-        ));
-    }
-    let token_gain = candidate
-        .cache_read_tokens
-        .saturating_sub(baseline.cache_read_tokens);
-    let ratio_gain =
-        cache_effect_ratio_bps(candidate).saturating_sub(cache_effect_ratio_bps(baseline));
-    let benefit =
-        token_gain >= CACHE_EFFECT_MIN_DELTA_TOKENS || ratio_gain >= CACHE_EFFECT_MIN_DELTA_BPS;
-    let ttft_allowance = 250u64.max(baseline.ttft_ms / 4);
-    let ttft_not_degraded = candidate.ttft_ms <= baseline.ttft_ms.saturating_add(ttft_allowance);
-    Ok(CacheEffectEvaluation {
-        status: if benefit && ttft_not_degraded {
-            ProviderCacheEffectStatus::Promoted
-        } else {
-            ProviderCacheEffectStatus::NoBenefit
-        },
-        baseline,
-        candidate,
-    })
-}
-
-fn cache_effect_ratio_bps(observation: CacheEffectObservation) -> u64 {
-    if observation.input_tokens == 0 {
-        return 0;
-    }
-    observation
-        .cache_read_tokens
-        .min(observation.input_tokens)
-        .saturating_mul(10_000)
-        / observation.input_tokens
 }
 
 pub(crate) async fn probe_provider_response_session_reuse(
@@ -10296,10 +9113,11 @@ pub(crate) async fn probe_provider_response_session_reuse(
     }
 
     let nonce = format!("ato-session-{}", Uuid::new_v4().simple());
+    let stable_prefix = "Atoapi response-session cache verification stable context. ".repeat(192);
     let seed_body = json!({
         "model": model_id,
         "input": format!(
-            "This is a connection compatibility check. Remember the exact token {nonce}. Reply only ACK."
+            "{stable_prefix}\nRemember the exact token {nonce}. Reply only ACK."
         ),
         "store": true,
         "stream": false,
@@ -10326,6 +9144,7 @@ pub(crate) async fn probe_provider_response_session_reuse(
             None,
         ));
     }
+    let first_usage = provider_usage_from_bytes(&first.bytes);
     let Some(previous_response_id) = response_id_from_bytes(&first.bytes) else {
         return Ok(response_session_reuse_probe_result(
             provider_id,
@@ -10366,32 +9185,99 @@ pub(crate) async fn probe_provider_response_session_reuse(
             Some(continuation.status),
         ));
     }
+    let continuation_usage = provider_usage_from_bytes(&continuation.bytes);
     let output = serde_json::from_slice::<Value>(&continuation.bytes)
         .ok()
         .and_then(|value| extract_response_text(&value))
         .unwrap_or_default();
-    if output
+    if !output
         .to_ascii_lowercase()
         .contains(&nonce.to_ascii_lowercase())
     {
-        Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            ProviderResponseSessionReuseStatus::Verified,
-            "verification passed; semantic continuation was preserved".to_string(),
-            Some(first.status),
-            Some(continuation.status),
+        return Ok(with_response_session_probe_usage(
+            response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                ProviderResponseSessionReuseStatus::Unsupported,
+                "continuation succeeded but did not preserve the verification token".to_string(),
+                Some(first.status),
+                Some(continuation.status),
+            ),
+            &first_usage,
+            &continuation_usage,
+            false,
+        ));
+    }
+
+    if let Some(message) = response_session_probe_usage_error(&first_usage, &continuation_usage) {
+        Ok(with_response_session_probe_usage(
+            response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                ProviderResponseSessionReuseStatus::Unverified,
+                message.to_string(),
+                Some(first.status),
+                Some(continuation.status),
+            ),
+            &first_usage,
+            &continuation_usage,
+            false,
         ))
     } else {
-        Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "continuation succeeded but did not preserve the verification token".to_string(),
-            Some(first.status),
-            Some(continuation.status),
+        Ok(with_response_session_probe_usage(
+            response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                ProviderResponseSessionReuseStatus::Verified,
+                format!(
+                    "verification passed; semantic continuation and cached-token usage were preserved (seed input {}, continuation input {}, cached {})",
+                    first_usage.input_tokens,
+                    continuation_usage.input_tokens,
+                    continuation_usage.cache_read_tokens
+                ),
+                Some(first.status),
+                Some(continuation.status),
+            ),
+            &first_usage,
+            &continuation_usage,
+            true,
         ))
     }
+}
+
+fn response_session_probe_usage_error(
+    first: &UsageRecord,
+    continuation: &UsageRecord,
+) -> Option<&'static str> {
+    if first.input_tokens == 0 {
+        return Some("semantic continuation succeeded but the seed response did not report input usage; session reuse remains disabled");
+    }
+    if continuation.input_tokens == 0 {
+        return Some("semantic continuation succeeded but the continuation did not report input usage; session reuse remains disabled");
+    }
+    if continuation.input_tokens < first.input_tokens {
+        return Some("semantic continuation succeeded but continuation usage did not include the seed context; session reuse remains disabled");
+    }
+    if continuation.cache_read_tokens < PROVIDER_CACHE_MIN_BUCKET_TOKENS {
+        return Some("semantic continuation succeeded but the continuation did not report one full 128-token cache bucket; no cache benefit was verified");
+    }
+    None
+}
+
+fn with_response_session_probe_usage(
+    mut result: ProviderResponseSessionReuseProbeResult,
+    first: &UsageRecord,
+    continuation: &UsageRecord,
+    usage_verified: bool,
+) -> ProviderResponseSessionReuseProbeResult {
+    result.first_input_tokens = (first.input_tokens > 0).then_some(first.input_tokens);
+    result.first_cached_tokens = (first.input_tokens > 0).then_some(first.cache_read_tokens);
+    result.continuation_input_tokens =
+        (continuation.input_tokens > 0).then_some(continuation.input_tokens);
+    result.continuation_cached_tokens =
+        (continuation.input_tokens > 0).then_some(continuation.cache_read_tokens);
+    result.usage_verified = usage_verified;
+    result
 }
 
 pub(crate) async fn probe_provider_responses_websocket(
@@ -10471,29 +9357,34 @@ pub(crate) async fn probe_and_record_provider_response_session_reuse(
         ),
     };
 
-    let mut config = state.config.write().await;
-    if config
-        .response_session_reuse_probe_target(provider_id)
-        .as_ref()
-        != Some(&probe_target)
-        || config.response_session_reuse_record_snapshot(provider_id, model_id)
-            != probe_record_snapshot
-    {
-        result.status = ProviderResponseSessionReuseStatus::Error;
-        result.enabled = false;
-        result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
-            .to_string();
-        result.checked_at = Some(Utc::now());
-        return Ok(result);
-    }
-    config.record_response_session_reuse_probe(
-        provider_id,
-        model_id,
-        result.status.clone(),
-        (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
-            .then(|| result.message.clone()),
-    );
-    config.save(&state.config_path)?;
+    let persist_version = {
+        let mut config = state.config.write().await;
+        if config
+            .response_session_reuse_probe_target(provider_id)
+            .as_ref()
+            != Some(&probe_target)
+            || config.response_session_reuse_record_snapshot(provider_id, model_id)
+                != probe_record_snapshot
+        {
+            result.status = ProviderResponseSessionReuseStatus::Error;
+            result.enabled = false;
+            result.usage_verified = false;
+            result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
+                .to_string();
+            result.checked_at = Some(Utc::now());
+            return Ok(result);
+        }
+        config.record_response_session_reuse_probe(
+            provider_id,
+            model_id,
+            result.status.clone(),
+            result.usage_verified,
+            (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
+                .then(|| result.message.clone()),
+        );
+        state.publish_config_snapshot(&config)?
+    };
+    state.wait_for_config_snapshot(persist_version).await?;
     result.checked_at = Some(Utc::now());
     Ok(result)
 }
@@ -10529,20 +9420,16 @@ async fn send_provider_management_probe_request(
         X_ATOAPI_REQUEST_KIND_HEADER,
         HeaderValue::from_static(request_kind),
     );
-    let outcome = send_main_upstream_request(
-        state,
-        provider.use_system_proxy,
-        &upstream_url(&provider.base_url, channel),
-        api_key,
-        channel,
+    let plan = RequestPlan::new(
+        provider,
+        upstream_url(&provider.base_url, channel),
+        channel.clone(),
         body,
-        &management_headers,
-        provider.custom_user_agent.as_deref(),
-        false,
-        false,
-        true,
     )
-    .await?;
+    .with_gzip_enabled(false);
+    let outcome =
+        send_main_upstream_request(state, api_key, plan.into_one_shot(), &management_headers)
+            .await?;
     let status = outcome.response.status().as_u16();
     let content_type = outcome
         .response
@@ -10563,10 +9450,6 @@ async fn send_provider_management_probe_request(
         status,
         content_type,
         bytes: body.bytes,
-        ttft_ms: body
-            .first_chunk_ms
-            .map(|first_chunk_ms| headers_at_ms.saturating_add(first_chunk_ms))
-            .unwrap_or(body.aggregate_done_ms),
     })
 }
 
@@ -10602,6 +9485,11 @@ fn response_session_reuse_probe_result(
         checked_at: Some(Utc::now()),
         first_status,
         continuation_status,
+        first_input_tokens: None,
+        first_cached_tokens: None,
+        continuation_input_tokens: None,
+        continuation_cached_tokens: None,
+        usage_verified: false,
     }
 }
 
@@ -10711,52 +9599,44 @@ fn upstream_header_is_blocked(name: &str) -> bool {
         || name.starts_with("x-b3-")
 }
 
-async fn send_upstream_request_to_url_with_diagnostics(
+async fn dispatch_prepared_one_shot_with_diagnostics(
     state: &AppState,
-    use_system_proxy: bool,
-    url: &str,
     api_key: &str,
-    channel: &Channel,
-    body: &Value,
+    plan: OneShotRequestPlan,
     inbound_headers: &HeaderMap,
-    custom_user_agent: Option<&str>,
-    max_attempts_override: Option<usize>,
-    request_body_gzip_enabled: bool,
     agent_attempt: Option<AgentAttemptDispatch>,
 ) -> Result<UpstreamSendOutcome> {
-    const MAX_ATTEMPTS: usize = 3;
     let agent_transport = agent_attempt.is_some();
-    let max_attempts = if agent_transport {
-        1
-    } else {
-        max_attempts_override
-            .unwrap_or(MAX_ATTEMPTS)
-            .clamp(1, MAX_ATTEMPTS)
-    };
-    let body_encode_started = Instant::now();
-    let outbound_prefix_fingerprints = maybe_responses_wire_prefix_fingerprints(channel, body);
-    let original_body = upstream_request_body_bytes(channel, body);
-    let request_body_encode_ms = body_encode_started.elapsed().as_millis() as u64;
+    let prepared = plan.wire();
+    let channel = plan.channel();
+    let url = plan.url();
+    let outbound_prefix_fingerprints = prepared.outbound_prefix_fingerprints().cloned();
+    let original_body = prepared.body().clone();
+    let request_body_encode_ms = prepared.encode_ms();
     let original_body_len = original_body.len() as u64;
     let gzip_cooldown_key = request_body_gzip_cooldown_key(url, channel);
-    let gzip_cooldown_active = request_body_gzip_enabled
+    let gzip_cooldown_active = plan.request_body_gzip_enabled()
         && request_body_gzip_cooldown_active(state, &gzip_cooldown_key).await;
     let gzip_threshold = request_body_gzip_threshold_bytes(channel);
-    let use_gzip =
-        request_body_gzip_enabled && !gzip_cooldown_active && original_body.len() >= gzip_threshold;
-    let gzip_encode_started = Instant::now();
-    let compressed_body = if use_gzip {
-        gzip_request_body(&original_body).ok()
+    let use_gzip = plan.request_body_gzip_enabled()
+        && !gzip_cooldown_active
+        && original_body.len() >= gzip_threshold;
+    let (compressed_body, gzip_encode_ms) = if use_gzip {
+        if let Some(body) = prepared.cached_gzip_body() {
+            (Some(body), 0)
+        } else {
+            let gzip_encode_started = Instant::now();
+            let body = gzip_request_body(&original_body)
+                .ok()
+                .map(Bytes::from)
+                .map(|body| prepared.cache_gzip_body(body));
+            (body, gzip_encode_started.elapsed().as_millis() as u64)
+        }
     } else {
-        None
-    };
-    let gzip_encode_ms = if use_gzip {
-        gzip_encode_started.elapsed().as_millis() as u64
-    } else {
-        0
+        (None, 0)
     };
     let mut diagnostics = UpstreamRequestDiagnostics {
-        network_path: if use_system_proxy {
+        network_path: if plan.use_system_proxy() {
             "system-proxy"
         } else {
             "direct"
@@ -10772,119 +9652,75 @@ async fn send_upstream_request_to_url_with_diagnostics(
         outbound_prefix_fingerprints,
         ..UpstreamRequestDiagnostics::default()
     };
-    let mut gzip_disabled_after_fallback = false;
-    let mut agent_attempt = agent_attempt;
+    diagnostics.attempts = 1;
+    let sending_gzip = compressed_body.is_some();
+    let outbound_headers = build_upstream_request_headers(
+        inbound_headers,
+        api_key,
+        channel,
+        prepared.is_stream(),
+        plan.custom_user_agent(),
+        sending_gzip,
+    );
+    let client = if agent_transport {
+        state
+            .transport_clients
+            .agent_client(plan.use_system_proxy())
+    } else {
+        state.upstream_client(plan.use_system_proxy())
+    };
+    let request_body = compressed_body.unwrap_or(original_body);
+    let request = client
+        .post(url)
+        .headers(outbound_headers)
+        .body(request_body);
 
-    for attempt in 0..max_attempts {
-        diagnostics.attempts += 1;
-        if attempt > 0 {
-            state.metrics.record_retry().await;
-        }
-
-        let sending_gzip = compressed_body.is_some() && !gzip_disabled_after_fallback;
-        let outbound_headers = build_upstream_request_headers(
-            inbound_headers,
-            api_key,
+    if let Some(dispatch) = agent_attempt {
+        let began = begin_agent_upstream_attempt(
+            state,
+            &dispatch.token,
+            &dispatch.provider,
+            &dispatch.model,
             channel,
-            request_body_stream_flag(body),
-            custom_user_agent,
-            sending_gzip,
-        );
-        let client = if agent_transport {
-            state.transport_clients.agent_client(use_system_proxy)
-        } else {
-            state.upstream_client(use_system_proxy)
-        };
-        let request = client.post(url).headers(outbound_headers);
-        let request = if sending_gzip {
-            request.body(
-                compressed_body
-                    .clone()
-                    .unwrap_or_else(|| original_body.clone()),
-            )
-        } else if matches!(channel, Channel::Responses) {
-            request.body(original_body.clone())
-        } else {
-            request.body(original_body.clone())
-        };
-
-        if let Some(dispatch) = agent_attempt.take() {
-            let began = begin_agent_upstream_attempt(
-                state,
-                &dispatch.token,
-                &dispatch.provider,
-                &dispatch.model,
-                channel,
-            )
-            .await;
-            if !began {
-                return Err(anyhow!(
-                    "Agent attempt {} was not authorized for upstream dispatch",
-                    dispatch.token.attempt_id()
-                ));
-            }
-        }
-        let send_started = Instant::now();
-        match request.send().await {
-            Ok(response) => {
-                let headers_ms = send_started.elapsed().as_millis() as u64;
-                diagnostics.headers_ms += headers_ms;
-                observe_upstream_response_timing(&mut diagnostics, &response, headers_ms);
-                if sending_gzip
-                    && should_fallback_to_uncompressed(response.status(), attempt, max_attempts)
-                {
-                    // Only mark the provider as gzip-incompatible when we are
-                    // actually going to retry the same request uncompressed.
-                    // Streaming requests intentionally use one attempt; a
-                    // transient 4xx/5xx there must not disable gzip for hours.
-                    note_request_body_gzip_fallback(state, &gzip_cooldown_key).await;
-                    diagnostics.gzip_fallback_used = true;
-                    diagnostics.sent_body_bytes = original_body_len;
-                    gzip_disabled_after_fallback = true;
-                    continue;
-                }
-                if should_retry_status(response.status())
-                    && attempt + 1 < max_attempts_for_status(response.status()).min(max_attempts)
-                {
-                    let delay = upstream_retry_delay(
-                        response.status(),
-                        response
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|value| value.to_str().ok()),
-                        attempt,
-                    );
-                    diagnostics.retry_wait_ms += delay.as_millis() as u64;
-                    sleep(delay).await;
-                    continue;
-                }
-                return Ok(UpstreamSendOutcome {
-                    response,
-                    diagnostics,
-                });
-            }
-            Err(err) => {
-                let headers_ms = send_started.elapsed().as_millis() as u64;
-                diagnostics.headers_ms += headers_ms;
-                diagnostics.last_attempt_headers_ms = headers_ms;
-                diagnostics.http_version = None;
-                diagnostics.remote_addr = None;
-                diagnostics.pool_diagnostic = None;
-                diagnostics.server_timing = None;
-                diagnostics.timing_source = None;
-                diagnostics.reported_processing_ms = None;
-                diagnostics.non_processing_ms = None;
-                if attempt + 1 >= max_attempts {
-                    return Err(err.into());
-                }
-                let delay = network_retry_delay(attempt);
-                diagnostics.retry_wait_ms += delay.as_millis() as u64;
-                sleep(delay).await;
-            }
+        )
+        .await;
+        if !began {
+            return Err(anyhow!(
+                "Agent attempt {} was not authorized for upstream dispatch",
+                dispatch.token.attempt_id()
+            ));
         }
     }
-
-    unreachable!("retry loop always returns on the final attempt")
+    let send_started = Instant::now();
+    match request.send().await {
+        Ok(response) => {
+            let headers_ms = send_started.elapsed().as_millis() as u64;
+            diagnostics.headers_ms = headers_ms;
+            observe_upstream_response_timing(&mut diagnostics, &response, headers_ms);
+            // Do not retry an incompatible gzip request. Learn that state for
+            // the next independent inbound and preserve this original result.
+            if sending_gzip && should_retry_without_gzip(response.status()) {
+                note_request_body_gzip_fallback(state, &gzip_cooldown_key).await;
+            }
+            Ok(UpstreamSendOutcome {
+                response,
+                diagnostics,
+            })
+        }
+        Err(err) => {
+            let headers_ms = send_started.elapsed().as_millis() as u64;
+            diagnostics.headers_ms = headers_ms;
+            diagnostics.last_attempt_headers_ms = headers_ms;
+            diagnostics.http_version = None;
+            diagnostics.remote_addr = None;
+            diagnostics.pool_diagnostic = None;
+            diagnostics.server_timing = None;
+            diagnostics.timing_source = None;
+            diagnostics.reported_processing_ms = None;
+            diagnostics.non_processing_ms = None;
+            Err(err.into())
+        }
+    }
 }
 
 async fn read_upstream_body_with_diagnostics(
@@ -10922,47 +9758,6 @@ async fn read_upstream_body_with_diagnostics(
             sse_chunks: None,
         })
     }
-}
-
-fn should_retry_status(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::REQUEST_TIMEOUT || status.is_server_error()
-}
-
-fn max_attempts_for_status(status: reqwest::StatusCode) -> usize {
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        1
-    } else if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
-        || status == reqwest::StatusCode::GATEWAY_TIMEOUT
-    {
-        2
-    } else {
-        3
-    }
-}
-
-fn upstream_retry_delay(
-    status: reqwest::StatusCode,
-    retry_after: Option<&str>,
-    attempt: usize,
-) -> TokioDuration {
-    let default = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        match attempt {
-            0 => TokioDuration::from_secs(5),
-            1 => TokioDuration::from_secs(15),
-            _ => TokioDuration::from_secs(30),
-        }
-    } else {
-        TokioDuration::from_millis(600 * (attempt as u64 + 1))
-    };
-
-    retry_after
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| TokioDuration::from_secs(seconds.min(30)).max(default))
-        .unwrap_or(default)
-}
-
-fn network_retry_delay(attempt: usize) -> TokioDuration {
-    TokioDuration::from_millis(350 * (attempt as u64 + 1))
 }
 
 fn responses_wire_prefix_fingerprints(
@@ -11136,46 +9931,25 @@ fn truncated_wire_segment_digest(hasher: Sha256) -> String {
 }
 
 fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
-    const ORDERED_KEYS: [&str; 23] = [
-        "model",
-        "prompt_cache_key",
-        "prompt_cache_retention",
-        "prompt_cache_options",
-        "instructions",
-        "tools",
-        "tool_choice",
-        "parallel_tool_calls",
-        "input",
-        "reasoning",
-        "text",
-        "response_format",
-        "temperature",
-        "top_p",
-        "max_output_tokens",
-        "include",
-        "stream",
-        "store",
-        "service_tier",
-        "truncation",
-        "previous_response_id",
-        "metadata",
-        "user",
-    ];
+    String::from_utf8(serialize_responses_body_bytes_for_provider_prefix(body))
+        .unwrap_or_else(|_| "null".to_string())
+}
 
+#[cfg(test)]
+fn legacy_serialize_responses_body_for_provider_prefix(body: &Value) -> String {
     let Some(map) = body.as_object() else {
         return serde_json::to_string(body).unwrap_or_else(|_| "null".to_string());
     };
 
     let mut parts = Vec::with_capacity(map.len());
-    for key in ORDERED_KEYS {
+    for key in RESPONSES_WIRE_ORDERED_KEYS {
         if let Some(value) = map.get(key) {
             parts.push(format_json_member(key, value));
         }
     }
-
     let mut remaining = map
         .keys()
-        .filter(|key| !ORDERED_KEYS.contains(&key.as_str()))
+        .filter(|key| !RESPONSES_WIRE_ORDERED_KEYS.contains(&key.as_str()))
         .collect::<Vec<_>>();
     remaining.sort();
     for key in remaining {
@@ -11183,7 +9957,6 @@ fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
             parts.push(format_json_member(key, value));
         }
     }
-
     format!("{{{}}}", parts.join(","))
 }
 
@@ -11274,7 +10047,7 @@ async fn stream_upstream(
     tail_input_diagnostics: TailInputDiagnostics,
     session_anchor_diagnostics: SessionAnchorDiagnostics,
     response_session_reuse_diagnostics: ResponseSessionReuseDiagnostics,
-    codex_chat_tool_context: Option<transform_codex_chat::CodexToolContext>,
+    cross_protocol_tool_context: Option<transform_codex_chat::CodexToolContext>,
     agent_log_id: Option<String>,
     agent_log_label: Option<String>,
     requested_model: Option<String>,
@@ -11285,7 +10058,7 @@ async fn stream_upstream(
     agent_attempt_id: Option<String>,
     mut shadow_affinity_decision: Option<ShadowAffinityDecision>,
     agent_generation: bool,
-    automatic_cache_probe_scope: Option<AutomaticCacheProbeScope>,
+    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
     // for the whole SSE response. The guarded section has already covered request
@@ -11296,33 +10069,155 @@ async fn stream_upstream(
 
     let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Chat);
-    let response_content_type = if convert_codex_chat_sse_to_responses_sse {
+    let convert_anthropic_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Anthropic);
+    let convert_anthropic_sse_to_chat_sse = matches!(client_channel, Channel::Chat)
+        && matches!(decision.upstream_channel, Channel::Anthropic);
+    let convert_chat_sse_to_anthropic_sse = matches!(client_channel, Channel::Anthropic)
+        && matches!(decision.upstream_channel, Channel::Chat);
+    let convert_responses_sse_to_chat_sse = matches!(client_channel, Channel::Chat)
+        && matches!(decision.upstream_channel, Channel::Responses);
+    let convert_responses_sse_to_anthropic_sse = matches!(client_channel, Channel::Anthropic)
+        && matches!(decision.upstream_channel, Channel::Responses);
+    let response_content_type = if convert_codex_chat_sse_to_responses_sse
+        || convert_anthropic_sse_to_responses_sse
+        || convert_anthropic_sse_to_chat_sse
+        || convert_chat_sse_to_anthropic_sse
+        || convert_responses_sse_to_chat_sse
+        || convert_responses_sse_to_anthropic_sse
+    {
         "text/event-stream".to_string()
     } else {
         content_type.clone()
     };
     let content_type_for_cache = response_content_type.clone();
     let (downstream_sender, mut downstream_receiver) =
-        mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_RELAY_CHANNEL_CAPACITY);
+        mpsc::channel::<Result<RelayBodyChunk, std::io::Error>>(STREAM_RELAY_CHANNEL_CAPACITY);
+    let downstream_byte_budget = Arc::new(Semaphore::new(STREAM_RELAY_BYTE_BUDGET));
+    let relay_tracker = state.relay_tasks.clone();
+    let relay_reservation = if response_handoff.is_none() {
+        match relay_tracker.reserve() {
+            Ok(reservation) => Some(reservation),
+            Err(_) => {
+                // The upstream response head already exists, but no relay may
+                // expose it after shutdown has stopped accepting owners. Record
+                // the failed inbound before returning a local 503.
+                let admission_body = json!({ "stream": true });
+                record_upstream_transport_failure(
+                    &state,
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &decision.upstream_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &admission_body,
+                    used_response_session,
+                    &response_session_reuse_diagnostics,
+                    requested_model.clone(),
+                    agent_log_id.as_deref(),
+                    "stream-relay-admission",
+                    upstream_request_diagnostics.attempts,
+                    &[],
+                    "stream_relay_admission",
+                    "proxy relay is shutting down",
+                )
+                .await;
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "proxy relay is shutting down",
+                );
+            }
+        }
+    } else {
+        None
+    };
 
-    tokio::spawn(async move {
+    let relay = async move {
         let raw_stream = upstream.bytes_stream();
+        let mut responses_to_chat_stream_summary = None;
+        let mut responses_to_anthropic_stream_summary = None;
+        let mut chat_to_anthropic_stream_summary = None;
         let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
             if convert_codex_chat_sse_to_responses_sse {
-                let tool_context = codex_chat_tool_context.unwrap_or_default();
+                let tool_context = cross_protocol_tool_context.clone().unwrap_or_default();
                 Box::pin(
-                    streaming_codex_chat::create_responses_sse_stream_from_chat_with_context(
+                    streaming_codex_chat::create_responses_sse_stream_from_chat_with_context_and_model(
                         raw_stream,
                         tool_context,
+                        decision.model.clone(),
                     )
                     .map(|item| item.map_err(|err| err.to_string())),
                 )
+            } else if convert_anthropic_sse_to_responses_sse {
+                let context = streaming_codex_anthropic::AnthropicResponsesContext {
+                    tool_context: cross_protocol_tool_context.unwrap_or_default(),
+                };
+                Box::pin(
+                    streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(
+                        raw_stream,
+                        context,
+                        decision.model.clone(),
+                    )
+                    .map(|item| item.map_err(|err| err.to_string())),
+                )
+            } else if convert_anthropic_sse_to_chat_sse {
+                // Keep the raw Anthropic stream pull-based: the existing
+                // Anthropic→Responses and Responses→Chat adapters compose
+                // without collecting the body, so the first Chat delta can
+                // leave the owner relay before `message_stop`.
+                let intermediate =
+                    streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(
+                        raw_stream,
+                        streaming_codex_anthropic::AnthropicResponsesContext {
+                            tool_context: transform_codex_chat::CodexToolContext::default(),
+                        },
+                        decision.model.clone(),
+                    );
+                let (adapted, summary) =
+                    streaming_responses_chat::create_chat_sse_stream_from_responses(
+                        intermediate,
+                        decision.model.clone(),
+                        diagnostics.chat_stream_include_usage,
+                    );
+                responses_to_chat_stream_summary = Some(summary);
+                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
+            } else if convert_chat_sse_to_anthropic_sse {
+                let (adapted, summary) =
+                    streaming_chat_anthropic::create_anthropic_sse_stream_from_chat(
+                        raw_stream,
+                        decision.model.clone(),
+                    );
+                chat_to_anthropic_stream_summary = Some(summary);
+                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
+            } else if convert_responses_sse_to_chat_sse {
+                let (adapted, summary) =
+                    streaming_responses_chat::create_chat_sse_stream_from_responses(
+                        raw_stream,
+                        decision.model.clone(),
+                        diagnostics.chat_stream_include_usage,
+                    );
+                responses_to_chat_stream_summary = Some(summary);
+                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
+            } else if convert_responses_sse_to_anthropic_sse {
+                let (adapted, summary) =
+                    streaming_responses_anthropic::create_anthropic_sse_stream_from_responses(
+                        raw_stream,
+                        decision.model.clone(),
+                    );
+                responses_to_anthropic_stream_summary = Some(summary);
+                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
             } else {
                 Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
             };
         let mut first_chunk_at: Option<u64> = None;
         let mut first_model_output_at: Option<u64> = None;
-        let mut cache_body = Vec::new();
+        let mut cache_capture = BoundedCacheCapture::new(eligible);
         let mut session_error_body = Vec::new();
         let mut stream_state = ResponsesStreamState::default();
         let mut sse_chunks = 0u64;
@@ -11331,8 +10226,11 @@ async fn stream_upstream(
         let mut stream_client_backpressure_ms = 0u64;
         let mut downstream_disconnected = false;
         let mut downstream_disconnect_stage = None;
+        let mut first_chunk_accepted_by_relay = false;
+        let mut terminal_accepted_by_relay = false;
         let mut stream_end = StreamEnd::CleanEof;
         let mut stream_transport_error = None;
+        let mut stream_metric_errors = Vec::<(String, String)>::new();
         let state_for_stream = state.clone();
         loop {
             let upstream_wait_started = Instant::now();
@@ -11345,10 +10243,7 @@ async fn stream_upstream(
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(err) => {
-                    state_for_stream
-                        .metrics
-                        .record_error("upstream_stream", &err)
-                        .await;
+                    stream_metric_errors.push(("upstream_stream".to_string(), err.clone()));
                     sse_end_reason = "upstream_stream_error".to_string();
                     stream_end = StreamEnd::TransportError;
                     stream_transport_error = Some(err);
@@ -11360,43 +10255,102 @@ async fn stream_upstream(
                 first_chunk_at = Some(chunk_received_at);
             }
             sse_chunks += 1;
-            let observation = stream_state.ingest(&chunk);
-            if first_model_output_at.is_none() && observation.model_output_started {
-                first_model_output_at = Some(chunk_received_at);
-            }
-            let terminal_seen = match client_channel {
-                Channel::Responses | Channel::Anthropic => observation.completed_event_seen,
-                Channel::Chat => observation.done_marker_seen,
-            };
-            if !downstream_disconnected {
-                let client_backpressure_started = Instant::now();
-                if downstream_sender
-                    .send(Ok::<Bytes, std::io::Error>(chunk.clone()))
-                    .await
-                    .is_err()
-                {
-                    downstream_disconnected = true;
-                    downstream_disconnect_stage = Some(
-                        if terminal_seen {
-                            "after_terminal"
-                        } else {
-                            "before_terminal"
-                        }
-                        .to_string(),
-                    );
+            for relay_chunk in relay_chunk_parts(&chunk) {
+                let mut accepted_by_relay = false;
+                if !downstream_disconnected {
+                    let client_backpressure_started = Instant::now();
+                    let permit = downstream_byte_budget
+                        .clone()
+                        .acquire_many_owned(relay_chunk.len() as u32)
+                        .await;
+                    let send_failed = match permit {
+                        Ok(permit) => downstream_sender
+                            .send(Ok(RelayBodyChunk {
+                                bytes: relay_chunk.clone(),
+                                permit,
+                            }))
+                            .await
+                            .is_err(),
+                        Err(_) => true,
+                    };
+                    if send_failed {
+                        downstream_disconnected = true;
+                        downstream_disconnect_stage = Some(
+                            if terminal_accepted_by_relay {
+                                "after_terminal"
+                            } else {
+                                "before_terminal"
+                            }
+                            .to_string(),
+                        );
+                    } else {
+                        accepted_by_relay = true;
+                    }
+                    stream_client_backpressure_ms = stream_client_backpressure_ms
+                        .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
                 }
-                stream_client_backpressure_ms = stream_client_backpressure_ms
-                    .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
-            }
-            if eligible {
-                cache_body.extend_from_slice(&chunk);
-            }
-            if used_response_session && session_error_body.len() < 65_536 {
-                let remaining = 65_536usize.saturating_sub(session_error_body.len());
-                session_error_body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                if accepted_by_relay && !first_chunk_accepted_by_relay {
+                    first_chunk_accepted_by_relay = true;
+                    tokio::task::yield_now().await;
+                }
+                let observation = stream_state.ingest(&relay_chunk);
+                if first_model_output_at.is_none() && observation.model_output_started {
+                    first_model_output_at = Some(chunk_received_at);
+                }
+                let terminal_seen = match client_channel {
+                    Channel::Responses => observation.responses_completed_event_seen,
+                    Channel::Anthropic => observation.message_stop_event_seen,
+                    Channel::Chat => observation.done_marker_seen,
+                };
+                if accepted_by_relay && terminal_seen {
+                    terminal_accepted_by_relay = true;
+                }
+                cache_capture.push(&relay_chunk);
+                if used_response_session && session_error_body.len() < 65_536 {
+                    let remaining = 65_536usize.saturating_sub(session_error_body.len());
+                    session_error_body
+                        .extend_from_slice(&relay_chunk[..relay_chunk.len().min(remaining)]);
+                }
             }
         }
-        let stream_metadata = stream_state.finish();
+        let cache_body = cache_capture.finish();
+        let mut stream_metadata = stream_state.finish();
+        if let Some(summary_handle) = responses_to_chat_stream_summary {
+            if let Ok(summary) = summary_handle.lock() {
+                if summary.usage.has_usage() {
+                    stream_metadata.usage = summary.usage.clone();
+                }
+                if summary.response_id.is_some() {
+                    stream_metadata.response_id = summary.response_id.clone();
+                }
+                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
+                stream_metadata.model_output_seen |= summary.model_output_seen;
+            }
+        }
+        if let Some(summary_handle) = responses_to_anthropic_stream_summary {
+            if let Ok(summary) = summary_handle.lock() {
+                if summary.usage.has_usage() {
+                    stream_metadata.usage = summary.usage.clone();
+                }
+                if summary.response_id.is_some() {
+                    stream_metadata.response_id = summary.response_id.clone();
+                }
+                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
+                stream_metadata.model_output_seen |= summary.model_output_seen;
+            }
+        }
+        if let Some(summary_handle) = chat_to_anthropic_stream_summary {
+            if let Ok(summary) = summary_handle.lock() {
+                if summary.usage.has_usage() {
+                    stream_metadata.usage = summary.usage.clone();
+                }
+                if summary.response_id.is_some() {
+                    stream_metadata.response_id = summary.response_id.clone();
+                }
+                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
+                stream_metadata.model_output_seen |= summary.model_output_seen;
+            }
+        }
         let terminal_verdict = evaluate_terminal(
             &client_channel,
             TerminalCompatibility::Strict,
@@ -11408,6 +10362,7 @@ async fn stream_upstream(
         } else if let Some(failure) = terminal_verdict.failure {
             sse_end_reason = match failure {
                 TerminalFailure::ErrorEvent => "upstream_sse_error",
+                TerminalFailure::FrameTooLarge => "upstream_sse_frame_too_large",
                 TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
                 TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
             }
@@ -11419,6 +10374,9 @@ async fn stream_upstream(
                     .unwrap_or_else(|| "upstream stream failed before completion".to_string()),
                 Some(TerminalFailure::IncompleteEof) => {
                     "upstream stream ended before a completion event".to_string()
+                }
+                Some(TerminalFailure::FrameTooLarge) => {
+                    "upstream SSE frame exceeded the inspection limit".to_string()
                 }
                 Some(TerminalFailure::ErrorEvent) | None => String::new(),
             };
@@ -11432,6 +10390,22 @@ async fn stream_upstream(
                 downstream_disconnect_stage = Some("before_terminal".to_string());
             }
         }
+        // The client has received every upstream byte. Close its body before
+        // usage, cache, metrics, and persistence settlement continue.
+        drop(downstream_sender);
+        if !terminal_verdict.success {
+            if let Some(error_summary) = stream_metadata.error_summary.as_deref() {
+                note_runtime_cache_capability_rejection(
+                    &state_for_stream,
+                    &decision,
+                    &decision.upstream_channel,
+                    &upstream_request_diagnostics,
+                    status,
+                    error_summary,
+                )
+                .await;
+            }
+        }
         if used_response_session
             && is_verified_third_party_response_session_reuse(&config, &decision)
             && stream_metadata.error_event_seen
@@ -11439,10 +10413,10 @@ async fn stream_upstream(
             let error_summary = upstream_error_summary(&session_error_body);
             let rejection = response_session_rejection_classification(status, &error_summary);
             if !error_summary.is_empty() {
-                state_for_stream
-                    .metrics
-                    .record_error("verified_response_session_delta_rejected", &error_summary)
-                    .await;
+                stream_metric_errors.push((
+                    "verified_response_session_delta_rejected".to_string(),
+                    error_summary.clone(),
+                ));
             }
             let cooldown_key = response_session_error_cooldown_key(&decision);
             note_response_session_error_cooldown_for_rejection(
@@ -11484,16 +10458,17 @@ async fn stream_upstream(
             (200..300).contains(&status),
             terminal_verdict.success,
         );
-        if !stream_success_for_cache
-            && matches!(
-                terminal_verdict.failure,
-                Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof)
-            )
-        {
-            state_for_stream
-                .metrics
-                .record_error("upstream_sse_error", &sse_end_reason)
-                .await;
+        let terminal_error_scope = match terminal_verdict.failure {
+            Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof) => {
+                Some("upstream_sse_error")
+            }
+            Some(TerminalFailure::FrameTooLarge) => Some("upstream_sse_frame_too_large"),
+            Some(TerminalFailure::TransportErrorBeforeTerminal) | None => None,
+        };
+        if !stream_success_for_cache {
+            if let Some(error_scope) = terminal_error_scope {
+                stream_metric_errors.push((error_scope.to_string(), sse_end_reason.clone()));
+            }
         }
         let total_ms = started.elapsed().as_millis() as u64;
         let usage_observation = if stream_success_for_cache {
@@ -11502,9 +10477,6 @@ async fn stream_upstream(
                 stream_metadata.usage.clone(),
                 &decision,
                 prefix_state_key.as_deref(),
-                response_session_key
-                    .as_deref()
-                    .or(session_anchor_diagnostics.hash.as_deref()),
                 used_response_session,
             )
             .await
@@ -11586,6 +10558,7 @@ async fn stream_upstream(
             client_channel: client_channel.label().to_string(),
             upstream_channel: decision.upstream_channel.label().to_string(),
             provider: decision.provider.name.clone(),
+            provider_id: Some(decision.provider.id.clone()),
             model: decision.model.clone(),
             requested_model,
             agent_reasoning_effort: None,
@@ -11734,6 +10707,7 @@ async fn stream_upstream(
             session_anchor_source: None,
             session_anchor_changed: None,
             session_anchor_peer_count: None,
+            inbound_body_bytes: None,
             original_body_bytes: None,
             send_body_bytes: None,
             send_body_is_delta: None,
@@ -11777,6 +10751,12 @@ async fn stream_upstream(
                             Some("upstream_sse_error".to_string()),
                             "sse_error",
                         ),
+                        Some(TerminalFailure::FrameTooLarge) => (
+                            AgentAttemptOutcome::StreamError,
+                            AgentInboundOutcome::StreamError,
+                            Some("upstream_sse_frame_too_large".to_string()),
+                            "sse_frame_too_large",
+                        ),
                         Some(TerminalFailure::TransportErrorBeforeTerminal) => (
                             AgentAttemptOutcome::StreamError,
                             AgentInboundOutcome::TransportError,
@@ -11801,26 +10781,34 @@ async fn stream_upstream(
                 Some(status),
                 error_scope,
                 terminal_state,
+                usage_record.clone(),
+                response_session_key
+                    .clone()
+                    .or(session_anchor_diagnostics.hash.clone()),
+                stream_metric_errors.clone(),
                 shadow_affinity_decision,
                 Some(&upstream_request_diagnostics),
             )
             .await;
-            if terminal_verdict.success {
-                if let Some(scope) = automatic_cache_probe_scope {
-                    spawn_automatic_cache_capability_probe(state_for_stream.clone(), scope);
-                }
-            }
         } else {
-            state_for_stream
-                .metrics
-                .record_upstream_call(request_log.clone())
-                .await;
-            state_for_stream
-                .metrics
-                .record_request(request_log, true)
-                .await;
+            let mut transaction = MetricsTransaction::upstream(request_log);
+            if let Some(usage_record) = usage_record {
+                transaction.observe_usage(
+                    usage_record,
+                    response_session_key
+                        .as_deref()
+                        .or(session_anchor_diagnostics.hash.as_deref()),
+                );
+            }
+            for (scope, message) in stream_metric_errors {
+                transaction.observe_error(scope, message);
+            }
+            state_for_stream.metrics.commit(transaction).await;
         }
         if eligible && stream_success_for_cache && !confirmed_compaction {
+            let Some(cache_body) = cache_body else {
+                return;
+            };
             insert_cache_entries(
                 &state_for_stream,
                 cache_keys,
@@ -11834,15 +10822,21 @@ async fn stream_upstream(
             )
             .await;
         }
-    });
+    };
 
     let stream_body = async_stream::stream! {
         while let Some(chunk) = downstream_receiver.recv().await {
-            yield chunk;
+            match chunk {
+                Ok(RelayBodyChunk { bytes, permit }) => {
+                    yield Ok::<Bytes, std::io::Error>(bytes);
+                    drop(permit);
+                }
+                Err(error) => yield Err(error),
+            }
         }
     };
 
-    Response::builder()
+    let response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, response_content_type)
         .body(Body::from_stream(stream_body))
@@ -11851,7 +10845,18 @@ async fn stream_upstream(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to build stream response",
             )
-        })
+        });
+
+    if let Some(handoff) = response_handoff {
+        let _ = handoff.send(response);
+        relay.await;
+        Response::new(Body::empty())
+    } else {
+        relay_reservation
+            .expect("normal stream responses reserve a relay owner before body construction")
+            .spawn(relay);
+        response
+    }
 }
 
 async fn authorize_for_agent(
@@ -11958,6 +10963,23 @@ fn route_is_agent_provider_bound(
         .and_then(|agent| agent.provider_id.as_deref())
         .is_some()
 }
+
+async fn provider_route_affinity_for_request(
+    state: &AppState,
+    config: &AppConfig,
+    request: &Value,
+    client_channel: &Channel,
+    route_is_agent_bound: bool,
+) -> (Option<String>, Option<String>) {
+    let key = provider_route_affinity_key(config, request, client_channel);
+    if route_is_agent_bound {
+        return (key, None);
+    }
+
+    let provider_id = lookup_provider_route_affinity(state, config, key.as_deref()).await;
+    (key, provider_id)
+}
+
 fn provider_route_affinity_key(
     config: &AppConfig,
     request: &Value,
@@ -12383,21 +11405,11 @@ fn apply_model_reasoning_effort(
         set_request_reasoning_effort(upstream_request, upstream_channel, effective);
     }
 
-    let catalog_supported = if configured.is_none()
-        && model
-            .map(|model| model.supported_reasoning_efforts.is_empty())
-            .unwrap_or(true)
-    {
-        agent_injection::official_reasoning_efforts_for_model(&decision.model)
-    } else {
-        None
-    };
     ReasoningEffortDiagnostics {
         agent,
         configured,
         effective,
         source,
-        catalog_supported,
     }
 }
 
@@ -12499,38 +11511,37 @@ async fn note_reasoning_effort_rejection(
 
 /// Advances only the exact persisted manual override that sent the rejected
 /// effort. A concurrent settings edit wins instead of being overwritten.
-async fn persist_model_reasoning_effort_fallback(
+async fn journal_model_reasoning_effort_fallback(
     state: &AppState,
     decision: &RouteDecision,
     current_effort: &str,
     next_effort: &str,
-) -> Result<bool> {
+) -> bool {
     let Some(model_id) = model_for_route_decision(decision).map(|model| model.id.clone()) else {
-        return Ok(false);
+        return false;
     };
     let Some(current_effort) = normalize_request_reasoning_effort(current_effort) else {
-        return Ok(false);
+        return false;
     };
     let Some(next_effort) = normalize_request_reasoning_effort(next_effort) else {
-        return Ok(false);
+        return false;
     };
 
     let mut config = state.config.write().await;
-    let original_config = config.clone();
     let now = Utc::now();
     let Some(provider) = config
         .providers
         .iter_mut()
         .find(|provider| provider.id == decision.provider.id)
     else {
-        return Ok(false);
+        return false;
     };
     let Some(model) = provider
         .models
         .iter_mut()
         .find(|model| model.id == model_id)
     else {
-        return Ok(false);
+        return false;
     };
     let configured_effort = model
         .reasoning_effort
@@ -12539,17 +11550,14 @@ async fn persist_model_reasoning_effort_fallback(
     if !model.reasoning_effort_override_enabled
         || configured_effort.as_deref() != Some(current_effort.as_str())
     {
-        return Ok(false);
+        return false;
     }
 
     model.reasoning_effort = Some(next_effort);
     provider.updated_at = now;
     config.updated_at = now;
-    if let Err(err) = config.save(&state.config_path) {
-        *config = original_config;
-        return Err(err);
-    }
-    Ok(true)
+    state.journal_config(&config);
+    true
 }
 
 async fn apply_runtime_reasoning_effort_cap(
@@ -12580,51 +11588,6 @@ async fn apply_runtime_reasoning_effort_cap(
         .to_string(),
     );
     true
-}
-
-/// Some third-party gateways turn an unsupported reasoning value into a bare
-/// HTML 502 and discard the parameter error. Probe only when either the
-/// configured override is above the agent value or the exact model is known
-/// in the local Codex catalog and the current effort is not supported there.
-/// The override is persisted only after the next tier returns a successful
-/// response; ordinary 502s without that evidence stay pass-through.
-fn should_probe_opaque_reasoning_fallback(
-    status: u16,
-    error_body: &[u8],
-    diagnostics: &ReasoningEffortDiagnostics,
-) -> bool {
-    if status != 502 {
-        return false;
-    }
-    let error = String::from_utf8_lossy(error_body).to_ascii_lowercase();
-    let opaque = error.contains("<html")
-        || error.contains("<!doctype html")
-        || error.contains("502 bad gateway");
-    if !opaque {
-        return false;
-    }
-
-    if let (Some(configured), Some(agent)) = (
-        diagnostics.configured.as_deref(),
-        diagnostics.agent.as_deref(),
-    ) {
-        let Some(configured_rank) = reasoning_effort_rank(configured) else {
-            return false;
-        };
-        let Some(agent_rank) = reasoning_effort_rank(agent) else {
-            return false;
-        };
-        return configured_rank > agent_rank;
-    }
-
-    let Some(current) = diagnostics.effective.as_deref() else {
-        return false;
-    };
-    let Some(supported) = diagnostics.catalog_supported.as_ref() else {
-        return false;
-    };
-    strongest_supported_reasoning_effort_at_or_below(current, supported, &HashSet::new())
-        .is_some_and(|next| next != current)
 }
 
 fn is_explicit_reasoning_effort_rejection(
@@ -12793,12 +11756,12 @@ fn apply_native_cache_controls(
     decision: &RouteDecision,
     active_channel: &Channel,
     key_id: Option<&str>,
-) {
+) -> Vec<String> {
     if !smart_hit_enabled(config)
         || !matches!(config.cache.mode, CacheMode::PrefixPrewarm)
         || !matches!(active_channel, Channel::Responses | Channel::Chat)
     {
-        return;
+        return Vec::new();
     }
     let native_cache_plan = cache_capability::plan(
         config,
@@ -12807,7 +11770,7 @@ fn apply_native_cache_controls(
         active_channel,
         key_id,
     );
-    cache_capability::apply(request, active_channel, native_cache_plan);
+    cache_capability::apply(request, active_channel, native_cache_plan)
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
@@ -12864,22 +11827,52 @@ fn apply_session_provider_cache_key(
     );
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CandidatePromptCacheRoutingOutcome {
+    applied: bool,
+    changed: bool,
+}
+
 fn apply_candidate_prompt_cache_routing(
     request: &mut Value,
     decision: &ShadowAffinityDecision,
-) -> bool {
+) -> CandidatePromptCacheRoutingOutcome {
     let Some(object) = request.as_object_mut() else {
-        return false;
+        return CandidatePromptCacheRoutingOutcome::default();
     };
     if cache_affinity::provider_native_candidate_applied(decision) {
-        object.remove("prompt_cache_key");
-        return true;
+        return CandidatePromptCacheRoutingOutcome {
+            applied: true,
+            changed: object.remove("prompt_cache_key").is_some(),
+        };
     }
     let Some(cache_key) = cache_affinity::static_cohort_prompt_cache_key(decision) else {
-        return false;
+        return CandidatePromptCacheRoutingOutcome::default();
     };
-    object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
-    true
+    let next = Value::String(cache_key);
+    let changed = object.get("prompt_cache_key") != Some(&next);
+    if changed {
+        object.insert("prompt_cache_key".to_string(), next);
+    }
+    CandidatePromptCacheRoutingOutcome {
+        applied: true,
+        changed,
+    }
+}
+
+fn record_prepared_wire_changed_field(changed_fields: &mut Vec<String>, key: &str) {
+    if !changed_fields.iter().any(|field| field == key) {
+        changed_fields.push(key.to_string());
+    }
+}
+
+fn extend_prepared_wire_changed_fields(
+    changed_fields: &mut Vec<String>,
+    additional_fields: impl IntoIterator<Item = String>,
+) {
+    for field in additional_fields {
+        record_prepared_wire_changed_field(changed_fields, &field);
+    }
 }
 
 fn copy_responses_prefix_cache_fields_for_native_stream(
@@ -13208,6 +12201,42 @@ fn normalize_tool_definitions(value: &mut Value) {
     };
     for item in items.iter_mut() {
         normalize_tool_definition(item);
+    }
+    items.sort_by(|left, right| tool_sort_key(left).cmp(&tool_sort_key(right)));
+}
+
+fn normalize_chat_tool_definitions(value: &mut Value) {
+    let Value::Array(items) = value else {
+        canonicalize_object_keys(value, "$.chat_tools");
+        return;
+    };
+    for item in items.iter_mut() {
+        let Some(object) = item.as_object_mut() else {
+            canonicalize_object_keys(item, "$.chat_tools[]");
+            continue;
+        };
+
+        let is_function = object.get("type").and_then(Value::as_str) == Some("function")
+            || object.contains_key("function")
+            || object.contains_key("name");
+        if is_function {
+            object.insert("type".to_string(), Value::String("function".to_string()));
+            if !object.contains_key("function") {
+                let mut function = Map::new();
+                for key in ["name", "description", "parameters", "strict"] {
+                    if let Some(value) = object.remove(key) {
+                        function.insert(key.to_string(), value);
+                    }
+                }
+                object.insert("function".to_string(), Value::Object(function));
+            }
+            if let Some(function) = object.get_mut("function").and_then(Value::as_object_mut) {
+                if let Some(parameters) = function.get_mut("parameters") {
+                    normalize_json_schema(parameters);
+                }
+            }
+        }
+        canonicalize_object_keys(item, "$.chat_tools[]");
     }
     items.sort_by(|left, right| tool_sort_key(left).cmp(&tool_sort_key(right)));
 }
@@ -13675,7 +12704,7 @@ fn stabilize_chat_provider_prefix_sample(value: &mut Value) {
     }
 
     if let Some(tools) = object.get_mut("tools") {
-        normalize_tool_definitions(tools);
+        normalize_chat_tool_definitions(tools);
     }
     if let Some(tool_choice) = object.get_mut("tool_choice") {
         canonicalize_object_keys(tool_choice, "$.chat_tool_choice");
@@ -13708,7 +12737,7 @@ fn stabilize_chat_provider_request(value: &mut Value) {
     }
 
     if let Some(tools) = object.get_mut("tools") {
-        normalize_tool_definitions(tools);
+        normalize_chat_tool_definitions(tools);
     }
     if let Some(tool_choice) = object.get_mut("tool_choice") {
         canonicalize_object_keys(tool_choice, "$.chat_request_tool_choice");
@@ -14276,13 +13305,21 @@ fn infer_client_requested_stream(
     false
 }
 
+fn chat_stream_include_usage_requested(request: &Value, client_channel: &Channel) -> bool {
+    matches!(client_channel, Channel::Chat)
+        && request
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 fn chat_to_responses_request(request: &Value) -> Value {
     let mut object = Map::new();
     copy_model(request, &mut object);
     if let Some(system) = extract_system_text(request, Channel::Chat) {
         object.insert("instructions".to_string(), Value::String(system));
     }
-    let messages = extract_messages(request, Channel::Chat);
+    let messages = chat_messages_to_responses_input(request.get("messages"));
     if !messages.is_empty() {
         object.insert("input".to_string(), Value::Array(messages));
     }
@@ -14401,12 +13438,20 @@ fn responses_to_chat_request(request: &Value) -> Value {
 }
 
 fn responses_to_anthropic_request(request: &Value) -> Value {
+    let tool_context = transform_codex_chat::build_codex_tool_context_from_request(request);
+    responses_to_anthropic_request_with_context(request, &tool_context)
+}
+
+fn responses_to_anthropic_request_with_context(
+    request: &Value,
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Value {
     let mut object = Map::new();
     copy_model(request, &mut object);
     if let Some(system) = extract_system_text(request, Channel::Responses) {
         object.insert("system".to_string(), Value::String(system));
     }
-    let messages = extract_messages(request, Channel::Responses);
+    let messages = responses_to_anthropic_messages(request.get("input"), tool_context);
     if !messages.is_empty() {
         object.insert("messages".to_string(), Value::Array(messages));
     }
@@ -14423,23 +13468,359 @@ fn responses_to_anthropic_request(request: &Value) -> Value {
             ("stream", "stream"),
             ("temperature", "temperature"),
             ("top_p", "top_p"),
-            ("tools", "tools"),
-            ("tool_choice", "tool_choice"),
-            ("metadata", "metadata"),
             ("top_k", "top_k"),
             ("thinking", "thinking"),
         ],
     );
+    let tools = responses_tools_to_anthropic(tool_context);
+    if !tools.is_empty() {
+        object.insert("tools".to_string(), Value::Array(tools));
+        if let Some(tool_choice) = request
+            .get("tool_choice")
+            .and_then(|value| responses_tool_choice_to_anthropic(value, tool_context))
+        {
+            object.insert("tool_choice".to_string(), tool_choice);
+        }
+    }
+    if let Some(user_id) = request
+        .pointer("/metadata/user_id")
+        .or_else(|| request.get("user"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        object.insert("metadata".to_string(), json!({ "user_id": user_id }));
+    }
     if let Some(stop_sequences) = normalize_stop_sequences(request.get("stop")) {
         object.insert("stop_sequences".to_string(), stop_sequences);
     }
     Value::Object(object)
 }
 
+fn responses_tools_to_anthropic(
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Vec<Value> {
+    tool_context
+        .chat_tools()
+        .iter()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let mut result = Map::new();
+            result.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = function
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                result.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            result.insert(
+                "input_schema".to_string(),
+                function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            );
+            Some(Value::Object(result))
+        })
+        .collect()
+}
+
+fn responses_tool_choice_to_anthropic(
+    tool_choice: &Value,
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Option<Value> {
+    match tool_choice {
+        Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(json!({ "type": "auto" })),
+            "required" | "any" => Some(json!({ "type": "any" })),
+            "none" => None,
+            _ => None,
+        },
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let name = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return None;
+                }
+                let namespace = object.get("namespace").and_then(Value::as_str);
+                Some(json!({
+                    "type": "tool",
+                    "name": tool_context.chat_name_for_response_function(name, namespace)
+                }))
+            }
+            Some("custom") => object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map(|name| json!({ "type": "tool", "name": name })),
+            Some("tool_search") => Some(json!({
+                "type": "tool",
+                "name": transform_codex_chat::TOOL_SEARCH_PROXY_NAME
+            })),
+            Some("auto") => Some(json!({ "type": "auto" })),
+            Some("required") | Some("any") => Some(json!({ "type": "any" })),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn responses_to_anthropic_messages(
+    input: Option<&Value>,
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(Value::String(text)) = input {
+        if !text.is_empty() {
+            push_anthropic_message(
+                &mut messages,
+                "user",
+                vec![json!({ "type": "text", "text": text })],
+            );
+        }
+        return messages;
+    }
+    let mut pending_thinking = Vec::new();
+    let mut pending_tool_uses = Vec::new();
+    let items = match input {
+        Some(Value::Array(items)) => items.iter().collect::<Vec<_>>(),
+        Some(value) => vec![value],
+        None => Vec::new(),
+    };
+
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(block) =
+                    responses_function_call_to_anthropic_tool_use(item, tool_context)
+                {
+                    pending_tool_uses.push(block);
+                }
+            }
+            Some("custom_tool_call") => {
+                if let Some(block) = responses_custom_tool_call_to_anthropic_tool_use(item) {
+                    pending_tool_uses.push(block);
+                }
+            }
+            Some("tool_search_call") => {
+                if let Some(block) = responses_tool_search_call_to_anthropic_tool_use(item) {
+                    pending_tool_uses.push(block);
+                }
+            }
+            Some("function_call_output")
+            | Some("custom_tool_call_output")
+            | Some("tool_search_output") => {
+                flush_pending_anthropic_assistant(
+                    &mut messages,
+                    &mut pending_thinking,
+                    &mut pending_tool_uses,
+                );
+                if let Some(block) = responses_tool_output_to_anthropic_result(item) {
+                    push_anthropic_message(&mut messages, "user", vec![block]);
+                }
+            }
+            Some("reasoning") => {
+                if let Some(block) =
+                    streaming_codex_anthropic::decode_anthropic_reasoning_envelope(item)
+                {
+                    pending_thinking.push(block);
+                }
+            }
+            _ => {
+                flush_pending_anthropic_assistant(
+                    &mut messages,
+                    &mut pending_thinking,
+                    &mut pending_tool_uses,
+                );
+                if let Some((role, content)) = responses_message_to_anthropic(item) {
+                    push_anthropic_message(&mut messages, role, content);
+                }
+            }
+        }
+    }
+    flush_pending_anthropic_assistant(&mut messages, &mut pending_thinking, &mut pending_tool_uses);
+    messages
+}
+
+fn flush_pending_anthropic_assistant(
+    messages: &mut Vec<Value>,
+    pending_thinking: &mut Vec<Value>,
+    pending_tool_uses: &mut Vec<Value>,
+) {
+    if pending_thinking.is_empty() && pending_tool_uses.is_empty() {
+        return;
+    }
+    let mut content = std::mem::take(pending_thinking);
+    content.append(pending_tool_uses);
+    push_anthropic_message(messages, "assistant", content);
+}
+
+fn responses_function_call_to_anthropic_tool_use(
+    item: &Value,
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Option<Value> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let name = item.get("name").and_then(Value::as_str)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    let chat_name = tool_context.chat_name_for_response_function(name, namespace);
+    Some(json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": chat_name,
+        "input": anthropic_tool_input(item.get("arguments"))
+    }))
+}
+
+fn responses_custom_tool_call_to_anthropic_tool_use(item: &Value) -> Option<Value> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let name = item.get("name").and_then(Value::as_str)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": name,
+        "input": { "input": item.get("input").cloned().unwrap_or_else(|| json!("")) }
+    }))
+}
+
+fn responses_tool_search_call_to_anthropic_tool_use(item: &Value) -> Option<Value> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": transform_codex_chat::TOOL_SEARCH_PROXY_NAME,
+        "input": anthropic_tool_input(item.get("arguments"))
+    }))
+}
+
+fn anthropic_tool_input(arguments: Option<&Value>) -> Value {
+    let arguments = json_canonical::canonicalize_tool_arguments(arguments);
+    match serde_json::from_str::<Value>(&arguments) {
+        Ok(Value::Object(object)) => Value::Object(object),
+        Ok(value) => json!({ "input": value }),
+        Err(_) => json!({ "input": arguments }),
+    }
+}
+
+fn responses_tool_output_to_anthropic_result(item: &Value) -> Option<Value> {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let content = match item.get("output") {
+        Some(Value::String(text)) => Value::String(text.clone()),
+        Some(value) => Value::String(json_canonical::canonical_json_string(value)),
+        None => Value::String(String::new()),
+    };
+    Some(json!({
+        "type": "tool_result",
+        "tool_use_id": call_id,
+        "content": content
+    }))
+}
+
+fn responses_message_to_anthropic(item: &Value) -> Option<(&'static str, Vec<Value>)> {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let role = match role {
+        "assistant" => "assistant",
+        "system" | "developer" | "latest_reminder" => return None,
+        _ => "user",
+    };
+    let content = item
+        .get("content")
+        .or_else(|| item.get("text"))
+        .or_else(|| item.get("input_text"))
+        .or_else(|| item.get("output_text"))?;
+    let content = responses_content_to_anthropic(content);
+    (!content.is_empty()).then_some((role, content))
+}
+
+fn responses_content_to_anthropic(value: &Value) -> Vec<Value> {
+    match value {
+        Value::String(text) => (!text.is_empty())
+            .then(|| json!({ "type": "text", "text": text }))
+            .into_iter()
+            .collect(),
+        Value::Array(items) => items
+            .iter()
+            .flat_map(responses_content_to_anthropic)
+            .collect(),
+        Value::Object(object) => {
+            let type_name = object
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match type_name {
+                "input_text" | "output_text" | "text" => object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| vec![json!({ "type": "text", "text": text })])
+                    .unwrap_or_default(),
+                "input_image" if object.get("image_url").and_then(Value::as_str).is_some() => {
+                    let url = object
+                        .get("image_url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    vec![json!({ "type": "image", "source": { "type": "url", "url": url } })]
+                }
+                _ => extract_text(value)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| vec![json!({ "type": "text", "text": text })])
+                    .unwrap_or_default(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, mut content: Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(last_content) = messages.last_mut().and_then(|last| {
+        (last.get("role").and_then(Value::as_str) == Some(role))
+            .then(|| last.get_mut("content").and_then(Value::as_array_mut))
+            .flatten()
+    }) {
+        last_content.append(&mut content);
+        return;
+    }
+    messages.push(json!({ "role": role, "content": content }));
+}
+
 fn anthropic_to_chat_request(request: &Value) -> Value {
     let mut object = Map::new();
     copy_model(request, &mut object);
-    let mut messages = extract_messages(request, Channel::Anthropic);
+    let mut messages = anthropic_messages_to_chat_messages(request.get("messages"));
     if let Some(system) = extract_system_text(request, Channel::Anthropic) {
         messages.insert(
             0,
@@ -14459,12 +13840,26 @@ fn anthropic_to_chat_request(request: &Value) -> Value {
             ("stream", "stream"),
             ("temperature", "temperature"),
             ("top_p", "top_p"),
-            ("tools", "tools"),
-            ("tool_choice", "tool_choice"),
             ("metadata", "metadata"),
-            ("top_k", "top_k"),
         ],
     );
+    let tools = anthropic_tools_to_chat(request.get("tools"));
+    if !tools.is_empty() {
+        object.insert("tools".to_string(), Value::Array(tools));
+        if let Some(tool_choice) = request
+            .get("tool_choice")
+            .and_then(anthropic_tool_choice_to_chat)
+        {
+            object.insert("tool_choice".to_string(), tool_choice);
+        }
+        if request
+            .pointer("/tool_choice/disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+        }
+    }
     copy_max_tokens(request, &mut object, "max_tokens");
     if let Some(stop_sequences) = normalize_stop_sequences(request.get("stop_sequences")) {
         object.insert("stop".to_string(), stop_sequences);
@@ -14480,7 +13875,7 @@ fn anthropic_to_responses_request(request: &Value) -> Value {
     if let Some(system) = extract_system_text(request, Channel::Anthropic) {
         object.insert("instructions".to_string(), Value::String(system));
     }
-    let messages = extract_messages(request, Channel::Anthropic);
+    let messages = anthropic_messages_to_responses_input(request.get("messages"));
     if !messages.is_empty() {
         object.insert("input".to_string(), Value::Array(messages));
     }
@@ -14500,13 +13895,579 @@ fn anthropic_to_responses_request(request: &Value) -> Value {
             ("stream", "stream"),
             ("temperature", "temperature"),
             ("top_p", "top_p"),
-            ("tools", "tools"),
-            ("tool_choice", "tool_choice"),
             ("metadata", "metadata"),
-            ("top_k", "top_k"),
         ],
     );
+    let tools = anthropic_tools_to_responses(request.get("tools"));
+    if !tools.is_empty() {
+        object.insert("tools".to_string(), Value::Array(tools));
+        if let Some(tool_choice) = request
+            .get("tool_choice")
+            .and_then(anthropic_tool_choice_to_responses)
+        {
+            object.insert("tool_choice".to_string(), tool_choice);
+        }
+        if request
+            .pointer("/tool_choice/disable_parallel_tool_use")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            object.insert("parallel_tool_calls".to_string(), Value::Bool(false));
+        }
+    }
     Value::Object(object)
+}
+
+/// Reject invalid Anthropic tool histories before they can become upstream
+/// Chat tool messages or Responses `function_call_output` items. Both target
+/// protocols require every tool result to immediately follow the assistant
+/// turn that created the call, and require that assistant turn's full call set
+/// to be consumed before any later conversational turn.
+fn validate_anthropic_tool_history(request: &Value) -> Result<(), String> {
+    let Some(messages) = request.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+
+    let mut seen_calls = std::collections::HashSet::new();
+    let mut pending_calls: Option<std::collections::HashSet<String>> = None;
+    for (message_index, message) in messages.iter().enumerate() {
+        let role = message.get("role").and_then(Value::as_str).ok_or_else(|| {
+            format!("Anthropic message at messages[{message_index}] is missing role")
+        })?;
+        if !matches!(role, "user" | "assistant") {
+            return Err(format!(
+                "Anthropic message at messages[{message_index}] has unsupported role `{role}`"
+            ));
+        }
+        let blocks = anthropic_message_content_blocks(
+            message
+                .get("content")
+                .or_else(|| message.get("text"))
+                .or_else(|| message.get("message")),
+        );
+
+        if let Some(expected_calls) = pending_calls.take() {
+            if role != "user" {
+                return Err(format!(
+                    "Anthropic tool_use calls before messages[{message_index}] must be followed immediately by a user tool_result message"
+                ));
+            }
+
+            let mut consumed_calls = std::collections::HashSet::new();
+            let mut result_prefix_ended = false;
+            for (block_index, block) in blocks.iter().enumerate() {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("tool_result") => {
+                        if result_prefix_ended {
+                            return Err(format!(
+                                "Anthropic tool_result at messages[{message_index}].content[{block_index}] must appear before ordinary user content"
+                            ));
+                        }
+                        let call_id = block
+                            .get("tool_use_id")
+                            .or_else(|| block.get("call_id"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .ok_or_else(|| {
+                                format!(
+                                    "Anthropic tool_result at messages[{message_index}].content[{block_index}] is missing tool_use_id"
+                                )
+                            })?;
+                        if !expected_calls.contains(call_id) {
+                            return Err(format!(
+                                "Anthropic tool_result references unknown or already-consumed tool_use_id `{call_id}`"
+                            ));
+                        }
+                        if !consumed_calls.insert(call_id.to_string()) {
+                            return Err(format!(
+                                "Anthropic tool_result references unknown or already-consumed tool_use_id `{call_id}`"
+                            ));
+                        }
+                    }
+                    Some("tool_use") => {
+                        return Err(format!(
+                            "Anthropic tool_use at messages[{message_index}].content[{block_index}] must appear in an assistant message"
+                        ));
+                    }
+                    _ => result_prefix_ended = true,
+                }
+            }
+
+            if consumed_calls.is_empty() {
+                return Err(format!(
+                    "Anthropic tool_use calls before messages[{message_index}] must be consumed by immediate user tool_result blocks"
+                ));
+            }
+            if consumed_calls != expected_calls {
+                return Err(format!(
+                    "Anthropic tool_result message at messages[{message_index}] must consume every preceding tool_use before continuing"
+                ));
+            }
+            continue;
+        }
+
+        let mut calls_in_message = std::collections::HashSet::new();
+        for (block_index, block) in blocks.iter().enumerate() {
+            match (role, block.get("type").and_then(Value::as_str)) {
+                ("assistant", Some("tool_use")) => {
+                    let call_id = block
+                        .get("id")
+                        .or_else(|| block.get("tool_use_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            format!(
+                                "Anthropic tool_use at messages[{message_index}].content[{block_index}] is missing id"
+                            )
+                        })?;
+                    if block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map_or(true, |name| name.trim().is_empty())
+                    {
+                        return Err(format!(
+                            "Anthropic tool_use at messages[{message_index}].content[{block_index}] is missing name"
+                        ));
+                    }
+                    if !seen_calls.insert(call_id.to_string()) {
+                        return Err(format!("Anthropic tool_use id `{call_id}` is duplicated"));
+                    }
+                    calls_in_message.insert(call_id.to_string());
+                }
+                ("assistant", Some("tool_result")) => {
+                    return Err(format!(
+                        "Anthropic tool_result at messages[{message_index}].content[{block_index}] must appear in a user message"
+                    ));
+                }
+                ("user", Some("tool_use")) => {
+                    return Err(format!(
+                        "Anthropic tool_use at messages[{message_index}].content[{block_index}] must appear in an assistant message"
+                    ));
+                }
+                ("user", Some("tool_result")) => {
+                    return Err(format!(
+                        "Anthropic tool_result references unknown or already-consumed tool_use_id"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !calls_in_message.is_empty() {
+            pending_calls = Some(calls_in_message);
+        }
+    }
+    if pending_calls.is_some() {
+        return Err(
+            "Anthropic tool_use calls must be followed immediately by a user tool_result message"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Convert native Anthropic Messages history to Responses input without
+/// flattening tool calls/results into text.  The generic message normalizer is
+/// intentionally not used here: it cannot preserve `tool_use_id`, which is
+/// the only stable join key for a following tool-result turn.
+fn anthropic_messages_to_responses_input(messages: Option<&Value>) -> Vec<Value> {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let blocks = anthropic_message_content_blocks(
+            message
+                .get("content")
+                .or_else(|| message.get("text"))
+                .or_else(|| message.get("message")),
+        );
+        match role {
+            "assistant" => anthropic_assistant_blocks_to_responses(&mut input, blocks),
+            _ => anthropic_user_blocks_to_responses(&mut input, blocks),
+        }
+    }
+    input
+}
+
+fn anthropic_message_content_blocks(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::Array(blocks)) => blocks.clone(),
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            vec![json!({ "type": "text", "text": text })]
+        }
+        Some(value) if !value.is_null() => vec![value.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Convert Anthropic Messages history to native Chat Completions messages
+/// without collapsing `tool_use` / `tool_result` links into text. Chat allows
+/// an assistant message to carry text and `tool_calls`, then requires each
+/// corresponding result as a separate `role: tool` message.
+fn anthropic_messages_to_chat_messages(messages: Option<&Value>) -> Vec<Value> {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut output = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        let blocks = anthropic_message_content_blocks(
+            message
+                .get("content")
+                .or_else(|| message.get("text"))
+                .or_else(|| message.get("message")),
+        );
+        if role == "assistant" {
+            anthropic_assistant_blocks_to_chat(&mut output, blocks);
+        } else {
+            anthropic_user_blocks_to_chat(&mut output, blocks);
+        }
+    }
+    output
+}
+
+fn anthropic_assistant_blocks_to_chat(output: &mut Vec<Value>, blocks: Vec<Value>) {
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                if let Some(call) = anthropic_tool_use_to_chat_call(&block) {
+                    tool_calls.push(call);
+                }
+            }
+            // There is no safe Chat equivalent for a signed Anthropic thinking
+            // block. Never downgrade it into forged reasoning metadata.
+            Some("thinking") | Some("redacted_thinking") => {}
+            _ => append_anthropic_chat_text(&mut text_parts, &block),
+        }
+    }
+    if text_parts.is_empty() && tool_calls.is_empty() {
+        return;
+    }
+    let mut message = Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert(
+        "content".to_string(),
+        merge_text_parts(text_parts)
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    if !tool_calls.is_empty() {
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    output.push(Value::Object(message));
+}
+
+fn anthropic_user_blocks_to_chat(output: &mut Vec<Value>, blocks: Vec<Value>) {
+    let mut text_parts = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            flush_anthropic_chat_text(output, &mut text_parts);
+            if let Some(call_id) = block
+                .get("tool_use_id")
+                .or_else(|| block.get("call_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                output.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": anthropic_tool_result_output(&block),
+                }));
+            } else {
+                let text = anthropic_tool_result_output(&block);
+                if !text.trim().is_empty() {
+                    text_parts.push(text);
+                }
+            }
+        } else if !matches!(
+            block.get("type").and_then(Value::as_str),
+            Some("thinking") | Some("redacted_thinking")
+        ) {
+            append_anthropic_chat_text(&mut text_parts, &block);
+        }
+    }
+    flush_anthropic_chat_text(output, &mut text_parts);
+}
+
+fn append_anthropic_chat_text(text_parts: &mut Vec<String>, block: &Value) {
+    let text = match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("tool_result") => Some(anthropic_tool_result_output(block)),
+        _ => extract_text(block),
+    };
+    if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+        text_parts.push(text);
+    }
+}
+
+fn flush_anthropic_chat_text(output: &mut Vec<Value>, text_parts: &mut Vec<String>) {
+    let Some(content) = merge_text_parts(std::mem::take(text_parts)) else {
+        return;
+    };
+    output.push(json!({ "role": "user", "content": content }));
+}
+
+fn anthropic_tool_use_to_chat_call(block: &Value) -> Option<Value> {
+    let call_id = block
+        .get("id")
+        .or_else(|| block.get("tool_use_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    Some(json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": block
+                .get("input")
+                .map(json_canonical::canonical_json_string)
+                .unwrap_or_else(|| "{}".to_string()),
+        }
+    }))
+}
+
+fn anthropic_assistant_blocks_to_responses(input: &mut Vec<Value>, blocks: Vec<Value>) {
+    let mut message_content = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("tool_use") => {
+                flush_anthropic_message_content(input, "assistant", &mut message_content);
+                if let Some(tool_call) = anthropic_tool_use_to_responses_call(&block) {
+                    input.push(tool_call);
+                }
+            }
+            Some("thinking") | Some("redacted_thinking") => {
+                flush_anthropic_message_content(input, "assistant", &mut message_content);
+                if let Some(reasoning) =
+                    streaming_codex_anthropic::encode_anthropic_reasoning_envelope(&block)
+                {
+                    input.push(reasoning);
+                }
+            }
+            _ => append_anthropic_text_content(&mut message_content, &block),
+        }
+    }
+    flush_anthropic_message_content(input, "assistant", &mut message_content);
+}
+
+fn anthropic_user_blocks_to_responses(input: &mut Vec<Value>, blocks: Vec<Value>) {
+    let mut message_content = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            if let Some(call_id) = block
+                .get("tool_use_id")
+                .or_else(|| block.get("call_id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                flush_anthropic_message_content(input, "user", &mut message_content);
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": anthropic_tool_result_output(&block),
+                }));
+            } else {
+                // A missing id cannot be represented as a valid Responses
+                // tool output. Retain the caller's content as user text rather
+                // than inventing a call id that can attach to the wrong call.
+                append_anthropic_text_content(&mut message_content, &block);
+            }
+        } else {
+            append_anthropic_text_content(&mut message_content, &block);
+        }
+    }
+    flush_anthropic_message_content(input, "user", &mut message_content);
+}
+
+fn flush_anthropic_message_content(input: &mut Vec<Value>, role: &str, content: &mut Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    input.push(json!({
+        "type": "message",
+        "role": role,
+        "content": std::mem::take(content),
+    }));
+}
+
+fn append_anthropic_text_content(content: &mut Vec<Value>, block: &Value) {
+    let text = match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        Some("tool_result") => Some(anthropic_tool_result_output(block)),
+        _ => extract_text(block),
+    };
+    if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+        content.push(json!({ "type": "input_text", "text": text }));
+    }
+}
+
+fn anthropic_tool_use_to_responses_call(block: &Value) -> Option<Value> {
+    let call_id = block
+        .get("id")
+        .or_else(|| block.get("tool_use_id"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let name = block
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    Some(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": block
+            .get("input")
+            .map(json_canonical::canonical_json_string)
+            .unwrap_or_else(|| "{}".to_string()),
+    }))
+}
+
+fn anthropic_tool_result_output(block: &Value) -> String {
+    let Some(content) = block.get("content") else {
+        return String::new();
+    };
+    let output = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    (part.get("type").and_then(Value::as_str) == Some("text"))
+                        .then(|| part.get("text").and_then(Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>();
+            if text.len() == parts.len() {
+                text.join("\n")
+            } else {
+                json_canonical::canonical_json_string(content)
+            }
+        }
+        value => json_canonical::canonical_json_string(value),
+    };
+    if block.get("is_error").and_then(Value::as_bool) == Some(true) {
+        format!("[tool_result_error]\n{output}")
+    } else {
+        output
+    }
+}
+
+fn anthropic_tools_to_responses(tools: Option<&Value>) -> Vec<Value> {
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let mut result = Map::new();
+            result.insert("type".to_string(), Value::String("function".to_string()));
+            result.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                result.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            result.insert(
+                "parameters".to_string(),
+                tool.get("input_schema")
+                    .or_else(|| tool.get("parameters"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            );
+            Some(Value::Object(result))
+        })
+        .collect()
+}
+
+fn anthropic_tools_to_chat(tools: Option<&Value>) -> Vec<Value> {
+    tools
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let name = tool.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let mut function = Map::new();
+            function.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(description) = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+            {
+                function.insert(
+                    "description".to_string(),
+                    Value::String(description.to_string()),
+                );
+            }
+            function.insert(
+                "parameters".to_string(),
+                tool.get("input_schema")
+                    .or_else(|| tool.get("parameters"))
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            );
+            Some(json!({ "type": "function", "function": function }))
+        })
+        .collect()
+}
+
+fn anthropic_tool_choice_to_responses(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(Value::String("auto".to_string())),
+        Some("any") | Some("required") => Some(Value::String("required".to_string())),
+        Some("none") => Some(Value::String("none".to_string())),
+        Some("tool") => value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| json!({ "type": "function", "name": name })),
+        _ => None,
+    }
+}
+
+fn anthropic_tool_choice_to_chat(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(Value::String("auto".to_string())),
+        Some("any") | Some("required") => Some(Value::String("required".to_string())),
+        Some("none") => Some(Value::String("none".to_string())),
+        Some("tool") => value
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .map(|name| json!({ "type": "function", "function": { "name": name } })),
+        _ => None,
+    }
 }
 
 fn copy_model(request: &Value, object: &mut Map<String, Value>) {
@@ -14659,6 +14620,122 @@ fn extract_system_text(request: &Value, source: Channel) -> Option<String> {
     }
 
     merge_text_parts(parts)
+}
+
+/// Convert Chat history into Responses input without flattening a completed
+/// assistant tool call and its matching tool result into user text.
+///
+/// This deliberately lives only on the Chat -> Responses path: the Anthropic
+/// conversion has a different tool schema and continues to use
+/// normalize_message.
+fn chat_messages_to_responses_input(messages: Option<&Value>) -> Vec<Value> {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut input = Vec::new();
+    for (message_index, message) in messages.iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        match role {
+            "assistant" => {
+                if let Some(normalized) = normalize_message(message) {
+                    input.push(normalized);
+                }
+                let tool_calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .or_else(|| message.get("function_call").cloned().map(|call| vec![call]))
+                    .unwrap_or_default();
+                for (tool_index, call) in tool_calls.iter().enumerate() {
+                    if let Some(item) =
+                        chat_tool_call_to_responses_item(call, message_index, tool_index)
+                    {
+                        input.push(item);
+                    }
+                }
+            }
+            "tool" => {
+                let call_id = message
+                    .get("tool_call_id")
+                    .or_else(|| message.get("call_id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                if let Some(call_id) = call_id {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": chat_tool_output_string(message),
+                    }));
+                } else if let Some(normalized) = normalize_message(message) {
+                    // An id-less legacy tool message cannot be represented as
+                    // a valid Responses tool output. Retain its text rather
+                    // than silently discarding caller data.
+                    input.push(normalized);
+                }
+            }
+            _ => {
+                if let Some(normalized) = normalize_message(message) {
+                    input.push(normalized);
+                }
+            }
+        }
+    }
+    input
+}
+
+fn chat_tool_call_to_responses_item(
+    call: &Value,
+    message_index: usize,
+    tool_index: usize,
+) -> Option<Value> {
+    let function = call.get("function").unwrap_or(call);
+    let name = function
+        .get("name")
+        .or_else(|| call.get("name"))
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let call_id = call
+        .get("id")
+        .or_else(|| call.get("call_id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("call_{message_index}_{tool_index}"));
+    let arguments = function
+        .get("arguments")
+        .or_else(|| call.get("arguments"))
+        .map(chat_tool_json_string)
+        .unwrap_or_default();
+    Some(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }))
+}
+
+fn chat_tool_output_string(message: &Value) -> String {
+    let content = message
+        .get("content")
+        .or_else(|| message.get("output"))
+        .or_else(|| message.get("text"));
+    match content {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(_)) => extract_text(content.unwrap())
+            .unwrap_or_else(|| chat_tool_json_string(content.unwrap())),
+        Some(value) => chat_tool_json_string(value),
+    }
+}
+
+fn chat_tool_json_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| canonical_json_string(value))
 }
 
 fn extract_messages(request: &Value, source: Channel) -> Vec<Value> {
@@ -14902,18 +14979,40 @@ fn is_text_event_stream(content_type: &str) -> bool {
 fn should_proxy_upstream_as_stream(
     is_success_status: bool,
     client_requested_stream: bool,
-    cross_protocol_stream: bool,
-    upstream_body: &Value,
+    buffered_cross_protocol_stream: bool,
+    _requires_sse_content_type: bool,
+    _upstream_body: &Value,
     content_type: &str,
 ) -> bool {
-    if !is_success_status || !client_requested_stream || cross_protocol_stream {
+    if !is_success_status || !client_requested_stream || buffered_cross_protocol_stream {
         return false;
     }
-    upstream_body
-        .get("stream")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        || is_text_event_stream(content_type)
+    // The outbound stream flag is not proof that this upstream response is
+    // SSE. A 2xx JSON body can carry response.failed; buffer and settle
+    // non-SSE bodies so semantic errors never become successful relays.
+    is_text_event_stream(content_type)
+}
+
+fn supports_incremental_cross_protocol_stream(
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+) -> bool {
+    matches!(
+        (client_channel, upstream_channel),
+        (Channel::Responses, Channel::Chat | Channel::Anthropic)
+            | (Channel::Chat, Channel::Responses | Channel::Anthropic)
+            | (Channel::Anthropic, Channel::Responses | Channel::Chat)
+    )
+}
+
+fn route_supports_incremental_cross_protocol_stream(
+    client_channel: &Channel,
+    decision: &RouteDecision,
+) -> bool {
+    supports_incremental_cross_protocol_stream(client_channel, &decision.upstream_channel)
+        && model_for_route_decision(decision)
+            .map(|model| model.supports_streaming)
+            .unwrap_or(true)
 }
 
 fn responses_sse_to_non_stream_json(
@@ -15256,7 +15355,7 @@ fn normalize_sse_error_value(value: &Value) -> Value {
 fn json_body_has_error(bytes: &[u8]) -> bool {
     serde_json::from_slice::<Value>(bytes)
         .ok()
-        .is_some_and(|value| value.get("error").is_some_and(|error| !error.is_null()))
+        .is_some_and(|value| json_value_has_error(&value))
 }
 
 fn transform_response_value(client_channel: &Channel, model: &str, value: &Value) -> Value {
@@ -15576,7 +15675,6 @@ async fn collect_provider_usage(
     bytes: &[u8],
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
-    cold_start_key: Option<&str>,
     used_response_session: bool,
 ) -> Option<ProviderUsageObservation> {
     let mut record = provider_usage_from_bytes(bytes);
@@ -15595,10 +15693,6 @@ async fn collect_provider_usage(
     )
     .await;
     let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
-    state
-        .metrics
-        .record_usage_with_cold_start_key(record.clone(), cold_start_key.or(prefix_state_key))
-        .await;
     Some(ProviderUsageObservation {
         raw: record,
         effective,
@@ -15610,7 +15704,6 @@ async fn collect_provider_usage_from_record(
     mut record: UsageRecord,
     decision: &RouteDecision,
     prefix_state_key: Option<&str>,
-    cold_start_key: Option<&str>,
     used_response_session: bool,
 ) -> Option<ProviderUsageObservation> {
     if !record.has_usage() {
@@ -15628,10 +15721,6 @@ async fn collect_provider_usage_from_record(
     )
     .await;
     let effective = provider_usage_effective_for_prefix_metrics(&record, is_response_session_delta);
-    state
-        .metrics
-        .record_usage_with_cold_start_key(record.clone(), cold_start_key.or(prefix_state_key))
-        .await;
     Some(ProviderUsageObservation {
         raw: record,
         effective,
@@ -15904,7 +15993,7 @@ mod tests {
     use std::{
         fs,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -15928,6 +16017,181 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn configure_test_codex_agent(config: &mut AppConfig, provider_id: &str) {
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some(provider_id.to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+    }
+
+    fn test_local_auth_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        headers
+    }
+
+    fn test_codex_compact_config(base_url: String, provider_id: &str) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Responses;
+        let mut provider = test_responses_provider(base_url);
+        provider.id = provider_id.to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, provider_id);
+        config
+    }
+
+    #[tokio::test]
+    async fn agent_dispatch_owner_failure_is_accounted_and_closes_lifecycle() {
+        let metrics = MetricsStore::new();
+        let metrics_for_owner = metrics.clone();
+        let response = dispatch_agent_generation_owner(
+            metrics.clone(),
+            DispatchTracker::default(),
+            "owner-dispatch-failure".to_string(),
+            Instant::now(),
+            Channel::Responses,
+            Some("codex".to_string()),
+            move |_| async move {
+                assert!(
+                    metrics_for_owner
+                        .begin_agent_inbound(AgentInboundStart {
+                            inbound_request_id: "owner-dispatch-failure".to_string(),
+                            at: Utc::now(),
+                            attempt_policy: "single".to_string(),
+                            attempt_budget: 1,
+                        })
+                        .await
+                );
+                assert_eq!(
+                    metrics_for_owner
+                        .begin_agent_attempt(AgentAttemptStart {
+                            inbound_request_id: "owner-dispatch-failure".to_string(),
+                            attempt_id: "owner-dispatch-attempt".to_string(),
+                            at: Utc::now(),
+                            attempt_reason: "primary".to_string(),
+                            provider: "provider".to_string(),
+                            model: "model".to_string(),
+                            upstream_channel: "responses".to_string(),
+                        })
+                        .await,
+                    Some(1)
+                );
+                panic!("forced owner failure after lifecycle start");
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_handoff_owner_abort_settles_agent_lifecycle_exactly_once() {
+        let metrics = MetricsStore::new();
+        let tracker = DispatchTracker::default();
+        let metrics_for_owner = metrics.clone();
+        let started = Instant::now();
+        let response = dispatch_agent_generation_owner(
+            metrics.clone(),
+            tracker.clone(),
+            "owner-abort-after-handoff".to_string(),
+            started,
+            Channel::Responses,
+            Some("codex".to_string()),
+            move |handoff| async move {
+                let _settlement_guard = AgentOwnerSettlementGuard::new(
+                    metrics_for_owner.clone(),
+                    "owner-abort-after-handoff".to_string(),
+                    started,
+                    Channel::Responses,
+                    Some("codex".to_string()),
+                );
+                assert!(
+                    metrics_for_owner
+                        .begin_agent_inbound(AgentInboundStart {
+                            inbound_request_id: "owner-abort-after-handoff".to_string(),
+                            at: Utc::now(),
+                            attempt_policy: "single".to_string(),
+                            attempt_budget: 1,
+                        })
+                        .await
+                );
+                assert_eq!(
+                    metrics_for_owner
+                        .begin_agent_attempt(AgentAttemptStart {
+                            inbound_request_id: "owner-abort-after-handoff".to_string(),
+                            attempt_id: "owner-abort-attempt".to_string(),
+                            at: Utc::now(),
+                            attempt_reason: "primary".to_string(),
+                            provider: "provider".to_string(),
+                            model: "model".to_string(),
+                            upstream_channel: "responses".to_string(),
+                        })
+                        .await,
+                    Some(1)
+                );
+                handoff.send(Response::new(Body::empty())).unwrap();
+                std::future::pending::<Response>().await
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            tracker
+                .close_and_drain(std::time::Duration::from_millis(10))
+                .await,
+            DispatchDrainOutcome::Aborted { task_count: 1 }
+        );
+        metrics.close_and_wait_for_commits().await;
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::RelayAborted
+        );
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_inbound_outcomes[0]
+                .terminal_state
+                .as_deref(),
+            Some("owner_dropped")
+        );
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
     }
 
     fn admin_probe_request(provider_id: &str, model_id: &str, local_key: Option<&str>) -> Request {
@@ -15959,6 +16223,30 @@ mod tests {
         agent_attempt_id: Option<String>,
         agent_generation: bool,
     ) -> Response {
+        stream_test_response_for_channels(
+            state,
+            upstream,
+            request_id,
+            Channel::Responses,
+            Channel::Responses,
+            None,
+            agent_attempt_id,
+            agent_generation,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_test_response_for_channels(
+        state: Arc<AppState>,
+        upstream: reqwest::Response,
+        request_id: &str,
+        client_channel: Channel,
+        upstream_channel: Channel,
+        chat_tool_context: Option<transform_codex_chat::CodexToolContext>,
+        agent_attempt_id: Option<String>,
+        agent_generation: bool,
+    ) -> Response {
         stream_upstream(
             state,
             upstream,
@@ -15966,11 +16254,11 @@ mod tests {
             200,
             Instant::now(),
             request_id.to_string(),
-            Channel::Responses,
+            client_channel,
             RouteDecision {
                 provider: test_responses_provider("http://127.0.0.1/v1".to_string()),
                 model: "gpt-5.5".to_string(),
-                upstream_channel: Channel::Responses,
+                upstream_channel,
             },
             false,
             Vec::new(),
@@ -15994,7 +16282,7 @@ mod tests {
             TailInputDiagnostics::default(),
             SessionAnchorDiagnostics::default(),
             ResponseSessionReuseDiagnostics::default(),
-            None,
+            chat_tool_context,
             None,
             None,
             None,
@@ -16008,6 +16296,504 @@ mod tests {
             None,
         )
         .await
+    }
+
+    async fn loopback_sse_first_chunk_ms(
+        client: &reqwest::Client,
+        url: &str,
+        request_body: &Value,
+        local_key: Option<&str>,
+        expected_first_marker: &str,
+    ) -> (u64, u64) {
+        let started = Instant::now();
+        let mut request = client.post(url).json(request_body);
+        if let Some(local_key) = local_key {
+            request = request.bearer_auth(local_key);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers_at_ms = started.elapsed().as_millis() as u64;
+        let mut body = response.bytes_stream();
+        let first_chunk = tokio::time::timeout(TokioDuration::from_secs(2), body.next())
+            .await
+            .expect("loopback stream should produce its first SSE chunk promptly")
+            .expect("loopback stream should not end before its first chunk")
+            .expect("loopback stream should not fail before its first chunk");
+        let first_chunk_at_ms = started.elapsed().as_millis() as u64;
+        assert!(
+            String::from_utf8_lossy(&first_chunk).contains(expected_first_marker),
+            "first loopback chunk must contain the expected protocol marker"
+        );
+        while let Some(chunk) = body.next().await {
+            chunk.expect("loopback stream should finish without a body error");
+        }
+        (headers_at_ms, first_chunk_at_ms)
+    }
+
+    fn percentile_ms(mut samples: Vec<u64>, percentile: f64) -> u64 {
+        assert!(!samples.is_empty());
+        samples.sort_unstable();
+        let index = ((samples.len() - 1) as f64 * percentile).ceil() as usize;
+        samples[index.min(samples.len() - 1)]
+    }
+
+    #[tokio::test]
+    #[ignore = "manual zero-token loopback TCP/SSE timing baseline"]
+    async fn local_sse_ttft_baseline_measures_real_proxy_path_once() {
+        const WARMUP_REQUESTS: usize = 3;
+        const SAMPLES: usize = 20;
+
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_loopback\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-timing-key".to_string();
+        config.workspace_fingerprint = "loopback-timing-workspace".to_string();
+        config.cache.enabled = false;
+        config.cache.exact_enabled = false;
+        config.cache.semantic_enabled = false;
+        config.cache.prewarm_enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "loopback-timing-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("loopback-timing-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-local-sse-baseline-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(state.clone()))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let request_body = json!({
+            "model": "gpt-5.5",
+            "input": [{"type": "message", "role": "user", "content": "loopback timing"}]
+        });
+        let upstream_url = format!("http://{upstream_addr}/v1/responses");
+        let proxy_url = format!("http://{proxy_addr}/codex/v1/responses");
+
+        for _ in 0..WARMUP_REQUESTS {
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &request_body,
+                None,
+                "response.output_text.delta",
+            )
+            .await;
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &request_body,
+                Some("local-timing-key"),
+                "response.output_text.delta",
+            )
+            .await;
+        }
+
+        let mut direct_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_headers_ms = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let (_, direct_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &request_body,
+                None,
+                "response.output_text.delta",
+            )
+            .await;
+            let (proxy_headers, proxy_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &request_body,
+                Some("local-timing-key"),
+                "response.output_text.delta",
+            )
+            .await;
+            direct_ttft_ms.push(direct_ttft);
+            proxy_ttft_ms.push(proxy_ttft);
+            proxy_headers_ms.push(proxy_headers);
+        }
+
+        let direct_p50 = percentile_ms(direct_ttft_ms.clone(), 0.50);
+        let direct_p95 = percentile_ms(direct_ttft_ms, 0.95);
+        let proxy_p50 = percentile_ms(proxy_ttft_ms.clone(), 0.50);
+        let proxy_p95 = percentile_ms(proxy_ttft_ms, 0.95);
+        let proxy_headers_p95 = percentile_ms(proxy_headers_ms, 0.95);
+        eprintln!(
+            "local SSE baseline: direct p50/p95={direct_p50}/{direct_p95}ms; proxy p50/p95={proxy_p50}/{proxy_p95}ms; proxy headers p95={proxy_headers_p95}ms; relay delta p95={}ms",
+            proxy_p95.saturating_sub(direct_p95),
+        );
+        assert!(
+            proxy_p95 <= direct_p95.saturating_add(1_000),
+            "the proxy path must not add an unbounded local delay to loopback SSE"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            (WARMUP_REQUESTS + SAMPLES) * 2,
+            "each direct control and each proxied inbound request must make exactly one upstream call"
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "manual zero-token Chat-to-Responses bridge TTFT baseline"]
+    async fn local_chat_to_responses_bridge_ttft_stays_within_five_ms() {
+        const WARMUP_REQUESTS: usize = 5;
+        const SAMPLES: usize = 40;
+
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(body["stream"], true);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_bridge\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"ready\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3,\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-bridge-timing-key".to_string();
+        config.workspace_fingerprint = "loopback-bridge-workspace".to_string();
+        config.active_provider_id = Some("loopback-chat-provider".to_string());
+        config.default_channel = Channel::Responses;
+        config.cache.enabled = false;
+        config.cache.exact_enabled = false;
+        config.cache.semantic_enabled = false;
+        config.cache.prewarm_enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "loopback-chat-provider".to_string();
+        provider.channel = Channel::Chat;
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-chat-responses-baseline-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(state.clone()))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let direct_body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": [{ "role": "user", "content": "loopback timing" }]
+        });
+        let proxy_body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": "loopback timing" }]
+        });
+        let upstream_url = format!("http://{upstream_addr}/v1/chat/completions");
+        let proxy_url = format!("http://{proxy_addr}/v1/responses");
+
+        for _ in 0..WARMUP_REQUESTS {
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &direct_body,
+                None,
+                "chatcmpl_bridge",
+            )
+            .await;
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &proxy_body,
+                Some("local-bridge-timing-key"),
+                "event: response.created",
+            )
+            .await;
+        }
+
+        let mut direct_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_headers_ms = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let (_, direct_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &direct_body,
+                None,
+                "chatcmpl_bridge",
+            )
+            .await;
+            let (proxy_headers, proxy_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &proxy_body,
+                Some("local-bridge-timing-key"),
+                "event: response.created",
+            )
+            .await;
+            direct_ttft_ms.push(direct_ttft);
+            proxy_ttft_ms.push(proxy_ttft);
+            proxy_headers_ms.push(proxy_headers);
+        }
+
+        let direct_p50 = percentile_ms(direct_ttft_ms.clone(), 0.50);
+        let direct_p95 = percentile_ms(direct_ttft_ms, 0.95);
+        let proxy_p50 = percentile_ms(proxy_ttft_ms.clone(), 0.50);
+        let proxy_p95 = percentile_ms(proxy_ttft_ms, 0.95);
+        let proxy_headers_p95 = percentile_ms(proxy_headers_ms, 0.95);
+        let relay_delta_p95 = proxy_p95.saturating_sub(direct_p95);
+        eprintln!(
+            "Chat-to-Responses bridge: direct p50/p95={direct_p50}/{direct_p95}ms; proxy p50/p95={proxy_p50}/{proxy_p95}ms; proxy headers p95={proxy_headers_p95}ms; relay delta p95={relay_delta_p95}ms"
+        );
+        assert!(
+            relay_delta_p95 <= 5,
+            "the Chat-to-Responses bridge must add no more than 5ms p95 on loopback"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            (WARMUP_REQUESTS + SAMPLES) * 2,
+            "each direct control and proxied inbound must make exactly one upstream call"
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "manual zero-token Responses-to-Chat bridge TTFT baseline"]
+    async fn local_responses_to_chat_bridge_ttft_stays_within_five_ms() {
+        const WARMUP_REQUESTS: usize = 5;
+        const SAMPLES: usize = 40;
+
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(body["stream"], true);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_bridge\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_bridge\",\"output_index\":0,\"content_index\":0,\"delta\":\"ready\"}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_bridge\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-responses-chat-bridge-timing-key".to_string();
+        config.workspace_fingerprint = "loopback-responses-chat-bridge-workspace".to_string();
+        config.active_provider_id = Some("loopback-responses-provider".to_string());
+        config.default_channel = Channel::Chat;
+        config.cache.enabled = false;
+        config.cache.exact_enabled = false;
+        config.cache.semantic_enabled = false;
+        config.cache.prewarm_enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "loopback-responses-provider".to_string();
+        provider.channel = Channel::Responses;
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-responses-chat-baseline-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(state.clone()))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let direct_body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": "loopback timing" }]
+        });
+        let proxy_body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "loopback timing" }]
+        });
+        let upstream_url = format!("http://{upstream_addr}/v1/responses");
+        let proxy_url = format!("http://{proxy_addr}/v1/chat/completions");
+
+        for _ in 0..WARMUP_REQUESTS {
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &direct_body,
+                None,
+                "response.output_text.delta",
+            )
+            .await;
+            let _ = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &proxy_body,
+                Some("local-responses-chat-bridge-timing-key"),
+                "chat.completion.chunk",
+            )
+            .await;
+        }
+
+        let mut direct_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_ttft_ms = Vec::with_capacity(SAMPLES);
+        let mut proxy_headers_ms = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let (_, direct_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &upstream_url,
+                &direct_body,
+                None,
+                "response.output_text.delta",
+            )
+            .await;
+            let (proxy_headers, proxy_ttft) = loopback_sse_first_chunk_ms(
+                &client,
+                &proxy_url,
+                &proxy_body,
+                Some("local-responses-chat-bridge-timing-key"),
+                "chat.completion.chunk",
+            )
+            .await;
+            direct_ttft_ms.push(direct_ttft);
+            proxy_ttft_ms.push(proxy_ttft);
+            proxy_headers_ms.push(proxy_headers);
+        }
+
+        let direct_p50 = percentile_ms(direct_ttft_ms.clone(), 0.50);
+        let direct_p95 = percentile_ms(direct_ttft_ms, 0.95);
+        let proxy_p50 = percentile_ms(proxy_ttft_ms.clone(), 0.50);
+        let proxy_p95 = percentile_ms(proxy_ttft_ms, 0.95);
+        let proxy_headers_p95 = percentile_ms(proxy_headers_ms, 0.95);
+        let relay_delta_p95 = proxy_p95.saturating_sub(direct_p95);
+        eprintln!(
+            "Responses-to-Chat bridge: direct p50/p95={direct_p50}/{direct_p95}ms; proxy p50/p95={proxy_p50}/{proxy_p95}ms; proxy headers p95={proxy_headers_p95}ms; relay delta p95={relay_delta_p95}ms"
+        );
+        assert!(
+            relay_delta_p95 <= 5,
+            "the Responses-to-Chat bridge must add no more than 5ms p95 on loopback"
+        );
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            (WARMUP_REQUESTS + SAMPLES) * 2,
+            "each direct control and proxied inbound must make exactly one upstream call"
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+        fs::remove_dir_all(config_dir).ok();
     }
 
     #[test]
@@ -16059,6 +16845,66 @@ mod tests {
             false,
             &request,
             Some("codex")
+        ));
+        assert!(local_response_cache_material(
+            true,
+            &Channel::Responses,
+            &Channel::Responses,
+            true,
+            false,
+            &request,
+        )
+        .is_some());
+        assert!(local_response_cache_material(
+            false,
+            &Channel::Responses,
+            &Channel::Responses,
+            true,
+            false,
+            &request,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn chat_responses_stream_cache_material_isolated_by_usage_option() {
+        let request = json!({
+            "model": "gpt-response",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "cache me" }]
+        });
+        let without_usage = local_response_cache_material(
+            true,
+            &Channel::Chat,
+            &Channel::Responses,
+            true,
+            false,
+            &request,
+        )
+        .unwrap();
+        let with_usage = local_response_cache_material(
+            true,
+            &Channel::Chat,
+            &Channel::Responses,
+            true,
+            true,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(without_usage["chat_stream_include_usage"], false);
+        assert_eq!(with_usage["chat_stream_include_usage"], true);
+        assert_ne!(
+            cache::cache_key(&without_usage, "provider", "gpt-response", "workspace"),
+            cache::cache_key(&with_usage, "provider", "gpt-response", "workspace")
+        );
+        assert!(chat_stream_include_usage_requested(
+            &json!({ "stream_options": { "include_usage": true } }),
+            &Channel::Chat
+        ));
+        assert!(!chat_stream_include_usage_requested(
+            &json!({ "stream_options": { "include_usage": true } }),
+            &Channel::Responses
         ));
     }
 
@@ -16383,12 +17229,13 @@ mod tests {
     }
 
     #[test]
-    fn stream_proxy_requires_client_stream_true() {
+    fn stream_proxy_requires_client_stream_and_actual_sse_response() {
         let body = json!({ "stream": true });
         assert!(should_proxy_upstream_as_stream(
             true,
             true,
             false,
+            false,
             &body,
             "text/event-stream"
         ));
@@ -16396,6 +17243,7 @@ mod tests {
             true,
             false,
             false,
+            false,
             &body,
             "text/event-stream"
         ));
@@ -16403,8 +17251,74 @@ mod tests {
             true,
             true,
             true,
+            false,
             &body,
             "text/event-stream"
+        ));
+        assert!(!should_proxy_upstream_as_stream(
+            true,
+            true,
+            false,
+            true,
+            &body,
+            "application/json"
+        ));
+        assert!(!should_proxy_upstream_as_stream(
+            true,
+            true,
+            false,
+            false,
+            &body,
+            "application/json"
+        ));
+        assert!(should_proxy_upstream_as_stream(
+            true,
+            true,
+            false,
+            true,
+            &body,
+            "text/event-stream"
+        ));
+        assert!(supports_incremental_cross_protocol_stream(
+            &Channel::Responses,
+            &Channel::Chat
+        ));
+        assert!(supports_incremental_cross_protocol_stream(
+            &Channel::Responses,
+            &Channel::Anthropic
+        ));
+        assert!(supports_incremental_cross_protocol_stream(
+            &Channel::Chat,
+            &Channel::Responses
+        ));
+        assert!(supports_incremental_cross_protocol_stream(
+            &Channel::Anthropic,
+            &Channel::Responses
+        ));
+
+        let mut provider = test_responses_provider("http://127.0.0.1/v1".to_string());
+        provider.channel = Channel::Chat;
+        provider.models = vec![ModelConfig {
+            id: "non-streaming-model".to_string(),
+            request_model_id: None,
+            display_name: "non-streaming-model".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: false,
+            enabled: true,
+        }];
+        let decision = RouteDecision {
+            provider,
+            model: "non-streaming-model".to_string(),
+            upstream_channel: Channel::Chat,
+        };
+        assert!(!route_supports_incremental_cross_protocol_stream(
+            &Channel::Responses,
+            &decision
         ));
     }
 
@@ -16430,6 +17344,7 @@ mod tests {
             seen_bucket_tokens_128: provider_cache_bucket_max_128(input_tokens),
             avoidable_shortfall_tokens_128: shortfall_tokens,
             small_gap_recovery_streak: u32::from(shortfall_tokens > 0 && shortfall_tokens <= 2048),
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 0,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -16459,6 +17374,78 @@ mod tests {
         assert_eq!(transformed["max_tokens"], 1024);
         assert_eq!(transformed["messages"][0]["role"], "user");
         assert_eq!(transformed["messages"][0]["content"], "Ping");
+    }
+
+    #[test]
+    fn responses_request_converts_tools_calls_results_and_metadata_to_anthropic_shape() {
+        let request = json!({
+            "model": "claude-test",
+            "stream": true,
+            "metadata": { "user_id": "user-1", "ignored": "not-anthropic-metadata" },
+            "tool_choice": { "type": "function", "name": "lookup" },
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": { "type": "object", "properties": { "q": { "type": "string" } } }
+                },
+                { "type": "custom", "name": "shell", "description": "Run a shell command" }
+            ],
+            "input": [
+                { "type": "function_call", "call_id": "call_lookup", "name": "lookup", "arguments": { "q": "weather" } },
+                { "type": "custom_tool_call", "call_id": "call_shell", "name": "shell", "input": "dir" },
+                { "type": "function_call_output", "call_id": "call_lookup", "output": { "temperature": 22 } },
+                { "type": "custom_tool_call_output", "call_id": "call_shell", "output": "done" },
+                { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "continue" }] }
+            ]
+        });
+
+        let transformed =
+            transform_request_for_channel(&request, &Channel::Responses, &Channel::Anthropic);
+
+        assert_eq!(transformed["model"], "claude-test");
+        assert_eq!(transformed["stream"], true);
+        assert_eq!(transformed["max_tokens"], 4096);
+        assert_eq!(transformed["metadata"], json!({ "user_id": "user-1" }));
+        assert_eq!(transformed["tools"][0]["name"], "lookup");
+        assert_eq!(transformed["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(
+            transformed["tool_choice"],
+            json!({ "type": "tool", "name": "lookup" })
+        );
+        assert_eq!(transformed["messages"][0]["role"], "assistant");
+        assert_eq!(transformed["messages"][0]["content"][0]["type"], "tool_use");
+        assert_eq!(transformed["messages"][0]["content"][0]["name"], "lookup");
+        assert_eq!(
+            transformed["messages"][0]["content"][0]["input"],
+            json!({ "q": "weather" })
+        );
+        assert_eq!(transformed["messages"][0]["content"][1]["name"], "shell");
+        assert_eq!(
+            transformed["messages"][0]["content"][1]["input"],
+            json!({ "input": "dir" })
+        );
+        assert_eq!(transformed["messages"][1]["role"], "user");
+        assert_eq!(
+            transformed["messages"][1]["content"][0]["tool_use_id"],
+            "call_lookup"
+        );
+        assert_eq!(
+            transformed["messages"][1]["content"][1]["tool_use_id"],
+            "call_shell"
+        );
+        assert_eq!(transformed["messages"][1]["content"][2]["text"], "continue");
+
+        let text_only = responses_to_anthropic_request(&json!({
+            "model": "claude-test",
+            "input": "plain input"
+        }));
+        assert_eq!(text_only["messages"][0]["role"], "user");
+        assert_eq!(
+            text_only["messages"][0]["content"][0]["text"],
+            "plain input"
+        );
     }
 
     #[test]
@@ -16564,6 +17551,383 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn chat_to_responses_preserves_tool_call_history_and_results() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "I will look that up.",
+                    "tool_calls": [
+                        {
+                            "id": "call_lookup",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"q\":\"weather\"}"
+                            }
+                        },
+                        {
+                            "id": "call_status",
+                            "type": "function",
+                            "function": {
+                                "name": "status",
+                                "arguments": "{\"region\":\"east\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_lookup",
+                    "content": "{\"temperature\":22}"
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_status",
+                    "content": "ready"
+                },
+                { "role": "user", "content": "Summarize the result." }
+            ]
+        });
+
+        let mut transformed = chat_to_responses_request(&request);
+        normalize_responses_request(&mut transformed);
+        let input = transformed.get("input").and_then(Value::as_array).unwrap();
+
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_lookup");
+        assert_eq!(input[1]["name"], "lookup");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_status");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_lookup");
+        assert_eq!(input[3]["output"], "{\"temperature\":22}");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_status");
+        assert_eq!(input[4]["output"], "ready");
+        assert_eq!(input[5]["type"], "message");
+        assert_eq!(input[5]["role"], "user");
+    }
+
+    #[test]
+    fn anthropic_to_responses_preserves_tool_use_and_tool_result_history() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "top_k": 42,
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } }
+                }
+            }],
+            "tool_choice": {
+                "type": "tool",
+                "name": "lookup",
+                "disable_parallel_tool_use": true
+            },
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "I will look that up." },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "b": 2, "a": 1 }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_lookup",
+                            "content": [{ "type": "text", "text": "{\"temperature\":22}" }]
+                        },
+                        { "type": "text", "text": "Summarize it." }
+                    ]
+                }
+            ]
+        });
+
+        let mut transformed = anthropic_to_responses_request(&request);
+        normalize_responses_request(&mut transformed);
+        let input = transformed.get("input").and_then(Value::as_array).unwrap();
+
+        assert_eq!(transformed["tools"][0]["type"], "function");
+        assert_eq!(transformed["tools"][0]["name"], "lookup");
+        assert_eq!(transformed["tools"][0]["parameters"]["type"], "object");
+        assert_eq!(
+            transformed["tool_choice"],
+            json!({ "type": "function", "name": "lookup" })
+        );
+        assert_eq!(transformed["parallel_tool_calls"], false);
+        assert!(
+            transformed.get("top_k").is_none(),
+            "standard Responses does not accept Anthropic top_k"
+        );
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "toolu_lookup");
+        assert_eq!(input[1]["name"], "lookup");
+        assert_eq!(input[1]["arguments"], "{\"a\":1,\"b\":2}");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "toolu_lookup");
+        assert_eq!(input[2]["output"], "{\"temperature\":22}");
+        assert_eq!(input[3]["type"], "message");
+        assert_eq!(input[3]["role"], "user");
+        assert_eq!(
+            input[3].pointer("/content/0/text").and_then(Value::as_str),
+            Some("Summarize it.")
+        );
+        assert!(validate_anthropic_tool_history(&request).is_ok());
+    }
+
+    #[test]
+    fn anthropic_to_chat_preserves_tool_use_result_history_and_tool_options() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "top_k": 42,
+            "tools": [{
+                "name": "lookup",
+                "description": "Look up a value",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } }
+                }
+            }],
+            "tool_choice": {
+                "type": "tool",
+                "name": "lookup",
+                "disable_parallel_tool_use": true
+            },
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "I will look that up." },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "b": 2, "a": 1 }
+                        }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_lookup",
+                            "content": [{ "type": "text", "text": "{\"temperature\":22}" }]
+                        },
+                        { "type": "text", "text": "Summarize it." }
+                    ]
+                }
+            ]
+        });
+
+        let transformed = anthropic_to_chat_request(&request);
+        let messages = transformed
+            .get("messages")
+            .and_then(Value::as_array)
+            .unwrap();
+
+        assert_eq!(transformed["tools"][0]["type"], "function");
+        assert_eq!(transformed["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            transformed["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert_eq!(
+            transformed["tool_choice"],
+            json!({ "type": "function", "function": { "name": "lookup" } })
+        );
+        assert_eq!(transformed["parallel_tool_calls"], false);
+        assert!(
+            transformed.get("top_k").is_none(),
+            "standard Chat Completions does not accept Anthropic top_k"
+        );
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "I will look that up.");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "toolu_lookup");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            "{\"a\":1,\"b\":2}"
+        );
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "toolu_lookup");
+        assert_eq!(messages[1]["content"], "{\"temperature\":22}");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "Summarize it.");
+        assert!(validate_anthropic_tool_history(&request).is_ok());
+    }
+
+    #[test]
+    fn anthropic_tool_history_rejects_missing_duplicate_and_dangling_ids() {
+        let dangling = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_missing",
+                    "content": "no call"
+                }]
+            }]
+        });
+        assert!(validate_anthropic_tool_history(&dangling)
+            .unwrap_err()
+            .contains("unknown or already-consumed"));
+
+        let missing = json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [{ "type": "tool_use", "name": "lookup", "input": {} }]
+            }]
+        });
+        assert!(validate_anthropic_tool_history(&missing)
+            .unwrap_err()
+            .contains("missing id"));
+
+        let duplicate = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "toolu_same", "name": "lookup", "input": {} }]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "toolu_same", "content": "done" }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "tool_use", "id": "toolu_same", "name": "lookup", "input": {} }]
+                }
+            ]
+        });
+        assert!(validate_anthropic_tool_history(&duplicate)
+            .unwrap_err()
+            .contains("duplicated"));
+
+        let unsupported_role = json!({
+            "messages": [{
+                "role": "tool",
+                "content": "not a native Anthropic role"
+            }]
+        });
+        assert!(validate_anthropic_tool_history(&unsupported_role)
+            .unwrap_err()
+            .contains("unsupported role"));
+
+        let tool_use_in_user_turn = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_wrong_role",
+                    "name": "lookup",
+                    "input": {}
+                }]
+            }]
+        });
+        assert!(validate_anthropic_tool_history(&tool_use_in_user_turn)
+            .unwrap_err()
+            .contains("must appear in an assistant message"));
+
+        let unconsumed = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_unconsumed",
+                        "name": "lookup",
+                        "input": {}
+                    }]
+                },
+                { "role": "user", "content": "Please continue without the tool result." }
+            ]
+        });
+        assert!(validate_anthropic_tool_history(&unconsumed)
+            .unwrap_err()
+            .contains("must be consumed by immediate user tool_result blocks"));
+
+        let non_adjacent = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_adjacent",
+                        "name": "lookup",
+                        "input": {}
+                    }]
+                },
+                { "role": "assistant", "content": "I should not be here before the result." }
+            ]
+        });
+        assert!(validate_anthropic_tool_history(&non_adjacent)
+            .unwrap_err()
+            .contains("must be followed immediately"));
+
+        let partial_parallel_results = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "tool_use", "id": "toolu_a", "name": "a", "input": {} },
+                        { "type": "tool_use", "id": "toolu_b", "name": "b", "input": {} }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "content": "only one result"
+                    }]
+                }
+            ]
+        });
+        assert!(validate_anthropic_tool_history(&partial_parallel_results)
+            .unwrap_err()
+            .contains("must consume every preceding tool_use"));
+
+        let text_before_result = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_prefix",
+                        "name": "lookup",
+                        "input": {}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": "This must follow the result, not precede it." },
+                        { "type": "tool_result", "tool_use_id": "toolu_prefix", "content": "done" }
+                    ]
+                }
+            ]
+        });
+        assert!(validate_anthropic_tool_history(&text_before_result)
+            .unwrap_err()
+            .contains("must appear before ordinary user content"));
     }
 
     #[test]
@@ -17890,6 +19254,56 @@ mod tests {
     }
 
     #[test]
+    fn response_session_delta_body_rebuilds_non_input_fields_exactly() {
+        let request = json!({
+            "model": "client-model",
+            "stream": true,
+            "store": false,
+            "instructions": "stable instructions",
+            "tools": [{"type": "function", "name": "read_file"}],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "large history ".repeat(10_000)
+            }],
+            "metadata": {"conversation": "stable"},
+            "vendor_extension": {"enabled": true}
+        });
+        let delta_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": "new tail"
+        }]);
+
+        let mut legacy = request.clone();
+        let legacy_object = legacy.as_object_mut().unwrap();
+        legacy_object.insert(
+            "previous_response_id".to_string(),
+            Value::String("resp_previous".to_string()),
+        );
+        legacy_object.insert("input".to_string(), delta_input.clone());
+        legacy_object.insert("store".to_string(), Value::Bool(true));
+        legacy_object.insert(
+            "model".to_string(),
+            Value::String("resolved-model".to_string()),
+        );
+
+        let optimized = build_response_session_delta_body(
+            &request,
+            delta_input,
+            "resp_previous",
+            "resolved-model",
+        )
+        .expect("an object request must produce a delta body");
+
+        assert_eq!(optimized, legacy);
+        assert_eq!(
+            serialize_responses_body_for_provider_prefix(&optimized),
+            serialize_responses_body_for_provider_prefix(&legacy)
+        );
+    }
+
+    #[test]
     fn large_exact_session_append_uses_raw_prefix_delta() {
         let previous = (0..800)
             .map(|index| {
@@ -18241,7 +19655,7 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(
             "old-key".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_old".to_string(),
                 scope_key: Some("scope-a".to_string()),
                 input: json!([
@@ -18249,7 +19663,7 @@ mod tests {
                     { "type": "message", "role": "assistant", "content": "covered" }
                 ]),
                 finished_at: Instant::now(),
-            },
+            }),
         );
 
         let fallback =
@@ -18290,12 +19704,12 @@ mod tests {
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
         state.response_sessions.lock().await.insert(
             "session-a".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_old".to_string(),
                 scope_key: Some("scope-a".to_string()),
                 input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         let request = json!({
             "model": "gpt-5.5",
@@ -18362,12 +19776,12 @@ mod tests {
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
         state.response_sessions.lock().await.insert(
             "sibling-key".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_sibling".to_string(),
                 scope_key: Some("scope-a".to_string()),
                 input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         let request = json!({
             "model": "gpt-5.5",
@@ -18437,6 +19851,29 @@ mod tests {
             &delta,
             &TailInputDiagnostics::default()
         ));
+        reset_serialized_body_len_calls();
+        let beneficial_original_bytes =
+            serialized_body_len(&Channel::Responses, &beneficial_original);
+        let prepared_delta = response_session_delta_benefit(
+            &beneficial_original,
+            &delta,
+            beneficial_original_bytes,
+            &TailInputDiagnostics::default(),
+        )
+        .expect("beneficial delta should retain its measured wire sizes");
+        assert_eq!(
+            serialized_body_len_calls(),
+            1,
+            "the optimized decision path must not route the delta through a discarded length-only serialization"
+        );
+        assert_eq!(
+            prepared_delta.body_sizes.original_body_bytes,
+            beneficial_original_bytes
+        );
+        assert_eq!(
+            prepared_delta.body_sizes.delta_body_bytes,
+            prepared_delta.wire_draft.len() as u64
+        );
     }
 
     #[test]
@@ -18543,6 +19980,22 @@ mod tests {
             ),
             Some("session_anchor_scope_sibling")
         );
+        let evaluation = evaluate_main_response_session_delta(
+            &config,
+            &decision,
+            true,
+            &request,
+            &TailInputDiagnostics::default(),
+            &exact_anchor,
+        );
+        assert_eq!(evaluation.skip_reason, None);
+        assert_eq!(
+            evaluation
+                .original_wire_draft
+                .as_ref()
+                .map(|draft| draft.len() as u64),
+            Some(serialized_body_len(&Channel::Responses, &request))
+        );
     }
 
     #[test]
@@ -18550,120 +20003,6 @@ mod tests {
         assert!(main_response_session_delta_enabled_for_agent(None));
         assert!(main_response_session_delta_enabled_for_agent(Some("zcode")));
         assert!(main_response_session_delta_enabled_for_agent(Some("codex")));
-    }
-
-    #[tokio::test]
-    async fn response_session_rescue_allows_delta_for_413() {
-        let config = AppConfig::default();
-        let decision = RouteDecision {
-            provider: ProviderConfig {
-                id: "share".to_string(),
-                name: "Share".to_string(),
-                base_url: "https://share.example/v1".to_string(),
-                models_url: None,
-                is_full_url: false,
-                custom_user_agent: None,
-                channel: Channel::Responses,
-                prompt_cache_retention_enabled: false,
-                request_body_gzip_enabled: false,
-                use_system_proxy: false,
-                api_key_encrypted: None,
-                models: Vec::new(),
-                enabled: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-413-rescue-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state.response_sessions.lock().await.insert(
-            "session-a".to_string(),
-            ResponseSessionState {
-                response_id: "resp_old".to_string(),
-                scope_key: Some("scope-a".to_string()),
-                input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
-                finished_at: Instant::now(),
-            },
-        );
-        let request = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor" },
-                { "type": "message", "role": "user", "content": "continue" }
-            ]
-        });
-
-        let rescue = maybe_rescue_response_session_after_413(
-            &state,
-            &request,
-            Some("session-a"),
-            Some("scope-a"),
-            &decision,
-        )
-        .await;
-        let rescued = rescue.body;
-
-        assert_eq!(rescued["previous_response_id"], "resp_old");
-        assert_eq!(
-            rescued["input"],
-            json!([{ "type": "message", "role": "user", "content": "continue" }])
-        );
-        assert!(rescue.diagnostics.append_delta_match);
-        assert_eq!(rescue.diagnostics.delta_items, 1);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn response_session_413_rescue_is_only_for_uncached_responses_overflow() {
-        assert!(should_attempt_response_session_rescue_after_413(
-            413,
-            false,
-            false,
-            &Channel::Responses,
-            false
-        ));
-        assert!(!should_attempt_response_session_rescue_after_413(
-            413,
-            true,
-            false,
-            &Channel::Responses,
-            false
-        ));
-        assert!(!should_attempt_response_session_rescue_after_413(
-            413,
-            false,
-            true,
-            &Channel::Responses,
-            false
-        ));
-        assert!(!should_attempt_response_session_rescue_after_413(
-            413,
-            false,
-            false,
-            &Channel::Chat,
-            false
-        ));
-        assert!(!should_attempt_response_session_rescue_after_413(
-            413,
-            false,
-            false,
-            &Channel::Responses,
-            true
-        ));
-        assert!(!should_attempt_response_session_rescue_after_413(
-            400,
-            false,
-            false,
-            &Channel::Responses,
-            false
-        ));
     }
 
     #[test]
@@ -18675,14 +20014,14 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(
             "old-key".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_old".to_string(),
                 scope_key: Some("scope-a".to_string()),
                 input: json!([
                     { "type": "message", "role": "user", "content": "anchor" }
                 ]),
                 finished_at: Instant::now(),
-            },
+            }),
         );
 
         assert!(
@@ -18699,14 +20038,14 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(
             "old-key".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_without_skill".to_string(),
                 scope_key: Some("scope-without-skill".to_string()),
                 input: json!([
                     { "type": "message", "role": "user", "content": "anchor" }
                 ]),
                 finished_at: Instant::now(),
-            },
+            }),
         );
 
         assert!(fallback_response_session(
@@ -18729,16 +20068,16 @@ mod tests {
         let mut sessions = HashMap::new();
         sessions.insert(
             "short".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_short".to_string(),
                 input: json!([{ "type": "message", "role": "user", "content": "a" }]),
                 scope_key: Some("scope-a".to_string()),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         sessions.insert(
             "long".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_long".to_string(),
                 input: json!([
                     { "type": "message", "role": "user", "content": "a" },
@@ -18747,7 +20086,7 @@ mod tests {
                 ]),
                 scope_key: Some("scope-a".to_string()),
                 finished_at: Instant::now(),
-            },
+            }),
         );
 
         let ranked = fallback_response_sessions(&sessions, "missing", Some("scope-a"), &current);
@@ -18771,6 +20110,42 @@ mod tests {
         let diagnostics = body_diagnostics(&Channel::Responses, &original, &delta, true);
         assert!(diagnostics.send_body_is_delta);
         assert!(diagnostics.send_body_bytes < diagnostics.original_body_bytes);
+    }
+
+    #[test]
+    fn agent_body_diagnostics_separate_inbound_and_prepared_wire_sizes() {
+        let upstream = json!({
+            "model": "gpt-5.6-sol",
+            "reasoning": { "effort": "max" },
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": "hello" }]
+        });
+        let provider = test_responses_provider("https://example.test/v1".to_string());
+        let plan = RequestPlan::new(
+            &provider,
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            &upstream,
+        );
+        let inbound_body_bytes = 17;
+        let mut diagnostics = body_diagnostics_with_known_inbound_length(
+            &Channel::Responses,
+            &upstream,
+            inbound_body_bytes,
+            false,
+        );
+
+        apply_prepared_body_lengths(&mut diagnostics, &plan);
+
+        assert_eq!(diagnostics.inbound_body_bytes, inbound_body_bytes);
+        assert_eq!(diagnostics.original_body_bytes, plan.body_len() as u64);
+        assert_eq!(diagnostics.send_body_bytes, plan.body_len() as u64);
+        assert_ne!(diagnostics.original_body_bytes, inbound_body_bytes);
+
+        let mut log = RequestLog::default();
+        apply_body_diagnostics(&mut log, &diagnostics);
+        assert_eq!(log.inbound_body_bytes, Some(inbound_body_bytes));
+        assert_eq!(log.original_body_bytes, Some(plan.body_len() as u64));
     }
 
     #[test]
@@ -19988,6 +21363,22 @@ mod tests {
             &Channel::Responses,
             Some("codex")
         ));
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-bound-route-affinity-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config.clone(), dir.join("config.toml"), cache).unwrap();
+        let (affinity_key, preferred_provider) = provider_route_affinity_for_request(
+            &state,
+            &config,
+            &request,
+            &Channel::Responses,
+            true,
+        )
+        .await;
+        assert!(affinity_key.is_some());
+        assert!(preferred_provider.is_none());
         let final_decision =
             if route_is_agent_provider_bound(&config, &request, &Channel::Responses, Some("codex"))
             {
@@ -20003,6 +21394,7 @@ mod tests {
             };
 
         assert_eq!(final_decision.provider.id, "bizd");
+        fs::remove_dir_all(dir).ok();
     }
     #[test]
     fn requested_model_provider_wins_when_active_provider_lacks_model() {
@@ -20727,10 +22119,14 @@ mod tests {
             "prompt_cache_key": "stable-cache-key",
             "model": "gpt-5.5",
             "instructions": "stable system",
-            "metadata": { "trace": "dynamic" }
+            "metadata": { "trace": "dynamic" },
+            "z_vendor_extension": { "escaped": "line\n\"雪\"" }
         });
 
         let serialized = serialize_responses_body_for_provider_prefix(&body);
+        let legacy = legacy_serialize_responses_body_for_provider_prefix(&body);
+        let serialized_bytes = serialize_responses_body_bytes_for_provider_prefix(&body);
+        let prepared = PreparedWireRequest::from_value(&Channel::Responses, &body);
 
         let model_at = serialized.find("\"model\"").unwrap();
         let cache_key_at = serialized.find("\"prompt_cache_key\"").unwrap();
@@ -20761,6 +22157,171 @@ mod tests {
         assert!(truncation_at < previous_response_at);
         assert!(previous_response_at < metadata_at);
         assert!(serde_json::from_str::<Value>(&serialized).is_ok());
+        assert_eq!(serialized, legacy);
+        assert_eq!(serialized_bytes.as_slice(), legacy.as_bytes());
+        assert_eq!(prepared.body().as_ref(), serialized.as_bytes());
+        assert_eq!(prepared.len(), serialized.len());
+        assert!(prepared.is_stream());
+    }
+
+    #[test]
+    fn request_plan_freezes_transport_channel_and_wire_for_one_shot_dispatch() {
+        let mut provider = test_responses_provider("https://example.test/v1".to_string());
+        provider.use_system_proxy = true;
+        provider.custom_user_agent = Some("Atoapi/test".to_string());
+        provider.request_body_gzip_enabled = true;
+        let body = json!({
+            "metadata": { "dynamic": true },
+            "stream": true,
+            "input": [{ "role": "user", "content": "hello" }],
+            "model": "gpt-5.6-sol",
+            "instructions": "stable"
+        });
+        let expected = serialize_responses_body_for_provider_prefix(&body);
+
+        let plan = RequestPlan::new(
+            &provider,
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            &body,
+        );
+        let cached_gzip = plan.wire().cache_gzip_body(Bytes::from(
+            gzip_request_body(plan.wire().body()).expect("test wire should gzip"),
+        ));
+        let plan = plan.into_one_shot();
+        let retained_gzip = plan
+            .wire()
+            .cached_gzip_body()
+            .expect("one-shot plan should retain the cached gzip body");
+
+        assert_eq!(plan.url(), "https://example.test/v1/responses");
+        assert!(matches!(plan.channel(), Channel::Responses));
+        assert!(plan.use_system_proxy());
+        assert_eq!(plan.custom_user_agent(), Some("Atoapi/test"));
+        assert!(plan.request_body_gzip_enabled());
+        assert_eq!(plan.wire().body().as_ref(), expected.as_bytes());
+        assert_eq!(cached_gzip.as_ptr(), retained_gzip.as_ptr());
+    }
+
+    #[test]
+    fn prepared_wire_draft_rewrites_only_actual_late_fields() {
+        let mut provider = test_responses_provider("https://example.test/v1".to_string());
+        provider.request_body_gzip_enabled = true;
+        let initial = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "cache-before",
+            "prompt_cache_retention": "24h",
+            "instructions": "stable instructions",
+            "tools": [{ "type": "function", "name": "read_file" }],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "large-tail ".repeat(20_000)
+            }],
+            "stream": false,
+            "store": true,
+            "z_vendor_extension": { "stable": true }
+        });
+        reset_draft_member_encodings();
+        let draft = PreparedWireDraft::from_responses_value(&initial)
+            .expect("Responses object should create a draft");
+        assert_eq!(
+            draft.len(),
+            serialize_responses_body_bytes_for_provider_prefix(&initial).len()
+        );
+
+        let mut final_body = initial.clone();
+        let object = final_body
+            .as_object_mut()
+            .expect("test request must stay an object");
+        object.insert(
+            "prompt_cache_key".to_string(),
+            Value::String("cache-after".to_string()),
+        );
+        object.remove("prompt_cache_retention");
+        object.insert(
+            "prompt_cache_options".to_string(),
+            json!({"mode": "implicit", "ttl": "30m"}),
+        );
+        object.insert("stream".to_string(), Value::Bool(true));
+        let changed_fields = vec![
+            "prompt_cache_key".to_string(),
+            "prompt_cache_retention".to_string(),
+            "prompt_cache_options".to_string(),
+            "stream".to_string(),
+        ];
+        let prepared = draft.freeze(&final_body, &changed_fields);
+        let expected = serialize_responses_body_bytes_for_provider_prefix(&final_body);
+        assert_eq!(prepared.body().as_ref(), expected.as_slice());
+        assert_eq!(draft_member_encoding_count("input"), 1);
+        assert_eq!(draft_member_encoding_count("instructions"), 1);
+        assert_eq!(draft_member_encoding_count("tools"), 1);
+        assert_eq!(draft_member_encoding_count("prompt_cache_key"), 2);
+        assert_eq!(draft_member_encoding_count("prompt_cache_retention"), 1);
+        assert_eq!(draft_member_encoding_count("prompt_cache_options"), 1);
+        assert_eq!(draft_member_encoding_count("stream"), 2);
+
+        let plan =
+            RequestPlan::from_prepared(&provider, "https://example.test/v1/responses", prepared);
+        let cached_gzip = plan.wire().cache_gzip_body(Bytes::from(
+            gzip_request_body(plan.wire().body()).expect("test wire should gzip"),
+        ));
+        let plan = plan.into_one_shot();
+        let retained_gzip = plan
+            .wire()
+            .cached_gzip_body()
+            .expect("one-shot plan should retain the final gzip cache");
+        assert!(matches!(plan.channel(), Channel::Responses));
+        assert_eq!(plan.body_len(), expected.len());
+        assert_eq!(cached_gzip.as_ptr(), retained_gzip.as_ptr());
+    }
+
+    #[test]
+    fn unchanged_prepared_wire_draft_reuses_its_first_canonical_bytes() {
+        let body = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{"role": "user", "content": "stable"}],
+            "stream": true
+        });
+        let draft = PreparedWireDraft::from_responses_value(&body).unwrap();
+        let first_ptr = draft.body_ptr();
+        let prepared = draft.freeze(&body, &[]);
+
+        assert_eq!(prepared.body().as_ptr(), first_ptr);
+        assert_eq!(
+            prepared.body().as_ref(),
+            serialize_responses_body_bytes_for_provider_prefix(&body).as_slice()
+        );
+    }
+
+    #[test]
+    fn prepared_wire_draft_reencodes_nested_input_only_when_reported() {
+        let initial = json!({
+            "model": "gpt-5.6-sol",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "stable"},
+                    {"type": "input_text", "text": "dynamic"}
+                ]
+            }],
+            "stream": true
+        });
+        reset_draft_member_encodings();
+        let draft = PreparedWireDraft::from_responses_value(&initial).unwrap();
+        let mut final_body = initial.clone();
+        final_body["input"][0]["content"][0]["prompt_cache_breakpoint"] =
+            json!({"mode": "explicit"});
+        let prepared = draft.freeze(&final_body, &["input".to_string()]);
+
+        assert_eq!(
+            prepared.body().as_ref(),
+            serialize_responses_body_bytes_for_provider_prefix(&final_body).as_slice()
+        );
+        assert_eq!(draft_member_encoding_count("input"), 2);
+        assert_eq!(draft_member_encoding_count("model"), 1);
+        assert_eq!(draft_member_encoding_count("stream"), 1);
     }
 
     #[test]
@@ -20796,8 +22357,9 @@ mod tests {
                     "content": "summarize for the next turn"
                 }));
 
-            let baseline_wire = upstream_request_body_bytes(&Channel::Responses, &baseline);
-            let compaction_wire = upstream_request_body_bytes(&Channel::Responses, &compaction);
+            let baseline_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &baseline);
+            let compaction_wire =
+                legacy_upstream_request_body_bytes(&Channel::Responses, &compaction);
             let shared_bytes = baseline_wire
                 .iter()
                 .zip(&compaction_wire)
@@ -21034,8 +22596,8 @@ mod tests {
                 Value::String(candidate_key.clone()),
             );
 
-        let baseline_wire = upstream_request_body_bytes(&Channel::Responses, &baseline);
-        let candidate_wire = upstream_request_body_bytes(&Channel::Responses, &candidate);
+        let baseline_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &baseline);
+        let candidate_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &candidate);
         assert_ne!(baseline_wire, candidate_wire);
         assert!(String::from_utf8_lossy(&candidate_wire).contains(&candidate_key));
 
@@ -21069,18 +22631,20 @@ mod tests {
 
         decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::CohortTwoShard;
         let mut two_shard = baseline.clone();
-        assert!(apply_candidate_prompt_cache_routing(
-            &mut two_shard,
-            &decision
-        ));
+        let two_shard_outcome = apply_candidate_prompt_cache_routing(&mut two_shard, &decision);
+        assert!(two_shard_outcome.applied);
+        assert!(two_shard_outcome.changed);
         let two_shard_key = two_shard
             .get("prompt_cache_key")
             .and_then(Value::as_str)
             .expect("two-shard candidate must have a cache key");
         assert_ne!(two_shard_key, candidate_key);
+        let repeated_two_shard = apply_candidate_prompt_cache_routing(&mut two_shard, &decision);
+        assert!(repeated_two_shard.applied);
+        assert!(!repeated_two_shard.changed);
         assert_eq!(
             without_key(&baseline_wire),
-            without_key(&upstream_request_body_bytes(
+            without_key(&legacy_upstream_request_body_bytes(
                 &Channel::Responses,
                 &two_shard,
             ))
@@ -21088,11 +22652,15 @@ mod tests {
 
         decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::ProviderNative;
         let mut provider_native = baseline.clone();
-        assert!(apply_candidate_prompt_cache_routing(
-            &mut provider_native,
-            &decision
-        ));
+        let provider_native_outcome =
+            apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
+        assert!(provider_native_outcome.applied);
+        assert!(provider_native_outcome.changed);
         assert!(provider_native.get("prompt_cache_key").is_none());
+        let repeated_provider_native =
+            apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
+        assert!(repeated_provider_native.applied);
+        assert!(!repeated_provider_native.changed);
         assert_eq!(without_key(&baseline_wire), provider_native);
     }
 
@@ -21112,13 +22680,13 @@ mod tests {
     }
 
     #[test]
-    fn request_body_gzip_uses_stronger_compression_for_large_payloads() {
+    fn request_body_gzip_uses_latency_friendly_levels_for_large_payloads() {
         assert_eq!(request_body_gzip_compression(262_144).level(), 1);
         assert_eq!(
             request_body_gzip_compression(REQUEST_BODY_GZIP_MIN_BYTES).level(),
             6
         );
-        assert_eq!(request_body_gzip_compression(1_048_576).level(), 9);
+        assert_eq!(request_body_gzip_compression(1_048_576).level(), 1);
 
         let payload = vec![b'a'; 1_048_576];
         let compressed = gzip_request_body(&payload).unwrap();
@@ -21126,10 +22694,43 @@ mod tests {
     }
 
     #[test]
+    fn large_gzip_latency_policy_keeps_representative_wire_growth_bounded() {
+        let mut content = String::with_capacity(1_500_000);
+        let mut line = 0usize;
+        while content.len() < 1_500_000 {
+            content.push_str(&format!(
+                "tool_result line={line:06} path=src/module_{:03}.rs status=ok payload=stable-but-varied text block\n",
+                line % 997
+            ));
+            line += 1;
+        }
+        content.truncate(1_500_000);
+        let body = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{ "type": "message", "role": "user", "content": content }]
+        });
+        let wire = legacy_upstream_request_body_bytes(&Channel::Responses, &body);
+        let fast = gzip_request_body(&wire).expect("selected gzip should succeed");
+        let mut default_encoder = GzEncoder::new(Vec::new(), Compression::default());
+        default_encoder.write_all(&wire).unwrap();
+        let default = default_encoder.finish().unwrap();
+        assert!(
+            fast.len() <= default.len().saturating_mul(105) / 100,
+            "latency gzip grew too much: fast={} default={}",
+            fast.len(),
+            default.len()
+        );
+    }
+
+    #[test]
     fn upstream_body_error_detection_handles_responses_and_sse() {
         assert!(upstream_body_has_error(
             br#"{"type":"response.failed","error":{"message":"provider failed"}}"#,
             "application/json"
+        ));
+        assert!(json_body_has_error(
+            br#"{"type":"response.failed","response":{"error":{"code":"invalid_parameter","message":"prompt_cache_breakpoint is not supported on this model"}}}"#
         ));
         assert!(upstream_body_has_error(
             b"event: error\ndata: {\"message\":\"bad\"}\n\n",
@@ -21774,13 +23375,26 @@ mod tests {
             "atoapi-stream-normal-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
+        let writer_started = Arc::new(AtomicBool::new(false));
+        let writer_release = Arc::new(AtomicBool::new(false));
+        let writer_started_for_job = writer_started.clone();
+        let writer_release_for_job = writer_release.clone();
+        let cache =
+            CacheStore::load_with_persistence_job(cache_path(&config_dir), move |operation| {
+                assert_eq!(operation, crate::persistence::WriteOperation::Snapshot);
+                writer_started_for_job.store(true, Ordering::Release);
+                while !writer_release_for_job.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.exact_enabled = true;
+        config.cache.persist_encrypted = true;
         let state = Arc::new(
-            AppState::for_test(
-                AppConfig::default(),
-                config_dir.join("config.toml"),
-                CacheStore::load(cache_path(&config_dir)).unwrap(),
-            )
-            .unwrap(),
+            AppState::for_test(config.clone(), config_dir.join("config.toml"), cache).unwrap(),
         );
 
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -21823,6 +23437,7 @@ mod tests {
             .send()
             .await
             .unwrap();
+        let response_sessions_guard = state.response_sessions.lock().await;
         let response = stream_upstream(
             state.clone(),
             upstream,
@@ -21836,8 +23451,8 @@ mod tests {
                 model: "gpt-5.5".to_string(),
                 upstream_channel: Channel::Responses,
             },
-            false,
-            Vec::new(),
+            true,
+            vec!["normal-stream-cache-key".to_string()],
             "cache-key".to_string(),
             None,
             None,
@@ -21845,13 +23460,17 @@ mod tests {
             None,
             None,
             None,
-            AppConfig::default(),
+            config.clone(),
             None,
             None,
             None,
+            Some("normal-response-session".to_string()),
             None,
-            None,
-            None,
+            Some(json!([{
+                "type": "message",
+                "role": "user",
+                "content": "hello"
+            }])),
             false,
             false,
             BodyDiagnostics::default(),
@@ -21873,15 +23492,35 @@ mod tests {
         )
         .await;
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("client EOF must not wait for response-session settlement")
+        .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("hello"));
         assert_eq!(text.matches("\"type\":\"response.completed\"").count(), 1);
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
-        let metrics = state.metrics.snapshot().await;
+        assert_eq!(
+            state.metrics.snapshot().await.recent_upstream_calls.len(),
+            0,
+            "settlement should still be blocked while the client has already received EOF"
+        );
+        drop(response_sessions_guard);
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_upstream_calls.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("settlement should finish after the blocked state lock is released");
         assert_eq!(metrics.recent_upstream_calls.len(), 1);
         assert_eq!(metrics.recent_requests.len(), 1);
         let log = &metrics.recent_requests[0];
@@ -21889,6 +23528,25 @@ mod tests {
         assert_eq!(log.downstream_disconnected, Some(false));
         assert_eq!(log.sse_completed_event_seen, Some(true));
         assert_eq!(log.sse_done_marker_seen, Some(true));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !writer_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache persistence must start after the client has already received EOF");
+        let next_lookup = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state
+                .cache
+                .lookup_exact("normal-stream-cache-key", &config.cache),
+        )
+        .await
+        .expect("a slow disk writer must not block the next cache lookup");
+        assert!(next_lookup.is_some());
+        writer_release.store(true, Ordering::Release);
+        state.cache.flush().await.unwrap();
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -21916,12 +23574,12 @@ mod tests {
         ]);
         state.response_sessions.lock().await.insert(
             session_key.clone(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_before_compaction".to_string(),
                 input: json!([{"type":"message","role":"user","content":"old history"}]),
                 scope_key: Some("compaction-scope".to_string()),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         let shadow_identity = affinity_identity::AffinityIdentity {
             realm_id: "compaction-realm".to_string(),
@@ -22382,6 +24040,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_upstream_byte_budget_backpressures_without_dropping_stream() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-relay-byte-budget-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let padding = Bytes::from(": pad\n\n".repeat(160_000));
+        assert!(padding.len() > STREAM_RELAY_BYTE_BUDGET / 2);
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let first = padding.clone();
+                let second = padding.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(first);
+                        yield Ok::<Bytes, Infallible>(second);
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_byte_budget\"}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response =
+            stream_test_response(state.clone(), upstream, "byte-budget-request", None, false).await;
+        let body = response.into_body();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.metrics.snapshot().await.recent_requests.len(),
+            0,
+            "the byte budget must stop settlement while oversized queued data is unconsumed"
+        );
+
+        let body = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            axum::body::to_bytes(body, usize::MAX),
+        )
+        .await
+        .expect("the relay must resume when downstream consumption releases byte permits")
+        .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body)
+                .matches("response.completed")
+                .count(),
+            1
+        );
+        let snapshot = state.metrics.snapshot().await;
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert!(snapshot.recent_requests[0]
+            .stream_client_backpressure_ms
+            .is_some());
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn relay_chunk_parts_never_exceed_the_byte_budget() {
+        let chunk = Bytes::from(vec![b'x'; STREAM_RELAY_BYTE_BUDGET * 2 + 17]);
+        let parts = relay_chunk_parts(&chunk).collect::<Vec<_>>();
+
+        assert_eq!(
+            parts.iter().map(Bytes::len).collect::<Vec<_>>(),
+            vec![STREAM_RELAY_BYTE_BUDGET, STREAM_RELAY_BYTE_BUDGET, 17]
+        );
+        assert_eq!(parts.concat(), chunk.as_ref());
+    }
+
+    #[test]
+    fn stream_cache_capture_discards_the_whole_body_after_its_limit() {
+        let bytes = vec![b'x'; STREAM_CACHE_CAPTURE_BYTE_LIMIT];
+        let mut exact = BoundedCacheCapture::new(true);
+        exact.push(&bytes);
+        assert_eq!(
+            exact.finish().unwrap().len(),
+            STREAM_CACHE_CAPTURE_BYTE_LIMIT
+        );
+
+        let mut overflow = BoundedCacheCapture::new(true);
+        overflow.push(&bytes);
+        overflow.push(b"x");
+        assert!(overflow.finish().is_none());
+    }
+
+    #[tokio::test]
     async fn stream_upstream_finishes_after_downstream_receiver_is_dropped() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-relay-drop-{}",
@@ -22515,6 +24288,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_upstream_returns_503_and_records_failure_when_relay_tracker_is_closed() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-relay-closed-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_closed\"}}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .relay_tasks
+                .close_and_drain(std::time::Duration::from_millis(1))
+                .await,
+            DispatchDrainOutcome::Graceful
+        );
+
+        let response =
+            stream_test_response(state.clone(), upstream, "closed-relay-request", None, false)
+                .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("proxy relay is shutting down"));
+
+        let snapshot = state.metrics.snapshot().await;
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
     async fn stream_upstream_classifies_disconnect_after_terminal() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-relay-terminal-drop-{}",
@@ -22601,6 +24449,1114 @@ mod tests {
             Some("after_terminal")
         );
         assert_eq!(request.sse_completed_event_seen, Some(true));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_classifies_unrelayed_terminal_as_before_terminal() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-unrelayed-terminal-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"first\"}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_unrelayed_terminal\",\"usage\":{\"input_tokens\":20,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "unrelayed-terminal-request",
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("output_text.delta"));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owner must drain and settle the unrelayed terminal event");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(true));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn chat_to_responses_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-chat-responses-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_drop\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_drop\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\" last\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"total_tokens\":22,\"prompt_tokens_details\":{\"cached_tokens\":16}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "chat-responses-drop-request",
+            Channel::Responses,
+            Channel::Chat,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed stream must emit before the upstream terminal")
+            .expect("the transformed stream must not end before its first event")
+            .expect("the first transformed event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("event: response.created"));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bridge owner must drain and settle after the client drops");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "responses");
+        assert_eq!(request.upstream_channel, "chat");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(true));
+        assert_eq!(request.cache_read_tokens, Some(16));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_to_chat_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-responses-chat-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_drop\",\"model\":\"gpt-5.5\",\"status\":\"in_progress\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_drop\",\"output_index\":0,\"delta\":\"first\"}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_drop\",\"output_index\":0,\"delta\":\" last\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_drop\",\"model\":\"gpt-5.5\",\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\n",
+                        ));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "responses-chat-drop-request",
+            Channel::Chat,
+            Channel::Responses,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed Chat stream must emit before Responses terminal")
+            .expect("the transformed Chat stream must not end before first event")
+            .expect("the first transformed Chat event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("\"content\":\"first\""));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Chat bridge owner must drain and settle after client drop");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "chat");
+        assert_eq!(request.upstream_channel, "responses");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(false));
+        assert_eq!(request.sse_done_marker_seen, Some(true));
+        assert_eq!(request.cache_read_tokens, Some(16));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_to_chat_bridge_errors_and_truncation_do_not_enter_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-responses-chat-terminal-errors-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    let attempt = upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        Body::from(Bytes::from_static(
+                            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"busy\",\"type\":\"server_error\"}}}\n\n",
+                        ))
+                    } else {
+                        Body::from(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_short\",\"delta\":\"partial\"}\n\n",
+                        ))
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        for request_id in ["responses-chat-error", "responses-chat-truncated"] {
+            let upstream = state
+                .upstream_client(false)
+                .post(format!("http://{upstream_addr}/stream"))
+                .send()
+                .await
+                .unwrap();
+            let response = stream_test_response_for_channels(
+                state.clone(),
+                upstream,
+                request_id,
+                Channel::Chat,
+                Channel::Responses,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains("\"error\":"));
+            assert!(!text.contains("data: [DONE]"));
+        }
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_failed_requests.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the transformed failures must settle exactly once each");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 2);
+        assert!(snapshot.errors >= 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn chat_anthropic_bridge_errors_and_truncation_do_not_enter_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-chat-anthropic-terminal-errors-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    let attempt = upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        Body::from(Bytes::from_static(
+                            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"busy\"}}\n\n",
+                        ))
+                    } else {
+                        Body::from(Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_short\",\"model\":\"claude-test\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+                        ))
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        for request_id in ["chat-anthropic-error", "chat-anthropic-truncated"] {
+            let upstream = state
+                .upstream_client(false)
+                .post(format!("http://{upstream_addr}/stream"))
+                .send()
+                .await
+                .unwrap();
+            let response = stream_test_response_for_channels(
+                state.clone(),
+                upstream,
+                request_id,
+                Channel::Chat,
+                Channel::Anthropic,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains("\"error\":") || text.contains("stream_truncated"));
+            assert!(!text.contains("data: [DONE]"));
+        }
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_failed_requests.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the transformed failures must settle exactly once each");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 2);
+        assert!(snapshot.errors >= 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_bridge_errors_and_truncation_do_not_enter_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-anthropic-chat-terminal-errors-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    let attempt = upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        Body::from(Bytes::from_static(
+                            b"event: error\ndata: {\"error\":{\"type\":\"server_error\",\"message\":\"busy\"}}\n\n",
+                        ))
+                    } else {
+                        Body::from(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_short\",\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":\"stop\"}]}\n\n",
+                        ))
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        for request_id in ["anthropic-chat-error", "anthropic-chat-truncated"] {
+            let upstream = state
+                .upstream_client(false)
+                .post(format!("http://{upstream_addr}/stream"))
+                .send()
+                .await
+                .unwrap();
+            let response = stream_test_response_for_channels(
+                state.clone(),
+                upstream,
+                request_id,
+                Channel::Anthropic,
+                Channel::Chat,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains("event: error"));
+            assert!(!text.contains("event: message_stop"));
+        }
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_failed_requests.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the transformed failures must settle exactly once each");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 2);
+        assert!(snapshot.errors >= 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_to_anthropic_bridge_errors_and_truncation_do_not_enter_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-responses-anthropic-terminal-errors-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    let attempt = upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        Body::from(Bytes::from_static(
+                            b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"busy\",\"type\":\"server_error\"}}}\n\n",
+                        ))
+                    } else {
+                        Body::from(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_short\",\"delta\":\"partial\"}\n\n",
+                        ))
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        for request_id in ["responses-anthropic-error", "responses-anthropic-truncated"] {
+            let upstream = state
+                .upstream_client(false)
+                .post(format!("http://{upstream_addr}/stream"))
+                .send()
+                .await
+                .unwrap();
+            let response = stream_test_response_for_channels(
+                state.clone(),
+                upstream,
+                request_id,
+                Channel::Anthropic,
+                Channel::Responses,
+                None,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains("event: error"));
+            assert!(!text.contains("event: message_stop"));
+        }
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_failed_requests.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the transformed failures must settle exactly once each");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 2);
+        assert!(snapshot.errors >= 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_to_anthropic_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-responses-anthropic-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_drop\",\"model\":\"gpt-test\",\"status\":\"in_progress\",\"usage\":{\"input_tokens\":20,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_drop\",\"output_index\":0,\"content_index\":0,\"delta\":\"first\"}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_drop\",\"output_index\":0,\"content_index\":0,\"delta\":\" last\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_drop\",\"model\":\"gpt-test\",\"status\":\"completed\",\"usage\":{\"input_tokens\":20,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":16}}}}\n\n",
+                        ));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "responses-anthropic-drop-request",
+            Channel::Anthropic,
+            Channel::Responses,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed Responses stream must emit before terminal")
+            .expect("the transformed Responses stream must not end before first event")
+            .expect("the first transformed Anthropic event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("event: message_start"));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Responses bridge owner must drain and settle after client drop");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "anthropic");
+        assert_eq!(request.upstream_channel, "responses");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(true));
+        assert_eq!(request.cache_read_tokens, Some(16));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn anthropic_to_responses_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-anthropic-responses-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_drop\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":16}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" last\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "anthropic-responses-drop-request",
+            Channel::Responses,
+            Channel::Anthropic,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed Anthropic stream must emit before terminal")
+            .expect("the transformed Anthropic stream must not end before first event")
+            .expect("the first transformed Anthropic event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("event: response.created"));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Anthropic bridge owner must drain and settle after client drop");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "responses");
+        assert_eq!(request.upstream_channel, "anthropic");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.sse_completed_event_seen, Some(true));
+        assert_eq!(request.cache_read_tokens, Some(16));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn chat_anthropic_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-chat-anthropic-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_chat_drop\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":20,\"cache_read_input_tokens\":16}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first\"}}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" last\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "chat-anthropic-drop-request",
+            Channel::Chat,
+            Channel::Anthropic,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed Anthropic stream must emit before terminal")
+            .expect("the transformed Anthropic stream must not end before first event")
+            .expect("the first transformed Chat event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("\"content\":\"first\""));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Chat bridge owner must drain and settle after client drop");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "chat");
+        assert_eq!(request.upstream_channel, "anthropic");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        // The client wire is Chat here, so terminal evidence is `[DONE]`;
+        // `completed_event_seen` remains specific to Responses SSE.
+        assert_eq!(request.sse_completed_event_seen, Some(false));
+        assert_eq!(request.sse_done_marker_seen, Some(true));
+        assert_eq!(request.cache_read_tokens, Some(16));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_bridge_drains_and_settles_once_after_client_drop() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-anthropic-chat-drop-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_drained = Arc::new(AtomicBool::new(false));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_drained_for_server = upstream_drained.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                let upstream_drained = upstream_drained_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_anthropic_drop\",\"model\":\"gpt-chat\",\"choices\":[{\"delta\":{\"content\":\"first\"},\"finish_reason\":null}]}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_anthropic_drop\",\"model\":\"gpt-chat\",\"choices\":[{\"delta\":{\"content\":\" last\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":16}}}\n\ndata: [DONE]\n\n",
+                        ));
+                        upstream_drained.store(true, Ordering::SeqCst);
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_for_channels(
+            state.clone(),
+            upstream,
+            "anthropic-chat-drop-request",
+            Channel::Anthropic,
+            Channel::Chat,
+            None,
+            None,
+            false,
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), body.next())
+            .await
+            .expect("the transformed Chat stream must emit before terminal")
+            .expect("the transformed Chat stream must not end before first event")
+            .expect("the first transformed Anthropic event must be readable");
+        assert!(String::from_utf8_lossy(&first).contains("event: message_start"));
+        drop(body);
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Anthropic bridge owner must drain and settle after client drop");
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(upstream_drained.load(Ordering::SeqCst));
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        let request = &snapshot.recent_requests[0];
+        assert_eq!(request.status, 200);
+        assert_eq!(request.client_channel, "anthropic");
+        assert_eq!(request.upstream_channel, "chat");
+        assert_eq!(request.downstream_disconnected, Some(true));
+        assert_eq!(
+            request.downstream_disconnect_stage.as_deref(),
+            Some("before_terminal")
+        );
+        assert_eq!(request.cache_read_tokens, Some(16));
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -22815,6 +25771,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_stream_frame_overflow_keeps_error_stats_out_of_success_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-stream-frame-overflow-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            state
+                .metrics
+                .begin_agent_inbound(AgentInboundStart {
+                    inbound_request_id: "agent-stream-frame-overflow".to_string(),
+                    at: Utc::now(),
+                    attempt_policy: "single".to_string(),
+                    attempt_budget: 1,
+                })
+                .await
+        );
+        assert_eq!(
+            state
+                .metrics
+                .begin_agent_attempt(AgentAttemptStart {
+                    inbound_request_id: "agent-stream-frame-overflow".to_string(),
+                    attempt_id: "agent-stream-frame-overflow-attempt".to_string(),
+                    at: Utc::now(),
+                    attempt_reason: "primary".to_string(),
+                    provider: "provider".to_string(),
+                    model: "gpt-5.5".to_string(),
+                    upstream_channel: "responses".to_string(),
+                })
+                .await,
+            Some(1)
+        );
+
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let mut payload = b"data: ".to_vec();
+                    payload.resize(1_048_700, b'x');
+                    payload.extend_from_slice(
+                        b"\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_after_frame_overflow\"}}\n\n",
+                    );
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(payload));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "agent-stream-frame-overflow",
+            Some("agent-stream-frame-overflow-attempt".to_string()),
+            true,
+        )
+        .await;
+        assert!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "the downstream body must expose the inspection failure"
+        );
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_inbound_outcomes.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("frame overflow must finish Agent lifecycle accounting");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 1);
+        assert_eq!(snapshot.recent_requests.len(), 0);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert!(snapshot.errors >= 1);
+        assert!(snapshot
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "upstream_sse_frame_too_large"));
+        let attempt = &snapshot.recent_agent_upstream_attempts[0];
+        assert_eq!(attempt.outcome, AgentAttemptOutcome::StreamError);
+        assert_eq!(
+            attempt.error_scope.as_deref(),
+            Some("upstream_sse_frame_too_large")
+        );
+        assert_eq!(
+            attempt.terminal_state.as_deref(),
+            Some("sse_frame_too_large")
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
     async fn selected_provider_key_success_update_does_not_block_stream_handoff() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-key-status-{}",
@@ -22853,6 +25938,116 @@ mod tests {
             .expect("background status update task should not panic");
 
         fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "manual provider-key selection lock contention baseline"]
+    async fn provider_key_selection_lock_contention_baseline() {
+        const ROUNDS: usize = 8;
+        const KEY_COUNTS: [usize; 3] = [1, 4, 16];
+        const CONCURRENCIES: [usize; 3] = [1, 32, 128];
+
+        for key_count in KEY_COUNTS {
+            let config_dir = std::env::temp_dir().join(format!(
+                "atoapi-key-selection-baseline-{key_count}-{}",
+                Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            ));
+            let provider_id = format!("key-baseline-provider-{key_count}");
+            let mut config = AppConfig::default();
+            let mut provider = test_responses_provider("http://127.0.0.1:1/v1".to_string());
+            provider.id = provider_id.clone();
+            config.providers = vec![provider];
+            config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+                provider_id: provider_id.clone(),
+                enabled: true,
+                strategy: crate::config::KeyLoadBalanceStrategy::RoundRobin,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                next_index: 0,
+                keys: (0..key_count)
+                    .map(|index| crate::config::ProviderKeyConfig {
+                        id: format!("key-{index}"),
+                        alias: None,
+                        key_encrypted: Some(
+                            crate::crypto::encrypt_secret("synthetic-key")
+                                .expect("synthetic key encryption should succeed"),
+                        ),
+                        enabled: true,
+                        priority: 5,
+                        status: crate::config::ProviderKeyStatus::Unknown,
+                        total_requests: 0,
+                        successes: 0,
+                        failures: 0,
+                        last_checked_at: None,
+                        last_error: None,
+                        disabled_until: None,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                    })
+                    .collect(),
+                updated_at: Utc::now(),
+            }];
+            let state = Arc::new(
+                AppState::for_test(
+                    config,
+                    config_dir.join("config.toml"),
+                    CacheStore::load(cache_path(&config_dir)).unwrap(),
+                )
+                .unwrap(),
+            );
+
+            for concurrency in CONCURRENCIES {
+                let mut lock_wait_us = Vec::with_capacity(ROUNDS * concurrency);
+                let mut in_lock_us = Vec::with_capacity(ROUNDS * concurrency);
+                let mut total_us = Vec::with_capacity(ROUNDS * concurrency);
+
+                for _ in 0..ROUNDS {
+                    let barrier = Arc::new(tokio::sync::Barrier::new(concurrency));
+                    let mut tasks = Vec::with_capacity(concurrency);
+                    for _ in 0..concurrency {
+                        let barrier = barrier.clone();
+                        let state = state.clone();
+                        let provider_id = provider_id.clone();
+                        tasks.push(tokio::spawn(async move {
+                            barrier.wait().await;
+                            let started = Instant::now();
+                            let lock_started = Instant::now();
+                            let mut config = state.config.write().await;
+                            let lock_wait = lock_started.elapsed().as_micros() as u64;
+                            let in_lock_started = Instant::now();
+                            let selected = config
+                                .select_provider_key_for_request(&provider_id, None, None)
+                                .expect("synthetic key selection should succeed")
+                                .expect("synthetic key pool should return a key");
+                            let in_lock = in_lock_started.elapsed().as_micros() as u64;
+                            drop(config);
+                            let total = started.elapsed().as_micros() as u64;
+                            assert_eq!(selected.secret, "synthetic-key");
+                            (lock_wait, in_lock, total)
+                        }));
+                    }
+                    for task in tasks {
+                        let (lock_wait, in_lock, total) =
+                            task.await.expect("baseline task should not panic");
+                        lock_wait_us.push(lock_wait);
+                        in_lock_us.push(in_lock);
+                        total_us.push(total);
+                    }
+                }
+
+                let lock_wait_p50 = percentile_ms(lock_wait_us.clone(), 0.50);
+                let lock_wait_p95 = percentile_ms(lock_wait_us, 0.95);
+                let in_lock_p50 = percentile_ms(in_lock_us.clone(), 0.50);
+                let in_lock_p95 = percentile_ms(in_lock_us, 0.95);
+                let total_p50 = percentile_ms(total_us.clone(), 0.50);
+                let total_p95 = percentile_ms(total_us, 0.95);
+                eprintln!(
+                    "provider-key baseline keys={key_count} concurrency={concurrency} lock_wait_us_p50/p95={lock_wait_p50}/{lock_wait_p95} in_lock_select_decrypt_us_p50/p95={in_lock_p50}/{in_lock_p95} total_us_p50/p95={total_p50}/{total_p95}"
+                );
+            }
+
+            fs::remove_dir_all(config_dir).ok();
+        }
     }
 
     #[tokio::test]
@@ -23087,6 +26282,7 @@ mod tests {
             seen_bucket_tokens_128: 0,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 0,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -23152,6 +26348,7 @@ mod tests {
             seen_bucket_tokens_128: 160_512,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 0,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -23204,6 +26401,7 @@ mod tests {
                 seen_bucket_tokens_128: 34_304,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 0,
                 settle_after_cold_read: false,
                 tail_tool_output_chars: 0,
@@ -23367,17 +26565,7 @@ mod tests {
             },
             484_250,
         ));
-        assert!(!should_use_chat_non_stream_compact_fast_path(
-            &TailInputDiagnostics {
-                input_items: 198,
-                message_chars: 30_177,
-                tool_output_chars: 452_356,
-                largest_tool_output_chars: 46_766,
-                source: Some("mixed".to_string()),
-                ..TailInputDiagnostics::default()
-            },
-            48_495,
-        ));
+        assert!(!should_use_chat_non_stream_compact_fast_path());
         let message_compact_tail = TailInputDiagnostics {
             input_items: 6,
             message_chars: 26_341,
@@ -23396,10 +26584,7 @@ mod tests {
             &message_compact_tail,
             33_407,
         ));
-        assert!(!should_use_chat_non_stream_compact_fast_path(
-            &message_compact_tail,
-            33_407,
-        ));
+        assert!(!should_use_chat_non_stream_compact_fast_path());
         let compact_message_tail_under_old_threshold = TailInputDiagnostics {
             input_items: 3,
             message_chars: 8_300,
@@ -23961,6 +27146,7 @@ mod tests {
             seen_bucket_tokens_128: 114_688,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 0,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -24199,10 +27385,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_sync_main_520_uses_compat_fallbacks() {
-        assert!(should_fallback_responses_sync_main_to_chat_compat(
-            520, true, false
-        ));
+    fn responses_sync_main_520_marks_chat_compat_for_next_inbound() {
         assert!(should_fallback_chat_compat_compact_to_responses(
             520, true, true
         ));
@@ -24402,7 +27585,7 @@ mod tests {
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
         state.response_sessions.lock().await.insert(
             "old-anchor".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_old".to_string(),
                 input: json!([
                     { "type": "message", "role": "user", "content": "anchor" },
@@ -24410,7 +27593,7 @@ mod tests {
                 ]),
                 scope_key: Some("scope-a".to_string()),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         let current_input = json!([
             { "type": "message", "role": "user", "content": "anchor" },
@@ -25754,6 +28937,96 @@ mod tests {
             let mut states = state.prefix_states.lock().await;
             let prefix = states.get_mut(key).unwrap();
             prefix.finished_at = Instant::now();
+            prefix.cache_instability_score = 3;
+            prefix.recent_clean_tiny_gap_streak = MIN_CLEAN_TINY_RECOVERY_STREAK;
+            prefix.avoidable_shortfall_tokens = 256;
+            prefix.avoidable_shortfall_tokens_128 = 256;
+        }
+        let recovered = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert!(recovered.wait_ms > 0);
+        assert!(recovered.wait_ms <= 500);
+        assert_eq!(
+            recovered.reason.as_deref(),
+            Some("responses_exact_avoidable_gap")
+        );
+
+        let tool_tail = TailInputDiagnostics {
+            tool_output_chars: 8_000,
+            largest_tool_output_chars: 8_000,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let tool_tail_wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &tool_tail,
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert_eq!(tool_tail_wait.wait_ms, 0);
+        assert_eq!(
+            tool_tail_wait.skip_reason.as_deref(),
+            Some("avoidable_gap_unstable")
+        );
+
+        let tool_call_tail = TailInputDiagnostics {
+            tool_call_chars: 1,
+            source: Some("tool_call".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let tool_call_wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &tool_call_tail,
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert_eq!(tool_call_wait.wait_ms, 0);
+        assert_eq!(
+            tool_call_wait.skip_reason.as_deref(),
+            Some("avoidable_gap_unstable")
+        );
+
+        {
+            let mut states = state.prefix_states.lock().await;
+            let prefix = states.get_mut(key).unwrap();
+            prefix.recent_clean_tiny_gap_streak = 0;
+        }
+        let unverified_previous_wait = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+        assert_eq!(unverified_previous_wait.wait_ms, 0);
+        assert_eq!(
+            unverified_previous_wait.skip_reason.as_deref(),
+            Some("avoidable_gap_unstable")
+        );
+
+        {
+            let mut states = state.prefix_states.lock().await;
+            let prefix = states.get_mut(key).unwrap();
+            prefix.finished_at = Instant::now();
             prefix.avoidable_shortfall_tokens = 0;
             prefix.avoidable_shortfall_tokens_128 = 0;
         }
@@ -26166,6 +29439,7 @@ mod tests {
                 seen_bucket_tokens_128: 271_104,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 8,
                 settle_after_cold_read: false,
                 tail_tool_output_chars: 11_356,
@@ -26364,10 +29638,23 @@ mod tests {
         };
 
         update_provider_prefix_state(&state, Some("main-prefix"), Some(&warm), false, false).await;
-        update_provider_prefix_state(
+        {
+            let mut states = state.prefix_states.lock().await;
+            states
+                .get_mut("main-prefix")
+                .unwrap()
+                .recent_clean_tiny_gap_streak = MIN_CLEAN_TINY_RECOVERY_STREAK;
+        }
+        update_provider_prefix_state_with_tail(
             &state,
             Some("main-prefix"),
+            None,
             Some(&session_delta_only),
+            &TailInputDiagnostics {
+                tool_call_chars: 1,
+                source: Some("tool_call".to_string()),
+                ..TailInputDiagnostics::default()
+            },
             true,
             false,
         )
@@ -26378,6 +29665,53 @@ mod tests {
         assert_eq!(kept.input_tokens, 236_227);
         assert_eq!(kept.cache_read_tokens, 230_912);
         assert_eq!(kept.seen_bucket_tokens, 230_912);
+        assert_eq!(kept.recent_clean_tiny_gap_streak, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_usage_clears_runtime_tiny_gap_evidence_without_lowering_prefix_state() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-missing-usage-tiny-recovery-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "main-prefix";
+        let mut prefix = prefix_state(64_512, 63_872, 512);
+        prefix.recent_clean_tiny_gap_streak = MIN_CLEAN_TINY_RECOVERY_STREAK;
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), prefix);
+
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            None,
+            None,
+            &TailInputDiagnostics {
+                tool_output_chars: 1,
+                largest_tool_output_chars: 1,
+                source: Some("tool_output".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let states = state.prefix_states.lock().await;
+        let kept = states.get(key).unwrap();
+        assert_eq!(kept.cache_read_tokens, 63_872);
+        assert_eq!(kept.seen_bucket_tokens, provider_cache_bucket_max(64_512));
+        assert_eq!(kept.recent_clean_tiny_gap_streak, 0);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -26727,36 +30061,21 @@ mod tests {
     }
 
     #[test]
-    fn response_session_errors_fallback_only_for_invalid_session_statuses() {
+    fn response_session_rejections_defer_full_body_to_next_inbound() {
         for status in [400, 404, 409, 410, 422] {
             assert!(
-                should_retry_full_response_after_session_error(status, true, true),
-                "status {status} should retry as a full Responses request after session reuse fails"
+                should_defer_response_session_rejection_to_next_inbound(status, true),
+                "status {status} should clear the session so the next inbound uses its full body"
             );
         }
-        assert!(!should_retry_full_response_after_session_error(
-            408, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            429, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            502, false, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            502, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            503, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            401, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            403, true, true
-        ));
-        assert!(!should_retry_full_response_after_session_error(
-            400, true, false
+        for status in [401, 403, 408, 429, 502, 503] {
+            assert!(
+                !should_defer_response_session_rejection_to_next_inbound(status, true),
+                "status {status} is not an explicit session-reference rejection"
+            );
+        }
+        assert!(!should_defer_response_session_rejection_to_next_inbound(
+            400, false
         ));
     }
 
@@ -26786,77 +30105,6 @@ mod tests {
         assert_eq!(
             response_session_rejection_classification(422, "invalid request"),
             ResponseSessionRejectionClass::TransientInvalid
-        );
-    }
-
-    #[test]
-    fn previous_response_unsupported_retry_body_can_expand_from_local_session() {
-        let request = json!({
-            "model": "gpt-test",
-            "previous_response_id": "resp_client_supplied",
-            "input": [
-                {
-                    "role": "user",
-                    "content": "continue"
-                }
-            ]
-        });
-        let previous_input = json!([
-            {
-                "role": "system",
-                "content": "stable instructions"
-            },
-            {
-                "role": "user",
-                "content": "original task"
-            }
-        ]);
-
-        let compat = expand_previous_response_id_for_compat(
-            &request,
-            &previous_input,
-            "client_previous_response_id_expanded_from_local_session",
-        )
-        .unwrap();
-
-        assert_eq!(
-            compat.reason,
-            "client_previous_response_id_expanded_from_local_session"
-        );
-        assert!(compat.body.get("previous_response_id").is_none());
-        assert_eq!(compat.body["input"].as_array().unwrap().len(), 3);
-        assert_eq!(compat.body["input"][0], previous_input[0]);
-        assert_eq!(compat.body["input"][2], request["input"][0]);
-    }
-
-    #[test]
-    fn previous_response_unsupported_retry_body_removes_previous_response_id() {
-        let request = json!({
-            "model": "gpt-test",
-            "previous_response_id": "resp_client_supplied",
-            "input": [
-                {
-                    "role": "user",
-                    "content": "continue"
-                }
-            ]
-        });
-
-        let compat = strip_previous_response_id_for_compat(
-            &request,
-            "client_previous_response_id_unsupported_retry",
-        )
-        .unwrap();
-
-        assert_eq!(
-            compat.reason,
-            "client_previous_response_id_unsupported_retry"
-        );
-        assert!(compat.body.get("previous_response_id").is_none());
-        assert_eq!(compat.body["input"], request["input"]);
-        assert_eq!(
-            request["previous_response_id"],
-            json!("resp_client_supplied")
         );
     }
 
@@ -27037,10 +30285,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_session_reuse_admin_probe_requires_auth_and_semantic_continuation() {
+    async fn response_session_reuse_probe_requires_usage_and_cached_token_evidence() {
         let hits = Arc::new(AtomicUsize::new(0));
+        let include_usage = Arc::new(AtomicBool::new(false));
         let nonce = Arc::new(tokio::sync::Mutex::new(String::new()));
         let hits_for_route = hits.clone();
+        let include_usage_for_route = include_usage.clone();
         let nonce_for_route = nonce.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
@@ -27048,11 +30298,13 @@ mod tests {
             "/v1/responses",
             post(move |Json(body): Json<Value>| {
                 let hits = hits_for_route.clone();
+                let include_usage = include_usage_for_route.clone();
                 let nonce = nonce_for_route.clone();
                 async move {
                     let attempt = hits.fetch_add(1, Ordering::SeqCst);
                     if attempt == 0 {
                         let input = body["input"].as_str().unwrap_or_default();
+                        assert!(input.len() > 8_000);
                         let token = input
                             .split("token ")
                             .nth(1)
@@ -27060,25 +30312,41 @@ mod tests {
                             .unwrap_or_default()
                             .to_string();
                         *nonce.lock().await = token;
-                        Json(json!({
+                        let mut response = json!({
                             "id": "resp_probe_seed",
                             "error": null,
                             "output": [{
                                 "type": "message",
                                 "content": [{ "type": "output_text", "text": "ACK" }]
                             }]
-                        }))
+                        });
+                        if include_usage.load(Ordering::SeqCst) {
+                            response["usage"] = json!({
+                                "input_tokens": 2_048,
+                                "output_tokens": 1,
+                                "input_tokens_details": { "cached_tokens": 0 }
+                            });
+                        }
+                        Json(response)
                     } else {
                         assert_eq!(body["previous_response_id"], "resp_probe_seed");
                         let token = nonce.lock().await.clone();
-                        Json(json!({
+                        let mut response = json!({
                             "id": "resp_probe_continuation",
                             "error": null,
                             "output": [{
                                 "type": "message",
                                 "content": [{ "type": "output_text", "text": token }]
                             }]
-                        }))
+                        });
+                        if include_usage.load(Ordering::SeqCst) {
+                            response["usage"] = json!({
+                                "input_tokens": 2_112,
+                                "output_tokens": 1,
+                                "input_tokens_details": { "cached_tokens": 1_920 }
+                            });
+                        }
+                        Json(response)
                     }
                 }
             }),
@@ -27116,8 +30384,40 @@ mod tests {
             .unwrap();
         let result: ProviderResponseSessionReuseProbeResult =
             serde_json::from_slice(&response_body).unwrap();
-        assert_eq!(result.status, ProviderResponseSessionReuseStatus::Verified);
-        assert!(result.enabled);
+        assert_eq!(
+            result.status,
+            ProviderResponseSessionReuseStatus::Unverified
+        );
+        assert!(!result.enabled);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(!state
+            .config
+            .read()
+            .await
+            .response_session_reuse_verified_for("probe-provider", "gpt-5.5"));
+
+        include_usage.store(true, Ordering::SeqCst);
+        hits.store(0, Ordering::SeqCst);
+        let verified_response = admin_probe_response_session_reuse(
+            AxumState(state.clone()),
+            admin_probe_request("probe-provider", "gpt-5.5", Some("admin-local-key")),
+        )
+        .await;
+        assert_eq!(verified_response.status(), StatusCode::OK);
+        let verified_body = axum::body::to_bytes(verified_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let verified: ProviderResponseSessionReuseProbeResult =
+            serde_json::from_slice(&verified_body).unwrap();
+        assert_eq!(
+            verified.status,
+            ProviderResponseSessionReuseStatus::Verified
+        );
+        assert!(verified.enabled);
+        assert!(verified.usage_verified);
+        assert_eq!(verified.first_input_tokens, Some(2_048));
+        assert_eq!(verified.continuation_input_tokens, Some(2_112));
+        assert_eq!(verified.continuation_cached_tokens, Some(1_920));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(state
             .config
@@ -27125,6 +30425,33 @@ mod tests {
             .await
             .response_session_reuse_verified_for("probe-provider", "gpt-5.5"));
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn response_session_probe_usage_rejects_missing_cache_or_context_usage() {
+        let seed = UsageRecord {
+            input_tokens: 2_048,
+            ..UsageRecord::default()
+        };
+        let missing_cache = UsageRecord {
+            input_tokens: 2_112,
+            cache_read_tokens: 64,
+            ..UsageRecord::default()
+        };
+        let missing_context = UsageRecord {
+            input_tokens: 1_024,
+            cache_read_tokens: 896,
+            ..UsageRecord::default()
+        };
+        let verified = UsageRecord {
+            input_tokens: 2_112,
+            cache_read_tokens: 1_920,
+            ..UsageRecord::default()
+        };
+
+        assert!(response_session_probe_usage_error(&seed, &missing_cache).is_some());
+        assert!(response_session_probe_usage_error(&seed, &missing_context).is_some());
+        assert_eq!(response_session_probe_usage_error(&seed, &verified), None);
     }
 
     #[tokio::test]
@@ -27196,7 +30523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_capability_probe_is_field_scoped_and_uses_exactly_five_management_requests() {
+    async fn cache_capability_probe_handles_http_200_semantic_field_rejection() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_route = hits.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -27218,11 +30545,15 @@ mod tests {
                         .contains("prompt_cache_breakpoint");
                     if has_breakpoint {
                         (
-                            StatusCode::BAD_REQUEST,
+                            StatusCode::OK,
                             Json(json!({
-                                "error": {
-                                    "type": "invalid_request_error",
-                                    "message": "unknown parameter prompt_cache_breakpoint"
+                                "type": "response.failed",
+                                "response": {
+                                    "status": "failed",
+                                    "error": {
+                                        "code": "invalid_parameter",
+                                        "message": "prompt_cache_breakpoint is not supported on this model"
+                                    }
                                 }
                             })),
                         )
@@ -27302,49 +30633,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_cache_probe_promotes_only_after_measured_effect_gain() {
+    async fn runtime_json_breakpoint_rejection_disables_only_that_field_without_retry() {
         let hits = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let hits_for_route = hits.clone();
+        let captured_for_route = captured.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = Router::new().route(
             "/v1/responses",
-            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+            post(move |Json(body): Json<Value>| {
                 let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
                 async move {
-                    assert_eq!(
-                        headers
-                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
-                            .and_then(|value| value.to_str().ok()),
-                        Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
-                    );
                     hits.fetch_add(1, Ordering::SeqCst);
-                    let serialized = serde_json::to_string(&body).unwrap_or_default();
-                    let effect_read = serialized.contains("effect sample read");
-                    let candidate = serialized.contains("prompt_cache_options")
-                        || serialized.contains("prompt_cache_breakpoint");
-                    let measured_gain = body
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .is_some_and(|model| model == "gpt-5.6-luna");
-                    let cached_tokens = if effect_read && candidate && measured_gain {
-                        512
+                    let has_breakpoint = serde_json::to_string(&body)
+                        .unwrap_or_default()
+                        .contains("prompt_cache_breakpoint");
+                    captured.lock().await.push(body);
+                    let (content_type, response_body) = if has_breakpoint {
+                        (
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "type": "response.failed",
+                                "response": {
+                                    "id": "resp_breakpoint_rejected",
+                                    "status": "failed",
+                                    "error": {
+                                        "code": "invalid_parameter",
+                                        "message": "prompt_cache_breakpoint is not supported on this model"
+                                    }
+                                }
+                            }))
+                            .unwrap(),
+                        )
                     } else {
-                        0
+                        (
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_breakpoint_recovered\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
                     };
-                    Json(json!({
-                        "id": "resp_cache_auto_probe",
-                        "model": "gpt-5.6-luna",
-                        "usage": {
-                            "input_tokens": 2048,
-                            "output_tokens": 1,
-                            "input_tokens_details": {"cached_tokens": cached_tokens}
-                        },
-                        "output": [{
-                            "type": "message",
-                            "content": [{"type": "output_text", "text": "ACK"}]
-                        }]
-                    }))
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, content_type)
+                        .body(Body::from(response_body))
+                        .unwrap()
                 }
             }),
         );
@@ -27352,162 +30692,312 @@ mod tests {
             axum::serve(upstream_listener, upstream_app).await.unwrap();
         });
 
-        let mut config = AppConfig::default();
-        config.cache.enabled = true;
-        config.cache.prewarm_enabled = true;
-        config.cache.mode = CacheMode::PrefixPrewarm;
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "cache-auto-provider".to_string();
-        config.providers = vec![provider];
+        let provider_id = "runtime-breakpoint-provider";
+        let model_id = "gpt-5.6-terra";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.record_cache_capability_probe(
+            provider_id,
+            model_id,
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_key(
+            provider_id,
+            model_id,
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            ProviderCacheEffectStatus::Promoted,
+            Some("previously verified".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
         let dir = std::env::temp_dir().join(format!(
-            "atoapi-cache-auto-probe-{}",
+            "atoapi-runtime-breakpoint-rejection-{}",
             Uuid::new_v4().simple()
         ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
-        let scope = AutomaticCacheProbeScope {
-            provider_id: "cache-auto-provider".to_string(),
-            provider_revision: state.config.read().await.providers[0]
-                .updated_at
-                .timestamp_millis(),
-            model_id: "gpt-5.6-luna".to_string(),
-            channel: Channel::Responses,
-            selected_key: SelectedProviderKey {
-                secret: "test-key".to_string(),
-                key_id: None,
-            },
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request_body = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": "stable prefix" },
+                            { "type": "input_text", "text": "dynamic tail" }
+                        ]
+                    }]
+                }))
+                .unwrap(),
+            )
         };
 
-        spawn_automatic_cache_capability_probe(state.clone(), scope.clone());
-        spawn_automatic_cache_capability_probe(state.clone(), scope.clone());
-        for _ in 0..100 {
-            let promoted = state.config.read().await.cache_capability_verified_for(
-                "cache-auto-provider",
-                "gpt-5.6-luna",
-                &Channel::Responses,
-                ProviderCacheCapabilityField::PromptCacheOptions,
-            );
-            if promoted {
-                break;
+        let first = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first_body)
+            .contains("prompt_cache_breakpoint is not supported on this model"));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = state.config.read().await.cache_capability_status(
+                    provider_id,
+                    model_id,
+                    &Channel::Responses,
+                    ProviderCacheCapabilityField::PromptCacheBreakpoint,
+                );
+                if status == ProviderCacheCapabilityStatus::Unsupported {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        })
+        .await
+        .expect("the explicit runtime rejection must disable only the rejected field");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let first_metrics = state.metrics.snapshot().await;
+        assert_eq!(first_metrics.upstream_requests, 1);
+        assert!(first_metrics.recent_requests.is_empty());
+        assert_eq!(first_metrics.recent_failed_requests.len(), 1);
 
-        assert_eq!(hits.load(Ordering::SeqCst), 9);
-        let saved = state.config.read().await;
-        for field in cache_capability::EFFECT_FIELDS {
-            let record = saved
-                .cache_capability_for_key(
-                    "cache-auto-provider",
-                    "gpt-5.6-luna",
-                    &Channel::Responses,
-                    None,
-                    field,
-                )
-                .expect("effect field should be persisted");
-            assert_eq!(record.status, ProviderCacheCapabilityStatus::Verified);
-            assert_eq!(record.effect_status, ProviderCacheEffectStatus::Promoted);
-            assert!(record.enabled);
-            assert_eq!(record.baseline_cache_read_tokens, Some(0));
-            assert_eq!(record.candidate_cache_read_tokens, Some(512));
-        }
-        drop(saved);
-
-        run_automatic_cache_capability_probe(&state, &scope)
+        let second = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 9);
+        assert!(String::from_utf8_lossy(&second_body).contains("response.completed"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert!(serde_json::to_string(&captured[0])
+            .unwrap()
+            .contains("prompt_cache_breakpoint"));
+        assert!(!serde_json::to_string(&captured[1])
+            .unwrap()
+            .contains("prompt_cache_breakpoint"));
 
-        let no_gain_scope = AutomaticCacheProbeScope {
-            model_id: "gpt-5.6-flat".to_string(),
-            ..scope.clone()
-        };
-        run_automatic_cache_capability_probe(&state, &no_gain_scope)
-            .await
-            .unwrap();
-        assert_eq!(hits.load(Ordering::SeqCst), 18);
-        let saved = state.config.read().await;
-        for field in cache_capability::EFFECT_FIELDS {
-            let record = saved
-                .cache_capability_for_key(
-                    "cache-auto-provider",
-                    "gpt-5.6-flat",
-                    &Channel::Responses,
-                    None,
-                    field,
-                )
-                .expect("no-gain effect field should be persisted");
-            assert_eq!(record.effect_status, ProviderCacheEffectStatus::NoBenefit);
-            assert!(!record.enabled);
-        }
-        drop(saved);
         fs::remove_dir_all(dir).ok();
     }
 
-    #[test]
-    fn cache_effect_gate_requires_gain_without_ttft_regression() {
-        let baseline = CacheEffectObservation {
-            input_tokens: 2_048,
-            cache_read_tokens: 256,
-            ttft_ms: 1_000,
+    #[tokio::test]
+    async fn runtime_sse_breakpoint_rejection_settles_after_downstream_drop_without_retry() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let captured_for_route = captured.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let has_breakpoint = serde_json::to_string(&body)
+                        .unwrap_or_default()
+                        .contains("prompt_cache_breakpoint");
+                    captured.lock().await.push(body);
+                    let response_body = if has_breakpoint {
+                        concat!(
+                            "event: response.failed\n",
+                            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_breakpoint_rejected\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_parameter\",\"message\":\"prompt_cache_breakpoint is not supported on this model\"}}}\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec()
+                    } else {
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_breakpoint_recovered\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":0}}}}\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec()
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(response_body))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "runtime-sse-breakpoint-provider";
+        let model_id = "gpt-5.6-terra";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.record_cache_capability_probe(
+            provider_id,
+            model_id,
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_key(
+            provider_id,
+            model_id,
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            ProviderCacheEffectStatus::Promoted,
+            Some("previously verified".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-runtime-sse-breakpoint-rejection-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request_body = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            { "type": "input_text", "text": "stable prefix" },
+                            { "type": "input_text", "text": "dynamic tail" }
+                        ]
+                    }]
+                }))
+                .unwrap(),
+            )
         };
-        let promoted = evaluate_cache_effect(
-            baseline,
-            CacheEffectObservation {
-                input_tokens: 2_048,
-                cache_read_tokens: 384,
-                ttft_ms: 1_200,
-            },
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+            Some("codex"),
         )
-        .unwrap();
-        assert_eq!(promoted.status, ProviderCacheEffectStatus::Promoted);
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        drop(first);
 
-        let ttft_regressed = evaluate_cache_effect(
-            baseline,
-            CacheEffectObservation {
-                input_tokens: 2_048,
-                cache_read_tokens: 768,
-                ttft_ms: 1_251,
-            },
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = state.config.read().await.cache_capability_status(
+                    provider_id,
+                    model_id,
+                    &Channel::Responses,
+                    ProviderCacheCapabilityField::PromptCacheBreakpoint,
+                );
+                if status == ProviderCacheCapabilityStatus::Unsupported {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached relay owner must settle an SSE rejection after downstream drop");
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let first_metrics = state.metrics.snapshot().await;
+        assert_eq!(first_metrics.upstream_requests, 1);
+        assert!(first_metrics.recent_requests.is_empty());
+        assert_eq!(first_metrics.recent_failed_requests.len(), 1);
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+            Some("codex"),
         )
-        .unwrap();
-        assert_eq!(ttft_regressed.status, ProviderCacheEffectStatus::NoBenefit);
+        .await;
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&second_body).contains("response.completed"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert!(serde_json::to_string(&captured[0])
+            .unwrap()
+            .contains("prompt_cache_breakpoint"));
+        assert!(!serde_json::to_string(&captured[1])
+            .unwrap()
+            .contains("prompt_cache_breakpoint"));
 
-        let no_gain = evaluate_cache_effect(
-            baseline,
-            CacheEffectObservation {
-                input_tokens: 2_048,
-                cache_read_tokens: 260,
-                ttft_ms: 900,
-            },
-        )
-        .unwrap();
-        assert_eq!(no_gain.status, ProviderCacheEffectStatus::NoBenefit);
-    }
-
-    #[test]
-    fn automatic_cache_probe_scope_isolates_root_key_rotations_without_leaking_secrets() {
-        let scope = AutomaticCacheProbeScope {
-            provider_id: "provider-a".to_string(),
-            provider_revision: 1,
-            model_id: "gpt-5.6-luna".to_string(),
-            channel: Channel::Responses,
-            selected_key: SelectedProviderKey {
-                secret: "root-secret-a".to_string(),
-                key_id: None,
-            },
-        };
-        let rotated = AutomaticCacheProbeScope {
-            selected_key: SelectedProviderKey {
-                secret: "root-secret-b".to_string(),
-                key_id: None,
-            },
-            ..scope.clone()
-        };
-
-        assert_ne!(scope.key(), rotated.key());
-        assert!(!scope.key().contains("root-secret-a"));
-        assert!(!rotated.key().contains("root-secret-b"));
+        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -27633,6 +31123,7 @@ mod tests {
             "probe-provider-nonsemantic",
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         let dir = std::env::temp_dir().join(format!(
@@ -27857,6 +31348,421 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_agent_stream_makes_no_hidden_management_probe() {
+        let normal_hits = Arc::new(AtomicUsize::new(0));
+        let management_hits = Arc::new(AtomicUsize::new(0));
+        let normal_hits_for_route = normal_hits.clone();
+        let management_hits_for_route = management_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                let normal_hits = normal_hits_for_route.clone();
+                let management_hits = management_hits_for_route.clone();
+                async move {
+                    if headers
+                        .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                    {
+                        management_hits.fetch_add(1, Ordering::SeqCst);
+                        return Json(json!({
+                            "id": "resp_management_probe",
+                            "model": "gpt-5.5",
+                            "usage": {
+                                "input_tokens": 2048,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": 0}
+                            },
+                            "output": [{
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "ACK"}]
+                            }]
+                        }))
+                        .into_response();
+                    }
+
+                    normal_hits.fetch_add(1, Ordering::SeqCst);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_single_upstream\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "single-upstream-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("single-upstream-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-no-automatic-cache-probe-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "single-upstream-session",
+                "model": "gpt-5.5",
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request.clone(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(normal_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(management_hits.load(Ordering::SeqCst), 0);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ready"));
+
+        let dropped_response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(dropped_response.status(), StatusCode::OK);
+        drop(dropped_response);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_agent_inbound_outcomes.len() >= 2 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped downstream must not cancel Agent settlement");
+        assert_eq!(normal_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(management_hits.load(Ordering::SeqCst), 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .take(2)
+            .all(|outcome| outcome.attempt_count == 1));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_prefix_guard_is_released_before_upstream_headers() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
+        let (second_seen_tx, second_seen_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hits_for_route = hits.clone();
+        let release_for_route = release.clone();
+        let second_seen_tx = Arc::new(std::sync::Mutex::new(Some(second_seen_tx)));
+        let first_seen_tx = Arc::new(std::sync::Mutex::new(Some(first_seen_tx)));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hit = hits_for_route.fetch_add(1, Ordering::SeqCst) + 1;
+                let release = release_for_route.clone();
+                let first_seen_tx = first_seen_tx.clone();
+                let second_seen_tx = second_seen_tx.clone();
+                async move {
+                    match hit {
+                        1 => {
+                            if let Some(sender) = first_seen_tx
+                                .lock()
+                                .expect("first-hit notifier lock must not be poisoned")
+                                .take()
+                            {
+                                let _ = sender.send(());
+                            }
+                        }
+                        2 => {
+                            if let Some(sender) = second_seen_tx
+                                .lock()
+                                .expect("second-hit notifier lock must not be poisoned")
+                                .take()
+                            {
+                                let _ = sender.send(());
+                            }
+                        }
+                        _ => {}
+                    }
+                    release.notified().await;
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_guard\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1}}}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "prefix-guard-lifecycle-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("prefix-guard-lifecycle-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-guard-lifecycle-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "guard-lifecycle-session",
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        );
+
+        let first_task = tokio::spawn(handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request.clone(),
+            Channel::Responses,
+            Some("codex"),
+        ));
+        first_seen_rx
+            .await
+            .expect("first request must reach upstream");
+
+        let second_task = tokio::spawn(handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        ));
+        let second_reached_before_headers =
+            tokio::time::timeout(std::time::Duration::from_millis(200), second_seen_rx)
+                .await
+                .is_ok();
+        release.notify_waiters();
+
+        let first_response = first_task.await.expect("first request must not panic");
+        let second_response = second_task.await.expect("second request must not panic");
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let _ = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            second_reached_before_headers,
+            "same-prefix request must reach upstream before the first response headers arrive"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn successful_agent_non_stream_makes_no_hidden_management_probe() {
+        let normal_hits = Arc::new(AtomicUsize::new(0));
+        let management_hits = Arc::new(AtomicUsize::new(0));
+        let normal_hits_for_route = normal_hits.clone();
+        let management_hits_for_route = management_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                let normal_hits = normal_hits_for_route.clone();
+                let management_hits = management_hits_for_route.clone();
+                async move {
+                    if headers
+                        .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        == Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
+                    {
+                        management_hits.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        normal_hits.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(json!({
+                        "id": "resp_single_upstream",
+                        "model": "gpt-5.5",
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": 1}
+                        },
+                        "output": [{
+                            "type": "message",
+                            "content": [{"type": "output_text", "text": "ready"}]
+                        }]
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "single-upstream-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "generic-agent".to_string(),
+            label: "Generic agent".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("single-upstream-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-no-hidden-cache-probe-sync-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let scoped_key = agent_injection::agent_local_key("local-test-key", "generic-agent");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {scoped_key}")).unwrap(),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "single-upstream-sync-session",
+                "model": "gpt-5.5",
+                "stream": false,
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        );
+
+        let response =
+            handle_generation_for_agent(state, headers, request, Channel::Responses, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ready"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(normal_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(management_hits.load(Ordering::SeqCst), 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn agent_finalization_persists_real_post_burst_observation_fields() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-post-burst-finalize-{}",
@@ -27966,6 +31872,9 @@ mod tests {
                 Some(200),
                 None,
                 "response_completed",
+                None,
+                None,
+                Vec::new(),
                 Some(shadow_decision),
                 None,
             )
@@ -27986,6 +31895,7 @@ mod tests {
         assert_eq!(observations[0].attempt_count, 1);
         drop(store);
 
+        state.persist_runtime_state().await.unwrap();
         let persisted: Value = serde_json::from_str(
             &fs::read_to_string(&state.runtime_state_path).expect("runtime state must be saved"),
         )
@@ -28001,7 +31911,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_model_reasoning_rejection_persists_one_level_per_failure() {
+    async fn configured_model_reasoning_rejection_is_one_shot_reasoning_compatibility_and_persists_next_turn(
+    ) {
         let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let attempted_efforts_for_route = attempted_efforts.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28017,7 +31928,7 @@ mod tests {
                         .unwrap_or_default()
                         .to_string();
                     attempted_efforts.lock().await.push(effort.clone());
-                    if matches!(effort.as_str(), "ultra" | "max") {
+                    if effort == "ultra" {
                         let rejection = json!({
                             "error": {
                                 "message": format!(
@@ -28030,7 +31941,7 @@ mod tests {
                             "application/json",
                             serde_json::to_vec(&rejection).unwrap(),
                         )
-                    } else if effort == "xhigh" {
+                    } else if effort == "max" {
                         raw_response(
                             200,
                             "text/event-stream",
@@ -28145,13 +32056,17 @@ mod tests {
         )
         .await;
         assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
-        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(
-            *attempted_efforts.lock().await,
-            vec!["ultra".to_string(), "max".to_string()]
-        );
+        assert!(String::from_utf8_lossy(&first_body).contains("not supported"));
+        assert_eq!(*attempted_efforts.lock().await, vec!["ultra".to_string()]);
+        let first_metrics = state.metrics.snapshot().await;
+        assert_eq!(first_metrics.upstream_requests, 1);
+        assert_eq!(first_metrics.retries, 0);
+        assert!(first_metrics.recent_requests.is_empty());
+        assert_eq!(first_metrics.recent_failed_requests.len(), 1);
+        assert_eq!(first_metrics.recent_agent_upstream_attempts.len(), 1);
         {
             let config = state.config.read().await;
             let provider = config
@@ -28165,7 +32080,7 @@ mod tests {
                     .iter()
                     .find(|model| model.id == "gpt-5.6-luna")
                     .and_then(|model| model.reasoning_effort.as_deref()),
-                Some("xhigh")
+                Some("max")
             );
             assert_eq!(
                 provider
@@ -28176,6 +32091,7 @@ mod tests {
                 Some("ultra")
             );
         }
+        state.flush_config().await.unwrap();
         let persisted: AppConfig =
             toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         let persisted_provider = persisted
@@ -28189,7 +32105,7 @@ mod tests {
                 .iter()
                 .find(|model| model.id == "gpt-5.6-luna")
                 .and_then(|model| model.reasoning_effort.as_deref()),
-            Some("xhigh")
+            Some("max")
         );
 
         let second = handle_generation_for_agent(
@@ -28207,19 +32123,19 @@ mod tests {
         assert!(String::from_utf8_lossy(&second_body).contains("ready"));
         assert_eq!(
             *attempted_efforts.lock().await,
-            vec!["ultra".to_string(), "max".to_string(), "xhigh".to_string()]
+            vec!["ultra".to_string(), "max".to_string()]
         );
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let metrics = state.metrics.snapshot().await;
         assert_eq!(metrics.total_requests, 2);
         assert_eq!(metrics.successful_requests, 1);
-        assert_eq!(metrics.upstream_requests, 3);
-        assert_eq!(metrics.retries, 1);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
         assert_eq!(metrics.recent_upstream_calls.len(), 1);
         assert_eq!(metrics.recent_requests.len(), 1);
         assert_eq!(metrics.recent_failed_requests.len(), 1);
-        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -28386,7 +32302,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opaque_cloudflare_502_uses_agent_effort_as_verified_fallback_floor() {
+    async fn opaque_cloudflare_502_does_not_retry_or_persist_reasoning_effort() {
         let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let attempted_efforts_for_route = attempted_efforts.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28506,47 +32422,34 @@ mod tests {
             Some("codex"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("ready"));
-        assert_eq!(
-            *attempted_efforts.lock().await,
-            vec!["ultra".to_string(), "max".to_string()]
-        );
+        assert!(String::from_utf8_lossy(&body).contains("opaque 502"));
+        assert_eq!(*attempted_efforts.lock().await, vec!["ultra".to_string()]);
 
         let config = state.config.read().await;
         assert_eq!(
             config.providers[0].models[0].reasoning_effort.as_deref(),
-            Some("max")
+            Some("ultra")
         );
         drop(config);
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.retries, 1);
-        assert_eq!(metrics.recent_failed_requests.len(), 0);
-        assert_eq!(metrics.recent_requests.len(), 1);
-        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
-        assert_eq!(
-            metrics.recent_agent_upstream_attempts[1].outcome,
-            AgentAttemptOutcome::HttpError
-        );
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
         assert_eq!(
             metrics.recent_agent_upstream_attempts[0].outcome,
-            AgentAttemptOutcome::HttpSuccess
-        );
-        assert_eq!(
-            metrics.recent_requests[0]
-                .reasoning_effort_source
-                .as_deref(),
-            Some("model_override_opaque_502_fallback")
+            AgentAttemptOutcome::HttpError
         );
 
         fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
-    async fn unmapped_luna_opaque_502_retries_once_at_catalog_supported_effort() {
+    async fn unmapped_luna_opaque_502_preserves_agent_effort_without_retry() {
         let attempted_efforts = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let attempted_efforts_for_route = attempted_efforts.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -28653,26 +32556,21 @@ mod tests {
             Some("codex"),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("ready"));
-        assert_eq!(
-            *attempted_efforts.lock().await,
-            vec!["ultra".to_string(), "max".to_string()]
-        );
+        assert!(String::from_utf8_lossy(&body).contains("502 Bad Gateway"));
+        assert_eq!(*attempted_efforts.lock().await, vec!["ultra".to_string()]);
 
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.retries, 1);
-        assert_eq!(metrics.recent_failed_requests.len(), 0);
-        assert_eq!(metrics.recent_requests.len(), 1);
-        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
         assert_eq!(
-            metrics.recent_requests[0]
-                .reasoning_effort_source
-                .as_deref(),
-            Some("agent_reasoning_opaque_502_fallback")
+            metrics.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::HttpError
         );
 
         fs::remove_dir_all(dir).ok();
@@ -28779,6 +32677,7 @@ mod tests {
             "verified-third-party",
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         config.agent_injections = vec![AgentInjectionConfig {
@@ -28896,6 +32795,7 @@ mod tests {
             &decision.provider.id,
             "gpt-5.5",
             ProviderResponseSessionReuseStatus::Verified,
+            true,
             None,
         );
         assert!(supports_main_response_session_delta(&config, &decision));
@@ -28908,7 +32808,7 @@ mod tests {
     }
 
     #[test]
-    fn gzip_fallback_only_targets_encoding_rejection_and_requires_retry() {
+    fn gzip_rejection_only_marks_a_future_request_cooldown() {
         assert!(should_retry_without_gzip(StatusCode::BAD_REQUEST));
         assert!(should_retry_without_gzip(
             StatusCode::UNSUPPORTED_MEDIA_TYPE
@@ -28916,22 +32816,164 @@ mod tests {
         assert!(should_retry_without_gzip(StatusCode::NOT_IMPLEMENTED));
         assert!(!should_retry_without_gzip(StatusCode::BAD_GATEWAY));
         assert!(!should_retry_without_gzip(StatusCode::SERVICE_UNAVAILABLE));
+    }
 
-        assert!(should_fallback_to_uncompressed(
-            StatusCode::BAD_REQUEST,
-            0,
-            2
-        ));
-        assert!(!should_fallback_to_uncompressed(
-            StatusCode::BAD_REQUEST,
-            0,
-            1
-        ));
-        assert!(!should_fallback_to_uncompressed(
-            StatusCode::SERVICE_UNAVAILABLE,
-            0,
-            3
-        ));
+    #[test]
+    #[ignore = "manual stage-6 large-body preparation and gzip baseline"]
+    fn phase6_large_body_preparation_baseline() {
+        use std::hint::black_box;
+
+        for target_bytes in [300_000usize, 2_000_000usize] {
+            let mut content = String::with_capacity(target_bytes);
+            let mut line = 0usize;
+            while content.len() < target_bytes {
+                content.push_str(&format!(
+                    "tool_result line={line:06} path=src/module_{:03}.rs status=ok payload=stable-but-varied text block\n",
+                    line % 997
+                ));
+                line += 1;
+            }
+            content.truncate(target_bytes);
+            let body = json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": content
+                }]
+            });
+            let mut diagnostic_ms = Vec::new();
+            let mut legacy_serialization_ms = Vec::new();
+            let mut compatibility_ms = Vec::new();
+            let mut prepared_ms = Vec::new();
+            let mut optimized_prepare_ms = Vec::new();
+            let mut selected_gzip_ms = Vec::new();
+            let mut gzip_ms = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            let mut gzip_sizes = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+            for _ in 0..5 {
+                let started = Instant::now();
+                black_box(body_diagnostics(&Channel::Responses, &body, &body, false));
+                diagnostic_ms.push(started.elapsed().as_micros());
+
+                let started = Instant::now();
+                black_box(legacy_serialize_responses_body_for_provider_prefix(&body));
+                legacy_serialization_ms.push(started.elapsed().as_micros());
+
+                let started = Instant::now();
+                black_box(serialized_body_len(&Channel::Responses, &body));
+                compatibility_ms.push(started.elapsed().as_micros());
+
+                let started = Instant::now();
+                black_box(PreparedWireRequest::from_value(&Channel::Responses, &body));
+                prepared_ms.push(started.elapsed().as_micros());
+
+                let wire = legacy_upstream_request_body_bytes(&Channel::Responses, &body);
+                let started = Instant::now();
+                let mut diagnostics = body_diagnostics_with_known_inbound_length(
+                    &Channel::Responses,
+                    &body,
+                    wire.len() as u64,
+                    false,
+                );
+                let prepared = PreparedWireRequest::from_value(&Channel::Responses, &body);
+                diagnostics.original_body_bytes = prepared.len() as u64;
+                diagnostics.send_body_bytes = prepared.len() as u64;
+                black_box(diagnostics);
+                optimized_prepare_ms.push(started.elapsed().as_micros());
+
+                for (index, compression) in [
+                    Compression::fast(),
+                    Compression::new(3),
+                    Compression::default(),
+                    Compression::best(),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let started = Instant::now();
+                    let mut encoder = GzEncoder::new(Vec::new(), compression);
+                    encoder
+                        .write_all(&wire)
+                        .expect("gzip baseline write should succeed");
+                    let compressed = encoder.finish().expect("gzip baseline should finish");
+                    gzip_ms[index].push(started.elapsed().as_micros());
+                    gzip_sizes[index].push(compressed.len());
+                }
+                let started = Instant::now();
+                black_box(gzip_request_body(&wire).expect("selected gzip should succeed"));
+                selected_gzip_ms.push(started.elapsed().as_micros());
+            }
+            println!(
+                "phase6 body={} diagnostic_us={:?} legacy_serialization_us={:?} direct_serialization_us={:?} prepared_us={:?} optimized_prepare_us={:?} selected_gzip_us={:?} gzip_us_fast_3_default_best={:?} gzip_size_fast_3_default_best={:?}",
+                target_bytes,
+                diagnostic_ms,
+                legacy_serialization_ms,
+                compatibility_ms,
+                prepared_ms,
+                optimized_prepare_ms,
+                selected_gzip_ms,
+                gzip_ms,
+                gzip_sizes
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "manual PreparedWireDraft accepted-delta encoding baseline"]
+    fn prepared_wire_draft_large_delta_baseline() {
+        use std::hint::black_box;
+
+        for target_bytes in [300_000usize, 2_000_000usize] {
+            let body = json!({
+                "model": "gpt-5.6-sol",
+                "prompt_cache_key": "cache-before",
+                "instructions": "stable instructions",
+                "tools": [{"type": "function", "name": "read_file"}],
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": "x".repeat(target_bytes)
+                }],
+                "stream": true,
+                "store": true,
+                "previous_response_id": "resp_previous"
+            });
+            let mut final_body = body.clone();
+            final_body["prompt_cache_key"] = json!("cache-after");
+            let changed_fields = vec!["prompt_cache_key".to_string()];
+            let mut legacy_us = Vec::new();
+            let mut draft_us = Vec::new();
+
+            for _ in 0..11 {
+                let started = Instant::now();
+                black_box(serialized_body_len(&Channel::Responses, &body));
+                black_box(PreparedWireRequest::from_value(
+                    &Channel::Responses,
+                    &final_body,
+                ));
+                legacy_us.push(started.elapsed().as_micros());
+
+                let started = Instant::now();
+                let draft = PreparedWireDraft::from_responses_value(&body).unwrap();
+                black_box(draft.freeze(&final_body, &changed_fields));
+                draft_us.push(started.elapsed().as_micros());
+            }
+            legacy_us.sort_unstable();
+            draft_us.sort_unstable();
+            let median = legacy_us.len() / 2;
+            let p95 = ((legacy_us.len() - 1) * 95).div_ceil(100);
+            println!(
+                "prepared_wire_draft body={} legacy_median_us={} draft_median_us={} legacy_p95_us={} draft_p95_us={} legacy={:?} draft={:?}",
+                target_bytes,
+                legacy_us[median],
+                draft_us[median],
+                legacy_us[p95],
+                draft_us[p95],
+                legacy_us,
+                draft_us
+            );
+        }
     }
 
     #[tokio::test]
@@ -28944,9 +32986,14 @@ mod tests {
                 "content": "x".repeat(700_000)
             }]
         });
+        let prepared = PreparedWireRequest::from_value(&Channel::Responses, &body);
 
         assert!(
-            !should_skip_request_body_gzip_for_cold_stream(&Channel::Responses, true, &body,),
+            !should_skip_request_body_gzip_for_cold_stream(
+                &Channel::Responses,
+                true,
+                prepared.len(),
+            ),
             "an explicitly enabled gzip path must not raw-upload a cold large responses stream"
         );
     }
@@ -29003,18 +33050,15 @@ mod tests {
             }]
         });
         let inbound_headers = HeaderMap::new();
+        let url = format!("http://{upstream_addr}/v1/responses");
+        let provider = test_responses_provider(url.clone());
+        let plan =
+            RequestPlan::new(&provider, url, Channel::Responses, &body).with_gzip_enabled(true);
         let outcome = send_main_upstream_request(
             &state,
-            false,
-            &format!("http://{upstream_addr}/v1/responses"),
             "upstream-key",
-            &Channel::Responses,
-            &body,
+            plan.into_one_shot(),
             &inbound_headers,
-            None,
-            true,
-            true,
-            true,
         )
         .await
         .unwrap();
@@ -29080,19 +33124,15 @@ mod tests {
             }]
         });
         let inbound_headers = HeaderMap::new();
+        let provider = test_responses_provider(url.clone());
+        let plan = RequestPlan::new(&provider, url, Channel::Responses, &medium_body)
+            .with_gzip_enabled(true);
 
         let outcome = send_main_upstream_request(
             &state,
-            false,
-            &url,
             "upstream-key",
-            &Channel::Responses,
-            &medium_body,
+            plan.into_one_shot(),
             &inbound_headers,
-            None,
-            true,
-            true,
-            true,
         )
         .await
         .unwrap();
@@ -29189,31 +33229,6 @@ mod tests {
     }
 
     #[test]
-    fn retry_delay_respects_rate_limit_backoff() {
-        assert_eq!(
-            upstream_retry_delay(reqwest::StatusCode::TOO_MANY_REQUESTS, None, 0),
-            TokioDuration::from_secs(5)
-        );
-        assert_eq!(
-            upstream_retry_delay(reqwest::StatusCode::TOO_MANY_REQUESTS, Some("9"), 0),
-            TokioDuration::from_secs(9)
-        );
-        assert_eq!(
-            upstream_retry_delay(reqwest::StatusCode::BAD_GATEWAY, None, 1),
-            TokioDuration::from_millis(1200)
-        );
-        assert_eq!(
-            max_attempts_for_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
-            1
-        );
-        assert_eq!(
-            max_attempts_for_status(reqwest::StatusCode::GATEWAY_TIMEOUT),
-            2
-        );
-        assert_eq!(max_attempts_for_status(reqwest::StatusCode::BAD_GATEWAY), 3);
-    }
-
-    #[test]
     fn upstream_errors_are_scoped_by_cause() {
         assert_eq!(
             upstream_error_scope(429, "Upstream rate limit exceeded"),
@@ -29248,18 +33263,6 @@ mod tests {
         assert!(should_fallback_compact_to_responses(405));
         assert!(should_fallback_compact_to_responses(501));
         assert!(should_fallback_compact_to_responses(400));
-        assert!(should_fallback_responses_sync_main_to_chat_compat(
-            401, true, false
-        ));
-        assert!(should_fallback_responses_sync_main_to_chat_compat(
-            502, true, false
-        ));
-        assert!(should_fallback_responses_sync_main_to_chat_compat(
-            503, true, false
-        ));
-        assert!(!should_fallback_responses_sync_main_to_chat_compat(
-            401, true, true
-        ));
         assert!(should_fallback_chat_compat_compact_to_responses(
             500, true, true
         ));
@@ -29289,8 +33292,515 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_compact_falls_back_to_non_streaming_responses_when_upstream_lacks_endpoint()
-    {
+    async fn responses_compact_transport_failure_commits_one_failed_terminal() {
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.active_provider_id = Some("provider".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![test_responses_provider(format!(
+            "http://{unavailable_addr}/v1"
+        ))];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-compact-transport-failure-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "role": "user", "content": "compact me" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_responses_compact(state.clone(), headers, body, None).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.successful_requests, 0);
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.errors, 1);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+        assert!(metrics.recent_requests.is_empty());
+        assert!(metrics.recent_upstream_calls.is_empty());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_responses_compact_transport_failure_settles_one_agent_attempt() {
+        let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let config = test_codex_compact_config(
+            format!("http://{unavailable_addr}/v1"),
+            "agent-compact-transport",
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-compact-transport-failure-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "role": "user", "content": "compact me" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            None,
+            Some("codex"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.agent_generation.inbound_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 1);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            metrics.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::TransportError
+        );
+        assert_eq!(metrics.recent_agent_inbound_outcomes.len(), 1);
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_responses_compact_unsupported_endpoint_does_not_fallback() {
+        let compact_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+        let compact_hits_for_route = compact_hits.clone();
+        let responses_fallback_hits = fallback_hits.clone();
+        let chat_fallback_hits = fallback_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses/:response_id/compact",
+                post(move || {
+                    let hits = compact_hits_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({
+                                "error": { "message": "compact endpoint is not available" }
+                            })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = responses_fallback_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "id": "unexpected-responses-fallback" }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let hits = chat_fallback_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "id": "unexpected-chat-fallback" }))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let config = test_codex_compact_config(
+            format!("http://{upstream_addr}/v1"),
+            "agent-compact-unsupported",
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-compact-unsupported-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "role": "user", "content": "compact me" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            body.clone(),
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&response_body).contains("compact endpoint is not available")
+        );
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_inbound_outcomes.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Agent compact failure must settle exactly once");
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 1);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            metrics.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::HttpError
+        );
+        assert_eq!(metrics.recent_agent_upstream_attempts[0].status, Some(404));
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+
+        let retry_on_new_inbound = handle_responses_compact_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(retry_on_new_inbound.status(), StatusCode::OK);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 1);
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_inbound_outcomes.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a new inbound must use the learned compatible path and settle");
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
+        assert_eq!(metrics.agent_generation.successful_inbounds, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 1);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_responses_compact_key_pool_uses_one_attempt() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let responses_hits = upstream_hits.clone();
+        let chat_hits = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let hits = responses_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "error": { "message": "invalid key" } })),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move || {
+                    let hits = chat_hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "error": { "message": "invalid key" } })),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "agent-compact-key-pool";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.to_string(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: ["key-a", "key-b"]
+                .into_iter()
+                .map(|id| crate::config::ProviderKeyConfig {
+                    id: id.to_string(),
+                    alias: None,
+                    key_encrypted: Some(id.to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect(),
+            updated_at: now,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-compact-key-pool-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "role": "user", "content": "compact me" }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            None,
+            Some("codex"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_inbound_outcomes.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Agent compact key failure must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 1);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts[0].status, Some(401));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_responses_compact_survives_caller_cancellation() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let request_started = Arc::new(tokio::sync::Notify::new());
+        let release_response = Arc::new(tokio::sync::Notify::new());
+        let hits_for_route = upstream_hits.clone();
+        let started_for_route = request_started.clone();
+        let release_for_route = release_response.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses/:response_id/compact",
+            post(move || {
+                let hits = hits_for_route.clone();
+                let started = started_for_route.clone();
+                let release = release_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                    Json(json!({
+                        "id": "resp_compacted_after_cancel",
+                        "object": "response",
+                        "model": "gpt-5.5",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "compact summary" }]
+                        }],
+                        "usage": {
+                            "input_tokens": 64,
+                            "output_tokens": 8,
+                            "input_tokens_details": { "cached_tokens": 32 }
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let config = test_codex_compact_config(
+            format!("http://{upstream_addr}/v1"),
+            "agent-compact-cancellation",
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-compact-cancellation-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": [{ "role": "user", "content": "compact me" }]
+            }))
+            .unwrap(),
+        );
+        let caller_state = state.clone();
+        let caller = tokio::spawn(async move {
+            handle_responses_compact_for_agent(
+                caller_state,
+                test_local_auth_headers(),
+                body,
+                Some("resp_old".to_string()),
+                Some("codex"),
+            )
+            .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            request_started.notified(),
+        )
+        .await
+        .expect("the upstream compact request must start");
+        caller.abort();
+        let _ = caller.await;
+        release_response.notify_one();
+
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await,
+            "the detached compact owner must finish after caller cancellation"
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.total_requests, 1);
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.agent_generation.inbound_requests, 1);
+        assert_eq!(metrics.agent_generation.successful_inbounds, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 0);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            metrics.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::HttpSuccess
+        );
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn responses_compact_learns_missing_endpoint_then_uses_fallback_next_inbound() {
         let compact_hits = Arc::new(AtomicUsize::new(0));
         let fallback_hits = Arc::new(AtomicUsize::new(0));
         let captured_fallback_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
@@ -29408,6 +33918,17 @@ mod tests {
             .unwrap(),
         );
 
+        let first = handle_responses_compact(
+            state.clone(),
+            headers.clone(),
+            body.clone(),
+            Some("resp_old".to_string()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NOT_FOUND);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_hits.load(Ordering::SeqCst), 0);
+
         let response =
             handle_responses_compact(state.clone(), headers, body, Some("resp_old".to_string()))
                 .await;
@@ -29429,12 +33950,17 @@ mod tests {
         assert!(captured.get("input").is_none());
 
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(metrics.total_requests, 1);
-        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
         assert_eq!(metrics.cache_misses, 0);
         assert_eq!(metrics.provider_input_tokens, 2048);
         assert_eq!(metrics.provider_cached_tokens, 1536);
-        assert_eq!(metrics.recent_requests[0].upstream_attempt_total, Some(2));
+        assert_eq!(metrics.agent_generation.inbound_requests, 0);
+        assert_eq!(metrics.agent_generation.generation_attempts, 0);
+        assert!(metrics.recent_agent_inbound_outcomes.is_empty());
+        assert!(metrics.recent_agent_upstream_attempts.is_empty());
+        assert_eq!(metrics.recent_requests[0].upstream_attempt_total, Some(1));
         assert_eq!(
             metrics.recent_requests[0].upstream_call_source.as_deref(),
             Some("compact-fallback-chat-compat")
@@ -30150,6 +34676,2237 @@ mod tests {
         fs::remove_dir_all(config_dir).ok();
     }
 
+    #[tokio::test]
+    async fn ordinary_responses_chat_provider_streams_before_upstream_terminal_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_chat_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_chat_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_ordinary\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_ordinary\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1,\"total_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-chat".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-chat".to_string(),
+            name: "Ordinary Chat".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Chat,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-5.5".to_string(),
+                request_model_id: None,
+                display_name: "gpt-5.5".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": [{ "type": "message", "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Responses,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the ordinary Chat upstream must receive exactly one request");
+        let captured = captured_chat_body.lock().await.clone();
+
+        let response_before_terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task).await;
+        let (response, handed_off_before_terminal) = match response_before_terminal {
+            Ok(joined) => (joined.unwrap(), true),
+            Err(_) => {
+                release_terminal.notify_one();
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), request_task)
+                        .await
+                        .expect(
+                            "the buffered compatibility path must finish after terminal release",
+                        )
+                        .unwrap();
+                (response, false)
+            }
+        };
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal_bytes = if handed_off_before_terminal {
+            tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk = response_body
+                        .next()
+                        .await
+                        .expect("the bridge body must not end before its model delta")
+                        .expect("the pre-terminal bridged event must be readable");
+                    bytes.extend_from_slice(&chunk);
+                    let text = String::from_utf8_lossy(&bytes);
+                    if text.contains("event: response.output_text.delta")
+                        && text.contains("\"delta\":\"hel\"")
+                    {
+                        break bytes;
+                    }
+                }
+            })
+            .await
+            .expect("the real model delta must reach the client before Chat terminal")
+        } else {
+            Vec::new()
+        };
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal_bytes.clone();
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+
+        assert_eq!(captured["stream"], true);
+        assert!(captured.get("stream_options").is_none());
+        assert!(handed_off_before_terminal);
+        let preterminal_text = String::from_utf8(preterminal_bytes).unwrap();
+        assert!(preterminal_text.contains("event: response.created"));
+        assert!(preterminal_text.contains("event: response.output_text.delta"));
+        assert!(preterminal_text.contains("\"delta\":\"hel\""));
+        assert!(response_text.contains("event: response.output_text.delta"));
+        assert!(response_text.contains("event: response.completed"));
+        assert!(response_text.contains("\"text\":\"hello\""));
+        let created_at = response_text.find("event: response.created").unwrap();
+        let in_progress_at = response_text.find("event: response.in_progress").unwrap();
+        let delta_at = response_text
+            .find("event: response.output_text.delta")
+            .unwrap();
+        let completed_at = response_text.find("event: response.completed").unwrap();
+        assert!(created_at < in_progress_at);
+        assert!(in_progress_at < delta_at);
+        assert!(delta_at < completed_at);
+        assert_eq!(
+            response_text.matches("event: response.completed").count(),
+            1
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bridged stream must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "chat");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_responses_provider_streams_before_upstream_terminal_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_responses_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_chat_bridge\",\"model\":\"gpt-response\",\"status\":\"in_progress\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_chat_bridge\",\"output_index\":0,\"content_index\":0,\"delta\":\"hel\"}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_chat_bridge\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_chat_bridge\",\"model\":\"gpt-response\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"id\":\"msg_chat_bridge\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-responses".to_string());
+        config.default_channel = Channel::Chat;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-responses".to_string(),
+            name: "Ordinary Responses".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-response".to_string(),
+                request_model_id: None,
+                display_name: "gpt-response".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-responses-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-response",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Chat,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the ordinary Responses upstream must receive exactly one request");
+        let captured = captured_responses_body.lock().await.clone();
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task)
+                .await
+            {
+                Ok(joined) => joined.unwrap(),
+                Err(_) => {
+                    release_terminal.notify_one();
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), request_task).await;
+                    panic!(
+                        "the Chat client must receive a stream response before Responses terminal"
+                    );
+                }
+            };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = response_body
+                    .next()
+                    .await
+                    .expect("the Chat bridge body must not end before its model delta")
+                    .expect("the pre-terminal Chat event must be readable");
+                bytes.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&bytes).contains("\"content\":\"hel\"") {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("the Responses text delta must reach the Chat client before terminal");
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal.clone();
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+
+        assert_eq!(captured["stream"], true);
+        assert!(captured.get("input").is_some());
+        assert!(response_text.contains("\"content\":\"hel\""));
+        assert!(response_text.contains("\"content\":\"lo\""));
+        assert!(response_text.contains("\"finish_reason\":\"stop\""));
+        assert!(!response_text.contains("\"usage\":"));
+        assert_eq!(response_text.matches("data: [DONE]").count(), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Chat bridge must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "chat");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn anthropic_responses_rejects_dangling_tool_result_before_upstream_attempt() {
+        let provider_id = "anthropic-dangling-tool-result";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Anthropic;
+        let mut provider = test_responses_provider("http://127.0.0.1:9/v1".to_string());
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-response".to_string(),
+            request_model_id: None,
+            display_name: "gpt-response".to_string(),
+            context_window: Some(300000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-anthropic-dangling-result-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-response",
+                "stream": true,
+                "max_tokens": 128,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_missing",
+                        "content": "this must not reach the upstream"
+                    }]
+                }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Anthropic,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&error).contains("unknown or already-consumed"));
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 0);
+        assert!(metrics.recent_upstream_calls.is_empty());
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn anthropic_chat_rejects_invalid_tool_history_before_upstream_attempt() {
+        let provider_id = "anthropic-chat-dangling-tool-result";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Anthropic;
+        let mut provider = test_responses_provider("http://127.0.0.1:9/v1".to_string());
+        provider.id = provider_id.to_string();
+        provider.channel = Channel::Chat;
+        provider.models = vec![ModelConfig {
+            id: "gpt-chat".to_string(),
+            request_model_id: None,
+            display_name: "gpt-chat".to_string(),
+            context_window: Some(300000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-anthropic-chat-dangling-result-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let invalid_cases = vec![
+            (
+                "dangling result",
+                "unknown or already-consumed",
+                json!([{ "role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_missing",
+                    "content": "this must not reach the upstream"
+                }] }]),
+            ),
+            (
+                "wrong tool_use role",
+                "must appear in an assistant message",
+                json!([{ "role": "user", "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_wrong_role",
+                    "name": "lookup",
+                    "input": {}
+                }] }]),
+            ),
+            (
+                "missing immediate result",
+                "must be consumed by immediate user tool_result blocks",
+                json!([
+                    { "role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_unconsumed",
+                        "name": "lookup",
+                        "input": {}
+                    }] },
+                    { "role": "user", "content": "continue without a result" }
+                ]),
+            ),
+            (
+                "non-adjacent assistant turn",
+                "must be followed immediately",
+                json!([
+                    { "role": "assistant", "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_adjacent",
+                        "name": "lookup",
+                        "input": {}
+                    }] },
+                    { "role": "assistant", "content": "this turn cannot precede the result" }
+                ]),
+            ),
+        ];
+
+        for (case_name, expected_error, messages) in invalid_cases {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-chat",
+                    "stream": true,
+                    "max_tokens": 128,
+                    "messages": messages,
+                }))
+                .unwrap(),
+            );
+            let response = handle_generation(
+                state.clone(),
+                test_local_auth_headers(),
+                body,
+                Channel::Anthropic,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{case_name}");
+            let error = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&error).contains(expected_error),
+                "{case_name}: {}",
+                String::from_utf8_lossy(&error)
+            );
+        }
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 0);
+        assert!(metrics.recent_upstream_calls.is_empty());
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_anthropic_responses_provider_streams_before_response_completed_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_responses_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_anthropic_bridge\",\"model\":\"gpt-response\",\"status\":\"in_progress\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_anthropic_bridge\",\"output_index\":0,\"content_index\":0,\"delta\":\"hel\"}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_anthropic_bridge\",\"output_index\":0,\"content_index\":0,\"delta\":\"lo\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_anthropic_bridge\",\"model\":\"gpt-response\",\"status\":\"completed\",\"output\":[{\"id\":\"msg_anthropic_bridge\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":8}}}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "ordinary-anthropic-responses";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Anthropic;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-response".to_string(),
+            request_model_id: None,
+            display_name: "gpt-response".to_string(),
+            context_window: Some(300000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-anthropic-responses-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-response",
+                "stream": true,
+                "max_tokens": 128,
+                "tools": [{
+                    "name": "lookup",
+                    "input_schema": { "type": "object", "properties": { "q": { "type": "string" } } }
+                }],
+                "tool_choice": {
+                    "type": "tool",
+                    "name": "lookup",
+                    "disable_parallel_tool_use": true
+                },
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "q": "weather" }
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_lookup",
+                                "content": "sunny"
+                            },
+                            { "type": "text", "text": "Say hello." }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Anthropic,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the Responses upstream must receive exactly one request");
+        let captured = captured_responses_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert_eq!(captured["max_output_tokens"], 128);
+        assert_eq!(captured["tools"][0]["parameters"]["type"], "object");
+        assert_eq!(captured["parallel_tool_calls"], false);
+        assert_eq!(captured["input"][0]["type"], "function_call");
+        assert_eq!(captured["input"][1]["type"], "function_call_output");
+        // The cache-stability pass may make a deterministic replacement, but
+        // the tool result must remain attached to exactly the same call.
+        assert_eq!(
+            captured["input"][1]["call_id"],
+            captured["input"][0]["call_id"]
+        );
+
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task)
+                .await
+            {
+                Ok(joined) => joined.unwrap(),
+                Err(_) => {
+                    release_terminal.notify_one();
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(2), request_task).await;
+                    panic!(
+                    "the Anthropic client must receive a stream response before Responses terminal"
+                );
+                }
+            };
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = response_body
+                    .next()
+                    .await
+                    .expect("the Anthropic body must not end before its model delta")
+                    .expect("the pre-terminal Anthropic event must be readable");
+                bytes.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&bytes).contains("\"text\":\"hel\"") {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("the Responses text delta must reach the Anthropic client before terminal");
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal.clone();
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+        assert!(response_text.contains("event: message_start"));
+        assert!(response_text.contains("\"text\":\"hel\""));
+        assert!(response_text.contains("\"text\":\"lo\""));
+        assert_eq!(response_text.matches("event: message_stop").count(), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Anthropic bridge must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "anthropic");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_incremental_chat_to_responses_key_failure_is_one_shot() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let seen_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let seen_authorizations_for_route = seen_authorizations.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                let seen_authorizations = seen_authorizations_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(value) = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        seen_authorizations.lock().await.push(value.to_string());
+                    }
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        Json(json!({ "error": { "message": "invalid api key" } })),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "ordinary-chat-responses-one-shot";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Chat;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-response".to_string(),
+            request_model_id: None,
+            display_name: "gpt-response".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.to_string(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: ["key-a", "key-b"]
+                .into_iter()
+                .map(|id| crate::config::ProviderKeyConfig {
+                    id: id.to_string(),
+                    alias: None,
+                    key_encrypted: Some(id.to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect(),
+            updated_at: now,
+        }];
+        config.providers = vec![provider];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-responses-one-shot-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let response = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-response",
+                    "stream": true,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Chat,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            seen_authorizations.lock().await.as_slice(),
+            ["Bearer key-a"]
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 0);
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_key_failure_is_one_shot_then_next_inbound_rotates_key() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let seen_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let seen_authorizations_for_route = seen_authorizations.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(move |headers: HeaderMap| {
+            let upstream_hits = upstream_hits_for_route.clone();
+            let seen_authorizations = seen_authorizations_for_route.clone();
+            async move {
+                upstream_hits.fetch_add(1, Ordering::SeqCst);
+                if let Some(value) = headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                {
+                    seen_authorizations.lock().await.push(value.to_string());
+                }
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": { "message": "invalid api key" } })),
+                )
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "ordinary-responses-one-shot";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Responses;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-response".to_string(),
+            request_model_id: None,
+            display_name: "gpt-response".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.to_string(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: ["key-a", "key-b"]
+                .into_iter()
+                .map(|id| crate::config::ProviderKeyConfig {
+                    id: id.to_string(),
+                    alias: None,
+                    key_encrypted: Some(id.to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect(),
+            updated_at: now,
+        }];
+        config.providers = vec![provider];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-responses-one-shot-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request_body = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-response",
+                    "stream": false,
+                    "input": "hi"
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            seen_authorizations.lock().await.as_slice(),
+            ["Bearer key-a"]
+        );
+        {
+            let config = state.config.read().await;
+            let key_a = config
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == provider_id)
+                .and_then(|pool| pool.keys.iter().find(|key| key.id == "key-a"))
+                .expect("the rejected key must remain in the pool");
+            assert!(!key_a.enabled);
+            assert_eq!(key_a.failures, 1);
+        }
+
+        let second = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            request_body(),
+            Channel::Responses,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            seen_authorizations.lock().await.as_slice(),
+            ["Bearer key-a", "Bearer key-b"]
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 2);
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_failed_requests.len(), 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_protocol_rejection_is_one_shot_without_chat_fallback() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().fallback(move || {
+            let upstream_hits = upstream_hits_for_route.clone();
+            async move {
+                upstream_hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::from_u16(520).expect("520 must be a valid upstream status"),
+                    Json(json!({ "error": { "message": "upstream protocol is unavailable" } })),
+                )
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "ordinary-responses-protocol-one-shot";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some(provider_id.to_string());
+        config.default_channel = Channel::Responses;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-response".to_string(),
+            request_model_id: None,
+            display_name: "gpt-response".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-responses-protocol-one-shot-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let response = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-response",
+                    "stream": false,
+                    "input": "hi"
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+        )
+        .await;
+
+        assert_eq!(response.status().as_u16(), 520);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert!(metrics.recent_requests.is_empty());
+        assert_eq!(metrics.recent_failed_requests.len(), 1);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_responses_non_streaming_model_falls_back_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_body.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    Json(json!({
+                        "id": "resp_buffered_chat",
+                        "object": "response",
+                        "model": "gpt-buffered",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "id": "msg_buffered_chat",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "buffered-ok", "annotations": [] }]
+                        }],
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "input_tokens_details": { "cached_tokens": 8 }
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-responses-buffered".to_string());
+        config.default_channel = Channel::Chat;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-responses-buffered".to_string(),
+            name: "Ordinary Responses Buffered".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![crate::config::ModelConfig {
+                id: "gpt-buffered".to_string(),
+                request_model_id: None,
+                display_name: "gpt-buffered".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: false,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-responses-buffered-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let response = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-buffered",
+                    "stream": true,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Chat,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(response_text.contains("buffered-ok"));
+        assert_eq!(response_text.matches("data: [DONE]").count(), 1);
+
+        let captured = captured_body.lock().await.clone();
+        assert_eq!(captured["stream"], false);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_anthropic_chat_provider_streams_before_done_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_anthropic_bridge\",\"created\":123,\"model\":\"gpt-chat\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"},\"finish_reason\":null}]}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"id\":\"chatcmpl_anthropic_bridge\",\"created\":123,\"model\":\"gpt-chat\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":8}}}\n\ndata: [DONE]\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-anthropic-chat".to_string());
+        config.default_channel = Channel::Anthropic;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-anthropic-chat".to_string(),
+            name: "Ordinary Anthropic Chat".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Chat,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![ModelConfig {
+                id: "gpt-chat".to_string(),
+                request_model_id: None,
+                display_name: "gpt-chat".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-anthropic-chat-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-chat",
+                "stream": true,
+                "max_tokens": 128,
+                "tools": [{
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } }
+                    }
+                }],
+                "tool_choice": {
+                    "type": "tool",
+                    "name": "lookup",
+                    "disable_parallel_tool_use": true
+                },
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [{
+                            "type": "tool_use",
+                            "id": "toolu_lookup",
+                            "name": "lookup",
+                            "input": { "b": 2, "a": 1 }
+                        }]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_lookup",
+                                "content": "found"
+                            },
+                            { "type": "text", "text": "summarize" }
+                        ]
+                    }
+                ]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Anthropic,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the Chat upstream must receive exactly one request");
+        let captured = captured_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert_eq!(captured["max_tokens"], 128);
+        assert_eq!(captured["tools"][0]["type"], "function");
+        assert_eq!(captured["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            captured["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert_eq!(
+            captured["tool_choice"],
+            json!({ "type": "function", "function": { "name": "lookup" } })
+        );
+        assert_eq!(captured["parallel_tool_calls"], false);
+        assert_eq!(captured["messages"][0]["role"], "assistant");
+        assert_eq!(
+            captured["messages"][0]["tool_calls"][0]["id"],
+            "toolu_lookup"
+        );
+        assert_eq!(
+            captured["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"a\":1,\"b\":2}"
+        );
+        assert_eq!(captured["messages"][1]["role"], "tool");
+        assert_eq!(captured["messages"][1]["tool_call_id"], "toolu_lookup");
+        assert_eq!(captured["messages"][1]["content"], "found");
+        assert_eq!(captured["messages"][2]["role"], "user");
+        assert_eq!(captured["messages"][2]["content"], "summarize");
+
+        let response_before_terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task).await;
+        let (response, handed_off_before_terminal) = match response_before_terminal {
+            Ok(joined) => (joined.unwrap(), true),
+            Err(_) => {
+                release_terminal.notify_one();
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), request_task)
+                        .await
+                        .expect("the Anthropic bridge must finish after terminal release")
+                        .unwrap();
+                (response, false)
+            }
+        };
+        assert!(handed_off_before_terminal);
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = response_body
+                    .next()
+                    .await
+                    .expect("the bridge body must not end before model output")
+                    .expect("the pre-terminal Anthropic event must be readable");
+                bytes.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("event: content_block_delta") && text.contains("\"text\":\"hel\"")
+                {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("the Chat text delta must reach the Anthropic client before DONE");
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal;
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+        assert!(response_text.contains("\"text\":\"lo\""));
+        assert!(response_text.contains("\"stop_reason\":\"end_turn\""));
+        assert_eq!(response_text.matches("event: message_stop").count(), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Anthropic bridge must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "anthropic");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "chat");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_anthropic_provider_streams_before_message_stop_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_chat_bridge\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":8}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-chat-anthropic".to_string());
+        config.default_channel = Channel::Chat;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-chat-anthropic".to_string(),
+            name: "Ordinary Chat Anthropic".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Anthropic,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![ModelConfig {
+                id: "claude-test".to_string(),
+                request_model_id: None,
+                display_name: "claude-test".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-anthropic-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-test",
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Chat,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the Anthropic upstream must receive exactly one request");
+        let captured = captured_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert_eq!(captured["max_tokens"], 4096);
+        assert_eq!(captured["messages"][0]["role"], "user");
+
+        let response_before_terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task).await;
+        let (response, handed_off_before_terminal) = match response_before_terminal {
+            Ok(joined) => (joined.unwrap(), true),
+            Err(_) => {
+                release_terminal.notify_one();
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), request_task)
+                        .await
+                        .expect("the Chat bridge must finish after terminal release")
+                        .unwrap();
+                (response, false)
+            }
+        };
+        assert!(handed_off_before_terminal);
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = response_body
+                    .next()
+                    .await
+                    .expect("the bridge body must not end before model output")
+                    .expect("the pre-terminal Chat event must be readable");
+                bytes.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&bytes).contains("\"content\":\"hel\"") {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("the Anthropic text delta must reach the Chat client before message_stop");
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal;
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+        assert!(response_text.contains("\"content\":\"lo\""));
+        assert!(response_text.contains("\"finish_reason\":\"stop\""));
+        assert_eq!(response_text.matches("data: [DONE]").count(), 1);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Chat bridge must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "chat");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "anthropic");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_anthropic_provider_streams_before_message_stop_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let request_seen = Arc::new(tokio::sync::Notify::new());
+        let release_terminal = Arc::new(tokio::sync::Notify::new());
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_body_for_route = captured_body.clone();
+        let request_seen_for_route = request_seen.clone();
+        let release_terminal_for_route = release_terminal.clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_body_for_route.clone();
+                let request_seen = request_seen_for_route.clone();
+                let release_terminal = release_terminal_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    *captured.lock().await = body;
+                    request_seen.notify_one();
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_ordinary\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":8}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hel\"}}\n\n",
+                        ));
+                        release_terminal.notified().await;
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-anthropic".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-anthropic".to_string(),
+            name: "Ordinary Anthropic".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Anthropic,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![ModelConfig {
+                id: "claude-test".to_string(),
+                request_model_id: None,
+                display_name: "claude-test".to_string(),
+                context_window: Some(300000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            }],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-anthropic-stream-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "claude-test",
+                "stream": true,
+                "input": [{ "type": "message", "role": "user", "content": "hi" }]
+            }))
+            .unwrap(),
+        );
+
+        let mut request_task = tokio::spawn(handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            Channel::Responses,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), request_seen.notified())
+            .await
+            .expect("the Anthropic upstream must receive exactly one request");
+        let captured = captured_body.lock().await.clone();
+        assert_eq!(captured["stream"], true);
+        assert_eq!(captured["max_tokens"], 4096);
+        assert!(captured.get("stream_options").is_none());
+        assert_eq!(captured["messages"][0]["role"], "user");
+
+        let response_before_terminal =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut request_task).await;
+        let (response, handed_off_before_terminal) = match response_before_terminal {
+            Ok(joined) => (joined.unwrap(), true),
+            Err(_) => {
+                release_terminal.notify_one();
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), request_task)
+                        .await
+                        .expect("the Anthropic bridge must finish after terminal release")
+                        .unwrap();
+                (response, false)
+            }
+        };
+        assert!(handed_off_before_terminal);
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut response_body = response.into_body().into_data_stream();
+        let preterminal = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            let mut bytes = Vec::new();
+            loop {
+                let chunk = response_body
+                    .next()
+                    .await
+                    .expect("the bridge body must not end before model output")
+                    .expect("the pre-terminal bridged event must be readable");
+                bytes.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&bytes);
+                if text.contains("event: response.output_text.delta")
+                    && text.contains("\"delta\":\"hel\"")
+                {
+                    break bytes;
+                }
+            }
+        })
+        .await
+        .expect("the Anthropic text delta must reach the client before message_stop");
+        release_terminal.notify_one();
+
+        let mut response_bytes = preterminal.clone();
+        while let Some(chunk) = response_body.next().await {
+            response_bytes.extend_from_slice(&chunk.unwrap());
+        }
+        let response_text = String::from_utf8(response_bytes).unwrap();
+        assert!(response_text.contains("event: response.completed"));
+        assert!(response_text.contains("\"text\":\"hello\""));
+        assert_eq!(
+            response_text.matches("event: response.completed").count(),
+            1
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the Anthropic bridge must settle exactly once");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_upstream_calls.len(), 1);
+        assert_eq!(metrics.recent_requests[0].client_channel, "responses");
+        assert_eq!(metrics.recent_requests[0].upstream_channel, "anthropic");
+        assert_eq!(metrics.recent_requests[0].cache_read_tokens, Some(8));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_anthropic_json_and_non_streaming_models_fallback_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_bodies_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/messages",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_bodies_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body.clone());
+                    let model = body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    match model {
+                        "buffered-sse-error" => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(Bytes::from_static(
+                                b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n",
+                            )))
+                            .unwrap(),
+                        "buffered-sse-truncated" => Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(Bytes::from_static(
+                                b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_short\",\"model\":\"claude-test\"}}\n\n",
+                            )))
+                            .unwrap(),
+                        _ => Json(json!({
+                            "id": format!("msg_{model}"),
+                            "type": "message",
+                            "model": model,
+                            "stop_reason": "tool_use",
+                            "content": [
+                                { "type": "text", "text": format!("ok-{model}") },
+                                { "type": "tool_use", "id": format!("toolu_{model}"), "name": "lookup", "input": { "b": 2, "a": 1 } }
+                            ],
+                            "usage": {
+                                "input_tokens": 10,
+                                "cache_read_input_tokens": 8,
+                                "cache_creation_input_tokens": 2,
+                                "output_tokens": 1
+                            }
+                        }))
+                        .into_response(),
+                    }
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let model = |id: &str, supports_streaming: bool| ModelConfig {
+            id: id.to_string(),
+            request_model_id: None,
+            display_name: id.to_string(),
+            context_window: Some(300000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming,
+            enabled: true,
+        };
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-anthropic-json".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-anthropic-json".to_string(),
+            name: "Ordinary Anthropic JSON".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Anthropic,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![
+                model("stream-capable", true),
+                model("buffered-only", false),
+                model("buffered-sse-error", false),
+                model("buffered-sse-truncated", false),
+            ],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-anthropic-json-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        for model_id in ["stream-capable", "buffered-only"] {
+            let response = handle_generation(
+                state.clone(),
+                test_local_auth_headers(),
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "model": model_id,
+                        "stream": true,
+                        "tools": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": { "type": "object", "properties": { "q": { "type": "string" } } }
+                        }],
+                        "input": [{ "type": "message", "role": "user", "content": "hi" }]
+                    }))
+                    .unwrap(),
+                ),
+                Channel::Responses,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream")
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+            assert!(response_text.contains(&format!("ok-{model_id}")));
+            assert!(response_text.contains("event: response.function_call_arguments.done"));
+            assert!(response_text.contains("\"arguments\":\"{\\\"a\\\":1,\\\"b\\\":2}\""));
+            assert!(response_text.contains("event: response.completed"));
+        }
+
+        for model_id in ["buffered-sse-error", "buffered-sse-truncated"] {
+            let response = handle_generation(
+                state.clone(),
+                test_local_auth_headers(),
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "model": model_id,
+                        "stream": true,
+                        "input": [{ "type": "message", "role": "user", "content": "hi" }]
+                    }))
+                    .unwrap(),
+                ),
+                Channel::Responses,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream")
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+            assert!(response_text.contains("event: response.failed"));
+            assert!(!response_text.contains("event: response.completed"));
+        }
+
+        let captured = captured_bodies.lock().await.clone();
+        assert_eq!(captured.len(), 4);
+        assert_eq!(captured[0]["stream"], true);
+        assert_eq!(captured[1]["stream"], false);
+        assert_eq!(captured[2]["stream"], false);
+        assert_eq!(captured[3]["stream"], false);
+        assert_eq!(captured[0]["tools"][0]["name"], "lookup");
+        assert_eq!(captured[0]["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 4);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 4);
+        assert_eq!(metrics.recent_upstream_calls.len(), 2);
+        assert_eq!(metrics.recent_requests.len(), 2);
+        assert_eq!(metrics.recent_failed_requests.len(), 2);
+        assert!(metrics.errors >= 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ordinary_responses_chat_bridge_buffers_json_and_non_streaming_models_once() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_bodies_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let hits = upstream_hits_for_route.clone();
+                let captured = captured_bodies_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body.clone());
+                    let model = body
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown");
+                    Json(json!({
+                        "id": format!("chatcmpl_{model}"),
+                        "object": "chat.completion",
+                        "model": model,
+                        "choices": [{
+                            "message": { "role": "assistant", "content": format!("ok-{model}") },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 1,
+                            "total_tokens": 11,
+                            "prompt_tokens_details": { "cached_tokens": 8 }
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let model = |id: &str, supports_streaming: bool| ModelConfig {
+            id: id.to_string(),
+            request_model_id: None,
+            display_name: id.to_string(),
+            context_window: Some(300000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming,
+            enabled: true,
+        };
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        config.active_provider_id = Some("ordinary-chat-json".to_string());
+        config.default_channel = Channel::Responses;
+        config.providers = vec![ProviderConfig {
+            id: "ordinary-chat-json".to_string(),
+            name: "Ordinary Chat JSON".to_string(),
+            base_url: format!("http://{upstream_addr}/v1"),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Chat,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("upstream-key".to_string()),
+            models: vec![model("stream-capable", true), model("buffered-only", false)],
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-ordinary-chat-json-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        for model_id in ["stream-capable", "buffered-only"] {
+            let response = handle_generation(
+                state.clone(),
+                test_local_auth_headers(),
+                Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "model": model_id,
+                        "stream": true,
+                        "input": [{ "type": "message", "role": "user", "content": "hi" }]
+                    }))
+                    .unwrap(),
+                ),
+                Channel::Responses,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/event-stream")
+            );
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let response_text = String::from_utf8(response_body.to_vec()).unwrap();
+            assert!(response_text.contains("event: response.output_text.delta"));
+            assert!(response_text.contains("event: response.completed"));
+            assert!(response_text.contains(&format!("ok-{model_id}")));
+        }
+
+        let captured = captured_bodies.lock().await.clone();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0]["model"], "stream-capable");
+        assert_eq!(captured[0]["stream"], true);
+        assert!(captured[0].get("stream_options").is_none());
+        assert_eq!(captured[1]["model"], "buffered-only");
+        assert_eq!(captured[1]["stream"], false);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.recent_upstream_calls.len(), 2);
+        assert_eq!(metrics.recent_requests.len(), 2);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
     fn reasoning_test_decision(configured: Option<&str>, supported: &[&str]) -> RouteDecision {
         RouteDecision {
             provider: ProviderConfig {
@@ -30282,44 +37039,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_reasoning_probe_requires_higher_manual_override_and_html_502() {
-        let diagnostics = ReasoningEffortDiagnostics {
-            agent: Some("xhigh".to_string()),
-            configured: Some("ultra".to_string()),
-            effective: Some("ultra".to_string()),
-            source: Some("model_override".to_string()),
-            catalog_supported: None,
-        };
-        assert!(should_probe_opaque_reasoning_fallback(
-            502,
-            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
-            &diagnostics,
-        ));
-        assert!(!should_probe_opaque_reasoning_fallback(
-            502,
-            br#"{"error":{"message":"invalid upstream gateway response"}}"#,
-            &diagnostics,
-        ));
-        assert!(!should_probe_opaque_reasoning_fallback(
-            502,
-            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
-            &ReasoningEffortDiagnostics {
-                agent: None,
-                ..diagnostics.clone()
-            },
-        ));
-        assert!(!should_probe_opaque_reasoning_fallback(
-            502,
-            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
-            &ReasoningEffortDiagnostics {
-                configured: Some("high".to_string()),
-                ..diagnostics
-            },
-        ));
-    }
-
-    #[test]
-    fn unmapped_luna_preserves_agent_effort_until_opaque_502_proves_fallback_needed() {
+    fn unmapped_luna_preserves_agent_effort_without_an_opaque_retry() {
         let client = json!({
             "model": "gpt-5.6-luna",
             "reasoning": { "effort": "ultra" }
@@ -30334,20 +37054,6 @@ mod tests {
 
         assert_eq!(upstream.pointer("/reasoning/effort"), Some(&json!("ultra")));
         assert_eq!(diagnostics.effective.as_deref(), Some("ultra"));
-        assert!(diagnostics
-            .catalog_supported
-            .as_ref()
-            .is_some_and(|levels| levels.iter().any(|level| level == "max")));
-        assert!(!should_probe_opaque_reasoning_fallback(
-            502,
-            br#"{"error":{"message":"invalid upstream gateway response"}}"#,
-            &diagnostics,
-        ));
-        assert!(should_probe_opaque_reasoning_fallback(
-            502,
-            b"<!DOCTYPE html><title>502 Bad Gateway</title>",
-            &diagnostics,
-        ));
     }
 
     #[test]
@@ -30494,26 +37200,65 @@ mod tests {
     }
 
     #[test]
-    fn cache_capability_rejection_requires_named_field_and_compatible_status() {
+    fn cache_capability_rejection_requires_structured_named_field_error() {
+        let bad_request = structured_upstream_error_summary(
+            br#"{"error":{"message":"unknown parameter prompt_cache_options"}}"#,
+        );
         assert!(explicit_cache_field_rejection(
             400,
-            "unknown parameter prompt_cache_options",
+            bad_request.as_deref(),
             ProviderCacheCapabilityField::PromptCacheOptions,
         ));
-        assert!(!explicit_cache_field_rejection(
-            502,
-            "unknown parameter prompt_cache_options",
-            ProviderCacheCapabilityField::PromptCacheOptions,
-        ));
-        assert!(!explicit_cache_field_rejection(
-            400,
-            "unknown parameter prompt_cache_options",
+
+        let semantic_failure = structured_upstream_error_summary(
+            br#"{"type":"response.failed","response":{"error":{"code":"invalid_parameter","message":"prompt_cache_breakpoint is not supported on this model"}}}"#,
+        );
+        assert!(explicit_cache_field_rejection(
+            200,
+            semantic_failure.as_deref(),
             ProviderCacheCapabilityField::PromptCacheBreakpoint,
         ));
+
+        let semantic_sse_failure = structured_upstream_error_summary(
+            b"event: response.failed\n\
+data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"prompt_cache_breakpoint is not supported\"}}}\n\n",
+        );
+        assert!(explicit_cache_field_rejection(
+            200,
+            semantic_sse_failure.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+        ));
+
+        let structured_gateway_failure = structured_upstream_error_summary(
+            br#"{"error":{"message":"prompt_cache_breakpoint is not supported"}}"#,
+        );
+        assert!(!explicit_cache_field_rejection(
+            502,
+            structured_gateway_failure.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+        ));
+
+        let html = b"<html><title>502</title><body>invalid parameter prompt_cache_breakpoint</body></html>";
+        assert_eq!(structured_upstream_error_summary(html), None);
+        assert!(!explicit_cache_field_rejection(
+            502,
+            structured_upstream_error_summary(html).as_deref(),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+
         assert!(!explicit_cache_field_rejection(
             400,
-            "invalid request",
-            ProviderCacheCapabilityField::PromptCacheOptions,
+            bad_request.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+        ));
+
+        let unrelated_reasoning = structured_upstream_error_summary(
+            br#"{"error":{"code":"invalid_parameter","message":"reasoning.effort is not supported"}}"#,
+        );
+        assert!(!explicit_cache_field_rejection(
+            400,
+            unrelated_reasoning.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
         ));
     }
 

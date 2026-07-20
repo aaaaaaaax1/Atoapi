@@ -2,9 +2,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 const RECENT_USAGE_WINDOW_MINUTES: i64 = 30;
 const RECENT_USAGE_WINDOW_SECONDS: u64 = 30 * 60;
@@ -142,6 +142,187 @@ pub struct AgentAttemptFinish {
     pub request_body_bytes: Option<u64>,
     pub sent_body_bytes: Option<u64>,
     pub gzip_attempted: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+enum MetricsTerminal {
+    Upstream {
+        request: RequestLog,
+        upstream_attempts: u64,
+    },
+    LocalCache {
+        request: RequestLog,
+        estimated_tokens_saved: u64,
+    },
+    LocalRejection {
+        request: RequestLog,
+    },
+    Agent {
+        inbound_request_id: String,
+        attempt_id: String,
+        attempt_finish: AgentAttemptFinish,
+        request: RequestLog,
+        inbound_outcome: AgentInboundOutcome,
+        terminal_state: Option<String>,
+    },
+    AgentOwnerFailure {
+        inbound_request_id: String,
+        request: RequestLog,
+        terminal_state: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTerminalSettlement {
+    pub inbound_request_id: String,
+    pub attempt_id: String,
+    pub attempt_finish: AgentAttemptFinish,
+    pub request: RequestLog,
+    pub inbound_outcome: AgentInboundOutcome,
+    pub terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOwnerFailureSettlement {
+    pub inbound_request_id: String,
+    pub request: RequestLog,
+    pub terminal_state: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingUsage {
+    observed_at: DateTime<Utc>,
+    record: UsageRecord,
+    cold_start_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingError {
+    at: DateTime<Utc>,
+    scope: String,
+    message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MetricsTransaction {
+    commit_key: String,
+    terminal: MetricsTerminal,
+    usage: Option<PendingUsage>,
+    errors: Vec<PendingError>,
+}
+
+impl MetricsTransaction {
+    pub fn upstream(request: RequestLog) -> Self {
+        let upstream_attempts = request
+            .upstream_attempts
+            .or(request.upstream_attempt_total)
+            .unwrap_or(1)
+            .max(1);
+        Self {
+            commit_key: metrics_transaction_key(&request.id),
+            terminal: MetricsTerminal::Upstream {
+                request,
+                upstream_attempts,
+            },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn local_cache(request: RequestLog, estimated_tokens_saved: u64) -> Self {
+        Self {
+            commit_key: metrics_transaction_key(&request.id),
+            terminal: MetricsTerminal::LocalCache {
+                request,
+                estimated_tokens_saved,
+            },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn local_rejection(request: RequestLog) -> Self {
+        Self {
+            commit_key: metrics_transaction_key(&request.id),
+            terminal: MetricsTerminal::LocalRejection { request },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn agent_terminal(mut settlement: AgentTerminalSettlement) -> Self {
+        let inbound_request_id = settlement.inbound_request_id.trim().to_string();
+        settlement.request.id = inbound_request_id.clone();
+        settlement.request.inbound_request_id = Some(inbound_request_id.clone());
+        Self {
+            commit_key: metrics_transaction_key(&inbound_request_id),
+            terminal: MetricsTerminal::Agent {
+                inbound_request_id,
+                attempt_id: settlement.attempt_id.trim().to_string(),
+                attempt_finish: settlement.attempt_finish,
+                request: settlement.request,
+                inbound_outcome: settlement.inbound_outcome,
+                terminal_state: settlement.terminal_state,
+            },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn agent_owner_failure(mut settlement: AgentOwnerFailureSettlement) -> Self {
+        let inbound_request_id = settlement.inbound_request_id.trim().to_string();
+        settlement.request.id = inbound_request_id.clone();
+        settlement.request.inbound_request_id = Some(inbound_request_id.clone());
+        Self {
+            commit_key: metrics_transaction_key(&inbound_request_id),
+            terminal: MetricsTerminal::AgentOwnerFailure {
+                inbound_request_id,
+                request: settlement.request,
+                terminal_state: settlement.terminal_state,
+            },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn observe_usage(&mut self, record: UsageRecord, cold_start_key: Option<&str>) {
+        if let Some(pending) = self.usage.as_mut() {
+            pending.record.merge(record);
+            if pending.cold_start_key.is_none() {
+                pending.cold_start_key = cold_start_key.map(str::to_string);
+            }
+        } else {
+            self.usage = Some(PendingUsage {
+                observed_at: Utc::now(),
+                record,
+                cold_start_key: cold_start_key.map(str::to_string),
+            });
+        }
+    }
+
+    pub fn observe_error(&mut self, scope: impl Into<String>, message: impl Into<String>) {
+        self.errors.push(PendingError {
+            at: Utc::now(),
+            scope: scope.into(),
+            message: message.into(),
+        });
+    }
+}
+
+fn metrics_transaction_key(id: &str) -> String {
+    let id = id.trim();
+    if id.is_empty() {
+        String::new()
+    } else {
+        id.to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsCommitResult {
+    Applied,
+    Duplicate,
+    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,7 +522,7 @@ pub struct ResponsesWirePrefixFingerprints {
     pub pre_input_wire: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestLog {
     pub id: String,
     pub at: DateTime<Utc>,
@@ -356,6 +537,8 @@ pub struct RequestLog {
     pub client_channel: String,
     pub upstream_channel: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -564,6 +747,8 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_anchor_peer_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub send_body_bytes: Option<u64>,
@@ -639,6 +824,8 @@ struct MetricsInner {
     completed_agent_inbound_order: VecDeque<String>,
     completed_agent_attempt_ids: HashSet<String>,
     completed_agent_attempt_order: VecDeque<String>,
+    completed_transaction_ids: HashSet<String>,
+    completed_transaction_order: VecDeque<String>,
     recent_agent_inbound_outcomes: VecDeque<AgentInboundOutcomeLog>,
     recent_agent_upstream_attempts: VecDeque<AgentUpstreamAttemptLog>,
 }
@@ -740,11 +927,95 @@ struct BackgroundPrewarmAccumulator {
 #[derive(Debug, Clone)]
 pub struct MetricsStore {
     inner: Arc<RwLock<MetricsInner>>,
+    commit_tracker: Arc<MetricsCommitTracker>,
+}
+
+#[derive(Debug)]
+struct MetricsCommitTracker {
+    state: StdMutex<MetricsCommitTrackerState>,
+    notify: Notify,
+}
+
+#[derive(Debug)]
+struct MetricsCommitTrackerState {
+    accepting: bool,
+    active: usize,
+}
+
+struct MetricsCommitGuard {
+    tracker: Arc<MetricsCommitTracker>,
+}
+
+impl Drop for MetricsCommitGuard {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = self
+                .tracker
+                .state
+                .lock()
+                .expect("metrics commit tracker lock must not be poisoned");
+            state.active = state.active.saturating_sub(1);
+            state.active == 0
+        };
+        if idle {
+            self.tracker.notify.notify_waiters();
+        }
+    }
+}
+
+impl MetricsCommitTracker {
+    fn enter(self: &Arc<Self>) -> Option<MetricsCommitGuard> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("metrics commit tracker lock must not be poisoned");
+        if !state.accepting {
+            return None;
+        }
+        state.active += 1;
+        Some(MetricsCommitGuard {
+            tracker: self.clone(),
+        })
+    }
+
+    fn is_idle(&self) -> bool {
+        self.state
+            .lock()
+            .expect("metrics commit tracker lock must not be poisoned")
+            .active
+            == 0
+    }
+
+    async fn close_and_wait(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("metrics commit tracker lock must not be poisoned");
+            state.accepting = false;
+        }
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_idle() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl MetricsStore {
     pub fn new() -> Self {
         Self {
+            commit_tracker: Arc::new(MetricsCommitTracker {
+                state: StdMutex::new(MetricsCommitTrackerState {
+                    accepting: true,
+                    active: 0,
+                }),
+                notify: Notify::new(),
+            }),
             inner: Arc::new(RwLock::new(MetricsInner {
                 started_at: Utc::now(),
                 total_requests: 0,
@@ -789,6 +1060,8 @@ impl MetricsStore {
                 completed_agent_inbound_order: VecDeque::new(),
                 completed_agent_attempt_ids: HashSet::new(),
                 completed_agent_attempt_order: VecDeque::new(),
+                completed_transaction_ids: HashSet::new(),
+                completed_transaction_order: VecDeque::new(),
                 recent_agent_inbound_outcomes: VecDeque::new(),
                 recent_agent_upstream_attempts: VecDeque::new(),
             })),
@@ -924,10 +1197,14 @@ impl MetricsStore {
         inner.agent_generation.generation_attempts += 1;
         inner.agent_generation.active_attempts += 1;
         inner.upstream_requests += 1;
+        if attempt_index > 1 {
+            inner.retries += 1;
+        }
         increment_provider_upstream_attempt(&mut inner.provider_stats, &provider);
         Some(attempt_index)
     }
 
+    #[cfg(test)]
     pub async fn finish_agent_attempt(&self, attempt_id: &str, finish: AgentAttemptFinish) -> bool {
         let attempt_id = attempt_id.trim();
         if attempt_id.is_empty() {
@@ -935,253 +1212,103 @@ impl MetricsStore {
         }
 
         let mut inner = self.inner.write().await;
-        if inner.completed_agent_attempt_ids.contains(attempt_id) {
-            return false;
-        }
-        let Some(active) = inner.active_agent_attempts.remove(attempt_id) else {
-            return false;
-        };
-        {
-            let MetricsInner {
-                completed_agent_attempt_ids,
-                completed_agent_attempt_order,
-                ..
-            } = &mut *inner;
-            remember_completed_id(
-                completed_agent_attempt_ids,
-                completed_agent_attempt_order,
-                attempt_id,
-            );
-        }
-        inner.agent_generation.active_attempts =
-            inner.agent_generation.active_attempts.saturating_sub(1);
-        push_limited(
-            &mut inner.recent_agent_upstream_attempts,
-            AgentUpstreamAttemptLog {
-                inbound_request_id: active.inbound_request_id,
-                attempt_id: active.attempt_id,
-                attempt_index: active.attempt_index,
-                attempt_budget: active.attempt_budget,
-                attempt_policy: active.attempt_policy,
-                attempt_reason: active.attempt_reason,
-                started_at: active.started_at,
-                finished_at: finish.finished_at,
-                provider: active.provider,
-                model: active.model,
-                upstream_channel: active.upstream_channel,
-                outcome: finish.outcome,
-                status: finish.status,
-                error_scope: finish.error_scope,
-                terminal_state: finish.terminal_state,
-                total_ms: finish.total_ms,
-                upstream_headers_ms: finish.upstream_headers_ms,
-                upstream_network_path: finish.upstream_network_path,
-                request_body_bytes: finish.request_body_bytes,
-                sent_body_bytes: finish.sent_body_bytes,
-                gzip_attempted: finish.gzip_attempted,
-            },
-            400,
-        );
-        true
+        finish_agent_attempt_inner(&mut inner, attempt_id, finish)
     }
 
-    pub async fn finish_agent_inbound(
+    #[cfg(test)]
+    async fn finish_agent_inbound(
         &self,
         inbound_request_id: &str,
-        mut request: RequestLog,
-        mut outcome: AgentInboundOutcome,
+        request: RequestLog,
+        outcome: AgentInboundOutcome,
         terminal_state: Option<String>,
     ) -> bool {
         let inbound_request_id = inbound_request_id.trim();
         if inbound_request_id.is_empty() {
             return false;
         }
-
         let mut inner = self.inner.write().await;
-        if inner
-            .completed_agent_inbound_ids
-            .contains(inbound_request_id)
-            || inner
-                .active_agent_attempts
-                .values()
-                .any(|attempt| attempt.inbound_request_id == inbound_request_id)
-        {
-            return false;
-        }
-        let Some(active) = inner.active_agent_inbounds.remove(inbound_request_id) else {
-            return false;
-        };
-        {
-            let MetricsInner {
-                completed_agent_inbound_ids,
-                completed_agent_inbound_order,
-                ..
-            } = &mut *inner;
-            remember_completed_id(
-                completed_agent_inbound_ids,
-                completed_agent_inbound_order,
-                inbound_request_id,
-            );
-        }
-        inner.agent_generation.active_inbounds =
-            inner.agent_generation.active_inbounds.saturating_sub(1);
-        inner.agent_generation.max_attempts_per_inbound = inner
-            .agent_generation
-            .max_attempts_per_inbound
-            .max(active.attempt_count);
-        if active.attempt_count > 1 {
-            inner.agent_generation.multi_attempt_inbounds += 1;
-        }
-
-        request.id = inbound_request_id.to_string();
-        request.inbound_request_id = Some(inbound_request_id.to_string());
-        request.upstream_request_id = active.last_attempt_id.clone();
-        request.upstream_attempt_index = (active.attempt_count > 0).then_some(active.attempt_count);
-        request.upstream_attempt_total = Some(active.attempt_count);
-        let successful = outcome.is_success() && request_log_is_successful_history(&request);
-        if successful {
-            inner.agent_generation.successful_inbounds += 1;
-        } else {
-            if outcome.is_success() {
-                outcome = AgentInboundOutcome::HttpError;
-            }
-            request.cache_status = "error".to_string();
-            inner.agent_generation.failed_inbounds += 1;
-        }
-
-        let projection = request.clone();
-        record_request_inner(&mut inner, projection.clone(), false);
-        if successful {
-            push_limited(&mut inner.recent_upstream_calls, projection, 400);
-        }
-        push_limited(
-            &mut inner.recent_agent_inbound_outcomes,
-            AgentInboundOutcomeLog {
-                request,
-                started_at: active.at,
-                attempt_policy: active.attempt_policy,
-                attempt_count: active.attempt_count,
-                attempt_budget: active.attempt_budget,
-                final_attempt_id: active.last_attempt_id,
-                outcome,
-                terminal_state,
-            },
-            200,
-        );
-        true
+        finish_agent_inbound_inner(
+            &mut inner,
+            inbound_request_id,
+            request,
+            outcome,
+            terminal_state,
+        )
     }
 
-    pub async fn record_upstream_call(&self, log: RequestLog) {
-        if !request_log_is_successful_history(&log) {
-            return;
+    #[cfg(test)]
+    async fn record_upstream_call(&self, log: RequestLog) {
+        if request_log_is_successful_history(&log) {
+            let mut inner = self.inner.write().await;
+            push_limited(&mut inner.recent_upstream_calls, log, 400);
         }
-        let mut inner = self.inner.write().await;
-        push_limited(&mut inner.recent_upstream_calls, log, 400);
     }
 
-    pub async fn record_request(&self, log: RequestLog, upstream: bool) {
+    #[cfg(test)]
+    async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
         record_request_inner(&mut inner, log, upstream);
     }
 
-    pub async fn record_upstream_observation(&self, log: RequestLog) {
-        let mut inner = self.inner.write().await;
-        inner.total_requests += 1;
-        if request_log_is_successful_history(&log) {
-            inner.successful_requests += 1;
-        }
-        inner.upstream_requests += 1;
-        push_limited(&mut inner.ttft_samples, log.ttft_ms, 512);
-        push_limited(&mut inner.total_samples, log.total_ms, 512);
-        upsert_gap_bucket(&mut inner.gap_buckets, &log);
-        upsert_request_body_bucket(&mut inner.request_body_buckets, &log);
-        let count_cold_start = request_log_is_provider_cold_start(&log)
-            && request_log_cold_start_key(&log)
-                .map(|key| remember_bounded_cold_start_key(&mut inner.request_cold_start_keys, key))
-                .unwrap_or(true);
-        upsert_provider_traffic(&mut inner.provider_stats, &log, true, count_cold_start);
-        if request_log_is_successful_history(&log) {
-            push_limited(&mut inner.recent_upstream_calls, log.clone(), 400);
-            push_limited(&mut inner.recent_requests, log, 200);
-        } else {
-            push_limited(&mut inner.recent_failed_requests, log, 200);
-        }
-    }
-
-    pub async fn record_local_proxy_hit(&self, estimated_tokens_saved: u64) {
-        let mut inner = self.inner.write().await;
-        inner.local_proxy_estimated_tokens_saved += estimated_tokens_saved;
-    }
-
-    pub async fn record_usage(&self, record: UsageRecord) {
+    #[cfg(test)]
+    async fn record_usage(&self, record: UsageRecord) {
         self.record_usage_with_cold_start_key(record, None).await;
     }
 
-    pub async fn record_usage_with_cold_start_key(
+    #[cfg(test)]
+    async fn record_usage_with_cold_start_key(
         &self,
         record: UsageRecord,
         cold_start_key: Option<&str>,
     ) {
         let mut inner = self.inner.write().await;
-        inner.provider_input_tokens += record.input_tokens;
-        inner.provider_cached_tokens += record.cache_read_tokens;
-        if record.input_tokens > 0 {
-            inner.provider_usage_requests += 1;
-        }
-        if record.cache_read_tokens > 0 {
-            inner.provider_cache_hit_requests += 1;
-        }
-        inner.usage.input_tokens += record.input_tokens;
-        inner.usage.output_tokens += record.output_tokens;
-        inner.usage.cache_read_tokens += record.cache_read_tokens;
-        inner.usage.cache_creation_tokens += record.cache_creation_tokens;
-        let count_cold_start = provider_usage_is_cold_start(&record)
-            && cold_start_key
-                .map(|key| remember_bounded_cold_start_key(&mut inner.cold_start_keys, key))
-                .unwrap_or(true);
-        if count_cold_start {
-            inner.usage.cold_start_requests += 1;
-            inner.usage.cold_start_input_tokens += record.input_tokens;
-            inner.usage.cold_start_output_tokens += record.output_tokens;
-        }
-        upsert_usage_group(
-            &mut inner.usage.by_provider,
-            &record.provider,
-            &record,
-            count_cold_start,
-        );
-        upsert_usage_group(
-            &mut inner.usage.by_model,
-            &record.model,
-            &record,
-            count_cold_start,
-        );
-        push_recent_usage(
-            &mut inner.recent_usage,
-            TimedUsageRecord {
-                at: Utc::now(),
-                record,
-                cold_start_counted: count_cold_start,
-            },
-        );
-    }
-
-    pub async fn record_retry(&self) {
-        self.inner.write().await.retries += 1;
+        record_usage_inner(&mut inner, record, cold_start_key, Utc::now());
     }
 
     pub async fn record_error(&self, scope: &str, message: &str) {
         let mut inner = self.inner.write().await;
-        inner.errors += 1;
-        push_limited(
-            &mut inner.recent_errors,
-            ErrorLog {
-                at: Utc::now(),
-                scope: scope.to_string(),
-                message: message.to_string(),
-            },
-            40,
-        );
+        record_error_inner(&mut inner, scope, message, Utc::now());
+    }
+
+    pub async fn commit(&self, transaction: MetricsTransaction) -> MetricsCommitResult {
+        let Some(commit_guard) = self.commit_tracker.enter() else {
+            return MetricsCommitResult::Rejected;
+        };
+        if let Ok(mut inner) = self.inner.try_write() {
+            return commit_metrics_transaction(&mut inner, transaction);
+        }
+
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let _commit_guard = commit_guard;
+            let mut inner = inner.write().await;
+            commit_metrics_transaction(&mut inner, transaction)
+        })
+        .await
+        .unwrap_or(MetricsCommitResult::Rejected)
+    }
+
+    pub(crate) fn commit_detached(&self, transaction: MetricsTransaction) -> bool {
+        let Some(commit_guard) = self.commit_tracker.enter() else {
+            return false;
+        };
+        if let Ok(mut inner) = self.inner.try_write() {
+            commit_metrics_transaction(&mut inner, transaction);
+            return true;
+        }
+
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            let _commit_guard = commit_guard;
+            let mut inner = inner.write().await;
+            commit_metrics_transaction(&mut inner, transaction)
+        });
+        true
+    }
+
+    pub(crate) async fn close_and_wait_for_commits(&self) {
+        self.commit_tracker.close_and_wait().await;
     }
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
@@ -1267,6 +1394,429 @@ impl MetricsStore {
                 .collect(),
         }
     }
+}
+
+fn commit_metrics_transaction(
+    inner: &mut MetricsInner,
+    transaction: MetricsTransaction,
+) -> MetricsCommitResult {
+    let MetricsTransaction {
+        commit_key,
+        terminal,
+        usage,
+        errors,
+    } = transaction;
+    if commit_key.is_empty() {
+        return MetricsCommitResult::Rejected;
+    }
+    if inner.completed_transaction_ids.contains(&commit_key) {
+        return MetricsCommitResult::Duplicate;
+    }
+    if let MetricsTerminal::Agent {
+        inbound_request_id,
+        attempt_id,
+        ..
+    } = &terminal
+    {
+        if !agent_terminal_is_valid(inner, inbound_request_id, attempt_id) {
+            record_error_inner(
+                inner,
+                "agent_lifecycle",
+                &format!(
+                    "Agent terminal transaction rejected inconsistent lifecycle state for inbound {inbound_request_id}"
+                ),
+                Utc::now(),
+            );
+            return MetricsCommitResult::Rejected;
+        }
+    }
+    if let MetricsTerminal::AgentOwnerFailure {
+        inbound_request_id, ..
+    } = &terminal
+    {
+        if inner
+            .completed_agent_inbound_ids
+            .contains(inbound_request_id)
+            && !inner.active_agent_inbounds.contains_key(inbound_request_id)
+        {
+            return MetricsCommitResult::Duplicate;
+        }
+    }
+
+    if let Some(usage) = usage {
+        record_usage_inner(
+            inner,
+            usage.record,
+            usage.cold_start_key.as_deref(),
+            usage.observed_at,
+        );
+    }
+    for error in errors {
+        record_error_inner(inner, &error.scope, &error.message, error.at);
+    }
+
+    match terminal {
+        MetricsTerminal::Upstream {
+            request,
+            upstream_attempts,
+        } => {
+            let successful = request_log_is_successful_history(&request);
+            let projection = request.clone();
+            record_request_inner(inner, request, false);
+            record_upstream_attempts_inner(inner, &projection.provider, upstream_attempts);
+            if successful {
+                push_limited(&mut inner.recent_upstream_calls, projection, 400);
+            }
+        }
+        MetricsTerminal::LocalCache {
+            request,
+            estimated_tokens_saved,
+        } => {
+            inner.local_proxy_estimated_tokens_saved = inner
+                .local_proxy_estimated_tokens_saved
+                .saturating_add(estimated_tokens_saved);
+            record_request_inner(inner, request, false);
+        }
+        MetricsTerminal::LocalRejection { request } => {
+            record_request_inner(inner, request, false);
+        }
+        MetricsTerminal::Agent {
+            inbound_request_id,
+            attempt_id,
+            attempt_finish,
+            request,
+            inbound_outcome,
+            terminal_state,
+        } => {
+            apply_agent_terminal_inner(
+                inner,
+                &inbound_request_id,
+                &attempt_id,
+                attempt_finish,
+                request,
+                inbound_outcome,
+                terminal_state,
+            );
+        }
+        MetricsTerminal::AgentOwnerFailure {
+            inbound_request_id,
+            request,
+            terminal_state,
+        } => {
+            apply_agent_owner_failure_inner(inner, &inbound_request_id, request, terminal_state);
+        }
+    }
+
+    remember_completed_id(
+        &mut inner.completed_transaction_ids,
+        &mut inner.completed_transaction_order,
+        &commit_key,
+    );
+    MetricsCommitResult::Applied
+}
+
+fn finish_agent_attempt_inner(
+    inner: &mut MetricsInner,
+    attempt_id: &str,
+    finish: AgentAttemptFinish,
+) -> bool {
+    if inner.completed_agent_attempt_ids.contains(attempt_id) {
+        return false;
+    }
+    let Some(active) = inner.active_agent_attempts.remove(attempt_id) else {
+        return false;
+    };
+    {
+        let MetricsInner {
+            completed_agent_attempt_ids,
+            completed_agent_attempt_order,
+            ..
+        } = inner;
+        remember_completed_id(
+            completed_agent_attempt_ids,
+            completed_agent_attempt_order,
+            attempt_id,
+        );
+    }
+    inner.agent_generation.active_attempts =
+        inner.agent_generation.active_attempts.saturating_sub(1);
+    push_limited(
+        &mut inner.recent_agent_upstream_attempts,
+        AgentUpstreamAttemptLog {
+            inbound_request_id: active.inbound_request_id,
+            attempt_id: active.attempt_id,
+            attempt_index: active.attempt_index,
+            attempt_budget: active.attempt_budget,
+            attempt_policy: active.attempt_policy,
+            attempt_reason: active.attempt_reason,
+            started_at: active.started_at,
+            finished_at: finish.finished_at,
+            provider: active.provider,
+            model: active.model,
+            upstream_channel: active.upstream_channel,
+            outcome: finish.outcome,
+            status: finish.status,
+            error_scope: finish.error_scope,
+            terminal_state: finish.terminal_state,
+            total_ms: finish.total_ms,
+            upstream_headers_ms: finish.upstream_headers_ms,
+            upstream_network_path: finish.upstream_network_path,
+            request_body_bytes: finish.request_body_bytes,
+            sent_body_bytes: finish.sent_body_bytes,
+            gzip_attempted: finish.gzip_attempted,
+        },
+        400,
+    );
+    true
+}
+
+fn finish_agent_inbound_inner(
+    inner: &mut MetricsInner,
+    inbound_request_id: &str,
+    mut request: RequestLog,
+    mut outcome: AgentInboundOutcome,
+    terminal_state: Option<String>,
+) -> bool {
+    if inner
+        .completed_agent_inbound_ids
+        .contains(inbound_request_id)
+        || inner
+            .active_agent_attempts
+            .values()
+            .any(|attempt| attempt.inbound_request_id == inbound_request_id)
+    {
+        return false;
+    }
+    let Some(active) = inner.active_agent_inbounds.remove(inbound_request_id) else {
+        return false;
+    };
+    {
+        let MetricsInner {
+            completed_agent_inbound_ids,
+            completed_agent_inbound_order,
+            ..
+        } = inner;
+        remember_completed_id(
+            completed_agent_inbound_ids,
+            completed_agent_inbound_order,
+            inbound_request_id,
+        );
+    }
+    inner.agent_generation.active_inbounds =
+        inner.agent_generation.active_inbounds.saturating_sub(1);
+    inner.agent_generation.max_attempts_per_inbound = inner
+        .agent_generation
+        .max_attempts_per_inbound
+        .max(active.attempt_count);
+    if active.attempt_count > 1 {
+        inner.agent_generation.multi_attempt_inbounds += 1;
+    }
+
+    request.id = inbound_request_id.to_string();
+    request.inbound_request_id = Some(inbound_request_id.to_string());
+    request.upstream_request_id = active.last_attempt_id.clone();
+    request.upstream_attempt_index = (active.attempt_count > 0).then_some(active.attempt_count);
+    request.upstream_attempt_total = Some(active.attempt_count);
+    let successful = outcome.is_success() && request_log_is_successful_history(&request);
+    if successful {
+        inner.agent_generation.successful_inbounds += 1;
+    } else {
+        if outcome.is_success() {
+            outcome = AgentInboundOutcome::HttpError;
+        }
+        request.cache_status = "error".to_string();
+        inner.agent_generation.failed_inbounds += 1;
+    }
+
+    let projection = request.clone();
+    record_request_inner(inner, projection.clone(), false);
+    if successful {
+        push_limited(&mut inner.recent_upstream_calls, projection, 400);
+    }
+    push_limited(
+        &mut inner.recent_agent_inbound_outcomes,
+        AgentInboundOutcomeLog {
+            request,
+            started_at: active.at,
+            attempt_policy: active.attempt_policy,
+            attempt_count: active.attempt_count,
+            attempt_budget: active.attempt_budget,
+            final_attempt_id: active.last_attempt_id,
+            outcome,
+            terminal_state,
+        },
+        200,
+    );
+    true
+}
+
+fn agent_terminal_is_valid(
+    inner: &MetricsInner,
+    inbound_request_id: &str,
+    attempt_id: &str,
+) -> bool {
+    if inbound_request_id.is_empty() || attempt_id.is_empty() {
+        return false;
+    }
+    let Some(inbound) = inner.active_agent_inbounds.get(inbound_request_id) else {
+        return false;
+    };
+    inbound.last_attempt_id.as_deref() == Some(attempt_id)
+        && !inner
+            .completed_agent_inbound_ids
+            .contains(inbound_request_id)
+        && !inner.completed_agent_attempt_ids.contains(attempt_id)
+        && inner
+            .active_agent_attempts
+            .get(attempt_id)
+            .is_some_and(|attempt| attempt.inbound_request_id == inbound_request_id)
+        && inner
+            .active_agent_attempts
+            .values()
+            .filter(|attempt| attempt.inbound_request_id == inbound_request_id)
+            .count()
+            == 1
+}
+
+fn apply_agent_terminal_inner(
+    inner: &mut MetricsInner,
+    inbound_request_id: &str,
+    attempt_id: &str,
+    attempt_finish: AgentAttemptFinish,
+    request: RequestLog,
+    inbound_outcome: AgentInboundOutcome,
+    terminal_state: Option<String>,
+) {
+    assert!(finish_agent_attempt_inner(
+        inner,
+        attempt_id,
+        attempt_finish
+    ));
+    assert!(finish_agent_inbound_inner(
+        inner,
+        inbound_request_id,
+        request,
+        inbound_outcome,
+        terminal_state,
+    ));
+}
+
+fn apply_agent_owner_failure_inner(
+    inner: &mut MetricsInner,
+    inbound_request_id: &str,
+    request: RequestLog,
+    terminal_state: Option<String>,
+) {
+    let attempt_ids = inner
+        .active_agent_attempts
+        .values()
+        .filter(|attempt| attempt.inbound_request_id == inbound_request_id)
+        .map(|attempt| attempt.attempt_id.clone())
+        .collect::<Vec<_>>();
+    for attempt_id in attempt_ids {
+        let _ = finish_agent_attempt_inner(
+            inner,
+            &attempt_id,
+            AgentAttemptFinish {
+                finished_at: Utc::now(),
+                outcome: AgentAttemptOutcome::RelayAborted,
+                status: Some(request.status),
+                error_scope: Some("agent_generation_owner".to_string()),
+                terminal_state: terminal_state.clone(),
+                total_ms: request.total_ms,
+                upstream_headers_ms: request.upstream_headers_ms,
+                upstream_network_path: request.upstream_network_path.clone(),
+                request_body_bytes: request.request_body_bytes,
+                sent_body_bytes: request.sent_body_bytes,
+                gzip_attempted: request.gzip_attempted,
+            },
+        );
+    }
+
+    if !inner.active_agent_inbounds.contains_key(inbound_request_id) {
+        inner.active_agent_inbounds.insert(
+            inbound_request_id.to_string(),
+            ActiveAgentInbound {
+                at: request.at,
+                attempt_policy: "owner-failure".to_string(),
+                attempt_budget: 1,
+                attempt_count: 0,
+                last_attempt_id: None,
+            },
+        );
+        inner.agent_generation.inbound_requests += 1;
+        inner.agent_generation.active_inbounds += 1;
+    }
+
+    assert!(finish_agent_inbound_inner(
+        inner,
+        inbound_request_id,
+        request,
+        AgentInboundOutcome::RelayAborted,
+        terminal_state,
+    ));
+}
+
+fn record_usage_inner(
+    inner: &mut MetricsInner,
+    record: UsageRecord,
+    cold_start_key: Option<&str>,
+    observed_at: DateTime<Utc>,
+) {
+    inner.provider_input_tokens += record.input_tokens;
+    inner.provider_cached_tokens += record.cache_read_tokens;
+    if record.input_tokens > 0 {
+        inner.provider_usage_requests += 1;
+    }
+    if record.cache_read_tokens > 0 {
+        inner.provider_cache_hit_requests += 1;
+    }
+    inner.usage.input_tokens += record.input_tokens;
+    inner.usage.output_tokens += record.output_tokens;
+    inner.usage.cache_read_tokens += record.cache_read_tokens;
+    inner.usage.cache_creation_tokens += record.cache_creation_tokens;
+    let count_cold_start = provider_usage_is_cold_start(&record)
+        && cold_start_key
+            .map(|key| remember_bounded_cold_start_key(&mut inner.cold_start_keys, key))
+            .unwrap_or(true);
+    if count_cold_start {
+        inner.usage.cold_start_requests += 1;
+        inner.usage.cold_start_input_tokens += record.input_tokens;
+        inner.usage.cold_start_output_tokens += record.output_tokens;
+    }
+    upsert_usage_group(
+        &mut inner.usage.by_provider,
+        &record.provider,
+        &record,
+        count_cold_start,
+    );
+    upsert_usage_group(
+        &mut inner.usage.by_model,
+        &record.model,
+        &record,
+        count_cold_start,
+    );
+    push_recent_usage(
+        &mut inner.recent_usage,
+        TimedUsageRecord {
+            at: observed_at,
+            record,
+            cold_start_counted: count_cold_start,
+        },
+    );
+}
+
+fn record_error_inner(inner: &mut MetricsInner, scope: &str, message: &str, at: DateTime<Utc>) {
+    inner.errors += 1;
+    push_limited(
+        &mut inner.recent_errors,
+        ErrorLog {
+            at,
+            scope: scope.to_string(),
+            message: message.to_string(),
+        },
+        40,
+    );
 }
 
 fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: bool) {
@@ -1508,6 +2058,14 @@ fn increment_provider_upstream_attempt(
             groups.len() - 1
         });
     groups[index].upstream_requests += 1;
+}
+
+fn record_upstream_attempts_inner(inner: &mut MetricsInner, provider: &str, attempts: u64) {
+    inner.upstream_requests = inner.upstream_requests.saturating_add(attempts);
+    inner.retries = inner.retries.saturating_add(attempts.saturating_sub(1));
+    for _ in 0..attempts {
+        increment_provider_upstream_attempt(&mut inner.provider_stats, provider);
+    }
 }
 
 fn sorted_provider_stats(
@@ -1837,6 +2395,7 @@ mod tests {
             client_channel: "chat".to_string(),
             upstream_channel: "chat".to_string(),
             provider: "provider".to_string(),
+            provider_id: Some("provider-id".to_string()),
             model: "model".to_string(),
             requested_model: None,
             agent_reasoning_effort: None,
@@ -1943,6 +2502,7 @@ mod tests {
             session_anchor_source: None,
             session_anchor_changed: None,
             session_anchor_peer_count: None,
+            inbound_body_bytes: None,
             original_body_bytes: None,
             send_body_bytes: None,
             send_body_is_delta: None,
@@ -1958,11 +2518,12 @@ mod tests {
     }
 
     #[test]
-    fn request_log_shadow_fields_default_for_legacy_metrics() {
+    fn request_log_optional_fields_default_for_legacy_metrics() {
         let log = request_log("miss", Some("cache-key"));
         let mut value = serde_json::to_value(log).unwrap();
         let object = value.as_object_mut().unwrap();
         for key in [
+            "provider_id",
             "shadow_affinity_mode",
             "shadow_affinity_arm",
             "shadow_affinity_realm_id",
@@ -1979,8 +2540,15 @@ mod tests {
             object.remove(key);
         }
         let restored: RequestLog = serde_json::from_value(value).unwrap();
+        assert!(restored.provider_id.is_none());
         assert!(restored.shadow_affinity_mode.is_none());
         assert!(restored.shadow_affinity_policy_compute_ms.is_none());
+    }
+
+    #[test]
+    fn request_log_serializes_stable_provider_id() {
+        let value = serde_json::to_value(request_log("miss", Some("cache-key"))).unwrap();
+        assert_eq!(value["provider_id"], "provider-id");
     }
 
     fn agent_inbound_start(id: &str, policy: &str, budget: u64) -> AgentInboundStart {
@@ -2021,6 +2589,523 @@ mod tests {
             sent_body_bytes: Some(128),
             gzip_attempted: Some(false),
         }
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_commits_usage_request_and_histories_once() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("miss", Some("transaction-success"));
+        request.id = "transaction-success".to_string();
+        let mut transaction = MetricsTransaction::upstream(request);
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 2_048,
+                output_tokens: 32,
+                cache_read_tokens: 1_920,
+                cache_creation_tokens: 0,
+            },
+            Some("prefix-success"),
+        );
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.retries, 0);
+        assert_eq!(snapshot.usage.input_tokens, 2_048);
+        assert_eq!(snapshot.usage.cache_read_tokens, 1_920);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert!(snapshot.recent_failed_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_counts_real_upstream_attempts_without_duplicating_inbound() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("miss", Some("transaction-retry"));
+        request.id = "transaction-retry".to_string();
+        request.upstream_attempt_total = Some(3);
+        request.upstream_attempts = Some(3);
+
+        assert_eq!(
+            metrics.commit(MetricsTransaction::upstream(request)).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 3);
+        assert_eq!(snapshot.retries, 2);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert!(snapshot.recent_failed_requests.is_empty());
+        assert_eq!(snapshot.provider_stats[0].total_requests, 1);
+        assert_eq!(snapshot.provider_stats[0].upstream_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_duplicate_key_is_a_complete_noop() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("miss", Some("transaction-duplicate"));
+        request.id = "transaction-duplicate".to_string();
+        let mut transaction = MetricsTransaction::upstream(request);
+        transaction.observe_error("upstream", "one error event");
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 0,
+            },
+            None,
+        );
+        assert_eq!(
+            metrics.commit(transaction.clone()).await,
+            MetricsCommitResult::Applied
+        );
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Duplicate
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.usage.input_tokens, 100);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_deduplicates_conflicting_terminal_kinds_by_inbound_id() {
+        let metrics = MetricsStore::new();
+        let mut cached = request_log("exact", Some("shared-raw-id"));
+        cached.id = "shared-raw-id".to_string();
+        let mut upstream = request_log("miss", Some("shared-raw-id"));
+        upstream.id = "shared-raw-id".to_string();
+
+        assert_eq!(
+            metrics
+                .commit(MetricsTransaction::local_cache(cached, 64))
+                .await,
+            MetricsCommitResult::Applied
+        );
+        assert_eq!(
+            metrics.commit(MetricsTransaction::upstream(upstream)).await,
+            MetricsCommitResult::Duplicate
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 0);
+        assert_eq!(snapshot.local_proxy.local_cache_hits, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_merges_multiple_usage_observations() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("miss", Some("merged-usage"));
+        request.id = "merged-usage".to_string();
+        let mut transaction = MetricsTransaction::upstream(request);
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 2,
+            },
+            None,
+        );
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 20,
+                output_tokens: 3,
+                cache_read_tokens: 10,
+                cache_creation_tokens: 1,
+            },
+            Some("merged-usage-prefix"),
+        );
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.usage.input_tokens, 120);
+        assert_eq!(snapshot.usage.output_tokens, 13);
+        assert_eq!(snapshot.usage.cache_read_tokens, 60);
+        assert_eq!(snapshot.usage.cache_creation_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn contended_metrics_commit_survives_caller_cancellation() {
+        let metrics = MetricsStore::new();
+        let guard = metrics.inner.write().await;
+        let mut request = request_log("miss", Some("cancel-safe-commit"));
+        request.id = "cancel-safe-commit".to_string();
+        let transaction = MetricsTransaction::upstream(request);
+        let metrics_for_commit = metrics.clone();
+        let caller = tokio::spawn(async move { metrics_for_commit.commit(transaction).await });
+
+        while Arc::strong_count(&metrics.inner) < 3 {
+            tokio::task::yield_now().await;
+        }
+        caller.abort();
+        let _ = caller.await;
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if metrics.snapshot().await.total_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached commit must finish after its caller is cancelled");
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_close_waits_for_detached_commit_and_rejects_late_commits() {
+        let metrics = MetricsStore::new();
+        let guard = metrics.inner.write().await;
+        let mut request = request_log("miss", Some("shutdown-commit"));
+        request.id = "shutdown-commit".to_string();
+        assert!(metrics.commit_detached(MetricsTransaction::upstream(request)));
+
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let metrics_for_close = metrics.clone();
+        tokio::spawn(async move {
+            metrics_for_close.close_and_wait_for_commits().await;
+            let _ = closed_tx.send(());
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), closed_rx)
+                .await
+                .is_err()
+        );
+        drop(guard);
+        metrics.close_and_wait_for_commits().await;
+
+        let mut late = request_log("miss", Some("late-commit"));
+        late.id = "late-commit".to_string();
+        assert!(!metrics.commit_detached(MetricsTransaction::upstream(late)));
+        assert_eq!(metrics.snapshot().await.total_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_failure_keeps_errors_out_of_success_history() {
+        let metrics = MetricsStore::new();
+        let mut failed = request_log("error", None);
+        failed.id = "transaction-failure".to_string();
+        failed.status = 503;
+        let mut transaction = MetricsTransaction::upstream(failed);
+        transaction.observe_error("upstream_http", "service unavailable");
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 0);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_local_cache_updates_request_and_saved_tokens_together() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("exact", Some("local-cache-transaction"));
+        request.id = "local-cache-transaction".to_string();
+
+        assert_eq!(
+            metrics
+                .commit(MetricsTransaction::local_cache(request, 4_096))
+                .await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 0);
+        assert_eq!(snapshot.local_proxy.estimated_tokens_saved, 4_096);
+        assert_eq!(snapshot.local_proxy.local_cache_hits, 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_local_rejection_counts_failure_without_upstream() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("error", None);
+        request.id = "local-rejection-transaction".to_string();
+        request.status = 503;
+        request.upstream_request_id = None;
+        request.upstream_attempt_index = None;
+        request.upstream_attempt_total = None;
+        request.upstream_attempts = None;
+        let mut transaction = MetricsTransaction::local_rejection(request);
+        transaction.observe_error("local_rejection", "cooldown active");
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.successful_requests, 0);
+        assert_eq!(snapshot.upstream_requests, 0);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_finishes_agent_attempt_and_inbound_atomically() {
+        let metrics = MetricsStore::new();
+        assert!(
+            metrics
+                .begin_agent_inbound(agent_inbound_start("agent-transaction", "single", 1))
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "agent-transaction",
+                    "agent-attempt",
+                    "primary"
+                ))
+                .await,
+            Some(1)
+        );
+        let transaction = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
+            inbound_request_id: "agent-transaction".to_string(),
+            attempt_id: "agent-attempt".to_string(),
+            attempt_finish: agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200)),
+            request: request_log("miss", Some("agent-transaction")),
+            inbound_outcome: AgentInboundOutcome::Success,
+            terminal_state: Some("response_completed".to_string()),
+        });
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.successful_inbounds, 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+        assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_owner_failure_synthesizes_one_failed_inbound_before_lifecycle_start() {
+        let metrics = MetricsStore::new();
+        let mut request = request_log("error", None);
+        request.id = "owner-failure-before-start".to_string();
+        request.status = 502;
+        let mut transaction =
+            MetricsTransaction::agent_owner_failure(AgentOwnerFailureSettlement {
+                inbound_request_id: "owner-failure-before-start".to_string(),
+                request,
+                terminal_state: Some("owner_stopped".to_string()),
+            });
+        transaction.observe_error("agent_generation_owner", "owner stopped");
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 0);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.agent_generation.inbound_requests, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert_eq!(snapshot.recent_agent_inbound_outcomes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_owner_failure_closes_an_active_attempt_and_inbound() {
+        let metrics = MetricsStore::new();
+        assert!(
+            metrics
+                .begin_agent_inbound(agent_inbound_start("owner-failure-active", "single", 1))
+                .await
+        );
+        assert_eq!(
+            metrics
+                .begin_agent_attempt(agent_attempt_start(
+                    "owner-failure-active",
+                    "owner-failure-attempt",
+                    "primary",
+                ))
+                .await,
+            Some(1)
+        );
+        let mut request = request_log("error", None);
+        request.id = "owner-failure-active".to_string();
+        request.status = 502;
+        let transaction = MetricsTransaction::agent_owner_failure(AgentOwnerFailureSettlement {
+            inbound_request_id: "owner-failure-active".to_string(),
+            request,
+            terminal_state: Some("owner_stopped".to_string()),
+        });
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.upstream_requests, 1);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.active_attempts, 0);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
+        assert_eq!(
+            snapshot.recent_agent_upstream_attempts[0].outcome,
+            AgentAttemptOutcome::RelayAborted
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_rejects_missing_agent_lifecycle_without_partial_commit() {
+        let metrics = MetricsStore::new();
+        let mut failed = request_log("error", None);
+        failed.status = 502;
+        failed.upstream_request_id = Some("missing-attempt".to_string());
+        failed.upstream_attempt_index = Some(1);
+        failed.upstream_attempt_total = Some(1);
+        let mut transaction = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
+            inbound_request_id: "missing-agent-lifecycle".to_string(),
+            attempt_id: "missing-attempt".to_string(),
+            attempt_finish: agent_attempt_finish(AgentAttemptOutcome::HttpError, Some(502)),
+            request: failed,
+            inbound_outcome: AgentInboundOutcome::HttpError,
+            terminal_state: Some("http_error".to_string()),
+        });
+        transaction.observe_error("pending_error", "must not be partially committed");
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 999,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            },
+            None,
+        );
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Rejected
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 0);
+        assert_eq!(snapshot.successful_requests, 0);
+        assert_eq!(snapshot.upstream_requests, 0);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.usage.input_tokens, 0);
+        assert_eq!(snapshot.agent_generation.inbound_requests, 0);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 0);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 0);
+        assert!(snapshot.recent_failed_requests.is_empty());
+        assert!(snapshot.recent_agent_upstream_attempts.is_empty());
+        assert!(snapshot.recent_agent_inbound_outcomes.is_empty());
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_metrics_transaction_does_not_consume_the_commit_key() {
+        let metrics = MetricsStore::new();
+        let rejected = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
+            inbound_request_id: "reusable-agent-key".to_string(),
+            attempt_id: "reusable-attempt".to_string(),
+            attempt_finish: agent_attempt_finish(AgentAttemptOutcome::HttpError, Some(502)),
+            request: request_log("error", None),
+            inbound_outcome: AgentInboundOutcome::HttpError,
+            terminal_state: Some("http_error".to_string()),
+        });
+        assert_eq!(
+            metrics.commit(rejected).await,
+            MetricsCommitResult::Rejected
+        );
+
+        let mut valid_request = request_log("miss", Some("reusable-agent-key"));
+        valid_request.id = "reusable-agent-key".to_string();
+        let valid = MetricsTransaction::upstream(valid_request);
+        assert_eq!(metrics.commit(valid).await, MetricsCommitResult::Applied);
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 1);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.recent_requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn metrics_transaction_rejects_attempt_from_another_inbound() {
+        let metrics = MetricsStore::new();
+        for inbound_id in ["inbound-a", "inbound-b"] {
+            assert!(
+                metrics
+                    .begin_agent_inbound(agent_inbound_start(inbound_id, "single", 1))
+                    .await
+            );
+            assert_eq!(
+                metrics
+                    .begin_agent_attempt(agent_attempt_start(
+                        inbound_id,
+                        &format!("attempt-{}", &inbound_id[inbound_id.len() - 1..]),
+                        "primary"
+                    ))
+                    .await,
+                Some(1)
+            );
+        }
+        let transaction = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
+            inbound_request_id: "inbound-a".to_string(),
+            attempt_id: "attempt-b".to_string(),
+            attempt_finish: agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200)),
+            request: request_log("miss", Some("wrong-attempt")),
+            inbound_outcome: AgentInboundOutcome::Success,
+            terminal_state: Some("response_completed".to_string()),
+        });
+
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Rejected
+        );
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 0);
+        assert_eq!(snapshot.errors, 1);
+        assert_eq!(snapshot.agent_generation.active_inbounds, 2);
+        assert_eq!(snapshot.agent_generation.active_attempts, 2);
+        assert!(snapshot.recent_agent_upstream_attempts.is_empty());
+        assert!(snapshot.recent_agent_inbound_outcomes.is_empty());
     }
 
     #[tokio::test]
@@ -2309,15 +3394,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reasoning_compatibility_counts_two_attempts_as_one_successful_inbound() {
+    async fn reasoning_rejection_counts_one_failed_single_attempt_inbound() {
         let metrics = MetricsStore::new();
         assert!(
             metrics
-                .begin_agent_inbound(agent_inbound_start(
-                    "reasoning-inbound",
-                    "reasoning_compatibility",
-                    2
-                ))
+                .begin_agent_inbound(agent_inbound_start("reasoning-inbound", "single", 1))
                 .await
         );
         assert_eq!(
@@ -2338,56 +3419,41 @@ mod tests {
                 )
                 .await
         );
-        assert_eq!(
-            metrics
-                .begin_agent_attempt(agent_attempt_start(
-                    "reasoning-inbound",
-                    "reasoning-attempt-2",
-                    "reasoning_explicit"
-                ))
-                .await,
-            Some(2)
-        );
-        assert!(
-            metrics
-                .finish_agent_attempt(
-                    "reasoning-attempt-2",
-                    agent_attempt_finish(AgentAttemptOutcome::HttpSuccess, Some(200))
-                )
-                .await
-        );
-
+        let mut failed_log = request_log("error", None);
+        failed_log.status = 502;
         assert!(
             metrics
                 .finish_agent_inbound(
                     "reasoning-inbound",
-                    request_log("miss", Some("reasoning-success")),
-                    AgentInboundOutcome::Success,
-                    Some("response_completed".to_string())
+                    failed_log,
+                    AgentInboundOutcome::HttpError,
+                    Some("reasoning_effort_rejected".to_string())
                 )
                 .await
         );
 
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.total_requests, 1);
-        assert_eq!(snapshot.successful_requests, 1);
-        assert_eq!(snapshot.upstream_requests, 2);
+        assert_eq!(snapshot.successful_requests, 0);
+        assert_eq!(snapshot.upstream_requests, 1);
         assert_eq!(snapshot.agent_generation.inbound_requests, 1);
-        assert_eq!(snapshot.agent_generation.generation_attempts, 2);
-        assert_eq!(snapshot.agent_generation.multi_attempt_inbounds, 1);
-        assert_eq!(snapshot.agent_generation.max_attempts_per_inbound, 2);
-        assert_eq!(snapshot.recent_requests.len(), 1);
-        assert_eq!(snapshot.recent_failed_requests.len(), 0);
-        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(snapshot.agent_generation.successful_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.failed_inbounds, 1);
+        assert_eq!(snapshot.agent_generation.generation_attempts, 1);
+        assert_eq!(snapshot.agent_generation.multi_attempt_inbounds, 0);
+        assert_eq!(snapshot.agent_generation.max_attempts_per_inbound, 1);
+        assert!(snapshot.recent_requests.is_empty());
+        assert!(snapshot.recent_upstream_calls.is_empty());
+        assert_eq!(snapshot.recent_failed_requests.len(), 1);
+        assert_eq!(snapshot.recent_agent_upstream_attempts.len(), 1);
         assert_eq!(snapshot.provider_stats[0].total_requests, 1);
-        assert_eq!(snapshot.provider_stats[0].successful_requests, 1);
-        assert_eq!(snapshot.provider_stats[0].upstream_requests, 2);
-        assert_eq!(snapshot.recent_requests[0].upstream_attempt_index, Some(2));
-        assert_eq!(snapshot.recent_requests[0].upstream_attempt_total, Some(2));
+        assert_eq!(snapshot.provider_stats[0].successful_requests, 0);
+        assert_eq!(snapshot.provider_stats[0].upstream_requests, 1);
         assert_eq!(
-            snapshot.recent_requests[0].upstream_request_id.as_deref(),
-            Some("reasoning-attempt-2")
+            snapshot.recent_agent_inbound_outcomes[0].outcome,
+            AgentInboundOutcome::HttpError
         );
+        assert_eq!(snapshot.recent_agent_upstream_attempts[0].status, Some(502));
     }
 
     #[tokio::test]

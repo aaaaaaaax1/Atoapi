@@ -7,11 +7,16 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
 use tokio::sync::RwLock;
 
-use crate::{config::CacheConfig, crypto};
+use crate::{
+    config::CacheConfig,
+    crypto,
+    metrics::MetricsStore,
+    persistence::{WriteBehindCoordinator, WriteOperation},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -47,17 +52,217 @@ pub enum CacheLookupStatus {
 
 #[derive(Debug, Clone)]
 pub struct CacheStore {
-    entries: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    entries: Arc<RwLock<HashMap<String, Arc<CacheEntry>>>>,
     path: PathBuf,
+    persistence: CacheWriteCoordinator,
+    #[cfg(test)]
+    publication_hook: Option<CachePublicationHook>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct CachePublicationHook(Arc<dyn Fn(WriteOperation) + Send + Sync>);
+
+#[cfg(test)]
+impl std::fmt::Debug for CachePublicationHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CachePublicationHook(..)")
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CacheWriteCoordinator {
+    state: Arc<StdMutex<CacheWriteState>>,
+    writer: WriteBehindCoordinator,
+}
+
+#[derive(Debug)]
+struct CacheWriteState {
+    accepting: bool,
+    latest_snapshot: Arc<Vec<Arc<CacheEntry>>>,
+}
+
+#[derive(Debug, Clone)]
+enum CacheWriteRequest {
+    Snapshot(Arc<Vec<Arc<CacheEntry>>>),
+    Delete,
+}
+
+impl CacheWriteRequest {
+    #[cfg(test)]
+    fn operation(&self) -> WriteOperation {
+        match self {
+            Self::Snapshot(_) => WriteOperation::Snapshot,
+            Self::Delete => WriteOperation::Delete,
+        }
+    }
+}
+
+struct CacheMutationGate<'a> {
+    coordinator: &'a CacheWriteCoordinator,
+    state: StdMutexGuard<'a, CacheWriteState>,
+}
+
+impl CacheMutationGate<'_> {
+    fn publish_snapshot(&mut self, snapshot: Vec<Arc<CacheEntry>>) -> u64 {
+        self.state.latest_snapshot = Arc::new(snapshot);
+        self.coordinator.writer.mark_dirty(WriteOperation::Snapshot)
+    }
+
+    fn publish_delete(&mut self) -> u64 {
+        // Release cached response bodies immediately. An older snapshot worker
+        // that has not captured its payload can safely write this empty state
+        // before the newer Delete operation removes the file.
+        self.state.latest_snapshot = Arc::new(Vec::new());
+        self.coordinator.writer.mark_dirty(WriteOperation::Delete)
+    }
+}
+
+impl CacheWriteCoordinator {
+    fn new(path: PathBuf) -> Self {
+        Self::new_with_job(move |request| match request {
+            CacheWriteRequest::Snapshot(snapshot) => {
+                write_cache_snapshot(&path, snapshot.as_ref().clone())
+            }
+            CacheWriteRequest::Delete => match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(err.into()),
+            },
+        })
+    }
+
+    fn new_with_job(
+        write_job: impl Fn(CacheWriteRequest) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        let state = Arc::new(StdMutex::new(CacheWriteState {
+            accepting: true,
+            latest_snapshot: Arc::new(Vec::new()),
+        }));
+        let state_for_writer = state.clone();
+        let writer = WriteBehindCoordinator::new("cache_persist", move |operation| {
+            let request = match operation {
+                WriteOperation::Snapshot => {
+                    let snapshot = state_for_writer
+                        .lock()
+                        .expect("cache persistence snapshot lock must not be poisoned")
+                        .latest_snapshot
+                        .clone();
+                    CacheWriteRequest::Snapshot(snapshot)
+                }
+                WriteOperation::Delete => CacheWriteRequest::Delete,
+            };
+            write_job(request)
+        });
+        Self { state, writer }
+    }
+
+    fn begin_mutation(&self) -> Result<CacheMutationGate<'_>> {
+        let state = self
+            .state
+            .lock()
+            .expect("cache persistence snapshot lock must not be poisoned");
+        if !state.accepting {
+            return Err(anyhow::anyhow!("response cache is closed"));
+        }
+        Ok(CacheMutationGate {
+            coordinator: self,
+            state,
+        })
+    }
+
+    fn attach_error_reporter(&self, metrics: MetricsStore) {
+        self.writer.attach_error_reporter(metrics);
+    }
+
+    async fn wait_for(&self, version: u64) -> Result<()> {
+        self.writer.wait_for(version).await
+    }
+
+    async fn flush(&self) -> Result<()> {
+        match self.writer.flush_latest().await {
+            Ok(()) => Ok(()),
+            Err(_) => self.writer.retry_latest().await,
+        }
+    }
+
+    async fn close_and_flush(&self) -> Result<()> {
+        self.close();
+        self.flush().await
+    }
+
+    fn close(&self) {
+        self.state
+            .lock()
+            .expect("cache persistence snapshot lock must not be poisoned")
+            .accepting = false;
+    }
+
+    #[cfg(test)]
+    fn is_accepting(&self) -> bool {
+        self.state
+            .lock()
+            .expect("cache persistence snapshot lock must not be poisoned")
+            .accepting
+    }
 }
 
 impl CacheStore {
     pub fn load(path: PathBuf) -> Result<Self> {
+        let entries = Arc::new(RwLock::new(HashMap::new()));
         let store = Self {
-            entries: Arc::new(RwLock::new(HashMap::new())),
+            persistence: CacheWriteCoordinator::new(path.clone()),
+            entries,
             path,
+            #[cfg(test)]
+            publication_hook: None,
         };
         Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_with_persistence_job(
+        path: PathBuf,
+        write_job: impl Fn(WriteOperation) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::load_with_snapshot_persistence_job(path, move |request| {
+            write_job(request.operation())
+        })
+    }
+
+    #[cfg(test)]
+    fn load_with_snapshot_persistence_job(
+        path: PathBuf,
+        write_job: impl Fn(CacheWriteRequest) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Ok(Self {
+            entries: Arc::new(RwLock::new(HashMap::new())),
+            path,
+            persistence: CacheWriteCoordinator::new_with_job(write_job),
+            publication_hook: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_with_persistence_job_and_publication_hook(
+        path: PathBuf,
+        write_job: impl Fn(WriteOperation) -> Result<()> + Send + Sync + 'static,
+        publication_hook: impl Fn(WriteOperation) + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mut store = Self::load_with_persistence_job(path, write_job)?;
+        store.publication_hook = Some(CachePublicationHook(Arc::new(publication_hook)));
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    fn before_publication(&self, operation: WriteOperation) {
+        if let Some(hook) = &self.publication_hook {
+            (hook.0)(operation);
+        }
+    }
+
+    pub fn attach_error_reporter(&self, metrics: MetricsStore) {
+        self.persistence.attach_error_reporter(metrics);
     }
 
     pub async fn load_from_disk(&self) -> Result<()> {
@@ -72,19 +277,8 @@ impl CacheStore {
         guard.clear();
         for mut entry in entries.into_iter().filter(|entry| entry.expires_at > now) {
             ensure_semantic_vector(&mut entry);
-            guard.insert(entry.key.clone(), entry);
+            guard.insert(entry.key.clone(), Arc::new(entry));
         }
-        Ok(())
-    }
-
-    pub async fn persist(&self) -> Result<()> {
-        let entries = self.entries.read().await;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let raw = serde_json::to_vec(&entries.values().cloned().collect::<Vec<_>>())?;
-        let encrypted = crypto::encrypt_cache_bytes(&raw)?;
-        fs::write(&self.path, encrypted)?;
         Ok(())
     }
 
@@ -133,7 +327,7 @@ impl CacheStore {
                     if score >= config.semantic_threshold
                         && best.as_ref().map(|(best, _)| score > *best).unwrap_or(true)
                     {
-                        best = Some((score, entry.clone()));
+                        best = Some((score, entry.as_ref().clone()));
                     }
                 }
                 if let Some((_, entry)) = best {
@@ -158,18 +352,32 @@ impl CacheStore {
             .get(key)
             .filter(|entry| entry.expires_at > now)
             .map(|entry| CacheLookup {
-                entry: entry.clone(),
+                entry: entry.as_ref().clone(),
                 status: CacheLookupStatus::Exact,
             })
     }
 
-    pub async fn insert(&self, mut entry: CacheEntry, config: &CacheConfig) -> Result<()> {
+    #[cfg(test)]
+    pub async fn insert(&self, entry: CacheEntry, config: &CacheConfig) -> Result<()> {
+        self.insert_many(vec![entry], config).await
+    }
+
+    pub async fn insert_many(
+        &self,
+        mut entries: Vec<CacheEntry>,
+        config: &CacheConfig,
+    ) -> Result<()> {
         if !config.enabled {
             return Ok(());
         }
-        ensure_semantic_vector(&mut entry);
+        for entry in &mut entries {
+            ensure_semantic_vector(entry);
+        }
         let mut guard = self.entries.write().await;
-        guard.insert(entry.key.clone(), entry);
+        let mut persistence_gate = self.persistence.begin_mutation()?;
+        for entry in entries {
+            guard.insert(entry.key.clone(), Arc::new(entry));
+        }
         if guard.len() > config.max_entries {
             let mut by_age = guard
                 .values()
@@ -180,22 +388,53 @@ impl CacheStore {
                 guard.remove(&key);
             }
         }
-        drop(guard);
         if config.persist_encrypted {
-            self.persist()
-                .await
-                .context("failed to persist response cache")?;
+            let snapshot = guard.values().cloned().collect::<Vec<_>>();
+            // Publish the matching immutable snapshot while both the entry map
+            // and close gate are held. The writer never reads later live state.
+            #[cfg(test)]
+            self.before_publication(WriteOperation::Snapshot);
+            persistence_gate.publish_snapshot(snapshot);
         }
+        drop(persistence_gate);
+        drop(guard);
         Ok(())
     }
 
     pub async fn clear(&self) -> Result<()> {
-        self.entries.write().await.clear();
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        }
-        Ok(())
+        let version = {
+            let mut entries = self.entries.write().await;
+            let mut persistence_gate = self.persistence.begin_mutation()?;
+            entries.clear();
+            #[cfg(test)]
+            self.before_publication(WriteOperation::Delete);
+            persistence_gate.publish_delete()
+        };
+        self.persistence
+            .wait_for(version)
+            .await
+            .context("failed to clear persisted response cache")
     }
+
+    #[cfg(test)]
+    pub async fn flush(&self) -> Result<()> {
+        self.persistence.flush().await
+    }
+
+    pub async fn close_and_flush(&self) -> Result<()> {
+        self.persistence.close_and_flush().await
+    }
+}
+
+fn write_cache_snapshot(path: &Path, entries: Vec<Arc<CacheEntry>>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let entries = entries.iter().map(Arc::as_ref).collect::<Vec<_>>();
+    let raw = serde_json::to_vec(&entries)?;
+    let encrypted = crypto::encrypt_cache_bytes(&raw)?;
+    fs::write(path, encrypted)?;
+    Ok(())
 }
 
 pub fn cache_path(config_dir: &Path) -> PathBuf {
@@ -751,6 +990,10 @@ mod tests {
     use super::*;
     use crate::config::CacheMode;
     use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Barrier, Mutex as StdMutex,
+    };
 
     #[test]
     fn cache_key_is_stable_for_reordered_objects() {
@@ -1331,5 +1574,316 @@ mod tests {
             p95_ms < 50,
             "warm replay cache-hit TTFT p95 was {p95_ms}ms, expected < 50ms"
         );
+    }
+
+    #[tokio::test]
+    async fn insert_many_flushes_one_reloadable_snapshot_and_clear_orders_delete() {
+        let path = std::env::temp_dir().join(format!(
+            "atoapi-write-behind-cache-{}.bin",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = CacheStore::load(path.clone()).unwrap();
+        let config = CacheConfig {
+            mode: CacheMode::PassiveWarm,
+            enabled: true,
+            exact_enabled: true,
+            semantic_enabled: false,
+            semantic_threshold: 0.985,
+            max_age_seconds: 3600,
+            max_entries: 10,
+            persist_encrypted: true,
+            prewarm_enabled: false,
+            background_prewarm_enabled: false,
+        };
+        let now = Utc::now();
+        let make_entry = |key: &str| CacheEntry {
+            key: key.to_string(),
+            semantic_text: None,
+            semantic_shape: None,
+            semantic_vector: Vec::new(),
+            content_type: "application/json".to_string(),
+            status: 200,
+            body: format!("{{\"key\":\"{key}\"}}").into_bytes(),
+            created_at: now,
+            expires_at: now + chrono::Duration::minutes(5),
+            provider_id: "provider".to_string(),
+            model: "model".to_string(),
+            workspace_fingerprint: Some("workspace".to_string()),
+        };
+
+        store
+            .insert_many(vec![make_entry("first"), make_entry("second")], &config)
+            .await
+            .unwrap();
+        store.flush().await.unwrap();
+        assert!(path.exists());
+
+        let reloaded = CacheStore::load(path.clone()).unwrap();
+        reloaded.load_from_disk().await.unwrap();
+        assert!(reloaded.lookup_exact("first", &config).await.is_some());
+        assert!(reloaded.lookup_exact("second", &config).await.is_some());
+
+        store
+            .insert_many(vec![make_entry("pending")], &config)
+            .await
+            .unwrap();
+        store.clear().await.unwrap();
+        store.flush().await.unwrap();
+        assert!(!path.exists());
+    }
+
+    fn concurrent_persistence_config() -> CacheConfig {
+        CacheConfig {
+            mode: CacheMode::PassiveWarm,
+            enabled: true,
+            exact_enabled: true,
+            semantic_enabled: false,
+            semantic_threshold: 0.985,
+            max_age_seconds: 3600,
+            max_entries: 10,
+            persist_encrypted: true,
+            prewarm_enabled: false,
+            background_prewarm_enabled: false,
+        }
+    }
+
+    fn concurrent_cache_entry(key: &str) -> CacheEntry {
+        CacheEntry {
+            key: key.to_string(),
+            semantic_text: None,
+            semantic_shape: None,
+            semantic_vector: Vec::new(),
+            content_type: "application/json".to_string(),
+            status: 200,
+            body: format!("{{\"key\":\"{key}\"}}").into_bytes(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(5),
+            provider_id: "provider".to_string(),
+            model: "model".to_string(),
+            workspace_fingerprint: Some("workspace".to_string()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn insert_publication_holds_mutation_order_against_concurrent_clear() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let operations_for_job = operations.clone();
+        let publication_entered = Arc::new(Barrier::new(2));
+        let publication_entered_for_hook = publication_entered.clone();
+        let publication_release = Arc::new(Barrier::new(2));
+        let publication_release_for_hook = publication_release.clone();
+        let store = CacheStore::load_with_persistence_job_and_publication_hook(
+            PathBuf::from("unused-cache-path"),
+            move |operation| {
+                operations_for_job.lock().unwrap().push(operation);
+                Ok(())
+            },
+            move |operation| {
+                if operation == WriteOperation::Snapshot {
+                    publication_entered_for_hook.wait();
+                    publication_release_for_hook.wait();
+                }
+            },
+        )
+        .unwrap();
+        let config = concurrent_persistence_config();
+        let insert_store = store.clone();
+        let insert_config = config.clone();
+        let insert = tokio::spawn(async move {
+            insert_store
+                .insert_many(
+                    vec![concurrent_cache_entry("insert-before-clear")],
+                    &insert_config,
+                )
+                .await
+                .unwrap();
+        });
+
+        publication_entered.wait();
+        let clear_completed = Arc::new(AtomicBool::new(false));
+        let clear_completed_for_task = clear_completed.clone();
+        let clear_store = store.clone();
+        let clear = tokio::spawn(async move {
+            clear_store.clear().await.unwrap();
+            clear_completed_for_task.store(true, Ordering::Release);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!clear_completed.load(Ordering::Acquire));
+        publication_release.wait();
+
+        insert.await.unwrap();
+        clear.await.unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(
+            operations.lock().unwrap().last(),
+            Some(&WriteOperation::Delete)
+        );
+        assert!(store
+            .lookup_exact("insert-before-clear", &config)
+            .await
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clear_publication_holds_mutation_order_against_concurrent_insert() {
+        let operations = Arc::new(StdMutex::new(Vec::new()));
+        let operations_for_job = operations.clone();
+        let publication_entered = Arc::new(Barrier::new(2));
+        let publication_entered_for_hook = publication_entered.clone();
+        let publication_release = Arc::new(Barrier::new(2));
+        let publication_release_for_hook = publication_release.clone();
+        let store = CacheStore::load_with_persistence_job_and_publication_hook(
+            PathBuf::from("unused-cache-path"),
+            move |operation| {
+                operations_for_job.lock().unwrap().push(operation);
+                Ok(())
+            },
+            move |operation| {
+                if operation == WriteOperation::Delete {
+                    publication_entered_for_hook.wait();
+                    publication_release_for_hook.wait();
+                }
+            },
+        )
+        .unwrap();
+        let config = concurrent_persistence_config();
+        let clear_store = store.clone();
+        let clear = tokio::spawn(async move {
+            clear_store.clear().await.unwrap();
+        });
+
+        publication_entered.wait();
+        let insert_completed = Arc::new(AtomicBool::new(false));
+        let insert_completed_for_task = insert_completed.clone();
+        let insert_store = store.clone();
+        let insert_config = config.clone();
+        let insert = tokio::spawn(async move {
+            insert_store
+                .insert_many(
+                    vec![concurrent_cache_entry("insert-after-clear")],
+                    &insert_config,
+                )
+                .await
+                .unwrap();
+            insert_completed_for_task.store(true, Ordering::Release);
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!insert_completed.load(Ordering::Acquire));
+        publication_release.wait();
+
+        clear.await.unwrap();
+        insert.await.unwrap();
+        store.flush().await.unwrap();
+        assert_eq!(
+            operations.lock().unwrap().last(),
+            Some(&WriteOperation::Snapshot)
+        );
+        assert!(store
+            .lookup_exact("insert-after-clear", &config)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pending_snapshot_excludes_entries_inserted_with_persistence_disabled() {
+        let path = std::env::temp_dir().join(format!(
+            "atoapi-immutable-cache-snapshot-{}.bin",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let writer_entered = Arc::new(Barrier::new(2));
+        let writer_entered_for_job = writer_entered.clone();
+        let writer_release = Arc::new(Barrier::new(2));
+        let writer_release_for_job = writer_release.clone();
+        let path_for_job = path.clone();
+        let store = CacheStore::load_with_snapshot_persistence_job(path.clone(), move |request| {
+            match request {
+                CacheWriteRequest::Snapshot(snapshot) => {
+                    writer_entered_for_job.wait();
+                    writer_release_for_job.wait();
+                    write_cache_snapshot(&path_for_job, snapshot.as_ref().clone())
+                }
+                CacheWriteRequest::Delete => Ok(()),
+            }
+        })
+        .unwrap();
+        let persisted = concurrent_persistence_config();
+        let mut memory_only = persisted.clone();
+        memory_only.persist_encrypted = false;
+
+        store
+            .insert_many(
+                vec![concurrent_cache_entry("published-before-disable")],
+                &persisted,
+            )
+            .await
+            .unwrap();
+        writer_entered.wait();
+        store
+            .insert_many(
+                vec![concurrent_cache_entry("memory-only-after-disable")],
+                &memory_only,
+            )
+            .await
+            .unwrap();
+        writer_release.wait();
+        store.flush().await.unwrap();
+
+        let reloaded = CacheStore::load(path.clone()).unwrap();
+        reloaded.load_from_disk().await.unwrap();
+        assert!(reloaded
+            .lookup_exact("published-before-disable", &persisted)
+            .await
+            .is_some());
+        assert!(reloaded
+            .lookup_exact("memory-only-after-disable", &persisted)
+            .await
+            .is_none());
+        fs::remove_file(path).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_gate_rejects_clear_and_insert_while_final_snapshot_is_inflight() {
+        let writer_entered = Arc::new(Barrier::new(2));
+        let writer_entered_for_job = writer_entered.clone();
+        let writer_release = Arc::new(Barrier::new(2));
+        let writer_release_for_job = writer_release.clone();
+        let store = CacheStore::load_with_snapshot_persistence_job(
+            PathBuf::from("unused-cache-path"),
+            move |request| {
+                if matches!(request, CacheWriteRequest::Snapshot(_)) {
+                    writer_entered_for_job.wait();
+                    writer_release_for_job.wait();
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let config = concurrent_persistence_config();
+        store
+            .insert_many(vec![concurrent_cache_entry("before-close")], &config)
+            .await
+            .unwrap();
+        writer_entered.wait();
+
+        let closing_store = store.clone();
+        let close = tokio::spawn(async move { closing_store.close_and_flush().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while store.persistence.is_accepting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cache close gate should stop accepting mutations");
+
+        assert!(store.clear().await.is_err());
+        assert!(store
+            .insert_many(vec![concurrent_cache_entry("after-close")], &config)
+            .await
+            .is_err());
+        assert!(store.lookup_exact("before-close", &config).await.is_some());
+        assert!(store.lookup_exact("after-close", &config).await.is_none());
+
+        writer_release.wait();
+        close.await.unwrap().unwrap();
     }
 }

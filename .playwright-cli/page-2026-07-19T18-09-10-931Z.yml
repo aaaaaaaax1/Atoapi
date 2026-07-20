@@ -1,0 +1,136 @@
+- iframe [active] [ref=f10e3]:
+  - generic [ref=f11e1]:
+    - generic [ref=f11e2]:
+      - banner [ref=f11e3]:
+        - generic [ref=f11e4]:
+          - button "打开设置" [ref=f11e5] [cursor=pointer]
+          - button "查看版本" [ref=f11e9] [cursor=pointer]:
+            - strong [ref=f11e10]: Atoapi
+            - generic [ref=f11e11]: Graphite · vNext
+        - tablist "Agent 列表" [ref=f11e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f11e13] [cursor=pointer]:
+            - generic [ref=f11e19]:
+              - generic [ref=f11e20]: Claude Code
+              - generic [ref=f11e21]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f11e23] [cursor=pointer]:
+            - generic [ref=f11e27]:
+              - generic [ref=f11e28]: Claude Desktop
+              - generic [ref=f11e29]: 已关闭
+          - tab "Codex 已关闭" [ref=f11e31] [cursor=pointer]:
+            - generic [ref=f11e36]:
+              - generic [ref=f11e37]: Codex
+              - generic [ref=f11e38]: 已关闭
+          - tab "Gemini 已关闭" [ref=f11e40] [cursor=pointer]:
+            - generic [ref=f11e44]:
+              - generic [ref=f11e45]: Gemini
+              - generic [ref=f11e46]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f11e48] [cursor=pointer]:
+            - generic [ref=f11e53]:
+              - generic [ref=f11e54]: OpenCode
+              - generic [ref=f11e55]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f11e57] [cursor=pointer]:
+            - generic [ref=f11e62]:
+              - generic [ref=f11e63]: OpenClaw
+              - generic [ref=f11e64]: 已关闭
+          - tab "Hermes 已关闭" [ref=f11e66] [cursor=pointer]:
+            - generic [ref=f11e74]:
+              - generic [ref=f11e75]: Hermes
+              - generic [ref=f11e76]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f11e78] [cursor=pointer]:
+            - generic [ref=f11e87]:
+              - generic [ref=f11e88]: 本地代理模式
+              - generic [ref=f11e89]: 已关闭
+        - generic [ref=f11e91]:
+          - generic [ref=f11e92]:
+            - generic [ref=f11e93]: 代理运行中
+            - generic [ref=f11e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f11e95] [cursor=pointer]
+      - region [ref=f11e101]:
+        - generic [ref=f11e102]:
+          - switch "启用当前 Agent" [ref=f11e103] [cursor=pointer]
+          - generic [ref=f11e104]:
+            - heading "Claude Code" [level=1] [ref=f11e105]
+            - paragraph [ref=f11e106]: 未选择上游
+        - generic [ref=f11e107]:
+          - generic [ref=f11e108]:
+            - generic [ref=f11e109]: Base URL
+            - code [ref=f11e110]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f11e111] [cursor=pointer]
+          - generic [ref=f11e115]:
+            - generic [ref=f11e116]: Local Key
+            - code [ref=f11e117]: atoapi-claude-code-demo-key
+            - button "复制本地 Key" [ref=f11e118] [cursor=pointer]
+        - button "新增上游" [ref=f11e123] [cursor=pointer]
+      - main [ref=f11e126]:
+        - generic [ref=f11e127]:
+          - generic [ref=f11e128]:
+            - generic [ref=f11e129]:
+              - heading "上游路由" [level=2] [ref=f11e130]
+              - paragraph [ref=f11e131]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f11e132]:
+              - generic [ref=f11e133]: 0 个可用上游
+              - generic [ref=f11e134]: 一次入站 · 一次上游
+          - generic [ref=f11e135]: 当前没有上游配置
+      - contentinfo [ref=f11e137]:
+        - button "打开缓存统计与请求记录" [ref=f11e138] [cursor=pointer]:
+          - generic [ref=f11e143]: 缓存与记录
+          - generic [ref=f11e144]:
+            - text: 命中率
+            - strong [ref=f11e145]: 0.0%
+          - generic [ref=f11e146]: 0 成功 · 0 error
+    - dialog [ref=f11e197]:
+      - banner [ref=f11e198]:
+        - generic [ref=f11e199]:
+          - heading "新增上游" [level=2] [ref=f11e200]
+          - paragraph [ref=f11e201]: 新建并绑定到当前 Agent
+        - button "关闭上游编辑器" [active] [ref=f11e202] [cursor=pointer]
+      - generic [ref=f11e207]:
+        - tablist "上游配置分类" [ref=f11e208]:
+          - tab "连接信息" [selected] [ref=f11e209] [cursor=pointer]
+          - tab "模型映射" [ref=f11e210] [cursor=pointer]
+          - tab "多 Key" [ref=f11e211] [cursor=pointer]
+          - tab "传输与缓存" [ref=f11e212] [cursor=pointer]
+          - tab "兼容性" [ref=f11e213] [cursor=pointer]
+        - generic [ref=f11e215]:
+          - generic [ref=f11e216]:
+            - generic [ref=f11e218]:
+              - heading "连接信息" [level=3] [ref=f11e219]
+              - paragraph [ref=f11e220]: 模型列表仅用于辅助添加映射，不影响基础代理。
+            - generic [ref=f11e221]:
+              - generic [ref=f11e222]:
+                - generic [ref=f11e223]: 上游名称
+                - textbox "上游名称" [ref=f11e224]: 新上游
+              - generic [ref=f11e225]:
+                - generic [ref=f11e226]: 通道
+                - combobox "通道" [ref=f11e227]:
+                  - option "Auto"
+                  - option "Responses" [selected]
+                  - option "Chat"
+                  - option "Anthropic"
+              - generic [ref=f11e228]:
+                - generic [ref=f11e229]: Base URL
+                - textbox "Base URL" [ref=f11e230]
+              - generic [ref=f11e231]:
+                - generic [ref=f11e232]: API Key
+                - generic [ref=f11e233]:
+                  - textbox "API Key 显示 API Key" [ref=f11e234]:
+                    - /placeholder: 输入上游 API Key
+                  - button "显示 API Key" [ref=f11e235] [cursor=pointer]
+              - generic [ref=f11e239]:
+                - generic [ref=f11e240]: Models URL（可选）
+                - textbox "Models URL（可选）" [ref=f11e241]
+          - generic [ref=f11e242]:
+            - generic [ref=f11e243]:
+              - generic [ref=f11e244]:
+                - heading "网络路径" [level=3] [ref=f11e245]
+                - paragraph [ref=f11e246]: 诊断只在用户点击后执行。
+              - button "测试路径" [ref=f11e247] [cursor=pointer]
+            - generic [ref=f11e250]:
+              - generic [ref=f11e251]:
+                - generic [ref=f11e252]: 使用系统代理
+                - generic [ref=f11e253]: 当前选择：直连
+              - switch "使用系统代理" [ref=f11e254] [cursor=pointer]
+      - contentinfo [ref=f11e255]:
+        - button "取消" [ref=f11e256] [cursor=pointer]
+        - button "保存并绑定" [ref=f11e257] [cursor=pointer]
+    - status

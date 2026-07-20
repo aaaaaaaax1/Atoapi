@@ -1,0 +1,97 @@
+- iframe [active] [ref=f10e3]:
+  - generic [active] [ref=f11e1]:
+    - generic [ref=f11e2]:
+      - banner [ref=f11e3]:
+        - generic [ref=f11e4]:
+          - button "打开设置" [ref=f11e5] [cursor=pointer]
+          - button "查看版本" [ref=f11e9] [cursor=pointer]:
+            - strong [ref=f11e10]: Atoapi
+            - generic [ref=f11e11]: Graphite · vNext
+        - tablist "Agent 列表" [ref=f11e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f11e261] [cursor=pointer]:
+            - generic [ref=f11e267]:
+              - generic [ref=f11e268]: Claude Code
+              - generic [ref=f11e269]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f11e271] [cursor=pointer]:
+            - generic [ref=f11e275]:
+              - generic [ref=f11e276]: Claude Desktop
+              - generic [ref=f11e277]: 已关闭
+          - tab "Codex 已关闭" [ref=f11e279] [cursor=pointer]:
+            - generic [ref=f11e284]:
+              - generic [ref=f11e285]: Codex
+              - generic [ref=f11e286]: 已关闭
+          - tab "Gemini 已关闭" [ref=f11e288] [cursor=pointer]:
+            - generic [ref=f11e292]:
+              - generic [ref=f11e293]: Gemini
+              - generic [ref=f11e294]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f11e296] [cursor=pointer]:
+            - generic [ref=f11e301]:
+              - generic [ref=f11e302]: OpenCode
+              - generic [ref=f11e303]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f11e305] [cursor=pointer]:
+            - generic [ref=f11e310]:
+              - generic [ref=f11e311]: OpenClaw
+              - generic [ref=f11e312]: 已关闭
+          - tab "Hermes 已关闭" [ref=f11e314] [cursor=pointer]:
+            - generic [ref=f11e322]:
+              - generic [ref=f11e323]: Hermes
+              - generic [ref=f11e324]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f11e326] [cursor=pointer]:
+            - generic [ref=f11e335]:
+              - generic [ref=f11e336]: 本地代理模式
+              - generic [ref=f11e337]: 已关闭
+        - generic [ref=f11e91]:
+          - generic [ref=f11e92]:
+            - generic [ref=f11e93]: 代理运行中
+            - generic [ref=f11e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f11e95] [cursor=pointer]
+      - region [ref=f11e101]:
+        - generic [ref=f11e102]:
+          - switch "启用当前 Agent" [ref=f11e103] [cursor=pointer]
+          - generic [ref=f11e104]:
+            - heading "Claude Code" [level=1] [ref=f11e105]
+            - paragraph [ref=f11e106]: Final QA · Responses · 模型直传
+        - generic [ref=f11e107]:
+          - generic [ref=f11e344]:
+            - generic [ref=f11e345]: Base URL
+            - code [ref=f11e346]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f11e347] [cursor=pointer]
+          - generic [ref=f11e351]:
+            - generic [ref=f11e352]: Local Key
+            - code [ref=f11e353]: atoapi-claude-code-demo-key
+            - button "复制本地 Key" [ref=f11e354] [cursor=pointer]
+        - button "新增上游" [ref=f11e123] [cursor=pointer]
+      - main [ref=f11e126]:
+        - generic [ref=f11e127]:
+          - generic [ref=f11e128]:
+            - generic [ref=f11e129]:
+              - heading "上游路由" [level=2] [ref=f11e130]
+              - paragraph [ref=f11e131]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f11e132]:
+              - generic [ref=f11e133]: 1 个可用上游
+              - generic [ref=f11e134]: 一次入站 · 一次上游
+          - article [ref=f11e359]:
+            - generic [ref=f11e365]:
+              - generic [ref=f11e366]: Final QA
+              - generic [ref=f11e367]: https://final.qa/v1
+            - generic [ref=f11e368]:
+              - generic [ref=f11e369]:
+                - generic [ref=f11e370]: Responses
+                - generic [ref=f11e371]: · Agent 直传
+                - generic [ref=f11e372]: · 0 Key
+              - generic [ref=f11e373]:
+                - generic [ref=f11e374]: 最近连通
+                - generic [ref=f11e375]: 未检测
+            - generic [ref=f11e376]:
+              - button "当前" [ref=f11e377] [cursor=pointer]
+              - button "测试 Final QA 连通性" [ref=f11e380] [cursor=pointer]
+              - button "编辑 Final QA" [ref=f11e383] [cursor=pointer]
+              - button "删除 Final QA" [ref=f11e387] [cursor=pointer]
+      - contentinfo [ref=f11e137]:
+        - button "打开缓存统计与请求记录" [ref=f11e138] [cursor=pointer]:
+          - generic [ref=f11e143]: 缓存与记录
+          - generic [ref=f11e144]:
+            - text: 命中率
+            - strong [ref=f11e395]: 0.0%
+          - generic [ref=f11e146]: 0 成功 · 0 error
+    - status: 上游配置已保存并绑定到当前 Agent

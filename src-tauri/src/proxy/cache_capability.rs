@@ -10,6 +10,7 @@ pub(super) const PROVIDER_CACHE_METADATA_FIELDS: [&str; 4] = [
     "prompt_cache_breakpoint",
 ];
 
+#[cfg(test)]
 pub(super) const EFFECT_FIELDS: [ProviderCacheCapabilityField; 2] = [
     ProviderCacheCapabilityField::PromptCacheOptions,
     ProviderCacheCapabilityField::PromptCacheBreakpoint,
@@ -59,27 +60,98 @@ pub(super) fn plan(
     }
 }
 
-pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePlan) {
+pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePlan) -> Vec<String> {
+    let mut changed_fields = Vec::new();
     if let Some(object) = request.as_object_mut() {
-        if !plan.preserve_prompt_cache_key {
-            object.remove("prompt_cache_key");
+        if !plan.preserve_prompt_cache_key && object.remove("prompt_cache_key").is_some() {
+            mark_changed_field(&mut changed_fields, "prompt_cache_key");
         }
-        if !plan.preserve_legacy_retention {
-            object.remove("prompt_cache_retention");
+        if !plan.preserve_legacy_retention && object.remove("prompt_cache_retention").is_some() {
+            mark_changed_field(&mut changed_fields, "prompt_cache_retention");
         }
         if plan.enable_modern_options {
-            object
-                .entry("prompt_cache_options".to_string())
-                .or_insert_with(|| json!({"mode": "implicit", "ttl": "30m"}));
-        } else {
-            object.remove("prompt_cache_options");
+            if !object.contains_key("prompt_cache_options") {
+                object.insert(
+                    "prompt_cache_options".to_string(),
+                    json!({"mode": "implicit", "ttl": "30m"}),
+                );
+                mark_changed_field(&mut changed_fields, "prompt_cache_options");
+            }
+        } else if object.remove("prompt_cache_options").is_some() {
+            mark_changed_field(&mut changed_fields, "prompt_cache_options");
         }
     }
 
     if plan.enable_explicit_breakpoint {
-        add_safe_explicit_breakpoint(request, channel);
+        if add_safe_explicit_breakpoint(request, channel) {
+            if let Some(root_key) = cache_payload_root_key(channel) {
+                mark_changed_field(&mut changed_fields, root_key);
+            }
+        }
     } else {
+        record_removed_cache_breakpoint_fields(request, &mut changed_fields);
+    }
+    changed_fields
+}
+
+pub(super) fn present_fields(request: &Value) -> Vec<ProviderCacheCapabilityField> {
+    let mut fields = Vec::new();
+    if let Some(object) = request.as_object() {
+        for (name, field) in [
+            (
+                "prompt_cache_key",
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            (
+                "prompt_cache_retention",
+                ProviderCacheCapabilityField::PromptCacheRetention,
+            ),
+            (
+                "prompt_cache_options",
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            ),
+        ] {
+            if object.contains_key(name) {
+                fields.push(field);
+            }
+        }
+    }
+    if contains_cache_breakpoint(request) {
+        fields.push(ProviderCacheCapabilityField::PromptCacheBreakpoint);
+    }
+    fields
+}
+
+fn mark_changed_field(changed_fields: &mut Vec<String>, key: &str) {
+    if !changed_fields.iter().any(|field| field == key) {
+        changed_fields.push(key.to_string());
+    }
+}
+
+fn cache_payload_root_key(channel: &Channel) -> Option<&'static str> {
+    match channel {
+        Channel::Responses => Some("input"),
+        Channel::Chat => Some("messages"),
+        Channel::Anthropic => None,
+    }
+}
+
+fn record_removed_cache_breakpoint_fields(request: &mut Value, changed_fields: &mut Vec<String>) {
+    let Some(object) = request.as_object_mut() else {
         remove_cache_breakpoints(request);
+        return;
+    };
+    if object.remove("prompt_cache_breakpoint").is_some() {
+        mark_changed_field(changed_fields, "prompt_cache_breakpoint");
+    }
+    let mut nested_changed = Vec::new();
+    for (key, value) in object.iter_mut() {
+        if remove_cache_breakpoints(value) {
+            nested_changed.push(key.clone());
+        }
+    }
+    for key in nested_changed {
+        mark_changed_field(changed_fields, &key);
     }
 }
 
@@ -175,6 +247,7 @@ pub(super) fn field_probe_body(
     body
 }
 
+#[cfg(test)]
 pub(super) fn effect_probe_body(
     channel: &Channel,
     model: &str,
@@ -232,6 +305,7 @@ pub(super) fn effect_probe_body(
     body
 }
 
+#[cfg(test)]
 fn effect_probe_stable_prefix(group_nonce: &str) -> String {
     let seed = format!(
         "Atoapi cache effect verification {group_nonce}. The following stable prefix is intentionally repeated for cache measurement. "
@@ -390,20 +464,23 @@ fn contains_cache_breakpoint(value: &Value) -> bool {
     }
 }
 
-fn remove_cache_breakpoints(value: &mut Value) {
+fn remove_cache_breakpoints(value: &mut Value) -> bool {
     match value {
         Value::Object(map) => {
-            map.remove("prompt_cache_breakpoint");
+            let mut changed = map.remove("prompt_cache_breakpoint").is_some();
             for child in map.values_mut() {
-                remove_cache_breakpoints(child);
+                changed |= remove_cache_breakpoints(child);
             }
+            changed
         }
         Value::Array(items) => {
+            let mut changed = false;
             for item in items {
-                remove_cache_breakpoints(item);
+                changed |= remove_cache_breakpoints(item);
             }
+            changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -451,7 +528,8 @@ mod tests {
                 {"type":"input_text","text":"dynamic"}
             ]}]
         });
-        apply(&mut body, &Channel::Responses, plan);
+        let changed = apply(&mut body, &Channel::Responses, plan);
+        assert_eq!(changed, vec!["prompt_cache_options"]);
         assert_eq!(body["prompt_cache_key"], "stable");
         assert_eq!(body["prompt_cache_retention"], "24h");
         assert!(body.get("prompt_cache_options").is_none());
@@ -502,7 +580,11 @@ mod tests {
                 {"type":"input_text","text":"dynamic"}
             ]}]
         });
-        apply(&mut body, &Channel::Responses, plan);
+        let changed = apply(&mut body, &Channel::Responses, plan);
+        assert_eq!(
+            changed,
+            vec!["prompt_cache_retention", "prompt_cache_options", "input"]
+        );
         assert!(body.get("prompt_cache_retention").is_none());
         assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
         assert_eq!(
@@ -554,7 +636,8 @@ mod tests {
             None,
         );
         let mut body = json!({"prompt_cache_key":"stable","input":[]});
-        apply(&mut body, &Channel::Responses, plan);
+        let changed = apply(&mut body, &Channel::Responses, plan);
+        assert_eq!(changed, vec!["prompt_cache_key", "prompt_cache_options"]);
         assert!(body.get("prompt_cache_key").is_none());
         assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
     }
@@ -570,7 +653,7 @@ mod tests {
                 {"type":"input_text","text":"dynamic"}
             ]}]
         });
-        apply(
+        let _ = apply(
             &mut official_body,
             &Channel::Responses,
             plan(

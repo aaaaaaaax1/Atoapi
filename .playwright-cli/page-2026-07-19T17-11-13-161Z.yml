@@ -1,0 +1,66 @@
+- main [ref=f1e3]:
+  - generic [ref=f1e4]:
+    - button "查看版本更新" [ref=f1e11] [cursor=pointer]:
+      - strong [ref=f1e12]: Atoapi
+      - generic [ref=f1e13]: Graphite · v0.2.16
+    - navigation "Agent 注入" [ref=f1e14]:
+      - tab "Claude Code Agent 已关闭" [selected] [ref=f1e379] [cursor=pointer]:
+        - generic [ref=f1e20]: Claude Code
+        - generic "Agent 已关闭" [ref=f1e23]
+      - tab "Codex Agent 已关闭" [ref=f1e380] [cursor=pointer]:
+        - generic [ref=f1e38]: Codex
+        - generic "Agent 已关闭" [ref=f1e41]
+      - tab "Gemini Agent 已关闭" [ref=f1e381] [cursor=pointer]:
+        - generic [ref=f1e46]: Gemini
+        - generic "Agent 已关闭" [ref=f1e49]
+      - tab "OpenCode Agent 已关闭" [ref=f1e382] [cursor=pointer]:
+        - generic [ref=f1e56]: OpenCode
+        - generic "Agent 已关闭" [ref=f1e59]
+      - tab "OpenClaw Agent 已关闭" [ref=f1e383] [cursor=pointer]:
+        - generic [ref=f1e66]: OpenClaw
+        - generic "Agent 已关闭" [ref=f1e69]
+      - button "更多 Agent" [ref=f1e82] [cursor=pointer]
+    - button "刷新配置和统计" [ref=f1e91] [cursor=pointer]
+  - region [ref=f1e334]:
+    - generic [ref=f1e335]:
+      - switch "启用当前 Agent" [ref=f1e336] [cursor=pointer]
+      - generic [ref=f1e338]:
+        - heading "Claude Code" [level=1] [ref=f1e339]
+        - paragraph [ref=f1e340]: UI 验证上游 · OpenAI Responses · 直接透传
+    - generic [ref=f1e341]:
+      - generic [ref=f1e342]:
+        - generic [ref=f1e343]: Anthropic Base URL
+        - code [ref=f1e344]: http://127.0.0.1:18883
+        - button "复制 Anthropic Base URL" [ref=f1e345] [cursor=pointer]
+      - generic [ref=f1e349]:
+        - generic [ref=f1e350]: Agent Key
+        - code [ref=f1e351]: ato-local-preview
+        - button "复制 Agent Key" [ref=f1e352] [cursor=pointer]
+    - button "新增上游" [ref=f1e357] [cursor=pointer]
+  - main [ref=f1e123]:
+    - generic "上游配置已保存并已绑定到当前 Agent" [ref=f1e517]
+    - region "Claude Code 上游路由" [ref=f1e360]:
+      - generic [ref=f1e361]:
+        - generic [ref=f1e362]:
+          - heading "上游路由" [level=2] [ref=f1e363]
+          - paragraph [ref=f1e364]: 未命中模型映射时，完整保留 Agent 发来的模型与推理参数。
+        - generic [ref=f1e365]:
+          - generic [ref=f1e366]: 1 个可用上游
+          - button "添加上游" [ref=f1e367] [cursor=pointer]
+      - article [ref=f1e518]:
+        - generic [ref=f1e524]:
+          - generic [ref=f1e525]: UI 验证上游
+          - generic "https://example.invalid/v1" [ref=f1e526]
+        - generic [ref=f1e528]:
+          - generic [ref=f1e529]: OpenAI Responses
+          - generic [ref=f1e530]: Agent 直传
+          - generic [ref=f1e531]: 0 Key
+        - generic [ref=f1e532]:
+          - button "已绑定" [ref=f1e533] [cursor=pointer]
+          - button "编辑上游、模型映射和 Key" [ref=f1e536] [cursor=pointer]
+          - button "删除上游" [ref=f1e540] [cursor=pointer]
+  - button "缓存与记录 命中率 0.0%" [ref=f1e384] [cursor=pointer]:
+    - generic [ref=f1e150]: 缓存与记录
+    - generic [ref=f1e151]:
+      - text: 命中率
+      - strong [ref=f1e152]: 0.0%

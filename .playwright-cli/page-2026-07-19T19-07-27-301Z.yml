@@ -1,0 +1,180 @@
+- iframe [active] [ref=f2e3]:
+  - generic [active] [ref=f3e1]:
+    - generic [ref=f3e2]:
+      - banner [ref=f3e3]:
+        - generic [ref=f3e4]:
+          - button "打开设置" [ref=f3e5] [cursor=pointer]
+          - button "查看版本" [ref=f3e9] [cursor=pointer]:
+            - strong [ref=f3e10]: Atoapi
+            - generic [ref=f3e11]: Graphite · v0.2.16
+        - tablist "Agent 列表" [ref=f3e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f3e13] [cursor=pointer]:
+            - generic [ref=f3e19]:
+              - generic [ref=f3e20]: Claude Code
+              - generic [ref=f3e21]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f3e23] [cursor=pointer]:
+            - generic [ref=f3e27]:
+              - generic [ref=f3e28]: Claude Desktop
+              - generic [ref=f3e29]: 已关闭
+          - tab "Codex 已关闭" [ref=f3e31] [cursor=pointer]:
+            - generic [ref=f3e36]:
+              - generic [ref=f3e37]: Codex
+              - generic [ref=f3e38]: 已关闭
+          - tab "Gemini 已关闭" [ref=f3e40] [cursor=pointer]:
+            - generic [ref=f3e44]:
+              - generic [ref=f3e45]: Gemini
+              - generic [ref=f3e46]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f3e48] [cursor=pointer]:
+            - generic [ref=f3e53]:
+              - generic [ref=f3e54]: OpenCode
+              - generic [ref=f3e55]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f3e57] [cursor=pointer]:
+            - generic [ref=f3e62]:
+              - generic [ref=f3e63]: OpenClaw
+              - generic [ref=f3e64]: 已关闭
+          - tab "Hermes 已关闭" [ref=f3e66] [cursor=pointer]:
+            - generic [ref=f3e74]:
+              - generic [ref=f3e75]: Hermes
+              - generic [ref=f3e76]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f3e78] [cursor=pointer]:
+            - generic [ref=f3e87]:
+              - generic [ref=f3e88]: 本地代理模式
+              - generic [ref=f3e89]: 已关闭
+        - generic [ref=f3e91]:
+          - generic [ref=f3e92]:
+            - generic [ref=f3e93]: 代理运行中
+            - generic [ref=f3e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f3e95] [cursor=pointer]
+      - region [ref=f3e101]:
+        - generic [ref=f3e102]:
+          - switch "启用当前 Agent" [ref=f3e103] [cursor=pointer]
+          - generic [ref=f3e104]:
+            - heading "Claude Code" [level=1] [ref=f3e105]
+            - paragraph [ref=f3e106]: 未选择上游
+        - generic [ref=f3e107]:
+          - generic [ref=f3e108]:
+            - generic [ref=f3e109]: Base URL
+            - code [ref=f3e110]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f3e111] [cursor=pointer]
+          - generic [ref=f3e115]:
+            - generic [ref=f3e116]: Local Key
+            - code [ref=f3e117]: ato-local-preview
+            - button "复制本地 Key" [ref=f3e118] [cursor=pointer]
+        - button "新增上游" [ref=f3e123] [cursor=pointer]
+      - main [ref=f3e126]:
+        - generic [ref=f3e127]:
+          - generic [ref=f3e128]:
+            - generic [ref=f3e129]:
+              - heading "上游路由" [level=2] [ref=f3e130]
+              - paragraph [ref=f3e131]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f3e132]:
+              - generic [ref=f3e133]: 0 个可用上游
+              - generic [ref=f3e134]: 一次入站 · 一次上游
+          - generic [ref=f3e135]: 当前没有上游配置
+      - contentinfo [ref=f3e137]:
+        - button "打开缓存统计与请求记录" [ref=f3e138] [cursor=pointer]:
+          - generic [ref=f3e143]: 缓存与记录
+          - generic [ref=f3e144]:
+            - text: 命中率
+            - strong [ref=f3e145]: 0.0%
+          - generic [ref=f3e146]: 0 成功 · 0 error
+    - dialog [ref=f3e197]:
+      - banner [ref=f3e198]:
+        - generic [ref=f3e199]:
+          - heading "新增上游" [level=2] [ref=f3e200]
+          - paragraph [ref=f3e201]: 新建并绑定到当前 Agent
+        - button "关闭上游编辑器" [ref=f3e202] [cursor=pointer]
+      - generic [ref=f3e207]:
+        - tablist "上游配置分类" [ref=f3e208]:
+          - tab "连接信息" [ref=f3e209] [cursor=pointer]
+          - tab "模型映射" [ref=f3e210] [cursor=pointer]
+          - tab "多 Key" [selected] [ref=f3e211] [cursor=pointer]
+          - tab "传输与缓存" [ref=f3e212] [cursor=pointer]
+          - tab "兼容性" [ref=f3e213] [cursor=pointer]
+        - generic [ref=f3e259]:
+          - generic [ref=f3e260]:
+            - generic [ref=f3e261]:
+              - heading "多 Key 池" [level=3] [ref=f3e262]
+              - paragraph [ref=f3e263]: 可编辑名称、优先级与 Key；拖拽或使用箭头调整顺序。
+            - generic [ref=f3e264]:
+              - button "全部测试" [ref=f3e265] [cursor=pointer]
+              - button "添加 Key" [ref=f3e268] [cursor=pointer]
+          - generic [ref=f3e270]:
+            - generic [ref=f3e271]:
+              - generic [ref=f3e272]: 负载均衡
+              - combobox "负载均衡" [ref=f3e273]:
+                - option "轮询" [selected]
+                - option "优先级"
+                - option "最低使用"
+                - option "顺序"
+            - generic [ref=f3e274]:
+              - generic [ref=f3e275]: 失败阈值
+              - textbox "失败阈值" [ref=f3e276]: "3"
+          - generic [ref=f3e278]:
+            - generic [ref=f3e279]: 批量添加 Key
+            - generic [ref=f3e280]:
+              - textbox "批量添加 Key" [ref=f3e281]
+              - button "添加" [ref=f3e282] [cursor=pointer]
+            - generic [ref=f3e284]: 逗号、分号、空格、回车或换行均可分隔；Shift+Enter 保留换行。
+          - generic "多 Key 列表" [ref=f3e341]:
+            - article [ref=f3e832]:
+              - button "拖拽排序 Key 2" [ref=f3e833]
+              - generic [ref=f3e841]:
+                - generic [ref=f3e842]: 名称
+                - textbox "Key 2 的名称" [ref=f3e843]: Key 2
+              - generic [ref=f3e844]:
+                - generic [ref=f3e845]: Key
+                - generic [ref=f3e846]:
+                  - textbox "Key 2 的 Key" [ref=f3e847]: sk-beta
+                  - button "显示 Key 2 的 Key" [ref=f3e848] [cursor=pointer]
+              - generic [ref=f3e852]:
+                - generic [ref=f3e853]: 优先级
+                - textbox "Key 2 的优先级" [ref=f3e854]: "3"
+              - generic [ref=f3e855]: 未测试
+              - generic [ref=f3e856]:
+                - button "测试 Key 2" [ref=f3e857] [cursor=pointer]
+                - button "Key 2 上移" [disabled] [ref=f3e860] [cursor=pointer]
+                - button "Key 2 下移" [ref=f3e863] [cursor=pointer]
+                - button "删除 Key 2" [ref=f3e866] [cursor=pointer]
+            - article [ref=f3e870]:
+              - button "拖拽排序 Key 1" [ref=f3e871]
+              - generic [ref=f3e879]:
+                - generic [ref=f3e880]: 名称
+                - textbox "Key 1 的名称" [ref=f3e881]: Key 1
+              - generic [ref=f3e882]:
+                - generic [ref=f3e883]: Key
+                - generic [ref=f3e884]:
+                  - textbox "Key 1 的 Key" [ref=f3e885]: sk-alpha
+                  - button "显示 Key 1 的 Key" [ref=f3e886] [cursor=pointer]
+              - generic [ref=f3e890]:
+                - generic [ref=f3e891]: 优先级
+                - textbox "Key 1 的优先级" [ref=f3e892]: "2"
+              - generic [ref=f3e893]: 未测试
+              - generic [ref=f3e894]:
+                - button "测试 Key 1" [ref=f3e895] [cursor=pointer]
+                - button "Key 1 上移" [ref=f3e898] [cursor=pointer]
+                - button "Key 1 下移" [ref=f3e901] [cursor=pointer]
+                - button "删除 Key 1" [ref=f3e904] [cursor=pointer]
+            - article [ref=f3e908]:
+              - button "拖拽排序 Key 3" [ref=f3e909]
+              - generic [ref=f3e917]:
+                - generic [ref=f3e918]: 名称
+                - textbox "Key 3 的名称" [ref=f3e919]: Key 3
+              - generic [ref=f3e920]:
+                - generic [ref=f3e921]: Key
+                - generic [ref=f3e922]:
+                  - textbox "Key 3 的 Key" [ref=f3e923]: sk-gamma
+                  - button "显示 Key 3 的 Key" [ref=f3e924] [cursor=pointer]
+              - generic [ref=f3e928]:
+                - generic [ref=f3e929]: 优先级
+                - textbox "Key 3 的优先级" [ref=f3e930]: "1"
+              - generic [ref=f3e931]: 未测试
+              - generic [ref=f3e932]:
+                - button "测试 Key 3" [ref=f3e933] [cursor=pointer]
+                - button "Key 3 上移" [ref=f3e936] [cursor=pointer]
+                - button "Key 3 下移" [disabled] [ref=f3e939] [cursor=pointer]
+                - button "删除 Key 3" [ref=f3e942] [cursor=pointer]
+      - contentinfo [ref=f3e255]:
+        - button "取消" [ref=f3e256] [cursor=pointer]
+        - button "保存并绑定" [ref=f3e257] [cursor=pointer]
+    - status: 已添加 3 个 Key

@@ -1,0 +1,119 @@
+- iframe [active] [ref=f11e3]:
+  - generic [ref=f12e1]:
+    - generic [ref=f12e2]:
+      - banner [ref=f12e3]:
+        - generic [ref=f12e4]:
+          - button "打开设置" [ref=f12e5] [cursor=pointer]
+          - button "查看版本" [ref=f12e140] [cursor=pointer]:
+            - strong [ref=f12e141]: Atoapi
+            - generic [ref=f12e142]: Graphite · v0.2.16
+        - tablist "Agent 列表" [ref=f12e9]:
+          - tab "Claude Code 已关闭" [selected] [ref=f12e10] [cursor=pointer]:
+            - generic [ref=f12e16]:
+              - generic [ref=f12e17]: Claude Code
+              - generic [ref=f12e18]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f12e20] [cursor=pointer]:
+            - generic [ref=f12e24]:
+              - generic [ref=f12e25]: Claude Desktop
+              - generic [ref=f12e26]: 已关闭
+          - tab "Codex 已关闭" [ref=f12e28] [cursor=pointer]:
+            - generic [ref=f12e33]:
+              - generic [ref=f12e34]: Codex
+              - generic [ref=f12e35]: 已关闭
+          - tab "Gemini 已关闭" [ref=f12e37] [cursor=pointer]:
+            - generic [ref=f12e41]:
+              - generic [ref=f12e42]: Gemini
+              - generic [ref=f12e43]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f12e45] [cursor=pointer]:
+            - generic [ref=f12e50]:
+              - generic [ref=f12e51]: OpenCode
+              - generic [ref=f12e52]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f12e54] [cursor=pointer]:
+            - generic [ref=f12e59]:
+              - generic [ref=f12e60]: OpenClaw
+              - generic [ref=f12e61]: 已关闭
+          - tab "Hermes 已关闭" [ref=f12e63] [cursor=pointer]:
+            - generic [ref=f12e71]:
+              - generic [ref=f12e72]: Hermes
+              - generic [ref=f12e73]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f12e75] [cursor=pointer]:
+            - generic [ref=f12e84]:
+              - generic [ref=f12e85]: 本地代理模式
+              - generic [ref=f12e86]: 已关闭
+        - generic [ref=f12e88]:
+          - generic [ref=f12e143]:
+            - generic [ref=f12e144]: 代理运行中
+            - generic [ref=f12e145]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f12e89] [cursor=pointer]
+      - region [ref=f12e95]:
+        - generic [ref=f12e96]:
+          - switch "启用当前 Agent" [ref=f12e97] [cursor=pointer]
+          - generic [ref=f12e98]:
+            - heading "Claude Code" [level=1] [ref=f12e99]
+            - paragraph [ref=f12e100]: 未选择上游
+        - generic [ref=f12e101]:
+          - generic [ref=f12e102]:
+            - generic [ref=f12e103]: Base URL
+            - code [ref=f12e104]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f12e105] [cursor=pointer]
+          - generic [ref=f12e109]:
+            - generic [ref=f12e110]: Local Key
+            - code [ref=f12e111]: ato-local-preview
+            - button "复制本地 Key" [ref=f12e112] [cursor=pointer]
+        - button "新增上游" [ref=f12e117] [cursor=pointer]
+      - main [ref=f12e120]:
+        - generic [ref=f12e121]:
+          - generic [ref=f12e122]:
+            - generic [ref=f12e123]:
+              - heading "上游路由" [level=2] [ref=f12e124]
+              - paragraph [ref=f12e146]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f12e125]:
+              - generic [ref=f12e126]: 0 个可用上游
+              - generic [ref=f12e127]: 一次入站 · 一次上游
+          - generic [ref=f12e128]: 当前没有上游配置
+      - contentinfo [ref=f12e130]:
+        - button "打开缓存统计与请求记录" [ref=f12e131] [cursor=pointer]:
+          - generic [ref=f12e136]: 缓存与记录
+          - generic [ref=f12e137]:
+            - text: 命中率
+            - strong [ref=f12e138]: 0.0%
+          - generic [ref=f12e139]: 0 成功 · 0 error
+    - dialog [ref=f12e148]:
+      - banner [ref=f12e149]:
+        - generic [ref=f12e150]:
+          - heading "设置" [level=2] [ref=f12e151]
+          - paragraph [ref=f12e152]: 全局代理与应用参数
+        - button "关闭设置" [active] [ref=f12e153] [cursor=pointer]
+      - generic [ref=f12e157]:
+        - tablist "设置分类" [ref=f12e158]:
+          - tab "代理" [selected] [ref=f12e159] [cursor=pointer]
+          - tab "应用" [ref=f12e160] [cursor=pointer]
+          - tab "数据" [ref=f12e161] [cursor=pointer]
+        - generic [ref=f12e162]:
+          - generic [ref=f12e163]:
+            - generic [ref=f12e168]:
+              - generic [ref=f12e169]: 本地代理运行中
+              - generic [ref=f12e170]: 当前监听 127.0.0.1:18883
+            - button "重启" [ref=f12e171] [cursor=pointer]
+          - generic [ref=f12e172]:
+            - generic [ref=f12e173]:
+              - generic [ref=f12e174]: 监听地址
+              - textbox "监听地址" [ref=f12e175]: 127.0.0.1
+            - generic [ref=f12e176]:
+              - generic [ref=f12e177]: 端口
+              - textbox "端口" [ref=f12e178]: "18883"
+            - generic [ref=f12e179]:
+              - generic [ref=f12e180]: 本地 Key
+              - generic [ref=f12e181]:
+                - textbox "本地 Key 显示本地 Key" [ref=f12e182]:
+                  - /placeholder: 已保存本地 Key（留空则不修改）
+                - button "显示本地 Key" [ref=f12e183] [cursor=pointer]
+          - generic [ref=f12e187]:
+            - generic [ref=f12e188]:
+              - generic [ref=f12e189]: 开机自动启动代理
+              - generic [ref=f12e190]: 软件启动后恢复监听端口
+            - switch "开机自动启动代理" [checked] [ref=f12e191] [cursor=pointer]
+      - contentinfo [ref=f12e192]:
+        - button "取消" [ref=f12e193] [cursor=pointer]
+        - button "保存设置" [ref=f12e194] [cursor=pointer]
+    - status

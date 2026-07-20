@@ -8,6 +8,8 @@ use super::{provider_usage_from_value, response_id_from_value, sse};
 pub(super) struct StreamObservation {
     pub model_output_started: bool,
     pub completed_event_seen: bool,
+    pub responses_completed_event_seen: bool,
+    pub message_stop_event_seen: bool,
     pub done_marker_seen: bool,
 }
 
@@ -16,10 +18,14 @@ pub(super) struct StreamSummary {
     pub usage: UsageRecord,
     pub response_id: Option<String>,
     pub completed_event_seen: bool,
+    pub responses_completed_event_seen: bool,
+    pub message_stop_event_seen: bool,
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
+    pub error_summary: Option<String>,
     pub compaction_output_seen: bool,
     pub model_output_seen: bool,
+    pub frame_overflowed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,6 +44,7 @@ pub(super) enum StreamEnd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TerminalFailure {
     ErrorEvent,
+    FrameTooLarge,
     IncompleteEof,
     TransportErrorBeforeTerminal,
 }
@@ -55,12 +62,16 @@ pub(super) fn evaluate_terminal(
     summary: &StreamSummary,
     end: StreamEnd,
 ) -> TerminalVerdict {
+    if summary.frame_overflowed {
+        return terminal_failure(TerminalFailure::FrameTooLarge);
+    }
     if summary.error_event_seen {
         return terminal_failure(TerminalFailure::ErrorEvent);
     }
 
     let strict_terminal_seen = match channel {
-        Channel::Responses | Channel::Anthropic => summary.completed_event_seen,
+        Channel::Responses => summary.responses_completed_event_seen,
+        Channel::Anthropic => summary.message_stop_event_seen,
         Channel::Chat => summary.done_marker_seen,
     };
     let compatible_terminal_seen = strict_terminal_seen
@@ -93,52 +104,44 @@ fn terminal_failure(failure: TerminalFailure) -> TerminalVerdict {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct ResponsesStreamState {
-    pending_line: String,
-    utf8_remainder: Vec<u8>,
+    decoder: sse::SseFrameDecoder,
     summary: StreamSummary,
 }
 
 impl ResponsesStreamState {
+    #[cfg(test)]
+    fn with_max_frame_bytes(max_frame_bytes: usize) -> Self {
+        Self {
+            decoder: sse::SseFrameDecoder::with_max_frame_bytes(max_frame_bytes),
+            summary: StreamSummary::default(),
+        }
+    }
+
     pub fn ingest(&mut self, chunk: &[u8]) -> StreamObservation {
         let output_seen_before = self.summary.model_output_seen;
-        sse::append_utf8_safe(&mut self.pending_line, &mut self.utf8_remainder, chunk);
-        while let Some(newline_index) = self.pending_line.find('\n') {
-            let line = self.pending_line[..newline_index]
-                .trim_end_matches('\r')
-                .to_string();
-            self.pending_line.drain(..=newline_index);
-            self.process_line(&line);
+        for frame in self.decoder.push(chunk) {
+            self.process_frame(frame);
         }
-        if self.pending_line.len() > 1_048_576 {
-            self.pending_line.clear();
-        }
+        self.summary.frame_overflowed |= self.decoder.overflowed();
         StreamObservation {
             model_output_started: !output_seen_before && self.summary.model_output_seen,
             completed_event_seen: self.summary.completed_event_seen,
+            responses_completed_event_seen: self.summary.responses_completed_event_seen,
+            message_stop_event_seen: self.summary.message_stop_event_seen,
             done_marker_seen: self.summary.done_marker_seen,
         }
     }
 
     pub fn finish(mut self) -> StreamSummary {
-        if !self.utf8_remainder.is_empty() {
-            self.pending_line
-                .push_str(&String::from_utf8_lossy(&self.utf8_remainder));
+        for frame in self.decoder.finish() {
+            self.process_frame(frame);
         }
-        if !self.pending_line.is_empty() {
-            let line = std::mem::take(&mut self.pending_line);
-            self.process_line(line.trim_end_matches('\r'));
-        }
+        self.summary.frame_overflowed |= self.decoder.overflowed();
         self.summary
     }
 
-    fn process_line(&mut self, line: &str) {
-        let Some(payload) = line.trim_start().strip_prefix("data:") else {
-            if line.contains("message_stop") {
-                self.summary.completed_event_seen = true;
-            }
-            return;
-        };
-        let payload = payload.trim();
+    fn process_frame(&mut self, frame: sse::SseFrame) {
+        let payload = frame.data.trim();
         if payload.is_empty() {
             return;
         }
@@ -146,25 +149,44 @@ impl ResponsesStreamState {
             self.summary.done_marker_seen = true;
             return;
         }
-        if payload.contains("response.completed") || payload.contains("message_stop") {
-            self.summary.completed_event_seen = true;
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+
+        // An SSE event line is metadata for this complete payload, not a
+        // terminal on its own. Parsing first prevents `event:
+        // response.completed` plus malformed data from being settled as a
+        // successful response.
+        if let Some(event) = frame.event.as_deref() {
+            self.process_event_type(event);
         }
-        if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            self.summary.model_output_seen |= value_has_model_output(&value);
-            self.summary.compaction_output_seen |= value_has_compaction_output(&value);
-            if value.get("error").is_some()
-                || value
-                    .get("type")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_error_event_type)
-            {
-                self.summary.error_event_seen = true;
-            }
-            self.summary.usage.merge(provider_usage_from_value(&value));
-            if let Some(id) = response_id_from_value(&value) {
-                self.summary.response_id = Some(id);
+        let event_type = value.get("type").and_then(Value::as_str);
+        if let Some(event_type) = event_type {
+            self.process_event_type(event_type);
+        }
+        self.summary.model_output_seen |= value_has_model_output(&value);
+        self.summary.compaction_output_seen |= value_has_compaction_output(&value);
+        if value.get("error").is_some_and(|error| !error.is_null()) {
+            self.summary.error_event_seen = true;
+        }
+        if self.summary.error_event_seen && self.summary.error_summary.is_none() {
+            let summary = super::upstream_error_summary_from_value(&value);
+            if !summary.is_empty() {
+                self.summary.error_summary = Some(summary);
             }
         }
+        self.summary.usage.merge(provider_usage_from_value(&value));
+        if let Some(id) = response_id_from_value(&value) {
+            self.summary.response_id = Some(id);
+        }
+    }
+
+    fn process_event_type(&mut self, event_type: &str) {
+        self.summary.responses_completed_event_seen |= event_type == "response.completed";
+        self.summary.message_stop_event_seen |= event_type == "message_stop";
+        self.summary.completed_event_seen =
+            self.summary.responses_completed_event_seen || self.summary.message_stop_event_seen;
+        self.summary.error_event_seen |= is_error_event_type(event_type);
     }
 }
 
@@ -357,6 +379,7 @@ mod tests {
 
         let summary = state.finish();
         assert!(summary.error_event_seen);
+        assert_eq!(summary.error_summary.as_deref(), Some("bad"));
         assert!(summary.done_marker_seen);
         assert!(!summary.completed_event_seen);
     }
@@ -372,6 +395,130 @@ mod tests {
         let second = state.ingest(&event.as_bytes()[split_at..]);
 
         assert!(second.model_output_started);
+    }
+
+    #[test]
+    fn parses_crlf_multiline_data_as_one_complete_frame() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"event: response.completed\r\ndata: {\"type\":\"response.completed\",\r\ndata: \"response\":{\"id\":\"resp_crlf\"}}\r\n\r\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.completed_event_seen);
+        assert_eq!(summary.response_id.as_deref(), Some("resp_crlf"));
+    }
+
+    #[test]
+    fn ordinary_text_containing_terminal_names_does_not_complete_stream() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed and message_stop are plain text\"}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.model_output_seen);
+        assert!(!summary.completed_event_seen);
+    }
+
+    #[test]
+    fn truncated_terminal_frame_at_eof_is_not_accepted() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(b"data: {\"type\":\"response.completed\",\"response\":{}");
+
+        let summary = state.finish();
+        assert!(!summary.completed_event_seen);
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::IncompleteEof)
+        );
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::TransportError,
+            ),
+            terminal_failure(TerminalFailure::TransportErrorBeforeTerminal)
+        );
+    }
+
+    #[test]
+    fn event_only_terminal_does_not_complete_stream() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(b"event: response.completed\n\n");
+
+        let summary = state.finish();
+        assert!(!summary.responses_completed_event_seen);
+        assert!(!summary.completed_event_seen);
+    }
+
+    #[test]
+    fn malformed_data_after_terminal_event_does_not_complete_stream() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(b"event: response.completed\ndata: not-json\n\n");
+
+        let summary = state.finish();
+        assert!(!summary.responses_completed_event_seen);
+        assert!(!summary.completed_event_seen);
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::IncompleteEof)
+        );
+    }
+
+    #[test]
+    fn null_error_field_does_not_turn_completion_into_failure() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.completed\",\"error\":null,\"response\":{\"id\":\"resp_null_error\"}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(!summary.error_event_seen);
+        assert!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            )
+            .success
+        );
+    }
+
+    #[test]
+    fn oversized_frame_is_a_failure_even_after_a_valid_completion() {
+        let mut state = ResponsesStreamState::with_max_frame_bytes(128);
+        let mut oversized = b"data: ".to_vec();
+        oversized.extend(std::iter::repeat(b'x').take(160));
+        state.ingest(&oversized);
+        state.ingest(
+            b"\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_after_overflow\"}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.frame_overflowed);
+        assert!(summary.completed_event_seen);
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::FrameTooLarge)
+        );
     }
 
     #[test]
@@ -391,7 +538,7 @@ mod tests {
         );
 
         let completed = StreamSummary {
-            completed_event_seen: true,
+            responses_completed_event_seen: true,
             ..StreamSummary::default()
         };
         assert_eq!(
@@ -452,7 +599,7 @@ mod tests {
         );
 
         let anthropic = StreamSummary {
-            completed_event_seen: true,
+            message_stop_event_seen: true,
             ..StreamSummary::default()
         };
         assert!(
@@ -467,9 +614,43 @@ mod tests {
     }
 
     #[test]
+    fn terminal_events_are_not_interchangeable_between_protocols() {
+        let responses = StreamSummary {
+            completed_event_seen: true,
+            responses_completed_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Anthropic,
+                TerminalCompatibility::Strict,
+                &responses,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::IncompleteEof)
+        );
+
+        let anthropic = StreamSummary {
+            completed_event_seen: true,
+            message_stop_event_seen: true,
+            ..StreamSummary::default()
+        };
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &anthropic,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::IncompleteEof)
+        );
+    }
+
+    #[test]
     fn error_event_fails_even_when_a_terminal_marker_is_present() {
         let summary = StreamSummary {
             completed_event_seen: true,
+            responses_completed_event_seen: true,
             error_event_seen: true,
             ..StreamSummary::default()
         };
@@ -488,6 +669,7 @@ mod tests {
     fn transport_error_after_terminal_is_a_successful_trailing_anomaly() {
         let summary = StreamSummary {
             completed_event_seen: true,
+            responses_completed_event_seen: true,
             ..StreamSummary::default()
         };
         assert_eq!(

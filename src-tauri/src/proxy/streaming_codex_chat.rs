@@ -11,12 +11,12 @@ use super::{
         CodexToolContext,
     },
 };
-use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
-use crate::proxy::sse::{strip_sse_field, take_sse_block};
+use crate::proxy::{json_canonical::canonicalize_tool_arguments_str, sse::SseFrameDecoder};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use uuid::Uuid;
 
 #[derive(Debug, Default)]
 struct TextItemState {
@@ -85,7 +85,7 @@ impl Default for ChatToResponsesState {
         Self {
             response_started: false,
             completed: false,
-            response_id: "resp_ccsplus".to_string(),
+            response_id: format!("resp_{}", Uuid::new_v4().simple()),
             model: String::new(),
             created_at: 0,
             next_output_index: 0,
@@ -102,8 +102,9 @@ impl Default for ChatToResponsesState {
 }
 
 impl ChatToResponsesState {
-    fn with_tool_context(tool_context: CodexToolContext) -> Self {
+    fn with_tool_context_and_model(tool_context: CodexToolContext, fallback_model: String) -> Self {
         Self {
+            model: fallback_model,
             tool_context,
             ..Self::default()
         }
@@ -112,16 +113,18 @@ impl ChatToResponsesState {
     fn handle_chat_chunk(&mut self, chunk: &Value) -> Vec<Bytes> {
         let mut events = Vec::new();
 
-        if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
-            self.response_id = response_id_from_chat_id(Some(id));
-        }
-        if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
-            if !model.is_empty() {
-                self.model = model.to_string();
+        if !self.response_started {
+            if let Some(id) = chunk.get("id").and_then(|v| v.as_str()) {
+                self.response_id = response_id_from_chat_id(Some(id));
             }
-        }
-        if let Some(created) = chunk.get("created").and_then(|v| v.as_u64()) {
-            self.created_at = created;
+            if let Some(model) = chunk.get("model").and_then(|v| v.as_str()) {
+                if !model.is_empty() {
+                    self.model = model.to_string();
+                }
+            }
+            if let Some(created) = chunk.get("created").and_then(|v| v.as_u64()) {
+                self.created_at = created;
+            }
         }
 
         events.extend(self.ensure_response_started());
@@ -915,45 +918,65 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_from_chat_with_context_and_model(
+        stream,
+        tool_context,
+        String::new(),
+    )
+}
+
+pub fn create_responses_sse_stream_from_chat_with_context_and_model<
+    E: std::error::Error + Send + 'static,
+>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    tool_context: CodexToolContext,
+    fallback_model: String,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
-        let mut buffer = String::new();
-        let mut utf8_remainder: Vec<u8> = Vec::new();
-        let mut state = ChatToResponsesState::with_tool_context(tool_context);
+        let mut decoder = SseFrameDecoder::default();
+        let mut state = ChatToResponsesState::with_tool_context_and_model(
+            tool_context,
+            fallback_model,
+        );
         let mut stream_failed = false;
+        let mut terminal_seen = false;
 
         tokio::pin!(stream);
 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
+                    if terminal_seen {
+                        continue;
+                    }
+                    let frames = decoder.push(&bytes);
+                    if decoder.overflowed() {
+                        yield Ok(state.failed_event(
+                            "Upstream Chat Completions SSE frame exceeded the inspection limit".to_string(),
+                            Some("stream_frame_too_large".to_string()),
+                        ));
+                        stream_failed = true;
+                        break;
+                    }
 
-                    while let Some(block) = take_sse_block(&mut buffer) {
-                        if block.trim().is_empty() {
-                            continue;
-                        }
-
-                        let mut event_name: Option<String> = None;
-                        let mut data_parts: Vec<String> = Vec::new();
-                        for line in block.lines() {
-                            if let Some(event) = strip_sse_field(line, "event") {
-                                event_name = Some(event.trim().to_string());
-                            }
-                            if let Some(data) = strip_sse_field(line, "data") {
-                                data_parts.push(data.to_string());
-                            }
-                        }
-
-                        if data_parts.is_empty() {
-                            continue;
-                        }
-
-                        let data = data_parts.join("\n");
+                    for frame in frames {
+                        let data = frame.data;
                         if data.trim() == "[DONE]" {
                             for event in state.finalize() {
                                 yield Ok(event);
                             }
-                            continue;
+                            terminal_seen = true;
+                            break;
+                        }
+
+                        if frame.event.as_deref() == Some("error") {
+                            let (message, error_type) = serde_json::from_str::<Value>(&data)
+                                .ok()
+                                .map(|value| extract_chat_sse_error(&value))
+                                .unwrap_or_else(|| (data.clone(), None));
+                            yield Ok(state.failed_event(message, error_type));
+                            stream_failed = true;
+                            break;
                         }
 
                         let chunk: Value = match serde_json::from_str(&data) {
@@ -961,7 +984,7 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
                             Err(_) => continue,
                         };
 
-                        if event_name.as_deref() == Some("error") || chunk.get("error").is_some() {
+                        if chunk.get("error").is_some_and(|error| !error.is_null()) {
                             let (message, error_type) = extract_chat_sse_error(&chunk);
                             yield Ok(state.failed_event(message, error_type));
                             stream_failed = true;
@@ -978,6 +1001,12 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
                     }
                 }
                 Err(e) => {
+                    if terminal_seen {
+                        yield Err(std::io::Error::other(format!(
+                            "Stream error after terminal event: {e}"
+                        )));
+                        break;
+                    }
                     yield Ok(state.failed_event(
                         format!("Stream error: {e}"),
                         Some("stream_error".to_string()),
@@ -988,7 +1017,7 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
             }
         }
 
-        if !stream_failed {
+        if !stream_failed && !terminal_seen {
             if state.completed || state.finish_reason.is_some() {
                 for event in state.finalize() {
                     yield Ok(event);
@@ -1112,6 +1141,42 @@ mod tests {
         assert!(!output.contains("<think>"));
         assert!(!output.contains("</think>"));
         assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn freezes_response_identity_after_the_created_event() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_first\",\"created\":123,\"model\":\"model-first\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_second\",\"created\":999,\"model\":\"model-second\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("resp_chatcmpl_first"));
+        assert!(!output.contains("resp_chatcmpl_second"));
+        assert!(output.contains("\"model\":\"model-first\""));
+        assert!(!output.contains("\"model\":\"model-second\""));
+        assert!(output.contains("\"created_at\":123"));
+        assert!(!output.contains("\"created_at\":999"));
+    }
+
+    #[tokio::test]
+    async fn uses_the_route_model_when_the_first_chat_chunk_omits_model() {
+        let upstream = stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl_fallback\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+            )),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n")),
+        ]);
+        let converted = create_responses_sse_stream_from_chat_with_context_and_model(
+            upstream,
+            CodexToolContext::default(),
+            "configured-model".to_string(),
+        );
+        let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
+        let output = String::from_utf8(bytes.concat()).unwrap();
+
+        assert!(output.contains("\"model\":\"configured-model\""));
     }
 
     #[tokio::test]
@@ -1317,6 +1382,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_sse_plain_text_error_event_preserves_the_message() {
+        let output = collect(vec![
+            "event: error\ndata: upstream overloaded\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream overloaded"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
     async fn chat_sse_data_only_error_emits_failed_without_completed() {
         let output = collect(vec![
             "data: {\"error\":{\"message\":\"quota exceeded\",\"code\":\"rate_limit_exceeded\"}}\n\n",
@@ -1327,6 +1405,57 @@ mod tests {
         assert!(output.contains("event: response.failed"));
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_converter_accepts_bom_and_cr_only_frames() {
+        let output = collect(vec![
+            "\u{FEFF}data: {\"id\":\"chatcmpl_cr\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\r\rdata: [DONE]\r\r",
+        ])
+        .await;
+
+        assert!(output.contains("\"text\":\"ok\""));
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_null_error_field_is_not_a_failure() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_null_error\",\"model\":\"gpt-5.4\",\"error\":null,\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("\"text\":\"ok\""));
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
+    }
+
+    #[tokio::test]
+    async fn chat_sse_discards_data_after_done_while_draining_upstream() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_done\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"before\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            "data: {\"id\":\"chatcmpl_done\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"content\":\"after\"}}]}\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("before"));
+        assert!(!output.contains("after"));
+        assert_eq!(output.matches("event: response.completed").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_chat_sse_frame_emits_one_failure_and_stops() {
+        let mut payload = b"data: ".to_vec();
+        payload.resize(1_048_700, b'x');
+        let upstream = stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(payload))]);
+        let converted = create_responses_sse_stream_from_chat(upstream);
+        let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
+        let output = String::from_utf8(bytes.concat()).unwrap();
+
+        assert_eq!(output.matches("event: response.failed").count(), 1);
+        assert!(output.contains("stream_frame_too_large"));
         assert!(!output.contains("event: response.completed"));
     }
 }

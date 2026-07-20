@@ -1,0 +1,146 @@
+- generic [ref=f4e1]:
+  - generic [ref=f4e2]:
+    - banner [ref=f4e3]:
+      - button "打开设置" [ref=f4e5] [cursor=pointer]
+      - tablist "Agent 列表" [ref=f4e9]:
+        - tab "Codex 已启用" [selected] [ref=f4e10] [cursor=pointer]:
+          - generic [ref=f4e15]:
+            - generic [ref=f4e16]: Codex
+            - generic [ref=f4e17]: 已启用
+        - tab "Claude Code 已启用" [ref=f4e19] [cursor=pointer]:
+          - generic [ref=f4e25]:
+            - generic [ref=f4e26]: Claude Code
+            - generic [ref=f4e27]: 已启用
+        - tab "Gemini 已关闭" [ref=f4e29] [cursor=pointer]:
+          - generic [ref=f4e33]:
+            - generic [ref=f4e34]: Gemini
+            - generic [ref=f4e35]: 已关闭
+        - tab "OpenCode 已启用" [ref=f4e37] [cursor=pointer]:
+          - generic [ref=f4e42]:
+            - generic [ref=f4e43]: OpenCode
+            - generic [ref=f4e44]: 已启用
+        - tab "OpenClaw 已关闭" [ref=f4e46] [cursor=pointer]:
+          - generic [ref=f4e51]:
+            - generic [ref=f4e52]: OpenClaw
+            - generic [ref=f4e53]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=f4e55] [cursor=pointer]:
+          - generic [ref=f4e64]:
+            - generic [ref=f4e65]: Proxy Mode
+            - generic [ref=f4e66]: 已启用
+      - generic [ref=f4e68]:
+        - button "刷新模拟数据" [ref=f4e69] [cursor=pointer]
+        - button "查看版本信息" [ref=f4e75] [cursor=pointer]
+    - region [ref=f4e78]:
+      - generic [ref=f4e79]:
+        - switch "启用当前 Agent" [checked] [ref=f4e80] [cursor=pointer]
+        - generic [ref=f4e81]:
+          - heading "Codex" [level=1] [ref=f4e82]
+          - paragraph [ref=f4e83]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=f4e84]:
+        - generic [ref=f4e85]:
+          - generic [ref=f4e86]: Base URL
+          - code [ref=f4e87]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=f4e88] [cursor=pointer]
+        - generic [ref=f4e92]:
+          - generic [ref=f4e93]: Local Key
+          - code [ref=f4e94]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=f4e95] [cursor=pointer]
+      - button "新增上游" [ref=f4e100] [cursor=pointer]
+    - main [ref=f4e103]:
+      - generic [ref=f4e104]:
+        - generic [ref=f4e105]:
+          - generic [ref=f4e106]:
+            - heading "上游路由" [level=2] [ref=f4e107]
+            - paragraph [ref=f4e108]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+          - generic [ref=f4e109]:
+            - generic [ref=f4e110]: 3 个可用上游
+            - generic [ref=f4e111]: 一次入站 · 一次上游
+        - generic [ref=f4e112]:
+          - article [ref=f4e113]:
+            - generic [ref=f4e119]:
+              - generic [ref=f4e120]: 云舟
+              - generic [ref=f4e121]: https://api.yunzhou.example/v1
+            - generic [ref=f4e122]:
+              - generic [ref=f4e123]:
+                - generic [ref=f4e124]: Responses
+                - generic [ref=f4e125]: · 3 个映射
+                - generic [ref=f4e126]: · 2 Key
+              - generic [ref=f4e127]: 最近连通 188ms
+            - generic [ref=f4e128]:
+              - button "当前" [ref=f4e129] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=f4e132] [cursor=pointer]
+              - button "编辑 云舟" [ref=f4e135] [cursor=pointer]
+              - button "删除 云舟" [ref=f4e139] [cursor=pointer]
+          - article [ref=f4e143]:
+            - generic [ref=f4e148]:
+              - generic [ref=f4e149]: api.aiaiaiai
+              - generic [ref=f4e150]: https://api.aiaiaiai.example/v1
+            - generic [ref=f4e151]:
+              - generic [ref=f4e152]:
+                - generic [ref=f4e153]: Auto
+                - generic [ref=f4e154]: · Agent 直传
+                - generic [ref=f4e155]: · 1 Key
+              - generic [ref=f4e156]: 最近连通 241ms
+            - generic [ref=f4e157]:
+              - button "使用" [ref=f4e158] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=f4e163] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=f4e166] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=f4e170] [cursor=pointer]
+          - article [ref=f4e174]:
+            - generic [ref=f4e179]:
+              - generic [ref=f4e180]: sheapi
+              - generic [ref=f4e181]: https://api.sheapi.example/v1
+            - generic [ref=f4e182]:
+              - generic [ref=f4e183]:
+                - generic [ref=f4e184]: Chat
+                - generic [ref=f4e185]: · 2 个映射
+                - generic [ref=f4e186]: · 4 Key
+              - generic [ref=f4e187]: 最近连通 326ms
+            - generic [ref=f4e188]:
+              - button "使用" [ref=f4e189] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=f4e194] [cursor=pointer]
+              - button "编辑 sheapi" [ref=f4e197] [cursor=pointer]
+              - button "删除 sheapi" [ref=f4e201] [cursor=pointer]
+    - contentinfo [ref=f4e205]:
+      - button "打开缓存统计与请求记录" [ref=f4e206] [cursor=pointer]:
+        - generic [ref=f4e211]: 缓存与记录
+        - generic [ref=f4e212]:
+          - text: 命中率
+          - strong [ref=f4e213]: 95.8%
+        - generic [ref=f4e214]: 128 成功 · 2 error
+  - dialog [ref=f4e216]:
+    - banner [ref=f4e217]:
+      - generic [ref=f4e218]:
+        - heading "设置" [level=2] [ref=f4e219]
+        - paragraph [ref=f4e220]: 全局代理与应用参数
+      - button "关闭设置" [active] [ref=f4e221] [cursor=pointer]
+    - generic [ref=f4e225]:
+      - tablist "设置分类" [ref=f4e226]:
+        - tab "代理" [selected] [ref=f4e227] [cursor=pointer]
+        - tab "应用" [ref=f4e228] [cursor=pointer]
+        - tab "数据" [ref=f4e229] [cursor=pointer]
+      - generic [ref=f4e230]:
+        - generic [ref=f4e231]:
+          - generic [ref=f4e236]:
+            - generic [ref=f4e237]: 本地代理运行中
+            - generic [ref=f4e238]: Responses、Chat、Anthropic 入口已监听
+          - button "重启" [ref=f4e239] [cursor=pointer]
+        - generic [ref=f4e240]:
+          - generic [ref=f4e241]:
+            - generic [ref=f4e242]: 监听地址
+            - textbox "监听地址" [ref=f4e243]: 127.0.0.1
+          - generic [ref=f4e244]:
+            - generic [ref=f4e245]: 端口
+            - textbox "端口" [ref=f4e246]: "18883"
+          - generic [ref=f4e247]:
+            - generic [ref=f4e248]: 本地 Key
+            - textbox "本地 Key" [ref=f4e249]: atoapi-local-demo-key
+        - generic [ref=f4e250]:
+          - generic [ref=f4e251]:
+            - generic [ref=f4e252]: 开机自动启动代理
+            - generic [ref=f4e253]: 软件启动后恢复监听端口
+          - switch "开机自动启动代理" [checked] [ref=f4e254] [cursor=pointer]
+    - contentinfo [ref=f4e255]:
+      - button "取消" [ref=f4e256] [cursor=pointer]
+      - button "保存设置" [ref=f4e257] [cursor=pointer]
+  - status

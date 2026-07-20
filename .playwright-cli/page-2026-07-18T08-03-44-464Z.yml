@@ -1,0 +1,86 @@
+- generic [active] [ref=f16e1]:
+  - generic [ref=f16e2]:
+    - banner [ref=f16e3]:
+      - button "打开设置" [ref=f16e5] [cursor=pointer]
+      - tablist "Agent 列表" [ref=f16e9]:
+        - tab "Codex" [selected] [ref=f16e10] [cursor=pointer]
+        - tab "Claude Code" [ref=f16e18] [cursor=pointer]
+        - tab "Gemini" [ref=f16e27] [cursor=pointer]
+        - tab "OpenCode" [ref=f16e34] [cursor=pointer]
+        - tab "OpenClaw" [ref=f16e42] [cursor=pointer]
+        - tab "Proxy Mode" [ref=f16e50] [cursor=pointer]
+      - button "查看版本信息" [ref=f16e63] [cursor=pointer]
+    - region [ref=f16e66]:
+      - generic [ref=f16e67]:
+        - switch "启用当前 Agent" [checked] [ref=f16e68] [cursor=pointer]
+        - generic [ref=f16e69]:
+          - heading "Codex" [level=1] [ref=f16e70]
+          - paragraph [ref=f16e71]: 云舟 · Responses · 3 个模型映射
+      - generic [ref=f16e72]:
+        - generic [ref=f16e73]:
+          - generic [ref=f16e74]: Base URL
+          - code [ref=f16e75]: http://127.0.0.1:18883/codex/v1
+          - button "复制 Base URL" [ref=f16e76] [cursor=pointer]
+        - generic [ref=f16e80]:
+          - generic [ref=f16e81]: Local Key
+          - code [ref=f16e82]: atoapi-codex-demo-key
+          - button "复制本地 Key" [ref=f16e83] [cursor=pointer]
+      - button "新增上游" [ref=f16e88] [cursor=pointer]
+    - main [ref=f16e91]:
+      - generic [ref=f16e92]:
+        - generic [ref=f16e93]:
+          - heading "上游路由" [level=2] [ref=f16e95]
+          - generic [ref=f16e96]: 3 个可用上游
+        - generic [ref=f16e98]:
+          - article [ref=f16e99]:
+            - generic [ref=f16e105]:
+              - generic [ref=f16e106]: 云舟
+              - generic [ref=f16e107]: https://api.yunzhou.example/v1
+            - generic [ref=f16e108]:
+              - generic [ref=f16e109]:
+                - generic [ref=f16e110]: Responses
+                - generic [ref=f16e111]: · 3 个映射
+                - generic [ref=f16e112]: · 2 Key
+              - generic [ref=f16e113]: 188ms
+            - generic [ref=f16e115]:
+              - button "当前" [ref=f16e116] [cursor=pointer]
+              - button "测试 云舟 连通性" [ref=f16e119] [cursor=pointer]
+              - button "编辑 云舟" [ref=f16e122] [cursor=pointer]
+              - button "删除 云舟" [ref=f16e126] [cursor=pointer]
+          - article [ref=f16e130]:
+            - generic [ref=f16e135]:
+              - generic [ref=f16e136]: api.aiaiaiai
+              - generic [ref=f16e137]: https://api.aiaiaiai.example/v1
+            - generic [ref=f16e138]:
+              - generic [ref=f16e139]:
+                - generic [ref=f16e140]: Auto
+                - generic [ref=f16e141]: · Agent 直传
+                - generic [ref=f16e142]: · 1 Key
+              - generic [ref=f16e143]: 241ms
+            - generic [ref=f16e145]:
+              - button "使用" [ref=f16e146] [cursor=pointer]
+              - button "测试 api.aiaiaiai 连通性" [ref=f16e151] [cursor=pointer]
+              - button "编辑 api.aiaiaiai" [ref=f16e154] [cursor=pointer]
+              - button "删除 api.aiaiaiai" [ref=f16e158] [cursor=pointer]
+          - article [ref=f16e162]:
+            - generic [ref=f16e167]:
+              - generic [ref=f16e168]: sheapi
+              - generic [ref=f16e169]: https://api.sheapi.example/v1
+            - generic [ref=f16e170]:
+              - generic [ref=f16e171]:
+                - generic [ref=f16e172]: Chat
+                - generic [ref=f16e173]: · 2 个映射
+                - generic [ref=f16e174]: · 4 Key
+              - generic [ref=f16e175]: 326ms
+            - generic [ref=f16e177]:
+              - button "使用" [ref=f16e178] [cursor=pointer]
+              - button "测试 sheapi 连通性" [ref=f16e183] [cursor=pointer]
+              - button "编辑 sheapi" [ref=f16e186] [cursor=pointer]
+              - button "删除 sheapi" [ref=f16e190] [cursor=pointer]
+    - contentinfo [ref=f16e194]:
+      - button "打开缓存统计与请求记录" [ref=f16e195] [cursor=pointer]:
+        - generic [ref=f16e200]: 缓存与记录
+        - generic [ref=f16e201]:
+          - text: 命中率
+          - strong [ref=f16e202]: 95.8%
+  - status

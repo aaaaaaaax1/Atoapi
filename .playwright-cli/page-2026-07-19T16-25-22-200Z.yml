@@ -1,0 +1,81 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]:
+      - button "查看版本更新" [ref=e6] [cursor=pointer]
+      - generic [ref=e10]:
+        - generic [ref=e11]: Atoapi
+        - generic [ref=e12]: Graphite · Relay
+      - button "查看版本更新" [ref=e14] [cursor=pointer]: v0.2.16
+    - navigation "Agent 注入" [ref=e15]:
+      - button "Claude Code 已关闭 Agent 已关闭" [ref=e16] [cursor=pointer]:
+        - generic [ref=e21]:
+          - generic [ref=e22]: Claude Code
+          - generic "未选择上游" [ref=e23]: 已关闭
+        - generic "Agent 已关闭" [ref=e24]
+      - button "Claude Desktop 已关闭 Agent 已关闭" [ref=e25] [cursor=pointer]:
+        - generic [ref=e30]:
+          - generic [ref=e31]: Claude Desktop
+          - generic "未选择上游" [ref=e32]: 已关闭
+        - generic "Agent 已关闭" [ref=e33]
+      - button "Codex 已关闭 Agent 已关闭" [ref=e34] [cursor=pointer]:
+        - generic [ref=e48]:
+          - generic [ref=e49]: Codex
+          - generic "未选择上游" [ref=e50]: 已关闭
+        - generic "Agent 已关闭" [ref=e51]
+      - button "Gemini 已关闭 Agent 已关闭" [ref=e52] [cursor=pointer]:
+        - generic [ref=e56]:
+          - generic [ref=e57]: Gemini
+          - generic "未选择上游" [ref=e58]: 已关闭
+        - generic "Agent 已关闭" [ref=e59]
+      - button "OpenCode 已关闭 Agent 已关闭" [ref=e60] [cursor=pointer]:
+        - generic [ref=e66]:
+          - generic [ref=e67]: OpenCode
+          - generic "未选择上游" [ref=e68]: 已关闭
+        - generic "Agent 已关闭" [ref=e69]
+      - button "OpenClaw 已关闭 Agent 已关闭" [ref=e70] [cursor=pointer]:
+        - generic [ref=e76]:
+          - generic [ref=e77]: OpenClaw
+          - generic "未选择上游" [ref=e78]: 已关闭
+        - generic "Agent 已关闭" [ref=e79]
+      - button "Hermes 已关闭 Agent 已关闭" [ref=e80] [cursor=pointer]:
+        - generic [ref=e84]:
+          - generic [ref=e85]: Hermes
+          - generic "未选择上游" [ref=e86]: 已关闭
+        - generic "Agent 已关闭" [ref=e87]
+      - button "本地代理模式 已关闭 Agent 已关闭" [ref=e88] [cursor=pointer]:
+        - generic [ref=e95]:
+          - generic [ref=e96]: 本地代理模式
+          - generic "未选择上游" [ref=e97]: 已关闭
+        - generic "Agent 已关闭" [ref=e98]
+    - generic [ref=e99]:
+      - generic "http://127.0.0.1:18883" [ref=e100]:
+        - generic [ref=e102]: 本地中转
+        - code [ref=e103]: 127.0.0.1:18883
+      - button "刷新配置和统计" [ref=e104] [cursor=pointer]
+      - button "查看版本更新" [ref=e110] [cursor=pointer]
+  - generic [ref=e114]:
+    - generic [ref=e115]:
+      - generic [ref=e116]:
+        - switch "开启这个 Agent 注入" [ref=e117] [cursor=pointer]
+        - generic [ref=e123]:
+          - heading "Claude Code" [level=3] [ref=e124]
+          - paragraph [ref=e125]: 为这个 Agent 选择一个中转上游。模型未命中映射时会直接透传 Agent 请求里的 model。
+      - button "新增上游" [ref=e127] [cursor=pointer]
+      - generic [ref=e130]:
+        - generic [ref=e131]:
+          - generic [ref=e132]: Anthropic Base URL
+          - code [ref=e133]: http://127.0.0.1:18883
+          - button "复制 Anthropic Base URL" [ref=e134] [cursor=pointer]
+        - generic [ref=e138]:
+          - generic [ref=e139]: Agent Key
+          - code [ref=e140]: ato-local-preview
+          - button "复制 Agent Key" [ref=e141] [cursor=pointer]
+    - heading "选择这个 Agent 使用的上游" [level=3] [ref=e147]
+    - generic [ref=e148]:
+      - generic [ref=e154]: 还没有上游。先新增一个中转，然后这个 Agent 会自动绑定到它。
+      - button "新增上游" [ref=e155] [cursor=pointer]
+  - generic [ref=e157]:
+    - button "缓存与记录" [ref=e158] [cursor=pointer]
+    - generic [ref=e165]:
+      - strong [ref=e166]: 命中率 0.0%
+      - generic [ref=e167]: 0 成功 · 0 error

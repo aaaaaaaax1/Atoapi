@@ -1,0 +1,97 @@
+- iframe [active] [ref=f2e3]:
+  - generic [active] [ref=f3e1]:
+    - generic [ref=f3e2]:
+      - banner [ref=f3e3]:
+        - generic [ref=f3e4]:
+          - button "打开设置" [ref=f3e5] [cursor=pointer]
+          - button "查看版本" [ref=f3e9] [cursor=pointer]:
+            - strong [ref=f3e10]: Atoapi
+            - generic [ref=f3e11]: Graphite · vNext
+        - tablist "Agent 列表" [ref=f3e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f3e261] [cursor=pointer]:
+            - generic [ref=f3e267]:
+              - generic [ref=f3e268]: Claude Code
+              - generic [ref=f3e269]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f3e271] [cursor=pointer]:
+            - generic [ref=f3e275]:
+              - generic [ref=f3e276]: Claude Desktop
+              - generic [ref=f3e277]: 已关闭
+          - tab "Codex 已关闭" [ref=f3e279] [cursor=pointer]:
+            - generic [ref=f3e284]:
+              - generic [ref=f3e285]: Codex
+              - generic [ref=f3e286]: 已关闭
+          - tab "Gemini 已关闭" [ref=f3e288] [cursor=pointer]:
+            - generic [ref=f3e292]:
+              - generic [ref=f3e293]: Gemini
+              - generic [ref=f3e294]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f3e296] [cursor=pointer]:
+            - generic [ref=f3e301]:
+              - generic [ref=f3e302]: OpenCode
+              - generic [ref=f3e303]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f3e305] [cursor=pointer]:
+            - generic [ref=f3e310]:
+              - generic [ref=f3e311]: OpenClaw
+              - generic [ref=f3e312]: 已关闭
+          - tab "Hermes 已关闭" [ref=f3e314] [cursor=pointer]:
+            - generic [ref=f3e322]:
+              - generic [ref=f3e323]: Hermes
+              - generic [ref=f3e324]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f3e326] [cursor=pointer]:
+            - generic [ref=f3e335]:
+              - generic [ref=f3e336]: 本地代理模式
+              - generic [ref=f3e337]: 已关闭
+        - generic [ref=f3e91]:
+          - generic [ref=f3e92]:
+            - generic [ref=f3e93]: 代理运行中
+            - generic [ref=f3e94]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f3e95] [cursor=pointer]
+      - region [ref=f3e101]:
+        - generic [ref=f3e102]:
+          - switch "启用当前 Agent" [ref=f3e103] [cursor=pointer]
+          - generic [ref=f3e104]:
+            - heading "Claude Code" [level=1] [ref=f3e105]
+            - paragraph [ref=f3e106]: Fresh · Responses · 模型直传
+        - generic [ref=f3e107]:
+          - generic [ref=f3e344]:
+            - generic [ref=f3e345]: Base URL
+            - code [ref=f3e346]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f3e347] [cursor=pointer]
+          - generic [ref=f3e351]:
+            - generic [ref=f3e352]: Local Key
+            - code [ref=f3e353]: atoapi-claude-code-demo-key
+            - button "复制本地 Key" [ref=f3e354] [cursor=pointer]
+        - button "新增上游" [ref=f3e123] [cursor=pointer]
+      - main [ref=f3e126]:
+        - generic [ref=f3e127]:
+          - generic [ref=f3e128]:
+            - generic [ref=f3e129]:
+              - heading "上游路由" [level=2] [ref=f3e130]
+              - paragraph [ref=f3e131]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f3e132]:
+              - generic [ref=f3e133]: 1 个可用上游
+              - generic [ref=f3e134]: 一次入站 · 一次上游
+          - article [ref=f3e359]:
+            - generic [ref=f3e365]:
+              - generic [ref=f3e366]: Fresh
+              - generic [ref=f3e367]: https://fresh.qa/v1
+            - generic [ref=f3e368]:
+              - generic [ref=f3e369]:
+                - generic [ref=f3e370]: Responses
+                - generic [ref=f3e371]: · Agent 直传
+                - generic [ref=f3e372]: · 0 Key
+              - generic [ref=f3e373]:
+                - generic [ref=f3e374]: 最近连通
+                - generic [ref=f3e375]: 未检测
+            - generic [ref=f3e376]:
+              - button "当前" [ref=f3e377] [cursor=pointer]
+              - button "测试 Fresh 连通性" [ref=f3e380] [cursor=pointer]
+              - button "编辑 Fresh" [ref=f3e383] [cursor=pointer]
+              - button "删除 Fresh" [ref=f3e387] [cursor=pointer]
+      - contentinfo [ref=f3e137]:
+        - button "打开缓存统计与请求记录" [ref=f3e138] [cursor=pointer]:
+          - generic [ref=f3e143]: 缓存与记录
+          - generic [ref=f3e144]:
+            - text: 命中率
+            - strong [ref=f3e395]: 0.0%
+          - generic [ref=f3e146]: 0 成功 · 0 error
+    - status: 上游配置已保存并绑定到当前 Agent

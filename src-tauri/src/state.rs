@@ -22,9 +22,10 @@ use crate::{
         AppConfig, ProviderConfig, PublicConfig,
     },
     metrics::MetricsStore,
+    persistence::{WriteBehindCoordinator, WriteOperation},
     proxy::{
         self, cache_affinity::ShadowAffinityStore, cache_validation::CacheValidationController,
-        TransportClients,
+        DispatchDrainOutcome, DispatchTracker, TransportClients,
     },
 };
 
@@ -58,33 +59,31 @@ impl ProxyServer {
 pub struct AppState {
     pub config: RwLock<AppConfig>,
     pub config_path: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub runtime_state_path: PathBuf,
     pub cache: CacheStore,
     pub metrics: MetricsStore,
     pub transport_clients: TransportClients,
     pub prefix_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    pub prefix_states: Mutex<HashMap<String, PrefixWarmState>>,
+    pub prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
     pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    pub compact_endpoint_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
-    pub response_session_error_cooldowns: Mutex<HashMap<String, ResponseSessionCooldownState>>,
-    pub response_sessions: Mutex<HashMap<String, ResponseSessionState>>,
+    pub response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
+    pub response_sessions: Arc<Mutex<HashMap<String, Arc<ResponseSessionState>>>>,
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
-    pub shadow_affinity: Mutex<ShadowAffinityStore>,
+    pub shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
     pub cache_validation: Mutex<CacheValidationController>,
-    cache_capability_probe_tasks: Mutex<HashMap<String, CacheCapabilityProbeTaskState>>,
+    pub relay_tasks: DispatchTracker,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct CacheCapabilityProbeTaskState {
-    in_flight: bool,
-    last_finished_at: Option<std::time::Instant>,
+    config_persistence: ConfigWriteCoordinator,
+    runtime_state_journal: RuntimeStateJournal,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +99,9 @@ pub struct PrefixWarmState {
     pub seen_bucket_tokens_128: u64,
     pub avoidable_shortfall_tokens_128: u64,
     pub small_gap_recovery_streak: u32,
+    // Runtime-only evidence: persisted prefix snapshots must re-earn this
+    // narrow recovery signal after restart.
+    pub recent_clean_tiny_gap_streak: u32,
     pub cache_instability_score: u32,
     pub settle_after_cold_read: bool,
     pub tail_tool_output_chars: u64,
@@ -176,6 +178,150 @@ struct PersistedResponseSessionCooldownState {
     unsupported: bool,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeStateMaps {
+    prefix_states: HashMap<String, PrefixWarmState>,
+    response_sessions: HashMap<String, Arc<ResponseSessionState>>,
+    response_session_error_cooldowns: HashMap<String, ResponseSessionCooldownState>,
+    shadow_affinity: ShadowAffinityStore,
+}
+
+fn capture_runtime_state(
+    prefix_states: &Mutex<HashMap<String, PrefixWarmState>>,
+    response_sessions: &Mutex<HashMap<String, Arc<ResponseSessionState>>>,
+    response_session_error_cooldowns: &Mutex<HashMap<String, ResponseSessionCooldownState>>,
+    shadow_affinity: &Mutex<ShadowAffinityStore>,
+) -> RuntimeStateMaps {
+    RuntimeStateMaps {
+        prefix_states: prefix_states.blocking_lock().clone(),
+        response_sessions: response_sessions.blocking_lock().clone(),
+        response_session_error_cooldowns: response_session_error_cooldowns.blocking_lock().clone(),
+        shadow_affinity: shadow_affinity.blocking_lock().clone(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConfigWriteCoordinator {
+    state: Arc<std::sync::Mutex<ConfigWriteState>>,
+    writer: WriteBehindCoordinator,
+}
+
+#[derive(Debug)]
+struct ConfigWriteState {
+    accepting: bool,
+    latest: Option<Arc<AppConfig>>,
+}
+
+impl ConfigWriteCoordinator {
+    fn new(path: PathBuf, metrics: MetricsStore) -> Self {
+        Self::new_with_job(metrics, move |config| config.save(&path))
+    }
+
+    fn new_with_job(
+        metrics: MetricsStore,
+        write_job: impl Fn(Arc<AppConfig>) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        let state = Arc::new(std::sync::Mutex::new(ConfigWriteState {
+            accepting: true,
+            latest: None,
+        }));
+        let state_for_writer = state.clone();
+        let writer = WriteBehindCoordinator::new("config_save", move |operation| {
+            debug_assert_eq!(operation, WriteOperation::Snapshot);
+            let config = state_for_writer
+                .lock()
+                .expect("config persistence snapshot lock must not be poisoned")
+                .latest
+                .clone()
+                .context("config persistence snapshot was not published")?;
+            write_job(config)
+        });
+        writer.attach_error_reporter(metrics);
+        Self { state, writer }
+    }
+
+    fn publish(&self, config: &AppConfig) -> Result<u64> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("config persistence snapshot lock must not be poisoned");
+        if !state.accepting {
+            return Err(anyhow::anyhow!("config persistence is closed"));
+        }
+        state.latest = Some(Arc::new(config.clone()));
+        // Keep snapshot replacement and generation publication under the same
+        // gate so flush can never observe one without the other.
+        Ok(self.writer.mark_dirty(WriteOperation::Snapshot))
+    }
+
+    async fn wait_for(&self, version: u64) -> Result<()> {
+        self.writer.wait_for(version).await
+    }
+
+    async fn persist(&self, config: &AppConfig) -> Result<()> {
+        let version = self.publish(config)?;
+        self.wait_for(version).await
+    }
+
+    async fn flush(&self) -> Result<()> {
+        match self.writer.flush_latest().await {
+            Ok(()) => Ok(()),
+            Err(_) => self.writer.retry_latest().await,
+        }
+    }
+
+    async fn close_and_flush(&self) -> Result<()> {
+        self.state
+            .lock()
+            .expect("config persistence snapshot lock must not be poisoned")
+            .accepting = false;
+        self.flush().await
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeStateJournal {
+    writer: WriteBehindCoordinator,
+}
+
+impl RuntimeStateJournal {
+    fn new(
+        path: PathBuf,
+        prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
+        response_sessions: Arc<Mutex<HashMap<String, Arc<ResponseSessionState>>>>,
+        response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
+        shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
+        metrics: MetricsStore,
+    ) -> Self {
+        let writer = WriteBehindCoordinator::new("runtime_state_save", move |operation| {
+            debug_assert_eq!(operation, WriteOperation::Snapshot);
+            let snapshot = capture_runtime_state(
+                &prefix_states,
+                &response_sessions,
+                &response_session_error_cooldowns,
+                &shadow_affinity,
+            );
+            save_runtime_state(
+                &path,
+                &snapshot.prefix_states,
+                &snapshot.response_sessions,
+                &snapshot.response_session_error_cooldowns,
+                &snapshot.shadow_affinity,
+            )
+        });
+        writer.attach_error_reporter(metrics);
+        Self { writer }
+    }
+
+    fn mark_dirty(&self) {
+        self.writer.mark_dirty(WriteOperation::Snapshot);
+    }
+
+    async fn flush(&self) -> Result<()> {
+        self.writer.write_now(WriteOperation::Snapshot).await
+    }
+}
+
 const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
 
@@ -193,65 +339,100 @@ impl AppState {
             config.proxy_mode_port = port.saturating_add(1);
         }
         let cache = CacheStore::load(cache_path(&config_dir))?;
+        let metrics = MetricsStore::new();
+        cache.attach_error_reporter(metrics.clone());
+        let config_persistence = ConfigWriteCoordinator::new(config_path.clone(), metrics.clone());
         let runtime_state_path = runtime_state_path(&config_dir);
         let mut runtime_state = load_runtime_state(&runtime_state_path)?;
         migrate_prefix_states_for_config(&mut runtime_state.prefix_states, &config);
+        let prefix_states = Arc::new(Mutex::new(runtime_state.prefix_states));
+        let response_session_error_cooldowns =
+            Arc::new(Mutex::new(runtime_state.response_session_error_cooldowns));
+        let response_sessions = Arc::new(Mutex::new(runtime_state.response_sessions));
+        let shadow_affinity = Arc::new(Mutex::new(runtime_state.shadow_affinity));
+        let runtime_state_journal = RuntimeStateJournal::new(
+            runtime_state_path.clone(),
+            prefix_states.clone(),
+            response_sessions.clone(),
+            response_session_error_cooldowns.clone(),
+            shadow_affinity.clone(),
+            metrics.clone(),
+        );
         Ok(Self {
             config: RwLock::new(config),
             config_path: config_path.clone(),
             runtime_state_path,
             cache,
-            metrics: MetricsStore::new(),
+            metrics,
             transport_clients: TransportClients::new(crate::ATOAPI_USER_AGENT)?,
             prefix_locks: Mutex::new(HashMap::new()),
-            prefix_states: Mutex::new(runtime_state.prefix_states),
+            prefix_states,
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
+            compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
-            response_session_error_cooldowns: Mutex::new(
-                runtime_state.response_session_error_cooldowns,
-            ),
-            response_sessions: Mutex::new(runtime_state.response_sessions),
+            response_session_error_cooldowns,
+            response_sessions,
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
-            shadow_affinity: Mutex::new(runtime_state.shadow_affinity),
+            shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
-            cache_capability_probe_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: DispatchTracker::default(),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
+            config_persistence,
+            runtime_state_journal,
         })
     }
 
     #[cfg(test)]
     pub fn for_test(config: AppConfig, config_path: PathBuf, cache: CacheStore) -> Result<Self> {
         let runtime_state_path = config_path.with_file_name("runtime-state.json");
+        let metrics = MetricsStore::new();
+        cache.attach_error_reporter(metrics.clone());
+        let config_persistence = ConfigWriteCoordinator::new(config_path.clone(), metrics.clone());
+        let prefix_states = Arc::new(Mutex::new(HashMap::new()));
+        let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let response_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
+        let runtime_state_journal = RuntimeStateJournal::new(
+            runtime_state_path.clone(),
+            prefix_states.clone(),
+            response_sessions.clone(),
+            response_session_error_cooldowns.clone(),
+            shadow_affinity.clone(),
+            metrics.clone(),
+        );
         Ok(Self {
             config: RwLock::new(config),
             config_path: config_path.clone(),
             runtime_state_path,
             cache,
-            metrics: MetricsStore::new(),
+            metrics,
             transport_clients: TransportClients::new("AtoapiTest/0.1")?,
             prefix_locks: Mutex::new(HashMap::new()),
-            prefix_states: Mutex::new(HashMap::new()),
+            prefix_states,
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
+            compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
-            response_session_error_cooldowns: Mutex::new(HashMap::new()),
-            response_sessions: Mutex::new(HashMap::new()),
+            response_session_error_cooldowns,
+            response_sessions,
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
-            shadow_affinity: Mutex::new(ShadowAffinityStore::default()),
+            shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
-            cache_capability_probe_tasks: Mutex::new(HashMap::new()),
+            relay_tasks: DispatchTracker::default(),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
+            config_persistence,
+            runtime_state_journal,
         })
     }
 
@@ -266,37 +447,14 @@ impl AppState {
         self.transport_clients.client(use_system_proxy)
     }
 
-    pub async fn try_begin_cache_capability_probe(
-        &self,
-        scope_key: &str,
-        cooldown: StdDuration,
-    ) -> bool {
-        let mut tasks = self.cache_capability_probe_tasks.lock().await;
-        let task = tasks.entry(scope_key.to_string()).or_default();
-        if task.in_flight
-            || task
-                .last_finished_at
-                .is_some_and(|finished| finished.elapsed() < cooldown)
-        {
-            return false;
-        }
-        task.in_flight = true;
-        true
-    }
-
-    pub async fn finish_cache_capability_probe(&self, scope_key: &str) {
-        let mut tasks = self.cache_capability_probe_tasks.lock().await;
-        let task = tasks.entry(scope_key.to_string()).or_default();
-        task.in_flight = false;
-        task.last_finished_at = Some(std::time::Instant::now());
-    }
-
     pub async fn reload_config(&self) -> Result<PublicConfig> {
+        let mut current = self.config.write().await;
+        self.flush_config().await?;
         let mut config = AppConfig::load_or_create(&self.config_path)?;
         agent_injection::ensure_defaults(&mut config);
-        config.save(&self.config_path)?;
+        self.persist_config_snapshot(&config).await?;
         let public = config.public_view(self.config_path.clone());
-        *self.config.write().await = config;
+        *current = config;
         Ok(public)
     }
 
@@ -309,7 +467,7 @@ impl AppState {
 
         agent_injection::apply_enabled(&mut config)?;
         config.updated_at = Utc::now();
-        config.save(&self.config_path)?;
+        self.persist_config_snapshot(&config).await?;
         Ok(())
     }
 
@@ -426,6 +584,11 @@ impl AppState {
     }
 
     pub async fn shutdown_for_exit(&self) -> Result<()> {
+        self.shutdown_for_exit_with_relay_timeout(StdDuration::from_secs(2))
+            .await
+    }
+
+    async fn shutdown_for_exit_with_relay_timeout(&self, relay_timeout: StdDuration) -> Result<()> {
         let main_server = self.server.lock().await.take();
         let proxy_mode_server = self.proxy_mode_server.lock().await.take();
         tokio::join!(
@@ -440,7 +603,28 @@ impl AppState {
                 }
             }
         );
-        self.persist_runtime_state().await
+        if let DispatchDrainOutcome::Aborted { task_count } =
+            self.relay_tasks.close_and_drain(relay_timeout).await
+        {
+            self.metrics
+                .record_error(
+                    "shutdown_relay_drain_timeout",
+                    &format!("aborted {task_count} active relay owner(s) after shutdown timeout"),
+                )
+                .await;
+        }
+        self.metrics.close_and_wait_for_commits().await;
+        // Relay draining fences request-owned runtime mutations. Cache/config
+        // also close their own publication gates so concurrent admin commands
+        // cannot publish after the final flush target is captured.
+        let (runtime_state, cache, config) = tokio::join!(
+            self.persist_runtime_state(),
+            self.cache.close_and_flush(),
+            self.config_persistence.close_and_flush()
+        );
+        runtime_state?;
+        cache?;
+        config
     }
 
     pub async fn proxy_status(&self) -> ProxyStatus {
@@ -459,28 +643,47 @@ impl AppState {
         }
     }
     async fn set_proxy_auto_start(&self, enabled: bool) -> Result<()> {
-        let mut config = self.config.write().await;
-        if config.proxy_auto_start != enabled {
+        let version = {
+            let mut config = self.config.write().await;
+            if config.proxy_auto_start == enabled {
+                return Ok(());
+            }
             config.proxy_auto_start = enabled;
             config.updated_at = Utc::now();
-            config.save(&self.config_path)?;
-        }
+            self.publish_config_snapshot(&config)?
+        };
+        self.wait_for_config_snapshot(version).await?;
         Ok(())
     }
 
+    pub fn journal_config(&self, config: &AppConfig) {
+        let _ = self.publish_config_snapshot(config);
+    }
+
+    /// Publish while the caller still owns the config mutation guard so
+    /// persistence generations preserve the same order as in-memory changes.
+    pub fn publish_config_snapshot(&self, config: &AppConfig) -> Result<u64> {
+        self.config_persistence.publish(config)
+    }
+
+    pub async fn wait_for_config_snapshot(&self, version: u64) -> Result<()> {
+        self.config_persistence.wait_for(version).await
+    }
+
+    pub async fn persist_config_snapshot(&self, config: &AppConfig) -> Result<()> {
+        self.config_persistence.persist(config).await
+    }
+
+    pub(crate) async fn flush_config(&self) -> Result<()> {
+        self.config_persistence.flush().await
+    }
+
     pub async fn persist_runtime_state(&self) -> Result<()> {
-        let prefix_states = self.prefix_states.lock().await.clone();
-        let response_sessions = self.response_sessions.lock().await.clone();
-        let response_session_error_cooldowns =
-            self.response_session_error_cooldowns.lock().await.clone();
-        let shadow_affinity = self.shadow_affinity.lock().await.clone();
-        save_runtime_state(
-            &self.runtime_state_path,
-            &prefix_states,
-            &response_sessions,
-            &response_session_error_cooldowns,
-            &shadow_affinity,
-        )
+        self.runtime_state_journal.flush().await
+    }
+
+    pub fn journal_runtime_state(&self) {
+        self.runtime_state_journal.mark_dirty();
     }
 }
 
@@ -622,7 +825,7 @@ fn prefix_state_strength(state: &PrefixWarmState) -> u64 {
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
-    response_sessions: &HashMap<String, ResponseSessionState>,
+    response_sessions: &HashMap<String, Arc<ResponseSessionState>>,
     response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
     shadow_affinity: &ShadowAffinityStore,
 ) -> Result<()> {
@@ -640,18 +843,10 @@ fn save_runtime_state(
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct RuntimeStateMaps {
-    prefix_states: HashMap<String, PrefixWarmState>,
-    response_sessions: HashMap<String, ResponseSessionState>,
-    response_session_error_cooldowns: HashMap<String, ResponseSessionCooldownState>,
-    shadow_affinity: ShadowAffinityStore,
-}
-
 impl PersistedRuntimeState {
     fn from_runtime(
         prefix_states: &HashMap<String, PrefixWarmState>,
-        response_sessions: &HashMap<String, ResponseSessionState>,
+        response_sessions: &HashMap<String, Arc<ResponseSessionState>>,
         response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
         shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
@@ -766,6 +961,7 @@ impl PersistedRuntimeState {
                         seen_bucket_tokens_128: state.seen_bucket_tokens_128,
                         avoidable_shortfall_tokens_128: state.avoidable_shortfall_tokens_128,
                         small_gap_recovery_streak: state.small_gap_recovery_streak,
+                        recent_clean_tiny_gap_streak: 0,
                         cache_instability_score: state.cache_instability_score,
                         settle_after_cold_read: false,
                         tail_tool_output_chars: state.tail_tool_output_chars,
@@ -785,12 +981,12 @@ impl PersistedRuntimeState {
                 }
                 Some((
                     key,
-                    ResponseSessionState {
+                    Arc::new(ResponseSessionState {
                         response_id: state.response_id,
                         input: state.input,
                         scope_key: state.scope_key,
                         finished_at: instant_now.checked_sub(age).unwrap_or(instant_now),
-                    },
+                    }),
                 ))
             })
             .collect();
@@ -846,7 +1042,11 @@ mod tests {
         ShadowCacheLane, SHADOW_POLICY_EPOCH,
     };
     use serde_json::json;
-    use std::fs;
+    use std::{
+        fs,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        sync::Mutex as StdMutex,
+    };
     use uuid::Uuid;
 
     #[tokio::test]
@@ -860,6 +1060,8 @@ mod tests {
         config.proxy_mode_host = "127.0.0.1".to_string();
         config.proxy_mode_port = 0;
         config.proxy_auto_start = true;
+        config.cache.enabled = true;
+        config.cache.persist_encrypted = true;
         let state = Arc::new(
             AppState::for_test(
                 config,
@@ -878,11 +1080,49 @@ mod tests {
             .await
             .is_ok());
 
+        let cache_config = state.config.read().await.cache.clone();
+        state
+            .cache
+            .insert_many(
+                vec![crate::cache::CacheEntry {
+                    key: "shutdown-cache-entry".to_string(),
+                    semantic_text: None,
+                    semantic_shape: None,
+                    semantic_vector: Vec::new(),
+                    content_type: "application/json".to_string(),
+                    status: 200,
+                    body: br#"{"ok":true}"#.to_vec(),
+                    created_at: Utc::now(),
+                    expires_at: Utc::now() + chrono::Duration::minutes(5),
+                    provider_id: "provider".to_string(),
+                    model: "model".to_string(),
+                    workspace_fingerprint: Some("workspace".to_string()),
+                }],
+                &cache_config,
+            )
+            .await
+            .unwrap();
+        state.journal_runtime_state();
+        let relay_settled = Arc::new(AtomicBool::new(false));
+        let relay_settled_for_task = relay_settled.clone();
+        let state_for_relay = state.clone();
+        state
+            .relay_tasks
+            .spawn(async move {
+                tokio::time::sleep(StdDuration::from_millis(25)).await;
+                relay_settled_for_task.store(true, Ordering::Release);
+                state_for_relay.journal_runtime_state();
+            })
+            .unwrap();
+
         state.shutdown_for_exit().await.unwrap();
 
         assert!(!state.proxy_status().await.running);
         assert!(!state.proxy_mode_status().await.running);
         assert!(state.config.read().await.proxy_auto_start);
+        assert!(relay_settled.load(Ordering::Acquire));
+        assert!(state.runtime_state_path.exists());
+        assert!(dir.join("cache.bin").exists());
         let main_rebind = tokio::net::TcpListener::bind(main_address).await.unwrap();
         let proxy_mode_rebind = tokio::net::TcpListener::bind(proxy_mode_address)
             .await
@@ -890,6 +1130,274 @@ mod tests {
         drop(main_rebind);
         drop(proxy_mode_rebind);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_timeout_aborts_relay_before_final_persistence_barrier() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-exit-abort-fence-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.persist_encrypted = true;
+        let cache_path = dir.join("cache.bin");
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path.clone()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let late_mutation = Arc::new(AtomicBool::new(false));
+        let late_mutation_for_relay = late_mutation.clone();
+        let state_for_relay = state.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        state
+            .relay_tasks
+            .spawn(async move {
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                let cache_config = state_for_relay.config.read().await.cache.clone();
+                state_for_relay
+                    .cache
+                    .insert_many(
+                        vec![crate::cache::CacheEntry {
+                            key: "late-cache-entry".to_string(),
+                            semantic_text: None,
+                            semantic_shape: None,
+                            semantic_vector: Vec::new(),
+                            content_type: "application/json".to_string(),
+                            status: 200,
+                            body: br#"{"late":true}"#.to_vec(),
+                            created_at: Utc::now(),
+                            expires_at: Utc::now() + chrono::Duration::minutes(5),
+                            provider_id: "provider".to_string(),
+                            model: "model".to_string(),
+                            workspace_fingerprint: Some("workspace".to_string()),
+                        }],
+                        &cache_config,
+                    )
+                    .await
+                    .unwrap();
+                state_for_relay.journal_runtime_state();
+                late_mutation_for_relay.store(true, Ordering::Release);
+            })
+            .unwrap();
+        started_rx.await.unwrap();
+
+        state
+            .shutdown_for_exit_with_relay_timeout(StdDuration::from_millis(10))
+            .await
+            .unwrap();
+
+        assert!(!late_mutation.load(Ordering::Acquire));
+        assert!(release_tx.send(()).is_err());
+        assert!(state.relay_tasks.spawn(async {}).is_err());
+        let cache_config = state.config.read().await.cache.clone();
+        assert!(state
+            .cache
+            .lookup_exact("late-cache-entry", &cache_config)
+            .await
+            .is_none());
+        assert!(!cache_path.exists());
+        assert!(state.runtime_state_path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn runtime_snapshot_shares_immutable_session_payload_and_releases_lock() {
+        let prefix_states = Arc::new(Mutex::new(HashMap::new()));
+        let response_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
+        let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
+        let session = Arc::new(ResponseSessionState {
+            response_id: "resp_large".to_string(),
+            input: json!([{
+                "type": "message",
+                "role": "user",
+                "content": "large immutable session payload ".repeat(200_000)
+            }]),
+            scope_key: Some("scope-large".to_string()),
+            finished_at: Instant::now(),
+        });
+        response_sessions
+            .lock()
+            .await
+            .insert("session-large".to_string(), session.clone());
+
+        let prefix_states_for_capture = prefix_states.clone();
+        let response_sessions_for_capture = response_sessions.clone();
+        let cooldowns_for_capture = response_session_error_cooldowns.clone();
+        let shadow_affinity_for_capture = shadow_affinity.clone();
+        let snapshot = tokio::task::spawn_blocking(move || {
+            capture_runtime_state(
+                &prefix_states_for_capture,
+                &response_sessions_for_capture,
+                &cooldowns_for_capture,
+                &shadow_affinity_for_capture,
+            )
+        })
+        .await
+        .unwrap();
+
+        let captured = snapshot.response_sessions.get("session-large").unwrap();
+        assert!(Arc::ptr_eq(captured, &session));
+        assert!(response_sessions.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn config_journal_coalesces_latest_snapshot_without_blocking_publisher() {
+        let saved_ports = Arc::new(StdMutex::new(Vec::new()));
+        let saved_ports_for_job = saved_ports.clone();
+        let coordinator =
+            ConfigWriteCoordinator::new_with_job(MetricsStore::new(), move |config| {
+                std::thread::sleep(StdDuration::from_millis(100));
+                saved_ports_for_job.lock().unwrap().push(config.port);
+                Ok(())
+            });
+        let mut config = AppConfig::default();
+        let started = Instant::now();
+        config.port = 18_881;
+        coordinator.publish(&config).unwrap();
+        config.port = 18_882;
+        coordinator.publish(&config).unwrap();
+        assert!(started.elapsed() < StdDuration::from_millis(20));
+
+        coordinator.flush().await.unwrap();
+        assert_eq!(*saved_ports.lock().unwrap(), vec![18_882]);
+    }
+
+    #[tokio::test]
+    async fn published_config_snapshot_releases_app_config_lock_before_slow_writer_finishes() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-config-publish-unlocks-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let writer_started = Arc::new(AtomicBool::new(false));
+        let writer_started_for_job = writer_started.clone();
+        let release_writer = Arc::new(AtomicBool::new(false));
+        let release_writer_for_job = release_writer.clone();
+        let writer_finished = Arc::new(AtomicBool::new(false));
+        let writer_finished_for_job = writer_finished.clone();
+        let saved_ports = Arc::new(StdMutex::new(Vec::new()));
+        let saved_ports_for_job = saved_ports.clone();
+
+        let mut state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        state.config_persistence =
+            ConfigWriteCoordinator::new_with_job(state.metrics.clone(), move |config| {
+                writer_started_for_job.store(true, Ordering::Release);
+                let deadline = Instant::now() + StdDuration::from_secs(2);
+                while !release_writer_for_job.load(Ordering::Acquire) && Instant::now() < deadline {
+                    std::thread::sleep(StdDuration::from_millis(1));
+                }
+                saved_ports_for_job.lock().unwrap().push(config.port);
+                writer_finished_for_job.store(true, Ordering::Release);
+                Ok(())
+            });
+        let state = Arc::new(state);
+
+        let version = {
+            let mut config = state.config.write().await;
+            config.port = 18_884;
+            state.publish_config_snapshot(&config).unwrap()
+        };
+        tokio::time::timeout(StdDuration::from_secs(1), async {
+            while !writer_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow config writer should start");
+        assert!(!writer_finished.load(Ordering::Acquire));
+
+        let config = tokio::time::timeout(StdDuration::from_millis(100), state.config.read())
+            .await
+            .expect("reader should not wait for config persistence");
+        assert_eq!(config.port, 18_884);
+        drop(config);
+
+        let mut wait = Box::pin(state.wait_for_config_snapshot(version));
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(25), &mut wait)
+                .await
+                .is_err()
+        );
+        release_writer.store(true, Ordering::Release);
+        tokio::time::timeout(StdDuration::from_secs(1), wait)
+            .await
+            .expect("config persistence should finish after release")
+            .unwrap();
+
+        assert!(writer_finished.load(Ordering::Acquire));
+        assert_eq!(*saved_ports.lock().unwrap(), vec![18_884]);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn config_journal_persists_newer_snapshot_after_inflight_older_write() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_job = attempts.clone();
+        let first_started = Arc::new(AtomicBool::new(false));
+        let first_started_for_job = first_started.clone();
+        let release_first = Arc::new(AtomicBool::new(false));
+        let release_first_for_job = release_first.clone();
+        let saved_ports = Arc::new(StdMutex::new(Vec::new()));
+        let saved_ports_for_job = saved_ports.clone();
+        let coordinator =
+            ConfigWriteCoordinator::new_with_job(MetricsStore::new(), move |config| {
+                if attempts_for_job.fetch_add(1, Ordering::SeqCst) == 0 {
+                    first_started_for_job.store(true, Ordering::Release);
+                    while !release_first_for_job.load(Ordering::Acquire) {
+                        std::thread::sleep(StdDuration::from_millis(1));
+                    }
+                }
+                saved_ports_for_job.lock().unwrap().push(config.port);
+                Ok(())
+            });
+        let mut config = AppConfig::default();
+        config.port = 18_881;
+        let first_version = coordinator.publish(&config).unwrap();
+        while !first_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        config.port = 18_882;
+        let second_version = coordinator.publish(&config).unwrap();
+        assert!(second_version > first_version);
+        release_first.store(true, Ordering::Release);
+        coordinator.wait_for(second_version).await.unwrap();
+
+        assert_eq!(*saved_ports.lock().unwrap(), vec![18_881, 18_882]);
+    }
+
+    #[tokio::test]
+    async fn config_journal_close_is_a_final_publication_fence() {
+        let saved_ports = Arc::new(StdMutex::new(Vec::new()));
+        let saved_ports_for_job = saved_ports.clone();
+        let coordinator =
+            ConfigWriteCoordinator::new_with_job(MetricsStore::new(), move |config| {
+                saved_ports_for_job.lock().unwrap().push(config.port);
+                Ok(())
+            });
+        let mut config = AppConfig::default();
+        config.port = 18_881;
+        let version = coordinator.publish(&config).unwrap();
+        coordinator.close_and_flush().await.unwrap();
+        coordinator.wait_for(version).await.unwrap();
+
+        config.port = 18_882;
+        assert!(coordinator.publish(&config).is_err());
+        assert_eq!(*saved_ports.lock().unwrap(), vec![18_881]);
     }
 
     #[tokio::test]
@@ -1014,6 +1522,7 @@ mod tests {
                 seen_bucket_tokens_128: 166_912,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 2,
                 cache_instability_score: 0,
                 settle_after_cold_read: false,
                 tail_tool_output_chars: 0,
@@ -1023,12 +1532,12 @@ mod tests {
         );
         state.response_sessions.lock().await.insert(
             "session-a".to_string(),
-            ResponseSessionState {
+            Arc::new(ResponseSessionState {
                 response_id: "resp_123".to_string(),
                 input: json!([{ "type": "message", "role": "user", "content": "hello" }]),
                 scope_key: Some("scope-a".to_string()),
                 finished_at: Instant::now(),
-            },
+            }),
         );
         state.response_session_error_cooldowns.lock().await.insert(
             "responses:share:gpt-5.5".to_string(),
@@ -1110,6 +1619,7 @@ mod tests {
 
         let prefix = loaded.prefix_states.get("prefix-a").unwrap();
         assert_eq!(prefix.cache_read_tokens, 166_912);
+        assert_eq!(prefix.recent_clean_tiny_gap_streak, 0);
         let session = loaded.response_sessions.get("session-a").unwrap();
         assert_eq!(session.response_id, "resp_123");
         assert_eq!(session.input[0]["role"], "user");
@@ -1190,6 +1700,7 @@ mod tests {
                 seen_bucket_tokens_128: 215_040,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 0,
                 settle_after_cold_read: false,
                 tail_tool_output_chars: 0,
@@ -1261,6 +1772,7 @@ mod tests {
             seen_bucket_tokens_128: 164_736,
             avoidable_shortfall_tokens_128: 0,
             small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
             cache_instability_score: 0,
             settle_after_cold_read: false,
             tail_tool_output_chars: 0,
@@ -1357,6 +1869,7 @@ mod tests {
                 seen_bucket_tokens_128: 166_912,
                 avoidable_shortfall_tokens_128: 0,
                 small_gap_recovery_streak: 0,
+                recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 0,
                 settle_after_cold_read: false,
                 tail_tool_output_chars: 0,

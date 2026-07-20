@@ -5,6 +5,7 @@ mod codex_ui_patch;
 mod config;
 mod crypto;
 mod metrics;
+mod persistence;
 mod proxy;
 mod state;
 

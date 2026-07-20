@@ -1,0 +1,78 @@
+- main [ref=f1e3]:
+  - generic [ref=f1e4]:
+    - generic [ref=f1e5]:
+      - button "查看版本更新" [ref=f1e6] [cursor=pointer]
+      - button "查看版本更新" [ref=f1e11] [cursor=pointer]:
+        - strong [ref=f1e12]: Atoapi
+        - generic [ref=f1e13]: Graphite · v0.2.16
+    - navigation "Agent 注入" [ref=f1e14]:
+      - tab "Claude Code 已关闭 Agent 已关闭" [selected] [ref=f1e15] [cursor=pointer]:
+        - generic [ref=f1e20]:
+          - generic [ref=f1e21]: Claude Code
+          - generic "未选择上游" [ref=f1e22]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e23]
+      - tab "Codex 已关闭 Agent 已关闭" [ref=f1e24] [cursor=pointer]:
+        - generic [ref=f1e38]:
+          - generic [ref=f1e39]: Codex
+          - generic "未选择上游" [ref=f1e40]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e41]
+      - tab "Gemini 已关闭 Agent 已关闭" [ref=f1e42] [cursor=pointer]:
+        - generic [ref=f1e46]:
+          - generic [ref=f1e47]: Gemini
+          - generic "未选择上游" [ref=f1e48]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e49]
+      - tab "OpenCode 已关闭 Agent 已关闭" [ref=f1e50] [cursor=pointer]:
+        - generic [ref=f1e56]:
+          - generic [ref=f1e57]: OpenCode
+          - generic "未选择上游" [ref=f1e58]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e59]
+      - tab "OpenClaw 已关闭 Agent 已关闭" [ref=f1e60] [cursor=pointer]:
+        - generic [ref=f1e66]:
+          - generic [ref=f1e67]: OpenClaw
+          - generic "未选择上游" [ref=f1e68]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e69]
+      - tab "本地代理模式 已关闭 Agent 已关闭" [ref=f1e70] [cursor=pointer]:
+        - generic [ref=f1e77]:
+          - generic [ref=f1e78]: 本地代理模式
+          - generic "未选择上游" [ref=f1e79]: 已关闭
+        - generic "Agent 已关闭" [ref=f1e80]
+      - button "更多 Agent" [ref=f1e82] [cursor=pointer]
+    - generic [ref=f1e87]:
+      - generic "http://127.0.0.1:18883" [ref=f1e88]:
+        - generic [ref=f1e89]: 代理运行中
+        - generic [ref=f1e90]: 127.0.0.1:18883
+      - button "刷新配置和统计" [ref=f1e91] [cursor=pointer]
+  - region [ref=f1e334]:
+    - generic [ref=f1e335]:
+      - switch "启用当前 Agent" [ref=f1e336] [cursor=pointer]
+      - generic [ref=f1e338]:
+        - heading "Claude Code" [level=1] [ref=f1e339]
+        - paragraph [ref=f1e340]: 未选择上游 · 未命中映射时保留 Agent 原始模型参数
+    - generic [ref=f1e341]:
+      - generic [ref=f1e342]:
+        - generic [ref=f1e343]: Anthropic Base URL
+        - code [ref=f1e344]: http://127.0.0.1:18883
+        - button "复制 Anthropic Base URL" [ref=f1e345] [cursor=pointer]
+      - generic [ref=f1e349]:
+        - generic [ref=f1e350]: Agent Key
+        - code [ref=f1e351]: ato-local-preview
+        - button "复制 Agent Key" [ref=f1e352] [cursor=pointer]
+    - button "新增上游" [ref=f1e357] [cursor=pointer]
+  - main [ref=f1e123]:
+    - region "Claude Code 上游路由" [ref=f1e360]:
+      - generic [ref=f1e361]:
+        - generic [ref=f1e362]:
+          - heading "上游路由" [level=2] [ref=f1e363]
+          - paragraph [ref=f1e364]: 未命中模型映射时，完整保留 Agent 发来的模型与推理参数。
+        - generic [ref=f1e365]:
+          - generic [ref=f1e366]: 0 个可用上游
+          - button "添加上游" [ref=f1e367] [cursor=pointer]
+      - generic [ref=f1e370]:
+        - generic [ref=f1e376]: 当前 Agent 还没有上游。添加后会自动绑定；未映射模型仍会原样透传。
+        - button "添加上游" [ref=f1e377] [cursor=pointer]
+  - button "缓存与记录 命中率 0.0% 0 成功 · 0 error" [ref=f1e144] [cursor=pointer]:
+    - generic [ref=f1e150]: 缓存与记录
+    - generic [ref=f1e151]:
+      - text: 命中率
+      - strong [ref=f1e152]: 0.0%
+    - generic [ref=f1e153]: 0 成功 · 0 error
