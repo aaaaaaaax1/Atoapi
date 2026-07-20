@@ -5070,10 +5070,16 @@
       padding: 4px 13px 6px;
     }
 
+    #requestsPanel {
+      --request-record-grid: minmax(166px, 1.22fr) minmax(120px, 0.84fr) minmax(58px, 0.38fr) minmax(118px, 0.76fr) minmax(108px, 0.72fr) minmax(130px, 0.84fr) minmax(86px, 0.58fr);
+      --request-record-head-gap: 10px;
+      --request-record-row-gap: 10px;
+    }
+
     .request-column-head {
       display: grid;
-      grid-template-columns: minmax(180px, 1.34fr) minmax(112px, 0.82fr) minmax(46px, 0.32fr) minmax(122px, 0.8fr) minmax(102px, 0.7fr) minmax(148px, 0.96fr);
-      gap: 10px;
+      grid-template-columns: var(--request-record-grid);
+      gap: var(--request-record-head-gap);
       width: 100%;
       box-sizing: border-box;
       min-height: 42px;
@@ -5098,6 +5104,7 @@
       padding-left: 9px;
     }
 
+    .request-column-head > span:nth-child(6),
     .request-column-head > span:last-child {
       justify-self: end;
       text-align: right;
@@ -5171,10 +5178,10 @@
     }
 
     .request-row {
-      grid-template-columns: minmax(180px, 1.34fr) minmax(112px, 0.82fr) minmax(46px, 0.32fr) minmax(122px, 0.8fr) minmax(102px, 0.7fr) minmax(148px, 0.96fr);
-      gap: 10px;
-      min-height: 40px;
-      padding: 4px 12px;
+      grid-template-columns: var(--request-record-grid);
+      gap: var(--request-record-row-gap);
+      min-height: 38px;
+      padding: 3px 12px;
       border: 0;
       border-bottom: 1px solid var(--line);
       border-radius: 0;
@@ -5190,7 +5197,8 @@
     .request-model,
     .request-stream,
     .request-tokens,
-    .request-cache {
+    .request-cache,
+    .request-status {
       min-width: 0;
     }
 
@@ -5198,7 +5206,7 @@
       display: grid;
       align-content: center;
       gap: 3px;
-      min-height: 34px;
+      min-height: 32px;
       padding-left: 9px;
       border-left: 3px solid rgba(130, 144, 255, 0.72);
     }
@@ -5211,16 +5219,55 @@
     }
 
     .request-identity b {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
       color: var(--text);
       font-size: 10.5px;
       font-weight: 680;
       line-height: 14px;
     }
 
+    .request-provider-name {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .request-identity .request-agent-badge {
+      display: inline-flex;
+      flex: 0 0 auto;
+      align-items: center;
+      min-height: 15px;
+      padding: 0 5px;
+      overflow: visible !important;
+      border: 1px solid rgba(189, 197, 214, 0.18);
+      border-radius: 999px;
+      background: rgba(189, 197, 214, 0.08);
+      color: #c9d0de !important;
+      font-size: 8.5px;
+      font-weight: 720;
+      letter-spacing: 0.01em;
+      line-height: 13px;
+      text-overflow: clip !important;
+      white-space: nowrap;
+    }
+
+    .request-agent-badge.agent-codex { border-color: rgba(128, 145, 255, 0.38); background: rgba(128, 145, 255, 0.11); color: #bac4ff !important; }
+    .request-agent-badge.agent-claude { border-color: rgba(220, 157, 111, 0.34); background: rgba(220, 157, 111, 0.1); color: #dfb18b !important; }
+    .request-agent-badge.agent-gemini { border-color: rgba(173, 138, 234, 0.34); background: rgba(173, 138, 234, 0.1); color: #c9b4ef !important; }
+    .request-agent-badge.agent-opencode { border-color: rgba(103, 189, 205, 0.34); background: rgba(103, 189, 205, 0.1); color: #99d7e1 !important; }
+    .request-agent-badge.agent-openclaw { border-color: rgba(103, 194, 153, 0.34); background: rgba(103, 194, 153, 0.1); color: #a1dcc1 !important; }
+    .request-agent-badge.agent-hermes { border-color: rgba(211, 132, 177, 0.34); background: rgba(211, 132, 177, 0.1); color: #e2afd0 !important; }
+    .request-agent-badge.agent-proxy { border-color: rgba(155, 169, 189, 0.3); background: rgba(155, 169, 189, 0.09); color: #bec9d8 !important; }
+
     .request-identity span {
-      color: var(--muted);
-      font-size: 9.5px;
-      line-height: 12px;
+      color: #aab4c4;
+      font-size: 10.5px;
+      font-weight: 560;
+      line-height: 13px;
     }
 
     .request-time {
@@ -5261,7 +5308,14 @@
     .request-model {
       display: grid;
       align-content: center;
+    }
+
+    .request-model-stack {
+      display: grid;
+      width: fit-content;
+      max-width: 100%;
       gap: 3px;
+      justify-items: start;
     }
 
     .request-model-name {
@@ -5282,6 +5336,7 @@
 
     .request-reasoning {
       width: fit-content;
+      justify-self: center;
       padding: 1px 6px;
       border-radius: 999px;
       background: rgba(88, 209, 155, 0.09);
@@ -5352,6 +5407,62 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+
+    .request-status {
+      display: grid;
+      align-content: center;
+      justify-items: end;
+      gap: 2px;
+      min-height: 30px;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .request-status b {
+      color: var(--success);
+      font-size: 10.5px;
+      font-weight: 720;
+      line-height: 14px;
+      white-space: nowrap;
+    }
+
+    .request-status small {
+      max-width: 100%;
+      overflow: hidden;
+      color: var(--muted);
+      font-size: 9px;
+      line-height: 11px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .request-stream.transport-sync b { color: #aeb5ff; }
+    .request-stream.transport-cache b { color: var(--success); }
+
+    .request-row.status-cold .request-identity { border-left-color: #86a4ff; }
+    .request-row.status-compact .request-identity { border-left-color: #e4ae52; }
+    .request-row.status-disconnect .request-identity { border-left-color: #d7a95b; }
+    .request-row.status-error .request-identity { border-left-color: var(--danger); }
+
+    .request-row.status-cold .request-stream b,
+    .request-row.status-cold .request-stream small,
+    .request-status.cold b,
+    .request-status.cold small { color: #98b0ff; }
+
+    .request-row.status-compact .request-stream b,
+    .request-row.status-compact .request-stream small,
+    .request-status.compact b,
+    .request-status.compact small { color: #e5b55e; }
+
+    .request-row.status-disconnect .request-stream b,
+    .request-row.status-disconnect .request-stream small,
+    .request-status.disconnect b,
+    .request-status.disconnect small { color: #e1b96f; }
+
+    .request-row.status-error .request-stream b,
+    .request-row.status-error .request-stream small,
+    .request-status.error b,
+    .request-status.error small { color: #ff8a94; }
 
     .model-mapping-head {
       align-items: center;
@@ -5442,7 +5553,13 @@
       color: #c4f3d9;
     }
 
-    @media (max-width: 760px) {
+    @media (max-width: 1040px) {
+      #requestsPanel {
+        --request-record-grid: minmax(144px, 1.1fr) minmax(118px, 0.9fr) minmax(58px, 0.46fr) minmax(72px, 0.54fr);
+        --request-record-head-gap: 5px 10px;
+        --request-record-row-gap: 5px 9px;
+      }
+
       .request-record-controls {
         align-items: flex-start;
         flex-direction: column;
@@ -5456,11 +5573,11 @@
 
       .request-column-head {
         width: 100%;
-        grid-template-columns: minmax(160px, 1.34fr) minmax(110px, 0.9fr) minmax(58px, 0.5fr);
+        grid-template-columns: var(--request-record-grid);
         grid-template-areas:
-          "identity model stream"
-          "tokens time cache";
-        gap: 5px 10px;
+          "identity model stream status"
+          "tokens time cache cache";
+        gap: var(--request-record-head-gap);
         padding: 7px 8px;
       }
 
@@ -5470,15 +5587,17 @@
       .request-column-head > :nth-child(4) { grid-area: tokens; }
       .request-column-head > :nth-child(5) { grid-area: time; }
       .request-column-head > :nth-child(6) { grid-area: cache; }
+      .request-column-head > :nth-child(7) { grid-area: status; }
 
       #requestsPanel .request-row,
       #requestsPanel .request-row:last-child {
-        grid-template-columns: minmax(160px, 1.34fr) minmax(110px, 0.9fr) minmax(58px, 0.5fr);
+        grid-template-columns: var(--request-record-grid);
         grid-template-areas:
-          "identity model stream"
-          "tokens time cache";
-        gap: 7px 10px;
-        min-height: 68px;
+          "identity model stream status"
+          "tokens time cache cache";
+        gap: var(--request-record-row-gap);
+        min-height: 56px;
+        padding: 3px 10px;
         height: auto;
         max-height: none;
       }
@@ -5489,31 +5608,46 @@
       .request-stream { grid-area: stream; }
       .request-tokens { grid-area: tokens; }
       .request-cache { grid-area: cache; }
+      .request-status { grid-area: status; }
     }
 
-    @media (max-width: 520px) {
+    @media (max-width: 560px) {
+      #requestsPanel {
+        --request-record-grid: minmax(0, 1.2fr) minmax(0, 0.8fr);
+        --request-record-head-gap: 4px 8px;
+        --request-record-row-gap: 4px 8px;
+      }
+
       .request-column-head {
-        grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+        grid-template-columns: var(--request-record-grid);
         grid-template-areas:
           "identity model"
           "stream tokens"
-          "time cache";
-        gap: 4px 8px;
+          "time cache"
+          "status status";
+        gap: var(--request-record-head-gap);
         font-size: 10px;
+      }
+
+      .request-column-head > :nth-child(6),
+      .request-column-head > :nth-child(7) {
+        justify-self: start;
+        text-align: left;
       }
 
       #requestsPanel .request-row,
       #requestsPanel .request-row:last-child {
-        grid-template-columns: minmax(0, 1.2fr) minmax(0, 0.8fr);
+        grid-template-columns: var(--request-record-grid);
         grid-template-areas:
           "identity model"
           "stream tokens"
-          "time cache";
-        min-height: 90px;
+          "time cache"
+          "status status";
+        min-height: 92px;
         height: auto;
         max-height: none;
-        padding: 6px 8px;
-        gap: 4px 8px;
+        padding: 4px 8px;
+        gap: var(--request-record-row-gap);
       }
 
       .request-identity { grid-area: identity; min-height: 30px; }
@@ -5521,8 +5655,31 @@
       .request-stream { grid-area: stream; }
       .request-tokens { grid-area: tokens; }
       .request-time { grid-area: time; }
+
+      .request-time {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 3px;
+      }
+
+      .request-time-line {
+        grid-template-columns: 3px max-content minmax(0, 1fr);
+        gap: 3px;
+        min-height: 14px;
+        font-size: 9px;
+      }
+
+      .request-time-line::before {
+        width: 3px;
+        height: 14px;
+      }
       .request-cache {
         grid-area: cache;
+        justify-items: start;
+        text-align: left;
+      }
+
+      .request-status {
+        grid-area: status;
         justify-items: start;
         text-align: left;
       }
@@ -5698,7 +5855,7 @@
                   <div class="request-scope-tabs" id="requestScopeTabs" role="tablist" aria-label="请求记录上游筛选"></div>
                   <div class="request-pager" id="requestPager" aria-label="请求记录分页"></div>
                 </div>
-                <div class="request-column-head" aria-hidden="true"><span>上游 / Agent</span><span>模型 / 思考</span><span>流</span><span>Tokens</span><span>首字 / 耗时</span><span>命中</span></div>
+                <div class="request-column-head" aria-hidden="true"><span>上游 / Agent</span><span>模型 / 思考</span><span>传输</span><span>Tokens</span><span>首字 / 耗时</span><span>命中</span><span>状态</span></div>
               </div>
               <div class="request-list" id="requestList"></div>
             </section>
@@ -5926,11 +6083,11 @@
     ];
 
     const requests = [
-      { id: "req-128", time: "12:51:42", provider: "云舟", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", ttft: "3.42s", total: "18.7s", input: "90,700", output: "690", cached: "89,300", reasoning: "max", ratio: "98.5%", detail: "缺 1,280 · 可 768 · 新 512", state: "命中", failed: false },
-      { id: "req-127", time: "12:48:16", provider: "云舟", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", ttft: "3.81s", total: "21.2s", input: "89,400", output: "812", cached: "85,600", reasoning: "max", ratio: "95.7%", detail: "缺 3,712 · 新 1,536", state: "命中", failed: false },
-      { id: "req-126", time: "12:44:03", provider: "api.aiaiaiai", model: "gpt-5.5", channel: "Responses · Codex · 流式", ttft: "4.16s", total: "16.4s", input: "86,200", output: "533", cached: "81,700", reasoning: "xhigh", ratio: "94.8%", detail: "缺 4,352 · 可 128", state: "命中", failed: false },
-      { id: "req-125", time: "12:40:27", provider: "sheapi", model: "gpt-5.6-sol", channel: "Responses · Codex · 流式", ttft: "1.92s", total: "1.9s", input: "-", output: "-", cached: "-", reasoning: "max", ratio: "error", detail: "HTTP 503 · No available channel", state: "error", failed: true },
-      { id: "req-124", time: "12:36:58", provider: "云舟", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", ttft: "5.03s", total: "22.9s", input: "81,100", output: "744", cached: "76,800", reasoning: "max", ratio: "94.7%", detail: "压缩后 · 缺 4,224 · 新 2,048", state: "压缩", failed: false }
+      { id: "req-128", time: "12:51:42", provider: "云舟", agent: "Codex", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", transport: "流式", ttft: "3.42s", total: "18.70s", input: "90,700", output: "690", cached: "89,300", reasoning: "max", ratio: "98.5%", detail: "缺 1,280 · 可 768 · 新 512", state: "命中", statusLabel: "OK", statusTone: "complete", failed: false },
+      { id: "req-127", time: "12:48:16", provider: "云舟", agent: "Codex", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", transport: "流式", ttft: "3.81s", total: "21.20s", input: "89,400", output: "812", cached: "85,600", reasoning: "max", ratio: "95.7%", detail: "缺 3,712 · 新 1,536", state: "命中", statusLabel: "OK", statusTone: "complete", failed: false },
+      { id: "req-126", time: "12:44:03", provider: "api.aiaiaiai", agent: "Codex", model: "gpt-5.5", channel: "Responses · Codex · 流式", transport: "同步", ttft: "4.16s", total: "16.40s", input: "86,200", output: "533", cached: "81,700", reasoning: "xhigh", ratio: "94.8%", detail: "缺 4,352 · 可 128", state: "命中", statusLabel: "OK", statusTone: "cold", statusDetail: "冷启动", failed: false },
+      { id: "req-125", time: "12:40:27", provider: "sheapi", agent: "Codex", model: "gpt-5.6-sol", channel: "Responses · Codex · 流式", transport: "流式", ttft: "1.92s", total: "1.90s", input: "-", output: "-", cached: "-", reasoning: "max", ratio: "error", detail: "HTTP 503 · No available channel", state: "error", statusLabel: "Error 503", statusTone: "error", failed: true },
+      { id: "req-124", time: "12:36:58", provider: "云舟", agent: "Codex", model: "gpt-5.6-luna → gpt-5.6-sol", channel: "Responses · Codex · 流式", transport: "流式", ttft: "5.03s", total: "22.90s", input: "81,100", output: "744", cached: "76,800", reasoning: "max", ratio: "94.7%", detail: "压缩后 · 缺 4,224 · 新 2,048", state: "压缩", statusLabel: "OK", statusTone: "compact", statusDetail: "实际压缩", failed: false }
     ];
 
     let selectedAgentId = "codex";
@@ -6129,25 +6286,27 @@
 
     function renderRequests() {
       const scope = activeRequestScope();
-      const successful = requests.filter((request) => !request.failed && isRequestInScope(request, scope));
-      const totalPages = Math.min(REQUEST_PAGE_LIMIT, Math.max(1, Math.ceil(successful.length / REQUESTS_PER_PAGE)));
+      const scoped = requests.filter((request) => isRequestInScope(request, scope));
+      const successful = scoped.filter((request) => !request.failed);
+      const totalPages = Math.min(REQUEST_PAGE_LIMIT, Math.max(1, Math.ceil(scoped.length / REQUESTS_PER_PAGE)));
       requestPage = Math.max(1, Math.min(requestPage, totalPages));
       const start = (requestPage - 1) * REQUESTS_PER_PAGE;
-      const pageItems = successful.slice(start, start + REQUESTS_PER_PAGE);
+      const pageItems = scoped.slice(start, start + REQUESTS_PER_PAGE);
       renderRequestScopeTabs();
       updateRequestScopeMetrics(scope, successful);
       $("#requestList").innerHTML = pageItems.length ? pageItems.map((request) => `
-        <article class="request-row" tabindex="0" data-request-id="${request.id}">
-          <div class="request-identity"><b>${request.provider} / Codex</b><span>${request.time}</span></div>
-          <div class="request-model"><span class="request-model-name">${request.model}</span><span class="request-reasoning">${request.reasoning}</span></div>
-          <div class="request-stream"><b>流</b><small>—</small></div>
+        <article class="request-row status-${request.statusTone || (request.failed ? "error" : "complete")}${request.failed ? " failed" : ""}" tabindex="0" data-request-id="${request.id}">
+          <div class="request-identity"><b><span class="request-provider-name">${request.provider}</span><span class="request-agent-badge agent-codex">${request.agent || "Codex"}</span></b><span>${request.time}</span></div>
+          <div class="request-model"><div class="request-model-stack"><span class="request-model-name">${request.model}</span><span class="request-reasoning">${request.reasoning}</span></div></div>
+          <div class="request-stream transport-${request.transport === "同步" ? "sync" : request.transport === "缓存" ? "cache" : "stream"}"><b>${request.transport || "流式"}</b><small>—</small></div>
           <div class="request-tokens"><b>${request.input} / ${request.output}</b><small>缓存 ${request.cached}</small></div>
           <div class="request-time"><span class="request-time-line good"><span>首字</span><b class="value">${request.ttft}</b></span><span class="request-time-line good"><span>耗时</span><b class="value">${request.total}</b></span></div>
           <div class="request-cache"><b>${request.ratio}</b><small>${request.detail}</small></div>
+          <div class="request-status ${request.statusTone || (request.failed ? "error" : "complete")}"><b>${request.statusLabel || "OK"}</b>${request.statusDetail ? `<small>${request.statusDetail}</small>` : ""}</div>
         </article>
-      `).join("") : `<div class="empty-row">当前上游暂时没有成功请求记录</div>`;
+      `).join("") : `<div class="empty-row">当前筛选下暂无请求记录</div>`;
       $("#requestPager").innerHTML = `
-        <span class="request-page-summary">${successful.length} 条 · 第 ${requestPage} / ${totalPages} 页</span>
+        <span class="request-page-summary">${scoped.length} 条 · 第 ${requestPage} / ${totalPages} 页</span>
         ${Array.from({ length: totalPages }, (_, index) => {
           const page = index + 1;
           return `<button class="request-page-button" type="button" data-request-page="${page}"${page === requestPage ? " aria-current=\"page\"" : ""}>${page}</button>`;

@@ -281,6 +281,7 @@ export interface MetricsSnapshot {
   gap_buckets?: GapBucketStats[];
   request_body_buckets?: RequestBodyBucketStats[];
   provider_stats: ProviderTrafficStats[];
+  agent_provider_stats?: AgentProviderTrafficStats[];
   agent_generation?: {
     inbound_requests: number;
     successful_inbounds: number;
@@ -326,7 +327,9 @@ export interface MetricsSnapshot {
     upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
     upstream_call_source?: string | null;
     status: number;
+    cold_start?: boolean | null;
     ttft_ms: number;
+    first_byte_ms?: number | null;
     upstream_ttft_ms?: number | null;
     local_prepare_ms?: number | null;
     upstream_headers_ms?: number | null;
@@ -425,7 +428,9 @@ export interface MetricsSnapshot {
     upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
     upstream_call_source?: string | null;
     status: number;
+    cold_start?: boolean | null;
     ttft_ms: number;
+    first_byte_ms?: number | null;
     upstream_ttft_ms?: number | null;
     local_prepare_ms?: number | null;
     upstream_headers_ms?: number | null;
@@ -530,6 +535,29 @@ export interface ProviderTrafficStats {
   recent_usage: RecentUsageStats;
   gap_buckets?: GapBucketStats[];
   request_body_buckets?: RequestBodyBucketStats[];
+}
+
+export interface AgentProviderTrafficStats {
+  agent_id: string;
+  agent_label: string;
+  provider_id: string;
+  provider: string;
+  total_requests: number;
+  successful_requests: number;
+  error_statuses: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_shortfall_tokens: number;
+  cache_avoidable_gap_tokens: number;
+  cache_new_tail_gap_tokens: number;
+  cold_start_requests: number;
+  cold_start_input_tokens: number;
+  cold_start_output_tokens: number;
+  cold_start_cache_read_tokens: number;
+  cold_start_cache_shortfall_tokens: number;
+  cold_start_cache_avoidable_gap_tokens: number;
+  cold_start_cache_new_tail_gap_tokens: number;
 }
 
 export interface GapBucketStats {

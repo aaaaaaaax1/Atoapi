@@ -51,8 +51,14 @@ pub(super) fn plan(
     NativeCachePlan {
         preserve_prompt_cache_key: status(ProviderCacheCapabilityField::PromptCacheKey)
             != ProviderCacheCapabilityStatus::Unsupported,
+        // A third-party provider's explicitly enabled legacy retention is a
+        // user-authorized compatibility control. Do not silently discard it
+        // merely because the same provider also verified modern options: the
+        // controls cover different retention/routing behavior and the legacy
+        // field is already quarantined on an explicit rejection. Official
+        // OpenAI keeps the modern-only path.
         preserve_legacy_retention: provider.prompt_cache_retention_enabled
-            && !enable_modern_options
+            && !is_official_openai(provider)
             && status(ProviderCacheCapabilityField::PromptCacheRetention)
                 != ProviderCacheCapabilityStatus::Unsupported,
         enable_modern_options,
@@ -537,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_modern_controls_replace_legacy_retention_and_add_breakpoint() {
+    fn verified_official_modern_controls_replace_legacy_retention_and_add_breakpoint() {
         let mut config = AppConfig::default();
         for field in [
             ProviderCacheCapabilityField::PromptCacheOptions,
@@ -567,7 +573,7 @@ mod tests {
         );
         let plan = plan(
             &config,
-            &provider("https://third.example/v1"),
+            &provider("https://api.openai.com/v1"),
             "gpt-5.6-luna",
             &Channel::Responses,
             None,
@@ -594,6 +600,54 @@ mod tests {
         assert!(body["input"][0]["content"][1]
             .get("prompt_cache_breakpoint")
             .is_none());
+    }
+
+    #[test]
+    fn verified_third_party_options_keep_user_authorized_retention() {
+        let mut config = AppConfig::default();
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ] {
+            config.record_cache_capability_probe(
+                "provider-a",
+                "gpt-5.6-terra",
+                Channel::Responses,
+                field,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+        }
+        config.record_cache_capability_effect_for_key(
+            "provider-a",
+            "gpt-5.6-terra",
+            &Channel::Responses,
+            None,
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            crate::config::ProviderCacheEffectStatus::Promoted,
+            None,
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        let plan = plan(
+            &config,
+            &provider("https://third.example/v1"),
+            "gpt-5.6-terra",
+            &Channel::Responses,
+            None,
+        );
+        let mut body = json!({
+            "prompt_cache_key": "stable",
+            "prompt_cache_retention": "24h",
+            "input": []
+        });
+
+        let _ = apply(&mut body, &Channel::Responses, plan);
+
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
     }
 
     #[test]

@@ -43,6 +43,8 @@ pub struct MetricsSnapshot {
     pub gap_buckets: Vec<GapBucketStats>,
     pub request_body_buckets: Vec<RequestBodyBucketStats>,
     pub provider_stats: Vec<ProviderTrafficStats>,
+    #[serde(default)]
+    pub agent_provider_stats: Vec<AgentProviderTrafficStats>,
     pub recent_upstream_calls: Vec<RequestLog>,
     pub recent_requests: Vec<RequestLog>,
     pub recent_failed_requests: Vec<RequestLog>,
@@ -479,6 +481,32 @@ pub struct ProviderTrafficStats {
     pub request_body_buckets: Vec<RequestBodyBucketStats>,
 }
 
+/// Lifetime traffic totals scoped to one Agent and one stable provider ID.
+/// This intentionally does not reuse the bounded request-history buffers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentProviderTrafficStats {
+    pub agent_id: String,
+    pub agent_label: String,
+    pub provider_id: String,
+    pub provider: String,
+    pub total_requests: u64,
+    pub successful_requests: u64,
+    pub error_statuses: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_shortfall_tokens: u64,
+    pub cache_avoidable_gap_tokens: u64,
+    pub cache_new_tail_gap_tokens: u64,
+    pub cold_start_requests: u64,
+    pub cold_start_input_tokens: u64,
+    pub cold_start_output_tokens: u64,
+    pub cold_start_cache_read_tokens: u64,
+    pub cold_start_cache_shortfall_tokens: u64,
+    pub cold_start_cache_avoidable_gap_tokens: u64,
+    pub cold_start_cache_new_tail_gap_tokens: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GapBucketStats {
     pub bucket: String,
@@ -551,6 +579,11 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_source: Option<String>,
     pub cache_status: String,
+    /// Whether this terminal record consumed the canonical, de-duplicated
+    /// usage cold-start allowance. `None` means no usage observation was
+    /// attached to the terminal (including historical records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cold_start: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -621,6 +654,11 @@ pub struct RequestLog {
     pub prefix_state_cache_read_tokens: Option<u64>,
     pub status: u16,
     pub ttft_ms: u64,
+    /// First raw upstream SSE bytes observed by the relay, measured from
+    /// request ingress. This intentionally differs from `ttft_ms`, which is
+    /// kept as the first model-output timing used by latency diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_ttft_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -808,6 +846,7 @@ struct MetricsInner {
     cold_start_keys: HashSet<String>,
     request_cold_start_keys: HashSet<String>,
     provider_stats: Vec<ProviderTrafficAccumulator>,
+    agent_provider_stats: Vec<AgentProviderTrafficAccumulator>,
     gap_buckets: Vec<GapBucketAccumulator>,
     request_body_buckets: Vec<RequestBodyBucketAccumulator>,
     background_prewarm: Vec<BackgroundPrewarmAccumulator>,
@@ -892,6 +931,30 @@ struct ProviderTrafficAccumulator {
     total_samples: VecDeque<u64>,
     gap_buckets: Vec<GapBucketAccumulator>,
     request_body_buckets: Vec<RequestBodyBucketAccumulator>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgentProviderTrafficAccumulator {
+    agent_id: String,
+    agent_label: String,
+    provider_id: String,
+    provider: String,
+    total_requests: u64,
+    successful_requests: u64,
+    error_statuses: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_shortfall_tokens: u64,
+    cache_avoidable_gap_tokens: u64,
+    cache_new_tail_gap_tokens: u64,
+    cold_start_requests: u64,
+    cold_start_input_tokens: u64,
+    cold_start_output_tokens: u64,
+    cold_start_cache_read_tokens: u64,
+    cold_start_cache_shortfall_tokens: u64,
+    cold_start_cache_avoidable_gap_tokens: u64,
+    cold_start_cache_new_tail_gap_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1044,6 +1107,7 @@ impl MetricsStore {
                 cold_start_keys: HashSet::new(),
                 request_cold_start_keys: HashSet::new(),
                 provider_stats: Vec::new(),
+                agent_provider_stats: Vec::new(),
                 gap_buckets: Vec::new(),
                 request_body_buckets: Vec::new(),
                 background_prewarm: Vec::new(),
@@ -1376,6 +1440,7 @@ impl MetricsStore {
             gap_buckets: sorted_gap_buckets(&inner.gap_buckets),
             request_body_buckets: sorted_request_body_buckets(&inner.request_body_buckets),
             provider_stats: sorted_provider_stats(&inner.provider_stats, &inner.recent_usage),
+            agent_provider_stats: sorted_agent_provider_stats(&inner.agent_provider_stats),
             recent_upstream_calls: inner.recent_upstream_calls.iter().cloned().collect(),
             recent_requests: inner.recent_requests.iter().cloned().collect(),
             recent_failed_requests: inner.recent_failed_requests.iter().cloned().collect(),
@@ -1443,23 +1508,24 @@ fn commit_metrics_transaction(
         }
     }
 
-    if let Some(usage) = usage {
+    let cold_start = usage.map(|usage| {
         record_usage_inner(
             inner,
             usage.record,
             usage.cold_start_key.as_deref(),
             usage.observed_at,
-        );
-    }
+        )
+    });
     for error in errors {
         record_error_inner(inner, &error.scope, &error.message, error.at);
     }
 
     match terminal {
         MetricsTerminal::Upstream {
-            request,
+            mut request,
             upstream_attempts,
         } => {
+            request.cold_start = cold_start;
             let successful = request_log_is_successful_history(&request);
             let projection = request.clone();
             record_request_inner(inner, request, false);
@@ -1469,25 +1535,28 @@ fn commit_metrics_transaction(
             }
         }
         MetricsTerminal::LocalCache {
-            request,
+            mut request,
             estimated_tokens_saved,
         } => {
+            request.cold_start = cold_start;
             inner.local_proxy_estimated_tokens_saved = inner
                 .local_proxy_estimated_tokens_saved
                 .saturating_add(estimated_tokens_saved);
             record_request_inner(inner, request, false);
         }
-        MetricsTerminal::LocalRejection { request } => {
+        MetricsTerminal::LocalRejection { mut request } => {
+            request.cold_start = cold_start;
             record_request_inner(inner, request, false);
         }
         MetricsTerminal::Agent {
             inbound_request_id,
             attempt_id,
             attempt_finish,
-            request,
+            mut request,
             inbound_outcome,
             terminal_state,
         } => {
+            request.cold_start = cold_start;
             apply_agent_terminal_inner(
                 inner,
                 &inbound_request_id,
@@ -1500,9 +1569,10 @@ fn commit_metrics_transaction(
         }
         MetricsTerminal::AgentOwnerFailure {
             inbound_request_id,
-            request,
+            mut request,
             terminal_state,
         } => {
+            request.cold_start = cold_start;
             apply_agent_owner_failure_inner(inner, &inbound_request_id, request, terminal_state);
         }
     }
@@ -1762,7 +1832,7 @@ fn record_usage_inner(
     record: UsageRecord,
     cold_start_key: Option<&str>,
     observed_at: DateTime<Utc>,
-) {
+) -> bool {
     inner.provider_input_tokens += record.input_tokens;
     inner.provider_cached_tokens += record.cache_read_tokens;
     if record.input_tokens > 0 {
@@ -1804,6 +1874,7 @@ fn record_usage_inner(
             cold_start_counted: count_cold_start,
         },
     );
+    count_cold_start
 }
 
 fn record_error_inner(inner: &mut MetricsInner, scope: &str, message: &str, at: DateTime<Utc>) {
@@ -1867,6 +1938,7 @@ fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: boo
             .map(|key| remember_bounded_cold_start_key(&mut inner.request_cold_start_keys, key))
             .unwrap_or(true);
     upsert_provider_traffic(&mut inner.provider_stats, &log, upstream, count_cold_start);
+    upsert_agent_provider_traffic(&mut inner.agent_provider_stats, &log);
     if request_log_is_successful_history(&log) {
         push_limited(&mut inner.recent_requests, log, 200);
     } else {
@@ -1898,6 +1970,33 @@ impl ProviderTrafficAccumulator {
             recent_usage: recent_usage_stats(recent_usage, Some(&self.provider)),
             gap_buckets: sorted_gap_buckets(&self.gap_buckets),
             request_body_buckets: sorted_request_body_buckets(&self.request_body_buckets),
+        }
+    }
+}
+
+impl AgentProviderTrafficAccumulator {
+    fn snapshot(&self) -> AgentProviderTrafficStats {
+        AgentProviderTrafficStats {
+            agent_id: self.agent_id.clone(),
+            agent_label: self.agent_label.clone(),
+            provider_id: self.provider_id.clone(),
+            provider: self.provider.clone(),
+            total_requests: self.total_requests,
+            successful_requests: self.successful_requests,
+            error_statuses: self.error_statuses,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            cache_shortfall_tokens: self.cache_shortfall_tokens,
+            cache_avoidable_gap_tokens: self.cache_avoidable_gap_tokens,
+            cache_new_tail_gap_tokens: self.cache_new_tail_gap_tokens,
+            cold_start_requests: self.cold_start_requests,
+            cold_start_input_tokens: self.cold_start_input_tokens,
+            cold_start_output_tokens: self.cold_start_output_tokens,
+            cold_start_cache_read_tokens: self.cold_start_cache_read_tokens,
+            cold_start_cache_shortfall_tokens: self.cold_start_cache_shortfall_tokens,
+            cold_start_cache_avoidable_gap_tokens: self.cold_start_cache_avoidable_gap_tokens,
+            cold_start_cache_new_tail_gap_tokens: self.cold_start_cache_new_tail_gap_tokens,
         }
     }
 }
@@ -2038,6 +2137,80 @@ fn upsert_provider_traffic(
     push_limited(&mut group.total_samples, log.total_ms, 512);
 }
 
+fn upsert_agent_provider_traffic(
+    groups: &mut Vec<AgentProviderTrafficAccumulator>,
+    log: &RequestLog,
+) {
+    let Some(agent_id) = log
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let provider = if log.provider.trim().is_empty() {
+        "unknown"
+    } else {
+        log.provider.trim()
+    };
+    let provider_id = log
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider);
+    let agent_label = log
+        .agent_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(agent_id);
+    let index = groups
+        .iter()
+        .position(|group| group.agent_id == agent_id && group.provider_id == provider_id)
+        .unwrap_or_else(|| {
+            groups.push(AgentProviderTrafficAccumulator {
+                agent_id: agent_id.to_string(),
+                agent_label: agent_label.to_string(),
+                provider_id: provider_id.to_string(),
+                provider: provider.to_string(),
+                ..AgentProviderTrafficAccumulator::default()
+            });
+            groups.len() - 1
+        });
+    let group = &mut groups[index];
+    group.total_requests += 1;
+    let successful = request_log_is_successful_history(log);
+    if successful {
+        group.successful_requests += 1;
+        // These are the same successful-request usage totals shown by the
+        // request dashboard. Failed attempts remain visible through
+        // `error_statuses`, but must not inflate cache-hit/token statistics.
+        group.input_tokens += log.input_tokens.unwrap_or_default();
+        group.output_tokens += log.output_tokens.unwrap_or_default();
+        group.cache_read_tokens += log.cache_read_tokens.unwrap_or_default();
+        group.cache_shortfall_tokens += log.cache_shortfall_tokens.unwrap_or_default();
+        group.cache_avoidable_gap_tokens += log.cache_avoidable_gap_tokens.unwrap_or_default();
+        group.cache_new_tail_gap_tokens += log.cache_new_tail_gap_tokens.unwrap_or_default();
+        if log.cold_start == Some(true) {
+            group.cold_start_requests += 1;
+            group.cold_start_input_tokens += log.input_tokens.unwrap_or_default();
+            group.cold_start_output_tokens += log.output_tokens.unwrap_or_default();
+            group.cold_start_cache_read_tokens += log.cache_read_tokens.unwrap_or_default();
+            group.cold_start_cache_shortfall_tokens +=
+                log.cache_shortfall_tokens.unwrap_or_default();
+            group.cold_start_cache_avoidable_gap_tokens +=
+                log.cache_avoidable_gap_tokens.unwrap_or_default();
+            group.cold_start_cache_new_tail_gap_tokens +=
+                log.cache_new_tail_gap_tokens.unwrap_or_default();
+        }
+    }
+    if log.status >= 400 || log.cache_status == "error" {
+        group.error_statuses += 1;
+    }
+}
+
 fn increment_provider_upstream_attempt(
     groups: &mut Vec<ProviderTrafficAccumulator>,
     provider: &str,
@@ -2081,6 +2254,21 @@ fn sorted_provider_stats(
             .total_requests
             .cmp(&left.total_requests)
             .then_with(|| left.provider.cmp(&right.provider))
+    });
+    stats
+}
+
+fn sorted_agent_provider_stats(
+    groups: &[AgentProviderTrafficAccumulator],
+) -> Vec<AgentProviderTrafficStats> {
+    let mut stats = groups
+        .iter()
+        .map(AgentProviderTrafficAccumulator::snapshot)
+        .collect::<Vec<_>>();
+    stats.sort_by(|left, right| {
+        left.agent_id
+            .cmp(&right.agent_id)
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
     });
     stats
 }
@@ -2403,6 +2591,7 @@ mod tests {
             effective_reasoning_effort: None,
             reasoning_effort_source: None,
             cache_status: cache_status.to_string(),
+            cold_start: None,
             agent_id: None,
             agent_label: None,
             upstream_call_kind: None,
@@ -2439,6 +2628,7 @@ mod tests {
             prefix_state_cache_read_tokens: None,
             status: 200,
             ttft_ms: 1,
+            first_byte_ms: None,
             upstream_ttft_ms: None,
             local_prepare_ms: None,
             upstream_headers_ms: None,
@@ -2519,11 +2709,14 @@ mod tests {
 
     #[test]
     fn request_log_optional_fields_default_for_legacy_metrics() {
-        let log = request_log("miss", Some("cache-key"));
+        let mut log = request_log("miss", Some("cache-key"));
+        log.cold_start = Some(true);
         let mut value = serde_json::to_value(log).unwrap();
         let object = value.as_object_mut().unwrap();
         for key in [
             "provider_id",
+            "cold_start",
+            "first_byte_ms",
             "shadow_affinity_mode",
             "shadow_affinity_arm",
             "shadow_affinity_realm_id",
@@ -2541,6 +2734,8 @@ mod tests {
         }
         let restored: RequestLog = serde_json::from_value(value).unwrap();
         assert!(restored.provider_id.is_none());
+        assert!(restored.cold_start.is_none());
+        assert!(restored.first_byte_ms.is_none());
         assert!(restored.shadow_affinity_mode.is_none());
         assert!(restored.shadow_affinity_policy_compute_ms.is_none());
     }
@@ -2549,6 +2744,16 @@ mod tests {
     fn request_log_serializes_stable_provider_id() {
         let value = serde_json::to_value(request_log("miss", Some("cache-key"))).unwrap();
         assert_eq!(value["provider_id"], "provider-id");
+        assert!(value.get("cold_start").is_none());
+    }
+
+    #[test]
+    fn request_log_serializes_known_cold_start() {
+        let mut log = request_log("miss", Some("cache-key"));
+        log.cold_start = Some(true);
+
+        let value = serde_json::to_value(log).unwrap();
+        assert_eq!(value["cold_start"], true);
     }
 
     fn agent_inbound_start(id: &str, policy: &str, budget: u64) -> AgentInboundStart {
@@ -2621,7 +2826,58 @@ mod tests {
         assert_eq!(snapshot.usage.cache_read_tokens, 1_920);
         assert_eq!(snapshot.recent_requests.len(), 1);
         assert_eq!(snapshot.recent_upstream_calls.len(), 1);
+        assert_eq!(snapshot.recent_requests[0].cold_start, Some(false));
+        assert_eq!(snapshot.recent_upstream_calls[0].cold_start, Some(false));
         assert!(snapshot.recent_failed_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn transaction_request_logs_project_deduplicated_usage_cold_start() {
+        let metrics = MetricsStore::new();
+        for id in ["cold-start-first", "cold-start-repeat"] {
+            let mut request = request_log("miss", Some("cold-start-history"));
+            request.id = id.to_string();
+            request.input_tokens = Some(30_000);
+            request.cache_read_tokens = Some(0);
+            let mut transaction = MetricsTransaction::upstream(request);
+            transaction.observe_usage(
+                UsageRecord {
+                    provider: "provider".to_string(),
+                    model: "model".to_string(),
+                    input_tokens: 30_000,
+                    output_tokens: 100,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                Some("shared-cold-start-key"),
+            );
+            assert_eq!(
+                metrics.commit(transaction).await,
+                MetricsCommitResult::Applied
+            );
+        }
+
+        let snapshot = metrics.snapshot().await;
+        let request_cold_start = |id: &str| {
+            snapshot
+                .recent_requests
+                .iter()
+                .find(|request| request.id == id)
+                .and_then(|request| request.cold_start)
+        };
+        let upstream_cold_start = |id: &str| {
+            snapshot
+                .recent_upstream_calls
+                .iter()
+                .find(|request| request.id == id)
+                .and_then(|request| request.cold_start)
+        };
+
+        assert_eq!(request_cold_start("cold-start-first"), Some(true));
+        assert_eq!(request_cold_start("cold-start-repeat"), Some(false));
+        assert_eq!(upstream_cold_start("cold-start-first"), Some(true));
+        assert_eq!(upstream_cold_start("cold-start-repeat"), Some(false));
+        assert_eq!(snapshot.usage.cold_start_requests, 1);
     }
 
     #[tokio::test]
@@ -3208,6 +3464,94 @@ mod tests {
         assert_eq!(snapshot.recent_failed_requests[0].status, 503);
         assert_eq!(snapshot.provider_stats[0].successful_requests, 1);
         assert_eq!(snapshot.provider_stats[0].error_statuses, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_provider_success_count_outlives_recent_history_limit() {
+        let metrics = MetricsStore::new();
+        for index in 0..201 {
+            let mut log = request_log("miss", Some("agent-success-history"));
+            log.id = format!("codex-success-{index}");
+            log.agent_id = Some("codex".to_string());
+            log.agent_label = Some("Codex".to_string());
+            log.provider = "shared-provider".to_string();
+            log.provider_id = Some("shared-provider-id".to_string());
+            log.input_tokens = Some(10);
+            log.output_tokens = Some(2);
+            log.cache_read_tokens = Some(9);
+            log.cache_shortfall_tokens = Some(10);
+            log.cache_avoidable_gap_tokens = Some(3);
+            log.cache_new_tail_gap_tokens = Some(7);
+            log.cold_start = (index == 0).then_some(true);
+            metrics.record_request(log, true).await;
+        }
+        let mut failed = request_log("error", Some("agent-failed-history"));
+        failed.id = "codex-failed".to_string();
+        failed.status = 502;
+        failed.agent_id = Some("codex".to_string());
+        failed.agent_label = Some("Codex".to_string());
+        failed.provider = "shared-provider".to_string();
+        failed.provider_id = Some("shared-provider-id".to_string());
+        failed.input_tokens = Some(9_999);
+        failed.output_tokens = Some(9_999);
+        failed.cache_read_tokens = Some(9_999);
+        metrics.record_request(failed, true).await;
+        for index in 0..3 {
+            let mut log = request_log("miss", Some("other-agent-success-history"));
+            log.id = format!("claude-success-{index}");
+            log.agent_id = Some("claude-code".to_string());
+            log.agent_label = Some("Claude Code".to_string());
+            log.provider = "shared-provider".to_string();
+            log.provider_id = Some("shared-provider-id".to_string());
+            metrics.record_request(log, true).await;
+        }
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.recent_requests.len(), 200);
+        let codex = snapshot
+            .agent_provider_stats
+            .iter()
+            .find(|item| item.agent_id == "codex" && item.provider_id == "shared-provider-id")
+            .expect("Codex aggregate should be present");
+        assert_eq!(codex.successful_requests, 201);
+        assert_eq!(codex.total_requests, 202);
+        assert_eq!(codex.error_statuses, 1);
+        assert_eq!(codex.input_tokens, 2_010);
+        assert_eq!(codex.output_tokens, 402);
+        assert_eq!(codex.cache_read_tokens, 1_809);
+        assert_eq!(codex.cache_shortfall_tokens, 2_010);
+        assert_eq!(codex.cache_avoidable_gap_tokens, 603);
+        assert_eq!(codex.cache_new_tail_gap_tokens, 1_407);
+        assert_eq!(codex.cold_start_requests, 1);
+        assert_eq!(codex.cold_start_cache_shortfall_tokens, 10);
+        assert_eq!(codex.cold_start_cache_avoidable_gap_tokens, 3);
+        assert_eq!(codex.cold_start_cache_new_tail_gap_tokens, 7);
+        let claude = snapshot
+            .agent_provider_stats
+            .iter()
+            .find(|item| item.agent_id == "claude-code")
+            .expect("Claude aggregate should be present");
+        assert_eq!(claude.successful_requests, 3);
+    }
+
+    #[tokio::test]
+    async fn compact_history_without_usage_keeps_cold_start_unknown() {
+        let metrics = MetricsStore::new();
+        let mut compact = request_log("compact", Some("compact-history"));
+        compact.id = "compact-history".to_string();
+        compact.upstream_call_source = Some("responses-compaction-v2".to_string());
+        compact.input_tokens = Some(9_216);
+        compact.cache_read_tokens = Some(0);
+
+        assert_eq!(
+            metrics.commit(MetricsTransaction::upstream(compact)).await,
+            MetricsCommitResult::Applied
+        );
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.recent_requests[0].cache_status, "compact");
+        assert_eq!(snapshot.recent_requests[0].cold_start, None);
+        assert_eq!(snapshot.recent_upstream_calls[0].cold_start, None);
     }
 
     #[tokio::test]

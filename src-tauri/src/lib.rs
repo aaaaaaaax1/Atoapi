@@ -28,7 +28,44 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
+
+#[derive(Default)]
+struct ExitCoordinator {
+    shutdown_started: AtomicBool,
+    final_exit_ready: AtomicBool,
+}
+
+impl ExitCoordinator {
+    fn begin_shutdown(&self) -> bool {
+        !self.shutdown_started.swap(true, Ordering::AcqRel)
+    }
+
+    fn allow_final_exit(&self) {
+        self.final_exit_ready.store(true, Ordering::Release);
+    }
+
+    fn final_exit_is_ready(&self) -> bool {
+        self.final_exit_ready.load(Ordering::Acquire)
+    }
+}
+
+fn spawn_exit_shutdown(
+    state: Arc<AppState>,
+    app_handle: tauri::AppHandle,
+    exit_coordinator: Arc<ExitCoordinator>,
+) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = state.shutdown_for_exit().await {
+            state
+                .metrics
+                .record_error("shutdown", &err.to_string())
+                .await;
+        }
+        exit_coordinator.allow_final_exit();
+        app_handle.exit(0);
+    });
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,9 +73,9 @@ pub fn run() {
         AppState::load()
             .unwrap_or_else(|err| panic!("failed to initialize application state: {err:?}")),
     );
-    let exiting = Arc::new(AtomicBool::new(false));
+    let exit_coordinator = Arc::new(ExitCoordinator::default());
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             get_config,
@@ -128,28 +165,53 @@ pub fn run() {
             Ok(())
         })
         .on_window_event({
-            let exiting = exiting.clone();
+            let exit_coordinator = exit_coordinator.clone();
             move |window, event| {
                 let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                     return;
                 };
                 api.prevent_close();
-                if exiting.swap(true, Ordering::AcqRel) {
+                if !exit_coordinator.begin_shutdown() {
                     return;
                 }
                 let state = window.state::<Arc<AppState>>().inner().clone();
                 let app_handle = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(err) = state.shutdown_for_exit().await {
-                        state
-                            .metrics
-                            .record_error("shutdown", &err.to_string())
-                            .await;
-                    }
-                    app_handle.exit(0);
-                });
+                spawn_exit_shutdown(state, app_handle, exit_coordinator.clone());
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Atoapi");
+        .build(tauri::generate_context!())
+        .expect("error while building Atoapi");
+
+    app.run({
+        let exit_coordinator = exit_coordinator.clone();
+        move |app_handle, event| {
+            let RunEvent::ExitRequested { api, .. } = event else {
+                return;
+            };
+            if exit_coordinator.final_exit_is_ready() {
+                return;
+            }
+            api.prevent_exit();
+            if !exit_coordinator.begin_shutdown() {
+                return;
+            }
+            let state = app_handle.state::<Arc<AppState>>().inner().clone();
+            spawn_exit_shutdown(state, app_handle.clone(), exit_coordinator.clone());
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExitCoordinator;
+
+    #[test]
+    fn exit_coordinator_runs_cleanup_once_before_allowing_exit() {
+        let coordinator = ExitCoordinator::default();
+        assert!(!coordinator.final_exit_is_ready());
+        assert!(coordinator.begin_shutdown());
+        assert!(!coordinator.begin_shutdown());
+        coordinator.allow_final_exit();
+        assert!(coordinator.final_exit_is_ready());
+    }
 }

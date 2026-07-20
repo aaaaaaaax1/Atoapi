@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.3.1",
+  "version": "1.3.3",
   "private": true,
   "type": "module",
   "scripts": {
@@ -10,6 +10,7 @@
     "analyze:metrics": "node scripts/analyze-metrics.mjs",
     "test:metrics": "node scripts/test-analyze-metrics.mjs",
     "test:request-state": "node scripts/test-request-record-state.mjs",
+    "test:provider-display": "node scripts/test-graphite-provider-display.mjs",
     "build:codex-patcher": "node scripts/build-codex-ui-patcher.mjs",
     "soak:metrics": "node scripts/soak-metrics.mjs",
     "accept:post-burst": "node scripts/accept-post-burst-live.mjs",

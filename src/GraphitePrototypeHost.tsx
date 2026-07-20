@@ -10,6 +10,22 @@ import type {
   ProviderConfig
 } from "./lib/api";
 import { providersForGraphiteAgent } from "./graphite/providerScope";
+import {
+  recordsForAgent,
+  scopesForSuccessfulAgentRequests,
+  trafficForAgentScope,
+  limitVisibleRequestRecords
+} from "./graphite/requestScope";
+import {
+  requestRecordIsBackendColdStart,
+  requestRecordState,
+  requestRecordStatusDisplay,
+  requestTransportDisplay
+} from "./lib/request-record-state";
+import { providerDisplayName, requestAgentBadge } from "./graphite/providerDisplay";
+
+// The table exposes ten 20-row pages. This does not govern lifetime metrics.
+const MAX_VISIBLE_REQUESTS = 200;
 
 export interface GraphiteProviderPayload {
   id?: string | null;
@@ -782,12 +798,7 @@ const bridgeSource = String.raw`
 
   function requestDuration(value) {
     if (!Number.isFinite(value) || value <= 0) return "不适用";
-    if (value >= 60_000) {
-      const totalSeconds = Math.round(value / 1000);
-      return Math.floor(totalSeconds / 60) + "m " + String(totalSeconds % 60).padStart(2, "0") + "s";
-    }
-    const seconds = value / 1000;
-    return seconds < 10 ? seconds.toFixed(1) + "s" : seconds.toFixed(0) + "s";
+    return (value / 1000).toFixed(2) + "s";
   }
 
   function requestActualModel(request) {
@@ -824,6 +835,9 @@ const bridgeSource = String.raw`
     const metricState = host.state?.metrics || {};
     const scope = activeRequestScope(metricState);
     renderRequestScopeTabs(metricState);
+    const columnLabels = document.querySelectorAll(".request-column-head span");
+    if (columnLabels[2]) columnLabels[2].textContent = "传输";
+    if (columnLabels[6]) columnLabels[6].textContent = "状态";
     const scoped = scope.providerId
       ? requests.filter((request) => request.providerId === scope.providerId)
       : requests.slice();
@@ -840,14 +854,19 @@ const bridgeSource = String.raw`
         ? (Number(request.cachedTokens || 0) / Number(request.inputTokens) * 100).toFixed(1) + "%"
         : "—";
       const model = requestActualModel(request);
-      return '<article class="request-row" tabindex="0" data-request-id="' + escape(request.id) + '">' +
-        '<div class="request-identity" title="' + escape(request.provider + " / " + request.agentLabel) + '"><b>' + escape(request.provider) + ' / ' + escape(request.agentLabel) + '</b><span>' + escape(request.time) + '</span></div>' +
-        '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div>' +
-        '<div class="request-stream"><b>流</b><small>' + (outputRate ? outputRate + ' t/s' : '—') + '</small></div>' +
+      const rowTone = request.statusTone || (request.failed ? "error" : "complete");
+      const statusDetail = request.statusDetail
+        ? '<small>' + escape(request.statusDetail) + '</small>'
+        : '';
+      return '<article class="request-row status-' + escape(rowTone) + (request.failed ? ' failed' : '') + '" tabindex="0" data-request-id="' + escape(request.id) + '">' +
+        '<div class="request-identity" title="' + escape(request.provider + " · " + request.agentLabel) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span>' + escape(request.time) + '</span></div>' +
+        '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><div class="request-model-stack"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div></div>' +
+        '<div class="request-stream transport-' + escape(request.transportTone || "stream") + '"><b>' + escape(request.transport) + '</b><small>' + (outputRate ? outputRate + ' t/s' : '—') + '</small></div>' +
         '<div class="request-tokens"><b>' + escape(requestTokens(request.inputTokens)) + ' / ' + escape(requestTokens(request.outputTokens)) + '</b><small>缓存 ' + escape(requestTokens(request.cachedTokens)) + ' (' + escape(cachePercent) + ')</small></div>' +
         '<div class="request-time"><span class="request-time-line ' + requestTimingTone(ttftMs, "ttft") + '"><span>首字</span><b class="value">' + escape(requestDuration(ttftMs)) + '</b></span><span class="request-time-line ' + requestTimingTone(totalMs, "total") + '"><span>耗时</span><b class="value">' + escape(requestDuration(totalMs)) + '</b></span></div>' +
-        '<div class="request-cache"><b>' + escape(cachePercent) + '</b><small>缺 ' + escape(requestTokens(request.cacheShortfallTokens)) + ' · 可 ' + escape(requestTokens(request.cacheAvoidableGapTokens)) + ' · 新 ' + escape(requestTokens(request.cacheNewTailGapTokens)) + '</small></div></article>';
-    }).join("") : '<div class="empty-row">当前筛选下暂无成功请求记录</div>';
+        '<div class="request-cache"><b>' + escape(cachePercent) + '</b><small>缺 ' + escape(requestTokens(request.cacheShortfallTokens)) + ' · 可 ' + escape(requestTokens(request.cacheAvoidableGapTokens)) + ' · 新 ' + escape(requestTokens(request.cacheNewTailGapTokens)) + '</small></div>' +
+        '<div class="request-status request-state ' + escape(rowTone) + '"><b>' + escape(request.statusLabel || "OK") + '</b>' + statusDetail + '</div></article>';
+    }).join("") : '<div class="empty-row">当前筛选下暂无请求记录</div>';
     const pageButtons = Array.from({ length: totalPages }, (_, index) => {
       const page = index + 1;
       return '<button class="request-page-button" type="button" data-request-page="' + page + '"' + (page === requestPage ? ' aria-current="page"' : '') + '>' + page + '</button>';
@@ -946,11 +965,17 @@ const bridgeSource = String.raw`
     const request = requests.find((item) => item.id === requestId);
     if (!request) { originalOpenRequestDetail(requestId); return; }
     $bridge("#requestDetailSubtitle").textContent = request.provider + " · " + request.model;
+    const rawModelTtftMs = Number(request.modelTtftMs || 0);
+    const displayedTtftMs = Number(request.ttftMs || 0);
+    const modelTtftRow = rawModelTtftMs > 0 && Math.abs(rawModelTtftMs - displayedTtftMs) >= 1
+      ? '<div class="detail-row"><span>模型首字</span><b>' + escape(requestDuration(rawModelTtftMs)) + '</b></div>'
+      : '';
     $bridge("#requestDetailBody").innerHTML =
-      '<div class="status-band"><span class="status-icon">' + icon(request.failed ? "circle-x" : "circle-check", 17) + '</span><div><b>' + escape(request.failed ? "上游错误" : request.state) + '</b><small>' + escape(request.failed ? (request.errorDetail || request.detail) : "成功流已完整收尾并记录 usage") + '</small></div></div>' +
+      '<div class="status-band"><span class="status-icon">' + icon(request.stateTone === "error" ? "circle-x" : "circle-check", 17) + '</span><div><b>' + escape(request.state) + '</b><small>' + escape(request.stateTone === "error" ? (request.errorDetail || request.detail) : "成功流已完整收尾并记录 usage") + '</small></div></div>' +
       '<div class="detail-list">' +
       '<div class="detail-row"><span>请求 ID</span><code>' + escape(request.id) + '</code></div>' +
       '<div class="detail-row"><span>首字 / 总耗时</span><b>' + escape(request.ttft) + ' / ' + escape(request.total) + '</b></div>' +
+      modelTtftRow +
       '<div class="detail-row"><span>输入 / 输出</span><b>' + escape(request.input) + ' / ' + escape(request.output) + '</b></div>' +
       '<div class="detail-row"><span>缓存命中</span><b>' + escape(request.cached) + ' · ' + escape(request.ratio) + '</b></div>' +
       '<div class="detail-row"><span>缓存细节</span><b>' + escape(request.detail) + '</b></div>' +
@@ -1043,7 +1068,7 @@ function formatTokenCount(value?: number | null): string {
 
 function formatDuration(value?: number | null): string {
   if (!value || value <= 0) return "—";
-  return `${(value / 1000).toFixed(value >= 10_000 ? 1 : 2)}s`;
+  return `${(value / 1000).toFixed(2)}s`;
 }
 
 function formatPercent(value?: number | null): string {
@@ -1071,12 +1096,13 @@ function buildState(
   appVersion: string
 ) {
   const providers = config?.providers ?? [];
+  const agentConfigs = config?.agent_injections ?? [];
   const providerMap = new Map(providers.map((provider) => [provider.id, provider]));
-  const selectedAgent = config?.agent_injections.find((agent) => agent.id === selectedAgentId) ?? null;
+  const selectedAgent = agentConfigs.find((agent) => agent.id === selectedAgentId) ?? null;
   const visibleProviders = selectedAgent
     ? providersForGraphiteAgent(providers, selectedAgent)
     : providers;
-  const agents = (config?.agent_injections ?? []).map((agent) => {
+  const agents = agentConfigs.map((agent) => {
     const provider = agent.provider_id ? providerMap.get(agent.provider_id) : undefined;
     const mappingCount = provider?.models.filter((model) => model.enabled).length ?? 0;
     return {
@@ -1087,7 +1113,7 @@ function buildState(
       enabled: agent.enabled,
       provider: provider?.id ?? "",
       route: provider
-        ? `${provider.name} · ${channelLabel(provider.channel)} · ${mappingCount ? `${mappingCount} 个模型映射` : "模型直传"}`
+        ? `${providerDisplayName(provider, agent)} · ${channelLabel(provider.channel)} · ${mappingCount ? `${mappingCount} 个模型映射` : "模型直传"}`
         : "未选择上游",
       endpoint: agent.kind === "codex" ? "/codex/v1" : agent.kind === "proxy-mode" ? "/v1" : "/v1",
       localBaseUrl: agent.kind === "proxy-mode"
@@ -1098,7 +1124,7 @@ function buildState(
   });
   const providerState = visibleProviders.map((provider) => ({
     id: provider.id,
-    name: provider.name,
+    name: providerDisplayName(provider, selectedAgent),
     url: provider.base_url,
     channel: provider.channel_mode === "auto" ? "Auto" : channelLabel(provider.channel),
     mappings: provider.models.filter((model) => model.enabled).length,
@@ -1153,31 +1179,86 @@ function buildState(
       provider.id === providerName || provider.name === providerName
     ) ?? null;
   };
-  const successfulRequestSource = (metrics?.recent_requests ?? [])
+  const successfulRequestSource = recordsForAgent((metrics?.recent_requests ?? [])
     .filter((request) => request.status >= 200 && request.status < 300 && request.cache_status !== "error")
-    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
-  const failedRequestSource = (metrics?.recent_failed_requests ?? [])
+    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at)), selectedAgent?.id);
+  const failedRequestSource = recordsForAgent((metrics?.recent_failed_requests ?? [])
     .filter((request) => request.status >= 400 || request.cache_status === "error")
-    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at));
-  const requestItems = successfulRequestSource.map((request) => {
+    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at)), selectedAgent?.id);
+  type RequestRecord = MetricsSnapshot["recent_requests"][number];
+  const preferredFirstByteMs = (request: RequestRecord): number => {
+    const direct = request.first_byte_ms;
+    if (typeof direct === "number" && Number.isFinite(direct) && direct >= 0) return direct;
+    const headers = request.upstream_headers_ms;
+    const firstChunk = request.upstream_first_chunk_ms;
+    if (
+      typeof headers === "number" && Number.isFinite(headers) && headers >= 0 &&
+      typeof firstChunk === "number" && Number.isFinite(firstChunk) && firstChunk > 0
+    ) {
+      const derived = headers + firstChunk;
+      if (derived > 0) return derived;
+    }
+    return request.ttft_ms ?? 0;
+  };
+  const toRequestItem = (request: RequestRecord) => {
     const input = request.input_tokens ?? 0;
     const cached = request.cache_read_tokens ?? 0;
     const ratio = input > 0 ? `${(cached / input * 100).toFixed(1)}%` : "—";
     const requested = request.requested_model?.trim();
     const model = requested && requested !== request.model ? `${requested} → ${request.model}` : request.model;
     const provider = providerForRequest(request.provider_id, request.provider);
+    const recordAgent = agentConfigs.find((agent) => agent.id === request.agent_id) ??
+      agentConfigs.find((agent) => agent.label === request.agent_label) ??
+      selectedAgent;
+    const badge = requestAgentBadge(request.agent_id, request.agent_label, agentConfigs);
+    const providerName = provider
+      ? providerDisplayName(provider, recordAgent)
+      : request.provider;
+    const displayFirstByteMs = preferredFirstByteMs(request);
+    const state = requestRecordState({
+      status: request.status,
+      cacheStatus: request.cache_status,
+      upstreamCallSource: request.upstream_call_source,
+      downstreamDisconnected: request.downstream_disconnected,
+      downstreamDisconnectStage: request.downstream_disconnect_stage,
+      shadowAffinityLane: request.shadow_affinity_lane,
+      prefixLagClassification: request.prefix_lag_classification,
+      inputTokens: input,
+      cacheReadTokens: cached,
+      coldStart: request.cold_start
+    }) ?? { label: "完成", tone: "complete" as const };
+    const transport = requestTransportDisplay({
+      upstreamCallKind: request.upstream_call_kind,
+      cacheStatus: request.cache_status
+    });
+    const statusDisplay = requestRecordStatusDisplay({
+      status: request.status,
+      cacheStatus: request.cache_status,
+      upstreamCallSource: request.upstream_call_source,
+      downstreamDisconnected: request.downstream_disconnected,
+      downstreamDisconnectStage: request.downstream_disconnect_stage,
+      shadowAffinityLane: request.shadow_affinity_lane,
+      prefixLagClassification: request.prefix_lag_classification,
+      inputTokens: input,
+      cacheReadTokens: cached,
+      coldStart: request.cold_start
+    });
     return {
       id: request.id,
+      recordedAt: request.at,
       time: formatRequestTime(request.at),
-      provider: request.provider,
+      provider: providerName,
       providerId: request.provider_id ?? provider?.id ?? null,
       model,
-      agentLabel: request.agent_label ?? request.agent_id ?? "Agent",
+      agentLabel: badge.label,
+      agentTone: badge.tone,
       clientChannel: request.client_channel ?? "Responses",
       channel: `${request.client_channel ?? "Responses"} · ${request.agent_id ?? "Agent"} · 流式`,
-      ttft: formatDuration(request.ttft_ms),
+      ttft: formatDuration(displayFirstByteMs),
       total: formatDuration(request.total_ms),
-      ttftMs: request.ttft_ms,
+      ttftMs: displayFirstByteMs,
+      modelTtft: formatDuration(request.ttft_ms),
+      modelTtftMs: request.ttft_ms,
       totalMs: request.total_ms,
       input: formatTokenCount(input),
       output: formatTokenCount(request.output_tokens ?? 0),
@@ -1191,9 +1272,17 @@ function buildState(
       reasoning: request.effective_reasoning_effort ?? request.configured_reasoning_effort ?? request.agent_reasoning_effort ?? "—",
       ratio,
       detail: `缺 ${(request.cache_shortfall_tokens ?? 0).toLocaleString("zh-CN")} · 可 ${(request.cache_avoidable_gap_tokens ?? 0).toLocaleString("zh-CN")} · 新 ${(request.cache_new_tail_gap_tokens ?? 0).toLocaleString("zh-CN")}`,
-      errorDetail: "",
-      state: request.prefix_lag_classification === "cold_start" ? "冷启动" : "命中",
-      failed: false,
+      errorDetail: request.status >= 400 || request.cache_status === "error"
+        ? `上游返回 HTTP ${request.status || "错误"}`
+        : "",
+      state: state.label,
+      stateTone: state.tone,
+      transport: transport.label,
+      transportTone: transport.tone,
+      statusLabel: statusDisplay.label,
+      statusDetail: statusDisplay.detail,
+      statusTone: statusDisplay.tone,
+      failed: state.tone === "error",
       status: request.status,
       cacheStatus: request.cache_status,
       networkPath: request.upstream_network_path ?? "—",
@@ -1203,15 +1292,33 @@ function buildState(
         ? "已验证增量复用"
         : request.response_session_skip_reason ?? "完整请求 · 未启用 delta"
     };
+  };
+  const requestItems = limitVisibleRequestRecords([
+    ...successfulRequestSource.map(toRequestItem),
+    ...failedRequestSource.map(toRequestItem)
+  ].sort((left, right) => Date.parse(right.recordedAt) - Date.parse(left.recordedAt)), MAX_VISIBLE_REQUESTS);
+  const requestScopes = scopesForSuccessfulAgentRequests(successfulRequestSource).map((scope) => {
+    if (!scope.providerId) return scope;
+    const provider = providerForRequest(scope.providerId);
+    return provider ? { ...scope, label: providerDisplayName(provider, selectedAgent) } : scope;
   });
-  const requestScopes = [
-    { id: "all", label: "全部", providerId: null },
-    ...providers.map((provider) => ({
-      id: `provider:${provider.id}`,
-      label: provider.name,
-      providerId: provider.id
-    }))
-  ];
+  const scopeIds = new Set(requestScopes.map((scope) => scope.id));
+  for (const traffic of metrics?.agent_provider_stats ?? []) {
+    const providerId = traffic.provider_id?.trim();
+    if (
+      !providerId ||
+      traffic.agent_id !== selectedAgent?.id ||
+      traffic.successful_requests <= 0 ||
+      scopeIds.has(`provider:${providerId}`)
+    ) continue;
+    const provider = providerForRequest(providerId, traffic.provider);
+    requestScopes.push({
+      id: `provider:${providerId}`,
+      label: provider ? providerDisplayName(provider, selectedAgent) : traffic.provider || providerId,
+      providerId
+    });
+    scopeIds.add(`provider:${providerId}`);
+  }
   const isForProvider = (
     request: MetricsSnapshot["recent_requests"][number],
     providerId: string | null
@@ -1221,30 +1328,77 @@ function buildState(
     const provider = providerForRequest(null, request.provider);
     return provider?.id === providerId;
   };
-  const metricForScope = (providerId: string | null) => {
-    const successes = successfulRequestSource.filter((request) => isForProvider(request, providerId));
-    const failures = failedRequestSource.filter((request) => isForProvider(request, providerId));
-    const considered = includeColdStarts
+  const successfulForScope = (providerId: string | null) =>
+    successfulRequestSource.filter((request) => isForProvider(request, providerId));
+  const consideredSuccessfulForScope = (providerId: string | null) => {
+    const successes = successfulForScope(providerId);
+    return includeColdStarts
       ? successes
-      : successes.filter((request) => request.prefix_lag_classification !== "cold_start");
-    const inputTokens = considered.reduce((sum, request) => sum + (request.input_tokens ?? 0), 0);
-    const outputTokens = considered.reduce((sum, request) => sum + (request.output_tokens ?? 0), 0);
-    const cachedTokens = considered.reduce((sum, request) => sum + (request.cache_read_tokens ?? 0), 0);
-    const cacheShortfall = considered.reduce((sum, request) => sum + (request.cache_shortfall_tokens ?? 0), 0);
-    const cacheAvoidable = considered.reduce((sum, request) => sum + (request.cache_avoidable_gap_tokens ?? 0), 0);
-    const cacheNewTail = considered.reduce((sum, request) => sum + (request.cache_new_tail_gap_tokens ?? 0), 0);
+      : successes.filter((request) => !requestRecordIsBackendColdStart({ coldStart: request.cold_start }));
+  };
+  const metricForScope = (providerId: string | null) => {
+    const successes = successfulForScope(providerId);
+    const failures = failedRequestSource.filter((request) => isForProvider(request, providerId));
+    const considered = consideredSuccessfulForScope(providerId);
+    const aggregate = trafficForAgentScope(
+      metrics?.agent_provider_stats,
+      selectedAgent?.id,
+      providerId
+    );
+    const inputTokens = aggregate
+      ? Math.max(0, aggregate.inputTokens - (includeColdStarts ? 0 : aggregate.coldStartInputTokens))
+      : 0;
+    const outputTokens = aggregate
+      ? Math.max(0, aggregate.outputTokens - (includeColdStarts ? 0 : aggregate.coldStartOutputTokens))
+      : 0;
+    const cachedTokens = aggregate
+      ? Math.max(0, aggregate.cachedTokens - (includeColdStarts ? 0 : aggregate.coldStartCachedTokens))
+      : 0;
+    const cacheShortfall = aggregate
+      ? Math.max(0, aggregate.cacheShortfallTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheShortfallTokens))
+      : 0;
+    const cacheAvoidable = aggregate
+      ? Math.max(0, aggregate.cacheAvoidableGapTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheAvoidableGapTokens))
+      : 0;
+    const cacheNewTail = aggregate
+      ? Math.max(0, aggregate.cacheNewTailGapTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheNewTailGapTokens))
+      : 0;
     return {
-      cacheRate: inputTokens > 0 ? formatPercent(cachedTokens / inputTokens) : "—",
-      inputTokens: formatTokens(inputTokens),
-      outputTokens: formatTokens(outputTokens),
-      cachedTokens: formatTokens(cachedTokens),
-      successfulRequests: successes.length,
-      errors: failures.length,
-      cacheShortfall: formatTokens(cacheShortfall),
-      cacheAvoidable: formatTokens(cacheAvoidable),
-      cacheNewTail: formatTokens(cacheNewTail)
+      cacheRate: aggregate && inputTokens > 0 ? formatPercent(cachedTokens / inputTokens) : "—",
+      inputTokens: aggregate ? formatTokens(inputTokens) : "—",
+      outputTokens: aggregate ? formatTokens(outputTokens) : "—",
+      cachedTokens: aggregate ? formatTokens(cachedTokens) : "—",
+      successfulRequests: aggregate
+        ? Math.max(0, aggregate.successfulRequests - (includeColdStarts ? 0 : aggregate.coldStartRequests))
+        : "—",
+      errors: aggregate?.errors ?? "—",
+      cacheShortfall: aggregate ? formatTokens(cacheShortfall) : "—",
+      cacheAvoidable: aggregate ? formatTokens(cacheAvoidable) : "—",
+      cacheNewTail: aggregate ? formatTokens(cacheNewTail) : "—"
     };
   };
+  const p95FirstByte = (requests: readonly RequestRecord[]) => {
+    const values = requests
+      .map(preferredFirstByteMs)
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((left, right) => left - right);
+    if (!values.length) return 0;
+    return values[Math.min(values.length - 1, Math.max(0, Math.ceil(values.length * 0.95) - 1))];
+  };
+  const providerRows = requestScopes
+    .filter((scope) => scope.providerId)
+    .map((scope) => {
+      const metric = metricForScope(scope.providerId);
+      const considered = consideredSuccessfulForScope(scope.providerId);
+      return {
+        provider: scope.label,
+        successful: metric.successfulRequests,
+        input: metric.inputTokens,
+        cached: metric.cachedTokens,
+        ttft: formatDuration(p95FirstByte(considered)),
+        ratio: metric.cacheRate
+      };
+    });
   const metricsState = {
     scopes: requestScopes.map((scope) => ({
       ...scope,
@@ -1253,14 +1407,7 @@ function buildState(
     cacheEnabled: config?.cache.enabled ?? false,
     includeColdStarts,
     showDetailedErrors,
-    providerRows: (metrics?.provider_stats ?? []).map((item) => ({
-      provider: item.provider,
-      successful: item.successful_requests,
-      input: formatTokens(item.recent_usage?.input_tokens ?? 0),
-      cached: formatTokens(item.recent_usage?.cache_read_tokens ?? 0),
-      ttft: formatDuration(item.ttft_p95_ms),
-      ratio: formatPercent(item.cache_hit_rate)
-    }))
+    providerRows
   };
   const settings = {
     host: config?.host ?? "127.0.0.1",

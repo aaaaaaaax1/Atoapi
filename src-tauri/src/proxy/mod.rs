@@ -122,6 +122,9 @@ const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
 const PROVIDER_CACHE_MIN_BUCKET_TOKENS: u64 = 128;
 const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
 const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
+// Shadow affinity remains observable by default, but it must not change an
+// ordinary request's provider cache key without an explicit validation run.
+const AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED: bool = false;
 
 #[derive(Debug, Deserialize)]
 struct ResponseSessionReuseProbeHttpInput {
@@ -1414,6 +1417,7 @@ async fn run_responses_compact_for_authorized_agent(
             "error"
         }
         .to_string(),
+        cold_start: None,
         agent_id: authorized_agent.clone(),
         agent_label: authorized_agent
             .as_deref()
@@ -1465,6 +1469,7 @@ async fn run_responses_compact_for_authorized_agent(
         prefix_state_cache_read_tokens: None,
         status,
         ttft_ms: response_ready_ms,
+        first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(response_ready_ms, None)),
         local_prepare_ms: None,
         upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
@@ -2069,6 +2074,7 @@ async fn run_generation_for_authorized_agent(
                     request_id,
                     &client_channel,
                     &decision,
+                    authorized_agent.as_deref(),
                     requested_model_for_log.clone(),
                     non_sse_compact_compat_for_decision(&config, &decision),
                 )
@@ -2138,6 +2144,7 @@ async fn run_generation_for_authorized_agent(
                     request_id,
                     &client_channel,
                     &decision,
+                    authorized_agent.as_deref(),
                     requested_model_for_log.clone(),
                     non_sse_compact_compat_for_decision(&config, &decision),
                 )
@@ -2522,6 +2529,7 @@ async fn run_generation_for_authorized_agent(
             } else {
                 channel_eligible
                     && !explicit_client_prompt_cache_key
+                    && AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
                     && cache_affinity::apply_automatic_static_cohort_canary(
                         decision,
                         smart_hit_enabled(&config),
@@ -3443,6 +3451,7 @@ async fn run_generation_for_authorized_agent(
             eligible,
         )
         .to_string(),
+        cold_start: None,
         agent_id: agent_log_id.clone(),
         agent_label: agent_log_label.clone(),
         upstream_call_kind: Some(
@@ -3504,6 +3513,7 @@ async fn run_generation_for_authorized_agent(
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
         status,
         ttft_ms: elapsed,
+        first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
         local_prepare_ms: Some(local_prepare_ms),
         upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
@@ -3680,9 +3690,9 @@ async fn acquire_provider_prefix_guard(
             .clone()
     };
     if matches!(channel, Channel::Responses) {
-        return tokio::time::timeout(responses_foreground_wait_cap(), lock.lock_owned())
-            .await
-            .ok();
+        // Prefix coordination may protect preparation when immediately
+        // available, but it is never allowed to delay a Responses request.
+        return lock.try_lock_owned().ok();
     }
     Some(lock.lock_owned().await)
 }
@@ -4440,13 +4450,9 @@ fn responses_foreground_wait_cap() -> TokioDuration {
 
 fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
-    elapsed_since_request_start: TokioDuration,
+    _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
-    matches!(channel, Channel::Responses).then(|| {
-        responses_foreground_wait_cap()
-            .checked_sub(elapsed_since_request_start)
-            .unwrap_or(TokioDuration::ZERO)
-    })
+    matches!(channel, Channel::Responses).then_some(TokioDuration::ZERO)
 }
 
 fn prefix_guard_wait_effect(
@@ -7254,12 +7260,11 @@ fn local_session_keys_enabled(config: &AppConfig) -> bool {
 }
 
 fn responses_session_reuse_enabled(config: &AppConfig) -> bool {
-    smart_hit_enabled(config)
+    smart_hit_enabled(config) && config.cache.prewarm_enabled
 }
 
 fn smart_hit_enabled(config: &AppConfig) -> bool {
     config.cache.enabled
-        && config.cache.prewarm_enabled
         && matches!(
             config.cache.mode,
             CacheMode::SessionPrewarm | CacheMode::PrefixPrewarm
@@ -8069,6 +8074,7 @@ fn upstream_transport_failure_log(
         effective_reasoning_effort: body_diagnostics.reasoning.effective.clone(),
         reasoning_effort_source: body_diagnostics.reasoning.source.clone(),
         cache_status: "error".to_string(),
+        cold_start: None,
         agent_id: None,
         agent_label: None,
         upstream_call_kind: Some(
@@ -8115,6 +8121,7 @@ fn upstream_transport_failure_log(
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
         status: 0,
         ttft_ms: elapsed,
+        first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
         local_prepare_ms: Some(local_prepare_ms),
         upstream_headers_ms: Some(0),
@@ -8242,6 +8249,7 @@ async fn cache_hit_response(
     request_id: String,
     client_channel: &Channel,
     decision: &RouteDecision,
+    agent_id: Option<&str>,
     requested_model: Option<String>,
     non_sse_compact_compat: bool,
 ) -> Response {
@@ -8273,8 +8281,9 @@ async fn cache_hit_response(
         effective_reasoning_effort: None,
         reasoning_effort_source: None,
         cache_status: cache_status.to_string(),
-        agent_id: None,
-        agent_label: None,
+        cold_start: None,
+        agent_id: agent_id.map(str::to_string),
+        agent_label: agent_id.map(str::to_string),
         upstream_call_kind: Some("cache".to_string()),
         upstream_call_source: Some("local_cache".to_string()),
         cache_key: Some(cache_key),
@@ -8309,6 +8318,7 @@ async fn cache_hit_response(
         prefix_state_cache_read_tokens: None,
         status: hit.entry.status,
         ttft_ms: elapsed,
+        first_byte_ms: None,
         upstream_ttft_ms: Some(0),
         local_prepare_ms: None,
         upstream_headers_ms: None,
@@ -10577,6 +10587,7 @@ async fn stream_upstream(
                 "error"
             }
             .to_string(),
+            cold_start: None,
             agent_id: agent_log_id.clone(),
             agent_label: agent_log_label.clone(),
             upstream_call_kind: Some("stream".to_string()),
@@ -10630,6 +10641,7 @@ async fn stream_upstream(
             prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
             status,
             ttft_ms,
+            first_byte_ms: first_chunk_at,
             upstream_ttft_ms: Some(upstream_ttft_ms(ttft_ms, Some(prefix_guard_wait.wait_ms))),
             local_prepare_ms: Some(local_prepare_ms),
             upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
@@ -11757,10 +11769,7 @@ fn apply_native_cache_controls(
     active_channel: &Channel,
     key_id: Option<&str>,
 ) -> Vec<String> {
-    if !smart_hit_enabled(config)
-        || !matches!(config.cache.mode, CacheMode::PrefixPrewarm)
-        || !matches!(active_channel, Channel::Responses | Channel::Chat)
-    {
+    if !smart_hit_enabled(config) || !matches!(active_channel, Channel::Responses | Channel::Chat) {
         return Vec::new();
     }
     let native_cache_plan = cache_capability::plan(
@@ -11774,7 +11783,7 @@ fn apply_native_cache_controls(
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
-    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+    if !smart_hit_enabled(config) {
         strip_provider_cache_key_fields(request);
         return;
     }
@@ -11815,7 +11824,7 @@ fn apply_session_provider_cache_key(
     config: &AppConfig,
     identity: Option<&SessionIdentity>,
 ) {
-    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+    if !smart_hit_enabled(config) {
         return;
     }
     let (Some(object), Some(identity)) = (request.as_object_mut(), identity) else {
@@ -11882,7 +11891,7 @@ fn copy_responses_prefix_cache_fields_for_native_stream(
     decision: &RouteDecision,
 ) {
     strip_provider_cache_key_fields(outbound);
-    if !smart_hit_enabled(config) || !matches!(config.cache.mode, CacheMode::PrefixPrewarm) {
+    if !smart_hit_enabled(config) {
         return;
     }
     let Some(cache_key) = openai_prompt_cache_key(prefix_body) else {
@@ -18142,6 +18151,69 @@ mod tests {
     }
 
     #[test]
+    fn stable_cache_controls_survive_disabled_prewarm_without_reenabling_session_reuse() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.prewarm_enabled = false;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        config.workspace_fingerprint = "cache-gate-test".to_string();
+
+        let provider = test_responses_provider("https://api.openai.com/v1".to_string());
+        let decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6".to_string(),
+        };
+        let mut request = json!({
+            "model": "gpt-5.6",
+            "thread_id": "stable-thread",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "stable prefix"}]
+            }]
+        });
+        let identity = SessionIdentity::derive(&config, &decision, &request, &request).unwrap();
+
+        optimize_provider_prefix(&mut request, &config, &decision);
+        assert!(request.get("prompt_cache_key").is_some());
+        apply_session_provider_cache_key(&mut request, &config, Some(&identity));
+        assert_eq!(
+            request.get("prompt_cache_key").and_then(Value::as_str),
+            Some(identity.provider_cache_key.as_str())
+        );
+
+        let mut native_request = json!({
+            "model": "gpt-5.6",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "stable"}]
+            }]
+        });
+        let changed = apply_native_cache_controls(
+            &mut native_request,
+            &config,
+            &decision,
+            &Channel::Responses,
+            None,
+        );
+        assert!(changed.iter().any(|field| field == "prompt_cache_options"));
+        assert!(native_request.get("prompt_cache_options").is_some());
+        assert!(smart_hit_enabled(&config));
+        assert!(!responses_session_reuse_enabled(&config));
+        assert_eq!(
+            prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
+            Some(TokioDuration::ZERO)
+        );
+    }
+
+    #[test]
+    fn automatic_static_cohort_routing_is_disabled_by_default() {
+        assert!(!AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED);
+    }
+
+    #[test]
     fn prefix_optimizer_preserves_valid_client_prompt_cache_key() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
@@ -23313,7 +23385,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_provider_prefix_guard_serializes_same_cache_key() {
+    async fn responses_provider_prefix_guard_never_waits_for_a_busy_key() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-lock-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -23326,47 +23398,104 @@ mod tests {
             )
             .unwrap(),
         );
-        let active = Arc::new(AtomicUsize::new(0));
-        let max_active = Arc::new(AtomicUsize::new(0));
-        let start = Arc::new(tokio::sync::Barrier::new(4));
-        let mut tasks = Vec::new();
+        let held = acquire_provider_prefix_guard(
+            &state,
+            &Channel::Responses,
+            Some("same-provider-prefix-key"),
+            None,
+        )
+        .await
+        .expect("the first request should acquire the prefix guard");
 
-        for _ in 0..4 {
-            let state_for_task = state.clone();
-            let active_for_task = active.clone();
-            let max_for_task = max_active.clone();
-            let start_for_task = start.clone();
-            tasks.push(tokio::spawn(async move {
-                start_for_task.wait().await;
-                let _guard = acquire_provider_prefix_guard(
-                    &state_for_task,
-                    &Channel::Responses,
-                    Some("same-provider-prefix-key"),
-                    None,
-                )
-                .await
-                .unwrap();
-                let current = active_for_task.fetch_add(1, Ordering::SeqCst) + 1;
-                loop {
-                    let previous = max_for_task.load(Ordering::SeqCst);
-                    if current <= previous
-                        || max_for_task
-                            .compare_exchange(previous, current, Ordering::SeqCst, Ordering::SeqCst)
-                            .is_ok()
-                    {
-                        break;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                active_for_task.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
+        let skipped = tokio::time::timeout(
+            TokioDuration::from_millis(25),
+            acquire_provider_prefix_guard(
+                &state,
+                &Channel::Responses,
+                Some("same-provider-prefix-key"),
+                None,
+            ),
+        )
+        .await
+        .expect("a busy Responses prefix guard must not delay the request");
+        assert!(skipped.is_none());
+        drop(held);
+        assert!(acquire_provider_prefix_guard(
+            &state,
+            &Channel::Responses,
+            Some("same-provider-prefix-key"),
+            None,
+        )
+        .await
+        .is_some());
+        fs::remove_dir_all(config_dir).ok();
+    }
 
-        for task in tasks {
-            task.await.unwrap();
-        }
+    #[tokio::test]
+    async fn local_cache_hit_projects_authorized_agent_to_request_history() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-local-cache-agent-scope-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let config = AppConfig::default();
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://api.example.com/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6".to_string(),
+        };
+        let now = Utc::now();
+        let response = cache_hit_response(
+            &state,
+            cache::CacheLookup {
+                status: CacheLookupStatus::Exact,
+                entry: CacheEntry {
+                    key: "agent-scoped-cache-hit".to_string(),
+                    semantic_text: None,
+                    semantic_shape: None,
+                    semantic_vector: Vec::new(),
+                    content_type: "application/json".to_string(),
+                    status: StatusCode::OK.as_u16(),
+                    body: br#"{"id":"cached","usage":{"input_tokens":8,"output_tokens":1}}"#
+                        .to_vec(),
+                    created_at: now,
+                    expires_at: now + Duration::minutes(1),
+                    provider_id: decision.provider.id.clone(),
+                    model: decision.model.clone(),
+                    workspace_fingerprint: Some("test".to_string()),
+                },
+            },
+            Instant::now(),
+            "agent-scoped-cache-hit-request".to_string(),
+            &Channel::Responses,
+            &decision,
+            Some("codex"),
+            None,
+            false,
+        )
+        .await;
 
-        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(response.status(), StatusCode::OK);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.recent_requests.len(), 1);
+        assert_eq!(
+            metrics.recent_requests[0].agent_id.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            metrics.recent_requests[0].agent_label.as_deref(),
+            Some("codex")
+        );
+        assert_eq!(metrics.recent_requests[0].cache_status, "exact");
+
+        fs::remove_dir_all(config_dir).ok();
     }
 
     #[tokio::test]
@@ -23411,6 +23540,7 @@ mod tests {
                         yield Ok::<Bytes, Infallible>(Bytes::from_static(
                             b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_normal\"}}\n\n",
                         ));
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                         yield Ok::<Bytes, Infallible>(Bytes::from_static(
                             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
                         ));
@@ -23524,6 +23654,11 @@ mod tests {
         assert_eq!(metrics.recent_upstream_calls.len(), 1);
         assert_eq!(metrics.recent_requests.len(), 1);
         let log = &metrics.recent_requests[0];
+        assert!(
+            log.first_byte_ms
+                .is_some_and(|first_byte_ms| first_byte_ms < log.ttft_ms),
+            "the first raw SSE frame must be recorded before the later model-text event"
+        );
         assert_eq!(log.sse_end_reason.as_deref(), Some("upstream_eof"));
         assert_eq!(log.downstream_disconnected, Some(false));
         assert_eq!(log.sse_completed_event_seen, Some(true));
