@@ -3,6 +3,7 @@ mod agent_injection;
 mod cache;
 mod codex_ui_patch;
 mod config;
+mod continuation_lineage;
 mod crypto;
 mod metrics;
 mod persistence;

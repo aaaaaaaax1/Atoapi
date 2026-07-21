@@ -17,6 +17,7 @@ pub(super) struct StreamObservation {
 pub(super) struct StreamSummary {
     pub usage: UsageRecord,
     pub response_id: Option<String>,
+    pub output_items: Vec<Value>,
     pub completed_event_seen: bool,
     pub responses_completed_event_seen: bool,
     pub message_stop_event_seen: bool,
@@ -160,10 +161,12 @@ impl ResponsesStreamState {
         if let Some(event) = frame.event.as_deref() {
             self.process_event_type(event);
         }
-        let event_type = value.get("type").and_then(Value::as_str);
-        if let Some(event_type) = event_type {
+        let payload_event_type = value.get("type").and_then(Value::as_str);
+        if let Some(event_type) = payload_event_type {
             self.process_event_type(event_type);
         }
+        let effective_event_type = payload_event_type.or(frame.event.as_deref());
+        self.capture_output_items(&value, effective_event_type);
         self.summary.model_output_seen |= value_has_model_output(&value);
         self.summary.compaction_output_seen |= value_has_compaction_output(&value);
         if value.get("error").is_some_and(|error| !error.is_null()) {
@@ -187,6 +190,34 @@ impl ResponsesStreamState {
         self.summary.completed_event_seen =
             self.summary.responses_completed_event_seen || self.summary.message_stop_event_seen;
         self.summary.error_event_seen |= is_error_event_type(event_type);
+    }
+
+    fn capture_output_items(&mut self, value: &Value, event_type: Option<&str>) {
+        if event_type == Some("response.completed") {
+            if let Some(items) = value
+                .get("response")
+                .and_then(|response| response.get("output"))
+                .or_else(|| value.get("output"))
+                .and_then(Value::as_array)
+            {
+                self.summary.output_items = items.clone();
+                return;
+            }
+        }
+        if event_type != Some("response.output_item.done") {
+            return;
+        }
+        let Some(item) = value.get("item") else {
+            return;
+        };
+        let duplicate = self.summary.output_items.iter().any(|existing| {
+            let existing_id = existing.get("id").and_then(Value::as_str);
+            let item_id = item.get("id").and_then(Value::as_str);
+            (existing_id.is_some() && existing_id == item_id) || existing == item
+        });
+        if !duplicate {
+            self.summary.output_items.push(item.clone());
+        }
     }
 }
 
@@ -314,6 +345,44 @@ mod tests {
         let summary = state.finish();
         assert!(summary.compaction_output_seen);
         assert!(summary.completed_event_seen);
+    }
+
+    #[test]
+    fn captures_complete_output_lineage_without_dropping_call_fields() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            br#"data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc-1","status":"completed","call_id":"call-1","name":"read_file","arguments":"{\"path\":\"README.md\"}","vendor":{"kept":true}}}
+
+"#,
+        );
+        state.ingest(
+            br#"data: {"type":"response.completed","response":{"id":"resp-1","output":[{"type":"function_call","id":"fc-1","status":"completed","call_id":"call-1","name":"read_file","arguments":"{\"path\":\"README.md\"}","vendor":{"kept":true}}]}}
+
+"#,
+        );
+
+        let summary = state.finish();
+        assert_eq!(summary.output_items.len(), 1);
+        assert_eq!(summary.output_items[0]["call_id"], "call-1");
+        assert_eq!(summary.output_items[0]["status"], "completed");
+        assert_eq!(summary.output_items[0]["vendor"]["kept"], true);
+    }
+
+    #[test]
+    fn captures_top_level_response_output_when_event_header_marks_completion() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            br#"event: response.completed
+data: {"id":"resp-top-level","object":"response","output":[{"type":"function_call","id":"fc-top","status":"completed","call_id":"call-top","name":"probe","arguments":"{}"}]}
+
+"#,
+        );
+
+        let summary = state.finish();
+        assert!(summary.responses_completed_event_seen);
+        assert_eq!(summary.response_id.as_deref(), Some("resp-top-level"));
+        assert_eq!(summary.output_items.len(), 1);
+        assert_eq!(summary.output_items[0]["call_id"], "call-top");
     }
 
     #[test]

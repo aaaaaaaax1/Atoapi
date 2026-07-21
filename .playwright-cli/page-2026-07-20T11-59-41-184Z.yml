@@ -1,0 +1,110 @@
+- generic [ref=e1]:
+  - generic [ref=e2]:
+    - banner [ref=e3]:
+      - generic [ref=e4]:
+        - button "打开设置" [ref=e5] [cursor=pointer]
+        - button "查看版本" [ref=e9] [cursor=pointer]:
+          - strong [ref=e10]: Atoapi
+          - generic [ref=e11]: Graphite · vNext
+      - tablist "Agent 列表" [ref=e12]:
+        - tab "Codex 已启用" [selected] [ref=e13] [cursor=pointer]:
+          - generic [ref=e18]:
+            - generic [ref=e19]: Codex
+            - generic [ref=e20]: 已启用
+        - tab "Claude Code 已启用" [ref=e22] [cursor=pointer]:
+          - generic [ref=e28]:
+            - generic [ref=e29]: Claude Code
+            - generic [ref=e30]: 已启用
+        - tab "Gemini 已关闭" [ref=e32] [cursor=pointer]:
+          - generic [ref=e36]:
+            - generic [ref=e37]: Gemini
+            - generic [ref=e38]: 已关闭
+        - tab "OpenCode 已启用" [ref=e40] [cursor=pointer]:
+          - generic [ref=e45]:
+            - generic [ref=e46]: OpenCode
+            - generic [ref=e47]: 已启用
+        - tab "OpenClaw 已关闭" [ref=e49] [cursor=pointer]:
+          - generic [ref=e54]:
+            - generic [ref=e55]: OpenClaw
+            - generic [ref=e56]: 已关闭
+        - tab "Proxy Mode 已启用" [ref=e58] [cursor=pointer]:
+          - generic [ref=e67]:
+            - generic [ref=e68]: Proxy Mode
+            - generic [ref=e69]: 已启用
+      - generic [ref=e71]:
+        - generic [ref=e72]:
+          - generic [ref=e73]: 代理运行中
+          - generic [ref=e74]: 127.0.0.1:18883
+        - button "刷新模拟数据" [ref=e75] [cursor=pointer]
+    - main [ref=e106]:
+      - text: · · · · · ·
+      - generic [ref=e224]:
+        - generic [ref=e225]:
+          - generic [ref=e226]:
+            - button "返回 Agent" [ref=e227] [cursor=pointer]
+            - generic [ref=e230]:
+              - heading "缓存统计" [level=2] [ref=e231]
+              - paragraph [ref=e232]: 成功记录与错误记录分离，详情按需展开。
+          - button "刷新" [ref=e233] [cursor=pointer]
+        - generic [ref=e239]:
+          - generic [ref=e240]:
+            - generic [ref=e241]: 云舟 命中率
+            - generic [ref=e242]: 96.4%
+          - generic [ref=e243]:
+            - generic [ref=e244]: 累计输入
+            - generic [ref=e245]: 26.1 万
+          - generic [ref=e246]:
+            - generic [ref=e247]: 累计命中
+            - generic [ref=e248]: 25.2 万
+          - generic [ref=e249]:
+            - generic [ref=e250]: 成功请求
+            - generic [ref=e251]:
+              - generic [ref=e252]: "3"
+              - generic [ref=e253]: 压缩 1 · 冷启动 0
+        - tablist "缓存统计视图" [ref=e254]:
+          - tab "概览" [selected] [ref=e255] [cursor=pointer]
+          - tab "请求记录" [ref=e256] [cursor=pointer]
+          - tab "上游统计" [ref=e257] [cursor=pointer]
+        - generic [ref=e259]:
+          - generic [ref=e260]:
+            - text: Provider cache
+            - generic [ref=e261]:
+              - strong [ref=e262]: 96.4%
+              - generic [ref=e263]: 云舟 · 3 条成功记录
+            - progressbar "缓存命中率 95.8%" [ref=e264]
+            - generic [ref=e265]:
+              - generic [ref=e266]:
+                - generic [ref=e267]: 缺口
+                - generic [ref=e268]: 5.4 万
+              - generic [ref=e269]:
+                - generic [ref=e270]: 可避免
+                - generic [ref=e271]: "768"
+              - generic [ref=e272]:
+                - generic [ref=e273]: 新尾部
+                - generic [ref=e274]: 1,536
+          - generic [ref=e275]:
+            - text: Policy
+            - generic [ref=e276]:
+              - generic [ref=e277]:
+                - generic [ref=e278]:
+                  - generic [ref=e279]: 智能缓存
+                  - generic [ref=e280]: 前缀稳定与真实 usage 统计
+                - switch "智能缓存" [checked] [ref=e281] [cursor=pointer]
+              - generic [ref=e282]:
+                - generic [ref=e283]:
+                  - generic [ref=e284]: 计入冷启动
+                  - generic [ref=e285]: 仅影响当前统计视图
+                - switch "计入冷启动" [ref=e286] [cursor=pointer]
+              - generic [ref=e287]:
+                - generic [ref=e288]:
+                  - generic [ref=e289]: 提示详细错误
+                  - generic [ref=e290]: 主列表保持简洁，详情抽屉保留原文
+                - switch "提示详细错误" [checked] [ref=e291] [cursor=pointer]
+    - contentinfo [ref=e214]:
+      - button "关闭缓存统计与请求记录" [active] [pressed] [ref=e292] [cursor=pointer]:
+        - generic [ref=e220]: 缓存与记录
+        - generic [ref=e221]:
+          - text: 命中率
+          - strong [ref=e222]: 96.4%
+        - generic [ref=e223]: 3 成功
+  - status

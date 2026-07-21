@@ -738,6 +738,29 @@
       color: var(--success);
     }
 
+    .metric-success-value {
+      display: flex;
+      min-width: 0;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .metric-success-value b {
+      flex: 0 0 auto;
+    }
+
+    .metric-success-details {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
     .tab-bar {
       min-width: 0;
       display: flex;
@@ -5805,7 +5828,7 @@
           <div class="metric-cell"><span>历史命中率</span><b class="good">95.8%</b></div>
           <div class="metric-cell"><span>累计输入</span><b>1,286 万</b></div>
           <div class="metric-cell"><span>累计命中</span><b>1,232 万</b></div>
-          <div class="metric-cell"><span>成功 / error</span><b>128 / 2</b></div>
+          <div class="metric-cell"><span>成功 / error</span><div class="metric-success-value"><b>128 / 2</b><small class="metric-success-details" id="successMetricDetails">压缩 1 · 冷启动 1</small></div></div>
         </div>
 
         <div class="tab-bar" role="tablist" aria-label="缓存统计视图">
@@ -6270,6 +6293,12 @@
         cells[1].textContent = mockTokenLabel(input);
         cells[2].textContent = mockTokenLabel(cached);
         cells[3].textContent = failed.length ? `${successful.length} / ${failed.length}` : String(successful.length);
+      }
+      const successDetails = $("#successMetricDetails");
+      if (successDetails) {
+        const compactions = successful.filter((request) => request.statusTone === "compact").length;
+        const coldStarts = successful.filter((request) => request.statusTone === "cold").length;
+        successDetails.textContent = `压缩 ${compactions} · 冷启动 ${coldStarts}`;
       }
       if (labels[0]) labels[0].textContent = scope.id === "all" ? "历史命中率" : `${scope.label} 命中率`;
       if (labels[3]) labels[3].textContent = failed.length ? "成功 / error" : "成功请求";

@@ -418,7 +418,15 @@ const bridgeSource = String.raw`
 
   function activeRequestScope(metric) {
     const scopes = Array.isArray(metric?.scopes) ? metric.scopes : [];
-    if (!scopes.length) return { id: "all", label: "全部", successfulRequests: 0, errors: 0, cacheRate: "—" };
+    if (!scopes.length) return {
+      id: "all",
+      label: "全部",
+      successfulRequests: 0,
+      errors: 0,
+      compactionRequests: 0,
+      coldStartRequests: 0,
+      cacheRate: "—"
+    };
     if (!requestScopeId || !scopes.some((scope) => scope.id === requestScopeId)) {
       const preferred = currentAgent()?.provider ? "provider:" + currentAgent().provider : "all";
       requestScopeId = scopes.some((scope) => scope.id === preferred) ? preferred : "all";
@@ -430,25 +438,30 @@ const bridgeSource = String.raw`
   function applyMetrics(nextState) {
     const metricState = nextState?.metrics || {};
     const metric = activeRequestScope(metricState);
+    const hasErrors = typeof metric.errors === "number" && metric.errors > 0;
     const cells = Array.from(document.querySelectorAll(".metric-strip .metric-cell b"));
     const labels = Array.from(document.querySelectorAll(".metric-strip .metric-cell span"));
     if (cells.length >= 4) {
       cells[0].textContent = metric.cacheRate || "—";
       cells[1].textContent = metric.inputTokens || "0";
       cells[2].textContent = metric.cachedTokens || "0";
-      cells[3].textContent = metric.errors ? metric.successfulRequests + " / " + metric.errors : String(metric.successfulRequests ?? 0);
+      cells[3].textContent = hasErrors ? metric.successfulRequests + " / " + metric.errors : String(metric.successfulRequests ?? 0);
     }
     if (labels[0]) labels[0].textContent = metric.label === "全部" ? "历史命中率" : metric.label + " 命中率";
     if (labels[1]) labels[1].textContent = "累计输入";
     if (labels[2]) labels[2].textContent = "累计命中";
-    if (labels[3]) labels[3].textContent = metric.errors ? "成功 / error" : "成功请求";
+    if (labels[3]) labels[3].textContent = hasErrors ? "成功 / error" : "成功请求";
+    const successDetails = $bridge("#successMetricDetails");
+    if (successDetails) {
+      successDetails.textContent = "压缩 " + (metric.compactionRequests ?? "—") + " · 冷启动 " + (metric.coldStartRequests ?? "—");
+    }
     const rate = metric.cacheRate || "—";
     const overview = $bridge("#overviewPanel");
     if (overview) {
       const strong = overview.querySelector(".hit-rate-line strong");
       if (strong) strong.textContent = rate;
       const summary = overview.querySelector(".hit-rate-line span");
-      if (summary) summary.innerHTML = escape(metric.label || "全部") + " · " + escape(metric.successfulRequests ?? 0) + " 条成功记录" + (metric.errors ? "<br />" + escape(metric.errors) + " error" : "");
+      if (summary) summary.innerHTML = escape(metric.label || "全部") + " · " + escape(metric.successfulRequests ?? 0) + " 条成功记录" + (hasErrors ? "<br />" + escape(metric.errors) + " error" : "");
       const progress = overview.querySelector("progress");
       const numericRate = Number.parseFloat(String(rate).replace("%", ""));
       if (progress && Number.isFinite(numericRate)) { progress.value = numericRate; progress.setAttribute("aria-label", "缓存命中率 " + rate); }
@@ -466,7 +479,7 @@ const bridgeSource = String.raw`
     if (dock) {
       const values = dock.querySelectorAll(".utility-stat");
       if (values[0]) values[0].innerHTML = "命中率 <strong>" + escape(rate) + "</strong>";
-      if (values[1]) values[1].textContent = metric.errors ? metric.successfulRequests + " 成功 · " + metric.errors + " error" : metric.successfulRequests + " 成功";
+      if (values[1]) values[1].textContent = hasErrors ? metric.successfulRequests + " 成功 · " + metric.errors + " error" : metric.successfulRequests + " 成功";
     }
     const body = $bridge("#providersPanel tbody");
     if (body && Array.isArray(metricState.providerRows)) {
@@ -1372,6 +1385,8 @@ function buildState(
         ? Math.max(0, aggregate.successfulRequests - (includeColdStarts ? 0 : aggregate.coldStartRequests))
         : "—",
       errors: aggregate?.errors ?? "—",
+      compactionRequests: aggregate?.compactionRequests ?? "—",
+      coldStartRequests: aggregate?.coldStartRequests ?? "—",
       cacheShortfall: aggregate ? formatTokens(cacheShortfall) : "—",
       cacheAvoidable: aggregate ? formatTokens(cacheAvoidable) : "—",
       cacheNewTail: aggregate ? formatTokens(cacheNewTail) : "—"

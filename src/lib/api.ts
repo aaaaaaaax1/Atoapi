@@ -394,6 +394,10 @@ export interface MetricsSnapshot {
     response_session_scope_match_count?: number | null;
     response_session_append_delta_match?: boolean | null;
     response_session_delta_items?: number | null;
+    response_context_plan?: string | null;
+    response_session_semantic_reuse_items?: number | null;
+    response_session_wire_saved_bytes?: number | null;
+    response_session_wire_saved_ratio?: number | null;
     response_session_cooldown_active?: boolean | null;
     response_session_rejected_status?: number | null;
     session_anchor_hash?: string | null;
@@ -495,6 +499,10 @@ export interface MetricsSnapshot {
     response_session_scope_match_count?: number | null;
     response_session_append_delta_match?: boolean | null;
     response_session_delta_items?: number | null;
+    response_context_plan?: string | null;
+    response_session_semantic_reuse_items?: number | null;
+    response_session_wire_saved_bytes?: number | null;
+    response_session_wire_saved_ratio?: number | null;
     response_session_cooldown_active?: boolean | null;
     response_session_rejected_status?: number | null;
     session_anchor_hash?: string | null;
@@ -548,6 +556,7 @@ export interface AgentProviderTrafficStats {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  compaction_requests: number;
   cache_shortfall_tokens: number;
   cache_avoidable_gap_tokens: number;
   cache_new_tail_gap_tokens: number;
@@ -1004,11 +1013,14 @@ function fallback(name: string, args?: Record<string, unknown>) {
       checked_at: new Date().toISOString(),
       first_status: null,
       continuation_status: null,
+      compact_status: null,
+      compact_continuation_status: null,
       first_input_tokens: null,
       first_cached_tokens: null,
       continuation_input_tokens: null,
       continuation_cached_tokens: null,
-      usage_verified: false
+      usage_verified: false,
+      compact_fidelity_verified: false
     } satisfies ProviderResponseSessionReuseProbeResult;
   }
   if (name === "set_provider_response_session_reuse_enabled") {
@@ -1340,9 +1352,11 @@ function injection(id: string, label: string, kind: AgentInjectionKind): AgentIn
 export interface ProviderResponseSessionReuseConfig {
   provider_id: string;
   model_id: string;
+  capability?: ProviderResponseSessionReuseCapability | null;
   enabled: boolean;
   status: ProviderResponseSessionReuseStatus;
   usage_verified: boolean;
+  compact_fidelity_verified: boolean;
   checked_at?: string | null;
   last_error?: string | null;
   updated_at: string;
@@ -1351,17 +1365,31 @@ export interface ProviderResponseSessionReuseConfig {
 export interface ProviderResponseSessionReuseProbeResult {
   provider_id: string;
   model_id: string;
+  capability?: ProviderResponseSessionReuseCapability | null;
   status: ProviderResponseSessionReuseStatus;
   enabled: boolean;
   message: string;
   checked_at?: string | null;
   first_status?: number | null;
   continuation_status?: number | null;
+  compact_status?: number | null;
+  compact_continuation_status?: number | null;
   first_input_tokens?: number | null;
   first_cached_tokens?: number | null;
   continuation_input_tokens?: number | null;
   continuation_cached_tokens?: number | null;
   usage_verified: boolean;
+  compact_fidelity_verified: boolean;
+}
+
+export type ResponseSessionReuseStreamShape = "non-stream-json" | "stream-sse";
+
+export interface ProviderResponseSessionReuseCapability {
+  endpoint: string;
+  channel: Channel;
+  key_realm_id: string;
+  stream_shape: ResponseSessionReuseStreamShape;
+  evidence_version: number;
 }
 
 export interface ProviderResponseSessionReuseProbeInput {

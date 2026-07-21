@@ -20,6 +20,7 @@ export interface AgentProviderTrafficScopeRecord {
   input_tokens?: number | null;
   output_tokens?: number | null;
   cache_read_tokens?: number | null;
+  compaction_requests?: number | null;
   cache_shortfall_tokens?: number | null;
   cache_avoidable_gap_tokens?: number | null;
   cache_new_tail_gap_tokens?: number | null;
@@ -39,6 +40,7 @@ export interface AgentProviderTrafficTotals {
   inputTokens: number;
   outputTokens: number;
   cachedTokens: number;
+  compactionRequests: number;
   cacheShortfallTokens: number;
   cacheAvoidableGapTokens: number;
   cacheNewTailGapTokens: number;
@@ -114,6 +116,7 @@ export function trafficForAgentScope(
     inputTokens: total.inputTokens + count(record.input_tokens),
     outputTokens: total.outputTokens + count(record.output_tokens),
     cachedTokens: total.cachedTokens + count(record.cache_read_tokens),
+    compactionRequests: total.compactionRequests + count(record.compaction_requests),
     cacheShortfallTokens: total.cacheShortfallTokens + count(record.cache_shortfall_tokens),
     cacheAvoidableGapTokens: total.cacheAvoidableGapTokens + count(record.cache_avoidable_gap_tokens),
     cacheNewTailGapTokens: total.cacheNewTailGapTokens + count(record.cache_new_tail_gap_tokens),
@@ -131,6 +134,7 @@ export function trafficForAgentScope(
     inputTokens: 0,
     outputTokens: 0,
     cachedTokens: 0,
+    compactionRequests: 0,
     cacheShortfallTokens: 0,
     cacheAvoidableGapTokens: 0,
     cacheNewTailGapTokens: 0,

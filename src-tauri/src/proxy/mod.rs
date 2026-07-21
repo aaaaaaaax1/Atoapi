@@ -8,8 +8,13 @@ use crate::{
         ProviderCacheCapabilityField, ProviderCacheCapabilityProbeFieldResult,
         ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
         ProviderCacheCapabilityStatus, ProviderCacheEffectStatus, ProviderChannelMode,
-        ProviderConfig, ProviderResponseSessionReuseProbeResult,
-        ProviderResponseSessionReuseStatus, SelectedProviderKey, REASONING_EFFORT_VALUES,
+        ProviderConfig, ProviderResponseSessionReuseCapability,
+        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus,
+        ResponseSessionReuseStreamShape, SelectedProviderKey, REASONING_EFFORT_VALUES,
+    },
+    continuation_lineage::{
+        LineageCommitOutcome, LineageInvalidateOutcome, LineageLease, LineageParent,
+        ResponseSessionCandidate, ResponseSessionState,
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
@@ -17,7 +22,7 @@ use crate::{
         MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
         ResponsesWirePrefixFingerprints, UsageRecord,
     },
-    state::{AppState, PrefixWarmState, ResponseSessionCooldownState, ResponseSessionState},
+    state::{AppState, PrefixWarmState, ResponseSessionCooldownState},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -56,6 +61,7 @@ mod cache_capability;
 mod cache_directed_relay;
 pub(crate) mod cache_validation;
 mod codex_chat_common;
+mod continuation_scope;
 mod json_canonical;
 mod prefix_control;
 mod prepared_wire_request;
@@ -75,6 +81,7 @@ use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken};
 use cache_affinity::{ShadowAffinityDecision, ShadowObservationInput};
 pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
+use continuation_scope::{response_session_capability, ContinuationScope};
 use prefix_control::{
     PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
     ProviderCacheGapBreakdown, MIN_CLEAN_TINY_RECOVERY_STREAK,
@@ -103,6 +110,7 @@ const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 30;
 const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 2 * 60;
 const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 5 * 60;
 const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 5 * 60;
+const RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES: u64 = 32 * 1024;
 #[cfg(test)]
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
@@ -444,6 +452,10 @@ struct ResponseSessionReuseDiagnostics {
     scope_match_count: u64,
     append_delta_match: bool,
     delta_items: u64,
+    context_plan: Option<String>,
+    semantic_reuse_items: u64,
+    wire_saved_bytes: u64,
+    wire_saved_ratio: Option<f64>,
     cooldown_active: bool,
     rejected_status: Option<u16>,
 }
@@ -896,9 +908,7 @@ async fn run_responses_compact_for_authorized_agent(
         &Channel::Responses,
         &decision.upstream_channel,
     );
-    if matches!(decision.upstream_channel, Channel::Responses) {
-        normalize_responses_request(&mut upstream_body);
-    }
+    let native_responses_passthrough = matches!(decision.upstream_channel, Channel::Responses);
     set_request_model(&mut upstream_body, &decision.model);
     set_stream_flag(&mut upstream_body, false);
     let reasoning_diagnostics = apply_model_reasoning_effort(
@@ -916,37 +926,65 @@ async fn run_responses_compact_for_authorized_agent(
         &upstream_body,
         authorized_agent.as_deref(),
     );
-    optimize_provider_prefix(&mut upstream_body, &config, &decision);
-    apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
-    let response_session_key = if responses_session_reuse_enabled(&config) {
-        session_identity
-            .as_ref()
-            .map(|identity| identity.anchor_key.clone())
+    if native_responses_passthrough {
+        strip_provider_cache_key_fields(&mut upstream_body);
+        let mut provider_prefix_body = upstream_body.clone();
+        normalize_responses_request(&mut provider_prefix_body);
+        optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
+        apply_session_provider_cache_key(
+            &mut provider_prefix_body,
+            &config,
+            session_identity.as_ref(),
+        );
+        copy_responses_prefix_cache_fields_for_native(
+            &mut upstream_body,
+            &provider_prefix_body,
+            &config,
+            &decision,
+        );
     } else {
-        None
-    };
-    let response_session_scope_key = if responses_session_reuse_enabled(&config) {
-        session_identity
+        optimize_provider_prefix(&mut upstream_body, &config, &decision);
+        apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
+    }
+    let continuation_scope = ContinuationScope::derive(
+        &config,
+        &decision,
+        &identity_client_request,
+        authorized_agent.as_deref(),
+        &selected_provider_key,
+    );
+    let response_session_key = if responses_session_reuse_enabled(&config) {
+        continuation_scope
             .as_ref()
-            .map(|identity| identity.scope_key.clone())
+            .map(|scope| scope.anchor_key.clone())
     } else {
         None
     };
     let full_response_input = upstream_body.get("input").cloned();
+    let response_session_snapshot_lease = match response_session_key.as_deref() {
+        Some(key) => Some(state.continuation_lineage.begin(key).await),
+        None => None,
+    };
     let tail_input_diagnostics = tail_input_diagnostics_for_session(
-        &state,
         &decision.upstream_channel,
-        response_session_key.as_deref(),
-        response_session_scope_key.as_deref(),
+        response_session_snapshot_lease.as_ref(),
         full_response_input.as_ref(),
-    )
-    .await;
-    let session_anchor_diagnostics = response_session_anchor_diagnostics(
-        &state,
-        response_session_key.as_deref(),
-        response_session_scope_key.as_deref(),
-    )
-    .await;
+    );
+    let response_session_compaction = match response_session_key.as_deref() {
+        Some(key) => Some(
+            state
+                .continuation_lineage
+                .begin_compaction(key, response_id.as_deref())
+                .await,
+        ),
+        None => None,
+    };
+    let response_session_compaction_parent_matched = response_session_compaction
+        .as_ref()
+        .is_none_or(|start| start.parent_matched());
+    let response_session_lease = response_session_compaction.map(|start| start.into_lease());
+    let session_anchor_diagnostics =
+        response_session_anchor_diagnostics(response_session_lease.as_ref());
     let compact_chat_compat_cooldown_key = compact_chat_compat_cooldown_key(&decision);
     let compact_chat_compat_cooldown_active =
         compact_chat_compat_cooldown_active(&state, &compact_chat_compat_cooldown_key).await;
@@ -1290,15 +1328,16 @@ async fn run_responses_compact_for_authorized_agent(
         None
     };
     if compact_success_for_cache && matches!(active_request_channel, Channel::Responses) {
-        update_response_session(
-            &state,
-            response_session_key.as_deref(),
-            response_session_scope_key.as_deref(),
-            full_response_input.as_ref(),
-            &bytes,
-        )
-        .await;
-        if authorized_agent.is_some() {
+        // The standalone compaction contract makes `output` the canonical
+        // input for the next FullReplay. It does not guarantee that the
+        // compaction response id is a valid previous_response_id, so keep the
+        // compaction epoch tombstoned instead of publishing a reusable head.
+        let lineage_cleanup_allowed = response_session_compaction_parent_matched
+            && match response_session_lease.as_ref() {
+                Some(lease) => state.continuation_lineage.is_current(lease).await,
+                None => true,
+            };
+        if authorized_agent.is_some() && lineage_cleanup_allowed {
             let identity = affinity_identity::derive(
                 &config,
                 &decision,
@@ -1533,6 +1572,10 @@ async fn run_responses_compact_for_authorized_agent(
         response_session_scope_match_count: session_anchor_diagnostics.peer_count,
         response_session_append_delta_match: Some(false),
         response_session_delta_items: Some(0),
+        response_context_plan: Some("full_replay_compaction".to_string()),
+        response_session_semantic_reuse_items: None,
+        response_session_wire_saved_bytes: None,
+        response_session_wire_saved_ratio: None,
         response_session_cooldown_active: Some(false),
         response_session_rejected_status: None,
         session_anchor_hash: None,
@@ -1590,9 +1633,7 @@ async fn run_responses_compact_for_authorized_agent(
             error_scope,
             terminal_state,
             usage_record,
-            response_session_key
-                .clone()
-                .or(session_anchor_diagnostics.hash.clone()),
+            None,
             compact_metric_errors,
             None,
             Some(&upstream_request_diagnostics),
@@ -1601,12 +1642,7 @@ async fn run_responses_compact_for_authorized_agent(
     } else {
         let mut transaction = MetricsTransaction::upstream(request_log);
         if let Some(usage_record) = usage_record {
-            transaction.observe_usage(
-                usage_record,
-                response_session_key
-                    .as_deref()
-                    .or(session_anchor_diagnostics.hash.as_deref()),
-            );
+            transaction.observe_usage(usage_record, None);
         }
         for (scope, message) in compact_metric_errors {
             transaction.observe_error(scope, message);
@@ -1899,10 +1935,8 @@ async fn run_generation_for_authorized_agent(
         && matches!(client_channel, Channel::Responses)
         && !request_had_stream_field
         && client_requested_stream;
-    let codex_native_responses_stream = forced_agent_id == Some("codex")
-        && matches!(client_channel, Channel::Responses)
+    let native_responses_passthrough = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
-        && client_requested_stream
         && !codex_responses_chat_compat;
     let (agent_log_id, agent_log_label) =
         request_agent_log_fields(&config, authorized_agent.as_deref());
@@ -1936,7 +1970,7 @@ async fn run_generation_for_authorized_agent(
     } else {
         transform_request_for_channel(&client_request, &client_channel, &decision.upstream_channel)
     };
-    if matches!(decision.upstream_channel, Channel::Responses) && !codex_native_responses_stream {
+    if matches!(decision.upstream_channel, Channel::Responses) && !native_responses_passthrough {
         normalize_responses_request(&mut upstream_body);
     }
     let mut reasoning_diagnostics = apply_model_reasoning_effort(
@@ -1962,7 +1996,7 @@ async fn run_generation_for_authorized_agent(
         &upstream_body,
         authorized_agent.as_deref(),
     );
-    if codex_native_responses_stream {
+    if native_responses_passthrough {
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
@@ -1970,7 +2004,7 @@ async fn run_generation_for_authorized_agent(
     }
 
     let mut provider_prefix_body = upstream_body.clone();
-    if codex_native_responses_stream {
+    if native_responses_passthrough {
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
         apply_session_provider_cache_key(
@@ -1978,7 +2012,7 @@ async fn run_generation_for_authorized_agent(
             &config,
             session_identity.as_ref(),
         );
-        copy_responses_prefix_cache_fields_for_native_stream(
+        copy_responses_prefix_cache_fields_for_native(
             &mut upstream_body,
             &provider_prefix_body,
             &config,
@@ -2010,20 +2044,6 @@ async fn run_generation_for_authorized_agent(
         &decision,
         &decision.upstream_channel,
     );
-    let response_session_key = if responses_session_reuse_enabled(&config) {
-        session_identity
-            .as_ref()
-            .map(|identity| identity.anchor_key.clone())
-    } else {
-        None
-    };
-    let response_session_scope_key = if responses_session_reuse_enabled(&config) {
-        session_identity
-            .as_ref()
-            .map(|identity| identity.scope_key.clone())
-    } else {
-        None
-    };
     let provider_prefix_family_identity = session_identity.as_ref().map(|identity| {
         if session_identity_source_is_trusted(identity.source) {
             identity.anchor_key.as_str()
@@ -2185,6 +2205,28 @@ async fn run_generation_for_authorized_agent(
             "provider API key is not configured",
         );
     }
+    let session_reuse_capability =
+        (native_responses_passthrough && client_requested_stream).then(|| {
+            response_session_capability(
+                &decision,
+                &selected_provider_key,
+                ResponseSessionReuseStreamShape::StreamSse,
+            )
+        });
+    let continuation_scope = ContinuationScope::derive(
+        &config,
+        &decision,
+        &identity_client_request,
+        authorized_agent.as_deref(),
+        &selected_provider_key,
+    );
+    let response_session_key = if responses_session_reuse_enabled(&config) {
+        continuation_scope
+            .as_ref()
+            .map(|scope| scope.anchor_key.clone())
+    } else {
+        None
+    };
 
     let skip_prefix_guard_for_sync_responses = responses_sync_main_skips_prefix_guard(
         &client_channel,
@@ -2261,20 +2303,46 @@ async fn run_generation_for_authorized_agent(
         .await
     };
     let full_response_input = upstream_body.get("input").cloned();
+    let client_supplied_previous_response_id = upstream_body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let response_session_starts_compaction_epoch =
+        matches!(decision.upstream_channel, Channel::Responses)
+            && (responses_request_has_compaction_trigger(&upstream_body)
+                || trusted_codex_metadata
+                    .as_ref()
+                    .is_some_and(|metadata| metadata.compaction_requested));
+    let response_session_snapshot_lease = match response_session_key.as_deref() {
+        Some(key) => Some(state.continuation_lineage.begin(key).await),
+        None => None,
+    };
     let tail_input_diagnostics = tail_input_diagnostics_for_session(
-        &state,
         &decision.upstream_channel,
-        response_session_key.as_deref(),
-        response_session_scope_key.as_deref(),
+        response_session_snapshot_lease.as_ref(),
         full_response_input.as_ref(),
-    )
-    .await;
-    let session_anchor_diagnostics = response_session_anchor_diagnostics(
-        &state,
-        response_session_key.as_deref(),
-        response_session_scope_key.as_deref(),
-    )
-    .await;
+    );
+    let response_session_compaction = if response_session_starts_compaction_epoch {
+        match response_session_key.as_deref() {
+            Some(key) => Some(
+                state
+                    .continuation_lineage
+                    .begin_compaction(key, client_supplied_previous_response_id.as_deref())
+                    .await,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let response_session_compaction_parent_matched = response_session_compaction
+        .as_ref()
+        .is_none_or(|start| start.parent_matched());
+    let response_session_lease = response_session_compaction
+        .map(|start| start.into_lease())
+        .or(response_session_snapshot_lease);
+    let session_anchor_diagnostics =
+        response_session_anchor_diagnostics(response_session_lease.as_ref());
     let local_prepare_ms = started.elapsed().as_millis() as u64;
     let prefix_guard_wait = if prefix_guard.is_some() {
         wait_for_provider_prefix_settle(
@@ -2295,21 +2363,14 @@ async fn run_generation_for_authorized_agent(
             ..PrefixGuardWaitDiagnostics::default()
         }
     };
-    let response_session_guard = if foreground_cache_wait_enabled(&config) {
-        acquire_response_session_guard(
-            &state,
-            &decision.upstream_channel,
-            response_session_key.as_deref(),
-        )
-        .await
-    } else {
-        None
-    };
-    let response_session_cooldown_key = response_session_error_cooldown_key(&decision);
+    let response_session_cooldown_key =
+        response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
     let mut response_session_delta_body_sizes = None;
     let mut selected_wire_draft = None;
     let (upstream_send_body, mut response_session_reuse_diagnostics) =
-        if matches!(decision.upstream_channel, Channel::Responses) {
+        if matches!(client_channel, Channel::Responses)
+            && matches!(decision.upstream_channel, Channel::Responses)
+        {
             let mut diagnostics = ResponseSessionReuseDiagnostics::default();
             let MainResponseSessionDeltaEvaluation {
                 skip_reason: main_delta_skip_reason,
@@ -2317,6 +2378,7 @@ async fn run_generation_for_authorized_agent(
             } = evaluate_main_response_session_delta(
                 &config,
                 &decision,
+                session_reuse_capability.as_ref(),
                 client_requested_stream,
                 &upstream_body,
                 &tail_input_diagnostics,
@@ -2338,15 +2400,11 @@ async fn run_generation_for_authorized_agent(
                 (upstream_body.clone(), diagnostics)
             } else if main_delta_skip_reason.is_none() {
                 let outcome = maybe_reuse_response_session(
-                    &state,
                     &upstream_body,
-                    response_session_key.as_deref(),
-                    response_session_scope_key.as_deref(),
+                    response_session_lease.as_ref(),
                     &decision,
                     true,
-                    false,
-                )
-                .await;
+                );
                 let original_body_bytes = original_wire_draft
                     .as_ref()
                     .map(|draft| draft.len() as u64)
@@ -2359,7 +2417,10 @@ async fn run_generation_for_authorized_agent(
                 ) {
                     response_session_delta_body_sizes = Some(prepared_delta.body_sizes);
                     selected_wire_draft = Some(prepared_delta.wire_draft);
-                    (outcome.body, outcome.diagnostics)
+                    diagnostics = outcome.diagnostics;
+                    diagnostics.wire_saved_bytes = prepared_delta.body_sizes.saved_bytes();
+                    diagnostics.wire_saved_ratio = prepared_delta.body_sizes.saved_ratio();
+                    (outcome.body, diagnostics)
                 } else {
                     selected_wire_draft = original_wire_draft.take();
                     diagnostics = outcome.diagnostics;
@@ -2378,10 +2439,43 @@ async fn run_generation_for_authorized_agent(
             )
         };
     let used_response_session = response_session_delta_request(&upstream_send_body, &upstream_body);
+    if matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Responses)
+    {
+        response_session_reuse_diagnostics.context_plan = Some(
+            if client_supplied_previous_response_id.is_some()
+                && !response_session_starts_compaction_epoch
+            {
+                "external_continuation"
+            } else if used_response_session {
+                "verified_native_delta"
+            } else {
+                "full_replay"
+            }
+            .to_string(),
+        );
+    }
     if used_response_session {
         response_session_reuse_diagnostics.skip_reason = None;
     }
     let active_used_response_session = used_response_session;
+    let response_session_parent = if !response_session_compaction_parent_matched
+        || (client_supplied_previous_response_id.is_some()
+            && !response_session_starts_compaction_epoch)
+    {
+        LineageParent::ExternalContinuation
+    } else if active_used_response_session {
+        response_session_lease
+            .as_ref()
+            .and_then(LineageLease::head)
+            .map(|head| LineageParent::Managed {
+                generation: head.generation,
+                response_id: head.response_id.clone(),
+            })
+            .unwrap_or(LineageParent::FullReplay)
+    } else {
+        LineageParent::FullReplay
+    };
     let agent_generation = is_agent_generation_request(authorized_agent.as_deref());
     let mut diagnostics = if agent_generation {
         body_diagnostics_with_known_inbound_length(
@@ -2622,7 +2716,6 @@ async fn run_generation_for_authorized_agent(
     // request is frozen, release them before any upstream network await so a
     // slow response header cannot serialize the next turn for this prefix.
     drop(prefix_guard);
-    drop(response_session_guard);
     // A compatibility downgrade is durable state for the next independent
     // Agent request, never an authorization to repeat this inbound request.
     let agent_policy = AttemptPolicy::Single;
@@ -2775,8 +2868,6 @@ async fn run_generation_for_authorized_agent(
     // key, a full body, or another protocol would be a second generation for
     // the same inbound request.  Invalidate the anchor during settlement and
     // let the next independent inbound request use its full body instead.
-    let verified_third_party_delta_in_flight = active_used_response_session
-        && is_verified_third_party_response_session_reuse(&config, &decision);
     // Key status is settled from this original response below. A later
     // inbound naturally selects a healthy key; this inbound owns no retry.
     // Protocol compatibility is learned by an explicit diagnostic or a future
@@ -2794,7 +2885,6 @@ async fn run_generation_for_authorized_agent(
     let mut pre_read_body = None;
     if is_agent_generation_request(authorized_agent.as_deref())
         && !active_used_response_session
-        && !verified_third_party_delta_in_flight
         && !is_success_status
     {
         if let Some(current_effort) = diagnostics.reasoning.effective.clone() {
@@ -2932,12 +3022,14 @@ async fn run_generation_for_authorized_agent(
             provider_prefix_family_key.clone(),
             route_affinity_key.clone(),
             config.clone(),
+            session_reuse_capability.clone(),
             None,
             prefix_state_update_key.clone(),
-            None,
             response_session_key.clone(),
-            response_session_scope_key.clone(),
             full_response_input,
+            response_session_lease.clone(),
+            response_session_parent.clone(),
+            response_session_starts_compaction_epoch,
             active_used_response_session,
             retried_full_response,
             diagnostics.clone(),
@@ -3051,77 +3143,57 @@ async fn run_generation_for_authorized_agent(
     };
     let bytes = body_read.bytes;
     let automatic_response_session_delta = active_used_response_session;
-    let automatic_verified_third_party_delta = automatic_response_session_delta
-        && is_verified_third_party_response_session_reuse(&config, &decision);
+    let automatic_verified_native_delta = automatic_response_session_delta
+        && supports_main_response_session_delta(
+            &config,
+            &decision,
+            session_reuse_capability.as_ref(),
+        );
     if !is_success_status
         && matches!(active_request_channel, Channel::Responses)
         && active_upstream_body.get("previous_response_id").is_some()
     {
         let error_summary = upstream_error_summary(&bytes);
         let rejection = response_session_rejection_classification(status, &error_summary);
-        let defer_session_to_next_inbound = should_defer_response_session_rejection_to_next_inbound(
-            status,
-            automatic_response_session_delta,
-        );
-        if automatic_verified_third_party_delta || defer_session_to_next_inbound {
+        if automatic_verified_native_delta {
             response_session_reuse_diagnostics.rejected_status = Some(status);
             if !error_summary.is_empty() {
                 request_metric_errors.push((
-                    if automatic_verified_third_party_delta {
-                        "verified_response_session_delta_rejected"
-                    } else {
-                        "response_session_delta_rejected"
-                    }
-                    .to_string(),
+                    "verified_response_session_delta_rejected".to_string(),
                     error_summary.clone(),
                 ));
             }
-            if defer_session_to_next_inbound {
-                defer_response_session_delta_to_next_inbound(
-                    &state,
-                    response_session_cooldown_key.as_deref(),
-                    response_session_key.as_deref(),
-                    &active_upstream_body,
-                    status,
-                    &error_summary,
-                )
-                .await;
-            } else {
-                note_response_session_error_cooldown_for_rejection(
-                    &state,
-                    response_session_cooldown_key.as_deref(),
-                    status,
-                    &error_summary,
-                )
-                .await;
-            }
-            if !defer_session_to_next_inbound
-                && matches!(
-                    rejection,
-                    ResponseSessionRejectionClass::StaleReference
-                        | ResponseSessionRejectionClass::Unsupported
-                )
-            {
+            note_response_session_error_cooldown_for_rejection(
+                &state,
+                response_session_cooldown_key.as_deref(),
+                status,
+                &error_summary,
+            )
+            .await;
+            if matches!(
+                rejection,
+                ResponseSessionRejectionClass::StaleReference
+                    | ResponseSessionRejectionClass::Unsupported
+            ) {
                 let stale_response_id = previous_response_id_from_request(&active_upstream_body);
                 clear_response_session_reference(
                     &state,
-                    response_session_key.as_deref(),
+                    response_session_lease.as_ref(),
                     stale_response_id.as_deref(),
                 )
                 .await;
             }
-            if automatic_verified_third_party_delta
-                && rejection == ResponseSessionRejectionClass::Unsupported
-            {
-                invalidate_verified_third_party_response_session_reuse(
+            if rejection == ResponseSessionRejectionClass::Unsupported {
+                invalidate_verified_response_session_reuse(
                     &state,
                     &decision.provider.id,
                     &decision.model,
+                    session_reuse_capability.as_ref(),
                     &error_summary,
                 )
                 .await;
             }
-        } else if !active_used_response_session
+        } else if !automatic_response_session_delta
             && rejection == ResponseSessionRejectionClass::Unsupported
         {
             note_response_session_error_cooldown_for_rejection(
@@ -3294,8 +3366,8 @@ async fn run_generation_for_authorized_agent(
     {
         update_response_session(
             &state,
-            response_session_key.as_deref(),
-            response_session_scope_key.as_deref(),
+            response_session_lease.as_ref(),
+            &response_session_parent,
             full_response_input.as_ref(),
             &bytes,
         )
@@ -3329,9 +3401,10 @@ async fn run_generation_for_authorized_agent(
         .unwrap_or_default();
     if confirmed_compaction {
         let shadow_assignment_key = mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
-        finalize_confirmed_responses_compaction(
+        let _ = finalize_confirmed_responses_compaction(
             &state,
-            response_session_key.as_deref(),
+            response_session_lease.as_ref(),
+            response_session_starts_compaction_epoch,
             prefix_state_update_key.as_deref(),
             provider_prefix_family_key.as_deref(),
             shadow_assignment_key.as_deref(),
@@ -3579,6 +3652,15 @@ async fn run_generation_for_authorized_agent(
             response_session_reuse_diagnostics.append_delta_match,
         ),
         response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+        response_context_plan: response_session_reuse_diagnostics.context_plan.clone(),
+        response_session_semantic_reuse_items: (response_session_reuse_diagnostics
+            .semantic_reuse_items
+            > 0)
+        .then_some(response_session_reuse_diagnostics.semantic_reuse_items),
+        response_session_wire_saved_bytes: (response_session_reuse_diagnostics.wire_saved_bytes
+            > 0)
+        .then_some(response_session_reuse_diagnostics.wire_saved_bytes),
+        response_session_wire_saved_ratio: response_session_reuse_diagnostics.wire_saved_ratio,
         response_session_cooldown_active: Some(response_session_reuse_diagnostics.cooldown_active),
         response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
         session_anchor_hash: None,
@@ -3630,9 +3712,13 @@ async fn run_generation_for_authorized_agent(
             error_scope,
             terminal_state,
             usage_record.clone(),
-            response_session_key
-                .clone()
-                .or(session_anchor_diagnostics.hash.clone()),
+            (!confirmed_compaction)
+                .then(|| {
+                    response_session_key
+                        .clone()
+                        .or(session_anchor_diagnostics.hash.clone())
+                })
+                .flatten(),
             request_metric_errors.clone(),
             shadow_affinity_decision.clone(),
             Some(&upstream_request_diagnostics),
@@ -3643,9 +3729,13 @@ async fn run_generation_for_authorized_agent(
         if let Some(usage_record) = usage_record {
             transaction.observe_usage(
                 usage_record,
-                response_session_key
-                    .as_deref()
-                    .or(session_anchor_diagnostics.hash.as_deref()),
+                (!confirmed_compaction)
+                    .then(|| {
+                        response_session_key
+                            .as_deref()
+                            .or(session_anchor_diagnostics.hash.as_deref())
+                    })
+                    .flatten(),
             );
         }
         for (scope, message) in request_metric_errors {
@@ -3694,25 +3784,6 @@ async fn acquire_provider_prefix_guard(
         // available, but it is never allowed to delay a Responses request.
         return lock.try_lock_owned().ok();
     }
-    Some(lock.lock_owned().await)
-}
-
-async fn acquire_response_session_guard(
-    state: &AppState,
-    channel: &Channel,
-    response_session_key: Option<&str>,
-) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-    if !matches!(channel, Channel::Responses) {
-        return None;
-    }
-    let key = response_session_key?;
-    let lock = {
-        let mut locks = state.prefix_locks.lock().await;
-        locks
-            .entry(format!("response-session:{key}"))
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
     Some(lock.lock_owned().await)
 }
 
@@ -3940,15 +4011,23 @@ async fn note_compact_endpoint_cooldown(state: &AppState, key: &str) {
     );
 }
 
-fn response_session_error_cooldown_key(decision: &RouteDecision) -> Option<String> {
-    matches!(decision.upstream_channel, Channel::Responses).then(|| {
-        format!(
-            "{}:{}:{}",
-            decision.upstream_channel.label(),
-            decision.provider.id,
-            decision.model
-        )
-    })
+fn response_session_error_cooldown_key(
+    decision: &RouteDecision,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
+) -> Option<String> {
+    if !matches!(decision.upstream_channel, Channel::Responses) {
+        return None;
+    }
+    let capability = capability?;
+    let encoded = serde_json::to_vec(capability).ok()?;
+    let digest = format!("{:x}", Sha256::digest(encoded));
+    Some(format!(
+        "{}:{}:{}:{}",
+        decision.upstream_channel.label(),
+        decision.provider.id,
+        decision.model,
+        digest
+    ))
 }
 
 #[cfg(test)]
@@ -4001,24 +4080,29 @@ async fn note_response_session_error_cooldown_for_rejection(
     }
 }
 
-async fn invalidate_verified_third_party_response_session_reuse(
+async fn invalidate_verified_response_session_reuse(
     state: &AppState,
     provider_id: &str,
     model_id: &str,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
     summary: &str,
 ) {
+    let Some(capability) = capability else {
+        return;
+    };
     let message = if summary.trim().is_empty() {
         "upstream rejected previous_response_id".to_string()
     } else {
         truncate_log_message(summary)
     };
     let mut config = state.config.write().await;
-    if !config.response_session_reuse_verified_for(provider_id, model_id) {
+    if !config.response_session_reuse_verified_for_scope(provider_id, model_id, capability) {
         return;
     }
     config.record_response_session_reuse_probe(
         provider_id,
         model_id,
+        Some(capability.clone()),
         ProviderResponseSessionReuseStatus::Unsupported,
         false,
         Some(message),
@@ -4060,33 +4144,34 @@ enum ResponseSessionRejectionClass {
 }
 
 fn response_session_rejection_classification(
-    status: u16,
+    _status: u16,
     summary: &str,
 ) -> ResponseSessionRejectionClass {
     let summary = summary.to_ascii_lowercase();
-    if summary.contains("previous_response_not_found")
-        || (summary.contains("previous response") && summary.contains("not found"))
-        || (summary.contains("response id") && summary.contains("not found"))
+    let names_previous_response = summary.contains("previous_response_id")
+        || summary.contains("previous_response_not_found")
+        || summary.contains("previous response")
+        || summary.contains("response id");
+    if names_previous_response
+        && (summary.contains("not found")
+            || summary.contains("expired")
+            || summary.contains("stale")
+            || summary.contains("does not exist"))
     {
         return ResponseSessionRejectionClass::StaleReference;
     }
-    if summary.contains("unsupported parameter")
-        || summary.contains("unknown parameter")
-        || summary.contains("unrecognized parameter")
-        || (summary.contains("previous_response_id")
-            && (summary.contains("unsupported")
-                || summary.contains("not supported")
-                || summary.contains("only supported")
-                || summary.contains("websocket")
-                || summary.contains("invalid parameter")))
+    if names_previous_response
+        && (summary.contains("unsupported")
+            || summary.contains("not supported")
+            || summary.contains("only supported")
+            || summary.contains("unknown parameter")
+            || summary.contains("unrecognized parameter")
+            || summary.contains("websocket")
+            || summary.contains("invalid parameter"))
     {
         return ResponseSessionRejectionClass::Unsupported;
     }
-    if matches!(status, 404 | 409 | 410) {
-        ResponseSessionRejectionClass::StaleReference
-    } else {
-        ResponseSessionRejectionClass::TransientInvalid
-    }
+    ResponseSessionRejectionClass::TransientInvalid
 }
 
 fn response_session_error_cooldown_secs(failures: u32, unsupported: bool) -> u64 {
@@ -5971,17 +6056,14 @@ fn responses_tail_has_tool_activity(current_tail: &TailInputDiagnostics) -> bool
         )
 }
 
-async fn maybe_reuse_response_session(
-    state: &AppState,
+fn maybe_reuse_response_session(
     request: &Value,
-    session_key: Option<&str>,
-    session_scope_key: Option<&str>,
+    lease: Option<&LineageLease>,
     decision: &RouteDecision,
     allow_stream_delta: bool,
-    allow_scope_fallback: bool,
 ) -> ResponseSessionReuseOutcome {
     let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-    let Some(key) = session_key else {
+    let Some(lease) = lease else {
         diagnostics.skip_reason = Some("no_session_key".to_string());
         return ResponseSessionReuseOutcome {
             body: request.clone(),
@@ -6014,34 +6096,15 @@ async fn maybe_reuse_response_session(
             diagnostics,
         };
     }
-    let sessions = {
-        let sessions = state.response_sessions.lock().await;
-        let mut candidates = Vec::new();
-        if let Some(exact) = sessions.get(key) {
-            diagnostics.exact_key_hit = true;
-            candidates.push(exact.clone());
-        }
-        diagnostics.scope_match_count =
-            count_response_session_scope_matches(&sessions, key, session_scope_key) as u64;
-        if allow_scope_fallback {
-            candidates.extend(fallback_response_sessions(
-                &sessions,
-                key,
-                session_scope_key,
-                current_input,
-            ));
-        }
-        diagnostics.candidate_count = candidates.len() as u64;
-        candidates
-    };
+    let mut sessions = Vec::new();
+    if let Some(exact) = lease.head() {
+        diagnostics.exact_key_hit = true;
+        sessions.push(exact.clone());
+    }
+    diagnostics.scope_match_count = 0;
+    diagnostics.candidate_count = sessions.len() as u64;
     if sessions.is_empty() {
-        diagnostics.skip_reason = if diagnostics.scope_match_count > 0 {
-            Some("no_append_prefix_candidate".to_string())
-        } else if session_scope_key.is_none() {
-            Some("no_scope_key".to_string())
-        } else {
-            Some("no_candidate".to_string())
-        };
+        diagnostics.skip_reason = Some("no_candidate".to_string());
         return ResponseSessionReuseOutcome {
             body: request.clone(),
             diagnostics,
@@ -6054,12 +6117,16 @@ async fn maybe_reuse_response_session(
             continue;
         }
         saw_unexpired = true;
-        let Some(delta_input) = appended_response_input_delta(&session.input, current_input) else {
+        let Some(delta_input) = appended_response_input_delta_for_session(&session, current_input)
+        else {
             saw_delta_rejected = true;
             continue;
         };
         diagnostics.append_delta_match = true;
         diagnostics.delta_items = response_input_item_count(&delta_input) as u64;
+        diagnostics.semantic_reuse_items = response_input_item_count(&session.input)
+            .saturating_add(session.output_items.len())
+            as u64;
 
         let Some(optimized) = build_response_session_delta_body(
             request,
@@ -6101,10 +6168,7 @@ fn build_response_session_delta_body(
     let source = request.as_object()?;
     let mut optimized = Map::new();
     for (key, value) in source {
-        if matches!(
-            key.as_str(),
-            "input" | "previous_response_id" | "store" | "model"
-        ) {
+        if matches!(key.as_str(), "input" | "previous_response_id" | "model") {
             continue;
         }
         optimized.insert(key.clone(), value.clone());
@@ -6115,7 +6179,6 @@ fn build_response_session_delta_body(
         Value::String(response_id.to_string()),
     );
     optimized.insert("input".to_string(), delta_input);
-    optimized.insert("store".to_string(), Value::Bool(true));
     Some(Value::Object(optimized))
 }
 
@@ -6123,6 +6186,7 @@ fn build_response_session_delta_body(
 fn should_attempt_main_response_session_delta(
     config: &AppConfig,
     decision: &RouteDecision,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
     client_requested_stream: bool,
     request: &Value,
     current_tail: &TailInputDiagnostics,
@@ -6131,6 +6195,7 @@ fn should_attempt_main_response_session_delta(
     evaluate_main_response_session_delta(
         config,
         decision,
+        capability,
         client_requested_stream,
         request,
         current_tail,
@@ -6171,16 +6236,14 @@ impl MainResponseSessionDeltaEvaluation {
 fn evaluate_main_response_session_delta(
     config: &AppConfig,
     decision: &RouteDecision,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
     client_requested_stream: bool,
     request: &Value,
-    current_tail: &TailInputDiagnostics,
+    _current_tail: &TailInputDiagnostics,
     session_anchor: &SessionAnchorDiagnostics,
 ) -> MainResponseSessionDeltaEvaluation {
     if !responses_session_reuse_enabled(config) {
         return MainResponseSessionDeltaEvaluation::skipped("session_reuse_disabled");
-    }
-    if !config.cache.prewarm_enabled {
-        return MainResponseSessionDeltaEvaluation::skipped("session_prewarm_disabled");
     }
     if !matches!(decision.upstream_channel, Channel::Responses) {
         return MainResponseSessionDeltaEvaluation::skipped("upstream_channel_not_responses");
@@ -6188,13 +6251,12 @@ fn evaluate_main_response_session_delta(
     if !client_requested_stream {
         return MainResponseSessionDeltaEvaluation::skipped("client_stream_disabled");
     }
-    if !supports_main_response_session_delta(config, decision) {
+    if !supports_main_response_session_delta(config, decision, capability) {
         return MainResponseSessionDeltaEvaluation::skipped("provider_session_delta_unverified");
     }
     if session_anchor.source.as_deref() != Some("exact") {
         return MainResponseSessionDeltaEvaluation::skipped(
             match session_anchor.source.as_deref() {
-                Some("scope-sibling") => "session_anchor_scope_sibling",
                 Some("new-anchor") => "session_anchor_missing",
                 _ => "session_anchor_not_exact",
             },
@@ -6203,37 +6265,23 @@ fn evaluate_main_response_session_delta(
     if request.get("previous_response_id").is_some() {
         return MainResponseSessionDeltaEvaluation::skipped("client_previous_response_id_present");
     }
+    if request.get("store").and_then(Value::as_bool) == Some(false) {
+        return MainResponseSessionDeltaEvaluation::skipped("client_store_disabled");
+    }
 
     let original_wire_draft = PreparedWireDraft::from_responses_value(request)
         .expect("an eligible Responses request must be a JSON object");
     let body_bytes = original_wire_draft.len() as u64;
-    if body_bytes >= 96 * 1024 {
-        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
-    }
-    if current_tail.delta_from_session
-        && (current_tail.tool_output_chars >= 512
-            || current_tail.largest_tool_output_chars >= 512
-            || current_tail.message_chars >= 512
-            || current_tail.input_items >= 2)
-    {
-        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
-    }
-    if current_tail.tool_output_chars >= 2_048
-        || current_tail.largest_tool_output_chars >= 2_048
-        || current_tail.message_chars >= 8_192
-    {
-        return MainResponseSessionDeltaEvaluation::measured(None, original_wire_draft);
-    }
-    MainResponseSessionDeltaEvaluation::measured(
-        Some("session_delta_tail_not_large_enough"),
-        original_wire_draft,
-    )
+    let skip_reason = (body_bytes <= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES)
+        .then_some("session_delta_full_body_below_minimum_savings");
+    MainResponseSessionDeltaEvaluation::measured(skip_reason, original_wire_draft)
 }
 
 #[cfg(test)]
 fn main_response_session_delta_skip_reason(
     config: &AppConfig,
     decision: &RouteDecision,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
     client_requested_stream: bool,
     request: &Value,
     current_tail: &TailInputDiagnostics,
@@ -6242,6 +6290,7 @@ fn main_response_session_delta_skip_reason(
     evaluate_main_response_session_delta(
         config,
         decision,
+        capability,
         client_requested_stream,
         request,
         current_tail,
@@ -6250,31 +6299,22 @@ fn main_response_session_delta_skip_reason(
     .skip_reason
 }
 
-fn supports_main_response_session_delta(config: &AppConfig, decision: &RouteDecision) -> bool {
+fn supports_main_response_session_delta(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    capability: Option<&ProviderResponseSessionReuseCapability>,
+) -> bool {
     if !matches!(decision.upstream_channel, Channel::Responses) {
         return false;
     }
 
-    // Official Responses support remains available by default. Third-party
-    // providers must pass the user-triggered semantic probe for this exact
-    // resolved upstream model before a delta can be sent.
-    is_official_openai_responses_provider(decision)
-        || config.response_session_reuse_verified_for(&decision.provider.id, &decision.model)
-}
-
-fn is_official_openai_responses_provider(decision: &RouteDecision) -> bool {
-    reqwest::Url::parse(&decision.provider.base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
-        .is_some_and(|host| host == "api.openai.com")
-}
-
-fn is_verified_third_party_response_session_reuse(
-    config: &AppConfig,
-    decision: &RouteDecision,
-) -> bool {
-    !is_official_openai_responses_provider(decision)
-        && config.response_session_reuse_verified_for(&decision.provider.id, &decision.model)
+    capability.is_some_and(|capability| {
+        config.response_session_reuse_verified_for_scope(
+            &decision.provider.id,
+            &decision.model,
+            capability,
+        )
+    })
 }
 
 fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>) -> bool {
@@ -6287,6 +6327,18 @@ struct ResponseSessionDeltaBodySizes {
     delta_body_bytes: u64,
 }
 
+impl ResponseSessionDeltaBodySizes {
+    fn saved_bytes(self) -> u64 {
+        self.original_body_bytes
+            .saturating_sub(self.delta_body_bytes)
+    }
+
+    fn saved_ratio(self) -> Option<f64> {
+        (self.original_body_bytes > 0)
+            .then(|| self.saved_bytes() as f64 / self.original_body_bytes as f64)
+    }
+}
+
 #[derive(Debug)]
 struct PreparedResponseSessionDelta {
     body_sizes: ResponseSessionDeltaBodySizes,
@@ -6297,7 +6349,7 @@ fn response_session_delta_benefit(
     original: &Value,
     delta: &Value,
     original_bytes: u64,
-    current_tail: &TailInputDiagnostics,
+    _current_tail: &TailInputDiagnostics,
 ) -> Option<PreparedResponseSessionDelta> {
     if !response_session_delta_request(delta, original) {
         return None;
@@ -6307,16 +6359,9 @@ fn response_session_delta_benefit(
     if delta_bytes >= original_bytes {
         return None;
     }
-    let beneficial = if original_bytes >= 96 * 1024 {
-        delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4)
-    } else if current_tail.tool_output_chars >= 2_048
-        || current_tail.largest_tool_output_chars >= 2_048
-        || current_tail.message_chars >= 8_192
-    {
-        delta_bytes.saturating_mul(10) <= original_bytes.saturating_mul(9)
-    } else {
-        delta_bytes.saturating_mul(2) <= original_bytes
-    };
+    let saved_bytes = original_bytes.saturating_sub(delta_bytes);
+    let beneficial = saved_bytes >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES
+        && delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4);
     beneficial.then_some(PreparedResponseSessionDelta {
         body_sizes: ResponseSessionDeltaBodySizes {
             original_body_bytes: original_bytes,
@@ -6336,48 +6381,17 @@ fn response_session_delta_is_beneficial(
     response_session_delta_benefit(original, delta, original_bytes, current_tail).is_some()
 }
 
-fn count_response_session_scope_matches(
-    sessions: &HashMap<String, Arc<ResponseSessionState>>,
-    current_key: &str,
-    current_scope_key: Option<&str>,
-) -> usize {
-    let Some(current_scope_key) = current_scope_key else {
-        return 0;
-    };
-    sessions
-        .iter()
-        .filter(|(key, session)| {
-            key.as_str() != current_key
-                && session.finished_at.elapsed() <= std::time::Duration::from_secs(1800)
-                && session.scope_key.as_deref() == Some(current_scope_key)
-        })
-        .count()
-}
-
-async fn response_session_anchor_diagnostics(
-    state: &AppState,
-    current_key: Option<&str>,
-    current_scope_key: Option<&str>,
-) -> SessionAnchorDiagnostics {
-    let Some(current_key) = current_key else {
+fn response_session_anchor_diagnostics(lease: Option<&LineageLease>) -> SessionAnchorDiagnostics {
+    let Some(lease) = lease else {
         return SessionAnchorDiagnostics::default();
     };
-    let sessions = state.response_sessions.lock().await;
-    let exact = sessions.contains_key(current_key);
-    let peer_count =
-        count_response_session_scope_matches(&sessions, current_key, current_scope_key);
-    let source = if exact {
-        "exact"
-    } else if peer_count > 0 {
-        "scope-sibling"
-    } else {
-        "new-anchor"
-    };
+    let exact = lease.head().is_some();
+    let source = if exact { "exact" } else { "new-anchor" };
     SessionAnchorDiagnostics {
-        hash: Some(current_key.to_string()),
+        hash: Some(lease.key().to_string()),
         source: Some(source.to_string()),
-        changed: Some(!exact && peer_count > 0),
-        peer_count: Some(peer_count as u64),
+        changed: Some(false),
+        peer_count: Some(0),
     }
 }
 
@@ -6388,79 +6402,8 @@ fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionA
     log.session_anchor_peer_count = diagnostics.peer_count;
 }
 
-#[cfg(test)]
-fn fallback_response_session(
-    sessions: &HashMap<String, Arc<ResponseSessionState>>,
-    current_key: &str,
-    current_scope_key: Option<&str>,
-    current_input: &Value,
-) -> Option<Arc<ResponseSessionState>> {
-    fallback_response_sessions(sessions, current_key, current_scope_key, current_input)
-        .into_iter()
-        .next()
-}
-
-fn fallback_response_sessions(
-    sessions: &HashMap<String, Arc<ResponseSessionState>>,
-    current_key: &str,
-    current_scope_key: Option<&str>,
-    current_input: &Value,
-) -> Vec<Arc<ResponseSessionState>> {
-    let Some(current_scope_key) = current_scope_key else {
-        return Vec::new();
-    };
-    let mut ranked = Vec::new();
-    for (key, session) in sessions {
-        if key == current_key
-            || session.finished_at.elapsed() > std::time::Duration::from_secs(1800)
-            || session.scope_key.as_deref() != Some(current_scope_key)
-        {
-            continue;
-        }
-        let Some(score) = response_session_fallback_score(&session.input, current_input) else {
-            continue;
-        };
-        ranked.push((
-            score,
-            response_input_item_count(&session.input),
-            session.finished_at.elapsed(),
-            session.clone(),
-        ));
-    }
-    ranked.sort_by(|left, right| {
-        right
-            .0
-            .cmp(&left.0)
-            .then_with(|| right.1.cmp(&left.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    ranked
-        .into_iter()
-        .map(|(_, _, _, session)| session)
-        .collect()
-}
-
 fn response_input_item_count(input: &Value) -> usize {
     input.as_array().map(Vec::len).unwrap_or_default()
-}
-
-fn response_session_fallback_score(previous: &Value, current: &Value) -> Option<usize> {
-    let (Value::Array(previous_items), Value::Array(current_items)) = (previous, current) else {
-        return None;
-    };
-    let previous_essential = response_input_essential_items(previous_items);
-    let current_essential = response_input_essential_items(current_items);
-    if previous_essential.is_empty() || previous_essential.len() >= current_essential.len() {
-        return None;
-    }
-    if !previous_essential
-        .iter()
-        .zip(current_essential.iter())
-        .all(|(previous, current)| previous.1 == current.1)
-    {
-        return None;
-    }
-    Some(previous_essential.len())
 }
 
 fn response_session_delta_request(candidate: &Value, original: &Value) -> bool {
@@ -6469,47 +6412,18 @@ fn response_session_delta_request(candidate: &Value, original: &Value) -> bool {
         && candidate.get("input") != original.get("input")
 }
 
-fn should_defer_response_session_rejection_to_next_inbound(
-    status: u16,
-    used_response_session: bool,
-) -> bool {
-    used_response_session && matches!(status, 400 | 404 | 409 | 410 | 422)
-}
-
 async fn clear_response_session_reference(
     state: &AppState,
-    session_key: Option<&str>,
+    lease: Option<&LineageLease>,
     response_id: Option<&str>,
-) {
-    let mut sessions = state.response_sessions.lock().await;
-    if let Some(key) = session_key {
-        sessions.remove(key);
-    }
-    if let Some(response_id) = response_id {
-        sessions.retain(|_, session| session.response_id != response_id);
-    }
-    drop(sessions);
-    state.journal_runtime_state();
-}
-
-async fn defer_response_session_delta_to_next_inbound(
-    state: &AppState,
-    response_session_cooldown_key: Option<&str>,
-    response_session_key: Option<&str>,
-    request: &Value,
-    status: u16,
-    error_summary: &str,
-) {
-    note_response_session_error_cooldown_for_rejection(
-        state,
-        response_session_cooldown_key,
-        status,
-        error_summary,
+) -> Option<LineageInvalidateOutcome> {
+    let lease = lease?;
+    Some(
+        state
+            .continuation_lineage
+            .invalidate(lease, response_id)
+            .await,
     )
-    .await;
-    let stale_response_id = previous_response_id_from_request(request);
-    clear_response_session_reference(state, response_session_key, stale_response_id.as_deref())
-        .await;
 }
 
 fn previous_response_id_from_request(request: &Value) -> Option<String> {
@@ -6519,149 +6433,119 @@ fn previous_response_id_from_request(request: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn appended_response_input_delta(previous: &Value, current: &Value) -> Option<Value> {
-    match (previous, current) {
-        (Value::Array(previous_items), Value::Array(current_items)) => {
-            if response_same_message_text_tail_delta_enabled() {
-                if let Some(delta) =
-                    appended_response_text_tail_delta(previous_items, current_items)
-                {
-                    return Some(delta);
-                }
-            }
-            let delta_start = response_input_delta_start_index(previous_items, current_items)?;
-            let delta = current_items[delta_start..]
-                .iter()
-                .filter(|item| response_session_delta_item_is_needed(item))
-                .cloned()
-                .collect::<Vec<_>>();
-            if delta.is_empty() {
-                None
-            } else {
-                Some(Value::Array(delta))
-            }
-        }
-        _ => None,
-    }
-}
-
-fn response_same_message_text_tail_delta_enabled() -> bool {
-    false
-}
-
-fn appended_response_text_tail_delta(
-    previous_items: &[Value],
-    current_items: &[Value],
+fn appended_response_input_delta_for_session(
+    session: &ResponseSessionState,
+    current: &Value,
 ) -> Option<Value> {
-    if previous_items.len() != current_items.len() || previous_items.is_empty() {
-        return None;
-    }
-    let previous_essential = response_input_essential_items(previous_items);
-    let current_essential = response_input_essential_items(current_items);
-    if previous_essential.len() != current_essential.len() || previous_essential.is_empty() {
-        return None;
-    }
-
-    let last = previous_essential.len().checked_sub(1)?;
-    if !previous_essential
-        .iter()
-        .take(last)
-        .zip(current_essential.iter().take(last))
-        .all(|(previous, current)| previous.1 == current.1)
-    {
-        return None;
-    }
-
-    let previous_index = previous_essential[last].0;
-    let current_index = current_essential[last].0;
-    let previous_item = previous_items.get(previous_index)?;
-    let current_item = current_items.get(current_index)?;
-    if !response_text_tail_delta_item_is_safe(previous_item, current_item) {
-        return None;
-    }
-
-    let previous_text = response_message_text(previous_item)?;
-    let current_text = response_message_text(current_item)?;
-    let suffix = current_text.strip_prefix(&previous_text)?;
-    if suffix.trim().is_empty() {
-        return None;
-    }
-
-    response_message_with_text(current_item, suffix.trim_start())
-        .map(|delta_item| Value::Array(vec![delta_item]))
-}
-
-fn response_text_tail_delta_item_is_safe(previous: &Value, current: &Value) -> bool {
-    let (Some(previous_object), Some(current_object)) = (previous.as_object(), current.as_object())
+    let (Value::Array(previous_items), Value::Array(current_items)) = (&session.input, current)
     else {
-        return false;
+        return None;
     };
-    let previous_type = previous_object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("message");
-    let current_type = current_object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("message");
-    if previous_type != "message" || current_type != "message" {
-        return false;
-    }
-    let previous_role = previous_object
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user");
-    let current_role = current_object
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user");
-    previous_role == "user" && current_role == "user"
-}
-
-fn response_message_text(item: &Value) -> Option<String> {
-    let object = item.as_object()?;
-    object
-        .get("content")
-        .or_else(|| object.get("text"))
-        .and_then(extract_text)
-}
-
-fn response_message_with_text(template: &Value, text: &str) -> Option<Value> {
-    if text.trim().is_empty() {
+    if session.output_items.is_empty() {
         return None;
     }
-    let object = template.as_object()?;
-    let role = object.get("role").and_then(Value::as_str).unwrap_or("user");
-    Some(json!({
-        "type": "message",
-        "role": role,
-        "content": [{ "type": "input_text", "text": text }]
-    }))
+    let expected_len = previous_items
+        .len()
+        .checked_add(session.output_items.len())?;
+    if current_items.len() <= expected_len {
+        return None;
+    }
+    let exact_prefix = previous_items
+        .iter()
+        .chain(session.output_items.iter())
+        .zip(current_items.iter().take(expected_len))
+        .all(|(expected, current)| expected == current);
+    if !exact_prefix {
+        return None;
+    }
+
+    let expected_call_outputs = expected_response_call_outputs(&session.output_items)?;
+    let delta = &current_items[expected_len..];
+    if delta.is_empty() || !response_session_delta_input_is_safe(delta, &expected_call_outputs) {
+        return None;
+    }
+    Some(Value::Array(delta.to_vec()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedResponseCallOutput {
+    call_id: String,
+    item_type: String,
+}
+
+fn expected_response_call_outputs(
+    output_items: &[Value],
+) -> Option<Vec<ExpectedResponseCallOutput>> {
+    let mut expected = Vec::new();
+    let mut seen_call_ids = HashSet::new();
+    for item in output_items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(item_type) = object.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !(item_type == "function_call" || item_type.ends_with("_call")) {
+            continue;
+        }
+        let call_id = object
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())?;
+        if !seen_call_ids.insert(call_id.to_string()) {
+            return None;
+        }
+        expected.push(ExpectedResponseCallOutput {
+            call_id: call_id.to_string(),
+            item_type: format!("{item_type}_output"),
+        });
+    }
+    Some(expected)
+}
+
+fn response_session_delta_input_is_safe(
+    delta: &[Value],
+    expected_call_outputs: &[ExpectedResponseCallOutput],
+) -> bool {
+    let mut next_call_output = 0usize;
+    for item in delta {
+        let Some(object) = item.as_object() else {
+            return false;
+        };
+        let item_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        if next_call_output < expected_call_outputs.len() {
+            let expected = &expected_call_outputs[next_call_output];
+            if item_type != expected.item_type
+                || object.get("call_id").and_then(Value::as_str) != Some(expected.call_id.as_str())
+            {
+                return false;
+            }
+            next_call_output += 1;
+            continue;
+        }
+        if item_type.ends_with("_call_output") {
+            return false;
+        }
+        if item_type != "message"
+            || !object
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| matches!(role, "user" | "system" | "developer"))
+        {
+            return false;
+        }
+    }
+    next_call_output == expected_call_outputs.len()
 }
 
 fn response_input_delta_start_index(
     previous_items: &[Value],
     current_items: &[Value],
 ) -> Option<usize> {
-    if let Some(index) = response_input_raw_prefix_delta_start_index(previous_items, current_items)
-    {
-        return Some(index);
-    }
-    let previous_essential = response_input_essential_items(previous_items);
-    let current_essential = response_input_essential_items(current_items);
-    if current_essential.len() <= previous_essential.len() {
-        return None;
-    }
-    if !previous_essential
-        .iter()
-        .zip(current_essential.iter())
-        .all(|(previous, current)| previous.1 == current.1)
-    {
-        return None;
-    }
-    current_essential
-        .get(previous_essential.len())
-        .map(|(index, _)| *index)
+    response_input_raw_prefix_delta_start_index(previous_items, current_items)
 }
 
 fn response_input_raw_prefix_delta_start_index(
@@ -6678,143 +6562,97 @@ fn response_input_raw_prefix_delta_start_index(
         .then_some(previous_items.len())
 }
 
-fn response_input_essential_prefix_matches(
-    previous_items: &[Value],
-    current_items: &[Value],
-) -> bool {
-    let previous_essential = response_input_essential_items(previous_items);
-    let current_essential = response_input_essential_items(current_items);
-    previous_essential.len() <= current_essential.len()
-        && previous_essential
-            .iter()
-            .zip(current_essential.iter())
-            .all(|(previous, current)| previous.1 == current.1)
-}
-
-fn response_input_essential_items(items: &[Value]) -> Vec<(usize, Value)> {
-    items
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| response_session_delta_item_is_needed(item))
-        .map(|(index, item)| (index, comparable_response_input_item(item)))
-        .collect()
-}
-
-fn response_session_delta_item_is_needed(item: &Value) -> bool {
-    let Some(object) = item.as_object() else {
-        return true;
-    };
-
-    if object
-        .get("role")
-        .and_then(Value::as_str)
-        .is_some_and(|role| matches!(role, "assistant" | "model"))
-    {
-        return false;
-    }
-
-    let Some(item_type) = object.get("type").and_then(Value::as_str) else {
-        return true;
-    };
-
-    match item_type {
-        "reasoning"
-        | "function_call"
-        | "computer_call"
-        | "web_search_call"
-        | "file_search_call"
-        | "code_interpreter_call"
-        | "image_generation_call"
-        | "local_shell_call" => false,
-        item_type if item_type.ends_with("_call") && !item_type.ends_with("_call_output") => false,
-        _ => true,
-    }
-}
-
-fn comparable_response_input_item(item: &Value) -> Value {
-    let mut normalized = item.clone();
-    normalize_responses_input(&mut normalized);
-    stabilize_responses_provider_prefix(&mut normalized);
-    strip_response_session_volatile_fields(&mut normalized);
-    strip_response_session_compare_noise(&mut normalized);
-    canonicalize_object_keys(&mut normalized, "$.response_session_input_item");
-    normalized
-}
-
-fn strip_response_session_compare_noise(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            map.remove("call_id");
-            for child in map.values_mut() {
-                strip_response_session_compare_noise(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                strip_response_session_compare_noise(item);
-            }
-        }
-        _ => {}
-    }
-}
-
 async fn update_response_session(
     state: &AppState,
-    session_key: Option<&str>,
-    session_scope_key: Option<&str>,
+    session_lease: Option<&LineageLease>,
+    parent: &LineageParent,
     full_response_input: Option<&Value>,
     bytes: &[u8],
-) {
+) -> Option<LineageCommitOutcome> {
     update_response_session_with_id(
         state,
-        session_key,
-        session_scope_key,
+        session_lease,
+        parent,
         full_response_input,
         response_id_from_bytes(bytes),
+        response_output_items_from_bytes(bytes),
     )
-    .await;
+    .await
 }
 
 async fn update_response_session_with_id(
     state: &AppState,
-    session_key: Option<&str>,
-    session_scope_key: Option<&str>,
+    session_lease: Option<&LineageLease>,
+    parent: &LineageParent,
     full_response_input: Option<&Value>,
     response_id: Option<String>,
-) {
-    let (Some(key), Some(input), Some(response_id)) =
-        (session_key, full_response_input, response_id)
-    else {
-        return;
+    output_items: Vec<Value>,
+) -> Option<LineageCommitOutcome> {
+    let Some(lease) = session_lease else {
+        return None;
     };
-    let session = Arc::new(ResponseSessionState {
+    if matches!(parent, LineageParent::ExternalContinuation) {
+        return Some(LineageCommitOutcome::ExternalContinuation);
+    }
+    let (Some(input), Some(response_id)) = (full_response_input, response_id) else {
+        let expected_response_id = lease.head().map(|head| head.response_id.as_str());
+        let outcome = state
+            .continuation_lineage
+            .invalidate(lease, expected_response_id)
+            .await;
+        return Some(match outcome {
+            LineageInvalidateOutcome::Applied { generation } => {
+                LineageCommitOutcome::Tombstoned { generation }
+            }
+            LineageInvalidateOutcome::Stale { expected, actual } => {
+                LineageCommitOutcome::Stale { expected, actual }
+            }
+            LineageInvalidateOutcome::EpochChanged { expected, actual } => {
+                LineageCommitOutcome::EpochChanged { expected, actual }
+            }
+            LineageInvalidateOutcome::ParentMismatch => LineageCommitOutcome::ParentMismatch,
+        });
+    };
+    let replacement_allowed = lease
+        .head()
+        .map(|existing| should_replace_response_session(&existing.input, input))
+        .unwrap_or(true);
+    let candidate = ResponseSessionCandidate {
         response_id,
         input: input.clone(),
-        scope_key: session_scope_key.map(ToOwned::to_owned),
+        output_items,
         finished_at: Instant::now(),
-    });
-    {
-        let mut sessions = state.response_sessions.lock().await;
-        if let Some(existing) = sessions.get(key) {
-            if !should_replace_response_session(&existing.input, input) {
-                return;
-            }
-        }
-        sessions.insert(key.to_string(), session);
-    }
-    state.journal_runtime_state();
+    };
+    Some(
+        state
+            .continuation_lineage
+            .commit(lease, parent, candidate, replacement_allowed)
+            .await,
+    )
 }
 
 async fn finalize_confirmed_responses_compaction(
     state: &AppState,
-    response_session_key: Option<&str>,
+    response_session_lease: Option<&LineageLease>,
+    response_session_epoch_started: bool,
     prefix_state_key: Option<&str>,
     provider_prefix_family_key: Option<&str>,
     shadow_assignment_key: Option<&str>,
-) {
+) -> bool {
     let clear_family_state = shadow_assignment_key.is_some();
-    if let Some(key) = response_session_key {
-        state.response_sessions.lock().await.remove(key);
+    let lineage_boundary_applied = match response_session_lease {
+        Some(lease) if response_session_epoch_started => {
+            state.continuation_lineage.is_current(lease).await
+        }
+        Some(lease) => state
+            .continuation_lineage
+            .confirm_compaction(lease)
+            .await
+            .is_some(),
+        None => true,
+    };
+    if !lineage_boundary_applied {
+        return false;
     }
 
     {
@@ -6850,6 +6688,7 @@ async fn finalize_confirmed_responses_compaction(
     }
 
     state.journal_runtime_state();
+    true
 }
 
 fn mark_shadow_compaction_boundary(
@@ -6871,10 +6710,11 @@ fn session_identity_source_is_trusted(source: &str) -> bool {
 fn should_replace_response_session(existing: &Value, next: &Value) -> bool {
     match (existing, next) {
         (Value::Array(existing_items), Value::Array(next_items)) => {
-            if response_input_essential_prefix_matches(next_items, existing_items) {
-                return false;
-            }
-            true
+            !(next_items.len() < existing_items.len()
+                && next_items
+                    .iter()
+                    .zip(existing_items.iter())
+                    .all(|(next, existing)| next == existing))
         }
         _ => true,
     }
@@ -6911,6 +6751,24 @@ fn response_id_from_value(value: &Value) -> Option<String> {
         .or_else(|| value.pointer("/response/id").and_then(Value::as_str))
         .or_else(|| value.pointer("/message/id").and_then(Value::as_str))
         .map(ToOwned::to_owned)
+}
+
+fn response_output_items_from_bytes(bytes: &[u8]) -> Vec<Value> {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return response_output_items_from_value(&value);
+    }
+    let mut stream = ResponsesStreamState::default();
+    stream.ingest(bytes);
+    stream.finish().output_items
+}
+
+fn response_output_items_from_value(value: &Value) -> Vec<Value> {
+    value
+        .get("output")
+        .or_else(|| value.pointer("/response/output"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn upstream_error_summary(bytes: &[u8]) -> String {
@@ -7260,7 +7118,7 @@ fn local_session_keys_enabled(config: &AppConfig) -> bool {
 }
 
 fn responses_session_reuse_enabled(config: &AppConfig) -> bool {
-    smart_hit_enabled(config) && config.cache.prewarm_enabled
+    smart_hit_enabled(config)
 }
 
 fn smart_hit_enabled(config: &AppConfig) -> bool {
@@ -7592,11 +7450,9 @@ fn apply_body_diagnostics(log: &mut RequestLog, diagnostics: &BodyDiagnostics) {
     log.reasoning_effort_source = diagnostics.reasoning.source.clone();
 }
 
-async fn tail_input_diagnostics_for_session(
-    state: &AppState,
+fn tail_input_diagnostics_for_session(
     channel: &Channel,
-    session_key: Option<&str>,
-    session_scope_key: Option<&str>,
+    lease: Option<&LineageLease>,
     current_input: Option<&Value>,
 ) -> TailInputDiagnostics {
     if !matches!(channel, Channel::Responses) {
@@ -7612,16 +7468,7 @@ async fn tail_input_diagnostics_for_session(
         return TailInputDiagnostics::default();
     }
 
-    let previous_session = if let Some(key) = session_key {
-        let sessions = state.response_sessions.lock().await;
-        sessions.get(key).cloned().or_else(|| {
-            fallback_response_sessions(&sessions, key, session_scope_key, current_input)
-                .into_iter()
-                .next()
-        })
-    } else {
-        None
-    };
+    let previous_session = lease.and_then(LineageLease::head).cloned();
     let tail_start = previous_session
         .as_ref()
         .and_then(|session| session.input.as_array())
@@ -8190,6 +8037,15 @@ fn upstream_transport_failure_log(
             response_session_reuse_diagnostics.append_delta_match,
         ),
         response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+        response_context_plan: response_session_reuse_diagnostics.context_plan.clone(),
+        response_session_semantic_reuse_items: (response_session_reuse_diagnostics
+            .semantic_reuse_items
+            > 0)
+        .then_some(response_session_reuse_diagnostics.semantic_reuse_items),
+        response_session_wire_saved_bytes: (response_session_reuse_diagnostics.wire_saved_bytes
+            > 0)
+        .then_some(response_session_reuse_diagnostics.wire_saved_bytes),
+        response_session_wire_saved_ratio: response_session_reuse_diagnostics.wire_saved_ratio,
         response_session_cooldown_active: Some(response_session_reuse_diagnostics.cooldown_active),
         response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
         session_anchor_hash: None,
@@ -8384,6 +8240,10 @@ async fn cache_hit_response(
         response_session_scope_match_count: None,
         response_session_append_delta_match: None,
         response_session_delta_items: None,
+        response_context_plan: None,
+        response_session_semantic_reuse_items: None,
+        response_session_wire_saved_bytes: None,
+        response_session_wire_saved_ratio: None,
         response_session_cooldown_active: None,
         response_session_rejected_status: None,
         session_anchor_hash: None,
@@ -8828,6 +8688,13 @@ struct ResponseSessionReuseProbeResponse {
     bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+struct ParsedResponseSessionSseProbe {
+    usage: UsageRecord,
+    response_id: String,
+    output_items: Vec<Value>,
+}
+
 pub(crate) async fn probe_and_record_provider_cache_capabilities(
     state: &AppState,
     provider_id: &str,
@@ -9121,18 +8988,191 @@ pub(crate) async fn probe_provider_response_session_reuse(
     if selected_key.secret.trim().is_empty() {
         return Err(anyhow!("provider API key is not configured"));
     }
+    let probe_decision = RouteDecision {
+        provider: provider.clone(),
+        upstream_channel: Channel::Responses,
+        model: model_id.to_string(),
+    };
+    let capability = response_session_capability(
+        &probe_decision,
+        &selected_key,
+        ResponseSessionReuseStreamShape::StreamSse,
+    );
 
-    let nonce = format!("ato-session-{}", Uuid::new_v4().simple());
+    let fidelity_nonce = Uuid::new_v4().simple().to_string();
+    let fidelity = build_response_session_fidelity_payload(&fidelity_nonce);
+    let tool_name = "atoapi_fidelity_probe";
     let stable_prefix = "Atoapi response-session cache verification stable context. ".repeat(192);
+    let anchor_input = json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": format!(
+                "{stable_prefix}\nGenerate a fresh unpredictable 64-character lowercase hexadecimal token. Return exactly that token as the only assistant output text."
+            ),
+        }],
+    }]);
+    let anchor_body = json!({
+        "model": model_id,
+        "instructions": "This is an explicit compatibility verification. Return exactly one freshly generated 64-character lowercase hexadecimal token and no other visible text.",
+        "input": anchor_input.clone(),
+        "store": true,
+        "stream": true,
+        "max_output_tokens": 128,
+    });
+    let anchor = send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &anchor_body,
+    )
+    .await?;
+    let Some(anchor_probe) = parse_successful_response_session_sse_probe(&anchor) else {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            probe_status_for_failure(anchor.status, &anchor.bytes),
+            format!(
+                "anchor request returned HTTP {}: {}",
+                anchor.status,
+                upstream_error_summary(&anchor.bytes)
+            ),
+            Some(anchor.status),
+            None,
+        ));
+    };
+    let anchor_usage = anchor_probe.usage;
+    let anchor_response_id = anchor_probe.response_id;
+    let anchor_output_items = anchor_probe.output_items;
+    let anchor_challenge = match response_session_probe_text_challenge(&anchor_output_items) {
+        Ok(challenge) => challenge,
+        Err(message) => {
+            return Ok(response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                Some(capability.clone()),
+                ProviderResponseSessionReuseStatus::Unsupported,
+                format!("anchor response failed: {message}"),
+                Some(anchor.status),
+                None,
+            ));
+        }
+    };
+    if serde_json::to_string(&anchor_body)
+        .unwrap_or_default()
+        .contains(&anchor_challenge)
+    {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "anchor challenge was present in the request wire instead of being generated only by the assistant"
+                .to_string(),
+            Some(anchor.status),
+            None,
+        ));
+    }
+
+    let freshness_decoy = send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &anchor_body,
+    )
+    .await?;
+    let Some(freshness_decoy_probe) = parse_successful_response_session_sse_probe(&freshness_decoy)
+    else {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            probe_status_for_failure(freshness_decoy.status, &freshness_decoy.bytes),
+            format!(
+                "freshness decoy returned HTTP {}: {}",
+                freshness_decoy.status,
+                upstream_error_summary(&freshness_decoy.bytes)
+            ),
+            Some(freshness_decoy.status),
+            None,
+        ));
+    };
+    let freshness_challenge =
+        match response_session_probe_text_challenge(&freshness_decoy_probe.output_items) {
+            Ok(challenge) => challenge,
+            Err(message) => {
+                return Ok(response_session_reuse_probe_result(
+                    provider_id,
+                    model_id,
+                    Some(capability.clone()),
+                    ProviderResponseSessionReuseStatus::Unsupported,
+                    format!("freshness decoy failed: {message}"),
+                    Some(freshness_decoy.status),
+                    None,
+                ));
+            }
+        };
+    if freshness_challenge == anchor_challenge {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "two independent anchor responses reused the same challenge; freshness and unpredictability were not verified"
+                .to_string(),
+            Some(freshness_decoy.status),
+            None,
+        ));
+    }
+
+    let probe_tools = json!([{
+        "type": "function",
+        "name": tool_name,
+        "description": "Returns a private protocol-fidelity fixture that must be preserved exactly.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "challenge": {
+                    "type": "string",
+                    "description": "The exact hidden 64-character lowercase hexadecimal token from the earlier assistant response selected by previous_response_id.",
+                    "minLength": 64,
+                    "maxLength": 64,
+                    "pattern": "^[0-9a-f]{64}$",
+                },
+            },
+            "required": ["challenge"],
+            "additionalProperties": false,
+        },
+    }]);
+    let seed_input = json!([response_session_probe_user_message(
+        "Use the exact hidden token from the selected earlier assistant response as challenge. Call the required fidelity tool exactly once and emit no assistant text."
+    )]);
     let seed_body = json!({
         "model": model_id,
-        "input": format!(
-            "{stable_prefix}\nRemember the exact token {nonce}. Reply only ACK."
-        ),
+        "previous_response_id": anchor_response_id,
+        "instructions": "This is an explicit compatibility verification. Retrieve the exact token from the selected earlier assistant response, call the required function exactly once with it, and emit no assistant text.",
+        "input": seed_input.clone(),
+        "tools": probe_tools.clone(),
+        "tool_choice": { "type": "function", "name": tool_name },
+        "parallel_tool_calls": false,
         "store": true,
-        "stream": false,
-        "max_output_tokens": 32,
+        "stream": true,
+        "max_output_tokens": 512,
     });
+    let seed_wire = serde_json::to_string(&seed_body).unwrap_or_default();
+    if seed_wire.contains(&anchor_challenge) || seed_wire.contains("\"call_id\"") {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "anchor continuation wire exposed the hidden token or a prior call_id".to_string(),
+            Some(anchor.status),
+            None,
+        ));
+    }
     let first = send_response_session_reuse_probe_request(
         state,
         &provider,
@@ -9140,40 +9180,131 @@ pub(crate) async fn probe_provider_response_session_reuse(
         &seed_body,
     )
     .await?;
-    if !is_successful_probe_response(&first) {
+    let Some(first_probe) = parse_successful_response_session_sse_probe(&first) else {
         return Ok(response_session_reuse_probe_result(
             provider_id,
             model_id,
+            Some(capability.clone()),
             probe_status_for_failure(first.status, &first.bytes),
             format!(
-                "seed request returned HTTP {}: {}",
+                "anchor continuation returned HTTP {}: {}",
                 first.status,
                 upstream_error_summary(&first.bytes)
             ),
             Some(first.status),
             None,
         ));
-    }
-    let first_usage = provider_usage_from_bytes(&first.bytes);
-    let Some(previous_response_id) = response_id_from_bytes(&first.bytes) else {
+    };
+    let first_usage = first_probe.usage;
+    let previous_response_id = first_probe.response_id;
+    let first_output_items = first_probe.output_items;
+    let seed_call = match response_session_probe_function_call(&first_output_items, tool_name) {
+        Ok(seed_call) => seed_call,
+        Err(message) => {
+            return Ok(response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                Some(capability.clone()),
+                ProviderResponseSessionReuseStatus::Unsupported,
+                message,
+                Some(first.status),
+                None,
+            ));
+        }
+    };
+    if seed_call.challenge != anchor_challenge {
         return Ok(response_session_reuse_probe_result(
             provider_id,
             model_id,
+            Some(capability.clone()),
             ProviderResponseSessionReuseStatus::Unsupported,
-            "seed response did not include a reusable response id".to_string(),
+            "anchor continuation did not recover the exact hidden token selected by previous_response_id"
+                .to_string(),
+            Some(first.status),
+            None,
+        ));
+    }
+    let call_id = seed_call.call_id.clone();
+    let challenge_nonce = seed_call.challenge.clone();
+
+    let lineage_decoy = send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &anchor_body,
+    )
+    .await?;
+    let Some(lineage_decoy_probe) = parse_successful_response_session_sse_probe(&lineage_decoy)
+    else {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            probe_status_for_failure(lineage_decoy.status, &lineage_decoy.bytes),
+            format!(
+                "lineage decoy returned HTTP {}: {}",
+                lineage_decoy.status,
+                upstream_error_summary(&lineage_decoy.bytes)
+            ),
             Some(first.status),
             None,
         ));
     };
+    let lineage_decoy_challenge =
+        match response_session_probe_text_challenge(&lineage_decoy_probe.output_items) {
+            Ok(challenge) => challenge,
+            Err(message) => {
+                return Ok(response_session_reuse_probe_result(
+                    provider_id,
+                    model_id,
+                    Some(capability.clone()),
+                    ProviderResponseSessionReuseStatus::Unsupported,
+                    format!("lineage decoy failed: {message}"),
+                    Some(first.status),
+                    None,
+                ));
+            }
+        };
+    if lineage_decoy_challenge == anchor_challenge || lineage_decoy_challenge == freshness_challenge
+    {
+        return Ok(response_session_reuse_probe_result(
+            provider_id,
+            model_id,
+            Some(capability.clone()),
+            ProviderResponseSessionReuseStatus::Unsupported,
+            "lineage decoy reused an earlier challenge; non-latest response selection was not verified"
+                .to_string(),
+            Some(first.status),
+            None,
+        ));
+    }
 
+    let function_call_output = json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": fidelity.output.clone(),
+    });
+    let verifier_tool = response_session_fidelity_verifier_tool();
+    let expected_fidelity_arguments =
+        response_session_fidelity_expected_arguments(&seed_call, &fidelity);
     let continuation_body = json!({
         "model": model_id,
         "previous_response_id": previous_response_id,
-        "input": "Return only the exact verification token from the immediately previous turn.",
+        "instructions": response_session_fidelity_render_instructions(),
+        "input": [function_call_output.clone()],
+        "tools": [verifier_tool.clone()],
+        "tool_choice": { "type": "function", "name": "atoapi_fidelity_verify" },
+        "parallel_tool_calls": false,
         "store": true,
-        "stream": false,
-        "max_output_tokens": 32,
+        "stream": true,
+        "max_output_tokens": 4_096,
     });
+    debug_assert!(
+        !serde_json::to_string(&continuation_body)
+            .unwrap_or_default()
+            .contains(&challenge_nonce),
+        "the continuation wire must not reveal the seed challenge"
+    );
     let continuation = send_response_session_reuse_probe_request(
         state,
         &provider,
@@ -9181,10 +9312,12 @@ pub(crate) async fn probe_provider_response_session_reuse(
         &continuation_body,
     )
     .await?;
-    if !is_successful_probe_response(&continuation) {
+    let Some(continuation_probe) = parse_successful_response_session_sse_probe(&continuation)
+    else {
         return Ok(response_session_reuse_probe_result(
             provider_id,
             model_id,
+            Some(capability.clone()),
             probe_status_for_failure(continuation.status, &continuation.bytes),
             format!(
                 "continuation returned HTTP {}: {}",
@@ -9194,22 +9327,39 @@ pub(crate) async fn probe_provider_response_session_reuse(
             Some(first.status),
             Some(continuation.status),
         ));
+    };
+    let continuation_usage = continuation_probe.usage;
+    if !response_session_probe_verifier_matches(
+        &continuation_probe.output_items,
+        &expected_fidelity_arguments,
+    ) {
+        return Ok(with_response_session_probe_usage(
+            response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                Some(capability.clone()),
+                ProviderResponseSessionReuseStatus::Unsupported,
+                "continuation succeeded but did not reproduce the exact typed tool manifest"
+                    .to_string(),
+                Some(first.status),
+                Some(continuation.status),
+            ),
+            &first_usage,
+            &continuation_usage,
+            false,
+        ));
     }
-    let continuation_usage = provider_usage_from_bytes(&continuation.bytes);
-    let output = serde_json::from_slice::<Value>(&continuation.bytes)
-        .ok()
-        .and_then(|value| extract_response_text(&value))
-        .unwrap_or_default();
-    if !output
-        .to_ascii_lowercase()
-        .contains(&nonce.to_ascii_lowercase())
+
+    if let Some(message) =
+        response_session_probe_plain_delta_usage_error(&anchor_usage, &first_usage)
     {
         return Ok(with_response_session_probe_usage(
             response_session_reuse_probe_result(
                 provider_id,
                 model_id,
-                ProviderResponseSessionReuseStatus::Unsupported,
-                "continuation succeeded but did not preserve the verification token".to_string(),
+                Some(capability.clone()),
+                ProviderResponseSessionReuseStatus::Unverified,
+                message.to_string(),
                 Some(first.status),
                 Some(continuation.status),
             ),
@@ -9220,10 +9370,11 @@ pub(crate) async fn probe_provider_response_session_reuse(
     }
 
     if let Some(message) = response_session_probe_usage_error(&first_usage, &continuation_usage) {
-        Ok(with_response_session_probe_usage(
+        return Ok(with_response_session_probe_usage(
             response_session_reuse_probe_result(
                 provider_id,
                 model_id,
+                Some(capability.clone()),
                 ProviderResponseSessionReuseStatus::Unverified,
                 message.to_string(),
                 Some(first.status),
@@ -9232,27 +9383,546 @@ pub(crate) async fn probe_provider_response_session_reuse(
             &first_usage,
             &continuation_usage,
             false,
-        ))
-    } else {
-        Ok(with_response_session_probe_usage(
-            response_session_reuse_probe_result(
+        ));
+    }
+
+    let mut compact_input = anchor_input.as_array().cloned().unwrap_or_default();
+    compact_input.extend(anchor_output_items);
+    compact_input.extend(seed_input.as_array().cloned().unwrap_or_default());
+    compact_input.extend(first_output_items);
+    compact_input.push(function_call_output);
+    let compact_body = json!({
+        "model": model_id,
+        "instructions": "Preserve the complete tool-call chain and every byte of its function output. Do not summarize, omit, reorder, or replace tool data with references.",
+        "input": compact_input,
+    });
+    let compact = match send_response_session_compaction_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &compact_body,
+    )
+    .await
+    {
+        Ok(compact) => compact,
+        Err(error) => {
+            return Ok(response_session_direct_verified_result(
                 provider_id,
                 model_id,
-                ProviderResponseSessionReuseStatus::Verified,
+                capability.clone(),
                 format!(
-                    "verification passed; semantic continuation and cached-token usage were preserved (seed input {}, continuation input {}, cached {})",
-                    first_usage.input_tokens,
-                    continuation_usage.input_tokens,
-                    continuation_usage.cache_read_tokens
+                    "direct fidelity v3 passed; compaction transport failed and remains FullReplay-only: {error}"
                 ),
-                Some(first.status),
-                Some(continuation.status),
+                first.status,
+                continuation.status,
+                &first_usage,
+                &continuation_usage,
+                None,
+                None,
+                false,
+            ));
+        }
+    };
+    if !is_successful_probe_response(&compact) {
+        return Ok(response_session_direct_verified_result(
+            provider_id,
+            model_id,
+            capability.clone(),
+            format!(
+                "direct fidelity v3 passed; compaction returned HTTP {} and remains FullReplay-only: {}",
+                compact.status,
+                upstream_error_summary(&compact.bytes)
             ),
+            first.status,
+            continuation.status,
             &first_usage,
             &continuation_usage,
-            true,
-        ))
+            Some(compact.status),
+            None,
+            false,
+        ));
     }
+    let Some(mut compacted_input) = response_session_compaction_output(&compact.bytes) else {
+        return Ok(response_session_direct_verified_result(
+            provider_id,
+            model_id,
+            capability.clone(),
+            "direct fidelity v3 passed; compaction did not return canonical output and remains FullReplay-only".to_string(),
+            first.status,
+            continuation.status,
+            &first_usage,
+            &continuation_usage,
+            Some(compact.status),
+            None,
+            false,
+        ));
+    };
+    compacted_input.push(response_session_probe_user_message(
+        "Read the compacted context and reproduce the private fidelity markers exactly as previously required.",
+    ));
+    let compact_continuation_body = json!({
+        "model": model_id,
+        "instructions": response_session_fidelity_render_instructions(),
+        "input": compacted_input,
+        "tools": [verifier_tool],
+        "tool_choice": { "type": "function", "name": "atoapi_fidelity_verify" },
+        "parallel_tool_calls": false,
+        "store": true,
+        "stream": true,
+        "max_output_tokens": 4_096,
+    });
+    let compact_continuation = match send_response_session_reuse_probe_request(
+        state,
+        &provider,
+        &selected_key.secret,
+        &compact_continuation_body,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Ok(response_session_direct_verified_result(
+                provider_id,
+                model_id,
+                capability.clone(),
+                format!(
+                    "direct fidelity v3 passed; post-compaction continuation failed and remains FullReplay-only: {error}"
+                ),
+                first.status,
+                continuation.status,
+                &first_usage,
+                &continuation_usage,
+                Some(compact.status),
+                None,
+                false,
+            ));
+        }
+    };
+    let Some(compact_continuation_probe) =
+        parse_successful_response_session_sse_probe(&compact_continuation)
+    else {
+        return Ok(response_session_direct_verified_result(
+            provider_id,
+            model_id,
+            capability.clone(),
+            format!(
+                "direct fidelity v3 passed; post-compaction continuation returned HTTP {} and remains FullReplay-only: {}",
+                compact_continuation.status,
+                upstream_error_summary(&compact_continuation.bytes)
+            ),
+            first.status,
+            continuation.status,
+            &first_usage,
+            &continuation_usage,
+            Some(compact.status),
+            Some(compact_continuation.status),
+            false,
+        ));
+    };
+    if !response_session_probe_verifier_matches(
+        &compact_continuation_probe.output_items,
+        &expected_fidelity_arguments,
+    ) {
+        return Ok(response_session_direct_verified_result(
+            provider_id,
+            model_id,
+            capability.clone(),
+            "direct fidelity v3 passed; post-compaction typed fidelity failed and remains FullReplay-only"
+                .to_string(),
+            first.status,
+            continuation.status,
+            &first_usage,
+            &continuation_usage,
+            Some(compact.status),
+            Some(compact_continuation.status),
+            false,
+        ));
+    }
+
+    Ok(response_session_direct_verified_result(
+        provider_id,
+        model_id,
+        capability,
+        format!(
+            "fidelity v3 verification passed; direct typed continuation, compaction continuation, and cached-token usage were preserved (seed input {}, continuation input {}, cached {})",
+            first_usage.input_tokens,
+            continuation_usage.input_tokens,
+            continuation_usage.cache_read_tokens
+        ),
+        first.status,
+        continuation.status,
+        &first_usage,
+        &continuation_usage,
+        Some(compact.status),
+        Some(compact_continuation.status),
+        true,
+    ))
+}
+
+#[derive(Debug)]
+struct ResponseSessionFidelityPayload {
+    output: String,
+    manifest: Value,
+}
+
+fn build_response_session_fidelity_payload(nonce: &str) -> ResponseSessionFidelityPayload {
+    let marker = |suffix: &str| format!("ATO_FID_{nonce}_{suffix}");
+    let file_path = format!("G:/atoapi/probe/{}.rs", marker("FILE_PATH"));
+    let file_content = format!(
+        "fn fidelity_probe() {{\n    println!(\"{}\");\n}}\n",
+        marker("FILE_CONTENT")
+    );
+    let stdout = format!(
+        "compile succeeded {}\nsecond stdout line retained\n",
+        marker("STDOUT")
+    );
+    let stderr = format!("warning stream {} retained\n", marker("STDERR"));
+    let error_code = marker("ERROR_CODE");
+    let error_message = format!("structured failure {}", marker("ERROR_MESSAGE"));
+    let unicode = format!("{}_汉字_Δ_🙂_换行\n保留", marker("UNICODE"));
+    let long_start = marker("LONG_START");
+    let long_middle = marker("LONG_MIDDLE");
+    let long_end = marker("LONG_END");
+    let repeated = marker("REPEATED");
+    let ordered = marker("ORDERED_BETWEEN_REPEATS");
+    let long_value = format!(
+        " {long_start} {} {long_middle} {} {long_end} ",
+        "0123456789abcdef".repeat(256),
+        "fedcba9876543210".repeat(256),
+    );
+    let manifest = json!({
+        "file": {
+            "path": file_path,
+            "content": file_content,
+        },
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": 37,
+        "error": {
+            "code": error_code,
+            "message": error_message,
+            "retryable": false,
+        },
+        "unicode": unicode,
+        "long_content": long_value,
+        "ordered_repeated": [repeated, ordered, repeated],
+    });
+    ResponseSessionFidelityPayload {
+        output: serde_json::to_string(&manifest).expect("a fixed fidelity fixture must serialize"),
+        manifest,
+    }
+}
+
+fn response_session_fidelity_render_instructions() -> &'static str {
+    "Call the required verifier function exactly once. Copy the complete prior function-call envelope into seed_function_call, including id, status, call_id, name, and the original arguments JSON string. Set challenge to the exact value from those prior arguments. Decode the function result JSON and copy every other field into the verifier arguments without changing types, nesting, bytes, Unicode, newlines, long content, duplicates, or order. Emit no assistant text."
+}
+
+fn response_session_fidelity_verifier_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": "atoapi_fidelity_verify",
+        "description": "Returns the exact typed fidelity manifest received from the prior tool result.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "challenge": { "type": "string" },
+                "seed_function_call": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "status": { "type": "string" },
+                        "call_id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "arguments": { "type": "string" }
+                    },
+                    "required": ["id", "status", "call_id", "name", "arguments"],
+                    "additionalProperties": false
+                },
+                "file": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                },
+                "stdout": { "type": "string" },
+                "stderr": { "type": "string" },
+                "exit_code": { "type": "integer" },
+                "error": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string" },
+                        "message": { "type": "string" },
+                        "retryable": { "type": "boolean" }
+                    },
+                    "required": ["code", "message", "retryable"],
+                    "additionalProperties": false
+                },
+                "unicode": { "type": "string" },
+                "long_content": { "type": "string" },
+                "ordered_repeated": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "minItems": 3,
+                    "maxItems": 3
+                }
+            },
+            "required": [
+                "challenge",
+                "seed_function_call",
+                "file",
+                "stdout",
+                "stderr",
+                "exit_code",
+                "error",
+                "unicode",
+                "long_content",
+                "ordered_repeated"
+            ],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn response_session_fidelity_expected_arguments(
+    seed_call: &ResponseSessionProbeFunctionCall,
+    payload: &ResponseSessionFidelityPayload,
+) -> Value {
+    let mut expected = payload
+        .manifest
+        .as_object()
+        .cloned()
+        .expect("the fixed fidelity manifest must be an object");
+    expected.insert(
+        "challenge".to_string(),
+        Value::String(seed_call.challenge.clone()),
+    );
+    expected.insert(
+        "seed_function_call".to_string(),
+        json!({
+            "id": seed_call.item_id.clone(),
+            "status": seed_call.status.clone(),
+            "call_id": seed_call.call_id.clone(),
+            "name": seed_call.name.clone(),
+            "arguments": seed_call.arguments.clone(),
+        }),
+    );
+    Value::Object(expected)
+}
+
+fn response_session_probe_user_message(text: &str) -> Value {
+    json!({
+        "type": "message",
+        "role": "user",
+        "content": [{ "type": "input_text", "text": text }],
+    })
+}
+
+fn response_session_probe_text_challenge(
+    output_items: &[Value],
+) -> std::result::Result<String, String> {
+    if output_items.iter().any(|item| {
+        !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("reasoning" | "message")
+        )
+    }) {
+        return Err(
+            "anchor response included output beside reasoning and one assistant message"
+                .to_string(),
+        );
+    }
+    let messages = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .collect::<Vec<_>>();
+    let [message] = messages.as_slice() else {
+        return Err("anchor response did not contain exactly one assistant message".to_string());
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant")
+        || message.get("status").and_then(Value::as_str) != Some("completed")
+    {
+        return Err("anchor assistant message was not completed".to_string());
+    }
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "anchor assistant message did not contain output text".to_string())?;
+    let [content] = content.as_slice() else {
+        return Err("anchor assistant message did not contain exactly one output item".to_string());
+    };
+    if content.get("type").and_then(Value::as_str) != Some("output_text") {
+        return Err("anchor assistant message did not contain output_text".to_string());
+    }
+    let challenge = content
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "anchor output_text did not contain a token".to_string())?;
+    let distinct = challenge.as_bytes().iter().copied().collect::<HashSet<_>>();
+    if challenge.len() != 64
+        || !challenge
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || distinct.len() < 8
+    {
+        return Err(
+            "anchor response did not generate a valid unpredictable hexadecimal token".to_string(),
+        );
+    }
+    if output_items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && serde_json::to_string(item)
+                .unwrap_or_default()
+                .contains(challenge)
+    }) {
+        return Err("anchor token leaked into visible reasoning output".to_string());
+    }
+    Ok(challenge.to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResponseSessionProbeFunctionCall {
+    item_id: String,
+    status: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    challenge: String,
+}
+
+fn response_session_probe_function_call(
+    output_items: &[Value],
+    expected_name: &str,
+) -> std::result::Result<ResponseSessionProbeFunctionCall, String> {
+    let call = response_session_probe_single_function_call(output_items, expected_name)?;
+    let item_id = call
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "seed function call did not include a valid item id".to_string())?;
+    let status = call
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "seed function call did not include a valid status".to_string())?;
+    let call_id = call
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "seed function call did not include a valid call_id".to_string())?;
+    let name = call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "seed function call did not include a valid name".to_string())?;
+    let arguments_raw = call
+        .get("arguments")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "seed function call arguments were not an exact JSON string".to_string())?;
+    let arguments = serde_json::from_str::<Value>(arguments_raw)
+        .map_err(|_| "seed function call arguments were not valid JSON".to_string())?;
+    let Some(arguments) = arguments.as_object() else {
+        return Err("seed function call arguments were not a JSON object".to_string());
+    };
+    let Some(challenge) = arguments.get("challenge").and_then(Value::as_str) else {
+        return Err("seed function call did not generate a challenge".to_string());
+    };
+    let distinct = challenge.as_bytes().iter().copied().collect::<HashSet<_>>();
+    let lowercase_hex = challenge
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if arguments.len() != 1 || challenge.len() != 64 || !lowercase_hex || distinct.len() < 8 {
+        return Err(format!(
+            "seed function call did not generate a valid unpredictable hexadecimal challenge (fields={}, length={}, lowercase_hex={}, distinct={})",
+            arguments.len(),
+            challenge.len(),
+            lowercase_hex,
+            distinct.len()
+        ));
+    }
+    if output_items.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && serde_json::to_string(item)
+                .unwrap_or_default()
+                .contains(challenge)
+    }) {
+        return Err(
+            "seed challenge leaked outside the structured function-call arguments".to_string(),
+        );
+    }
+    Ok(ResponseSessionProbeFunctionCall {
+        item_id: item_id.to_string(),
+        status: status.to_string(),
+        call_id: call_id.to_string(),
+        name: name.to_string(),
+        arguments: arguments_raw.to_string(),
+        challenge: challenge.to_string(),
+    })
+}
+
+fn response_session_probe_single_function_call<'a>(
+    output_items: &'a [Value],
+    expected_name: &str,
+) -> std::result::Result<&'a Value, String> {
+    if output_items.iter().any(|item| {
+        !matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("reasoning" | "function_call")
+        )
+    }) {
+        return Err("seed response included unexpected output beside reasoning and the required function call".to_string());
+    }
+    let calls = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .collect::<Vec<_>>();
+    let [call] = calls.as_slice() else {
+        return Err("response did not produce exactly one required function call".to_string());
+    };
+    if call.get("name").and_then(Value::as_str) != Some(expected_name) {
+        return Err("seed response called a different function".to_string());
+    }
+    call.get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "seed function call did not include a valid item id".to_string())?;
+    if call.get("status").and_then(Value::as_str) != Some("completed") {
+        return Err("seed function call did not finish with completed status".to_string());
+    }
+    call.get("call_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "function call did not include a valid call_id".to_string())?;
+    Ok(call)
+}
+
+fn response_session_probe_verifier_matches(
+    output_items: &[Value],
+    expected_arguments: &Value,
+) -> bool {
+    let Ok(call) =
+        response_session_probe_single_function_call(output_items, "atoapi_fidelity_verify")
+    else {
+        return false;
+    };
+    let Some(arguments) = call.get("arguments").and_then(Value::as_str) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(arguments).is_ok_and(|arguments| arguments == *expected_arguments)
+}
+
+fn response_session_compaction_output(bytes: &[u8]) -> Option<Vec<Value>> {
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    let output = value.get("output").and_then(Value::as_array)?.clone();
+    if !output
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
+    {
+        return None;
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 fn response_session_probe_usage_error(
@@ -9274,6 +9944,25 @@ fn response_session_probe_usage_error(
     None
 }
 
+fn response_session_probe_plain_delta_usage_error(
+    anchor: &UsageRecord,
+    plain_delta: &UsageRecord,
+) -> Option<&'static str> {
+    if anchor.input_tokens == 0 {
+        return Some("plain previous_response_id continuation succeeded but the anchor response did not report input usage; session reuse remains disabled");
+    }
+    if plain_delta.input_tokens == 0 {
+        return Some("plain previous_response_id continuation succeeded but did not report input usage; session reuse remains disabled");
+    }
+    if plain_delta.input_tokens < anchor.input_tokens {
+        return Some("plain previous_response_id continuation usage did not include the selected anchor context; session reuse remains disabled");
+    }
+    if plain_delta.cache_read_tokens < PROVIDER_CACHE_MIN_BUCKET_TOKENS {
+        return Some("plain previous_response_id continuation did not report one full 128-token cache bucket; no cache benefit was verified");
+    }
+    None
+}
+
 fn with_response_session_probe_usage(
     mut result: ProviderResponseSessionReuseProbeResult,
     first: &UsageRecord,
@@ -9287,6 +9976,53 @@ fn with_response_session_probe_usage(
     result.continuation_cached_tokens =
         (continuation.input_tokens > 0).then_some(continuation.cache_read_tokens);
     result.usage_verified = usage_verified;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn response_session_direct_verified_result(
+    provider_id: &str,
+    model_id: &str,
+    capability: ProviderResponseSessionReuseCapability,
+    message: String,
+    first_status: u16,
+    continuation_status: u16,
+    first_usage: &UsageRecord,
+    continuation_usage: &UsageRecord,
+    compact_status: Option<u16>,
+    compact_continuation_status: Option<u16>,
+    compact_fidelity_verified: bool,
+) -> ProviderResponseSessionReuseProbeResult {
+    with_response_session_probe_compaction_statuses(
+        with_response_session_probe_usage(
+            response_session_reuse_probe_result(
+                provider_id,
+                model_id,
+                Some(capability),
+                ProviderResponseSessionReuseStatus::Verified,
+                message,
+                Some(first_status),
+                Some(continuation_status),
+            ),
+            first_usage,
+            continuation_usage,
+            true,
+        ),
+        compact_status,
+        compact_continuation_status,
+        compact_fidelity_verified,
+    )
+}
+
+fn with_response_session_probe_compaction_statuses(
+    mut result: ProviderResponseSessionReuseProbeResult,
+    compact_status: Option<u16>,
+    compact_continuation_status: Option<u16>,
+    compact_fidelity_verified: bool,
+) -> ProviderResponseSessionReuseProbeResult {
+    result.compact_status = compact_status;
+    result.compact_continuation_status = compact_continuation_status;
+    result.compact_fidelity_verified = compact_fidelity_verified;
     result
 }
 
@@ -9360,6 +10096,7 @@ pub(crate) async fn probe_and_record_provider_response_session_reuse(
         Err(err) => response_session_reuse_probe_result(
             provider_id,
             model_id,
+            None,
             ProviderResponseSessionReuseStatus::Error,
             err.to_string(),
             None,
@@ -9387,10 +10124,17 @@ pub(crate) async fn probe_and_record_provider_response_session_reuse(
         config.record_response_session_reuse_probe(
             provider_id,
             model_id,
+            result.capability.clone(),
             result.status.clone(),
             result.usage_verified,
             (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
                 .then(|| result.message.clone()),
+        );
+        config.set_response_session_reuse_compact_fidelity(
+            provider_id,
+            model_id,
+            result.capability.as_ref(),
+            result.compact_fidelity_verified,
         );
         state.publish_config_snapshot(&config)?
     };
@@ -9416,11 +10160,50 @@ async fn send_response_session_reuse_probe_request(
     .await
 }
 
+async fn send_response_session_compaction_probe_request(
+    state: &AppState,
+    provider: &ProviderConfig,
+    api_key: &str,
+    body: &Value,
+) -> Result<ResponseSessionReuseProbeResponse> {
+    send_provider_management_probe_request_to_url(
+        state,
+        provider,
+        api_key,
+        &Channel::Responses,
+        responses_compact_collection_url(&provider.base_url),
+        body,
+        RESPONSE_SESSION_PROBE_REQUEST_KIND,
+    )
+    .await
+}
+
 async fn send_provider_management_probe_request(
     state: &AppState,
     provider: &ProviderConfig,
     api_key: &str,
     channel: &Channel,
+    body: &Value,
+    request_kind: &'static str,
+) -> Result<ResponseSessionReuseProbeResponse> {
+    send_provider_management_probe_request_to_url(
+        state,
+        provider,
+        api_key,
+        channel,
+        upstream_url(&provider.base_url, channel),
+        body,
+        request_kind,
+    )
+    .await
+}
+
+async fn send_provider_management_probe_request_to_url(
+    state: &AppState,
+    provider: &ProviderConfig,
+    api_key: &str,
+    channel: &Channel,
+    url: String,
     body: &Value,
     request_kind: &'static str,
 ) -> Result<ResponseSessionReuseProbeResponse> {
@@ -9430,13 +10213,7 @@ async fn send_provider_management_probe_request(
         X_ATOAPI_REQUEST_KIND_HEADER,
         HeaderValue::from_static(request_kind),
     );
-    let plan = RequestPlan::new(
-        provider,
-        upstream_url(&provider.base_url, channel),
-        channel.clone(),
-        body,
-    )
-    .with_gzip_enabled(false);
+    let plan = RequestPlan::new(provider, url, channel.clone(), body).with_gzip_enabled(false);
     let outcome =
         send_main_upstream_request(state, api_key, plan.into_one_shot(), &management_headers)
             .await?;
@@ -9468,6 +10245,42 @@ fn is_successful_probe_response(response: &ResponseSessionReuseProbeResponse) ->
         && !upstream_body_has_error(&response.bytes, &response.content_type)
 }
 
+#[cfg(test)]
+fn is_successful_response_session_sse_probe(response: &ResponseSessionReuseProbeResponse) -> bool {
+    parse_successful_response_session_sse_probe(response).is_some()
+}
+
+fn parse_successful_response_session_sse_probe(
+    response: &ResponseSessionReuseProbeResponse,
+) -> Option<ParsedResponseSessionSseProbe> {
+    if !is_successful_probe_response(response)
+        || !response
+            .content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+    {
+        return None;
+    }
+    let mut stream = ResponsesStreamState::default();
+    stream.ingest(&response.bytes);
+    let summary = stream.finish();
+    if !evaluate_terminal(
+        &Channel::Responses,
+        TerminalCompatibility::Strict,
+        &summary,
+        StreamEnd::CleanEof,
+    )
+    .success
+    {
+        return None;
+    }
+    Some(ParsedResponseSessionSseProbe {
+        response_id: summary.response_id?,
+        usage: summary.usage,
+        output_items: summary.output_items,
+    })
+}
+
 fn probe_status_for_failure(status: u16, bytes: &[u8]) -> ProviderResponseSessionReuseStatus {
     if response_session_rejection_classification(status, &upstream_error_summary(bytes))
         == ResponseSessionRejectionClass::Unsupported
@@ -9481,6 +10294,7 @@ fn probe_status_for_failure(status: u16, bytes: &[u8]) -> ProviderResponseSessio
 fn response_session_reuse_probe_result(
     provider_id: &str,
     model_id: &str,
+    capability: Option<ProviderResponseSessionReuseCapability>,
     status: ProviderResponseSessionReuseStatus,
     message: String,
     first_status: Option<u16>,
@@ -9489,17 +10303,21 @@ fn response_session_reuse_probe_result(
     ProviderResponseSessionReuseProbeResult {
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
+        capability,
         enabled: status == ProviderResponseSessionReuseStatus::Verified,
         status,
         message,
         checked_at: Some(Utc::now()),
         first_status,
         continuation_status,
+        compact_status: None,
+        compact_continuation_status: None,
         first_input_tokens: None,
         first_cached_tokens: None,
         continuation_input_tokens: None,
         continuation_cached_tokens: None,
         usage_verified: false,
+        compact_fidelity_verified: false,
     }
 }
 
@@ -10045,12 +10863,14 @@ async fn stream_upstream(
     provider_prefix_family_key: Option<String>,
     route_affinity_key: Option<String>,
     config: AppConfig,
+    session_reuse_capability: Option<ProviderResponseSessionReuseCapability>,
     _prefix_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     prefix_state_key: Option<String>,
-    _response_session_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     response_session_key: Option<String>,
-    response_session_scope_key: Option<String>,
     full_response_input: Option<Value>,
+    response_session_lease: Option<LineageLease>,
+    response_session_parent: LineageParent,
+    response_session_starts_compaction_epoch: bool,
     used_response_session: bool,
     retried_full_response: bool,
     diagnostics: BodyDiagnostics,
@@ -10075,7 +10895,6 @@ async fn stream_upstream(
     // preparation and send; holding it through output serializes unrelated turns
     // and inflates TTFT/total time.
     drop(_prefix_guard);
-    drop(_response_session_guard);
 
     let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Chat);
@@ -10417,7 +11236,11 @@ async fn stream_upstream(
             }
         }
         if used_response_session
-            && is_verified_third_party_response_session_reuse(&config, &decision)
+            && supports_main_response_session_delta(
+                &config,
+                &decision,
+                session_reuse_capability.as_ref(),
+            )
             && stream_metadata.error_event_seen
         {
             let error_summary = upstream_error_summary(&session_error_body);
@@ -10428,7 +11251,8 @@ async fn stream_upstream(
                     error_summary.clone(),
                 ));
             }
-            let cooldown_key = response_session_error_cooldown_key(&decision);
+            let cooldown_key =
+                response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
             note_response_session_error_cooldown_for_rejection(
                 &state_for_stream,
                 cooldown_key.as_deref(),
@@ -10443,16 +11267,20 @@ async fn stream_upstream(
             ) {
                 clear_response_session_reference(
                     &state_for_stream,
-                    response_session_key.as_deref(),
-                    None,
+                    response_session_lease.as_ref(),
+                    response_session_lease
+                        .as_ref()
+                        .and_then(LineageLease::head)
+                        .map(|head| head.response_id.as_str()),
                 )
                 .await;
             }
             if rejection == ResponseSessionRejectionClass::Unsupported {
-                invalidate_verified_third_party_response_session_reuse(
+                invalidate_verified_response_session_reuse(
                     &state_for_stream,
                     &decision.provider.id,
                     &decision.model,
+                    session_reuse_capability.as_ref(),
                     &error_summary,
                 )
                 .await;
@@ -10500,10 +11328,11 @@ async fn stream_upstream(
         if stream_success_for_cache && !confirmed_compaction {
             update_response_session_with_id(
                 &state_for_stream,
-                response_session_key.as_deref(),
-                response_session_scope_key.as_deref(),
+                response_session_lease.as_ref(),
+                &response_session_parent,
                 full_response_input.as_ref(),
                 stream_metadata.response_id.clone(),
+                stream_metadata.output_items.clone(),
             )
             .await;
         }
@@ -10536,9 +11365,10 @@ async fn stream_upstream(
         if confirmed_compaction {
             let shadow_assignment_key =
                 mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
-            finalize_confirmed_responses_compaction(
+            let _ = finalize_confirmed_responses_compaction(
                 &state_for_stream,
-                response_session_key.as_deref(),
+                response_session_lease.as_ref(),
+                response_session_starts_compaction_epoch,
                 prefix_state_key.as_deref(),
                 provider_prefix_family_key.as_deref(),
                 shadow_assignment_key.as_deref(),
@@ -10711,6 +11541,16 @@ async fn stream_upstream(
                 response_session_reuse_diagnostics.append_delta_match,
             ),
             response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
+            response_context_plan: response_session_reuse_diagnostics.context_plan.clone(),
+            response_session_semantic_reuse_items: (response_session_reuse_diagnostics
+                .semantic_reuse_items
+                > 0)
+            .then_some(response_session_reuse_diagnostics.semantic_reuse_items),
+            response_session_wire_saved_bytes: (response_session_reuse_diagnostics
+                .wire_saved_bytes
+                > 0)
+            .then_some(response_session_reuse_diagnostics.wire_saved_bytes),
+            response_session_wire_saved_ratio: response_session_reuse_diagnostics.wire_saved_ratio,
             response_session_cooldown_active: Some(
                 response_session_reuse_diagnostics.cooldown_active,
             ),
@@ -10794,9 +11634,13 @@ async fn stream_upstream(
                 error_scope,
                 terminal_state,
                 usage_record.clone(),
-                response_session_key
-                    .clone()
-                    .or(session_anchor_diagnostics.hash.clone()),
+                (!confirmed_compaction)
+                    .then(|| {
+                        response_session_key
+                            .clone()
+                            .or(session_anchor_diagnostics.hash.clone())
+                    })
+                    .flatten(),
                 stream_metric_errors.clone(),
                 shadow_affinity_decision,
                 Some(&upstream_request_diagnostics),
@@ -10807,9 +11651,13 @@ async fn stream_upstream(
             if let Some(usage_record) = usage_record {
                 transaction.observe_usage(
                     usage_record,
-                    response_session_key
-                        .as_deref()
-                        .or(session_anchor_diagnostics.hash.as_deref()),
+                    (!confirmed_compaction)
+                        .then(|| {
+                            response_session_key
+                                .as_deref()
+                                .or(session_anchor_diagnostics.hash.as_deref())
+                        })
+                        .flatten(),
                 );
             }
             for (scope, message) in stream_metric_errors {
@@ -11884,7 +12732,7 @@ fn extend_prepared_wire_changed_fields(
     }
 }
 
-fn copy_responses_prefix_cache_fields_for_native_stream(
+fn copy_responses_prefix_cache_fields_for_native(
     outbound: &mut Value,
     prefix_body: &Value,
     config: &AppConfig,
@@ -15635,6 +16483,17 @@ fn responses_compact_url(base_url: &str, response_id: &str) -> String {
     }
 }
 
+fn responses_compact_collection_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if trimmed.ends_with("/responses") {
+        format!("{trimmed}/compact")
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/responses/compact")
+    } else {
+        format!("{trimmed}/v1/responses/compact")
+    }
+}
+
 fn compact_request_set_response_id(request: &mut Value, response_id: &str) {
     if let Value::Object(object) = request {
         object.insert(
@@ -16028,6 +16887,21 @@ mod tests {
         }
     }
 
+    fn test_session_reuse_capability(
+        decision: &RouteDecision,
+        secret: &str,
+        key_id: Option<&str>,
+    ) -> ProviderResponseSessionReuseCapability {
+        response_session_capability(
+            decision,
+            &SelectedProviderKey {
+                secret: secret.to_string(),
+                key_id: key_id.map(ToOwned::to_owned),
+            },
+            ResponseSessionReuseStreamShape::StreamSse,
+        )
+    }
+
     fn configure_test_codex_agent(config: &mut AppConfig, provider_id: &str) {
         config.agent_injections = vec![AgentInjectionConfig {
             id: "codex".to_string(),
@@ -16285,6 +17159,8 @@ mod tests {
             None,
             None,
             None,
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -18151,7 +19027,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_cache_controls_survive_disabled_prewarm_without_reenabling_session_reuse() {
+    fn stable_cache_controls_and_verified_session_reuse_are_independent_of_prewarm() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.prewarm_enabled = false;
@@ -18201,7 +19077,7 @@ mod tests {
         assert!(changed.iter().any(|field| field == "prompt_cache_options"));
         assert!(native_request.get("prompt_cache_options").is_some());
         assert!(smart_hit_enabled(&config));
-        assert!(!responses_session_reuse_enabled(&config));
+        assert!(responses_session_reuse_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
             Some(TokioDuration::ZERO)
@@ -19298,34 +20174,6 @@ mod tests {
     }
 
     #[test]
-    fn response_session_delta_only_accepts_array_append() {
-        let previous = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "message", "role": "assistant", "content": "two" }
-        ]);
-        let appended = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "message", "role": "assistant", "content": "two" },
-            { "type": "message", "role": "user", "content": "three" }
-        ]);
-        let changed = json!([
-            { "type": "message", "role": "user", "content": "one changed" },
-            { "type": "message", "role": "assistant", "content": "two" },
-            { "type": "message", "role": "user", "content": "three" }
-        ]);
-
-        assert_eq!(
-            appended_response_input_delta(&previous, &appended),
-            Some(json!([{ "type": "message", "role": "user", "content": "three" }]))
-        );
-        assert_eq!(appended_response_input_delta(&previous, &changed), None);
-        assert_eq!(
-            appended_response_input_delta(&previous, &json!("plain text")),
-            None
-        );
-    }
-
-    #[test]
     fn response_session_delta_body_rebuilds_non_input_fields_exactly() {
         let request = json!({
             "model": "client-model",
@@ -19354,7 +20202,6 @@ mod tests {
             Value::String("resp_previous".to_string()),
         );
         legacy_object.insert("input".to_string(), delta_input.clone());
-        legacy_object.insert("store".to_string(), Value::Bool(true));
         legacy_object.insert(
             "model".to_string(),
             Value::String("resolved-model".to_string()),
@@ -19369,6 +20216,7 @@ mod tests {
         .expect("an object request must produce a delta body");
 
         assert_eq!(optimized, legacy);
+        assert_eq!(optimized["store"], false);
         assert_eq!(
             serialize_responses_body_for_provider_prefix(&optimized),
             serialize_responses_body_for_provider_prefix(&legacy)
@@ -19404,185 +20252,314 @@ mod tests {
     }
 
     #[test]
-    fn response_session_delta_accepts_normalized_equivalent_prefix() {
-        let previous = json!([
-            {
-                "id": "msg_dynamic_old",
+    fn managed_response_session_delta_requires_exact_output_lineage() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp-parent".to_string(),
+            input: json!([{
                 "type": "message",
+                "role": "user",
+                "content": "inspect the project"
+            }]),
+            output_items: vec![json!({
+                "type": "function_call",
+                "id": "fc-1",
                 "status": "completed",
-                "role": "user",
-                "content": [{ "type": "text", "text": "one" }],
-                "metadata": { "trace": "old" }
+                "call_id": "call-1",
+                "name": "shell",
+                "arguments": "{\"command\":\"build\"}",
+                "vendor": {"kept": true}
+            })],
+            finished_at: Instant::now(),
+        };
+        let current = json!([{
+            "type": "message",
+            "role": "user",
+            "content": "inspect the project"
+        }, {
+            "type": "function_call",
+            "id": "fc-1",
+            "status": "completed",
+            "call_id": "call-1",
+            "name": "shell",
+            "arguments": "{\"command\":\"build\"}",
+            "vendor": {"kept": true}
+        }, {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": {
+                "stdout": "compiled",
+                "stderr": "warning",
+                "exit_code": 0,
+                "file": "fn main() {}"
             },
-            {
-                "id": "call_dynamic_old",
-                "type": "function_call",
-                "call_id": "call_old",
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\",\"limit\":20}"
-            },
-            {
-                "id": "out_dynamic_old",
-                "type": "function_call_output",
-                "call_id": "call_old",
-                "output": "{\"ok\":true,\"lines\":2}"
-            }
-        ]);
-        let current = json!([
-            {
-                "id": "msg_dynamic_new",
-                "type": "message",
-                "status": "in_progress",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": "one" }],
-                "metadata": { "trace": "new" }
-            },
-            {
-                "id": "call_dynamic_new",
-                "type": "function_call",
-                "call_id": "call_new",
-                "name": "read_file",
-                "arguments": "{\"limit\":20,\"path\":\"README.md\"}"
-            },
-            {
-                "id": "out_dynamic_new",
-                "type": "function_call_output",
-                "call_id": "call_new",
-                "output": "{\"lines\":2,\"ok\":true}"
-            },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
+            "vendor_output": {"unknown": null}
+        }, {
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }]);
 
         assert_eq!(
-            appended_response_input_delta(&previous, &current),
-            Some(json!([{ "type": "message", "role": "user", "content": "continue" }]))
-        );
-    }
-
-    #[test]
-    fn response_session_delta_skips_model_outputs_already_covered_by_previous_response() {
-        let previous = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "message", "role": "assistant", "content": "thinking done" },
-            {
-                "type": "function_call",
-                "call_id": "call_123",
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            },
-            {
+            appended_response_input_delta_for_session(&session, &current),
+            Some(json!([{
                 "type": "function_call_output",
-                "call_id": "call_123",
-                "output": "{\"ok\":true}"
-            }
-        ]);
-        let current = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "message", "role": "assistant", "content": "thinking done" },
-            {
-                "type": "function_call",
-                "call_id": "call_123",
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call_123",
-                "output": "{\"ok\":true}"
-            },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
-
-        assert_eq!(
-            appended_response_input_delta(&previous, &current),
-            Some(json!([{ "type": "message", "role": "user", "content": "continue" }]))
-        );
-    }
-
-    #[test]
-    fn response_session_delta_keeps_new_tool_outputs_after_model_call() {
-        let previous = json!([
-            { "type": "message", "role": "user", "content": "one" }
-        ]);
-        let current = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "reasoning", "summary": [] },
-            {
-                "type": "function_call",
-                "call_id": "call_123",
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            },
-            {
-                "type": "function_call_output",
-                "call_id": "call_123",
-                "output": "{\"ok\":true}"
-            },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
-
-        assert_eq!(
-            appended_response_input_delta(&previous, &current),
-            Some(json!([
-                {
-                    "type": "function_call_output",
-                    "call_id": "call_123",
-                    "output": "{\"ok\":true}"
+                "call_id": "call-1",
+                "output": {
+                    "stdout": "compiled",
+                    "stderr": "warning",
+                    "exit_code": 0,
+                    "file": "fn main() {}"
                 },
-                { "type": "message", "role": "user", "content": "continue" }
-            ]))
+                "vendor_output": {"unknown": null}
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "continue"
+            }]))
         );
     }
 
     #[test]
-    fn response_session_delta_does_not_send_model_output_only_tail() {
-        let previous = json!([
-            { "type": "message", "role": "user", "content": "one" }
-        ]);
-        let current = json!([
-            { "type": "message", "role": "user", "content": "one" },
-            { "type": "reasoning", "summary": [] },
-            {
+    fn managed_response_session_delta_rejects_changed_or_missing_lineage() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp-parent".to_string(),
+            input: json!([{"type":"message","role":"user","content":"anchor"}]),
+            output_items: vec![json!({
                 "type": "function_call",
-                "call_id": "call_123",
+                "id": "fc-1",
+                "status": "completed",
+                "call_id": "call-1",
                 "name": "read_file",
                 "arguments": "{\"path\":\"README.md\"}"
-            }
+            })],
+            finished_at: Instant::now(),
+        };
+        let changed_call = json!([
+            {"type":"message","role":"user","content":"anchor"},
+            {
+                "type":"function_call",
+                "id":"fc-1",
+                "status":"completed",
+                "call_id":"call-changed",
+                "name":"read_file",
+                "arguments":"{\"path\":\"README.md\"}"
+            },
+            {"type":"function_call_output","call_id":"call-changed","output":"secret file"}
         ]);
+        assert_eq!(
+            appended_response_input_delta_for_session(&session, &changed_call),
+            None
+        );
 
-        assert_eq!(appended_response_input_delta(&previous, &current), None);
+        let missing_output_lineage = ResponseSessionState {
+            output_items: Vec::new(),
+            ..session
+        };
+        let plain_append = json!([
+            {"type":"message","role":"user","content":"anchor"},
+            {"type":"message","role":"user","content":"continue"}
+        ]);
+        assert_eq!(
+            appended_response_input_delta_for_session(&missing_output_lineage, &plain_append),
+            None
+        );
     }
 
     #[test]
-    fn response_session_delta_rejects_same_message_user_text_tail_by_default() {
-        let previous = json!([
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": "inspect cache logs" }]
-            }
-        ]);
-        let current = json!([
-            {
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": "inspect cache logs and summarize new gaps" }]
-            }
-        ]);
+    fn managed_response_session_delta_requires_ordered_single_use_call_outputs() {
+        let input = json!([{"type":"message","role":"user","content":"anchor"}]);
+        let output_items = vec![
+            json!({
+                "type": "function_call",
+                "id": "fc-1",
+                "status": "completed",
+                "call_id": "call-1",
+                "name": "first",
+                "arguments": "{}"
+            }),
+            json!({
+                "type": "function_call",
+                "id": "fc-2",
+                "status": "completed",
+                "call_id": "call-2",
+                "name": "second",
+                "arguments": "{}"
+            }),
+        ];
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp-parent".to_string(),
+            input: input.clone(),
+            output_items: output_items.clone(),
+            finished_at: Instant::now(),
+        };
+        let current = |delta: Vec<Value>| {
+            let mut items = input.as_array().unwrap().clone();
+            items.extend(output_items.clone());
+            items.extend(delta);
+            Value::Array(items)
+        };
+        let output_1 = json!({
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "one"
+        });
+        let output_2 = json!({
+            "type": "function_call_output",
+            "call_id": "call-2",
+            "output": "two"
+        });
+        let user = json!({"type":"message","role":"user","content":"continue"});
 
-        assert_eq!(appended_response_input_delta(&previous, &current), None);
+        assert!(appended_response_input_delta_for_session(
+            &session,
+            &current(vec![output_1.clone(), output_2.clone(), user.clone()])
+        )
+        .is_some());
+        assert!(appended_response_input_delta_for_session(
+            &session,
+            &current(vec![output_2.clone(), output_1.clone(), user.clone()])
+        )
+        .is_none());
+        assert!(appended_response_input_delta_for_session(
+            &session,
+            &current(vec![output_1.clone(), user.clone()])
+        )
+        .is_none());
+        assert!(appended_response_input_delta_for_session(
+            &session,
+            &current(vec![
+                output_1.clone(),
+                output_1.clone(),
+                output_2.clone(),
+                user.clone()
+            ])
+        )
+        .is_none());
+        assert!(appended_response_input_delta_for_session(
+            &session,
+            &current(vec![user, output_1, output_2])
+        )
+        .is_none());
+
+        let missing_call_id = ResponseSessionState {
+            output_items: vec![json!({
+                "type": "function_call",
+                "id": "fc-only-id",
+                "status": "completed",
+                "name": "unsafe",
+                "arguments": "{}"
+            })],
+            ..session
+        };
+        let mut unsafe_current = input.as_array().unwrap().clone();
+        unsafe_current.extend(missing_call_id.output_items.clone());
+        unsafe_current.push(json!({"type":"message","role":"user","content":"continue"}));
+        assert!(appended_response_input_delta_for_session(
+            &missing_call_id,
+            &Value::Array(unsafe_current)
+        )
+        .is_none());
     }
 
     #[test]
-    fn response_session_delta_rejects_changed_user_text_tail() {
-        let previous = json!([
-            { "type": "message", "role": "user", "content": "inspect cache logs" }
-        ]);
-        let changed = json!([
-            { "type": "message", "role": "user", "content": "summarize cache logs" }
-        ]);
+    fn verified_native_delta_matches_full_replay_for_fifty_paired_fixtures() {
+        for index in 0..50 {
+            let call_id = format!("call-{index}");
+            let previous_input = json!([{
+                "type": "message",
+                "role": "developer",
+                "content": format!("stable-{index}-").repeat(6_000)
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": format!("inspect fixture {index}")
+            }]);
+            let output_items = vec![
+                json!({
+                    "type": "reasoning",
+                    "id": format!("rs-{index}"),
+                    "summary": []
+                }),
+                json!({
+                    "type": "function_call",
+                    "id": format!("fc-{index}"),
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": "read_fixture",
+                    "arguments": serde_json::to_string(&json!({"index": index})).unwrap()
+                }),
+            ];
+            let new_items = vec![
+                json!({
+                    "type": "function_call_output",
+                    "call_id": format!("call-{index}"),
+                    "output": {
+                        "stdout": format!("ok-{index}"),
+                        "stderr": "",
+                        "exit_code": 0,
+                        "unicode": "完整🙂"
+                    }
+                }),
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": format!("continue fixture {index}")
+                }),
+            ];
+            let session = ResponseSessionState {
+                generation: index + 1,
+                parent_generation: None,
+                response_id: format!("resp-{index}"),
+                input: previous_input.clone(),
+                output_items: output_items.clone(),
+                finished_at: Instant::now(),
+            };
+            let mut full_input = previous_input.as_array().unwrap().clone();
+            full_input.extend(output_items);
+            full_input.extend(new_items.clone());
+            let full_input = Value::Array(full_input);
+            let delta_input = appended_response_input_delta_for_session(&session, &full_input)
+                .expect("the exact paired fixture must produce a safe delta");
+            assert_eq!(delta_input, Value::Array(new_items));
 
-        assert_eq!(appended_response_input_delta(&previous, &changed), None);
+            let mut reconstructed = session.input.as_array().unwrap().clone();
+            reconstructed.extend(session.output_items.clone());
+            reconstructed.extend(delta_input.as_array().unwrap().clone());
+            assert_eq!(Value::Array(reconstructed), full_input);
+
+            let full_request = json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "store": true,
+                "input": full_input
+            });
+            let delta_request = build_response_session_delta_body(
+                &full_request,
+                delta_input,
+                &session.response_id,
+                "gpt-5.5",
+            )
+            .unwrap();
+            let full_bytes = serialized_body_len(&Channel::Responses, &full_request);
+            let prepared = response_session_delta_benefit(
+                &full_request,
+                &delta_request,
+                full_bytes,
+                &TailInputDiagnostics::default(),
+            )
+            .expect("each paired fixture must clear the 20% and 32 KiB wire gate");
+            assert!(prepared.body_sizes.saved_bytes() >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES);
+            assert!(prepared
+                .body_sizes
+                .saved_ratio()
+                .is_some_and(|ratio| ratio >= 0.20));
+        }
     }
 
     #[test]
@@ -19717,33 +20694,6 @@ mod tests {
         assert_ne!(canonical_scope, changed_scope);
     }
 
-    #[test]
-    fn response_session_fallback_finds_strict_essential_prefix() {
-        let current = json!([
-            { "type": "message", "role": "user", "content": "anchor" },
-            { "type": "message", "role": "assistant", "content": "covered" },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "old-key".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_old".to_string(),
-                scope_key: Some("scope-a".to_string()),
-                input: json!([
-                    { "type": "message", "role": "user", "content": "anchor" },
-                    { "type": "message", "role": "assistant", "content": "covered" }
-                ]),
-                finished_at: Instant::now(),
-            }),
-        );
-
-        let fallback =
-            fallback_response_session(&sessions, "new-key", Some("scope-a"), &current).unwrap();
-
-        assert_eq!(fallback.response_id, "resp_old");
-    }
-
     #[tokio::test]
     async fn response_session_reuse_allows_safe_streaming_main_delta() {
         let config = AppConfig::default();
@@ -19774,34 +20724,36 @@ mod tests {
         ));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state.response_sessions.lock().await.insert(
-            "session-a".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_old".to_string(),
-                scope_key: Some("scope-a".to_string()),
-                input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
-                finished_at: Instant::now(),
-            }),
-        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "session-a",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_old".to_string(),
+                    input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
+                    output_items: vec![json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "covered"
+                    })],
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
         let request = json!({
             "model": "gpt-5.5",
             "stream": true,
             "input": [
                 { "type": "message", "role": "user", "content": "anchor" },
+                { "type": "message", "role": "assistant", "content": "covered" },
                 { "type": "message", "role": "user", "content": "continue" }
             ]
         });
 
-        let outcome = maybe_reuse_response_session(
-            &state,
-            &request,
-            Some("session-a"),
-            Some("scope-a"),
-            &decision,
-            true,
-            false,
-        )
-        .await;
+        let lease = state.continuation_lineage.begin("session-a").await;
+        let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
         let optimized = outcome.body;
 
         assert_eq!(optimized["previous_response_id"], "resp_old");
@@ -19846,15 +20798,20 @@ mod tests {
         ));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state.response_sessions.lock().await.insert(
-            "sibling-key".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_sibling".to_string(),
-                scope_key: Some("scope-a".to_string()),
-                input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
-                finished_at: Instant::now(),
-            }),
-        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "sibling-key",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_sibling".to_string(),
+                    input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
         let request = json!({
             "model": "gpt-5.5",
             "stream": true,
@@ -19864,23 +20821,15 @@ mod tests {
             ]
         });
 
-        let outcome = maybe_reuse_response_session(
-            &state,
-            &request,
-            Some("current-key"),
-            Some("scope-a"),
-            &decision,
-            true,
-            false,
-        )
-        .await;
+        let lease = state.continuation_lineage.begin("current-key").await;
+        let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
 
         assert_eq!(outcome.body, request);
         assert_eq!(outcome.diagnostics.candidate_count, 0);
-        assert_eq!(outcome.diagnostics.scope_match_count, 1);
+        assert_eq!(outcome.diagnostics.scope_match_count, 0);
         assert_eq!(
             outcome.diagnostics.skip_reason.as_deref(),
-            Some("no_append_prefix_candidate")
+            Some("no_candidate")
         );
         fs::remove_dir_all(dir).ok();
     }
@@ -19908,7 +20857,7 @@ mod tests {
             "model": "gpt-5.5",
             "stream": true,
             "input": [
-                { "type": "message", "role": "user", "content": "anchor ".repeat(3000) },
+                { "type": "message", "role": "user", "content": "anchor ".repeat(20_000) },
                 { "type": "message", "role": "user", "content": "tiny" }
             ]
         });
@@ -19946,6 +20895,45 @@ mod tests {
             prepared_delta.body_sizes.delta_body_bytes,
             prepared_delta.wire_draft.len() as u64
         );
+        assert!(
+            prepared_delta
+                .body_sizes
+                .original_body_bytes
+                .saturating_sub(prepared_delta.body_sizes.delta_body_bytes)
+                >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES
+        );
+        assert!(
+            prepared_delta.body_sizes.delta_body_bytes.saturating_mul(5)
+                <= prepared_delta
+                    .body_sizes
+                    .original_body_bytes
+                    .saturating_mul(4)
+        );
+
+        let relative_only_original = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "x".repeat(220_000)
+            }]
+        });
+        let relative_only_delta = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "previous_response_id": "resp_old",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": "y".repeat(185_000)
+            }]
+        });
+        assert!(!response_session_delta_is_beneficial(
+            &relative_only_original,
+            &relative_only_delta,
+            &TailInputDiagnostics::default()
+        ));
     }
 
     #[test]
@@ -19990,10 +20978,30 @@ mod tests {
             source: Some("scope-sibling".to_string()),
             ..SessionAnchorDiagnostics::default()
         };
+        let capability = test_session_reuse_capability(&decision, "key", None);
+
+        assert!(!should_attempt_main_response_session_delta(
+            &config,
+            &decision,
+            Some(&capability),
+            true,
+            &request,
+            &TailInputDiagnostics::default(),
+            &exact_anchor,
+        ));
+        config.record_response_session_reuse_probe(
+            &decision.provider.id,
+            &decision.model,
+            Some(capability.clone()),
+            ProviderResponseSessionReuseStatus::Verified,
+            true,
+            None,
+        );
 
         assert!(should_attempt_main_response_session_delta(
             &config,
             &decision,
+            Some(&capability),
             true,
             &request,
             &TailInputDiagnostics::default(),
@@ -20002,6 +21010,7 @@ mod tests {
         assert!(!should_attempt_main_response_session_delta(
             &config,
             &decision,
+            Some(&capability),
             true,
             &request,
             &TailInputDiagnostics::default(),
@@ -20010,6 +21019,7 @@ mod tests {
         assert!(!should_attempt_main_response_session_delta(
             &config,
             &decision,
+            Some(&capability),
             false,
             &request,
             &TailInputDiagnostics::default(),
@@ -20022,9 +21032,12 @@ mod tests {
             },
             ..decision.clone()
         };
+        let third_party_capability =
+            test_session_reuse_capability(&third_party_decision, "key", None);
         assert!(!should_attempt_main_response_session_delta(
             &config,
             &third_party_decision,
+            Some(&third_party_capability),
             true,
             &request,
             &TailInputDiagnostics::default(),
@@ -20034,6 +21047,7 @@ mod tests {
             main_response_session_delta_skip_reason(
                 &config,
                 &third_party_decision,
+                Some(&third_party_capability),
                 true,
                 &request,
                 &TailInputDiagnostics::default(),
@@ -20045,16 +21059,18 @@ mod tests {
             main_response_session_delta_skip_reason(
                 &config,
                 &decision,
+                Some(&capability),
                 true,
                 &request,
                 &TailInputDiagnostics::default(),
                 &sibling_anchor,
             ),
-            Some("session_anchor_scope_sibling")
+            Some("session_anchor_not_exact")
         );
         let evaluation = evaluate_main_response_session_delta(
             &config,
             &decision,
+            Some(&capability),
             true,
             &request,
             &TailInputDiagnostics::default(),
@@ -20075,94 +21091,6 @@ mod tests {
         assert!(main_response_session_delta_enabled_for_agent(None));
         assert!(main_response_session_delta_enabled_for_agent(Some("zcode")));
         assert!(main_response_session_delta_enabled_for_agent(Some("codex")));
-    }
-
-    #[test]
-    fn response_session_fallback_rejects_changed_essential_prefix() {
-        let current = json!([
-            { "type": "message", "role": "user", "content": "changed" },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "old-key".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_old".to_string(),
-                scope_key: Some("scope-a".to_string()),
-                input: json!([
-                    { "type": "message", "role": "user", "content": "anchor" }
-                ]),
-                finished_at: Instant::now(),
-            }),
-        );
-
-        assert!(
-            fallback_response_session(&sessions, "new-key", Some("scope-a"), &current).is_none()
-        );
-    }
-
-    #[test]
-    fn response_session_fallback_rejects_different_skill_scope() {
-        let current = json!([
-            { "type": "message", "role": "user", "content": "anchor" },
-            { "type": "message", "role": "user", "content": "continue" }
-        ]);
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "old-key".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_without_skill".to_string(),
-                scope_key: Some("scope-without-skill".to_string()),
-                input: json!([
-                    { "type": "message", "role": "user", "content": "anchor" }
-                ]),
-                finished_at: Instant::now(),
-            }),
-        );
-
-        assert!(fallback_response_session(
-            &sessions,
-            "new-key",
-            Some("scope-with-skill"),
-            &current
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn response_session_fallback_ranks_longer_matching_candidate() {
-        let current = json!([
-            { "type": "message", "role": "user", "content": "a" },
-            { "type": "message", "role": "assistant", "content": "b" },
-            { "type": "message", "role": "user", "content": "c" },
-            { "type": "message", "role": "user", "content": "fresh" }
-        ]);
-        let mut sessions = HashMap::new();
-        sessions.insert(
-            "short".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_short".to_string(),
-                input: json!([{ "type": "message", "role": "user", "content": "a" }]),
-                scope_key: Some("scope-a".to_string()),
-                finished_at: Instant::now(),
-            }),
-        );
-        sessions.insert(
-            "long".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_long".to_string(),
-                input: json!([
-                    { "type": "message", "role": "user", "content": "a" },
-                    { "type": "message", "role": "assistant", "content": "b" },
-                    { "type": "message", "role": "user", "content": "c" }
-                ]),
-                scope_key: Some("scope-a".to_string()),
-                finished_at: Instant::now(),
-            }),
-        );
-
-        let ranked = fallback_response_sessions(&sessions, "missing", Some("scope-a"), &current);
-        assert_eq!(ranked.first().unwrap().response_id, "resp_long");
     }
 
     #[test]
@@ -20498,12 +21426,266 @@ mod tests {
         ]);
 
         assert!(!should_replace_response_session(&longer, &shorter));
-        assert!(!should_replace_response_session(
+        assert!(should_replace_response_session(
             &shorter,
             &model_output_only_longer
         ));
         assert!(should_replace_response_session(&shorter, &longer));
         assert!(should_replace_response_session(&longer, &different));
+    }
+
+    #[tokio::test]
+    async fn external_previous_response_id_never_mutates_local_lineage() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-external-continuation-lineage-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-local".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"local"}]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let lease = state.continuation_lineage.begin("thread").await;
+        let external_input = json!([{"type":"message","role":"user","content":"external"}]);
+
+        assert_eq!(
+            update_response_session_with_id(
+                &state,
+                Some(&lease),
+                &LineageParent::ExternalContinuation,
+                Some(&external_input),
+                Some("resp-external".to_string()),
+                Vec::new(),
+            )
+            .await,
+            Some(LineageCommitOutcome::ExternalContinuation)
+        );
+        let head = state.continuation_lineage.head("thread").await.unwrap();
+        assert_eq!(head.response_id, "resp-local");
+        assert_eq!(head.generation, 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn successful_native_response_without_id_tombstones_old_head() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-missing-response-id-lineage-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-old".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"old"}]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let lease = state.continuation_lineage.begin("thread").await;
+        let next_input = json!([{"type":"message","role":"user","content":"next"}]);
+
+        assert_eq!(
+            update_response_session_with_id(
+                &state,
+                Some(&lease),
+                &LineageParent::FullReplay,
+                Some(&next_input),
+                None,
+                Vec::new(),
+            )
+            .await,
+            Some(LineageCommitOutcome::Tombstoned { generation: 2 })
+        );
+        assert!(!state.continuation_lineage.contains_head("thread").await);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_stale_failure_cannot_clear_a_newer_proxy_success() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-late-session-failure-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-root".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"root"}]),
+                    output_items: vec![json!({
+                        "type":"message",
+                        "role":"assistant",
+                        "content":"done"
+                    })],
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let stale_failure = state.continuation_lineage.begin("thread").await;
+        let winner = state.continuation_lineage.begin("thread").await;
+        let parent = LineageParent::Managed {
+            generation: 1,
+            response_id: "resp-root".to_string(),
+        };
+        let winner_input = json!([
+            {"type":"message","role":"user","content":"root"},
+            {"type":"message","role":"assistant","content":"done"},
+            {"type":"message","role":"user","content":"next"}
+        ]);
+        let (release_winner, wait_winner) = tokio::sync::oneshot::channel::<()>();
+        let winner_state = state.clone();
+        let winner_task = tokio::spawn(async move {
+            let _ = wait_winner.await;
+            update_response_session_with_id(
+                &winner_state,
+                Some(&winner),
+                &parent,
+                Some(&winner_input),
+                Some("resp-winner".to_string()),
+                Vec::new(),
+            )
+            .await
+        });
+
+        release_winner.send(()).unwrap();
+        assert_eq!(
+            winner_task.await.unwrap(),
+            Some(LineageCommitOutcome::Applied { generation: 2 })
+        );
+        assert_eq!(
+            clear_response_session_reference(&state, Some(&stale_failure), Some("resp-root")).await,
+            Some(LineageInvalidateOutcome::Stale {
+                expected: 1,
+                actual: 2,
+            })
+        );
+        assert_eq!(
+            state
+                .continuation_lineage
+                .head("thread")
+                .await
+                .unwrap()
+                .response_id,
+            "resp-winner"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_compaction_never_clears_newer_lineage_or_prefix_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-stale-compaction-cleanup-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-root".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"root"}]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let stale_compaction = state
+            .continuation_lineage
+            .begin_compaction("thread", Some("resp-root"))
+            .await
+            .into_lease();
+        let newer_epoch = state
+            .continuation_lineage
+            .begin_compaction("thread", None)
+            .await
+            .into_lease();
+        let newer_input = json!([{"type":"message","role":"user","content":"new epoch"}]);
+        assert_eq!(
+            update_response_session_with_id(
+                &state,
+                Some(&newer_epoch),
+                &LineageParent::FullReplay,
+                Some(&newer_input),
+                Some("resp-new".to_string()),
+                Vec::new(),
+            )
+            .await,
+            Some(LineageCommitOutcome::Applied { generation: 4 })
+        );
+        let prefix_key = "new-prefix".to_string();
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(prefix_key.clone(), prefix_state(100_000, 99_000, 1_000));
+
+        assert!(
+            !finalize_confirmed_responses_compaction(
+                &state,
+                Some(&stale_compaction),
+                true,
+                Some(&prefix_key),
+                None,
+                None,
+            )
+            .await
+        );
+        assert!(state.prefix_states.lock().await.contains_key(&prefix_key));
+        assert_eq!(
+            state
+                .continuation_lineage
+                .head("thread")
+                .await
+                .unwrap()
+                .response_id,
+            "resp-new"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -21115,6 +22297,60 @@ mod tests {
             request.pointer("/input/0/call_id").and_then(Value::as_str),
             Some("call_from_previous_response")
         );
+    }
+
+    #[test]
+    fn native_responses_cache_overlay_preserves_lossless_context_fields() {
+        let config = AppConfig::default();
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://example.test/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let mut outbound = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "client-cache-key",
+            "metadata": {"trace": "must-survive"},
+            "vendor_extension": {"unknown": true, "nullable": null},
+            "input": [{
+                "type": "function_call",
+                "id": "fc-original",
+                "status": "completed",
+                "call_id": "call-original",
+                "tool_call_id": "tool-original",
+                "name": "shell",
+                "arguments": "{\"command\":\"build\"}"
+            }, {
+                "type": "function_call_output",
+                "call_id": "call-original",
+                "output": {
+                    "stdout": "ok\nline2",
+                    "stderr": "warning",
+                    "exit_code": 0,
+                    "file": "fn main() {}"
+                }
+            }]
+        });
+        let original_context = outbound.clone();
+        let prefix_body = json!({
+            "prompt_cache_key": "atoapi-cache-key",
+            "prompt_cache_retention": "24h"
+        });
+
+        copy_responses_prefix_cache_fields_for_native(
+            &mut outbound,
+            &prefix_body,
+            &config,
+            &decision,
+        );
+
+        assert_eq!(outbound["metadata"], original_context["metadata"]);
+        assert_eq!(
+            outbound["vendor_extension"],
+            original_context["vendor_extension"]
+        );
+        assert_eq!(outbound["input"], original_context["input"]);
+        assert_eq!(outbound["prompt_cache_key"], "atoapi-cache-key");
     }
 
     #[test]
@@ -23567,7 +24803,11 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let response_sessions_guard = state.response_sessions.lock().await;
+        let response_session_lease = state
+            .continuation_lineage
+            .begin("normal-response-session")
+            .await;
+        let response_sessions_guard = state.continuation_lineage.hold_mutations_for_test().await;
         let response = stream_upstream(
             state.clone(),
             upstream,
@@ -23595,12 +24835,14 @@ mod tests {
             None,
             None,
             Some("normal-response-session".to_string()),
-            None,
             Some(json!([{
                 "type": "message",
                 "role": "user",
                 "content": "hello"
             }])),
+            Some(response_session_lease),
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -23707,15 +24949,25 @@ mod tests {
             (prefix_key.clone(), prefix_state(310_000, 300_000, 10_000)),
             (family_key.clone(), prefix_state(310_000, 300_000, 10_000)),
         ]);
-        state.response_sessions.lock().await.insert(
-            session_key.clone(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_before_compaction".to_string(),
-                input: json!([{"type":"message","role":"user","content":"old history"}]),
-                scope_key: Some("compaction-scope".to_string()),
-                finished_at: Instant::now(),
-            }),
-        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                &session_key,
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_before_compaction".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"old history"}]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let response_session_lease = state
+            .continuation_lineage
+            .begin_compaction(&session_key, Some("resp_before_compaction"))
+            .await
+            .into_lease();
         let shadow_identity = affinity_identity::AffinityIdentity {
             realm_id: "compaction-realm".to_string(),
             cohort_id: "compaction-cohort".to_string(),
@@ -23807,11 +25059,13 @@ mod tests {
             None,
             AppConfig::default(),
             None,
-            Some(prefix_key.clone()),
             None,
+            Some(prefix_key.clone()),
             Some(session_key.clone()),
-            Some("compaction-scope".to_string()),
             Some(compaction_input.clone()),
+            Some(response_session_lease),
+            LineageParent::FullReplay,
+            true,
             false,
             false,
             compaction_diagnostics,
@@ -23850,11 +25104,7 @@ mod tests {
         assert!(!prefix_states.contains_key(&prefix_key));
         assert!(!prefix_states.contains_key(&family_key));
         drop(prefix_states);
-        assert!(!state
-            .response_sessions
-            .lock()
-            .await
-            .contains_key(&session_key));
+        assert!(!state.continuation_lineage.contains_head(&session_key).await);
         let shadow_affinity = state.shadow_affinity.lock().await;
         let assignment = shadow_affinity
             .assignments
@@ -23984,12 +25234,14 @@ mod tests {
             None,
             None,
             AppConfig::default(),
+            None,
             guard,
             prefix_key.clone(),
             None,
             None,
             None,
-            None,
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -24119,6 +25371,8 @@ mod tests {
             None,
             None,
             None,
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -24371,6 +25625,8 @@ mod tests {
             None,
             None,
             None,
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -26289,6 +27545,8 @@ mod tests {
             None,
             None,
             None,
+            LineageParent::FullReplay,
+            false,
             false,
             false,
             BodyDiagnostics::default(),
@@ -27710,7 +28968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_new_anchor_scope_sibling_tail_diagnostics_use_delta_only() {
+    async fn responses_new_anchor_does_not_inherit_scope_sibling_tail() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-scope-sibling-tail-diagnostics-{}",
@@ -27718,36 +28976,38 @@ mod tests {
         ));
         let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
         let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state.response_sessions.lock().await.insert(
-            "old-anchor".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_old".to_string(),
-                input: json!([
-                    { "type": "message", "role": "user", "content": "anchor" },
-                    { "type": "message", "role": "assistant", "content": "covered" }
-                ]),
-                scope_key: Some("scope-a".to_string()),
-                finished_at: Instant::now(),
-            }),
-        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "old-anchor",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_old".to_string(),
+                    input: json!([
+                        { "type": "message", "role": "user", "content": "anchor" },
+                        { "type": "message", "role": "assistant", "content": "covered" }
+                    ]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
         let current_input = json!([
             { "type": "message", "role": "user", "content": "anchor" },
             { "type": "message", "role": "assistant", "content": "covered" },
             { "type": "message", "role": "user", "content": "continue" }
         ]);
 
+        let lease = state.continuation_lineage.begin("new-anchor").await;
         let diagnostics = tail_input_diagnostics_for_session(
-            &state,
             &Channel::Responses,
-            Some("new-anchor"),
-            Some("scope-a"),
+            Some(&lease),
             Some(&current_input),
-        )
-        .await;
+        );
 
-        assert!(diagnostics.delta_from_session);
-        assert_eq!(diagnostics.input_items, 1);
-        assert_eq!(diagnostics.message_chars, "continue".chars().count() as u64);
+        assert!(!diagnostics.delta_from_session);
+        assert_eq!(diagnostics.input_items, 3);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -29898,7 +31158,7 @@ mod tests {
     }
 
     #[test]
-    fn response_session_reuse_is_enabled_for_prefix_max_hit_mode() {
+    fn response_session_reuse_follows_smart_hit_instead_of_prewarm() {
         let mut config = AppConfig::default();
         config.cache.mode = CacheMode::PrefixPrewarm;
         config.cache.enabled = true;
@@ -29910,6 +31170,9 @@ mod tests {
         assert!(responses_session_reuse_enabled(&config));
 
         config.cache.prewarm_enabled = false;
+        assert!(responses_session_reuse_enabled(&config));
+
+        config.cache.enabled = false;
         assert!(!responses_session_reuse_enabled(&config));
     }
 
@@ -30196,22 +31459,14 @@ mod tests {
     }
 
     #[test]
-    fn response_session_rejections_defer_full_body_to_next_inbound() {
-        for status in [400, 404, 409, 410, 422] {
-            assert!(
-                should_defer_response_session_rejection_to_next_inbound(status, true),
-                "status {status} should clear the session so the next inbound uses its full body"
+    fn response_session_rejection_never_uses_status_alone_as_lineage_evidence() {
+        for status in [400, 404, 409, 410, 422, 502, 503] {
+            assert_eq!(
+                response_session_rejection_classification(status, "ordinary upstream error"),
+                ResponseSessionRejectionClass::TransientInvalid,
+                "status {status} without previous_response_id evidence must preserve lineage"
             );
         }
-        for status in [401, 403, 408, 429, 502, 503] {
-            assert!(
-                !should_defer_response_session_rejection_to_next_inbound(status, true),
-                "status {status} is not an explicit session-reference rejection"
-            );
-        }
-        assert!(!should_defer_response_session_rejection_to_next_inbound(
-            400, false
-        ));
     }
 
     #[test]
@@ -30327,7 +31582,8 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
-        let key = response_session_error_cooldown_key(&responses);
+        let capability = test_session_reuse_capability(&responses, "key", None);
+        let key = response_session_error_cooldown_key(&responses, Some(&capability));
         assert!(key.is_some());
         assert!(!response_session_cooldown_active(&state, key.as_deref()).await);
         note_response_session_error_cooldown(&state, key.as_deref()).await;
@@ -30355,7 +31611,7 @@ mod tests {
             upstream_channel: Channel::Chat,
             model: "gpt-5.5".to_string(),
         };
-        assert!(response_session_error_cooldown_key(&chat).is_none());
+        assert!(response_session_error_cooldown_key(&chat, Some(&capability)).is_none());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -30422,70 +31678,294 @@ mod tests {
     #[tokio::test]
     async fn response_session_reuse_probe_requires_usage_and_cached_token_evidence() {
         let hits = Arc::new(AtomicUsize::new(0));
+        let compact_hits = Arc::new(AtomicUsize::new(0));
         let include_usage = Arc::new(AtomicBool::new(false));
-        let nonce = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let compact_supported = Arc::new(AtomicBool::new(true));
+        let compact_fidelity_matches = Arc::new(AtomicBool::new(true));
+        let challenge = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let expected_arguments = Arc::new(tokio::sync::Mutex::new(Value::Null));
         let hits_for_route = hits.clone();
+        let compact_hits_for_route = compact_hits.clone();
+        let compact_supported_for_route = compact_supported.clone();
+        let compact_fidelity_matches_for_route = compact_fidelity_matches.clone();
         let include_usage_for_route = include_usage.clone();
-        let nonce_for_route = nonce.clone();
+        let challenge_for_route = challenge.clone();
+        let expected_arguments_for_route = expected_arguments.clone();
+        let expected_arguments_for_compact = expected_arguments.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses",
-            post(move |Json(body): Json<Value>| {
-                let hits = hits_for_route.clone();
-                let include_usage = include_usage_for_route.clone();
-                let nonce = nonce_for_route.clone();
-                async move {
-                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                    if attempt == 0 {
-                        let input = body["input"].as_str().unwrap_or_default();
-                        assert!(input.len() > 8_000);
-                        let token = input
-                            .split("token ")
-                            .nth(1)
-                            .and_then(|value| value.split('.').next())
-                            .unwrap_or_default()
-                            .to_string();
-                        *nonce.lock().await = token;
-                        let mut response = json!({
-                            "id": "resp_probe_seed",
-                            "error": null,
-                            "output": [{
-                                "type": "message",
-                                "content": [{ "type": "output_text", "text": "ACK" }]
-                            }]
-                        });
-                        if include_usage.load(Ordering::SeqCst) {
-                            response["usage"] = json!({
-                                "input_tokens": 2_048,
-                                "output_tokens": 1,
-                                "input_tokens_details": { "cached_tokens": 0 }
-                            });
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let hits = hits_for_route.clone();
+                    let include_usage = include_usage_for_route.clone();
+                    let compact_fidelity_matches = compact_fidelity_matches_for_route.clone();
+                    let challenge = challenge_for_route.clone();
+                    let expected_arguments = expected_arguments_for_route.clone();
+                    async move {
+                        assert_eq!(body["stream"], true);
+                        let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                        let anchor_a =
+                            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+                        let anchor_b =
+                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+                        let anchor_c =
+                            "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35";
+                        let mut response = match attempt {
+                            0 => {
+                                let input = body
+                                    .pointer("/input/0/content/0/text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                assert!(input.len() > 8_000);
+                                assert!(body.get("previous_response_id").is_none());
+                                assert!(body.get("tools").is_none());
+                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_a));
+                                *challenge.lock().await = anchor_a.to_string();
+                                json!({
+                                    "id": "resp_probe_anchor",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "message",
+                                        "id": "msg_probe_anchor",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": anchor_a
+                                        }]
+                                    }]
+                                })
+                            }
+                            1 => {
+                                assert!(body.get("previous_response_id").is_none());
+                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_b));
+                                json!({
+                                    "id": "resp_probe_freshness_decoy",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "message",
+                                        "id": "msg_probe_freshness_decoy",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": anchor_b
+                                        }]
+                                    }]
+                                })
+                            }
+                            2 => {
+                                assert_eq!(body["previous_response_id"], "resp_probe_anchor");
+                                let serialized = serde_json::to_string(&body).unwrap();
+                                assert!(!serialized.contains(anchor_a));
+                                assert!(!serialized.contains("\"call_id\""));
+                                assert_eq!(
+                                    body.pointer("/tool_choice/name").and_then(Value::as_str),
+                                    Some("atoapi_fidelity_probe")
+                                );
+                                json!({
+                                    "id": "resp_probe_seed",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "function_call",
+                                        "id": "fc_probe_seed",
+                                        "status": "completed",
+                                        "call_id": "call_probe_seed",
+                                        "name": "atoapi_fidelity_probe",
+                                        "arguments": serde_json::to_string(&json!({"challenge": anchor_a})).unwrap()
+                                    }]
+                                })
+                            }
+                            3 => {
+                                assert!(body.get("previous_response_id").is_none());
+                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_c));
+                                json!({
+                                    "id": "resp_probe_lineage_decoy",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "message",
+                                        "id": "msg_probe_lineage_decoy",
+                                        "status": "completed",
+                                        "role": "assistant",
+                                        "content": [{
+                                            "type": "output_text",
+                                            "text": anchor_c
+                                        }]
+                                    }]
+                                })
+                            }
+                            4 => {
+                                assert_eq!(body["previous_response_id"], "resp_probe_seed");
+                                assert_eq!(body["input"][0]["type"], "function_call_output");
+                                assert_eq!(body["input"][0]["call_id"], "call_probe_seed");
+                                assert_eq!(
+                                    body.pointer("/tool_choice/name").and_then(Value::as_str),
+                                    Some("atoapi_fidelity_verify")
+                                );
+                                assert!(!serde_json::to_string(&body)
+                                    .unwrap()
+                                    .contains(challenge.lock().await.as_str()));
+                                let tool_output = body["input"][0]["output"].as_str().unwrap();
+                                let mut arguments: Map<String, Value> =
+                                    serde_json::from_str::<Value>(tool_output)
+                                        .unwrap()
+                                        .as_object()
+                                        .unwrap()
+                                        .clone();
+                                arguments.insert(
+                                    "challenge".to_string(),
+                                    Value::String(challenge.lock().await.clone()),
+                                );
+                                arguments.insert(
+                                    "seed_function_call".to_string(),
+                                    json!({
+                                        "id": "fc_probe_seed",
+                                        "status": "completed",
+                                        "call_id": "call_probe_seed",
+                                        "name": "atoapi_fidelity_probe",
+                                        "arguments": serde_json::to_string(&json!({
+                                            "challenge": challenge.lock().await.clone()
+                                        })).unwrap()
+                                    }),
+                                );
+                                let arguments = Value::Object(arguments);
+                                *expected_arguments.lock().await = arguments.clone();
+                                json!({
+                                    "id": "resp_probe_continuation",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "function_call",
+                                        "id": "fc_probe_verify",
+                                        "status": "completed",
+                                        "call_id": "call_probe_verify",
+                                        "name": "atoapi_fidelity_verify",
+                                        "arguments": serde_json::to_string(&arguments).unwrap()
+                                    }]
+                                })
+                            }
+                            5 => {
+                                assert!(body.get("previous_response_id").is_none());
+                                assert_eq!(
+                                    body["input"],
+                                    json!([
+                                        {
+                                            "type": "compaction",
+                                            "encrypted_content": "opaque-probe-compaction"
+                                        },
+                                        response_session_probe_user_message(
+                                            "Read the compacted context and reproduce the private fidelity markers exactly as previously required."
+                                        )
+                                    ])
+                                );
+                                let serialized = serde_json::to_string(&body).unwrap();
+                                assert!(!serialized.contains(challenge.lock().await.as_str()));
+                                assert!(!serialized.contains("resp_probe_seed"));
+                                assert!(!serialized.contains("call_probe_seed"));
+                                let mut arguments = expected_arguments.lock().await.clone();
+                                if !compact_fidelity_matches.load(Ordering::SeqCst) {
+                                    arguments["stdout"] =
+                                        Value::String("tampered-after-compaction".to_string());
+                                }
+                                json!({
+                                    "id": "resp_probe_after_compact",
+                                    "object": "response",
+                                    "status": "completed",
+                                    "error": null,
+                                    "output": [{
+                                        "type": "function_call",
+                                        "id": "fc_probe_after_compact",
+                                        "status": "completed",
+                                        "call_id": "call_probe_after_compact",
+                                        "name": "atoapi_fidelity_verify",
+                                        "arguments": serde_json::to_string(&arguments).unwrap()
+                                    }]
+                                })
+                            }
+                            _ => panic!("unexpected extra Responses probe request"),
+                        };
+                        if include_usage.load(Ordering::SeqCst) && matches!(attempt, 0 | 2 | 4) {
+                            response["usage"] = match attempt {
+                                0 => json!({
+                                    "input_tokens": 2_048,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": { "cached_tokens": 0 }
+                                }),
+                                2 => json!({
+                                    "input_tokens": 2_112,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": { "cached_tokens": 1_920 }
+                                }),
+                                _ => json!({
+                                    "input_tokens": 2_176,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": { "cached_tokens": 2_048 }
+                                }),
+                            };
                         }
-                        Json(response)
-                    } else {
-                        assert_eq!(body["previous_response_id"], "resp_probe_seed");
-                        let token = nonce.lock().await.clone();
-                        let mut response = json!({
-                            "id": "resp_probe_continuation",
-                            "error": null,
-                            "output": [{
-                                "type": "message",
-                                "content": [{ "type": "output_text", "text": token }]
-                            }]
-                        });
-                        if include_usage.load(Ordering::SeqCst) {
-                            response["usage"] = json!({
-                                "input_tokens": 2_112,
-                                "output_tokens": 1,
-                                "input_tokens_details": { "cached_tokens": 1_920 }
-                            });
-                        }
-                        Json(response)
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            response_json_to_sse(
+                                &Channel::Responses,
+                                &serde_json::to_vec(&response).unwrap(),
+                            ),
+                        )
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route(
+                "/v1/responses/compact",
+                post(move |Json(body): Json<Value>| {
+                    let compact_hits = compact_hits_for_route.clone();
+                    let compact_supported = compact_supported_for_route.clone();
+                    let expected_arguments = expected_arguments_for_compact.clone();
+                    async move {
+                        compact_hits.fetch_add(1, Ordering::SeqCst);
+                        if !compact_supported.load(Ordering::SeqCst) {
+                            return raw_response(
+                                404,
+                                "application/json",
+                                serde_json::to_vec(&json!({
+                                    "error": { "message": "responses compact is unsupported" }
+                                }))
+                                .unwrap(),
+                            );
+                        }
+                        assert!(body["input"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| item["type"] == "function_call")
+                                && items
+                                    .iter()
+                                    .any(|item| item["type"] == "function_call_output")
+                        }));
+                        assert!(!expected_arguments.lock().await.is_null());
+                        raw_response(
+                            200,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "id": "cmp_probe",
+                                "object": "response.compaction",
+                                "output": [{
+                                    "type": "compaction",
+                                    "encrypted_content": "opaque-probe-compaction"
+                                }]
+                            }))
+                            .unwrap(),
+                        )
+                    }
+                }),
+            );
         tokio::spawn(async move {
             axum::serve(upstream_listener, upstream_app).await.unwrap();
         });
@@ -30521,10 +32001,13 @@ mod tests {
             serde_json::from_slice(&response_body).unwrap();
         assert_eq!(
             result.status,
-            ProviderResponseSessionReuseStatus::Unverified
+            ProviderResponseSessionReuseStatus::Unverified,
+            "{}",
+            result.message
         );
         assert!(!result.enabled);
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 0);
         assert!(!state
             .config
             .read()
@@ -30533,6 +32016,7 @@ mod tests {
 
         include_usage.store(true, Ordering::SeqCst);
         hits.store(0, Ordering::SeqCst);
+        compact_hits.store(0, Ordering::SeqCst);
         let verified_response = admin_probe_response_session_reuse(
             AxumState(state.clone()),
             admin_probe_request("probe-provider", "gpt-5.5", Some("admin-local-key")),
@@ -30550,21 +32034,114 @@ mod tests {
         );
         assert!(verified.enabled);
         assert!(verified.usage_verified);
-        assert_eq!(verified.first_input_tokens, Some(2_048));
-        assert_eq!(verified.continuation_input_tokens, Some(2_112));
-        assert_eq!(verified.continuation_cached_tokens, Some(1_920));
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert!(state
-            .config
-            .read()
-            .await
-            .response_session_reuse_verified_for("probe-provider", "gpt-5.5"));
+        assert_eq!(verified.first_input_tokens, Some(2_112));
+        assert_eq!(verified.first_cached_tokens, Some(1_920));
+        assert_eq!(verified.continuation_input_tokens, Some(2_176));
+        assert_eq!(verified.continuation_cached_tokens, Some(2_048));
+        assert_eq!(verified.compact_status, Some(200));
+        assert_eq!(verified.compact_continuation_status, Some(200));
+        assert!(verified.compact_fidelity_verified);
+        let capability = verified
+            .capability
+            .as_ref()
+            .expect("a verified streaming probe must return its exact capability scope");
+        assert_eq!(capability.channel, Channel::Responses);
+        assert_eq!(
+            capability.stream_shape,
+            ResponseSessionReuseStreamShape::StreamSse
+        );
+        assert!(capability.endpoint.ends_with("/v1/responses"));
+        assert!(!capability.key_realm_id.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        let config = state.config.read().await;
+        assert!(config.response_session_reuse_verified_for_scope(
+            "probe-provider",
+            "gpt-5.5",
+            capability
+        ));
+        assert!(config
+            .response_session_reuse_for_provider("probe-provider")
+            .into_iter()
+            .find(|record| record.model_id == "gpt-5.5")
+            .is_some_and(|record| record.compact_fidelity_verified));
+        drop(config);
+
+        compact_supported.store(false, Ordering::SeqCst);
+        hits.store(0, Ordering::SeqCst);
+        compact_hits.store(0, Ordering::SeqCst);
+        let unsupported_compact =
+            probe_and_record_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
+                .await
+                .unwrap();
+        assert_eq!(
+            unsupported_compact.status,
+            ProviderResponseSessionReuseStatus::Verified
+        );
+        assert!(unsupported_compact.enabled);
+        assert!(unsupported_compact.usage_verified);
+        assert!(!unsupported_compact.compact_fidelity_verified);
+        assert_eq!(unsupported_compact.compact_status, Some(404));
+        assert_eq!(unsupported_compact.compact_continuation_status, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        let config = state.config.read().await;
+        assert!(config.response_session_reuse_verified_for_scope(
+            "probe-provider",
+            "gpt-5.5",
+            unsupported_compact
+                .capability
+                .as_ref()
+                .expect("direct verification must retain its exact certificate scope")
+        ));
+        let persisted = config
+            .response_session_reuse_for_provider("probe-provider")
+            .into_iter()
+            .find(|record| record.model_id == "gpt-5.5")
+            .expect("direct certificate should remain persisted");
+        assert!(!persisted.compact_fidelity_verified);
+        drop(config);
+
+        compact_supported.store(true, Ordering::SeqCst);
+        compact_fidelity_matches.store(false, Ordering::SeqCst);
+        hits.store(0, Ordering::SeqCst);
+        compact_hits.store(0, Ordering::SeqCst);
+        let mismatched_compact =
+            probe_and_record_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
+                .await
+                .unwrap();
+        assert_eq!(
+            mismatched_compact.status,
+            ProviderResponseSessionReuseStatus::Verified
+        );
+        assert!(mismatched_compact.enabled);
+        assert!(mismatched_compact.usage_verified);
+        assert!(!mismatched_compact.compact_fidelity_verified);
+        assert_eq!(mismatched_compact.compact_status, Some(200));
+        assert_eq!(mismatched_compact.compact_continuation_status, Some(200));
+        assert!(mismatched_compact.message.contains("typed fidelity failed"));
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        let config = state.config.read().await;
+        assert!(config.response_session_reuse_verified_for_scope(
+            "probe-provider",
+            "gpt-5.5",
+            mismatched_compact
+                .capability
+                .as_ref()
+                .expect("typed compact mismatch must retain the direct certificate")
+        ));
+        assert!(config
+            .response_session_reuse_for_provider("probe-provider")
+            .into_iter()
+            .find(|record| record.model_id == "gpt-5.5")
+            .is_some_and(|record| !record.compact_fidelity_verified));
         fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn response_session_probe_usage_rejects_missing_cache_or_context_usage() {
-        let seed = UsageRecord {
+        let anchor = UsageRecord {
             input_tokens: 2_048,
             ..UsageRecord::default()
         };
@@ -30584,9 +32161,266 @@ mod tests {
             ..UsageRecord::default()
         };
 
-        assert!(response_session_probe_usage_error(&seed, &missing_cache).is_some());
-        assert!(response_session_probe_usage_error(&seed, &missing_context).is_some());
-        assert_eq!(response_session_probe_usage_error(&seed, &verified), None);
+        assert!(response_session_probe_plain_delta_usage_error(&anchor, &missing_cache).is_some());
+        assert!(
+            response_session_probe_plain_delta_usage_error(&anchor, &missing_context).is_some()
+        );
+        assert_eq!(
+            response_session_probe_plain_delta_usage_error(&anchor, &verified),
+            None
+        );
+        assert!(response_session_probe_usage_error(&anchor, &missing_cache).is_some());
+        assert!(response_session_probe_usage_error(&anchor, &missing_context).is_some());
+        assert_eq!(response_session_probe_usage_error(&anchor, &verified), None);
+    }
+
+    #[test]
+    fn response_session_probe_requires_completed_sse_shape() {
+        let json_response = ResponseSessionReuseProbeResponse {
+            status: 200,
+            content_type: "application/json".to_string(),
+            bytes: serde_json::to_vec(&json!({
+                "id": "resp-json",
+                "output": []
+            }))
+            .unwrap(),
+        };
+        assert!(!is_successful_response_session_sse_probe(&json_response));
+
+        let incomplete_sse = ResponseSessionReuseProbeResponse {
+            status: 200,
+            content_type: "text/event-stream".to_string(),
+            bytes: b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+                .to_vec(),
+        };
+        assert!(!is_successful_response_session_sse_probe(&incomplete_sse));
+
+        let completed_sse = ResponseSessionReuseProbeResponse {
+            status: 200,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            bytes: b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ok\",\"output\":[]}}\n\n"
+                .to_vec(),
+        };
+        assert!(is_successful_response_session_sse_probe(&completed_sse));
+    }
+
+    #[test]
+    fn response_session_probe_verifier_rejects_any_typed_manifest_mutation() {
+        fn verifier_output(arguments: &Value) -> Vec<Value> {
+            vec![json!({
+                "type": "function_call",
+                "id": "fc_verify",
+                "status": "completed",
+                "call_id": "call_verify",
+                "name": "atoapi_fidelity_verify",
+                "arguments": serde_json::to_string(arguments).unwrap(),
+            })]
+        }
+
+        let payload = build_response_session_fidelity_payload("typed-manifest");
+        let seed_challenge = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let seed_item = json!({
+            "type": "function_call",
+            "id": "fc_seed",
+            "status": "completed",
+            "call_id": "call_seed",
+            "name": "atoapi_fidelity_probe",
+            "arguments": serde_json::to_string(&json!({
+                "challenge": seed_challenge
+            })).unwrap()
+        });
+        let seed_call = response_session_probe_function_call(
+            std::slice::from_ref(&seed_item),
+            "atoapi_fidelity_probe",
+        )
+        .unwrap();
+        let expected = response_session_fidelity_expected_arguments(&seed_call, &payload);
+        assert!(response_session_probe_verifier_matches(
+            &verifier_output(&expected),
+            &expected
+        ));
+
+        let mut mutations = Vec::new();
+        let mut exit_code = expected.clone();
+        exit_code["exit_code"] = json!(0);
+        mutations.push(exit_code);
+
+        let mut merged_streams = expected.clone();
+        merged_streams["stdout"] = expected["stderr"].clone();
+        mutations.push(merged_streams);
+
+        let mut flattened_error = expected.clone();
+        flattened_error["error"] = expected["error"]["message"].clone();
+        mutations.push(flattened_error);
+
+        let mut truncated_long_content = expected.clone();
+        let mut truncated = truncated_long_content["long_content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        truncated.pop();
+        truncated_long_content["long_content"] = Value::String(truncated);
+        mutations.push(truncated_long_content);
+
+        let mut reordered_duplicates = expected.clone();
+        reordered_duplicates["ordered_repeated"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        mutations.push(reordered_duplicates);
+
+        let mut changed_seed_item_id = expected.clone();
+        changed_seed_item_id["seed_function_call"]["id"] = json!("fc_other");
+        mutations.push(changed_seed_item_id);
+
+        let mut changed_seed_arguments = expected.clone();
+        changed_seed_arguments["seed_function_call"]["arguments"] =
+            json!("{\"challenge\":\"different\"}");
+        mutations.push(changed_seed_arguments);
+
+        let mut extra_field = expected.clone();
+        extra_field
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_string(), json!(true));
+        mutations.push(extra_field);
+
+        for mutated in mutations {
+            assert!(!response_session_probe_verifier_matches(
+                &verifier_output(&mutated),
+                &expected
+            ));
+        }
+
+        let mut extra_output = verifier_output(&expected);
+        extra_output.push(json!({
+            "type": "message",
+            "id": "msg_extra",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "extra" }]
+        }));
+        assert!(!response_session_probe_verifier_matches(
+            &extra_output,
+            &expected
+        ));
+    }
+
+    #[test]
+    fn response_session_probe_seed_requires_exact_call_id_and_arguments() {
+        let challenge = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        let exact = json!({
+            "type": "function_call",
+            "id": "fc_seed",
+            "status": "completed",
+            "call_id": "call_seed",
+            "name": "atoapi_fidelity_probe",
+            "arguments": serde_json::to_string(&json!({ "challenge": challenge })).unwrap()
+        });
+        let parsed = response_session_probe_function_call(
+            std::slice::from_ref(&exact),
+            "atoapi_fidelity_probe",
+        )
+        .unwrap();
+        assert_eq!(parsed.call_id, "call_seed");
+        assert_eq!(parsed.challenge, challenge);
+
+        let mut missing_call_id = exact.clone();
+        missing_call_id.as_object_mut().unwrap().remove("call_id");
+        assert!(
+            response_session_probe_function_call(&[missing_call_id], "atoapi_fidelity_probe")
+                .is_err()
+        );
+
+        let mut extra_argument = exact.clone();
+        extra_argument["arguments"] = Value::String(
+            serde_json::to_string(&json!({ "challenge": challenge, "extra": true })).unwrap(),
+        );
+        assert!(
+            response_session_probe_function_call(&[extra_argument], "atoapi_fidelity_probe")
+                .is_err()
+        );
+
+        let mut predictable_challenge = exact.clone();
+        predictable_challenge["arguments"] =
+            Value::String(serde_json::to_string(&json!({ "challenge": "0".repeat(64) })).unwrap());
+        assert!(response_session_probe_function_call(
+            &[predictable_challenge],
+            "atoapi_fidelity_probe"
+        )
+        .is_err());
+
+        let reasoning_leak = json!({
+            "type": "reasoning",
+            "id": "reasoning_seed",
+            "summary": [{ "type": "summary_text", "text": challenge }]
+        });
+        assert!(response_session_probe_function_call(
+            &[reasoning_leak, exact.clone()],
+            "atoapi_fidelity_probe"
+        )
+        .is_err());
+
+        assert!(response_session_probe_function_call(
+            &[exact.clone(), exact],
+            "atoapi_fidelity_probe"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn response_session_probe_parses_crlf_multidata_completed_sse_once() {
+        let response = ResponseSessionReuseProbeResponse {
+            status: 200,
+            content_type: "text/event-stream; charset=utf-8".to_string(),
+            bytes: concat!(
+                "event: response.completed\r\n",
+                "data: {\"type\":\"response.completed\",\r\n",
+                "data: \"response\":{\"id\":\"resp-crlf\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-crlf\",\"status\":\"completed\",\"call_id\":\"call-crlf\",\"name\":\"probe\",\"arguments\":\"{}\"}],\r\n",
+                "data: \"usage\":{\"input_tokens\":256,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":128}}}}\r\n\r\n"
+            )
+            .as_bytes()
+            .to_vec(),
+        };
+
+        let parsed = parse_successful_response_session_sse_probe(&response).unwrap();
+        assert_eq!(parsed.response_id, "resp-crlf");
+        assert_eq!(parsed.output_items.len(), 1);
+        assert_eq!(parsed.output_items[0]["call_id"], "call-crlf");
+        assert_eq!(parsed.usage.input_tokens, 256);
+        assert_eq!(parsed.usage.cache_read_tokens, 128);
+    }
+
+    #[test]
+    fn response_session_compaction_probe_requires_canonical_top_level_output() {
+        let canonical = serde_json::to_vec(&json!({
+            "id": "cmp-ok",
+            "object": "response.compaction",
+            "output": [{
+                "type": "compaction",
+                "encrypted_content": "opaque"
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            response_session_compaction_output(&canonical)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let nested_only = serde_json::to_vec(&json!({
+            "id": "cmp-bad",
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "data": { "type": "compaction" }
+                }]
+            }]
+        }))
+        .unwrap();
+        assert!(response_session_compaction_output(&nested_only).is_none());
     }
 
     #[tokio::test]
@@ -31174,8 +33008,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "sends two explicit semantic continuation requests to the configured real upstream"]
-    async fn live_provider_response_session_reuse_probe() {
+    #[ignore = "sends seven explicit fidelity and compaction requests to the configured real upstream"]
+    async fn live_provider_response_session_reuse_qualification() {
         let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
             .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
         let model_id =
@@ -31187,10 +33021,61 @@ mod tests {
             .expect("live response-session probe should complete");
 
         println!(
-            "RESPONSE_SESSION_LIVE_RESULT status={:?} enabled={} first_status={:?} continuation_status={:?}",
-            result.status, result.enabled, result.first_status, result.continuation_status
+            "RESPONSE_SESSION_LIVE_RESULT status={:?} enabled={} first_status={:?} continuation_status={:?} message={}",
+            result.status,
+            result.enabled,
+            result.first_status,
+            result.continuation_status,
+            truncate_log_message(&result.message)
         );
         assert!(result.first_status.is_some());
+    }
+
+    #[tokio::test]
+    #[ignore = "sends seven explicit management requests per real fidelity sample"]
+    async fn live_provider_response_session_reuse_probe_samples() {
+        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
+            .expect("ATOAPI_TEST_PROVIDER is required for real fidelity samples");
+        let model_id =
+            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
+        let sample_count = std::env::var("ATOAPI_TEST_PAIRS")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(18);
+        assert!(
+            (1..=50).contains(&sample_count),
+            "ATOAPI_TEST_PAIRS must be between 1 and 50"
+        );
+        let state = AppState::load().expect("isolated real-sample config should load");
+        let mut compact_verified = 0usize;
+
+        for sample in 1..=sample_count {
+            let result = probe_provider_response_session_reuse(&state, &provider_id, &model_id)
+                .await
+                .expect("real response-session sample should complete");
+            println!(
+                "RESPONSE_SESSION_REAL_SAMPLE {sample}/{sample_count} status={:?} compact={} message={}",
+                result.status,
+                result.compact_fidelity_verified,
+                truncate_log_message(&result.message)
+            );
+            assert_eq!(
+                result.status,
+                ProviderResponseSessionReuseStatus::Verified,
+                "real fidelity sample {sample} failed: {}",
+                result.message
+            );
+            assert!(result.enabled, "real sample must enable direct delta");
+            assert!(
+                result.usage_verified,
+                "real sample must include cached-token evidence for plain and typed delta"
+            );
+            compact_verified += usize::from(result.compact_fidelity_verified);
+        }
+
+        println!(
+            "RESPONSE_SESSION_REAL_SAMPLE_SUMMARY passed={sample_count} compact_verified={compact_verified}"
+        );
     }
 
     #[tokio::test]
@@ -31215,7 +33100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn third_party_session_reuse_probe_rejects_nonsemantic_continuation() {
+    async fn third_party_session_reuse_probe_rejects_input_only_continuation() {
         let hits = Arc::new(AtomicUsize::new(0));
         let hits_for_route = hits.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -31225,24 +33110,141 @@ mod tests {
             post(move |Json(body): Json<Value>| {
                 let hits = hits_for_route.clone();
                 async move {
-                    if hits.fetch_add(1, Ordering::SeqCst) == 0 {
-                        Json(json!({
-                            "id": "resp_probe_seed",
+                    assert_eq!(body["stream"], true);
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let anchor_a =
+                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+                    let anchor_b =
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+                    let anchor_c =
+                        "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35";
+                    let response = match attempt {
+                        0 | 1 => {
+                            let (response_id, item_id, challenge) = if attempt == 0 {
+                                (
+                                    "resp_probe_anchor",
+                                    "msg_probe_anchor",
+                                    anchor_a,
+                                )
+                            } else {
+                                (
+                                    "resp_probe_freshness_decoy",
+                                    "msg_probe_freshness_decoy",
+                                    anchor_b,
+                                )
+                            };
+                            assert!(!serde_json::to_string(&body).unwrap().contains(challenge));
+                            json!({
+                                "id": response_id,
+                                "object": "response",
+                                "usage": {
+                                    "input_tokens": 2_048,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {"cached_tokens": 0}
+                                },
+                                "output": [{
+                                    "type": "message",
+                                    "id": item_id,
+                                    "status": "completed",
+                                    "role": "assistant",
+                                    "content": [{
+                                        "type": "output_text",
+                                        "text": challenge
+                                    }]
+                                }]
+                            })
+                        }
+                        2 => {
+                            assert_eq!(body["previous_response_id"], "resp_probe_anchor");
+                            let serialized = serde_json::to_string(&body).unwrap();
+                            assert!(!serialized.contains(anchor_a));
+                            assert!(!serialized.contains("\"call_id\""));
+                            json!({
+                                "id": "resp_probe_seed",
+                                "object": "response",
+                                "usage": {
+                                    "input_tokens": 2_048,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {"cached_tokens": 0}
+                                },
+                                "output": [{
+                                    "type": "function_call",
+                                    "id": "fc_probe_seed",
+                                    "status": "completed",
+                                    "call_id": "call_probe_seed",
+                                    "name": "atoapi_fidelity_probe",
+                                    "arguments": serde_json::to_string(&json!({
+                                        "challenge": anchor_a
+                                    })).unwrap()
+                                }]
+                            })
+                        }
+                        3 => json!({
+                            "id": "resp_probe_lineage_decoy",
+                            "object": "response",
                             "output": [{
                                 "type": "message",
-                                "content": [{ "type": "output_text", "text": "ACK" }]
+                                "id": "msg_probe_lineage_decoy",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": anchor_c
+                                }]
                             }]
-                        }))
-                    } else {
-                        assert_eq!(body["previous_response_id"], "resp_probe_seed");
-                        Json(json!({
-                            "id": "resp_probe_continuation",
-                            "output": [{
-                                "type": "message",
-                                "content": [{ "type": "output_text", "text": "not-the-token" }]
-                            }]
-                        }))
-                    }
+                        }),
+                        4 => {
+                            assert_eq!(body["previous_response_id"], "resp_probe_seed");
+                            let tool_output = body["input"][0]["output"].as_str().unwrap();
+                            let mut arguments = serde_json::from_str::<Value>(tool_output)
+                                .unwrap()
+                                .as_object()
+                                .unwrap()
+                                .clone();
+                            arguments.insert(
+                                "challenge".to_string(),
+                                Value::String(anchor_a.to_string()),
+                            );
+                            arguments.insert(
+                                "seed_function_call".to_string(),
+                                json!({
+                                    "id": "flattened-input-only",
+                                    "status": "completed",
+                                    "call_id": "call_probe_seed",
+                                    "name": "atoapi_fidelity_probe",
+                                    "arguments": serde_json::to_string(&json!({
+                                        "challenge": anchor_a
+                                    })).unwrap()
+                                }),
+                            );
+                            json!({
+                                "id": "resp_probe_continuation",
+                                "object": "response",
+                                "usage": {
+                                    "input_tokens": 2_112,
+                                    "output_tokens": 1,
+                                    "input_tokens_details": {"cached_tokens": 1_920}
+                                },
+                                "output": [{
+                                    "type": "function_call",
+                                    "id": "fc_probe_verify",
+                                    "status": "completed",
+                                    "call_id": "call_probe_verify",
+                                    "name": "atoapi_fidelity_verify",
+                                    "arguments": serde_json::to_string(&Value::Object(arguments)).unwrap()
+                                }]
+                            })
+                        }
+                        _ => panic!("flattened continuation must stop before compaction"),
+                    };
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        response_json_to_sse(
+                            &Channel::Responses,
+                            &serde_json::to_vec(&response).unwrap(),
+                        ),
+                    )
                 }
             }),
         );
@@ -31253,10 +33255,20 @@ mod tests {
         let mut config = AppConfig::default();
         let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "probe-provider-nonsemantic".to_string();
+        let verification_capability = test_session_reuse_capability(
+            &RouteDecision {
+                provider: provider.clone(),
+                upstream_channel: Channel::Responses,
+                model: "gpt-5.5".to_string(),
+            },
+            "key",
+            None,
+        );
         config.providers = vec![provider];
         config.record_response_session_reuse_probe(
             "probe-provider-nonsemantic",
             "gpt-5.5",
+            Some(verification_capability),
             ProviderResponseSessionReuseStatus::Verified,
             true,
             None,
@@ -31286,12 +33298,191 @@ mod tests {
             ProviderResponseSessionReuseStatus::Unsupported
         );
         assert!(!result.enabled);
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
         assert!(!state
             .config
             .read()
             .await
             .response_session_reuse_verified_for("probe-provider-nonsemantic", "gpt-5.5"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn response_session_probe_rejects_fixed_challenge_across_independent_seeds() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    assert!(attempt < 2, "fixed challenge must fail before continuation");
+                    let challenge =
+                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+                    assert!(!serde_json::to_string(&body).unwrap().contains(challenge));
+                    let response = json!({
+                        "id": format!("resp_fixed_{attempt}"),
+                        "object": "response",
+                        "status": "completed",
+                        "error": null,
+                        "output": [{
+                            "type": "message",
+                            "id": format!("msg_fixed_{attempt}"),
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": challenge
+                            }]
+                        }]
+                    });
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        response_json_to_sse(
+                            &Channel::Responses,
+                            &serde_json::to_vec(&response).unwrap(),
+                        ),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "probe-provider-fixed-challenge".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-session-probe-fixed-challenge-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result = probe_provider_response_session_reuse(
+            &state,
+            "probe-provider-fixed-challenge",
+            "gpt-5.5",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.status,
+            ProviderResponseSessionReuseStatus::Unsupported
+        );
+        assert!(!result.enabled);
+        assert!(result.message.contains("reused the same challenge"));
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn response_session_probe_rejects_global_last_response_instead_of_previous_id() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let anchor_a =
+                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+                    let anchor_b =
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+                    let response = match attempt {
+                        0 | 1 => {
+                            let (id, message_id, challenge) = if attempt == 0 {
+                                ("resp_anchor_a", "msg_anchor_a", anchor_a)
+                            } else {
+                                ("resp_anchor_b", "msg_anchor_b", anchor_b)
+                            };
+                            json!({
+                                "id": id,
+                                "object": "response",
+                                "status": "completed",
+                                "error": null,
+                                "output": [{
+                                    "type": "message",
+                                    "id": message_id,
+                                    "status": "completed",
+                                    "role": "assistant",
+                                    "content": [{
+                                        "type": "output_text",
+                                        "text": challenge
+                                    }]
+                                }]
+                            })
+                        }
+                        2 => {
+                            assert_eq!(body["previous_response_id"], "resp_anchor_a");
+                            assert!(!serde_json::to_string(&body).unwrap().contains("call_id"));
+                            json!({
+                                "id": "resp_wrong_global_last",
+                                "object": "response",
+                                "status": "completed",
+                                "error": null,
+                                "output": [{
+                                    "type": "function_call",
+                                    "id": "fc_wrong_global_last",
+                                    "status": "completed",
+                                    "call_id": "call_wrong_global_last",
+                                    "name": "atoapi_fidelity_probe",
+                                    "arguments": serde_json::to_string(&json!({
+                                        "challenge": anchor_b
+                                    })).unwrap()
+                                }]
+                            })
+                        }
+                        _ => panic!("global-last shim must fail before typed continuation"),
+                    };
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        response_json_to_sse(
+                            &Channel::Responses,
+                            &serde_json::to_vec(&response).unwrap(),
+                        ),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "probe-provider-global-last".to_string();
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-session-probe-global-last-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result =
+            probe_provider_response_session_reuse(&state, "probe-provider-global-last", "gpt-5.5")
+                .await
+                .unwrap();
+
+        assert_eq!(
+            result.status,
+            ProviderResponseSessionReuseStatus::Unsupported
+        );
+        assert!(!result.enabled);
+        assert!(result.message.contains("selected by previous_response_id"));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -32757,7 +34948,7 @@ mod tests {
                                     "event: response.output_text.delta\n",
                                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
                                     "event: response.completed\n",
-                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_seed\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"
+                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_seed\",\"model\":\"gpt-5.5\",\"output\":[{\"type\":\"message\",\"id\":\"msg_seed\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ready\"}]}],\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n"
                                 )
                                 .as_bytes()
                                 .to_vec(),
@@ -32807,10 +34998,20 @@ mod tests {
             supports_streaming: true,
             enabled: true,
         }];
+        let verification_capability = test_session_reuse_capability(
+            &RouteDecision {
+                provider: provider.clone(),
+                upstream_channel: Channel::Responses,
+                model: "gpt-5.5".to_string(),
+            },
+            "key",
+            None,
+        );
         config.providers = vec![provider];
         config.record_response_session_reuse_probe(
             "verified-third-party",
             "gpt-5.5",
+            Some(verification_capability),
             ProviderResponseSessionReuseStatus::Verified,
             true,
             None,
@@ -32868,7 +35069,7 @@ mod tests {
             .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
-            !state.response_sessions.lock().await.is_empty(),
+            !state.continuation_lineage.is_empty().await,
             "the seed stream must save a response id before the delta request"
         );
 
@@ -32877,10 +35078,17 @@ mod tests {
             serde_json::to_vec(&json!({
                 "thread_id": "verified-session",
                 "model": "gpt-5.5",
-                "input": [
-                    { "type": "message", "role": "user", "content": stable_prefix },
-                    { "type": "message", "role": "user", "content": incremental_tail }
-                ]
+                 "input": [
+                     { "type": "message", "role": "user", "content": stable_prefix },
+                     {
+                         "type": "message",
+                         "id": "msg_seed",
+                         "status": "completed",
+                         "role": "assistant",
+                         "content": [{ "type": "output_text", "text": "ready" }]
+                     },
+                     { "type": "message", "role": "user", "content": incremental_tail }
+                 ]
             }))
             .unwrap(),
         );
@@ -32924,22 +35132,36 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
+        let capability = test_session_reuse_capability(&decision, "key", None);
 
-        assert!(!supports_main_response_session_delta(&config, &decision));
+        assert!(!supports_main_response_session_delta(
+            &config,
+            &decision,
+            Some(&capability)
+        ));
         config.record_response_session_reuse_probe(
             &decision.provider.id,
             "gpt-5.5",
+            Some(capability.clone()),
             ProviderResponseSessionReuseStatus::Verified,
             true,
             None,
         );
-        assert!(supports_main_response_session_delta(&config, &decision));
+        assert!(supports_main_response_session_delta(
+            &config,
+            &decision,
+            Some(&capability)
+        ));
 
         let other_model = RouteDecision {
             model: "gpt-5.6".to_string(),
             ..decision
         };
-        assert!(!supports_main_response_session_delta(&config, &other_model));
+        assert!(!supports_main_response_session_delta(
+            &config,
+            &other_model,
+            Some(&capability)
+        ));
     }
 
     #[test]
@@ -33314,7 +35536,8 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
-        let key = response_session_error_cooldown_key(&responses).unwrap();
+        let capability = test_session_reuse_capability(&responses, "key", None);
+        let key = response_session_error_cooldown_key(&responses, Some(&capability)).unwrap();
 
         note_response_session_error_cooldown(&state, Some(&key)).await;
         {
@@ -33393,6 +35616,14 @@ mod tests {
         assert_eq!(
             responses_compact_url("https://api.example.com/v1/responses", "resp_123"),
             "https://api.example.com/v1/responses/resp_123/compact"
+        );
+        assert_eq!(
+            responses_compact_collection_url("https://api.example.com/v1"),
+            "https://api.example.com/v1/responses/compact"
+        );
+        assert_eq!(
+            responses_compact_collection_url("https://api.example.com/v1/responses"),
+            "https://api.example.com/v1/responses/compact"
         );
         assert!(should_fallback_compact_to_responses(404));
         assert!(should_fallback_compact_to_responses(405));
@@ -34107,7 +36338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_compact_success_updates_response_session_for_next_turn() {
+    async fn responses_compact_success_keeps_full_replay_boundary_for_next_turn() {
         let compact_hits = Arc::new(AtomicUsize::new(0));
         let captured_compact_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
         let compact_hits_for_route = compact_hits.clone();
@@ -34186,6 +36417,20 @@ mod tests {
             updated_at: Utc::now(),
         }];
 
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("mock-responses".to_string()),
+            model_id: Some("gpt-5.5".to_string()),
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-compact-session-e2e-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -34204,6 +36449,12 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer local-test-key"),
         );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"compact-session","thread_id":"compact-thread","request_kind":"compaction"}"#,
+            ),
+        );
         let initial_input = json!([
             {
                 "type": "message",
@@ -34211,6 +36462,40 @@ mod tests {
                 "content": [{ "type": "input_text", "text": "please compact context" }]
             }
         ]);
+        let decision = RouteDecision {
+            provider: state.config.read().await.providers[0].clone(),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let config_snapshot = state.config.read().await.clone();
+        let continuation_scope = ContinuationScope::derive(
+            &config_snapshot,
+            &decision,
+            &json!({
+                "thread_id": "compact-thread",
+                "session_id": "compact-session"
+            }),
+            Some("codex"),
+            &SelectedProviderKey {
+                secret: "upstream-key".to_string(),
+                key_id: None,
+            },
+        )
+        .expect("trusted compact metadata should derive the same lineage key");
+        state
+            .continuation_lineage
+            .seed_for_test(
+                &continuation_scope.anchor_key,
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_old".to_string(),
+                    input: initial_input.clone(),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
         let body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",
@@ -34220,24 +36505,24 @@ mod tests {
             .unwrap(),
         );
 
-        let response =
-            handle_responses_compact(state.clone(), headers, body, Some("resp_old".to_string()))
-                .await;
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            headers,
+            body,
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
 
-        let sessions = state.response_sessions.lock().await.clone();
-        assert_eq!(sessions.len(), 1);
-        let (session_key, session) = sessions.iter().next().unwrap();
-        assert_eq!(session.response_id, "resp_compacted");
-        assert_eq!(session.input, initial_input);
-        assert!(session.scope_key.is_some());
+        let sessions = state.continuation_lineage.snapshot_heads().await;
+        assert!(sessions.is_empty());
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.recent_requests[0].cache_status, "compact");
+        assert_eq!(metrics.recent_requests[0].cold_start, Some(false));
+        assert_eq!(metrics.provider_stats[0].cold_start_requests, 0);
 
-        let decision = RouteDecision {
-            provider: state.config.read().await.providers[0].clone(),
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
         let next_input = json!([
             {
                 "type": "message",
@@ -34253,27 +36538,19 @@ mod tests {
         let next_request = json!({
             "model": "gpt-5.5",
             "stream": true,
-            "input": next_input
+            "input": next_input.clone()
         });
-        let reuse = maybe_reuse_response_session(
-            &state,
-            &next_request,
-            Some(session_key),
-            session.scope_key.as_deref(),
-            &decision,
-            true,
-            false,
-        )
-        .await;
+        let lease = state
+            .continuation_lineage
+            .begin(&continuation_scope.anchor_key)
+            .await;
+        let reuse = maybe_reuse_response_session(&next_request, Some(&lease), &decision, true);
 
-        assert_eq!(reuse.body["previous_response_id"], "resp_compacted");
+        assert!(reuse.body.get("previous_response_id").is_none());
+        assert_eq!(reuse.body["input"], next_input);
         assert_eq!(
-            reuse.body["input"],
-            json!([{
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": "continue after compact" }]
-            }])
+            reuse.diagnostics.skip_reason.as_deref(),
+            Some("no_candidate")
         );
     }
 
@@ -34487,7 +36764,36 @@ mod tests {
                 "stream": false,
                 "prompt_cache_key": "client-key-must-not-be-forwarded",
                 "prompt_cache_retention": "24h",
-                "input": [{ "type": "message", "role": "user", "content": "hi" }]
+                "metadata": { "wire_fidelity": "preserve-me" },
+                "vendor_extension": {
+                    "nullable": null,
+                    "ordered_payload": [3, 1, 2]
+                },
+                "input": [
+                    { "type": "message", "role": "user", "content": "hi" },
+                    {
+                        "type": "function_call",
+                        "id": "fc-native-1",
+                        "status": "completed",
+                        "call_id": "call-native-1",
+                        "name": "run_command",
+                        "arguments": "{\"command\":\"cargo test\"}",
+                        "metadata": { "source": "codex" },
+                        "vendor_item": { "must_survive": true }
+                    },
+                    {
+                        "type": "function_call_output",
+                        "id": "fco-native-1",
+                        "status": "completed",
+                        "call_id": "call-native-1",
+                        "output": {
+                            "stdout": "625 passed\n",
+                            "stderr": "warning: retained\n",
+                            "file": "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
+                        },
+                        "vendor_output": { "exit_code": 0 }
+                    }
+                ]
             }))
             .unwrap(),
         );
@@ -34518,6 +36824,30 @@ mod tests {
         assert!(captured.get("input").is_some());
         assert!(captured.get("thread_id").is_none());
         assert!(captured.get("session_id").is_none());
+        assert_eq!(captured["metadata"]["wire_fidelity"], "preserve-me");
+        assert_eq!(captured["vendor_extension"]["nullable"], Value::Null);
+        assert_eq!(
+            captured["vendor_extension"]["ordered_payload"],
+            json!([3, 1, 2])
+        );
+        assert_eq!(captured["input"][1]["id"], "fc-native-1");
+        assert_eq!(captured["input"][1]["status"], "completed");
+        assert_eq!(captured["input"][1]["call_id"], "call-native-1");
+        assert_eq!(captured["input"][1]["metadata"]["source"], "codex");
+        assert_eq!(captured["input"][1]["vendor_item"]["must_survive"], true);
+        assert_eq!(captured["input"][2]["id"], "fco-native-1");
+        assert_eq!(captured["input"][2]["status"], "completed");
+        assert_eq!(captured["input"][2]["call_id"], "call-native-1");
+        assert_eq!(captured["input"][2]["output"]["stdout"], "625 passed\n");
+        assert_eq!(
+            captured["input"][2]["output"]["stderr"],
+            "warning: retained\n"
+        );
+        assert_eq!(
+            captured["input"][2]["output"]["file"],
+            "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
+        );
+        assert_eq!(captured["input"][2]["vendor_output"]["exit_code"], 0);
         let forwarded_cache_key = captured
             .get("prompt_cache_key")
             .and_then(Value::as_str)

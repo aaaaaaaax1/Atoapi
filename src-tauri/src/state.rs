@@ -21,6 +21,7 @@ use crate::{
         app_config_dir, config_path, isolated_test_listen_port, provider_model_cache_key,
         AppConfig, ProviderConfig, PublicConfig,
     },
+    continuation_lineage::ContinuationLineageIndex,
     metrics::MetricsStore,
     persistence::{WriteBehindCoordinator, WriteOperation},
     proxy::{
@@ -74,7 +75,7 @@ pub struct AppState {
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
     pub response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
-    pub response_sessions: Arc<Mutex<HashMap<String, Arc<ResponseSessionState>>>>,
+    pub continuation_lineage: ContinuationLineageIndex,
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     pub provider_key_affinity: Mutex<HashMap<String, String>>,
     pub shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
@@ -110,14 +111,6 @@ pub struct PrefixWarmState {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResponseSessionState {
-    pub response_id: String,
-    pub input: serde_json::Value,
-    pub scope_key: Option<String>,
-    pub finished_at: std::time::Instant,
-}
-
-#[derive(Debug, Clone)]
 pub struct ResponseSessionCooldownState {
     pub until: std::time::Instant,
     pub failures: u32,
@@ -128,8 +121,8 @@ pub struct ResponseSessionCooldownState {
 struct PersistedRuntimeState {
     #[serde(default)]
     prefix_states: HashMap<String, PersistedPrefixWarmState>,
-    #[serde(default)]
-    response_sessions: HashMap<String, PersistedResponseSessionState>,
+    #[serde(default, skip_serializing, rename = "response_sessions")]
+    _legacy_response_sessions: HashMap<String, PersistedResponseSessionState>,
     #[serde(default)]
     response_session_error_cooldowns: HashMap<String, PersistedResponseSessionCooldownState>,
     #[serde(default)]
@@ -181,20 +174,17 @@ struct PersistedResponseSessionCooldownState {
 #[derive(Debug, Default)]
 struct RuntimeStateMaps {
     prefix_states: HashMap<String, PrefixWarmState>,
-    response_sessions: HashMap<String, Arc<ResponseSessionState>>,
     response_session_error_cooldowns: HashMap<String, ResponseSessionCooldownState>,
     shadow_affinity: ShadowAffinityStore,
 }
 
 fn capture_runtime_state(
     prefix_states: &Mutex<HashMap<String, PrefixWarmState>>,
-    response_sessions: &Mutex<HashMap<String, Arc<ResponseSessionState>>>,
     response_session_error_cooldowns: &Mutex<HashMap<String, ResponseSessionCooldownState>>,
     shadow_affinity: &Mutex<ShadowAffinityStore>,
 ) -> RuntimeStateMaps {
     RuntimeStateMaps {
         prefix_states: prefix_states.blocking_lock().clone(),
-        response_sessions: response_sessions.blocking_lock().clone(),
         response_session_error_cooldowns: response_session_error_cooldowns.blocking_lock().clone(),
         shadow_affinity: shadow_affinity.blocking_lock().clone(),
     }
@@ -288,7 +278,6 @@ impl RuntimeStateJournal {
     fn new(
         path: PathBuf,
         prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
-        response_sessions: Arc<Mutex<HashMap<String, Arc<ResponseSessionState>>>>,
         response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
         shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
         metrics: MetricsStore,
@@ -297,14 +286,12 @@ impl RuntimeStateJournal {
             debug_assert_eq!(operation, WriteOperation::Snapshot);
             let snapshot = capture_runtime_state(
                 &prefix_states,
-                &response_sessions,
                 &response_session_error_cooldowns,
                 &shadow_affinity,
             );
             save_runtime_state(
                 &path,
                 &snapshot.prefix_states,
-                &snapshot.response_sessions,
                 &snapshot.response_session_error_cooldowns,
                 &snapshot.shadow_affinity,
             )
@@ -348,12 +335,11 @@ impl AppState {
         let prefix_states = Arc::new(Mutex::new(runtime_state.prefix_states));
         let response_session_error_cooldowns =
             Arc::new(Mutex::new(runtime_state.response_session_error_cooldowns));
-        let response_sessions = Arc::new(Mutex::new(runtime_state.response_sessions));
+        let continuation_lineage = ContinuationLineageIndex::default();
         let shadow_affinity = Arc::new(Mutex::new(runtime_state.shadow_affinity));
         let runtime_state_journal = RuntimeStateJournal::new(
             runtime_state_path.clone(),
             prefix_states.clone(),
-            response_sessions.clone(),
             response_session_error_cooldowns.clone(),
             shadow_affinity.clone(),
             metrics.clone(),
@@ -375,7 +361,7 @@ impl AppState {
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns,
-            response_sessions,
+            continuation_lineage,
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity,
@@ -396,12 +382,11 @@ impl AppState {
         let config_persistence = ConfigWriteCoordinator::new(config_path.clone(), metrics.clone());
         let prefix_states = Arc::new(Mutex::new(HashMap::new()));
         let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
-        let response_sessions = Arc::new(Mutex::new(HashMap::new()));
+        let continuation_lineage = ContinuationLineageIndex::default();
         let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
         let runtime_state_journal = RuntimeStateJournal::new(
             runtime_state_path.clone(),
             prefix_states.clone(),
-            response_sessions.clone(),
             response_session_error_cooldowns.clone(),
             shadow_affinity.clone(),
             metrics.clone(),
@@ -423,7 +408,7 @@ impl AppState {
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns,
-            response_sessions,
+            continuation_lineage,
             provider_route_affinity: Mutex::new(HashMap::new()),
             provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity,
@@ -825,7 +810,6 @@ fn prefix_state_strength(state: &PrefixWarmState) -> u64 {
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
-    response_sessions: &HashMap<String, Arc<ResponseSessionState>>,
     response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
     shadow_affinity: &ShadowAffinityStore,
 ) -> Result<()> {
@@ -834,7 +818,6 @@ fn save_runtime_state(
     }
     let persisted = PersistedRuntimeState::from_runtime(
         prefix_states,
-        response_sessions,
         response_session_error_cooldowns,
         shadow_affinity,
     );
@@ -846,7 +829,6 @@ fn save_runtime_state(
 impl PersistedRuntimeState {
     fn from_runtime(
         prefix_states: &HashMap<String, PrefixWarmState>,
-        response_sessions: &HashMap<String, Arc<ResponseSessionState>>,
         response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
         shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
@@ -873,27 +855,6 @@ impl PersistedRuntimeState {
                             tail_tool_output_chars: state.tail_tool_output_chars,
                             tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
                             tail_tool_output_noise_hint: state.tail_tool_output_noise_hint.clone(),
-                        },
-                    )
-                })
-            })
-            .collect();
-        let response_sessions = response_sessions
-            .iter()
-            .filter_map(|(key, state)| {
-                let age = state.finished_at.elapsed();
-                (age <= RUNTIME_STATE_TTL).then(|| {
-                    let saved_at = chrono::Duration::from_std(age)
-                        .ok()
-                        .map(|age| now - age)
-                        .unwrap_or(now);
-                    (
-                        key.clone(),
-                        PersistedResponseSessionState {
-                            saved_at,
-                            response_id: state.response_id.clone(),
-                            input: state.input.clone(),
-                            scope_key: state.scope_key.clone(),
                         },
                     )
                 })
@@ -930,7 +891,7 @@ impl PersistedRuntimeState {
 
         Self {
             prefix_states,
-            response_sessions,
+            _legacy_response_sessions: HashMap::new(),
             response_session_error_cooldowns,
             shadow_affinity: shadow_affinity.clone(),
         }
@@ -971,25 +932,10 @@ impl PersistedRuntimeState {
                 ))
             })
             .collect();
-        let response_sessions = self
-            .response_sessions
-            .into_iter()
-            .filter_map(|(key, state)| {
-                let age = (now - state.saved_at).to_std().ok()?;
-                if age > RUNTIME_STATE_TTL {
-                    return None;
-                }
-                Some((
-                    key,
-                    Arc::new(ResponseSessionState {
-                        response_id: state.response_id,
-                        input: state.input,
-                        scope_key: state.scope_key,
-                        finished_at: instant_now.checked_sub(age).unwrap_or(instant_now),
-                    }),
-                ))
-            })
-            .collect();
+        // Legacy plaintext response-session snapshots are deliberately not
+        // admitted into the active continuation map.  A restart therefore
+        // falls back to the Agent's complete request instead of trusting a
+        // stale or cross-key response reference.
         let response_session_error_cooldowns = self
             .response_session_error_cooldowns
             .into_iter()
@@ -1026,7 +972,6 @@ impl PersistedRuntimeState {
         crate::proxy::cache_affinity::evict_assignments(&mut shadow_affinity, now);
         RuntimeStateMaps {
             prefix_states,
-            response_sessions,
             response_session_error_cooldowns,
             shadow_affinity,
         }
@@ -1209,34 +1154,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_snapshot_shares_immutable_session_payload_and_releases_lock() {
+    async fn runtime_snapshot_does_not_touch_the_memory_only_lineage_index() {
         let prefix_states = Arc::new(Mutex::new(HashMap::new()));
-        let response_sessions = Arc::new(Mutex::new(HashMap::new()));
         let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
-        let session = Arc::new(ResponseSessionState {
-            response_id: "resp_large".to_string(),
-            input: json!([{
-                "type": "message",
-                "role": "user",
-                "content": "large immutable session payload ".repeat(200_000)
-            }]),
-            scope_key: Some("scope-large".to_string()),
-            finished_at: Instant::now(),
-        });
-        response_sessions
-            .lock()
-            .await
-            .insert("session-large".to_string(), session.clone());
 
         let prefix_states_for_capture = prefix_states.clone();
-        let response_sessions_for_capture = response_sessions.clone();
         let cooldowns_for_capture = response_session_error_cooldowns.clone();
         let shadow_affinity_for_capture = shadow_affinity.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
             capture_runtime_state(
                 &prefix_states_for_capture,
-                &response_sessions_for_capture,
                 &cooldowns_for_capture,
                 &shadow_affinity_for_capture,
             )
@@ -1244,9 +1172,7 @@ mod tests {
         .await
         .unwrap();
 
-        let captured = snapshot.response_sessions.get("session-large").unwrap();
-        assert!(Arc::ptr_eq(captured, &session));
-        assert!(response_sessions.try_lock().is_ok());
+        assert!(snapshot.prefix_states.is_empty());
     }
 
     #[tokio::test]
@@ -1498,7 +1424,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_state_persists_recent_prefix_and_response_session() {
+    async fn runtime_state_persists_prefix_but_not_plaintext_response_session() {
         let dir =
             std::env::temp_dir().join(format!("atoapi-runtime-state-{}", Uuid::new_v4().simple()));
         fs::create_dir_all(&dir).unwrap();
@@ -1530,15 +1456,28 @@ mod tests {
                 tail_tool_output_noise_hint: None,
             },
         );
-        state.response_sessions.lock().await.insert(
-            "session-a".to_string(),
-            Arc::new(ResponseSessionState {
-                response_id: "resp_123".to_string(),
-                input: json!([{ "type": "message", "role": "user", "content": "hello" }]),
-                scope_key: Some("scope-a".to_string()),
-                finished_at: Instant::now(),
-            }),
-        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "session-a",
+                crate::continuation_lineage::ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_sensitive_123".to_string(),
+                    input: json!([{
+                        "type": "function_call_output",
+                        "call_id": "call-sensitive",
+                        "output": {
+                            "file": "SENSITIVE_SOURCE_MARKER",
+                            "stderr": "SENSITIVE_ERROR_MARKER",
+                            "exit_code": 1
+                        }
+                    }]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
         state.response_session_error_cooldowns.lock().await.insert(
             "responses:share:gpt-5.5".to_string(),
             ResponseSessionCooldownState {
@@ -1615,15 +1554,15 @@ mod tests {
         drop(shadow_affinity);
 
         state.persist_runtime_state().await.unwrap();
+        let raw = fs::read_to_string(&state.runtime_state_path).unwrap();
+        assert!(!raw.contains("SENSITIVE_SOURCE_MARKER"));
+        assert!(!raw.contains("SENSITIVE_ERROR_MARKER"));
+        assert!(!raw.contains("resp_sensitive_123"));
         let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
 
         let prefix = loaded.prefix_states.get("prefix-a").unwrap();
         assert_eq!(prefix.cache_read_tokens, 166_912);
         assert_eq!(prefix.recent_clean_tiny_gap_streak, 0);
-        let session = loaded.response_sessions.get("session-a").unwrap();
-        assert_eq!(session.response_id, "resp_123");
-        assert_eq!(session.input[0]["role"], "user");
-        assert_eq!(session.scope_key.as_deref(), Some("scope-a"));
         let cooldown = loaded
             .response_session_error_cooldowns
             .get("responses:share:gpt-5.5")

@@ -31,14 +31,7 @@ pub(super) fn derive(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("default");
-    let key_record = key_record_digest(selected_key);
-    let realm_id = hash_parts(&[
-        "cache-realm-v1",
-        &provider_deployment,
-        channel,
-        &decision.model,
-        &key_record,
-    ]);
+    let realm_id = realm_id(decision, selected_key);
     let stable_material = stable_prefix_material(upstream_request);
     let stable_prefix_digest = hash_text(&canonical_json_string(&stable_material));
     let cohort_id = hash_parts(&[
@@ -64,20 +57,38 @@ pub(super) fn derive(
 }
 
 fn normalized_deployment(base_url: &str) -> String {
-    base_url.trim().trim_end_matches('/').to_ascii_lowercase()
+    let trimmed = base_url.trim().trim_end_matches('/');
+    reqwest::Url::parse(trimmed)
+        .map(|url| url.to_string().trim_end_matches('/').to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
 }
 
-fn key_record_digest(selected_key: &SelectedProviderKey) -> String {
-    let material = selected_key
+pub(super) fn key_realm_id(selected_key: &SelectedProviderKey) -> String {
+    let key_id = selected_key
         .key_id
         .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(selected_key.secret.as_str());
-    if material.trim().is_empty() {
-        "default".to_string()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default");
+    let secret_digest = if selected_key.secret.trim().is_empty() {
+        "empty".to_string()
     } else {
-        hash_text(material)
-    }
+        hash_text(selected_key.secret.trim())
+    };
+    hash_parts(&["key-record-v2", key_id, &secret_digest])
+}
+
+pub(super) fn realm_id(decision: &RouteDecision, selected_key: &SelectedProviderKey) -> String {
+    let provider_deployment = normalized_deployment(&decision.provider.base_url);
+    let channel = decision.upstream_channel.label();
+    let key_record = key_realm_id(selected_key);
+    hash_parts(&[
+        "cache-realm-v2",
+        &provider_deployment,
+        channel,
+        &decision.model,
+        &key_record,
+    ])
 }
 
 fn trusted_conversation_identity(

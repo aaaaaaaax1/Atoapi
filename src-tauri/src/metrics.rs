@@ -495,6 +495,7 @@ pub struct AgentProviderTrafficStats {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    pub compaction_requests: u64,
     pub cache_shortfall_tokens: u64,
     pub cache_avoidable_gap_tokens: u64,
     pub cache_new_tail_gap_tokens: u64,
@@ -773,6 +774,14 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_session_delta_items: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_context_plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_session_semantic_reuse_items: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_session_wire_saved_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_session_wire_saved_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_session_cooldown_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_session_rejected_status: Option<u16>,
@@ -945,6 +954,7 @@ struct AgentProviderTrafficAccumulator {
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
+    compaction_requests: u64,
     cache_shortfall_tokens: u64,
     cache_avoidable_gap_tokens: u64,
     cache_new_tail_gap_tokens: u64,
@@ -1987,6 +1997,7 @@ impl AgentProviderTrafficAccumulator {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             cache_read_tokens: self.cache_read_tokens,
+            compaction_requests: self.compaction_requests,
             cache_shortfall_tokens: self.cache_shortfall_tokens,
             cache_avoidable_gap_tokens: self.cache_avoidable_gap_tokens,
             cache_new_tail_gap_tokens: self.cache_new_tail_gap_tokens,
@@ -2190,6 +2201,9 @@ fn upsert_agent_provider_traffic(
         group.input_tokens += log.input_tokens.unwrap_or_default();
         group.output_tokens += log.output_tokens.unwrap_or_default();
         group.cache_read_tokens += log.cache_read_tokens.unwrap_or_default();
+        if log.cache_status == "compact" {
+            group.compaction_requests += 1;
+        }
         group.cache_shortfall_tokens += log.cache_shortfall_tokens.unwrap_or_default();
         group.cache_avoidable_gap_tokens += log.cache_avoidable_gap_tokens.unwrap_or_default();
         group.cache_new_tail_gap_tokens += log.cache_new_tail_gap_tokens.unwrap_or_default();
@@ -2686,6 +2700,10 @@ mod tests {
             response_session_scope_match_count: None,
             response_session_append_delta_match: None,
             response_session_delta_items: None,
+            response_context_plan: None,
+            response_session_semantic_reuse_items: None,
+            response_session_wire_saved_bytes: None,
+            response_session_wire_saved_ratio: None,
             response_session_cooldown_active: None,
             response_session_rejected_status: None,
             session_anchor_hash: None,
@@ -2754,6 +2772,26 @@ mod tests {
 
         let value = serde_json::to_value(log).unwrap();
         assert_eq!(value["cold_start"], true);
+    }
+
+    #[test]
+    fn request_log_keeps_provider_cache_and_delta_reuse_metrics_separate() {
+        let mut log = request_log("hit", Some("cache-key"));
+        log.input_tokens = Some(100_000);
+        log.cache_read_tokens = Some(81_920);
+        log.provider_cache_token_ratio = Some(0.8192);
+        log.response_context_plan = Some("verified_native_delta".to_string());
+        log.response_session_semantic_reuse_items = Some(42);
+        log.response_session_wire_saved_bytes = Some(65_536);
+        log.response_session_wire_saved_ratio = Some(0.75);
+
+        let value = serde_json::to_value(log).unwrap();
+        assert_eq!(value["cache_read_tokens"], 81_920);
+        assert_eq!(value["provider_cache_token_ratio"], 0.8192);
+        assert_eq!(value["response_context_plan"], "verified_native_delta");
+        assert_eq!(value["response_session_semantic_reuse_items"], 42);
+        assert_eq!(value["response_session_wire_saved_bytes"], 65_536);
+        assert_eq!(value["response_session_wire_saved_ratio"], 0.75);
     }
 
     fn agent_inbound_start(id: &str, policy: &str, budget: u64) -> AgentInboundStart {
@@ -3483,6 +3521,10 @@ mod tests {
             log.cache_avoidable_gap_tokens = Some(3);
             log.cache_new_tail_gap_tokens = Some(7);
             log.cold_start = (index == 0).then_some(true);
+            if index == 0 {
+                log.cache_status = "compact".to_string();
+                log.upstream_call_source = Some("responses-compaction-v2".to_string());
+            }
             metrics.record_request(log, true).await;
         }
         let mut failed = request_log("error", Some("agent-failed-history"));
@@ -3519,6 +3561,7 @@ mod tests {
         assert_eq!(codex.input_tokens, 2_010);
         assert_eq!(codex.output_tokens, 402);
         assert_eq!(codex.cache_read_tokens, 1_809);
+        assert_eq!(codex.compaction_requests, 1);
         assert_eq!(codex.cache_shortfall_tokens, 2_010);
         assert_eq!(codex.cache_avoidable_gap_tokens, 603);
         assert_eq!(codex.cache_new_tail_gap_tokens, 1_407);
