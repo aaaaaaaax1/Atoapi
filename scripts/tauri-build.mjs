@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join, delimiter } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -36,7 +36,13 @@ const candidateDirs = [
 
 const exe = process.platform === "win32" ? ".exe" : "";
 const currentPath = process.env.PATH || "";
-const extraDirs = candidateDirs.filter((dir) => existsSync(join(dir, `cargo${exe}`)));
+// A stale zero-byte rustup shim must not shadow a valid toolchain binary.
+// This desktop environment can retain an empty %USERPROFILE%\\.cargo stub
+// after toolchain repair, while the real cargo.exe lives under rustup.
+const extraDirs = candidateDirs.filter((dir) => {
+  const cargoPath = join(dir, `cargo${exe}`);
+  return existsSync(cargoPath) && statSync(cargoPath).size > 0;
+});
 process.env.PATH = [...extraDirs, currentPath].join(delimiter);
 
 const check = spawnSync(`cargo${exe}`, ["--version"], {

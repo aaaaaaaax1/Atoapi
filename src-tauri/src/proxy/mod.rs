@@ -232,6 +232,29 @@ fn try_compute_shadow_affinity_without_wait(
     (decision, false)
 }
 
+/// Cache affinity is an optional placement optimization.  Do not queue an
+/// inbound request behind its state mutex merely to change a cache hint: if a
+/// settlement owns the snapshot, this request keeps the baseline wire intact.
+fn try_admit_active_cache_route_without_wait(
+    shadow_affinity: &tokio::sync::Mutex<cache_affinity::ShadowAffinityStore>,
+    decision: &mut ShadowAffinityDecision,
+    provider_route_eligible: bool,
+    provider_prompt_cache_key_verified: bool,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let Ok(mut shadow_affinity) = shadow_affinity.try_lock() else {
+        decision.skip_reason = Some("active_cache_route_snapshot_lock_busy".to_string());
+        return false;
+    };
+    cache_affinity::admit_active_cache_route(
+        &mut shadow_affinity,
+        decision,
+        provider_route_eligible,
+        provider_prompt_cache_key_verified,
+        now,
+    )
+}
+
 #[derive(Debug, Deserialize)]
 struct ResponseSessionReuseProbeHttpInput {
     provider_id: String,
@@ -2732,13 +2755,42 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
-    let provider_prompt_cache_key_allowed = config.cache_capability_status_for_key(
+    let provider_prompt_cache_key_status = config.cache_capability_status_for_key(
         &decision.provider.id,
         &decision.model,
         &active_request_channel,
         selected_provider_key.key_id.as_deref(),
         ProviderCacheCapabilityField::PromptCacheKey,
-    ) != ProviderCacheCapabilityStatus::Unsupported;
+    );
+    let provider_prompt_cache_key_allowed =
+        provider_prompt_cache_key_status != ProviderCacheCapabilityStatus::Unsupported;
+    let provider_prompt_cache_key_verified =
+        provider_prompt_cache_key_status == ProviderCacheCapabilityStatus::Verified;
+    // The production path is a placement-only canary.  It is deliberately
+    // evaluated after manual validation selection so an explicit diagnostic
+    // run remains authoritative, and it never waits for the affinity mutex.
+    let active_cache_route_eligible = agent_generation
+        && !shadow_affinity_lock_busy
+        && validation_selection.is_none()
+        && smart_hit_enabled(&config)
+        // Cache affinity identity currently describes native upstream channel
+        // semantics. Do not apply the new route to a Chat compatibility hop.
+        && matches!(active_request_channel, Channel::Responses)
+        && matches!(
+            provider_prompt_cache_key_status,
+            ProviderCacheCapabilityStatus::Verified | ProviderCacheCapabilityStatus::Unverified
+        )
+        && provider_prompt_cache_key_allowed
+        && !explicit_client_prompt_cache_key;
+    let active_cache_route_selected = shadow_affinity_decision.as_mut().is_some_and(|decision| {
+        try_admit_active_cache_route_without_wait(
+            &state.shadow_affinity,
+            decision,
+            active_cache_route_eligible,
+            provider_prompt_cache_key_verified,
+            Utc::now(),
+        )
+    });
     let candidate_cache_routing_applied =
         shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let provider_native_candidate = validation_selection.is_none()
@@ -2754,6 +2806,13 @@ async fn run_generation_for_authorized_agent(
                     smart_hit_enabled(&config),
                     channel_eligible,
                 )
+            } else if active_cache_route_selected {
+                true
+            } else if active_cache_route_eligible {
+                // A live scope that does not yet have enough baseline evidence
+                // must remain ordinary traffic.  Do not fall through to the
+                // older static cohort route and accidentally broaden it.
+                false
             } else {
                 channel_eligible
                     && !explicit_client_prompt_cache_key

@@ -36,6 +36,18 @@ const POST_BURST_PROMOTION_MAX_ERROR_DELTA_BPS: u64 = 50;
 const POST_BURST_PROMOTION_TTFT_P50_DELTA_MS: u64 = 200;
 const POST_BURST_PROMOTION_TTFT_P95_DELTA_MS: u64 = 300;
 const POST_BURST_RESIDUAL_CACHE_GAP_BPS: u64 = 9_995;
+// The live route is deliberately tiny: one current scope per exact upstream
+// realm.  It is a placement-only experiment, so it must earn the right to
+// remain enabled from the upstream's real usage before it can stay sticky.
+const ACTIVE_CACHE_ROUTE_MIN_BASELINE_SUCCESSFUL_OBSERVATIONS: u64 = 4;
+const ACTIVE_CACHE_ROUTE_MIN_BASELINE_USAGE_OBSERVATIONS: u64 = 4;
+const ACTIVE_CACHE_ROUTE_MIN_BASELINE_INPUT_TOKENS: u64 = 32 * 1024;
+const ACTIVE_CACHE_ROUTE_MIN_CANDIDATE_SUCCESSFUL_OBSERVATIONS: u64 = 18;
+const ACTIVE_CACHE_ROUTE_MAX_INCONCLUSIVE_OBSERVATIONS: u64 = 3;
+const ACTIVE_CACHE_ROUTE_TTFT_REGRESSION_MS: u64 = 500;
+const ACTIVE_CACHE_ROUTE_TTFT_REGRESSION_BPS: u64 = 12_500;
+const ACTIVE_CACHE_ROUTE_TTFT_SAMPLE_LIMIT: usize = 24;
+const ACTIVE_CACHE_ROUTE_LEASE_HOURS: i64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +81,35 @@ pub(crate) enum ShadowAffinityArm {
     Candidate,
 }
 
+/// Per-conversation lifecycle for the only production-affecting cache
+/// affinity path.  The route never changes model input; it only selects a
+/// stable root `prompt_cache_key` after baseline traffic proves there is room
+/// for a real cache improvement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ActiveCacheRouteState {
+    #[default]
+    Baseline,
+    Candidate,
+    Promoted,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ActiveCacheRouteEvidence {
+    pub(crate) observations: u64,
+    pub(crate) successful_observations: u64,
+    pub(crate) usage_observations: u64,
+    pub(crate) inconclusive_observations: u64,
+    pub(crate) input_tokens: u64,
+    pub(crate) cache_read_tokens: u64,
+    pub(crate) avoidable_gap_tokens: u64,
+    pub(crate) provider_unstable_gap_tokens: u64,
+    pub(crate) multi_attempt_observations: u64,
+    pub(crate) ttft_samples: VecDeque<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShadowAffinityAssignment {
     pub(crate) conversation_id: String,
@@ -94,6 +135,21 @@ pub(crate) struct ShadowAffinityAssignment {
     pub(crate) input_tokens: u64,
     #[serde(default)]
     pub(crate) cache_read_tokens: u64,
+    #[serde(default)]
+    pub(crate) active_cache_route_state: ActiveCacheRouteState,
+    #[serde(default)]
+    pub(crate) active_cache_route_baseline: ActiveCacheRouteEvidence,
+    #[serde(default)]
+    pub(crate) active_cache_route_candidate: ActiveCacheRouteEvidence,
+    #[serde(default)]
+    pub(crate) active_cache_route_reason: Option<String>,
+    /// Legacy aggregate observations can seed the first post-upgrade scope
+    /// once.  Any scope boundary consumes this forever so pre-boundary
+    /// metrics can never be replayed into a fresh cohort or compaction epoch.
+    #[serde(default)]
+    pub(crate) active_cache_route_legacy_seed_consumed: bool,
+    #[serde(default)]
+    pub(crate) active_cache_route_valid_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +319,10 @@ pub(crate) struct ShadowAffinityStore {
     pub assignments: HashMap<String, ShadowAffinityAssignment>,
     #[serde(default)]
     pub(crate) post_burst: PostBurstEvidenceLedger,
+    /// One owner per exact upstream/key realm keeps the live canary bounded
+    /// without scanning every conversation on the send path.
+    #[serde(default)]
+    pub(crate) active_cache_route_owners: HashMap<String, String>,
     #[serde(skip)]
     assignment_age_index: BTreeSet<(DateTime<Utc>, String)>,
 }
@@ -341,6 +401,189 @@ fn ratio_bps(numerator: u64, denominator: u64) -> u64 {
         return 0;
     }
     ((numerator as u128 * 10_000) / denominator as u128).min(10_000) as u64
+}
+
+/// Compare provider-reported cache ratios without rounding.  One token of
+/// genuine improvement/regression matters to the route lifecycle; bps remain
+/// suitable for dashboards but are too coarse for promotion decisions.
+fn active_cache_route_ratio_is_strictly_lower(
+    left_cache_read_tokens: u64,
+    left_input_tokens: u64,
+    right_cache_read_tokens: u64,
+    right_input_tokens: u64,
+) -> bool {
+    left_input_tokens > 0
+        && right_input_tokens > 0
+        && (left_cache_read_tokens as u128 * right_input_tokens as u128)
+            < (right_cache_read_tokens as u128 * left_input_tokens as u128)
+}
+
+fn active_cache_route_ratio_is_strictly_higher(
+    left_cache_read_tokens: u64,
+    left_input_tokens: u64,
+    right_cache_read_tokens: u64,
+    right_input_tokens: u64,
+) -> bool {
+    active_cache_route_ratio_is_strictly_lower(
+        right_cache_read_tokens,
+        right_input_tokens,
+        left_cache_read_tokens,
+        left_input_tokens,
+    )
+}
+
+fn active_cache_route_ratio_is_below_target(
+    evidence: &ActiveCacheRouteEvidence,
+    target_bps: u64,
+) -> bool {
+    evidence.input_tokens > 0
+        && (evidence.cache_read_tokens as u128 * 10_000)
+            < (evidence.input_tokens as u128 * target_bps as u128)
+}
+
+fn active_cache_route_ttft_p95_ms(evidence: &ActiveCacheRouteEvidence) -> u64 {
+    let mut samples = evidence.ttft_samples.iter().copied().collect::<Vec<_>>();
+    percentile_ms(&mut samples, 95)
+}
+
+fn record_active_cache_route_evidence(
+    evidence: &mut ActiveCacheRouteEvidence,
+    input: ShadowObservationInput,
+) {
+    evidence.observations = evidence.observations.saturating_add(1);
+    evidence.successful_observations = evidence
+        .successful_observations
+        .saturating_add(u64::from(input.success));
+    evidence.multi_attempt_observations = evidence
+        .multi_attempt_observations
+        .saturating_add(u64::from(input.attempt_count.max(1) != 1));
+    if input.success && input.ttft_ms > 0 {
+        evidence.ttft_samples.push_back(input.ttft_ms);
+        while evidence.ttft_samples.len() > ACTIVE_CACHE_ROUTE_TTFT_SAMPLE_LIMIT {
+            evidence.ttft_samples.pop_front();
+        }
+    }
+    if input.has_usage && input.input_tokens > 0 {
+        evidence.usage_observations = evidence.usage_observations.saturating_add(1);
+        evidence.input_tokens = evidence.input_tokens.saturating_add(input.input_tokens);
+        evidence.cache_read_tokens = evidence
+            .cache_read_tokens
+            .saturating_add(input.cache_read_tokens);
+        evidence.avoidable_gap_tokens = evidence
+            .avoidable_gap_tokens
+            .saturating_add(input.avoidable_gap_tokens);
+        evidence.provider_unstable_gap_tokens = evidence
+            .provider_unstable_gap_tokens
+            .saturating_add(input.provider_unstable_gap_tokens);
+    } else {
+        evidence.inconclusive_observations = evidence.inconclusive_observations.saturating_add(1);
+    }
+}
+
+/// Existing releases persisted aggregate shadow observations but not the new
+/// route-specific evidence.  Seed the first baseline from those exact same
+/// upstream usage records so a busy live conversation can be admitted without
+/// making the user create another twenty sessions.  No synthetic usage is
+/// introduced: missing historical TTFT samples simply leave the TTFT guard
+/// inactive until fresh evidence arrives.
+fn seed_active_cache_route_baseline(assignment: &mut ShadowAffinityAssignment) {
+    if assignment.active_cache_route_baseline.observations > 0
+        || assignment.active_cache_route_legacy_seed_consumed
+        || assignment.observations == 0
+    {
+        return;
+    }
+    assignment.active_cache_route_baseline = ActiveCacheRouteEvidence {
+        observations: assignment.observations,
+        successful_observations: assignment.successful_observations,
+        usage_observations: assignment.usage_observations,
+        inconclusive_observations: assignment.inconclusive_observations,
+        input_tokens: assignment.input_tokens,
+        cache_read_tokens: assignment.cache_read_tokens,
+        ..ActiveCacheRouteEvidence::default()
+    };
+    assignment.active_cache_route_legacy_seed_consumed = true;
+}
+
+fn active_cache_route_baseline_is_eligible(evidence: &ActiveCacheRouteEvidence) -> bool {
+    evidence.successful_observations >= ACTIVE_CACHE_ROUTE_MIN_BASELINE_SUCCESSFUL_OBSERVATIONS
+        && evidence.usage_observations >= ACTIVE_CACHE_ROUTE_MIN_BASELINE_USAGE_OBSERVATIONS
+        && evidence.input_tokens >= ACTIVE_CACHE_ROUTE_MIN_BASELINE_INPUT_TOKENS
+        && evidence.multi_attempt_observations == 0
+        && !evidence.ttft_samples.is_empty()
+        && active_cache_route_ratio_is_below_target(evidence, POST_BURST_RESIDUAL_CACHE_GAP_BPS)
+}
+
+fn active_cache_route_is_applied(decision: &ShadowAffinityDecision) -> bool {
+    matches!(
+        decision.decision.as_str(),
+        "active_cache_candidate_applied" | "active_cache_route_promoted"
+    )
+}
+
+fn active_cache_route_rollback_reason(
+    baseline: &ActiveCacheRouteEvidence,
+    candidate: &ActiveCacheRouteEvidence,
+    input: ShadowObservationInput,
+) -> Option<&'static str> {
+    if !input.success {
+        return Some("active_cache_route_upstream_error");
+    }
+    if input.attempt_count.max(1) != 1 {
+        return Some("active_cache_route_attempt_regression");
+    }
+    if !input.has_usage || input.input_tokens == 0 {
+        return (candidate.inconclusive_observations
+            >= ACTIVE_CACHE_ROUTE_MAX_INCONCLUSIVE_OBSERVATIONS)
+            .then_some("active_cache_route_usage_inconclusive");
+    }
+
+    // The route has no semantic effect and must not retain even one genuine
+    // raw cache-ratio loss.  This compares only provider-returned
+    // cached_tokens/input_tokens, never a local "equivalent" estimate.
+    if baseline.input_tokens > 0
+        && active_cache_route_ratio_is_strictly_lower(
+            input.cache_read_tokens,
+            input.input_tokens,
+            baseline.cache_read_tokens,
+            baseline.input_tokens,
+        )
+    {
+        return Some("active_cache_route_raw_cache_regression");
+    }
+
+    let baseline_ttft_p95 = active_cache_route_ttft_p95_ms(baseline);
+    if baseline_ttft_p95 > 0
+        && input.ttft_ms > baseline_ttft_p95.saturating_add(ACTIVE_CACHE_ROUTE_TTFT_REGRESSION_MS)
+        && input.ttft_ms.saturating_mul(10_000)
+            > baseline_ttft_p95.saturating_mul(ACTIVE_CACHE_ROUTE_TTFT_REGRESSION_BPS)
+    {
+        return Some("active_cache_route_ttft_regression");
+    }
+    None
+}
+
+fn reset_active_cache_route(assignment: &mut ShadowAffinityAssignment) {
+    assignment.active_cache_route_state = ActiveCacheRouteState::Baseline;
+    assignment.active_cache_route_baseline = ActiveCacheRouteEvidence::default();
+    assignment.active_cache_route_candidate = ActiveCacheRouteEvidence::default();
+    assignment.active_cache_route_reason = None;
+    assignment.active_cache_route_legacy_seed_consumed = true;
+    assignment.active_cache_route_valid_until = None;
+}
+
+fn clear_active_cache_route_owner(
+    store: &mut ShadowAffinityStore,
+    realm_id: &str,
+    conversation_id: &str,
+) {
+    if store
+        .active_cache_route_owners
+        .get(realm_id)
+        .is_some_and(|owner| owner == conversation_id)
+    {
+        store.active_cache_route_owners.remove(realm_id);
+    }
 }
 
 fn cacheable_input_tokens_128(input_tokens: u64) -> u64 {
@@ -576,6 +819,83 @@ fn rebuild_assignment_age_index(store: &mut ShadowAffinityStore) {
     );
 }
 
+/// Reconstruct the bounded live-route ownership index only during state
+/// preparation.  Normal request processing performs O(1) lookups and never
+/// scans all assignments to decide whether it may send upstream.
+fn rebuild_active_cache_route_owners(store: &mut ShadowAffinityStore, now: DateTime<Utc>) {
+    store.active_cache_route_owners.clear();
+    let mut expired_or_unleased = Vec::new();
+    let mut candidates = store
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            matches!(
+                assignment.active_cache_route_state,
+                ActiveCacheRouteState::Candidate | ActiveCacheRouteState::Promoted
+            ) && assignment
+                .active_cache_route_valid_until
+                .is_some_and(|valid_until| valid_until > now)
+        })
+        .map(|(conversation_id, assignment)| {
+            (
+                assignment.realm_id.clone(),
+                assignment.last_seen_at,
+                conversation_id.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    expired_or_unleased.extend(
+        store
+            .assignments
+            .iter()
+            .filter(|(_, assignment)| {
+                matches!(
+                    assignment.active_cache_route_state,
+                    ActiveCacheRouteState::Candidate | ActiveCacheRouteState::Promoted
+                ) && assignment
+                    .active_cache_route_valid_until
+                    .is_none_or(|valid_until| valid_until <= now)
+            })
+            .map(|(conversation_id, _)| conversation_id.clone()),
+    );
+    // Prefer the most recently active owner if a stale/corrupt persisted file
+    // contains two candidates for one realm.  The loser fails closed instead
+    // of silently producing two live placement routes after a restart.
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    let mut conflicting_candidates = Vec::new();
+    for (realm_id, _, conversation_id) in candidates {
+        if store.active_cache_route_owners.contains_key(&realm_id) {
+            conflicting_candidates.push(conversation_id);
+        } else {
+            store
+                .active_cache_route_owners
+                .insert(realm_id, conversation_id);
+        }
+    }
+    expired_or_unleased.extend(conflicting_candidates);
+    for conversation_id in expired_or_unleased {
+        if let Some(assignment) = store.assignments.get_mut(&conversation_id) {
+            let owner_conflict = assignment
+                .active_cache_route_valid_until
+                .is_some_and(|valid_until| valid_until > now);
+            reset_active_cache_route(assignment);
+            assignment.active_cache_route_reason = Some(
+                if owner_conflict {
+                    "active_cache_route_owner_conflict_after_restore"
+                } else {
+                    "active_cache_route_lease_expired_after_restore"
+                }
+                .to_string(),
+            );
+        }
+    }
+}
+
 fn ensure_assignment_age_index(store: &mut ShadowAffinityStore) {
     if store.assignment_age_index.len() != store.assignments.len() {
         rebuild_assignment_age_index(store);
@@ -599,10 +919,12 @@ fn ensure_post_burst_window_age_index(ledger: &mut PostBurstEvidenceLedger) {
 }
 
 pub(crate) fn prepare_shadow_affinity_store(store: &mut ShadowAffinityStore) {
+    let now = Utc::now();
     rebuild_assignment_age_index(store);
+    rebuild_active_cache_route_owners(store, now);
     rebuild_post_burst_window_age_index(&mut store.post_burst);
     rebuild_evidence_scope_index(&mut store.post_burst);
-    evict_assignments(store, Utc::now());
+    evict_assignments(store, now);
 }
 
 fn remove_post_burst_window(
@@ -740,6 +1062,7 @@ fn remove_assignment(
     store
         .assignment_age_index
         .remove(&(assignment.last_seen_at, conversation_id.to_string()));
+    clear_active_cache_route_owner(store, &assignment.realm_id, conversation_id);
     remove_post_burst_window(&mut store.post_burst, conversation_id);
     Some(assignment)
 }
@@ -1554,6 +1877,207 @@ fn forced_isolated_candidate_variant() -> Option<ShadowCacheCandidateVariant> {
     }
 }
 
+/// Admit (or resume) a production cache-placement candidate for the current
+/// exact scope. It is an explicitly single-scope, time-bounded canary: one
+/// owner per realm and no automatic cohort-wide rollout. Callers must already
+/// have established that the client did not supply a cache key. This function
+/// is synchronous and intended to run only while a caller holds a `try_lock`;
+/// it never waits for disk, another request, or upstream I/O.
+pub(super) fn admit_active_cache_route(
+    store: &mut ShadowAffinityStore,
+    decision: &mut ShadowAffinityDecision,
+    provider_route_eligible: bool,
+    provider_prompt_cache_key_verified: bool,
+    now: DateTime<Utc>,
+) -> bool {
+    if !provider_route_eligible {
+        return false;
+    }
+    if !decision.trusted_identity || decision.lane != ShadowCacheLane::Steady {
+        return false;
+    }
+    let Some(conversation_id) = decision.assignment_key.as_deref() else {
+        return false;
+    };
+
+    let expired_route = store
+        .assignments
+        .get(conversation_id)
+        .is_some_and(|assignment| {
+            matches!(
+                assignment.active_cache_route_state,
+                ActiveCacheRouteState::Candidate | ActiveCacheRouteState::Promoted
+            ) && assignment
+                .active_cache_route_valid_until
+                .is_some_and(|valid_until| valid_until <= now)
+        });
+    if expired_route {
+        let realm_id = store
+            .assignments
+            .get(conversation_id)
+            .map(|assignment| assignment.realm_id.clone());
+        if let Some(assignment) = store.assignments.get_mut(conversation_id) {
+            reset_active_cache_route(assignment);
+            assignment.active_cache_route_reason =
+                Some("active_cache_route_lease_expired".to_string());
+        }
+        if let Some(realm_id) = realm_id {
+            clear_active_cache_route_owner(store, &realm_id, conversation_id);
+        }
+        decision.arm = ShadowAffinityArm::Baseline;
+        decision.skip_reason = Some("active_cache_route_lease_expired".to_string());
+        return false;
+    }
+
+    let owner = store
+        .active_cache_route_owners
+        .get(&decision.realm_id)
+        .cloned();
+    let (state, claim_owner) = {
+        let Some(assignment) = store.assignments.get_mut(conversation_id) else {
+            decision.skip_reason = Some("active_cache_route_assignment_missing".to_string());
+            return false;
+        };
+        if assignment.realm_id != decision.realm_id
+            || assignment.cohort_id != decision.cohort_id
+            || assignment.anchor_epoch != decision.anchor_epoch
+        {
+            decision.skip_reason = Some("active_cache_route_scope_changed".to_string());
+            return false;
+        }
+        seed_active_cache_route_baseline(assignment);
+        if !provider_prompt_cache_key_verified
+            && assignment.active_cache_route_baseline.cache_read_tokens == 0
+        {
+            decision.skip_reason =
+                Some("active_cache_route_prompt_cache_key_unverified".to_string());
+            return false;
+        }
+        match assignment.active_cache_route_state {
+            ActiveCacheRouteState::Baseline => {
+                if !active_cache_route_baseline_is_eligible(&assignment.active_cache_route_baseline)
+                {
+                    decision.skip_reason =
+                        Some("active_cache_route_baseline_insufficient".to_string());
+                    return false;
+                }
+                if owner
+                    .as_deref()
+                    .is_some_and(|current_owner| current_owner != conversation_id)
+                {
+                    decision.skip_reason = Some("active_cache_route_realm_busy".to_string());
+                    return false;
+                }
+                assignment.active_cache_route_state = ActiveCacheRouteState::Candidate;
+                assignment.active_cache_route_candidate = ActiveCacheRouteEvidence::default();
+                assignment.active_cache_route_reason =
+                    Some("active_cache_route_collecting".to_string());
+                assignment.active_cache_route_valid_until =
+                    Some(now + Duration::hours(ACTIVE_CACHE_ROUTE_LEASE_HOURS));
+                (ActiveCacheRouteState::Candidate, true)
+            }
+            ActiveCacheRouteState::Candidate | ActiveCacheRouteState::Promoted => {
+                if owner
+                    .as_deref()
+                    .is_some_and(|current_owner| current_owner != conversation_id)
+                {
+                    decision.skip_reason = Some("active_cache_route_realm_busy".to_string());
+                    return false;
+                }
+                if assignment.active_cache_route_valid_until.is_none() {
+                    assignment.active_cache_route_valid_until =
+                        Some(now + Duration::hours(ACTIVE_CACHE_ROUTE_LEASE_HOURS));
+                }
+                (assignment.active_cache_route_state, owner.is_none())
+            }
+            ActiveCacheRouteState::RolledBack => {
+                decision.arm = ShadowAffinityArm::Baseline;
+                decision.skip_reason = Some("active_cache_route_rolled_back".to_string());
+                return false;
+            }
+        }
+    };
+    if claim_owner {
+        store
+            .active_cache_route_owners
+            .insert(decision.realm_id.clone(), conversation_id.to_string());
+    }
+
+    decision.candidate_variant = ShadowCacheCandidateVariant::CohortKey;
+    decision.arm = ShadowAffinityArm::Candidate;
+    decision.mode = "applied".to_string();
+    decision.decision = match state {
+        ActiveCacheRouteState::Candidate => "active_cache_candidate_applied",
+        ActiveCacheRouteState::Promoted => "active_cache_route_promoted",
+        ActiveCacheRouteState::Baseline | ActiveCacheRouteState::RolledBack => unreachable!(),
+    }
+    .to_string();
+    decision.skip_reason = None;
+    true
+}
+
+fn observe_active_cache_route(
+    store: &mut ShadowAffinityStore,
+    decision: &ShadowAffinityDecision,
+    input: ShadowObservationInput,
+    now: DateTime<Utc>,
+) {
+    let Some(conversation_id) = decision.assignment_key.as_deref() else {
+        return;
+    };
+    let mut release_owner = None;
+    {
+        let Some(assignment) = store.assignments.get_mut(conversation_id) else {
+            return;
+        };
+        if assignment.realm_id != decision.realm_id {
+            return;
+        }
+        if active_cache_route_is_applied(decision) {
+            record_active_cache_route_evidence(&mut assignment.active_cache_route_candidate, input);
+            let rollback = active_cache_route_rollback_reason(
+                &assignment.active_cache_route_baseline,
+                &assignment.active_cache_route_candidate,
+                input,
+            );
+            if let Some(reason) = rollback {
+                assignment.active_cache_route_state = ActiveCacheRouteState::RolledBack;
+                assignment.active_cache_route_reason = Some(reason.to_string());
+                release_owner = Some(assignment.realm_id.clone());
+            } else if assignment.active_cache_route_state == ActiveCacheRouteState::Candidate
+                && assignment
+                    .active_cache_route_candidate
+                    .successful_observations
+                    >= ACTIVE_CACHE_ROUTE_MIN_CANDIDATE_SUCCESSFUL_OBSERVATIONS
+            {
+                if active_cache_route_ratio_is_strictly_higher(
+                    assignment.active_cache_route_candidate.cache_read_tokens,
+                    assignment.active_cache_route_candidate.input_tokens,
+                    assignment.active_cache_route_baseline.cache_read_tokens,
+                    assignment.active_cache_route_baseline.input_tokens,
+                ) {
+                    assignment.active_cache_route_state = ActiveCacheRouteState::Promoted;
+                    assignment.active_cache_route_reason =
+                        Some("active_cache_route_positive_raw_cache_gain".to_string());
+                    assignment.active_cache_route_valid_until =
+                        Some(now + Duration::hours(ACTIVE_CACHE_ROUTE_LEASE_HOURS));
+                } else {
+                    assignment.active_cache_route_state = ActiveCacheRouteState::RolledBack;
+                    assignment.active_cache_route_reason =
+                        Some("active_cache_route_no_positive_raw_cache_gain".to_string());
+                    release_owner = Some(assignment.realm_id.clone());
+                }
+            }
+        } else if assignment.active_cache_route_state == ActiveCacheRouteState::Baseline {
+            record_active_cache_route_evidence(&mut assignment.active_cache_route_baseline, input);
+            assignment.active_cache_route_legacy_seed_consumed = true;
+        }
+    }
+    if let Some(realm_id) = release_owner {
+        clear_active_cache_route_owner(store, &realm_id, conversation_id);
+    }
+}
+
 pub(super) fn compute_shadow_affinity(
     store: &mut ShadowAffinityStore,
     identity: &AffinityIdentity,
@@ -1632,7 +2156,16 @@ pub(super) fn compute_shadow_affinity(
             .assignment_age_index
             .remove(&(previous_last_seen_at, conversation_id.clone()));
     }
-    let (realm_id, cohort_id, assignment_lane, arm, shard, policy_epoch, anchor_epoch) = {
+    let (
+        realm_id,
+        cohort_id,
+        assignment_lane,
+        arm,
+        shard,
+        policy_epoch,
+        anchor_epoch,
+        active_cache_route_scope_reset,
+    ) = {
         let assignment = store
             .assignments
             .entry(conversation_id.clone())
@@ -1657,11 +2190,23 @@ pub(super) fn compute_shadow_affinity(
                 inconclusive_observations: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                active_cache_route_state: ActiveCacheRouteState::Baseline,
+                active_cache_route_baseline: ActiveCacheRouteEvidence::default(),
+                active_cache_route_candidate: ActiveCacheRouteEvidence::default(),
+                active_cache_route_reason: None,
+                active_cache_route_legacy_seed_consumed: false,
+                active_cache_route_valid_until: None,
             });
         assignment.last_seen_at = now;
+        let cohort_changed = assignment.cohort_id != identity.cohort_id;
+        if cohort_changed {
+            reset_active_cache_route(assignment);
+        }
         assignment.cohort_id = identity.cohort_id.clone();
         assignment.realm_id = identity.realm_id.clone();
-        if giant_tail && assignment.lane == ShadowCacheLane::Steady {
+        let giant_tail_scope_reset = giant_tail && assignment.lane == ShadowCacheLane::Steady;
+        if giant_tail_scope_reset {
+            reset_active_cache_route(assignment);
             assignment.lane = ShadowCacheLane::ToolBurstQuarantine;
         }
         (
@@ -1672,11 +2217,16 @@ pub(super) fn compute_shadow_affinity(
             assignment.shard,
             assignment.policy_epoch,
             assignment.anchor_epoch,
+            cohort_changed || giant_tail_scope_reset,
         )
     };
     store
         .assignment_age_index
         .insert((now, conversation_id.clone()));
+    if active_cache_route_scope_reset {
+        clear_active_cache_route_owner(store, &realm_id, &conversation_id);
+        remove_post_burst_window(&mut store.post_burst, &conversation_id);
+    }
     let active_window = active_post_burst_window_for_scope(
         &mut store.post_burst,
         &conversation_id,
@@ -1989,6 +2539,7 @@ pub(super) fn observe_shadow_affinity(
         }
     }
     store.assignment_age_index.insert((now, key.to_string()));
+    observe_active_cache_route(store, decision, input, now);
     observe_post_burst_evidence(&mut store.post_burst, decision, input, now);
     maintain_shadow_affinity_after_settlement(store, now);
 }
@@ -2011,6 +2562,7 @@ pub(super) fn reset_anchor(
             .assignments
             .get_mut(conversation_id)
             .expect("checked above");
+        reset_active_cache_route(assignment);
         assignment.anchor_epoch = assignment.anchor_epoch.saturating_add(1);
         assignment.lane = ShadowCacheLane::CompactedAnchor;
         assignment.last_seen_at = now;
@@ -2023,6 +2575,7 @@ pub(super) fn reset_anchor(
         None
     };
     if let Some((realm_id, policy_epoch, anchor_epoch)) = opened {
+        clear_active_cache_route_owner(store, &realm_id, conversation_id);
         store
             .assignment_age_index
             .insert((now, conversation_id.to_string()));
@@ -4103,6 +4656,12 @@ mod tests {
                     inconclusive_observations: 0,
                     input_tokens: 0,
                     cache_read_tokens: 0,
+                    active_cache_route_state: ActiveCacheRouteState::Baseline,
+                    active_cache_route_baseline: ActiveCacheRouteEvidence::default(),
+                    active_cache_route_candidate: ActiveCacheRouteEvidence::default(),
+                    active_cache_route_reason: None,
+                    active_cache_route_legacy_seed_consumed: false,
+                    active_cache_route_valid_until: None,
                 },
             );
         }
@@ -4277,6 +4836,12 @@ mod tests {
                     inconclusive_observations: 0,
                     input_tokens: 0,
                     cache_read_tokens: 0,
+                    active_cache_route_state: ActiveCacheRouteState::Baseline,
+                    active_cache_route_baseline: ActiveCacheRouteEvidence::default(),
+                    active_cache_route_candidate: ActiveCacheRouteEvidence::default(),
+                    active_cache_route_reason: None,
+                    active_cache_route_legacy_seed_consumed: false,
+                    active_cache_route_valid_until: None,
                 },
             );
         }
@@ -4332,6 +4897,12 @@ mod tests {
                 inconclusive_observations: 0,
                 input_tokens: 0,
                 cache_read_tokens: 0,
+                active_cache_route_state: ActiveCacheRouteState::Baseline,
+                active_cache_route_baseline: ActiveCacheRouteEvidence::default(),
+                active_cache_route_candidate: ActiveCacheRouteEvidence::default(),
+                active_cache_route_reason: None,
+                active_cache_route_legacy_seed_consumed: false,
+                active_cache_route_valid_until: None,
             },
         );
         store.post_burst.windows.insert(
@@ -4677,5 +5248,540 @@ mod tests {
 
         assert_eq!(restored.evidence_generation, 0);
         assert_eq!(restored.valid_until, None);
+    }
+
+    #[test]
+    fn active_cache_route_fields_default_for_pre_route_runtime_state() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let decision =
+            compute_shadow_affinity(&mut store, &identity("legacy-route"), None, now, 0, 0);
+        let assignment = store.assignments[decision.assignment_key.as_deref().unwrap()].clone();
+        let mut legacy = serde_json::to_value(assignment).unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("active_cache_route_state");
+        legacy.remove("active_cache_route_baseline");
+        legacy.remove("active_cache_route_candidate");
+        legacy.remove("active_cache_route_reason");
+        legacy.remove("active_cache_route_legacy_seed_consumed");
+        legacy.remove("active_cache_route_valid_until");
+
+        let restored: ShadowAffinityAssignment =
+            serde_json::from_value(serde_json::Value::Object(legacy.clone())).unwrap();
+        assert_eq!(
+            restored.active_cache_route_state,
+            ActiveCacheRouteState::Baseline
+        );
+        assert_eq!(restored.active_cache_route_baseline.observations, 0);
+        assert_eq!(restored.active_cache_route_candidate.observations, 0);
+        assert_eq!(restored.active_cache_route_reason, None);
+        assert!(!restored.active_cache_route_legacy_seed_consumed);
+        assert_eq!(restored.active_cache_route_valid_until, None);
+    }
+
+    #[test]
+    fn active_cache_route_restore_keeps_one_owner_per_realm() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let first =
+            compute_shadow_affinity(&mut store, &identity("restore-first"), None, now, 0, 0);
+        let second = compute_shadow_affinity(
+            &mut store,
+            &identity("restore-second"),
+            None,
+            now + Duration::seconds(1),
+            0,
+            0,
+        );
+        let first_key = first.assignment_key.unwrap();
+        let second_key = second.assignment_key.unwrap();
+        store
+            .assignments
+            .get_mut(&first_key)
+            .unwrap()
+            .active_cache_route_state = ActiveCacheRouteState::Candidate;
+        store
+            .assignments
+            .get_mut(&first_key)
+            .unwrap()
+            .active_cache_route_valid_until = Some(now + Duration::hours(1));
+        store
+            .assignments
+            .get_mut(&second_key)
+            .unwrap()
+            .active_cache_route_state = ActiveCacheRouteState::Promoted;
+        store
+            .assignments
+            .get_mut(&second_key)
+            .unwrap()
+            .active_cache_route_valid_until = Some(now + Duration::hours(1));
+        store.active_cache_route_owners.clear();
+
+        prepare_shadow_affinity_store(&mut store);
+
+        assert_eq!(store.active_cache_route_owners.len(), 1);
+        assert_eq!(
+            store.active_cache_route_owners.values().next(),
+            Some(&second_key)
+        );
+        assert_eq!(
+            store.assignments[&first_key].active_cache_route_state,
+            ActiveCacheRouteState::Baseline
+        );
+        assert_eq!(
+            store.assignments[&first_key]
+                .active_cache_route_reason
+                .as_deref(),
+            Some("active_cache_route_owner_conflict_after_restore")
+        );
+        assert_eq!(
+            store.assignments[&second_key].active_cache_route_state,
+            ActiveCacheRouteState::Promoted
+        );
+    }
+
+    #[test]
+    fn active_cache_route_resets_on_stable_prefix_scope_change() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "cohort-change", now);
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            true,
+            now,
+        ));
+        observe_shadow_affinity(
+            &mut store,
+            &decision,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 96_000,
+                status: 200,
+                ttft_ms: 450,
+                attempt_count: 1,
+                ..ShadowObservationInput::default()
+            },
+            now + Duration::seconds(1),
+        );
+
+        let mut changed_identity = identity("cohort-change");
+        changed_identity.cohort_id = "different-stable-prefix".to_string();
+        let reset = compute_shadow_affinity(
+            &mut store,
+            &changed_identity,
+            None,
+            now + Duration::seconds(2),
+            0,
+            0,
+        );
+        let assignment_key = reset.assignment_key.as_deref().unwrap();
+        let assignment = &store.assignments[assignment_key];
+        assert_eq!(assignment.cohort_id, changed_identity.cohort_id);
+        assert_eq!(
+            assignment.active_cache_route_state,
+            ActiveCacheRouteState::Baseline
+        );
+        assert_eq!(assignment.active_cache_route_baseline.observations, 0);
+        assert_eq!(assignment.active_cache_route_candidate.observations, 0);
+        assert!(assignment.active_cache_route_legacy_seed_consumed);
+        assert!(store.active_cache_route_owners.is_empty());
+
+        let mut no_reuse = reset.clone();
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut no_reuse,
+            true,
+            true,
+            now + Duration::seconds(2),
+        ));
+        assert_eq!(
+            no_reuse.skip_reason.as_deref(),
+            Some("active_cache_route_baseline_insufficient")
+        );
+    }
+
+    #[test]
+    fn active_cache_route_compaction_never_reseeds_old_epoch_usage() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let decision = active_cache_route_baseline(&mut store, "compaction-seed", now);
+        let assignment_key = decision.assignment_key.clone().unwrap();
+        let old_observations = store.assignments[&assignment_key].observations;
+
+        reset_anchor(&mut store, &assignment_key, now + Duration::seconds(1));
+        remove_post_burst_window(&mut store.post_burst, &assignment_key);
+        store.assignments.get_mut(&assignment_key).unwrap().lane = ShadowCacheLane::Steady;
+        let mut post_compaction = compute_shadow_affinity(
+            &mut store,
+            &identity("compaction-seed"),
+            None,
+            now + Duration::seconds(2),
+            0,
+            0,
+        );
+        assert_eq!(
+            store.assignments[&assignment_key].observations,
+            old_observations
+        );
+        assert_eq!(
+            store.assignments[&assignment_key]
+                .active_cache_route_baseline
+                .observations,
+            0
+        );
+        assert!(store.assignments[&assignment_key].active_cache_route_legacy_seed_consumed);
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut post_compaction,
+            true,
+            true,
+            now + Duration::seconds(2),
+        ));
+        assert_eq!(
+            post_compaction.skip_reason.as_deref(),
+            Some("active_cache_route_baseline_insufficient")
+        );
+    }
+
+    #[test]
+    fn active_cache_route_compares_raw_cache_ratios_without_bps_rounding() {
+        assert!(active_cache_route_ratio_is_strictly_higher(
+            950_001, 1_000_000, 950_000, 1_000_000
+        ));
+        assert!(active_cache_route_ratio_is_strictly_lower(
+            950_000, 1_000_000, 950_001, 1_000_000
+        ));
+        assert!(!active_cache_route_ratio_is_strictly_higher(
+            950_000, 1_000_000, 950_000, 1_000_000
+        ));
+    }
+
+    #[test]
+    fn active_cache_route_lease_expires_instead_of_becoming_a_permanent_rollout() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "lease-expiry", now);
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            true,
+            now,
+        ));
+        let mut expired = decision.clone();
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut expired,
+            true,
+            true,
+            now + Duration::hours(ACTIVE_CACHE_ROUTE_LEASE_HOURS) + Duration::seconds(1),
+        ));
+        let assignment = &store.assignments[decision.assignment_key.as_deref().unwrap()];
+        assert_eq!(
+            assignment.active_cache_route_state,
+            ActiveCacheRouteState::Baseline
+        );
+        assert_eq!(
+            assignment.active_cache_route_reason.as_deref(),
+            Some("active_cache_route_lease_expired")
+        );
+        assert!(store.active_cache_route_owners.is_empty());
+    }
+
+    #[test]
+    fn unverified_prompt_cache_key_requires_real_cache_usage_before_live_routing() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "unverified-key", now);
+        let assignment_key = decision.assignment_key.as_deref().unwrap();
+        store
+            .assignments
+            .get_mut(assignment_key)
+            .unwrap()
+            .active_cache_route_baseline
+            .cache_read_tokens = 0;
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            false,
+            now,
+        ));
+        assert_eq!(
+            decision.skip_reason.as_deref(),
+            Some("active_cache_route_prompt_cache_key_unverified")
+        );
+    }
+
+    fn active_cache_route_baseline(
+        store: &mut ShadowAffinityStore,
+        thread: &str,
+        now: DateTime<Utc>,
+    ) -> ShadowAffinityDecision {
+        let identity = identity(thread);
+        for index in 0..4 {
+            let decision = compute_shadow_affinity(
+                store,
+                &identity,
+                None,
+                now + Duration::seconds(index),
+                0,
+                0,
+            );
+            observe_shadow_affinity(
+                store,
+                &decision,
+                ShadowObservationInput {
+                    success: true,
+                    has_usage: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 95_000,
+                    status: 200,
+                    ttft_ms: 500,
+                    attempt_count: 1,
+                    ..ShadowObservationInput::default()
+                },
+                now + Duration::seconds(index),
+            );
+        }
+        compute_shadow_affinity(store, &identity, None, now + Duration::seconds(5), 0, 0)
+    }
+
+    #[test]
+    fn active_cache_route_admits_an_existing_live_scope_without_new_conversations() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "active-route", now);
+
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            true,
+            now,
+        ));
+        assert_eq!(decision.mode, "applied");
+        assert_eq!(decision.decision, "active_cache_candidate_applied");
+        assert_eq!(decision.arm, ShadowAffinityArm::Candidate);
+        assert!(static_cohort_prompt_cache_key(&decision).is_some());
+    }
+
+    #[test]
+    fn active_cache_route_limits_live_exposure_to_one_scope_per_realm() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut first = active_cache_route_baseline(&mut store, "single-scope-first", now);
+        let mut second = active_cache_route_baseline(
+            &mut store,
+            "single-scope-second",
+            now + Duration::minutes(1),
+        );
+
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut first,
+            true,
+            true,
+            now + Duration::minutes(1),
+        ));
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut second,
+            true,
+            true,
+            now + Duration::minutes(1),
+        ));
+        assert_eq!(
+            second.skip_reason.as_deref(),
+            Some("active_cache_route_realm_busy")
+        );
+        assert_eq!(store.active_cache_route_owners.len(), 1);
+    }
+
+    #[test]
+    fn active_cache_route_immediately_rolls_back_a_raw_cache_regression() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "active-route-rollback", now);
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            true,
+            now,
+        ));
+
+        observe_shadow_affinity(
+            &mut store,
+            &decision,
+            ShadowObservationInput {
+                success: true,
+                has_usage: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 94_000,
+                status: 200,
+                ttft_ms: 500,
+                attempt_count: 1,
+                ..ShadowObservationInput::default()
+            },
+            now + Duration::seconds(6),
+        );
+
+        let assignment_key = decision.assignment_key.as_deref().unwrap();
+        assert_eq!(
+            store.assignments[assignment_key].active_cache_route_state,
+            ActiveCacheRouteState::RolledBack
+        );
+        let mut next = compute_shadow_affinity(
+            &mut store,
+            &identity("active-route-rollback"),
+            None,
+            now + Duration::seconds(7),
+            0,
+            0,
+        );
+        assert!(!admit_active_cache_route(
+            &mut store,
+            &mut next,
+            true,
+            true,
+            now + Duration::seconds(7),
+        ));
+        assert_eq!(
+            next.skip_reason.as_deref(),
+            Some("active_cache_route_rolled_back")
+        );
+    }
+
+    #[test]
+    fn active_cache_route_immediately_rolls_back_errors_ttft_and_attempt_regressions() {
+        let now = Utc::now();
+        for (suffix, input, expected_reason) in [
+            (
+                "error",
+                ShadowObservationInput {
+                    success: false,
+                    has_usage: false,
+                    status: 502,
+                    ttft_ms: 500,
+                    attempt_count: 1,
+                    ..ShadowObservationInput::default()
+                },
+                "active_cache_route_upstream_error",
+            ),
+            (
+                "ttft",
+                ShadowObservationInput {
+                    success: true,
+                    has_usage: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 96_000,
+                    status: 200,
+                    ttft_ms: 1_100,
+                    attempt_count: 1,
+                    ..ShadowObservationInput::default()
+                },
+                "active_cache_route_ttft_regression",
+            ),
+            (
+                "attempt",
+                ShadowObservationInput {
+                    success: true,
+                    has_usage: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 96_000,
+                    status: 200,
+                    ttft_ms: 500,
+                    attempt_count: 2,
+                    ..ShadowObservationInput::default()
+                },
+                "active_cache_route_attempt_regression",
+            ),
+        ] {
+            let mut store = ShadowAffinityStore::default();
+            let thread = format!("active-route-{suffix}");
+            let mut decision = active_cache_route_baseline(&mut store, &thread, now);
+            assert!(admit_active_cache_route(
+                &mut store,
+                &mut decision,
+                true,
+                true,
+                now,
+            ));
+            observe_shadow_affinity(&mut store, &decision, input, now + Duration::seconds(1));
+            let assignment = store.assignments[decision.assignment_key.as_deref().unwrap()].clone();
+            assert_eq!(
+                assignment.active_cache_route_state,
+                ActiveCacheRouteState::RolledBack
+            );
+            assert_eq!(
+                assignment.active_cache_route_reason.as_deref(),
+                Some(expected_reason)
+            );
+        }
+    }
+
+    #[test]
+    fn active_cache_route_promotes_only_after_eighteen_strictly_positive_samples() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let mut decision = active_cache_route_baseline(&mut store, "active-route-promote", now);
+        assert!(admit_active_cache_route(
+            &mut store,
+            &mut decision,
+            true,
+            true,
+            now,
+        ));
+
+        for index in 0..18 {
+            let at = now + Duration::seconds(6 + index);
+            let mut current = if index == 0 {
+                decision.clone()
+            } else {
+                compute_shadow_affinity(
+                    &mut store,
+                    &identity("active-route-promote"),
+                    None,
+                    at,
+                    0,
+                    0,
+                )
+            };
+            if index > 0 {
+                assert!(admit_active_cache_route(
+                    &mut store,
+                    &mut current,
+                    true,
+                    true,
+                    at,
+                ));
+            }
+            observe_shadow_affinity(
+                &mut store,
+                &current,
+                ShadowObservationInput {
+                    success: true,
+                    has_usage: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 96_000,
+                    status: 200,
+                    ttft_ms: 450,
+                    attempt_count: 1,
+                    ..ShadowObservationInput::default()
+                },
+                at,
+            );
+        }
+
+        let assignment_key = decision.assignment_key.as_deref().unwrap();
+        assert_eq!(
+            store.assignments[assignment_key].active_cache_route_state,
+            ActiveCacheRouteState::Promoted
+        );
     }
 }

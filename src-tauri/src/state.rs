@@ -1649,6 +1649,12 @@ mod tests {
                         inconclusive_observations: 0,
                         input_tokens: 131_072,
                         cache_read_tokens: 130_560,
+                        active_cache_route_state: Default::default(),
+                        active_cache_route_baseline: Default::default(),
+                        active_cache_route_candidate: Default::default(),
+                        active_cache_route_reason: None,
+                        active_cache_route_legacy_seed_consumed: false,
+                        active_cache_route_valid_until: None,
                     },
                 );
             }
@@ -2228,6 +2234,12 @@ mod tests {
                 inconclusive_observations: 1,
                 input_tokens: 12_000,
                 cache_read_tokens: 10_000,
+                active_cache_route_state: Default::default(),
+                active_cache_route_baseline: Default::default(),
+                active_cache_route_candidate: Default::default(),
+                active_cache_route_reason: None,
+                active_cache_route_legacy_seed_consumed: false,
+                active_cache_route_valid_until: None,
             },
         );
         shadow_affinity.post_burst.next_window_id = 7;
