@@ -87,6 +87,8 @@ pub struct AppConfig {
     pub proxy_mode_host: String,
     #[serde(default = "default_proxy_mode_port")]
     pub proxy_mode_port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy_url: Option<String>,
     pub local_key: String,
     pub default_channel: Channel,
     #[serde(default)]
@@ -884,6 +886,7 @@ pub struct PublicConfig {
     pub proxy_auto_start: bool,
     pub proxy_mode_host: String,
     pub proxy_mode_port: u16,
+    pub upstream_proxy_url: Option<String>,
     pub local_key: String,
     pub default_channel: Channel,
     pub active_provider_id: Option<String>,
@@ -914,6 +917,7 @@ impl Default for AppConfig {
             proxy_auto_start: default_proxy_auto_start(),
             proxy_mode_host: default_proxy_mode_host(),
             proxy_mode_port: default_proxy_mode_port(),
+            upstream_proxy_url: None,
             local_key,
             default_channel: Channel::Anthropic,
             active_provider_id: None,
@@ -966,6 +970,12 @@ fn proxy_bind_conflicts(host: &str, port: u16, other_host: &str, other_port: u16
     Ok(ip == other_ip || ip.is_unspecified() || other_ip.is_unspecified())
 }
 impl AppConfig {
+    pub fn upstream_proxy_url_for(&self, use_system_proxy: bool) -> Option<&str> {
+        use_system_proxy
+            .then_some(self.upstream_proxy_url.as_deref())
+            .flatten()
+    }
+
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let raw = fs::read_to_string(path)
@@ -1045,6 +1055,7 @@ impl AppConfig {
             proxy_auto_start: self.proxy_auto_start,
             proxy_mode_host: self.proxy_mode_host.clone(),
             proxy_mode_port: self.proxy_mode_port,
+            upstream_proxy_url: self.upstream_proxy_url.clone(),
             local_key: self.local_key.clone(),
             default_channel: self.default_channel.clone(),
             active_provider_id: self.active_provider_id.clone(),
@@ -2279,6 +2290,31 @@ fn clean_optional_string(value: Option<String>) -> Option<String> {
         .filter(|item| !item.is_empty())
 }
 
+pub fn normalize_upstream_proxy_url(value: Option<String>) -> Result<Option<String>> {
+    let Some(value) = clean_optional_string(value) else {
+        return Ok(None);
+    };
+    let parsed =
+        reqwest::Url::parse(&value).with_context(|| "explicit upstream proxy URL is invalid")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(anyhow!(
+            "explicit upstream proxy URL must use http:// or https:// and include a host"
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!(
+            "proxy credentials must not be embedded in the explicit upstream proxy URL"
+        ));
+    }
+    if !matches!(parsed.path(), "" | "/") || parsed.query().is_some() || parsed.fragment().is_some()
+    {
+        return Err(anyhow!(
+            "explicit upstream proxy URL must not contain a path, query, or fragment"
+        ));
+    }
+    Ok(Some(value))
+}
+
 fn public_agent_local_key(local_key: &str, agent_id: &str) -> Option<String> {
     if local_key.trim().is_empty() {
         return None;
@@ -2504,6 +2540,37 @@ fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_upstream_proxy_url_is_optional_and_strictly_validated() {
+        assert_eq!(normalize_upstream_proxy_url(None).unwrap(), None);
+        assert_eq!(
+            normalize_upstream_proxy_url(Some("  http://127.0.0.1:7897  ".to_string()))
+                .unwrap()
+                .as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+        assert!(normalize_upstream_proxy_url(Some("socks5://127.0.0.1:7897".to_string())).is_err());
+        assert!(normalize_upstream_proxy_url(Some(
+            "http://user:secret@127.0.0.1:7897".to_string()
+        ))
+        .is_err());
+        assert!(normalize_upstream_proxy_url(Some(
+            "http://127.0.0.1:7897/?token=secret".to_string()
+        ))
+        .is_err());
+        assert!(
+            normalize_upstream_proxy_url(Some("http://127.0.0.1:7897/proxy".to_string())).is_err()
+        );
+
+        let mut config = AppConfig::default();
+        config.upstream_proxy_url = Some("http://127.0.0.1:7897".to_string());
+        assert_eq!(config.upstream_proxy_url_for(false), None);
+        assert_eq!(
+            config.upstream_proxy_url_for(true),
+            Some("http://127.0.0.1:7897")
+        );
+    }
 
     fn test_response_session_capability(
         key_realm_id: &str,

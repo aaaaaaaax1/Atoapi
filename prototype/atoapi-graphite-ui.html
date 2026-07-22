@@ -796,7 +796,7 @@
     .overview-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.1fr) minmax(260px, 0.9fr);
-      min-height: 250px;
+      min-height: 280px;
     }
 
     .overview-section {
@@ -5533,6 +5533,34 @@
 
     .model-candidate-panel .secondary-button { min-height: 32px; }
 
+    .compatibility-model-control {
+      margin: 10px 0 12px;
+    }
+
+    .compatibility-model-field > label {
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .compatibility-model-input-row {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .compatibility-model-input-row .secondary-button {
+      min-height: 38px;
+      height: 38px;
+    }
+
+    .compatibility-model-hint {
+      color: var(--faint);
+      font-size: 10px;
+      line-height: 1.45;
+    }
+
     #providerKeys.key-pool-disabled .form-grid,
     #providerKeys.key-pool-disabled .bulk-key-add,
     #providerKeys.key-pool-disabled .key-pool-list,
@@ -5554,6 +5582,521 @@
     :where(.field select, .mapping-row select, #providerModelCandidateSelect) option {
       background: #181c25;
       color: #edf0f8;
+    }
+
+    .cache-trend-card {
+      min-width: 0;
+      padding: 14px 16px 16px;
+      border: 0;
+      border-radius: 10px;
+      background: #13161e;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.018);
+    }
+
+    /* Keep the overview and trend as two quiet surfaces instead of one large
+       panel split by a hard rule. This also leaves room for the chart tooltip. */
+    #overviewPanel {
+      display: grid;
+      gap: 10px;
+      overflow: visible;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    #overviewPanel .overview-grid {
+      overflow: hidden;
+      border-radius: 10px;
+      background: #13161e;
+      box-shadow: 0 8px 20px rgba(0, 0, 0, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.018);
+    }
+
+    .workspace {
+      scrollbar-width: none;
+      -ms-overflow-style: none;
+    }
+
+    .workspace::-webkit-scrollbar {
+      width: 0;
+      height: 0;
+      display: none;
+    }
+
+    .cache-trend-head {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(170px, 0.72fr) minmax(0, 1.28fr);
+      align-items: start;
+      gap: 14px;
+    }
+
+    .cache-trend-title {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+    }
+
+    .cache-trend-title h3,
+    .cache-trend-title p {
+      margin: 0;
+    }
+
+    .cache-trend-title h3 {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 720;
+    }
+
+    .cache-trend-title p {
+      overflow-wrap: anywhere;
+      color: var(--muted);
+      font-size: 9.5px;
+      line-height: 1.45;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .cache-trend-toolbar {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .cache-trend-scope-trigger,
+    .cache-trend-range-button,
+    .cache-trend-retry,
+    .cache-trend-custom-apply {
+      min-height: 28px;
+      border: 1px solid rgba(218, 224, 235, 0.1);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.025);
+      color: var(--muted);
+      font-size: 9.5px;
+    }
+
+    .cache-trend-scope-control {
+      position: relative;
+      flex: 0 1 176px;
+      min-width: 116px;
+      max-width: 176px;
+    }
+
+    .cache-trend-scope {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      margin: -1px;
+      opacity: 0;
+      pointer-events: none;
+      clip-path: inset(50%);
+    }
+
+    .cache-trend-scope-trigger {
+      width: 100%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 26px 0 8px;
+      cursor: pointer;
+      text-align: left;
+      transition: border-color var(--motion-quick) var(--ease-ui), background-color var(--motion-quick) var(--ease-ui), color var(--motion-quick) var(--ease-ui);
+    }
+
+    .cache-trend-scope-trigger:hover,
+    .cache-trend-scope-trigger[aria-expanded="true"] {
+      border-color: rgba(130, 144, 255, 0.34);
+      background: rgba(130, 144, 255, 0.08);
+      color: var(--text);
+    }
+
+    .cache-trend-scope-trigger .icon {
+      width: 14px;
+      height: 14px;
+      color: var(--faint);
+      transition: transform var(--motion-quick) var(--ease-ui);
+    }
+
+    .cache-trend-scope-trigger[aria-expanded="true"] .icon { transform: rotate(180deg); }
+
+    .cache-trend-scope-menu {
+      position: absolute;
+      z-index: 18;
+      top: calc(100% + 5px);
+      right: 0;
+      left: 0;
+      display: grid;
+      gap: 2px;
+      padding: 4px;
+      border: 1px solid rgba(218, 224, 235, 0.15);
+      border-radius: 7px;
+      background: #171b23;
+      box-shadow: 0 14px 32px rgba(0, 0, 0, 0.36), inset 0 1px 0 rgba(255, 255, 255, 0.035);
+    }
+
+    .cache-trend-scope-menu[hidden] { display: none !important; }
+
+    .cache-trend-scope-option {
+      width: 100%;
+      min-height: 27px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font: inherit;
+      font-size: 9.5px;
+      text-align: left;
+      transition: background-color var(--motion-quick) var(--ease-ui), color var(--motion-quick) var(--ease-ui);
+    }
+
+    .cache-trend-scope-option:hover,
+    .cache-trend-scope-option:focus-visible {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text);
+    }
+
+    .cache-trend-scope-option[aria-selected="true"] {
+      background: rgba(130, 144, 255, 0.16);
+      color: #e0e4ff;
+    }
+
+    .cache-trend-range-tabs {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      padding: 2px;
+      border-radius: 7px;
+      background: rgba(0, 0, 0, 0.15);
+    }
+
+    .cache-trend-range-button {
+      min-width: 36px;
+      padding: 0 7px;
+      border-color: transparent;
+      background: transparent;
+      cursor: pointer;
+      transition: background-color var(--motion-quick) var(--ease-ui), color var(--motion-quick) var(--ease-ui), border-color var(--motion-quick) var(--ease-ui);
+    }
+
+    .cache-trend-range-button:hover,
+    .cache-trend-retry:hover,
+    .cache-trend-custom-apply:hover {
+      border-color: rgba(218, 224, 235, 0.16);
+      background: rgba(255, 255, 255, 0.055);
+      color: var(--text);
+    }
+
+    .cache-trend-range-button[aria-pressed="true"] {
+      border-color: rgba(130, 144, 255, 0.34);
+      background: rgba(130, 144, 255, 0.11);
+      color: #d8dcff;
+    }
+
+    .cache-trend-retry {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      padding: 0 9px;
+      cursor: pointer;
+    }
+
+    .cache-trend-custom {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr)) auto;
+      gap: 8px;
+      align-items: end;
+      margin-top: 10px;
+      padding: 9px;
+      border-radius: 7px;
+      background: rgba(0, 0, 0, 0.14);
+    }
+
+    .cache-trend-custom[hidden] { display: none !important; }
+
+    .cache-trend-date-field {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+      cursor: pointer;
+    }
+
+    .cache-trend-date-field span {
+      color: var(--faint);
+      font-size: 9px;
+    }
+
+    .cache-trend-date-field input {
+      width: 100%;
+      min-width: 0;
+      height: 30px;
+      border: 1px solid rgba(218, 224, 235, 0.1);
+      border-radius: 5px;
+      padding: 0 7px;
+      background: #151920;
+      color: var(--text);
+      color-scheme: dark;
+      font-size: 9.5px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .cache-trend-custom-apply {
+      padding: 0 11px;
+      color: #dce1e5;
+      cursor: pointer;
+    }
+
+    .cache-trend-summary {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr));
+      gap: 1px;
+      margin-top: 11px;
+      overflow: hidden;
+      border: 1px solid rgba(218, 224, 235, 0.075);
+      border-radius: 7px;
+      background: rgba(218, 224, 235, 0.06);
+    }
+
+    .cache-trend-stat {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
+      padding: 8px 9px;
+      background: rgba(13, 16, 21, 0.94);
+    }
+
+    .cache-trend-stat span {
+      overflow: hidden;
+      color: var(--faint);
+      font-size: 8.5px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .cache-trend-stat b {
+      overflow: hidden;
+      color: #dce1e5;
+      font-size: 11px;
+      font-weight: 680;
+      font-variant-numeric: tabular-nums;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .cache-trend-stat.is-rate b,
+    .cache-trend-stat.is-hit b { color: var(--success); }
+    .cache-trend-stat.is-miss b { color: #d8ae69; }
+
+    .cache-trend-plot-shell {
+      position: relative;
+      min-width: 0;
+      min-height: 250px;
+      margin-top: 10px;
+      border: 1px solid rgba(218, 224, 235, 0.075);
+      border-radius: 8px;
+      background: rgba(8, 11, 15, 0.42);
+      overflow: hidden;
+    }
+
+    .cache-trend-chart-head {
+      min-width: 0;
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 7px 10px 0;
+    }
+
+    .cache-trend-legend {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .cache-trend-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 8.5px;
+      white-space: nowrap;
+    }
+
+    .cache-trend-legend i {
+      width: 12px;
+      height: 2px;
+      border-radius: 999px;
+      background: var(--series-color);
+    }
+
+    .cache-trend-chart-note {
+      color: var(--faint);
+      font-size: 8.5px;
+      white-space: nowrap;
+    }
+
+    .cache-trend-chart {
+      position: relative;
+      min-width: 0;
+      /* Second measured increment after visual review: the whole trend panel
+         gets more vertical room while the overview remains the primary view. */
+      height: 260px;
+      padding: 0 4px 4px;
+    }
+
+    .cache-trend-chart svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+      overflow: visible;
+      touch-action: none;
+    }
+
+    .cache-trend-chart svg:focus-visible {
+      /* The active point, guide line and tooltip already communicate focus.
+         Avoid a browser-like white frame around the entire chart. */
+      outline: none;
+    }
+
+    .cache-trend-tooltip {
+      position: absolute;
+      z-index: 4;
+      width: min(244px, calc(100% - 16px));
+      padding: 9px 10px;
+      border: 1px solid rgba(218, 224, 235, 0.16);
+      border-radius: 7px;
+      background: rgba(20, 24, 30, 0.96);
+      box-shadow: 0 14px 32px rgba(0, 0, 0, 0.34);
+      color: var(--text);
+      pointer-events: none;
+      -webkit-backdrop-filter: blur(14px);
+      backdrop-filter: blur(14px);
+    }
+
+    .cache-trend-tooltip[hidden] { display: none !important; }
+
+    .cache-trend-tooltip time {
+      display: block;
+      margin-bottom: 7px;
+      color: #dce1e5;
+      font-size: 9.5px;
+      font-weight: 650;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .cache-trend-tooltip-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 5px 10px;
+    }
+
+    .cache-trend-tooltip-grid span {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 8.5px;
+    }
+
+    .cache-trend-tooltip-grid b {
+      color: var(--text);
+      font-size: 9.5px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .cache-trend-tooltip-grid .trend-tooltip-rate b { color: var(--success); }
+
+    .cache-trend-state {
+      position: absolute;
+      inset: 35px 0 0;
+      z-index: 3;
+      display: none;
+      place-items: center;
+      padding: 18px;
+      background: rgba(12, 15, 20, 0.76);
+      text-align: center;
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
+    }
+
+    .cache-trend-state > div {
+      display: grid;
+      justify-items: center;
+      gap: 6px;
+      max-width: 360px;
+    }
+
+    .cache-trend-state b { font-size: 11px; }
+    .cache-trend-state small { color: var(--muted); font-size: 9.5px; line-height: 1.45; }
+    .cache-trend-state .icon { color: var(--muted); }
+    .cache-trend-state.loading .icon { animation: connection-test-spin 700ms linear infinite; }
+
+    .cache-trend-plot-shell[data-state="loading"] .cache-trend-state.loading,
+    .cache-trend-plot-shell[data-state="empty"] .cache-trend-state.empty,
+    .cache-trend-plot-shell[data-state="error"] .cache-trend-state.error { display: grid; }
+
+    @media (max-width: 980px) {
+      .cache-trend-head { grid-template-columns: 1fr; }
+      .cache-trend-toolbar { justify-content: flex-start; }
+      .cache-trend-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .cache-trend-chart { height: 244px; }
+    }
+
+    @media (max-width: 760px) {
+      .cache-trend-card { padding: 12px; }
+      .cache-trend-toolbar { align-items: stretch; }
+      .cache-trend-scope-control { flex: 1 1 150px; max-width: none; }
+      .cache-trend-range-tabs { flex: 1 1 100%; justify-content: space-between; }
+      .cache-trend-range-button { flex: 1 1 auto; min-width: 0; padding-inline: 5px; }
+      .cache-trend-custom { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .cache-trend-custom-apply { grid-column: 1 / -1; }
+      .cache-trend-summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .cache-trend-chart-head { align-items: flex-start; flex-direction: column; }
+      .cache-trend-chart-note { white-space: normal; }
+      .cache-trend-chart { height: 228px; }
+      .cache-trend-state { inset-block-start: 56px; }
+    }
+
+    @media (max-width: 520px) {
+      .cache-trend-head { gap: 10px; }
+      .cache-trend-toolbar { gap: 6px; }
+      .cache-trend-scope-control { flex-basis: 100%; }
+      .cache-trend-range-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .cache-trend-range-button { width: 100%; }
+      .cache-trend-custom {
+        position: fixed;
+        z-index: 30;
+        right: 8px;
+        bottom: 54px;
+        left: 8px;
+        grid-template-columns: 1fr;
+        padding: 12px;
+        border: 1px solid rgba(218, 224, 235, 0.14);
+        background: rgba(20, 24, 30, 0.97);
+        box-shadow: 0 -18px 50px rgba(0, 0, 0, 0.38);
+        -webkit-backdrop-filter: blur(18px);
+        backdrop-filter: blur(18px);
+      }
+      .cache-trend-custom-apply { grid-column: auto; }
+      .cache-trend-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .cache-trend-stat:last-child { grid-column: 1 / -1; }
+      .cache-trend-chart { height: 214px; padding-inline: 0; }
+      .cache-trend-legend { gap: 7px; }
+      .cache-trend-tooltip { padding: 8px; }
+      .cache-trend-tooltip-grid { gap: 4px 8px; }
     }
 
     .agent-tab[aria-selected="true"] {
@@ -5870,6 +6413,68 @@
               </div>
             </div>
           </div>
+          <section class="cache-trend-card" id="cacheTrendCard" aria-labelledby="cacheTrendTitle">
+            <header class="cache-trend-head">
+              <div class="cache-trend-title">
+                <span class="section-kicker">Cache trend</span>
+                <h3 id="cacheTrendTitle">缓存趋势</h3>
+                <p id="cacheTrendRangeSummary">所选时间范围 · 全部上游 · [start, end)</p>
+              </div>
+              <div class="cache-trend-toolbar">
+                <div class="cache-trend-scope-control" id="cacheTrendScopeControl">
+                  <label class="sr-only" for="cacheTrendScopeTrigger">趋势上游范围</label>
+                  <select class="cache-trend-scope" id="cacheTrendScopeSelect" hidden></select>
+                  <button class="cache-trend-scope-trigger" id="cacheTrendScopeTrigger" type="button" aria-haspopup="listbox" aria-controls="cacheTrendScopeMenu" aria-expanded="false"><span id="cacheTrendScopeValue">全部</span><i class="icon" data-lucide="chevron-down"></i></button>
+                  <div class="cache-trend-scope-menu" id="cacheTrendScopeMenu" role="listbox" aria-label="趋势上游范围" hidden></div>
+                </div>
+                <div class="cache-trend-range-tabs" role="group" aria-label="趋势时间范围">
+                  <button class="cache-trend-range-button" type="button" data-trend-range="today" aria-pressed="false">今天</button>
+                  <button class="cache-trend-range-button" type="button" data-trend-range="1d" aria-pressed="true">1d</button>
+                  <button class="cache-trend-range-button" type="button" data-trend-range="7d" aria-pressed="false">7d</button>
+                  <button class="cache-trend-range-button" type="button" data-trend-range="14d" aria-pressed="false">14d</button>
+                  <button class="cache-trend-range-button" type="button" data-trend-range="30d" aria-pressed="false">30d</button>
+                  <button class="cache-trend-range-button" type="button" data-trend-range="custom" aria-pressed="false">自定义</button>
+                </div>
+                <button class="cache-trend-retry" id="cacheTrendRetry" type="button" aria-label="重新加载缓存趋势"><i class="icon" data-lucide="refresh-cw"></i><span>刷新</span></button>
+              </div>
+            </header>
+            <div class="cache-trend-custom" id="cacheTrendCustomRange" hidden>
+              <label class="cache-trend-date-field"><span>开始（包含）</span><input id="cacheTrendStartInput" type="datetime-local" step="60" /></label>
+              <label class="cache-trend-date-field"><span>结束（不包含）</span><input id="cacheTrendEndInput" type="datetime-local" step="60" /></label>
+              <button class="cache-trend-custom-apply" id="cacheTrendApplyCustom" type="button">应用范围</button>
+            </div>
+            <div class="cache-trend-summary" id="cacheTrendSummary" aria-label="所选时间范围缓存摘要">
+              <div class="cache-trend-stat"><span>成功请求</span><b data-trend-summary="successful_requests">—</b></div>
+              <div class="cache-trend-stat"><span>输入</span><b data-trend-summary="input_tokens">—</b></div>
+              <div class="cache-trend-stat"><span>输出</span><b data-trend-summary="output_tokens">—</b></div>
+              <div class="cache-trend-stat is-hit"><span>缓存命中</span><b data-trend-summary="cache_read_tokens">—</b></div>
+              <div class="cache-trend-stat is-miss"><span>未命中</span><b data-trend-summary="cache_miss_tokens">—</b></div>
+              <div class="cache-trend-stat"><span>缓存创建</span><b data-trend-summary="cache_creation_tokens">—</b></div>
+              <div class="cache-trend-stat is-rate"><span>加权命中率</span><b data-trend-summary="cache_hit_rate">—</b></div>
+            </div>
+            <div class="cache-trend-plot-shell" id="cacheTrendPlotShell" data-state="loading" aria-live="polite">
+              <div class="cache-trend-chart-head">
+                <div class="cache-trend-legend" aria-label="趋势图例">
+                  <span><i style="--series-color:#aab4c4"></i>输入</span>
+                  <span><i style="--series-color:#71808e"></i>输出</span>
+                  <span><i style="--series-color:#8fd3ae"></i>缓存命中</span>
+                  <span><i style="--series-color:#d8ae69"></i>未命中</span>
+                  <span><i style="--series-color:#a8b2ff"></i>命中率（右轴）</span>
+                </div>
+                <span class="cache-trend-chart-note">左轴 Tokens · 右轴命中率</span>
+              </div>
+              <div class="cache-trend-chart" id="cacheTrendChart">
+                <svg id="cacheTrendSvg" viewBox="0 0 1000 220" preserveAspectRatio="none" role="img" tabindex="0" aria-labelledby="cacheTrendChartTitle cacheTrendChartDescription">
+                  <title id="cacheTrendChartTitle">缓存趋势图</title>
+                  <desc id="cacheTrendChartDescription">使用左右方向键浏览时间点，显示输入、输出、缓存命中、未命中和加权命中率。</desc>
+                </svg>
+                <div class="cache-trend-tooltip" id="cacheTrendTooltip" role="status" hidden></div>
+              </div>
+              <div class="cache-trend-state loading"><div><i class="icon" data-lucide="loader-circle"></i><b>正在加载趋势</b><small>按所选 Agent、上游和时间范围读取真实统计。</small></div></div>
+              <div class="cache-trend-state empty"><div><i class="icon" data-lucide="chart-no-axes-column"></i><b>当前范围暂无趋势数据</b><small>趋势从本版本开始持续记录，不会用旧请求或假 0% 曲线回填。</small></div></div>
+              <div class="cache-trend-state error"><div><i class="icon" data-lucide="triangle-alert"></i><b>趋势加载失败</b><small id="cacheTrendErrorMessage">请检查后台状态后重试。</small><button class="cache-trend-retry" type="button" data-trend-retry>重试</button></div></div>
+            </div>
+          </section>
         </section>
 
             <section class="analytics-panel panel" id="requestsPanel" hidden>
@@ -5934,6 +6539,7 @@
             <label class="field"><span>监听地址</span><input value="127.0.0.1" autocomplete="off" /></label>
             <label class="field"><span>端口</span><input value="18883" inputmode="numeric" autocomplete="off" /></label>
             <label class="field wide"><span>本地 Key</span><span class="secret-field"><input id="settingsLocalKeyInput" value="atoapi-local-demo-key" type="password" autocomplete="new-password" /><button class="secret-toggle" type="button" data-secret-toggle="settingsLocalKeyInput" aria-label="显示本地 Key" title="显示完整 Key"><i class="icon" data-lucide="eye"></i></button></span></label>
+            <label class="field wide"><span>显式上游代理 URL（可选）</span><input id="settingsUpstreamProxyUrlInput" value="" placeholder="http://127.0.0.1:7897" inputmode="url" autocomplete="off" /></label>
           </div>
           <div class="option-row">
             <div><b>开机自动启动代理</b><small>软件启动后恢复监听端口</small></div>
@@ -6042,7 +6648,17 @@
             <section class="panel" id="providerCompatibility" hidden>
               <div class="form-section">
                 <div class="form-section-head"><div><h3>Responses 会话复用</h3><p>验证通过后才可启用增量请求。</p></div></div>
-                <div class="status-band"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>上游不支持</b><small>continuation succeeded but did not preserve the verification token</small></div><button class="secondary-button" type="button" data-mock-action="模拟验证完成：当前上游不支持">重新验证</button></div>
+                <div class="compatibility-model-control">
+                  <div class="field wide compatibility-model-field">
+                    <label for="providerSessionReuseModelInput">实际模型 ID</label>
+                    <span class="compatibility-model-input-row">
+                      <input id="providerSessionReuseModelInput" list="providerModelCandidates" placeholder="选择已获取模型或直接输入，例如 gpt-5.6-sol" autocomplete="off" spellcheck="false" />
+                      <button class="secondary-button" id="fetchCompatibilityModelsButton" type="button" data-mock-action="已模拟获取模型"><i class="icon" data-lucide="refresh-cw"></i>获取模型</button>
+                    </span>
+                    <small class="compatibility-model-hint">使用实际上游模型进行资格验证；不要求先添加模型映射。</small>
+                  </div>
+                </div>
+                <div class="status-band"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>尚未验证</b><small>选择或输入实际模型后再验证</small></div><button class="secondary-button" id="probeSessionReuseButton" type="button" data-mock-action="模拟验证完成：当前上游不支持">重新验证</button></div>
                 <div class="option-row"><div><b>启用会话复用</b><small>当前由能力验证门控</small></div><button class="switch" type="button" role="switch" aria-checked="false" aria-label="启用会话复用" disabled></button></div>
               </div>
             </section>
@@ -6138,6 +6754,486 @@
     function hydrateIcons() {
       if (window.lucide) window.lucide.createIcons();
     }
+
+    function createCacheTrendController() {
+      const shell = $("#cacheTrendPlotShell");
+      const svg = $("#cacheTrendSvg");
+      const chart = $("#cacheTrendChart");
+      const tooltip = $("#cacheTrendTooltip");
+      const scopeSelect = $("#cacheTrendScopeSelect");
+      const scopeControl = $("#cacheTrendScopeControl");
+      const scopeTrigger = $("#cacheTrendScopeTrigger");
+      const scopeValue = $("#cacheTrendScopeValue");
+      const scopeMenu = $("#cacheTrendScopeMenu");
+      const rangeSummary = $("#cacheTrendRangeSummary");
+      const customPanel = $("#cacheTrendCustomRange");
+      const startInput = $("#cacheTrendStartInput");
+      const endInput = $("#cacheTrendEndInput");
+      let preset = "1d";
+      let contextKey = "standalone";
+      let externalLoader = null;
+      let scopeHandler = null;
+      let sequence = 0;
+      let activeSequence = 0;
+      let activeRangeKey = "";
+      let activeQuery = null;
+      let activePoints = [];
+      let activeIndex = -1;
+      let pinned = false;
+      let mockTimer = null;
+
+      const valueKeys = [
+        "successful_requests", "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_miss_tokens", "cache_creation_tokens", "cache_shortfall_tokens",
+        "cache_avoidable_gap_tokens", "cache_new_tail_gap_tokens",
+        "compaction_requests", "cold_start_requests"
+      ];
+
+      function safeNumber(value) {
+        const number = Number(value);
+        return Number.isFinite(number) && number >= 0 ? number : 0;
+      }
+
+      function normalizeValues(value) {
+        return Object.fromEntries(valueKeys.map((key) => [key, safeNumber(value?.[key])]));
+      }
+
+      function formatFull(value) {
+        return Math.round(safeNumber(value)).toLocaleString("zh-CN");
+      }
+
+      function formatRate(cached, input) {
+        return input > 0 ? `${Math.max(0, Math.min(100, cached / input * 100)).toFixed(1)}%` : "—";
+      }
+
+      function toLocalDateTime(date) {
+        const offset = date.getTimezoneOffset() * 60_000;
+        return new Date(date.getTime() - offset).toISOString().slice(0, 16);
+      }
+
+      function dateRangeFor(nextPreset = preset) {
+        const end = new Date();
+        if (nextPreset === "custom") {
+          const start = new Date(startInput.value);
+          const customEnd = new Date(endInput.value);
+          return { start, end: customEnd };
+        }
+        if (nextPreset === "today") {
+          const start = new Date(end);
+          start.setHours(0, 0, 0, 0);
+          return { start, end };
+        }
+        const days = { "1d": 1, "7d": 7, "14d": 14, "30d": 30 }[nextPreset] || 1;
+        return { start: new Date(end.getTime() - days * 86_400_000), end };
+      }
+
+      function rangeQuery() {
+        const range = dateRangeFor();
+        if (!Number.isFinite(range.start.valueOf()) || !Number.isFinite(range.end.valueOf()) || range.start >= range.end) {
+          return null;
+        }
+        const startUtc = range.start.toISOString();
+        const endUtc = range.end.toISOString();
+        const scopeId = scopeSelect.value || requestScopeId || "all";
+        return {
+          preset,
+          startUtc,
+          endUtc,
+          scopeId,
+          rangeKey: [contextKey, scopeId, startUtc, endUtc].join("|")
+        };
+      }
+
+      function updateRangeSummary(query, data) {
+        const scopeLabel = scopeSelect.selectedOptions[0]?.textContent?.trim() || "全部上游";
+        const start = new Date(data?.start_utc || query.startUtc);
+        const end = new Date(data?.end_utc || query.endUtc);
+        const dateOptions = { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
+        rangeSummary.textContent = `${scopeLabel} · ${start.toLocaleString("zh-CN", dateOptions)} → ${end.toLocaleString("zh-CN", dateOptions)} · [start, end)`;
+      }
+
+      function closeScopeMenu({ restoreFocus = false } = {}) {
+        if (scopeMenu.hidden) return;
+        scopeMenu.hidden = true;
+        scopeTrigger.setAttribute("aria-expanded", "false");
+        if (restoreFocus) scopeTrigger.focus();
+      }
+
+      function renderScopeControl() {
+        const selected = scopeSelect.selectedOptions[0] || scopeSelect.options[0];
+        scopeValue.textContent = selected?.textContent?.trim() || "全部";
+        scopeTrigger.disabled = !selected;
+        scopeMenu.innerHTML = Array.from(scopeSelect.options).map((option) => {
+          const selected = option.value === scopeSelect.value;
+          return `<button class="cache-trend-scope-option" type="button" role="option" data-trend-scope-option="${escapeHtml(option.value)}" aria-selected="${selected}">${escapeHtml(option.textContent || option.value)}</button>`;
+        }).join("");
+      }
+
+      function openDatePicker(input) {
+        if (typeof input.showPicker !== "function") return;
+        try { input.showPicker(); } catch (_) { /* The native icon remains the safe fallback. */ }
+      }
+
+      function setState(state, message = "") {
+        shell.dataset.state = state;
+        if (state === "error") $("#cacheTrendErrorMessage").textContent = message || "请检查后台状态后重试。";
+        if (state !== "ready") {
+          pinned = false;
+          tooltip.hidden = true;
+          activeIndex = -1;
+          // Keep an old, successful chart from being interactive underneath an
+          // empty/loading/error state. The backend intentionally returns
+          // zero-valued hour buckets for a range with no successes.
+          activePoints = [];
+        }
+        hydrateIcons();
+      }
+
+      function clearSummary() {
+        $$('[data-trend-summary]', $("#cacheTrendSummary")).forEach((node) => {
+          node.textContent = "—";
+          node.removeAttribute("title");
+        });
+      }
+
+      function renderSummary(summary) {
+        const values = normalizeValues(summary);
+        const display = {
+          successful_requests: formatFull(values.successful_requests),
+          input_tokens: formatFull(values.input_tokens),
+          output_tokens: formatFull(values.output_tokens),
+          cache_read_tokens: formatFull(values.cache_read_tokens),
+          cache_miss_tokens: formatFull(values.cache_miss_tokens),
+          cache_creation_tokens: formatFull(values.cache_creation_tokens),
+          cache_hit_rate: formatRate(values.cache_read_tokens, values.input_tokens)
+        };
+        Object.entries(display).forEach(([key, value]) => {
+          const node = $(`[data-trend-summary="${key}"]`, $("#cacheTrendSummary"));
+          if (!node) return;
+          node.textContent = value;
+          node.title = value;
+        });
+      }
+
+      function seriesPath(points, x, y, key) {
+        return points.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(2)},${y(point[key]).toFixed(2)}`).join(" ");
+      }
+
+      function axisLabel(value) {
+        if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}m`;
+        if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}k`;
+        return String(Math.round(value));
+      }
+
+      function renderChart(points) {
+        activePoints = points.map((point) => ({
+          ...normalizeValues(point),
+          start_utc: point?.start_utc || new Date().toISOString()
+        }));
+        const width = 1000;
+        const top = 14;
+        const bottom = 190;
+        const left = 58;
+        const right = 946;
+        const plotWidth = right - left;
+        const plotHeight = bottom - top;
+        const maxTokens = Math.max(1, ...activePoints.flatMap((point) => [point.input_tokens, point.output_tokens, point.cache_read_tokens, point.cache_miss_tokens]));
+        const x = (index) => left + (activePoints.length <= 1 ? plotWidth / 2 : index / (activePoints.length - 1) * plotWidth);
+        const tokenY = (value) => bottom - Math.max(0, Math.min(1, value / maxTokens)) * plotHeight;
+        const rateY = (value) => bottom - Math.max(0, Math.min(1, value)) * plotHeight;
+        const inputPath = seriesPath(activePoints, x, tokenY, "input_tokens");
+        const outputPath = seriesPath(activePoints, x, tokenY, "output_tokens");
+        const cachedPath = seriesPath(activePoints, x, tokenY, "cache_read_tokens");
+        const missPath = seriesPath(activePoints, x, tokenY, "cache_miss_tokens");
+        const ratePath = activePoints.map((point, index) => {
+          const rate = point.input_tokens > 0 ? point.cache_read_tokens / point.input_tokens : 0;
+          return `${index ? "L" : "M"}${x(index).toFixed(2)},${rateY(rate).toFixed(2)}`;
+        }).join(" ");
+        const areaPath = `${inputPath} L${x(activePoints.length - 1).toFixed(2)},${bottom} L${x(0).toFixed(2)},${bottom} Z`;
+        const horizontal = Array.from({ length: 5 }, (_, index) => {
+          const ratio = index / 4;
+          const y = top + ratio * plotHeight;
+          const tokenLabel = axisLabel(maxTokens * (1 - ratio));
+          const rateLabel = `${Math.round((1 - ratio) * 100)}%`;
+          return `<line x1="${left}" y1="${y}" x2="${right}" y2="${y}" stroke="rgba(218,224,235,.07)" vector-effect="non-scaling-stroke"/><text x="${left - 8}" y="${y + 3}" text-anchor="end" fill="#697276" font-size="9">${tokenLabel}</text><text x="${right + 8}" y="${y + 3}" fill="#697276" font-size="9">${rateLabel}</text>`;
+        }).join("");
+        const tickCount = Math.min(5, activePoints.length);
+        const ticks = Array.from({ length: tickCount }, (_, index) => {
+          const pointIndex = Math.round(index / Math.max(1, tickCount - 1) * (activePoints.length - 1));
+          const point = activePoints[pointIndex];
+          const date = new Date(point.start_utc);
+          const label = date.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+          return `<text x="${x(pointIndex)}" y="211" text-anchor="middle" fill="#697276" font-size="9">${escapeHtml(label)}</text>`;
+        }).join("");
+        svg.innerHTML = `<title id="cacheTrendChartTitle">缓存趋势图</title><desc id="cacheTrendChartDescription">使用左右方向键浏览时间点，显示输入、输出、缓存命中、未命中和加权命中率。</desc><defs><linearGradient id="cacheTrendInputArea" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#aab4c4" stop-opacity=".15"/><stop offset="1" stop-color="#aab4c4" stop-opacity="0"/></linearGradient></defs>${horizontal}<path d="${areaPath}" fill="url(#cacheTrendInputArea)"/><path d="${inputPath}" fill="none" stroke="#aab4c4" stroke-width="1.5" vector-effect="non-scaling-stroke"/><path d="${outputPath}" fill="none" stroke="#71808e" stroke-width="1.2" vector-effect="non-scaling-stroke"/><path d="${cachedPath}" fill="none" stroke="#8fd3ae" stroke-width="1.8" vector-effect="non-scaling-stroke"/><path d="${missPath}" fill="none" stroke="#d8ae69" stroke-width="1.35" vector-effect="non-scaling-stroke"/><path d="${ratePath}" fill="none" stroke="#a8b2ff" stroke-width="1.6" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"/>${ticks}<g id="cacheTrendActiveLayer"></g>`;
+        svg.dataset.plotLeft = String(left);
+        svg.dataset.plotRight = String(right);
+        svg.dataset.plotTop = String(top);
+        svg.dataset.plotBottom = String(bottom);
+        svg.dataset.maxTokens = String(maxTokens);
+        activeIndex = Math.max(0, activePoints.length - 1);
+        renderActive(activeIndex, false);
+      }
+
+      function tooltipRows(point) {
+        const rate = formatRate(point.cache_read_tokens, point.input_tokens);
+        const rows = [
+          ["成功请求", formatFull(point.successful_requests)], ["加权命中率", rate, "trend-tooltip-rate"],
+          ["输入", formatFull(point.input_tokens)], ["输出", formatFull(point.output_tokens)],
+          ["缓存命中", formatFull(point.cache_read_tokens)], ["未命中", formatFull(point.cache_miss_tokens)],
+          ["缓存创建", formatFull(point.cache_creation_tokens)], ["缓存缺口", formatFull(point.cache_shortfall_tokens)],
+          ["可避免", formatFull(point.cache_avoidable_gap_tokens)], ["新尾部", formatFull(point.cache_new_tail_gap_tokens)],
+          ["压缩", formatFull(point.compaction_requests)], ["冷启动", formatFull(point.cold_start_requests)]
+        ];
+        return rows.map(([label, value, className]) => `<span class="${className || ""}">${label}<b>${value}</b></span>`).join("");
+      }
+
+      function renderActive(index, showTooltip = true) {
+        if (!activePoints.length) return;
+        activeIndex = Math.max(0, Math.min(activePoints.length - 1, index));
+        const point = activePoints[activeIndex];
+        const left = Number(svg.dataset.plotLeft || 58);
+        const right = Number(svg.dataset.plotRight || 946);
+        const top = Number(svg.dataset.plotTop || 14);
+        const bottom = Number(svg.dataset.plotBottom || 190);
+        const maxTokens = Number(svg.dataset.maxTokens || 1);
+        const x = left + (activePoints.length <= 1 ? (right - left) / 2 : activeIndex / (activePoints.length - 1) * (right - left));
+        const tokenY = (value) => bottom - Math.max(0, Math.min(1, value / maxTokens)) * (bottom - top);
+        const rate = point.input_tokens > 0 ? point.cache_read_tokens / point.input_tokens : 0;
+        const rateY = bottom - Math.max(0, Math.min(1, rate)) * (bottom - top);
+        const layer = $("#cacheTrendActiveLayer", svg);
+        if (layer) layer.innerHTML = `<line x1="${x}" y1="${top}" x2="${x}" y2="${bottom}" stroke="rgba(237,241,242,.28)" stroke-width="1" vector-effect="non-scaling-stroke"/><circle cx="${x}" cy="${tokenY(point.input_tokens)}" r="3" fill="#aab4c4"/><circle cx="${x}" cy="${tokenY(point.cache_read_tokens)}" r="3.2" fill="#8fd3ae"/><circle cx="${x}" cy="${tokenY(point.cache_miss_tokens)}" r="3" fill="#d8ae69"/><circle cx="${x}" cy="${rateY}" r="3" fill="#a8b2ff"/>`;
+        svg.setAttribute("aria-label", `${new Date(point.start_utc).toLocaleString("zh-CN")}，成功 ${formatFull(point.successful_requests)}，命中率 ${formatRate(point.cache_read_tokens, point.input_tokens)}`);
+        if (!showTooltip) { tooltip.hidden = true; return; }
+        tooltip.innerHTML = `<time>${escapeHtml(new Date(point.start_utc).toLocaleString("zh-CN", { hour12: false }))}</time><div class="cache-trend-tooltip-grid">${tooltipRows(point)}</div>`;
+        tooltip.hidden = false;
+        const bounds = chart.getBoundingClientRect();
+        const xPixels = x / 1000 * bounds.width;
+        const tooltipWidth = tooltip.offsetWidth || 220;
+        const tooltipHeight = tooltip.offsetHeight || 150;
+        const desiredLeft = xPixels + 12 + tooltipWidth > bounds.width ? xPixels - tooltipWidth - 12 : xPixels + 12;
+        tooltip.style.left = `${Math.max(8, Math.min(bounds.width - tooltipWidth - 8, desiredLeft))}px`;
+        tooltip.style.top = `${Math.max(8, Math.min(bounds.height - tooltipHeight - 8, 18))}px`;
+      }
+
+      function mockTrend(query) {
+        const start = new Date(query.startUtc);
+        const end = new Date(query.endUtc);
+        const duration = Math.max(60_000, end - start);
+        const pointCount = Math.min(36, Math.max(12, Math.ceil(duration / 21_600_000)));
+        const points = Array.from({ length: pointCount }, (_, index) => {
+          const input = Math.max(1_000, Math.round(44_000 + index * 1_460 + Math.sin(index * 0.71) * 8_400));
+          const ratio = Math.max(0.74, Math.min(0.995, 0.9 + Math.sin(index * 0.39) * 0.035 + index / pointCount * 0.035));
+          const cached = Math.round(input * ratio);
+          const miss = input - cached;
+          return {
+            start_utc: new Date(start.getTime() + duration / pointCount * index).toISOString(),
+            successful_requests: 2 + index % 6,
+            input_tokens: input,
+            output_tokens: Math.round(input * (0.006 + index % 4 * 0.0014)),
+            cache_read_tokens: cached,
+            cache_miss_tokens: miss,
+            cache_creation_tokens: Math.round(miss * 0.16),
+            cache_shortfall_tokens: miss,
+            cache_avoidable_gap_tokens: Math.round(miss * 0.12),
+            cache_new_tail_gap_tokens: Math.round(miss * 0.76),
+            compaction_requests: index > 0 && index % 16 === 0 ? 1 : 0,
+            cold_start_requests: index === 0 ? 1 : 0
+          };
+        });
+        const summary = points.reduce((total, point) => {
+          valueKeys.forEach((key) => total[key] += point[key]);
+          return total;
+        }, normalizeValues({}));
+        return { start_utc: query.startUtc, end_utc: query.endUtc, agent_id: selectedAgentId, provider_id: query.scopeId === "all" ? null : query.scopeId.replace(/^provider:/, ""), summary, points };
+      }
+
+      function request(reason = "manual") {
+        sequence += 1;
+        // A pinned tooltip belongs to the previous data/range. Do not leave
+        // hover interaction locked after refreshing or changing scope.
+        pinned = false;
+        tooltip.hidden = true;
+        const query = rangeQuery();
+        if (!query) {
+          activeSequence = sequence;
+          activeRangeKey = `invalid|${sequence}`;
+          activeQuery = null;
+          clearSummary();
+          setState("error", "结束时间必须晚于开始时间。");
+          return;
+        }
+        activeSequence = sequence;
+        activeRangeKey = query.rangeKey;
+        activeQuery = query;
+        clearSummary();
+        updateRangeSummary(query);
+        setState("loading");
+        const payload = { ...query, sequence, reason };
+        if (externalLoader) {
+          externalLoader(payload);
+          return;
+        }
+        clearTimeout(mockTimer);
+        mockTimer = setTimeout(() => setData(mockTrend(query), sequence, query.rangeKey), 260);
+      }
+
+      function setData(data, responseSequence = activeSequence, responseRangeKey = activeRangeKey) {
+        if (responseSequence !== activeSequence || responseRangeKey !== activeRangeKey) return false;
+        const query = activeQuery;
+        if (!query || query.rangeKey !== responseRangeKey) return false;
+        // An accepted payload replaces the chart's interaction context too.
+        // This covers pushed/new data as well as the scope/range/refresh paths
+        // that already call request(), so an old pinned tooltip never blocks
+        // hover on the replacement chart.
+        pinned = false;
+        tooltip.hidden = true;
+        activeIndex = -1;
+        const points = Array.isArray(data?.points) ? data.points : [];
+        updateRangeSummary(query, data);
+        const summary = normalizeValues(data?.summary);
+        // The backend fills missing hours with zero buckets so the x-axis is
+        // continuous. A range containing only those buckets is still empty,
+        // not a real 0% cache trend.
+        if (!points.length || summary.successful_requests === 0) {
+          clearSummary();
+          svg.innerHTML = '<title id="cacheTrendChartTitle">缓存趋势图</title><desc id="cacheTrendChartDescription">当前范围暂无趋势数据。</desc>';
+          setState("empty");
+          return true;
+        }
+        renderSummary(summary);
+        renderChart(points);
+        setState("ready");
+        return true;
+      }
+
+      function setError(message, responseSequence = activeSequence, responseRangeKey = activeRangeKey) {
+        if (responseSequence !== activeSequence || responseRangeKey !== activeRangeKey) return false;
+        clearSummary();
+        setState("error", String(message || "趋势加载失败，请重试。"));
+        return true;
+      }
+
+      function setPreset(nextPreset) {
+        preset = nextPreset;
+        $$('[data-trend-range]').forEach((button) => button.setAttribute("aria-pressed", String(button.dataset.trendRange === preset)));
+        customPanel.hidden = preset !== "custom";
+        if (preset === "custom") {
+          const current = dateRangeFor("1d");
+          if (!startInput.value) startInput.value = toLocalDateTime(current.start);
+          if (!endInput.value) endInput.value = toLocalDateTime(current.end);
+          startInput.focus();
+          return;
+        }
+        request("range");
+      }
+
+      function syncScopes(scopes, selectedScopeId = requestScopeId || "all") {
+        const normalized = Array.isArray(scopes) && scopes.length ? scopes : [{ id: "all", label: "全部" }];
+        const nextId = normalized.some((scope) => scope.id === selectedScopeId) ? selectedScopeId : normalized[0].id;
+        const signature = normalized.map((scope) => `${scope.id}:${scope.label}`).join("|");
+        if (scopeSelect.dataset.signature !== signature) {
+          scopeSelect.innerHTML = normalized.map((scope) => `<option value="${escapeHtml(scope.id)}">${escapeHtml(scope.label)}</option>`).join("");
+          scopeSelect.dataset.signature = signature;
+        }
+        scopeSelect.value = nextId;
+        renderScopeControl();
+      }
+
+      function syncScope(scopeId) {
+        if (Array.from(scopeSelect.options).some((option) => option.value === scopeId)) {
+          scopeSelect.value = scopeId;
+          renderScopeControl();
+        }
+      }
+
+      $$('[data-trend-range]').forEach((button) => button.addEventListener("click", () => setPreset(button.dataset.trendRange || "1d")));
+      $("#cacheTrendApplyCustom").addEventListener("click", () => request("custom"));
+      $("#cacheTrendRetry").addEventListener("click", () => request("retry"));
+      $$('[data-trend-retry]').forEach((button) => button.addEventListener("click", () => request("retry")));
+      scopeTrigger.addEventListener("click", () => {
+        const opening = scopeMenu.hidden;
+        scopeMenu.hidden = !opening;
+        scopeTrigger.setAttribute("aria-expanded", String(opening));
+      });
+      scopeMenu.addEventListener("click", (event) => {
+        const option = event.target.closest("[data-trend-scope-option]");
+        if (!option || !scopeMenu.contains(option)) return;
+        const nextScopeId = option.dataset.trendScopeOption || "";
+        closeScopeMenu({ restoreFocus: true });
+        if (!nextScopeId || nextScopeId === scopeSelect.value) return;
+        scopeSelect.value = nextScopeId;
+        scopeSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      document.addEventListener("pointerdown", (event) => {
+        if (!scopeControl.contains(event.target)) closeScopeMenu();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (event.key === "Escape" && !scopeMenu.hidden) {
+          event.preventDefault();
+          closeScopeMenu({ restoreFocus: true });
+        }
+      });
+      [startInput, endInput].forEach((input) => {
+        input.closest(".cache-trend-date-field")?.addEventListener("pointerdown", (event) => {
+          if (event.button === 0) openDatePicker(input);
+        });
+      });
+      scopeSelect.addEventListener("change", () => {
+        renderScopeControl();
+        closeScopeMenu();
+        requestScopeId = scopeSelect.value || "all";
+        requestPage = 1;
+        if (scopeHandler) scopeHandler(requestScopeId);
+        else renderRequests();
+        request("scope");
+      });
+      svg.addEventListener("pointermove", (event) => {
+        if (!activePoints.length || pinned) return;
+        const bounds = svg.getBoundingClientRect();
+        const left = Number(svg.dataset.plotLeft || 58);
+        const right = Number(svg.dataset.plotRight || 946);
+        const x = (event.clientX - bounds.left) / Math.max(1, bounds.width) * 1000;
+        const ratio = Math.max(0, Math.min(1, (x - left) / Math.max(1, right - left)));
+        renderActive(Math.round(ratio * (activePoints.length - 1)), true);
+      });
+      svg.addEventListener("pointerleave", () => { if (!pinned) tooltip.hidden = true; });
+      svg.addEventListener("pointerdown", (event) => {
+        pinned = true;
+        svg.focus();
+        const bounds = svg.getBoundingClientRect();
+        const left = Number(svg.dataset.plotLeft || 58);
+        const right = Number(svg.dataset.plotRight || 946);
+        const x = (event.clientX - bounds.left) / Math.max(1, bounds.width) * 1000;
+        renderActive(Math.round(Math.max(0, Math.min(1, (x - left) / Math.max(1, right - left))) * (activePoints.length - 1)), true);
+      });
+      svg.addEventListener("keydown", (event) => {
+        if (!activePoints.length) return;
+        if (["ArrowLeft", "ArrowRight", "Home", "End", "Enter", " ", "Escape"].includes(event.key)) event.preventDefault();
+        if (event.key === "ArrowLeft") renderActive(activeIndex - 1, true);
+        if (event.key === "ArrowRight") renderActive(activeIndex + 1, true);
+        if (event.key === "Home") renderActive(0, true);
+        if (event.key === "End") renderActive(activePoints.length - 1, true);
+        if (event.key === "Enter" || event.key === " ") { pinned = !pinned; renderActive(activeIndex, true); }
+        if (event.key === "Escape") { pinned = false; tooltip.hidden = true; }
+      });
+      window.addEventListener("resize", () => { if (!tooltip.hidden && activeIndex >= 0) renderActive(activeIndex, true); });
+
+      return {
+        request,
+        setData,
+        setError,
+        syncScopes,
+        syncScope,
+        setContextKey(value) { contextKey = String(value || "standalone"); },
+        setExternalLoader(loader) { externalLoader = typeof loader === "function" ? loader : null; },
+        setScopeHandler(handler) { scopeHandler = typeof handler === "function" ? handler : null; },
+        isCurrent(responseSequence, responseRangeKey) { return responseSequence === activeSequence && responseRangeKey === activeRangeKey; }
+      };
+    }
+
+    const cacheTrend = createCacheTrendController();
+    window.__atoapiTrend = cacheTrend;
 
     function selectedAgent() {
       return agents.find((agent) => agent.id === selectedAgentId) || agents[0];
@@ -6278,7 +7374,10 @@
         requestScopeId = button.dataset.requestScope || "all";
         requestPage = 1;
         renderRequests();
+        cacheTrend.syncScope(requestScopeId);
+        cacheTrend.request("request-scope");
       }));
+      cacheTrend.syncScopes(requestScopes(), active.id);
     }
 
     function updateRequestScopeMetrics(scope, successful) {
@@ -6510,6 +7609,7 @@
     }
 
     function renderAll() {
+      cacheTrend.setContextKey(`${selectedAgentId}|standalone`);
       renderAgents();
       renderContext();
       renderProviders();
@@ -6625,6 +7725,8 @@
       $("#cacheButton").setAttribute("aria-label", "关闭缓存统计与请求记录");
       $("#cacheButton").title = "关闭缓存统计与请求记录";
       activatePanel(".analytics-tab", "overviewPanel");
+      cacheTrend.syncScopes(requestScopes(), activeRequestScope().id);
+      cacheTrend.request("open");
     }
 
     function showAgent() {
@@ -6651,7 +7753,10 @@
       else showAgent();
     });
     $("#backToAgentButton").addEventListener("click", showAgent);
-    $("#metricsRefreshButton").addEventListener("click", () => showToast("模拟统计已刷新"));
+    $("#metricsRefreshButton").addEventListener("click", () => {
+      cacheTrend.request("refresh");
+      showToast("模拟统计已刷新");
+    });
     $("#refreshButton").addEventListener("click", () => showToast("模拟 Agent 配置已刷新"));
     $("#agentEnabledSwitch").addEventListener("click", (event) => {
       const agent = selectedAgent();
@@ -6664,7 +7769,10 @@
 
     $("#brandButton").addEventListener("click", () => $("#versionPopover").hidden = !$("#versionPopover").hidden);
 
-    $$(".analytics-tab").forEach((tab) => tab.addEventListener("click", () => activatePanel(".analytics-tab", tab.dataset.panel)));
+    $$(".analytics-tab").forEach((tab) => tab.addEventListener("click", () => {
+      activatePanel(".analytics-tab", tab.dataset.panel);
+      if (tab.dataset.panel === "overviewPanel") cacheTrend.request("overview");
+    }));
     $$(".settings-tab").forEach((tab) => tab.addEventListener("click", () => activatePanel(".settings-tab", tab.dataset.panel)));
     $$(".editor-tab").forEach((tab) => tab.addEventListener("click", () => activatePanel(".editor-tab", tab.dataset.panel)));
 

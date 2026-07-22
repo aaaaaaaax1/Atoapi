@@ -137,6 +137,7 @@ export interface AppConfig {
   proxy_auto_start: boolean;
   proxy_mode_host: string;
   proxy_mode_port: number;
+  upstream_proxy_url?: string | null;
   local_key: string;
   default_channel: Channel;
   active_provider_id?: string | null;
@@ -522,6 +523,42 @@ export interface MetricsSnapshot {
   }>;
 }
 
+export interface MetricsTrendInput {
+  start_utc: string;
+  end_utc: string;
+  agent_id: string;
+  provider_id?: string | null;
+  include_cold_starts: boolean;
+}
+
+export interface MetricsTrendValues {
+  successful_requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_miss_tokens: number;
+  cache_creation_tokens: number;
+  cache_shortfall_tokens: number;
+  cache_avoidable_gap_tokens: number;
+  cache_new_tail_gap_tokens: number;
+  compaction_requests: number;
+  cold_start_requests: number;
+  cache_hit_rate?: number;
+}
+
+export interface MetricsTrendPoint extends MetricsTrendValues {
+  start_utc: string;
+}
+
+export interface MetricsTrendSnapshot {
+  start_utc: string;
+  end_utc: string;
+  agent_id: string;
+  provider_id?: string | null;
+  summary: MetricsTrendValues;
+  points: MetricsTrendPoint[];
+}
+
 export interface ProviderTrafficStats {
   provider: string;
   total_requests: number;
@@ -694,6 +731,7 @@ export interface GeneralConfigInput {
   host: string;
   port: number;
   proxy_auto_start?: boolean;
+  upstream_proxy_url?: string;
   local_key: string;
   default_channel: Channel;
   workspace_fingerprint: string;
@@ -706,6 +744,7 @@ let fallbackConfig: AppConfig = {
   proxy_auto_start: true,
   proxy_mode_host: "127.0.0.1",
   proxy_mode_port: 18884,
+  upstream_proxy_url: null,
   local_key: "ato-local-preview",
   default_channel: "anthropic",
   active_provider_id: null,
@@ -941,6 +980,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
     };
   }
   if (name === "get_metrics") return fallbackMetrics;
+  if (name === "get_metrics_trend") {
+    return fallbackMetricsTrend(args?.input as MetricsTrendInput | undefined);
+  }
   if (name === "get_cache_validation_status") return fallbackCacheValidation;
   if (name === "set_cache_validation_mode") {
     const input = args?.input as CacheValidationControlInput | undefined;
@@ -1266,6 +1308,10 @@ function fallback(name: string, args?: Record<string, unknown>) {
       host: input.host,
       port: input.port,
       proxy_auto_start: input.proxy_auto_start ?? fallbackConfig.proxy_auto_start,
+      upstream_proxy_url:
+        input.upstream_proxy_url === undefined
+          ? fallbackConfig.upstream_proxy_url
+          : input.upstream_proxy_url || null,
       local_key: input.local_key,
       default_channel: input.default_channel,
       workspace_fingerprint: input.workspace_fingerprint,
@@ -1500,6 +1546,74 @@ function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKey
     available_keys: keys.filter((key) => key.enabled).length,
     keys
   };
+}
+
+function fallbackMetricsTrend(input?: MetricsTrendInput): MetricsTrendSnapshot {
+  const end = validDate(input?.end_utc) ?? new Date();
+  const start = validDate(input?.start_utc) ?? new Date(end.getTime() - 24 * 60 * 60 * 1000);
+  const duration = Math.max(60_000, end.getTime() - start.getTime());
+  const pointCount = Math.min(48, Math.max(12, Math.ceil(duration / (6 * 60 * 60 * 1000))));
+  const step = duration / pointCount;
+  const points = Array.from({ length: pointCount }, (_, index): MetricsTrendPoint => {
+    const wave = Math.sin(index * 0.72) * 0.08 + Math.cos(index * 0.31) * 0.035;
+    const inputTokens = Math.max(2_048, Math.round(54_000 + index * 1_350 + wave * 82_000));
+    const cacheRatio = Math.max(0.72, Math.min(0.992, 0.91 + wave + index / pointCount * 0.045));
+    const cacheReadTokens = Math.round(inputTokens * cacheRatio);
+    const cacheMissTokens = Math.max(0, inputTokens - cacheReadTokens);
+    return {
+      start_utc: new Date(start.getTime() + index * step).toISOString(),
+      successful_requests: 2 + (index % 5),
+      input_tokens: inputTokens,
+      output_tokens: Math.round(inputTokens * (0.006 + (index % 4) * 0.0015)),
+      cache_read_tokens: cacheReadTokens,
+      cache_miss_tokens: cacheMissTokens,
+      cache_creation_tokens: Math.round(cacheMissTokens * 0.18),
+      cache_shortfall_tokens: cacheMissTokens,
+      cache_avoidable_gap_tokens: Math.round(cacheMissTokens * 0.12),
+      cache_new_tail_gap_tokens: Math.round(cacheMissTokens * 0.74),
+      compaction_requests: index > 0 && index % 17 === 0 ? 1 : 0,
+      cold_start_requests: index === 0 && input?.include_cold_starts !== false ? 1 : 0
+    };
+  });
+  const summary = points.reduce<MetricsTrendValues>((total, point) => ({
+    successful_requests: total.successful_requests + point.successful_requests,
+    input_tokens: total.input_tokens + point.input_tokens,
+    output_tokens: total.output_tokens + point.output_tokens,
+    cache_read_tokens: total.cache_read_tokens + point.cache_read_tokens,
+    cache_miss_tokens: total.cache_miss_tokens + point.cache_miss_tokens,
+    cache_creation_tokens: total.cache_creation_tokens + point.cache_creation_tokens,
+    cache_shortfall_tokens: total.cache_shortfall_tokens + point.cache_shortfall_tokens,
+    cache_avoidable_gap_tokens: total.cache_avoidable_gap_tokens + point.cache_avoidable_gap_tokens,
+    cache_new_tail_gap_tokens: total.cache_new_tail_gap_tokens + point.cache_new_tail_gap_tokens,
+    compaction_requests: total.compaction_requests + point.compaction_requests,
+    cold_start_requests: total.cold_start_requests + point.cold_start_requests
+  }), {
+    successful_requests: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_miss_tokens: 0,
+    cache_creation_tokens: 0,
+    cache_shortfall_tokens: 0,
+    cache_avoidable_gap_tokens: 0,
+    cache_new_tail_gap_tokens: 0,
+    compaction_requests: 0,
+    cold_start_requests: 0
+  });
+  return {
+    start_utc: start.toISOString(),
+    end_utc: end.toISOString(),
+    agent_id: input?.agent_id || "codex",
+    provider_id: input?.provider_id ?? null,
+    summary,
+    points
+  };
+}
+
+function validDate(value?: string | null): Date | null {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? null : date;
 }
 
 function maskKeyPreview(value: string) {

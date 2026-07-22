@@ -67,53 +67,41 @@ meet them.
 
 ## Attempt Policy
 
-The default Agent generation budget is one actual upstream HTTP POST per
-inbound request. Cache placement, session reuse, key pools, gzip, network
-errors, redirects, 413 handling, and protocol compatibility can never add an
-attempt.
+The Agent generation budget is one actual upstream HTTP POST per inbound
+request. Cache placement, session reuse, key pools, gzip, network errors,
+redirects, 413 handling, protocol compatibility, and reasoning compatibility
+can never add an attempt.
 
-V0.2.3 has one existing, user-authorized exception: when an Agent request
-receives evidence classified by the existing reasoning-effort compatibility
-logic, it may send one lower-effort attempt in the same inbound request. V1
-preserves that behavior during Stage 0, but makes it an explicit
-`ReasoningCompatibility` attempt policy with a hard budget of two. It must be
-reported as two attempts belonging to one inbound request, never as two inbound
-requests.
-
-An explicit reasoning-parameter rejection can update the configured model and
-UI immediately. An opaque 502 may use the second attempt only when the existing
-strict probe predicate allows it. Generic 5xx responses never receive this
-exception. No third attempt is allowed; a second explicit rejection may only
-update the next request's configured effort.
-
-This exception is independent of cache policy. Removing it in favor of strict
-one-to-one behavior is a separate product change, not part of V1 cache work.
+This strict one-to-one rule supersedes the v0.2.3 same-inbound reasoning
+fallback. An explicit reasoning-parameter rejection may update only the exact
+model's configured effort and UI for the next independent inbound request. The
+current inbound returns the original upstream error. Generic or opaque 5xx
+responses never lower reasoning unless the strict classifier proves a
+reasoning-parameter rejection, and they never authorize another POST.
 
 ## Hard Invariants
 
-1. A default Agent generation that reaches dispatch creates exactly one actual
+1. Every Agent generation that reaches dispatch creates exactly one actual
    upstream HTTP POST.
-2. The only multi-attempt Agent policy is the explicit, bounded reasoning
-   compatibility exception described above.
-3. No automatic cache prewarm, companion request, key failover, protocol
+2. No automatic cache prewarm, companion request, key failover, protocol
    fallback, 413 rescue, gzip fallback, full-context retry, or redirect follow
    is allowed for Agent generation traffic.
-4. Foreground cache wait is `0ms`; cache learning never sleeps on the request
+3. Foreground cache wait is `0ms`; cache learning never sleeps on the request
    path.
-5. Full request semantics are preserved. V1 does not summarize, trim, reorder
+4. Full request semantics are preserved. V1 does not summarize, trim, reorder
    arrays, remove history, or change tools, model, reasoning, and output
-   settings except for the existing authorized reasoning fallback.
-6. `previous_response_id` is used only with trusted conversation identity and
+   settings. A proven reasoning rejection affects only a later inbound request.
+5. `previous_response_id` is used only with trusted conversation identity and
    a model-scoped capability that was verified independently. A rejected delta
    is returned as the original error without a hidden full-context retry.
-7. Downstream cancellation after dispatch ownership begins does not cancel the
+6. Downstream cancellation after dispatch ownership begins does not cancel the
    owner task. It continues through a protocol terminal event or an error and
    completes usage, cache learning, metrics, and final accounting.
-8. Failed or incomplete calls update attempt and error accounting but never
+7. Failed or incomplete calls update attempt and error accounting but never
    enter successful request history.
-9. Current user configuration and the actual resolved upstream model always
+8. Current user configuration and the actual resolved upstream model always
    outrank learned state.
-10. Each inbound outcome and each actual upstream POST is accounted exactly
+9. Each inbound outcome and each actual upstream POST is accounted exactly
     once, including transport failures before response headers.
 
 ## External Seam
@@ -199,7 +187,7 @@ cancellation or panic runs an exactly-once finalizer that records
 Stage 0 introduces only the modules needed for the foundation:
 
 - `CacheDirectedRelay`: owns the Agent generation lifecycle;
-- `AttemptGate`: enforces the default and reasoning-compatibility budgets;
+- `AttemptGate`: issues the single non-cloneable Agent send authorization;
 - `OneShotTransport`: consumes one attempt token and performs one HTTP POST;
 - `CompletionRelay`: owns upstream parsing, forwarding, and finalization;
 - `MetricsSink`: records inbound outcomes, attempts, and shadow diagnostics.
@@ -215,6 +203,15 @@ The provider is a true external dependency behind the private transport port.
 Production uses the existing reusable reqwest clients with redirect following
 disabled for generation POSTs. Tests use a scripted adapter that counts actual
 sends and controls headers, chunks, terminal events, and failures.
+
+An optional global explicit upstream proxy URL covers Mihomo or another local
+HTTP proxy that is listening but is not registered as the Windows system
+proxy. It applies only when the selected provider already enables
+`use_system_proxy`. Clients are pooled by exact proxy URL and redirect policy;
+Agent traffic keeps its separate no-redirect client. When the URL is absent,
+the direct and Windows-system-proxy paths retain their original prebuilt client
+references and do not enter the dynamic pool or acquire its lock. Only
+credential-free `http://` and `https://` proxy URLs are accepted.
 
 ## Conversation Identity
 
@@ -435,8 +432,8 @@ Aggregates include:
   `cache_realm_id`, attempt policy, and decision or skip reason.
 
 The success-history UI remains 2xx/protocol-success only. Error totals retain
-all failures. Reasoning fallback attempts share the same inbound ID and carry
-distinct attempt indices and reason labels.
+all failures. Legacy multi-attempt fields remain readable for historical
+metrics, but new Agent generation rows have exactly one attempt.
 
 ## Failure And Performance Behavior
 
@@ -447,6 +444,9 @@ distinct attempt indices and reason labels.
   Stage 0 does not falsely claim they already vanished.
 - `OneShotTransport` disables internal retry, gzip fallback, key failover, and
   redirect following. Each invocation consumes one attempt token.
+- Explicit-proxy selection performs no probe, retry, or extra POST. Its pool is
+  bounded, persistent for the process lifetime, and bypassed entirely when no
+  explicit URL is configured.
 - Upstream transport, HTTP, and stream errors are returned truthfully after the
   authorized attempt budget is exhausted.
 - A full learning queue drops the learning sample instead of adding response
@@ -464,13 +464,14 @@ more than 5ms against the v0.2.3 fixture benchmark.
 ### Stage 0: Foundation Relay
 
 Move Agent send and streaming ownership behind `dispatch_once`, split inbound
-and attempt metrics, and preserve current final wire behavior and the explicit
-reasoning compatibility exception. No new cache strategy is active.
+and attempt metrics, and preserve current final wire behavior. No new cache
+strategy is active.
 
 Exit gate:
 
-- default Agent paths make one actual POST;
-- the authorized reasoning path makes at most two labeled attempts;
+- every Agent path makes one actual POST;
+- a reasoning rejection returns the original error and only updates the next
+  independent request's exact-model configuration;
 - response-head cancellation and downstream-body cancellation both finalize;
 - protocol terminal and exactly-once accounting tests pass;
 - final wire bytes, cache/stream/gzip headers, downstream status/headers, SSE
@@ -512,7 +513,7 @@ Exit gate:
   baseline;
 - candidate error rate is not more than 0.5 percentage points above baseline;
 - candidate TTFT p95 is not worse by more than the larger of 300ms and 5%;
-- no unlabelled multi-attempt inbound or semantic differential occurs.
+- no multi-attempt Agent inbound or semantic differential occurs.
 
 In addition to those safety gates, promotion requires at least one efficacy
 gate:
@@ -580,8 +581,9 @@ Using the scripted transport adapter:
 - connection failure before headers: one attempt record and no retry;
 - gzip rejection, key failure, 413, delta rejection, and protocol compatibility
   failure: one default Agent POST and no fallback;
-- explicit reasoning rejection: at most one labeled lower-effort attempt;
-- generic 502 outside the strict reasoning predicate: no second attempt;
+- explicit reasoning rejection: no retry; update only the next independent
+  request's exact-model effort;
+- generic 502 outside the strict reasoning predicate: no retry and no downgrade;
 - duplicate `InboundPermit`: rejected before network I/O;
 - policy/state failure: one baseline-compatible send.
 
@@ -647,8 +649,9 @@ For one selected provider/model canary:
    equivalent ordinary turns;
 3. verify each default row has one inbound and one upstream attempt, with the
    requested model and reasoning unchanged;
-4. trigger one known reasoning-effort compatibility case and verify any second
-   attempt is labeled, bounded, and attached to the same inbound row;
+4. trigger one known reasoning-effort compatibility case and verify the row has
+   one POST, preserves the original error, and updates only the affected model
+   for the next independent request;
 5. run one tool call with a deliberately large but non-sensitive output, then
    send two ordinary follow-ups;
 6. stop consuming one response before headers and another after receiving part

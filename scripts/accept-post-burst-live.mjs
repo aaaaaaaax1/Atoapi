@@ -41,6 +41,11 @@ const stableInstructionChars = boundedNumber(
   4_096,
   120_000
 );
+const maxOutputTokens = boundedNumber(
+  args["max-output-tokens"] ?? 256,
+  16,
+  4_096
+);
 const compactionHistoryChars = boundedNumber(
   args["compaction-history-chars"] ?? 300_000,
   80_000,
@@ -66,6 +71,7 @@ const longLivedToolChars = boundedNumber(
 const requestedPort = boundedNumber(args.port ?? 18_885, 1_024, 65_533);
 const keepRunDir = booleanArg(args["keep-run-dir"]);
 const forceCanary = booleanArg(args["force-canary"]);
+const seedOnly = booleanArg(args["seed-only"]);
 const fixedWindows = args["fixed-windows"] === undefined
   ? null
   : boundedNumber(args["fixed-windows"], 1, 20);
@@ -80,6 +86,12 @@ if (fixedWindows !== null && mode !== "observe") {
 }
 if (forceCanary && mode !== "full") {
   failUsage("--force-canary requires --mode full.");
+}
+if (seedOnly && !args.url) {
+  failUsage("--seed-only requires --url so it cannot start an isolated runtime.");
+}
+if (seedOnly && booleanArg(args["probe-capabilities"])) {
+  failUsage("--seed-only cannot be combined with --probe-capabilities.");
 }
 if (!lane) failUsage("--lane must be tool_burst_quarantine or compacted_anchor.");
 if (!candidateVariant) {
@@ -118,7 +130,11 @@ try {
     capabilityProbe = await probeCapabilities();
   }
 
-  if (mode === "long_lived") {
+  if (seedOnly) {
+    const result = await runSingleSeedDiagnostic();
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.pass) process.exitCode = 1;
+  } else if (mode === "long_lived") {
     await runLongLivedSession();
     const result = buildLongLivedResult();
     console.log(JSON.stringify(result, null, 2));
@@ -413,6 +429,25 @@ function newSession(label) {
   };
 }
 
+async function runSingleSeedDiagnostic() {
+  const session = newSession("manual-seed");
+  const result = await sendRequest(session, "manual_seed", true);
+  return {
+    manualSeedOnly: true,
+    externalRuntime: !runtime.managed,
+    model,
+    status: result.status,
+    completed: result.completed,
+    counters: result.counters,
+    metric: compactMetric(result.metric),
+    error: result.error,
+    pass: result.completed &&
+      result.counters.inboundRequests === 1 &&
+      result.counters.generationAttempts === 1 &&
+      result.counters.upstreamRequests === 1
+  };
+}
+
 async function verifySessionSeed(session, expectedArm) {
   const seed = await sendRequest(session, "seed", true);
   const arm = String(seed.metric?.shadow_affinity_arm ?? "");
@@ -441,17 +476,47 @@ async function verifySessionSeed(session, expectedArm) {
     selectSession(session, arm, true);
     return null;
   }
+  // A deterministic request-shape/model rejection cannot become valid merely
+  // by issuing more seed requests. Failing here keeps this explicit acceptance
+  // tool from turning one bad configuration choice into a burst of hidden
+  // management traffic. Authentication/quota failures retain the bounded
+  // retry budget because a multi-key pool may select a different usable key
+  // on the next independent test inbound.
+  if (isDeterministicSeedRejectionStatus(seed.status)) {
+    const proxyError = await latestProxyErrorSummary();
+    throw new Error(
+      `seed request was rejected without automatic fallback; ` +
+      `status=${seed.status}, model=${model}, error=${seed.error || "missing"}, ` +
+      `proxy_error=${proxyError}`
+    );
+  }
   probeFailures += 1;
   if (probeFailures > maxProbeFailures) {
-    const diagnosticMetrics = await getJson(`${runtime.baseUrl}/admin/metrics`);
-    const latestError = diagnosticMetrics.recent_errors?.[0];
+    const proxyError = await latestProxyErrorSummary();
     throw new Error(
       `probe failures or missing usage exceeded ${maxProbeFailures}; ` +
       `last status=${seed.status}, arm=${arm || "missing"}, usage=${hasUsage}, ` +
-      `proxy_error=${latestError ? `${latestError.scope}:${latestError.message}` : "missing"}`
+      `proxy_error=${proxyError}`
     );
   }
   return null;
+}
+
+async function latestProxyErrorSummary() {
+  try {
+    const diagnosticMetrics = await getJson(`${runtime.baseUrl}/admin/metrics`);
+    const latestError = diagnosticMetrics.recent_errors?.[0];
+    if (!latestError) return "missing";
+    const scope = String(latestError.scope ?? "unknown").slice(0, 80);
+    const message = String(latestError.message ?? "missing").slice(0, 400);
+    return `${scope}:${message}`;
+  } catch {
+    return "unavailable";
+  }
+}
+
+function isDeterministicSeedRejectionStatus(status) {
+  return new Set([400, 404, 422]).has(Number(status));
 }
 
 function selectSession(session, arm, enqueue) {
@@ -708,7 +773,7 @@ async function sendRequest(
       body: JSON.stringify({
         model,
         stream: true,
-        max_output_tokens: 16,
+        max_output_tokens: maxOutputTokens,
         instructions: stableInstructions,
         input: session.input
       }),
@@ -895,6 +960,7 @@ function buildResult(finalAffinity) {
       interRequestDelayMs,
       toolChars,
       stableInstructionChars,
+      maxOutputTokens,
       compactionHistoryChars,
       compactionSummaryChars,
       fixedWindows
@@ -1357,6 +1423,10 @@ function runSelfTest() {
   assert.equal(normalizeCandidateVariant("cohort_key"), "cohort_key");
   assert.equal(normalizeCandidateVariant("cohort-two-shard"), "cohort_two_shard");
   assert.equal(normalizeCandidateVariant("unknown"), null);
+  assert.equal(isDeterministicSeedRejectionStatus(400), true);
+  assert.equal(isDeterministicSeedRejectionStatus(422), true);
+  assert.equal(isDeterministicSeedRejectionStatus(403), false);
+  assert.equal(isDeterministicSeedRejectionStatus(503), false);
   if (candidateVariant === "auto") {
     const readinessChain = {
       readiness: [

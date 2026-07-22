@@ -1,7 +1,7 @@
-// node_modules/@electron/asar/lib/asar.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/asar.js
 import path5 from "node:path";
 
-// node_modules/balanced-match/dist/esm/index.js
+// node_modules/.pnpm/balanced-match@4.0.4/node_modules/balanced-match/dist/esm/index.js
 var balanced = (a, b, str) => {
   const ma = a instanceof RegExp ? maybeMatch(a, str) : a;
   const mb = b instanceof RegExp ? maybeMatch(b, str) : b;
@@ -54,7 +54,7 @@ var range = (a, b, str) => {
   return result;
 };
 
-// node_modules/brace-expansion/dist/esm/index.js
+// node_modules/.pnpm/brace-expansion@5.0.7/node_modules/brace-expansion/dist/esm/index.js
 var escSlash = "\0SLASH" + Math.random() + "\0";
 var escOpen = "\0OPEN" + Math.random() + "\0";
 var escClose = "\0CLOSE" + Math.random() + "\0";
@@ -218,7 +218,7 @@ function expand_(str, max, isTop) {
   }
 }
 
-// node_modules/minimatch/dist/esm/assert-valid-pattern.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/assert-valid-pattern.js
 var MAX_PATTERN_LENGTH = 1024 * 64;
 var assertValidPattern = (pattern) => {
   if (typeof pattern !== "string") {
@@ -229,7 +229,7 @@ var assertValidPattern = (pattern) => {
   }
 };
 
-// node_modules/minimatch/dist/esm/brace-expressions.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/brace-expressions.js
 var posixClasses = {
   "[:alnum:]": ["\\p{L}\\p{Nl}\\p{Nd}", true],
   "[:alpha:]": ["\\p{L}\\p{Nl}", true],
@@ -338,7 +338,7 @@ var parseClass = (glob, position) => {
   return [comb, uflag, endPos - pos, true];
 };
 
-// node_modules/minimatch/dist/esm/unescape.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/unescape.js
 var unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true } = {}) => {
   if (magicalBraces) {
     return windowsPathsNoEscape ? s.replace(/\[([^/\\])\]/g, "$1") : s.replace(/((?!\\).|^)\[([^/\\])\]/g, "$1$2").replace(/\\([^/])/g, "$1");
@@ -346,7 +346,7 @@ var unescape = (s, { windowsPathsNoEscape = false, magicalBraces = true } = {}) 
   return windowsPathsNoEscape ? s.replace(/\[([^/\\{}])\]/g, "$1") : s.replace(/((?!\\).|^)\[([^/\\{}])\]/g, "$1$2").replace(/\\([^/{}])/g, "$1");
 };
 
-// node_modules/minimatch/dist/esm/ast.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/ast.js
 var _a;
 var types = /* @__PURE__ */ new Set(["!", "?", "+", "*", "@"]);
 var isExtglobType = (c) => types.has(c);
@@ -990,7 +990,7 @@ var AST = class {
 };
 _a = AST;
 
-// node_modules/minimatch/dist/esm/escape.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/escape.js
 var escape = (s, { windowsPathsNoEscape = false, magicalBraces = false } = {}) => {
   if (magicalBraces) {
     return windowsPathsNoEscape ? s.replace(/[?*()[\]{}]/g, "[$&]") : s.replace(/[?*()[\]\\{}]/g, "\\$&");
@@ -998,7 +998,7 @@ var escape = (s, { windowsPathsNoEscape = false, magicalBraces = false } = {}) =
   return windowsPathsNoEscape ? s.replace(/[?*()[\]]/g, "[$&]") : s.replace(/[?*()[\]\\]/g, "\\$&");
 };
 
-// node_modules/minimatch/dist/esm/index.js
+// node_modules/.pnpm/minimatch@10.2.5/node_modules/minimatch/dist/esm/index.js
 var minimatch = (p, pattern, options = {}) => {
   assertValidPattern(pattern);
   if (!options.nocomment && pattern.charAt(0) === "#") {
@@ -1807,7 +1807,7 @@ minimatch.Minimatch = Minimatch;
 minimatch.escape = escape;
 minimatch.unescape = unescape;
 
-// node_modules/@electron/asar/lib/wrapped-fs.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/wrapped-fs.js
 import { createRequire } from "node:module";
 var require2 = createRequire(import.meta.url);
 var fs = "electron" in process.versions ? require2("original-fs") : require2("node:fs");
@@ -1831,12 +1831,12 @@ var wrappedFs = Object.keys(fs).reduce((accum, method) => {
   mkdirpSync: (dir) => fs.mkdirSync(dir, { recursive: true })
 });
 
-// node_modules/@electron/asar/lib/filesystem.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/filesystem.js
 import os from "node:os";
 import path2 from "node:path";
 import stream2 from "node:stream/promises";
 
-// node_modules/@electron/asar/lib/integrity.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/integrity.js
 import crypto from "node:crypto";
 import stream from "node:stream";
 import streamPromises from "node:stream/promises";
@@ -1894,7 +1894,7 @@ function getFileIntegrityFromBuffer(data) {
   return { algorithm: ALGORITHM, hash, blockSize: BLOCK_SIZE, blocks };
 }
 
-// node_modules/@electron/asar/lib/filesystem.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/filesystem.js
 var UINT32_MAX = 2 ** 32 - 1;
 var BUFFER_HASH_THRESHOLD = 2 * 1024 * 1024;
 var Filesystem = class {
@@ -2079,10 +2079,10 @@ var Filesystem = class {
   }
 };
 
-// node_modules/@electron/asar/lib/disk.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/disk.js
 import path3 from "node:path";
 
-// node_modules/@electron/asar/lib/pickle.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/pickle.js
 var SIZE_INT32 = 4;
 var SIZE_UINT32 = 4;
 var SIZE_INT64 = 8;
@@ -2262,7 +2262,7 @@ var Pickle = class _Pickle {
   }
 };
 
-// node_modules/@electron/asar/lib/disk.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/disk.js
 var filesystemCache = /* @__PURE__ */ Object.create(null);
 async function copyFile(dest, src, filename) {
   const srcFile = path3.join(src, filename);
@@ -2382,7 +2382,7 @@ async function createSymlink(dest, filepath, link) {
   });
 }
 
-// node_modules/glob/dist/esm/index.min.js
+// node_modules/.pnpm/glob@13.0.6/node_modules/glob/dist/esm/index.min.js
 import { fileURLToPath as Wi } from "node:url";
 import { posix as mi, win32 as re } from "node:path";
 import { fileURLToPath as gi } from "node:url";
@@ -5366,7 +5366,7 @@ var Ui = Object.assign(ts, { stream: Bt, iterate: Ut });
 var Ze = Object.assign(Je, { glob: Je, globSync: ts, sync: Ui, globStream: Qe, stream: Ii, globStreamSync: Bt, streamSync: ji, globIterate: es, iterate: Bi, globIterateSync: Ut, iterateSync: zi, Glob: I, hasMagic: le, escape: tt, unescape: W });
 Ze.glob = Ze;
 
-// node_modules/@electron/asar/lib/crawlfs.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/crawlfs.js
 import path4 from "node:path";
 async function determineFileType(filename) {
   const stat = await wrappedFs.lstat(filename);
@@ -5415,7 +5415,7 @@ async function crawl(dir, options) {
   return [filenames, metadata];
 }
 
-// node_modules/@electron/asar/lib/asar.js
+// node_modules/.pnpm/@electron+asar@4.2.0/node_modules/@electron/asar/lib/asar.js
 function isUnpackedDir(dirPath, pattern, unpackDirs) {
   if (dirPath.startsWith(pattern) || minimatch(dirPath, pattern)) {
     unpackDirs.add(dirPath);

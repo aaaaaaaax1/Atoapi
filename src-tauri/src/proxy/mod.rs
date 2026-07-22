@@ -19,7 +19,7 @@ use crate::{
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
         AgentInboundStart, AgentOwnerFailureSettlement, AgentTerminalSettlement,
-        MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
+        FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
         ResponsesWirePrefixFingerprints, UsageRecord,
     },
     state::{AppState, PrefixWarmState, ResponseSessionCooldownState},
@@ -54,14 +54,20 @@ use tokio::{
     time::{sleep, Duration as TokioDuration},
 };
 use uuid::Uuid;
+mod action_scope;
 pub(crate) mod affinity_identity;
 mod attempt_gate;
 pub(crate) mod cache_affinity;
 mod cache_capability;
+mod cache_control_core;
 mod cache_directed_relay;
 pub(crate) mod cache_validation;
 mod codex_chat_common;
+mod completion_relay;
 mod continuation_scope;
+mod final_scope_shadow;
+pub(crate) mod final_scope_waterline;
+mod generation_envelope;
 mod json_canonical;
 mod prefix_control;
 mod prepared_wire_request;
@@ -69,6 +75,7 @@ mod request_plan;
 mod responses_stream;
 mod responses_websocket_probe;
 mod session_identity;
+mod settlement_pipeline;
 mod sse;
 mod streaming_chat_anthropic;
 mod streaming_codex_anthropic;
@@ -77,11 +84,31 @@ mod streaming_responses_anthropic;
 mod streaming_responses_chat;
 mod transform_codex_chat;
 mod transport;
+#[cfg(test)]
+mod wire_fixture_tests;
+use action_scope::{ActionScopeInput, CompositeActionScope};
 use attempt_gate::{AttemptGate, AttemptPolicy, AttemptReason, AttemptToken};
 use cache_affinity::{ShadowAffinityDecision, ShadowObservationInput};
+use cache_control_core::{
+    CacheContextMode, CacheControlCore, CacheControlPlanInput, FinalWireReceipt,
+};
 pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
-use continuation_scope::{response_session_capability, ContinuationScope};
+use completion_relay::stream_upstream;
+#[cfg(test)]
+use completion_relay::{
+    relay_chunk_parts, BoundedCacheCapture, STREAM_CACHE_CAPTURE_BYTE_LIMIT,
+    STREAM_RELAY_BYTE_BUDGET, STREAM_RELAY_CHANNEL_CAPACITY,
+};
+use continuation_scope::{
+    native_responses_verified_delta_schema_is_known, response_session_capability, ContinuationScope,
+};
+use final_scope_shadow::{FinalScopeShadow, FinalScopeShadowInput, FinalScopeShadowReceipt};
+use final_scope_waterline::{
+    PredecessorProofReceipt, PredecessorProofStatus, WaterlineControlHead, WaterlineSettlement,
+    WaterlineSettlementOutcome, WaterlineTicket,
+};
+use generation_envelope::GenerationEnvelope;
 use prefix_control::{
     PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
     ProviderCacheGapBreakdown, MIN_CLEAN_TINY_RECOVERY_STREAK,
@@ -92,14 +119,18 @@ use prepared_wire_request::{
     RESPONSES_WIRE_ORDERED_KEYS,
 };
 use prepared_wire_request::{
-    serialize_responses_body_bytes_for_provider_prefix, PreparedWireDraft,
+    serialize_responses_body_bytes_for_provider_prefix, PreparedResponseBody,
 };
 use request_plan::{OneShotRequestPlan, RequestPlan};
 use responses_stream::{
     evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
-    StreamEnd, TerminalCompatibility, TerminalFailure,
+    StreamEnd, TerminalCompatibility, TerminalFailure, TerminalPrecheckGuard,
 };
 use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
+use settlement_pipeline::{
+    agent_owner_failure_transaction, finalize_agent_generation, insert_cache_entries,
+    AgentOwnerSettlementGuard,
+};
 pub(crate) use transport::TransportClients;
 #[cfg(test)]
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
@@ -120,9 +151,6 @@ const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
-const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
-const STREAM_RELAY_BYTE_BUDGET: usize = 2 * 1024 * 1024;
-const STREAM_CACHE_CAPTURE_BYTE_LIMIT: usize = STREAM_RELAY_BYTE_BUDGET;
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
@@ -133,6 +161,76 @@ const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
 // Shadow affinity remains observable by default, but it must not change an
 // ordinary request's provider cache key without an explicit validation run.
 const AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED: bool = false;
+#[cfg(not(test))]
+const ISOLATED_AUTO_CACHE_CANARY_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
+
+/// Production remains permanently shadow-only until an administrator starts a
+/// validation run. The only automatic exception is a separate process that
+/// has opted into the isolated acceptance harness; it has its own temporary
+/// config directory and cannot alter the live desktop instance.
+fn automatic_static_cohort_routing_enabled() -> bool {
+    #[cfg(test)]
+    {
+        AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            automatic_static_cohort_routing_enabled_value(
+                crate::config::isolated_test_instance(),
+                std::env::var(ISOLATED_AUTO_CACHE_CANARY_ENV)
+                    .ok()
+                    .as_deref(),
+            )
+        })
+    }
+}
+
+fn automatic_static_cohort_routing_enabled_value(
+    isolated_instance: bool,
+    isolated_canary: Option<&str>,
+) -> bool {
+    AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
+        || (isolated_instance
+            && isolated_canary
+                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled")))
+}
+
+/// Cache-affinity state is an optional routing/measurement optimization, not
+/// semantic conversation state.  Never queue an inbound Agent request behind a
+/// background runtime snapshot: retain a truthful shadow-only receipt instead.
+fn try_compute_shadow_affinity_without_wait(
+    shadow_affinity: &tokio::sync::Mutex<cache_affinity::ShadowAffinityStore>,
+    identity: &affinity_identity::AffinityIdentity,
+    session_anchor_key: Option<&str>,
+    identity_elapsed: std::time::Duration,
+    now: chrono::DateTime<Utc>,
+    tool_output_chars: u64,
+    largest_tool_output_chars: u64,
+) -> (ShadowAffinityDecision, bool) {
+    let policy_compute_ms = identity_elapsed.as_millis() as u64;
+    let Ok(mut shadow_affinity) = shadow_affinity.try_lock() else {
+        return (
+            cache_affinity::shadow_affinity_snapshot_lock_busy(identity, policy_compute_ms),
+            true,
+        );
+    };
+    let mut decision = cache_affinity::compute_shadow_affinity(
+        &mut shadow_affinity,
+        identity,
+        session_anchor_key,
+        now,
+        tool_output_chars,
+        largest_tool_output_chars,
+    );
+    // The cache-affinity policy begins when its stable identity is derived,
+    // not only when the assignment map is consulted. Large instructions and
+    // tool schemas live in that identity material, so excluding their
+    // canonicalization would under-report the actual request-path cost.
+    decision.policy_compute_ms = decision.policy_compute_ms.saturating_add(policy_compute_ms);
+    (decision, false)
+}
 
 #[derive(Debug, Deserialize)]
 struct ResponseSessionReuseProbeHttpInput {
@@ -145,52 +243,6 @@ struct RouteDecision {
     provider: ProviderConfig,
     upstream_channel: Channel,
     model: String,
-}
-
-struct RelayBodyChunk {
-    bytes: Bytes,
-    permit: OwnedSemaphorePermit,
-}
-
-struct BoundedCacheCapture {
-    body: Vec<u8>,
-    complete: bool,
-}
-
-impl BoundedCacheCapture {
-    fn new(enabled: bool) -> Self {
-        Self {
-            body: Vec::new(),
-            complete: enabled,
-        }
-    }
-
-    fn push(&mut self, bytes: &[u8]) {
-        if !self.complete {
-            return;
-        }
-        if self.body.len().saturating_add(bytes.len()) > STREAM_CACHE_CAPTURE_BYTE_LIMIT {
-            self.body = Vec::new();
-            self.complete = false;
-            return;
-        }
-        self.body.extend_from_slice(bytes);
-    }
-
-    fn finish(self) -> Option<Vec<u8>> {
-        self.complete.then_some(self.body)
-    }
-}
-
-fn relay_chunk_parts(chunk: &Bytes) -> impl Iterator<Item = Bytes> + '_ {
-    (0..chunk.len())
-        .step_by(STREAM_RELAY_BYTE_BUDGET)
-        .map(move |start| {
-            let end = start
-                .saturating_add(STREAM_RELAY_BYTE_BUDGET)
-                .min(chunk.len());
-            chunk.slice(start..end)
-        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -217,8 +269,31 @@ struct ReasoningEffortDiagnostics {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TrustedCodexRequestMetadata {
     thread_id: Option<String>,
+    conversation_id: Option<String>,
     session_id: Option<String>,
+    request_kind: Option<String>,
     compaction_requested: bool,
+    source: TrustedCodexMetadataSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TrustedCodexMetadataSource {
+    AdapterHeader,
+    #[default]
+    AgentClientMetadata,
+}
+
+impl TrustedCodexMetadataSource {
+    const fn action_scope_attested(self) -> bool {
+        matches!(self, Self::AdapterHeader)
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::AdapterHeader => "adapter-header",
+            Self::AgentClientMetadata => "agent-client-metadata",
+        }
+    }
 }
 #[derive(Debug, Clone, Default)]
 struct UpstreamRequestDiagnostics {
@@ -246,6 +321,9 @@ struct UpstreamRequestDiagnostics {
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
     sent_cache_capability_fields: Vec<ProviderCacheCapabilityField>,
     cache_capability_key_id: Option<String>,
+    final_wire_receipt: Option<FinalWireReceipt>,
+    final_scope_shadow: Option<FinalScopeShadowReceipt>,
+    final_scope_waterline: Option<FinalScopeWaterlineLog>,
 }
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
@@ -281,6 +359,60 @@ impl UpstreamRequestDiagnostics {
         if next.cache_capability_key_id.is_some() {
             self.cache_capability_key_id = next.cache_capability_key_id.clone();
         }
+        if next.final_wire_receipt.is_some() {
+            self.final_wire_receipt = next.final_wire_receipt.clone();
+        }
+        if next.final_scope_shadow.is_some() {
+            self.final_scope_shadow = next.final_scope_shadow.clone();
+        }
+        if next.final_scope_waterline.is_some() {
+            self.final_scope_waterline = next.final_scope_waterline.clone();
+        }
+    }
+}
+
+/// Single owner for one final-scope shadow ticket. Normal sync/stream paths
+/// consume it explicitly; every early return or cancelled relay settles a
+/// failed terminal observation from `Drop` without waiting or spawning work.
+struct FinalScopeDispatchGuard {
+    state: Arc<AppState>,
+    ticket: Option<WaterlineTicket>,
+}
+
+impl FinalScopeDispatchGuard {
+    fn new(state: Arc<AppState>, ticket: WaterlineTicket) -> Self {
+        Self {
+            state,
+            ticket: Some(ticket),
+        }
+    }
+
+    fn finish(
+        mut self,
+        raw_usage: Option<&UsageRecord>,
+        upstream_succeeded: bool,
+        confirmed_compaction: bool,
+        committed_head: Option<WaterlineControlHead>,
+    ) -> Option<FinalScopeWaterlineLog> {
+        let ticket = self.ticket.take()?;
+        settle_final_scope_waterline_and_record(
+            &self.state,
+            &ticket,
+            raw_usage,
+            upstream_succeeded,
+            confirmed_compaction,
+            committed_head,
+        )
+    }
+}
+
+impl Drop for FinalScopeDispatchGuard {
+    fn drop(&mut self) {
+        let Some(ticket) = self.ticket.take() else {
+            return;
+        };
+        let _ =
+            settle_final_scope_waterline_and_record(&self.state, &ticket, None, false, false, None);
     }
 }
 struct UpstreamSendOutcome {
@@ -397,6 +529,12 @@ struct TailInputDiagnostics {
     tool_output_noise_hint: Option<String>,
     source: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct TailInputAnalysis {
+    diagnostics: TailInputDiagnostics,
+    predecessor: PredecessorProofReceipt,
+}
 #[derive(Debug, Clone, Default)]
 struct ToolOutputNoiseDiagnostics {
     lines: u64,
@@ -441,7 +579,10 @@ struct SessionAnchorDiagnostics {
 }
 #[derive(Debug, Clone)]
 struct ResponseSessionReuseOutcome {
-    body: Value,
+    /// Present only when an exact native continuation delta was built.
+    /// Full-replay fallbacks borrow the original prepared body instead of
+    /// cloning a potentially very large Agent input merely to report a skip.
+    delta_body: Option<Value>,
     diagnostics: ResponseSessionReuseDiagnostics,
 }
 #[derive(Debug, Clone, Default)]
@@ -463,6 +604,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/admin/metrics", get(admin_metrics))
+        .route("/admin/final-scope-shadow", get(admin_final_scope_shadow))
         .route("/admin/cache-validation", get(admin_cache_validation))
         .route("/admin/cache-affinity", get(admin_cache_affinity))
         .route("/admin/cache-capabilities", get(admin_cache_capabilities))
@@ -510,6 +652,10 @@ async fn health() -> impl IntoResponse {
 }
 async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.metrics.snapshot().await)
+}
+
+async fn admin_final_scope_shadow(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.final_scope_observations.snapshot())
 }
 async fn admin_cache_validation(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
     Json(state.cache_validation.lock().await.status(Utc::now()))
@@ -946,13 +1092,34 @@ async fn run_responses_compact_for_authorized_agent(
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
         apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
     }
-    let continuation_scope = ContinuationScope::derive(
-        &config,
-        &decision,
-        &identity_client_request,
-        authorized_agent.as_deref(),
-        &selected_provider_key,
-    );
+    // Compaction may change a lineage epoch, so it must use the same
+    // adapter-attested scope as Native Responses continuation. Client-body
+    // identity hints remain usable for cache placement but cannot begin or
+    // clear a compaction lineage.
+    let response_endpoint = upstream_url(&decision.provider.base_url, &Channel::Responses);
+    let compaction_action_scope = if native_responses_passthrough {
+        trusted_codex_metadata.as_ref().and_then(|metadata| {
+            CompositeActionScope::derive(ActionScopeInput {
+                workspace_fingerprint: &config.workspace_fingerprint,
+                agent_id: authorized_agent.as_deref(),
+                provider_id: &decision.provider.id,
+                endpoint: &response_endpoint,
+                resolved_model: &decision.model,
+                channel: &Channel::Responses,
+                key_realm_id: &affinity_identity::key_realm_id(&selected_provider_key),
+                thread_id: metadata.thread_id.as_deref(),
+                conversation_id: metadata.conversation_id.as_deref(),
+                session_id: metadata.session_id.as_deref(),
+                adapter_attested: metadata.source.action_scope_attested(),
+                identity_source: metadata.source.label(),
+            })
+        })
+    } else {
+        None
+    };
+    let continuation_scope = compaction_action_scope
+        .as_ref()
+        .map(ContinuationScope::from_action_scope);
     let response_session_key = if responses_session_reuse_enabled(&config) {
         continuation_scope
             .as_ref()
@@ -1038,12 +1205,19 @@ async fn run_responses_compact_for_authorized_agent(
     if compact_chat_fast_json {
         set_stream_flag(&mut active_upstream_body, false);
     }
-    let mut request_plan = Some(RequestPlan::new(
-        &decision.provider,
-        active_url.clone(),
-        active_request_channel.clone(),
-        &active_upstream_body,
-    ));
+    let mut request_plan = Some(
+        RequestPlan::new(
+            &decision.provider,
+            active_url.clone(),
+            active_request_channel.clone(),
+            &active_upstream_body,
+        )
+        .with_explicit_proxy_url(
+            config
+                .upstream_proxy_url_for(decision.provider.use_system_proxy)
+                .map(str::to_owned),
+        ),
+    );
     let mut compact_metric_errors = Vec::<(String, String)>::new();
     let compact_prefix_guard_wait = PrefixGuardWaitDiagnostics::default();
     let compact_response_session_reuse = ResponseSessionReuseDiagnostics::default();
@@ -1161,6 +1335,7 @@ async fn run_responses_compact_for_authorized_agent(
                     false,
                     &compact_response_session_reuse,
                     requested_model_for_log.clone(),
+                    None,
                     authorized_agent.as_deref(),
                     "compact-transport",
                     1,
@@ -1288,6 +1463,7 @@ async fn run_responses_compact_for_authorized_agent(
                     false,
                     &compact_response_session_reuse,
                     requested_model_for_log.clone(),
+                    None,
                     authorized_agent.as_deref(),
                     "compact-body",
                     upstream_request_diagnostics.attempts.max(1),
@@ -1481,6 +1657,7 @@ async fn run_responses_compact_for_authorized_agent(
             .outbound_prefix_fingerprints
             .clone(),
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+        final_scope_waterline: None,
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
         shadow_affinity_realm_id: None,
@@ -1735,91 +1912,6 @@ async fn handle_generation_for_agent(
     .await
 }
 
-struct AgentOwnerSettlementGuard {
-    metrics: MetricsStore,
-    request_id: String,
-    started: Instant,
-    client_channel: Channel,
-    agent_id: Option<String>,
-    armed: bool,
-}
-
-impl AgentOwnerSettlementGuard {
-    fn new(
-        metrics: MetricsStore,
-        request_id: String,
-        started: Instant,
-        client_channel: Channel,
-        agent_id: Option<String>,
-    ) -> Self {
-        Self {
-            metrics,
-            request_id,
-            started,
-            client_channel,
-            agent_id,
-            armed: true,
-        }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for AgentOwnerSettlementGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        let transaction = agent_owner_failure_transaction(
-            &self.request_id,
-            self.started,
-            &self.client_channel,
-            self.agent_id.clone(),
-            "owner_dropped",
-            "agent generation owner was dropped before settlement completed",
-        );
-        let _ = self.metrics.commit_detached(transaction);
-    }
-}
-
-fn agent_owner_failure_transaction(
-    request_id: &str,
-    started: Instant,
-    client_channel: &Channel,
-    agent_id: Option<String>,
-    terminal_state: &str,
-    message: &str,
-) -> MetricsTransaction {
-    let elapsed = started.elapsed().as_millis() as u64;
-    let request_id = request_id.to_string();
-    let mut transaction = MetricsTransaction::agent_owner_failure(AgentOwnerFailureSettlement {
-        inbound_request_id: request_id.clone(),
-        request: RequestLog {
-            id: request_id.clone(),
-            at: Utc::now(),
-            inbound_request_id: Some(request_id),
-            client_channel: client_channel.label().to_string(),
-            upstream_channel: "unknown".to_string(),
-            provider: "unknown".to_string(),
-            provider_id: None,
-            model: "unknown".to_string(),
-            cache_status: "error".to_string(),
-            agent_id: agent_id.clone(),
-            agent_label: agent_id,
-            status: StatusCode::BAD_GATEWAY.as_u16(),
-            ttft_ms: elapsed,
-            total_ms: elapsed,
-            sse_end_reason: Some(terminal_state.to_string()),
-            ..RequestLog::default()
-        },
-        terminal_state: Some(terminal_state.to_string()),
-    });
-    transaction.observe_error("agent_generation_owner", message.to_string());
-    transaction
-}
-
 async fn dispatch_agent_generation_owner<F, Fut>(
     metrics: MetricsStore,
     tracker: DispatchTracker,
@@ -1860,7 +1952,7 @@ async fn run_generation_for_authorized_agent(
     started: Instant,
     request_id: String,
     inbound_body_bytes: u64,
-    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
+    mut response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
 ) -> Response {
     let mut client_request: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
@@ -2205,6 +2297,23 @@ async fn run_generation_for_authorized_agent(
             "provider API key is not configured",
         );
     }
+    let response_endpoint = upstream_url(&decision.provider.base_url, &Channel::Responses);
+    let action_scope = trusted_codex_metadata.as_ref().and_then(|metadata| {
+        CompositeActionScope::derive(ActionScopeInput {
+            workspace_fingerprint: &config.workspace_fingerprint,
+            agent_id: authorized_agent.as_deref(),
+            provider_id: &decision.provider.id,
+            endpoint: &response_endpoint,
+            resolved_model: &decision.model,
+            channel: &decision.upstream_channel,
+            key_realm_id: &affinity_identity::key_realm_id(&selected_provider_key),
+            thread_id: metadata.thread_id.as_deref(),
+            conversation_id: metadata.conversation_id.as_deref(),
+            session_id: metadata.session_id.as_deref(),
+            adapter_attested: metadata.source.action_scope_attested(),
+            identity_source: metadata.source.label(),
+        })
+    });
     let session_reuse_capability =
         (native_responses_passthrough && client_requested_stream).then(|| {
             response_session_capability(
@@ -2213,13 +2322,9 @@ async fn run_generation_for_authorized_agent(
                 ResponseSessionReuseStreamShape::StreamSse,
             )
         });
-    let continuation_scope = ContinuationScope::derive(
-        &config,
-        &decision,
-        &identity_client_request,
-        authorized_agent.as_deref(),
-        &selected_provider_key,
-    );
+    let continuation_scope = action_scope
+        .as_ref()
+        .map(ContinuationScope::from_action_scope);
     let response_session_key = if responses_session_reuse_enabled(&config) {
         continuation_scope
             .as_ref()
@@ -2317,11 +2422,13 @@ async fn run_generation_for_authorized_agent(
         Some(key) => Some(state.continuation_lineage.begin(key).await),
         None => None,
     };
-    let tail_input_diagnostics = tail_input_diagnostics_for_session(
+    let tail_input_analysis = analyze_tail_input_for_session(
         &decision.upstream_channel,
         response_session_snapshot_lease.as_ref(),
         full_response_input.as_ref(),
     );
+    let tail_input_diagnostics = tail_input_analysis.diagnostics;
+    let mut final_scope_predecessor = tail_input_analysis.predecessor;
     let response_session_compaction = if response_session_starts_compaction_epoch {
         match response_session_key.as_deref() {
             Some(key) => Some(
@@ -2366,21 +2473,21 @@ async fn run_generation_for_authorized_agent(
     let response_session_cooldown_key =
         response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
     let mut response_session_delta_body_sizes = None;
-    let mut selected_wire_draft = None;
-    let (upstream_send_body, mut response_session_reuse_diagnostics) =
+    let mut selected_prepared_delta = None;
+    let (original_prepared_body, mut response_session_reuse_diagnostics) =
         if matches!(client_channel, Channel::Responses)
             && matches!(decision.upstream_channel, Channel::Responses)
         {
             let mut diagnostics = ResponseSessionReuseDiagnostics::default();
             let MainResponseSessionDeltaEvaluation {
                 skip_reason: main_delta_skip_reason,
-                mut original_wire_draft,
+                original_body,
             } = evaluate_main_response_session_delta(
                 &config,
                 &decision,
                 session_reuse_capability.as_ref(),
                 client_requested_stream,
-                &upstream_body,
+                upstream_body,
                 &tail_input_diagnostics,
                 &session_anchor_diagnostics,
             );
@@ -2390,55 +2497,56 @@ async fn run_generation_for_authorized_agent(
             )
             .await
             {
-                selected_wire_draft = original_wire_draft.take();
                 diagnostics.cooldown_active = true;
                 diagnostics.skip_reason = Some(cooldown_skip_reason);
-                (upstream_body.clone(), diagnostics)
+                (original_body, diagnostics)
             } else if !main_response_session_delta_enabled_for_agent(forced_agent_id) {
-                selected_wire_draft = original_wire_draft.take();
                 diagnostics.skip_reason = Some("codex_main_session_delta_disabled".to_string());
-                (upstream_body.clone(), diagnostics)
+                (original_body, diagnostics)
             } else if main_delta_skip_reason.is_none() {
-                let outcome = maybe_reuse_response_session(
-                    &upstream_body,
+                let ResponseSessionReuseOutcome {
+                    delta_body,
+                    diagnostics: outcome_diagnostics,
+                } = maybe_reuse_response_session(
+                    original_body.body(),
                     response_session_lease.as_ref(),
                     &decision,
                     true,
                 );
-                let original_body_bytes = original_wire_draft
-                    .as_ref()
-                    .map(|draft| draft.len() as u64)
+                let original_body_bytes = original_body
+                    .initial_wire_len()
+                    .map(|len| len as u64)
                     .expect("an eligible session delta must retain its measured full-body wire");
-                if let Some(prepared_delta) = response_session_delta_benefit(
-                    &upstream_body,
-                    &outcome.body,
-                    original_body_bytes,
-                    &tail_input_diagnostics,
-                ) {
+                let prepared_delta = delta_body.and_then(|delta_body| {
+                    response_session_delta_benefit(
+                        original_body.body(),
+                        delta_body,
+                        original_body_bytes,
+                        &tail_input_diagnostics,
+                    )
+                });
+                diagnostics = outcome_diagnostics;
+                if let Some(prepared_delta) = prepared_delta {
                     response_session_delta_body_sizes = Some(prepared_delta.body_sizes);
-                    selected_wire_draft = Some(prepared_delta.wire_draft);
-                    diagnostics = outcome.diagnostics;
+                    selected_prepared_delta = Some(prepared_delta.body);
                     diagnostics.wire_saved_bytes = prepared_delta.body_sizes.saved_bytes();
                     diagnostics.wire_saved_ratio = prepared_delta.body_sizes.saved_ratio();
-                    (outcome.body, diagnostics)
+                    (original_body, diagnostics)
                 } else {
-                    selected_wire_draft = original_wire_draft.take();
-                    diagnostics = outcome.diagnostics;
                     diagnostics.skip_reason = Some("main_session_delta_not_beneficial".to_string());
-                    (upstream_body.clone(), diagnostics)
+                    (original_body, diagnostics)
                 }
             } else {
-                selected_wire_draft = original_wire_draft.take();
                 diagnostics.skip_reason = main_delta_skip_reason.map(str::to_string);
-                (upstream_body.clone(), diagnostics)
+                (original_body, diagnostics)
             }
         } else {
             (
-                upstream_body.clone(),
+                PreparedResponseBody::plain(upstream_body),
                 ResponseSessionReuseDiagnostics::default(),
             )
         };
-    let used_response_session = response_session_delta_request(&upstream_send_body, &upstream_body);
+    let used_response_session = selected_prepared_delta.is_some();
     if matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
     {
@@ -2480,14 +2588,14 @@ async fn run_generation_for_authorized_agent(
     let mut diagnostics = if agent_generation {
         body_diagnostics_with_known_inbound_length(
             &decision.upstream_channel,
-            &upstream_body,
+            original_prepared_body.body(),
             inbound_body_bytes,
             active_used_response_session,
         )
     } else {
         body_diagnostics_without_send_length(
             &decision.upstream_channel,
-            &upstream_body,
+            original_prepared_body.body(),
             active_used_response_session,
         )
     };
@@ -2522,7 +2630,7 @@ async fn run_generation_for_authorized_agent(
             &decision.upstream_channel,
             client_requested_stream,
             &tail_input_diagnostics,
-            serialized_body_len(&decision.upstream_channel, &upstream_body),
+            serialized_body_len(&decision.upstream_channel, original_prepared_body.body()),
         );
     let active_request_channel = if responses_non_stream_chat_compat {
         Channel::Chat
@@ -2531,30 +2639,63 @@ async fn run_generation_for_authorized_agent(
     };
     let active_responses_non_stream_chat_compat = responses_non_stream_chat_compat;
     let active_url = upstream_url(&decision.provider.base_url, &active_request_channel);
+    let cache_control_plan = CacheControlCore::plan(CacheControlPlanInput {
+        action_scope: if active_request_channel == decision.upstream_channel {
+            action_scope.as_ref()
+        } else {
+            None
+        },
+        active_channel: &active_request_channel,
+        context_mode: if client_supplied_previous_response_id.is_some()
+            && !response_session_starts_compaction_epoch
+        {
+            CacheContextMode::ExternalContinuation
+        } else if active_used_response_session {
+            CacheContextMode::VerifiedNativeDelta
+        } else {
+            CacheContextMode::FullReplay
+        },
+        lineage_epoch: response_session_lineage_epoch(response_session_lease.as_ref()),
+    });
 
-    let mut active_upstream_body = build_active_upstream_body_for_compat(
-        &upstream_body,
-        &upstream_send_body,
-        &config,
-        &decision,
-        &active_request_channel,
-        responses_non_stream_upstream_sse_compat,
-    );
-    let mut prepared_wire_changed_fields = Vec::new();
-    if !matches!(active_request_channel, Channel::Responses) {
-        selected_wire_draft = None;
-    } else if selected_wire_draft.is_some()
-        && upstream_send_body.get("stream") != active_upstream_body.get("stream")
+    let shadow_affinity_identity = agent_generation.then(|| {
+        let identity_started = Instant::now();
+        let identity = affinity_identity::derive(
+            &config,
+            &decision,
+            &identity_client_request,
+            original_prepared_body.body(),
+            authorized_agent.as_deref(),
+            &selected_provider_key,
+        );
+        (identity, identity_started.elapsed())
+    });
+    let mut active_upstream_body = if matches!(active_request_channel, Channel::Responses) {
+        selected_prepared_delta.unwrap_or(original_prepared_body)
+    } else {
+        let selected_body = selected_prepared_delta
+            .as_ref()
+            .unwrap_or(&original_prepared_body);
+        PreparedResponseBody::plain(build_active_upstream_body_for_compat(
+            original_prepared_body.body(),
+            selected_body.body(),
+            &config,
+            &decision,
+            &active_request_channel,
+            responses_non_stream_upstream_sse_compat,
+        ))
+    };
+    if matches!(active_request_channel, Channel::Responses)
+        && responses_non_stream_upstream_sse_compat
     {
-        record_prepared_wire_changed_field(&mut prepared_wire_changed_fields, "stream");
+        active_upstream_body.set_root("stream", Value::Bool(true));
     }
     let chat_compat_fast_json =
         responses_non_stream_chat_compat && should_use_chat_non_stream_compact_fast_path();
     if chat_compat_fast_json {
-        set_stream_flag(&mut active_upstream_body, false);
+        active_upstream_body.set_root("stream", Value::Bool(false));
     }
-    diagnostics.send_body_is_delta =
-        response_session_delta_request(&active_upstream_body, &upstream_body);
+    diagnostics.send_body_is_delta = active_used_response_session;
     if responses_non_stream_chat_compat {
         prefix_state_update_key = None;
     }
@@ -2565,30 +2706,24 @@ async fn run_generation_for_authorized_agent(
         .and_then(Value::as_str)
         .map(str::trim)
         .is_some_and(provider_prompt_cache_key_is_valid);
-    let mut shadow_affinity_decision = if agent_generation {
-        let identity = affinity_identity::derive(
-            &config,
-            &decision,
-            &identity_client_request,
-            &upstream_body,
-            authorized_agent.as_deref(),
-            &selected_provider_key,
-        );
-        let mut shadow_affinity = state.shadow_affinity.lock().await;
-        Some(cache_affinity::compute_shadow_affinity(
-            &mut shadow_affinity,
-            &identity,
-            session_identity
-                .as_ref()
-                .map(|identity| identity.anchor_key.as_str()),
-            Utc::now(),
-            tail_input_diagnostics.tool_output_chars,
-            tail_input_diagnostics.largest_tool_output_chars,
-        ))
-    } else {
-        None
-    };
-    let validation_selection = if agent_generation {
+    let (mut shadow_affinity_decision, shadow_affinity_lock_busy) =
+        if let Some((identity, identity_elapsed)) = shadow_affinity_identity {
+            let (decision, lock_busy) = try_compute_shadow_affinity_without_wait(
+                &state.shadow_affinity,
+                &identity,
+                session_identity
+                    .as_ref()
+                    .map(|identity| identity.anchor_key.as_str()),
+                identity_elapsed,
+                Utc::now(),
+                tail_input_diagnostics.tool_output_chars,
+                tail_input_diagnostics.largest_tool_output_chars,
+            );
+            (Some(decision), lock_busy)
+        } else {
+            (None, false)
+        };
+    let validation_selection = if agent_generation && !shadow_affinity_lock_busy {
         state.cache_validation.lock().await.selection(
             &decision.provider.id,
             &decision.model,
@@ -2604,7 +2739,6 @@ async fn run_generation_for_authorized_agent(
         selected_provider_key.key_id.as_deref(),
         ProviderCacheCapabilityField::PromptCacheKey,
     ) != ProviderCacheCapabilityStatus::Unsupported;
-    let mut candidate_prompt_cache_key_changed = false;
     let candidate_cache_routing_applied =
         shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let provider_native_candidate = validation_selection.is_none()
@@ -2623,7 +2757,7 @@ async fn run_generation_for_authorized_agent(
             } else {
                 channel_eligible
                     && !explicit_client_prompt_cache_key
-                    && AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
+                    && automatic_static_cohort_routing_enabled()
                     && cache_affinity::apply_automatic_static_cohort_canary(
                         decision,
                         smart_hit_enabled(&config),
@@ -2641,15 +2775,11 @@ async fn run_generation_for_authorized_agent(
                 return false;
             }
             let outcome = apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
-            candidate_prompt_cache_key_changed = outcome.changed;
             if outcome.applied {
-                provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
+                provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
             }
             outcome.applied
         });
-    if candidate_prompt_cache_key_changed {
-        record_prepared_wire_changed_field(&mut prepared_wire_changed_fields, "prompt_cache_key");
-    }
     if let Some(decision) = shadow_affinity_decision.as_ref() {
         state
             .metrics
@@ -2663,55 +2793,64 @@ async fn run_generation_for_authorized_agent(
         state.metrics.record_shadow_application(true).await;
     }
     if agent_generation {
-        let native_cache_changed_fields = apply_native_cache_controls(
+        apply_native_cache_controls(
             &mut active_upstream_body,
             &config,
             &decision,
             &active_request_channel,
             selected_provider_key.key_id.as_deref(),
         );
-        extend_prepared_wire_changed_fields(
-            &mut prepared_wire_changed_fields,
-            native_cache_changed_fields,
-        );
-        provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
+        provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
     }
-    let mut request_plan = Some(if let Some(wire_draft) = selected_wire_draft.take() {
-        RequestPlan::from_prepared(
-            &decision.provider,
-            active_url.clone(),
-            wire_draft.freeze(&active_upstream_body, &prepared_wire_changed_fields),
-        )
-    } else {
-        RequestPlan::new(
-            &decision.provider,
-            active_url.clone(),
-            active_request_channel.clone(),
-            &active_upstream_body,
-        )
-    });
-    apply_prepared_body_lengths(
-        &mut diagnostics,
-        request_plan
-            .as_ref()
-            .expect("the initial request plan must be available"),
+    let final_scope_waterline_is_full_replay = native_responses_passthrough
+        && matches!(&active_request_channel, Channel::Responses)
+        && !active_used_response_session
+        && !response_session_starts_compaction_epoch
+        && matches!(&response_session_parent, LineageParent::FullReplay);
+    if !final_scope_waterline_is_full_replay {
+        final_scope_predecessor = final_scope_predecessor.not_full_replay();
+    } else if !active_upstream_body.preserves_initial_root("input") {
+        final_scope_predecessor = final_scope_predecessor.invalidate_final_input();
+    }
+    let generation_envelope = GenerationEnvelope::freeze(
+        &decision.provider,
+        active_url,
+        active_request_channel.clone(),
+        active_upstream_body,
+    )
+    .with_explicit_proxy_url(
+        config
+            .upstream_proxy_url_for(decision.provider.use_system_proxy)
+            .map(str::to_owned),
     );
+    let final_wire_receipt = cache_control_plan.seal(&generation_envelope);
+    upstream_request_diagnostics.final_scope_shadow =
+        FinalScopeShadow::derive(FinalScopeShadowInput {
+            native_responses: native_responses_passthrough,
+            active_channel: &active_request_channel,
+            final_wire: &final_wire_receipt,
+        });
+    let mut final_scope_dispatch = begin_final_scope_waterline(
+        &state,
+        upstream_request_diagnostics.final_scope_shadow.as_ref(),
+        final_scope_waterline_is_full_replay,
+        final_scope_predecessor,
+    )
+    .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
+    upstream_request_diagnostics.final_wire_receipt = Some(final_wire_receipt);
+    apply_prepared_body_lengths(&mut diagnostics, generation_envelope.request_plan());
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
         &active_request_channel,
         client_requested_stream,
-        request_plan
-            .as_ref()
-            .expect("the initial request plan must be available")
-            .body_len(),
+        generation_envelope.request_plan().body_len(),
     );
-    request_plan = Some(
-        request_plan
-            .take()
-            .expect("the initial request plan must be available")
-            .with_gzip_enabled(
-                decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-            ),
-    );
+    let mut frozen_generation = generation_envelope
+        .with_gzip_enabled(
+            decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+        )
+        .into_dispatch();
+    let mut request_plan = Some(frozen_generation.take_one_shot_plan());
+    let active_upstream_body = frozen_generation.body();
     // Coordination guards protect request preparation only.  Once the wire
     // request is frozen, release them before any upstream network await so a
     // slow response header cannot serialize the next turn for this prefix.
@@ -2754,8 +2893,7 @@ async fn run_generation_for_authorized_agent(
                 &api_key,
                 request_plan
                     .take()
-                    .expect("the Agent request plan must be available for one-shot dispatch")
-                    .into_one_shot(),
+                    .expect("the Agent request plan must be available for one-shot dispatch"),
                 &headers,
                 &decision,
                 token,
@@ -2768,8 +2906,7 @@ async fn run_generation_for_authorized_agent(
                 &api_key,
                 request_plan
                     .take()
-                    .expect("the non-Agent request plan must be available for one-shot dispatch")
-                    .into_one_shot(),
+                    .expect("the non-Agent request plan must be available for one-shot dispatch"),
                 &headers,
             )
             .await
@@ -2778,8 +2915,11 @@ async fn run_generation_for_authorized_agent(
     let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
+            upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
+                .take()
+                .and_then(|guard| guard.finish(None, false, false, None));
             if agent_generation {
-                let log = upstream_transport_failure_log(
+                let mut log = upstream_transport_failure_log(
                     &request_id,
                     &started,
                     &client_channel,
@@ -2797,6 +2937,8 @@ async fn run_generation_for_authorized_agent(
                     requested_model_for_log.clone(),
                     "main-transport",
                 );
+                log.final_scope_waterline =
+                    upstream_request_diagnostics.final_scope_waterline.clone();
                 finalize_agent_generation(
                     &state,
                     &request_id,
@@ -2832,6 +2974,7 @@ async fn run_generation_for_authorized_agent(
                     active_used_response_session,
                     &response_session_reuse_diagnostics,
                     requested_model_for_log.clone(),
+                    upstream_request_diagnostics.final_scope_waterline.clone(),
                     None,
                     "main-transport",
                     upstream_request_diagnostics.attempts.saturating_add(1),
@@ -2900,7 +3043,10 @@ async fn run_generation_for_authorized_agent(
             {
                 Ok(outcome) => outcome,
                 Err(err) => {
-                    let log = upstream_transport_failure_log(
+                    upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
+                        .take()
+                        .and_then(|guard| guard.finish(None, false, false, None));
+                    let mut log = upstream_transport_failure_log(
                         &request_id,
                         &started,
                         &client_channel,
@@ -2918,6 +3064,8 @@ async fn run_generation_for_authorized_agent(
                         requested_model_for_log.clone(),
                         "reasoning-effort-error-body",
                     );
+                    log.final_scope_waterline =
+                        upstream_request_diagnostics.final_scope_waterline.clone();
                     finalize_agent_generation(
                         &state,
                         &request_id,
@@ -2977,8 +3125,11 @@ async fn run_generation_for_authorized_agent(
         }
     }
 
-    upstream_request_diagnostics.sent_cache_capability_fields =
-        cache_capability::present_fields(&active_upstream_body);
+    upstream_request_diagnostics.sent_cache_capability_fields = upstream_request_diagnostics
+        .final_wire_receipt
+        .as_ref()
+        .map(|receipt| receipt.cache_controls.present_fields())
+        .unwrap_or_else(|| cache_capability::present_fields(&active_upstream_body));
     upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
     let is_stream = should_proxy_upstream_as_stream(
         is_success_status,
@@ -3043,6 +3194,7 @@ async fn run_generation_for_authorized_agent(
             prefix_guard_wait.clone(),
             local_prepare_ms,
             upstream_request_diagnostics.clone(),
+            final_scope_dispatch.take(),
             upstream_response_headers_at_ms,
             active_agent_attempt_id.take(),
             shadow_affinity_decision,
@@ -3067,10 +3219,13 @@ async fn run_generation_for_authorized_agent(
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
+                    .take()
+                    .and_then(|guard| guard.finish(None, false, false, None));
                 if agent_generation {
                     let mut terminal_errors = request_metric_errors.clone();
                     terminal_errors.push(("upstream_body".to_string(), err.to_string()));
-                    let log = upstream_transport_failure_log(
+                    let mut log = upstream_transport_failure_log(
                         &request_id,
                         &started,
                         &client_channel,
@@ -3088,6 +3243,8 @@ async fn run_generation_for_authorized_agent(
                         requested_model_for_log.clone(),
                         "upstream-body",
                     );
+                    log.final_scope_waterline =
+                        upstream_request_diagnostics.final_scope_waterline.clone();
                     finalize_agent_generation(
                         &state,
                         &request_id,
@@ -3124,6 +3281,8 @@ async fn run_generation_for_authorized_agent(
                         requested_model_for_log.clone(),
                         "upstream-body",
                     );
+                    log.final_scope_waterline =
+                        upstream_request_diagnostics.final_scope_waterline.clone();
                     log.status = status;
                     log.upstream_attempt_total = Some(upstream_request_diagnostics.attempts.max(1));
                     log.upstream_attempts = Some(upstream_request_diagnostics.attempts.max(1));
@@ -3283,6 +3442,94 @@ async fn run_generation_for_authorized_agent(
     let cache_capability_rejection_summary = (!is_success_status)
         .then(|| structured_upstream_error_summary(settlement_bytes))
         .flatten();
+    let mut response_content_type =
+        if matches!(client_channel, Channel::Responses) && !client_requested_stream {
+            "application/json".to_string()
+        } else {
+            content_type.clone()
+        };
+    let mut response_bytes = if let Some(anthropic_response) = anthropic_responses_json.as_ref() {
+        anthropic_response.clone()
+    } else if matches!(client_channel, Channel::Responses)
+        && matches!(active_request_channel, Channel::Chat)
+        && codex_responses_chat_compat
+    {
+        serde_json::from_slice::<Value>(&bytes_for_client)
+            .ok()
+            .and_then(|value| {
+                cross_protocol_tool_context
+                    .as_ref()
+                    .and_then(|tool_context| {
+                        transform_codex_chat::chat_completion_to_response_with_context(
+                            value,
+                            tool_context,
+                        )
+                        .ok()
+                    })
+            })
+            .and_then(|value| serde_json::to_vec(&value).ok())
+            .unwrap_or_else(|| {
+                transform_response_bytes(
+                    &client_channel,
+                    &active_request_channel,
+                    &decision.model,
+                    &bytes_for_client,
+                )
+            })
+    } else {
+        transform_response_bytes(
+            &client_channel,
+            &active_request_channel,
+            &decision.model,
+            &bytes_for_client,
+        )
+    };
+    if non_sse_compact_compat_for_decision(&config, &decision)
+        && matches!(client_channel, Channel::Responses)
+    {
+        response_bytes = normalize_responses_json_for_client(&response_bytes);
+    }
+    if cross_protocol_stream {
+        response_content_type = "text/event-stream".to_string();
+        response_bytes = if matches!(client_channel, Channel::Responses)
+            && matches!(active_request_channel, Channel::Anthropic)
+        {
+            let context = streaming_codex_anthropic::AnthropicResponsesContext {
+                tool_context: cross_protocol_tool_context.clone().unwrap_or_default(),
+            };
+            let converted = if is_text_event_stream(&content_type) {
+                streaming_codex_anthropic::anthropic_sse_to_responses_sse(
+                    &bytes,
+                    context,
+                    decision.model.clone(),
+                )
+            } else {
+                streaming_codex_anthropic::anthropic_json_to_responses_sse(
+                    &bytes,
+                    context,
+                    decision.model.clone(),
+                )
+            };
+            converted.unwrap_or_else(|_| response_json_to_sse(&client_channel, &response_bytes))
+        } else {
+            response_json_to_sse(&client_channel, &response_bytes)
+        };
+    }
+    let response_bytes = Bytes::from(response_bytes);
+    let owned_response_handoff = response_handoff.is_some();
+    let mut client_completed_ms = None;
+    let mut client_response = None;
+    if is_success_status {
+        if owned_response_handoff {
+            client_completed_ms = Some(started.elapsed().as_millis() as u64);
+        }
+        client_response = publish_buffered_response(
+            response_handoff.take(),
+            status,
+            &response_content_type,
+            response_bytes.clone(),
+        );
+    }
     if let Some(error_summary) = cache_capability_rejection_summary.as_deref() {
         note_runtime_cache_capability_rejection(
             &state,
@@ -3360,19 +3607,41 @@ async fn run_generation_for_authorized_agent(
         is_success_status,
         compaction_terminal_seen,
     );
-    if is_success_status
+    let response_session_response_id = (is_success_status
+        && !confirmed_compaction
+        && matches!(active_request_channel, Channel::Responses))
+    .then(|| response_id_from_bytes(&bytes))
+    .flatten();
+    let response_session_update = if is_success_status
         && !confirmed_compaction
         && matches!(active_request_channel, Channel::Responses)
     {
-        update_response_session(
+        update_response_session_with_id(
             &state,
             response_session_lease.as_ref(),
             &response_session_parent,
             full_response_input.as_ref(),
-            &bytes,
+            response_session_response_id.clone(),
+            response_output_items_from_bytes(&bytes),
         )
-        .await;
-    }
+        .await
+    } else {
+        None
+    };
+    let committed_head = committed_waterline_control_head(
+        response_session_lease.as_ref(),
+        response_session_update.as_ref(),
+        response_session_response_id.as_deref(),
+    );
+    upstream_request_diagnostics.final_scope_waterline =
+        final_scope_dispatch.take().and_then(|guard| {
+            guard.finish(
+                usage_record.as_ref(),
+                is_success_status,
+                confirmed_compaction,
+                committed_head,
+            )
+        });
     let prefix_observation = observe_provider_prefix_usage(
         &state,
         prefix_state_update_key.as_deref(),
@@ -3383,7 +3652,7 @@ async fn run_generation_for_authorized_agent(
         active_used_response_session,
         retried_full_response,
         prefix_guard_wait.budget_exhausted,
-        is_success_status && !sync_compact_diagnostic_only,
+        is_success_status && !sync_compact_diagnostic_only && !confirmed_compaction,
     )
     .await;
     let gap_breakdown = prefix_observation.gap;
@@ -3426,80 +3695,18 @@ async fn run_generation_for_authorized_agent(
     } else if !active_responses_non_stream_chat_compat {
         clear_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
     }
-    let mut response_content_type =
-        if matches!(client_channel, Channel::Responses) && !client_requested_stream {
-            "application/json".to_string()
-        } else {
-            content_type.clone()
-        };
-    let mut response_bytes = if let Some(anthropic_response) = anthropic_responses_json.as_ref() {
-        anthropic_response.clone()
-    } else if matches!(client_channel, Channel::Responses)
-        && matches!(active_request_channel, Channel::Chat)
-        && codex_responses_chat_compat
-    {
-        serde_json::from_slice::<Value>(&bytes_for_client)
-            .ok()
-            .and_then(|value| {
-                cross_protocol_tool_context
-                    .as_ref()
-                    .and_then(|tool_context| {
-                        transform_codex_chat::chat_completion_to_response_with_context(
-                            value,
-                            tool_context,
-                        )
-                        .ok()
-                    })
-            })
-            .and_then(|value| serde_json::to_vec(&value).ok())
-            .unwrap_or_else(|| {
-                transform_response_bytes(
-                    &client_channel,
-                    &active_request_channel,
-                    &decision.model,
-                    &bytes_for_client,
-                )
-            })
-    } else {
-        transform_response_bytes(
-            &client_channel,
-            &active_request_channel,
-            &decision.model,
-            &bytes_for_client,
-        )
-    };
-    if non_sse_compact_compat_for_decision(&config, &decision)
-        && matches!(client_channel, Channel::Responses)
-    {
-        response_bytes = normalize_responses_json_for_client(&response_bytes);
+    if !is_success_status {
+        if owned_response_handoff {
+            client_completed_ms = Some(started.elapsed().as_millis() as u64);
+        }
+        client_response = publish_buffered_response(
+            response_handoff.take(),
+            status,
+            &response_content_type,
+            response_bytes.clone(),
+        );
     }
-    if cross_protocol_stream {
-        response_content_type = "text/event-stream".to_string();
-        response_bytes = if matches!(client_channel, Channel::Responses)
-            && matches!(active_request_channel, Channel::Anthropic)
-        {
-            let context = streaming_codex_anthropic::AnthropicResponsesContext {
-                tool_context: cross_protocol_tool_context.clone().unwrap_or_default(),
-            };
-            let converted = if is_text_event_stream(&content_type) {
-                streaming_codex_anthropic::anthropic_sse_to_responses_sse(
-                    &bytes,
-                    context,
-                    decision.model.clone(),
-                )
-            } else {
-                streaming_codex_anthropic::anthropic_json_to_responses_sse(
-                    &bytes,
-                    context,
-                    decision.model.clone(),
-                )
-            };
-            converted.unwrap_or_else(|_| response_json_to_sse(&client_channel, &response_bytes))
-        } else {
-            response_json_to_sse(&client_channel, &response_bytes)
-        };
-    }
-    let elapsed = started.elapsed().as_millis() as u64;
+    let elapsed = client_completed_ms.unwrap_or_else(|| started.elapsed().as_millis() as u64);
     let mut request_log = RequestLog {
         id: request_id.clone(),
         at: Utc::now(),
@@ -3555,6 +3762,7 @@ async fn run_generation_for_authorized_agent(
             .outbound_prefix_fingerprints
             .clone(),
         provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
+        final_scope_waterline: upstream_request_diagnostics.final_scope_waterline.clone(),
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
         shadow_affinity_realm_id: None,
@@ -3752,14 +3960,14 @@ async fn run_generation_for_authorized_agent(
             semantic_shape,
             response_content_type.clone(),
             status,
-            response_bytes.clone(),
+            response_bytes.to_vec(),
             &decision,
             &config,
         )
         .await;
     }
 
-    raw_response(status, &response_content_type, response_bytes)
+    client_response.unwrap_or_else(|| Response::new(Body::empty()))
 }
 
 async fn acquire_provider_prefix_guard(
@@ -3774,10 +3982,7 @@ async fn acquire_provider_prefix_guard(
     let key = provider_prefix_key?;
     let lock = {
         let mut locks = state.prefix_locks.lock().await;
-        locks
-            .entry(key.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        locks.acquire(key)
     };
     if matches!(channel, Channel::Responses) {
         // Prefix coordination may protect preparation when immediately
@@ -3803,7 +4008,12 @@ async fn wait_for_provider_prefix_settle(
         };
     }
     let state_snapshot = {
-        let states = state.prefix_states.lock().await;
+        let Ok(states) = state.prefix_states.try_lock() else {
+            return PrefixGuardWaitDiagnostics {
+                skip_reason: Some("runtime_snapshot_lock_busy".to_string()),
+                ..PrefixGuardWaitDiagnostics::default()
+            };
+        };
         lookup_provider_prefix_state_with_source(
             &states,
             provider_prefix_key,
@@ -4709,7 +4919,7 @@ fn upstream_ttft_ms(ttft_ms: u64, prefix_guard_wait_ms: Option<u64>) -> u64 {
 }
 
 #[cfg(test)]
-fn legacy_upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
+fn current_reference_upstream_request_body_bytes(channel: &Channel, body: &Value) -> Vec<u8> {
     if matches!(channel, Channel::Responses) {
         serialize_responses_body_for_provider_prefix(body).into_bytes()
     } else {
@@ -5071,6 +5281,147 @@ async fn update_provider_prefix_state(
     .await
 }
 
+fn begin_final_scope_waterline(
+    state: &AppState,
+    receipt: Option<&FinalScopeShadowReceipt>,
+    sent_prediction_eligible: bool,
+    predecessor: PredecessorProofReceipt,
+) -> Option<WaterlineTicket> {
+    let Some(receipt) = receipt else {
+        state.final_scope_observations.record_outcome("no_receipt");
+        return None;
+    };
+    if !receipt.eligible_for_shadow_observation {
+        let outcome = if receipt.missing_attested_scope {
+            "ineligible_unattested_scope"
+        } else if receipt.missing_final_wire_static_projection {
+            "ineligible_static_projection"
+        } else if receipt.missing_lineage_epoch {
+            "ineligible_lineage_epoch"
+        } else if receipt.unsupported_evidence_version {
+            "ineligible_evidence_version"
+        } else if receipt.ambiguous_breakpoint_placement {
+            "ineligible_breakpoint"
+        } else {
+            "ineligible"
+        };
+        state.final_scope_observations.record_outcome(outcome);
+        return None;
+    }
+    // This ledger is intentionally best-effort. It is shadow-only, so a
+    // contended lock must never add latency to the frozen one-shot request.
+    let Ok(mut ledger) = state.final_scope_waterlines.try_lock() else {
+        state
+            .final_scope_observations
+            .record_outcome("begin_lock_busy");
+        return None;
+    };
+    let ticket =
+        ledger.try_begin_with_proof(&receipt.digest, true, sent_prediction_eligible, predecessor);
+    state
+        .final_scope_observations
+        .record_outcome(if ticket.is_some() {
+            "ticketed"
+        } else {
+            "ineligible"
+        });
+    ticket
+}
+
+fn settle_final_scope_waterline(
+    state: &AppState,
+    ticket: &WaterlineTicket,
+    raw_usage: Option<&UsageRecord>,
+    upstream_succeeded: bool,
+    confirmed_compaction: bool,
+    committed_head: Option<WaterlineControlHead>,
+) -> WaterlineSettlementOutcome {
+    let Ok(mut ledger) = state.final_scope_waterlines.try_lock() else {
+        state
+            .final_scope_observations
+            .record_outcome("settle_lock_busy");
+        return WaterlineSettlementOutcome::ignored("settle_lock_busy");
+    };
+    let outcome = ledger.settle_with_outcome(
+        ticket,
+        WaterlineSettlement {
+            upstream_succeeded,
+            compaction: confirmed_compaction,
+            raw_usage,
+            committed_head,
+        },
+    );
+    state
+        .final_scope_observations
+        .record_outcome(outcome.status);
+    outcome
+}
+
+fn settle_final_scope_waterline_and_record(
+    state: &AppState,
+    ticket: &WaterlineTicket,
+    raw_usage: Option<&UsageRecord>,
+    upstream_succeeded: bool,
+    confirmed_compaction: bool,
+    committed_head: Option<WaterlineControlHead>,
+) -> Option<FinalScopeWaterlineLog> {
+    let outcome = settle_final_scope_waterline(
+        state,
+        ticket,
+        raw_usage,
+        upstream_succeeded,
+        confirmed_compaction,
+        committed_head,
+    );
+    let log = final_scope_waterline_log(ticket, &outcome);
+    state.final_scope_observations.try_record(log.clone());
+    Some(log)
+}
+
+fn final_scope_waterline_log(
+    ticket: &WaterlineTicket,
+    outcome: &WaterlineSettlementOutcome,
+) -> FinalScopeWaterlineLog {
+    let prior = ticket.prior_waterlines.unwrap_or_default();
+    let waterlines = outcome.waterlines.unwrap_or(prior);
+    let predecessor_head = ticket.predecessor.head.as_ref();
+    FinalScopeWaterlineLog {
+        version: 3,
+        outcome: outcome.status.to_string(),
+        scope_digest: ticket.scope_digest.clone(),
+        entry_generation: ticket.entry_generation,
+        sent_prediction_eligible: ticket.sent_prediction_eligible,
+        predecessor_proof: ticket.predecessor.status.label().to_string(),
+        predecessor_exact: ticket.predecessor.is_exact(),
+        predecessor_bound: outcome.predecessor_bound,
+        lineage_epoch: ticket.predecessor.lineage_epoch,
+        predecessor_generation: predecessor_head.map(|head| head.generation),
+        predecessor_input_items: ticket.predecessor.predecessor_input_items,
+        current_input_items: ticket.predecessor.current_input_items,
+        prior_settlement_age_ms: ticket.prior_settlement_age_ms,
+        prior_observed_cache_read_tokens: prior.observed_cache_read_tokens,
+        prior_sent_prefix_bucket_tokens_128: prior.sent_prefix_bucket_tokens_128,
+        prior_settled_prefix_bucket_tokens_128: prior.settled_prefix_bucket_tokens_128,
+        prior_latest_sent_prefix_bucket_tokens_128: prior.latest_sent_prefix_bucket_tokens_128,
+        prior_latest_settled_prefix_bucket_tokens_128: prior
+            .latest_settled_prefix_bucket_tokens_128,
+        raw_input_tokens: outcome.raw_input_tokens,
+        raw_cache_read_tokens: outcome.raw_cache_read_tokens,
+        observed_cache_read_tokens: waterlines.observed_cache_read_tokens,
+        sent_prefix_bucket_tokens_128: waterlines.sent_prefix_bucket_tokens_128,
+        settled_prefix_bucket_tokens_128: waterlines.settled_prefix_bucket_tokens_128,
+        latest_sent_prefix_bucket_tokens_128: waterlines.latest_sent_prefix_bucket_tokens_128,
+        latest_settled_prefix_bucket_tokens_128: waterlines.latest_settled_prefix_bucket_tokens_128,
+        cache_regression_streak: waterlines.cache_regression_streak,
+        stable_settlement_streak: waterlines.stable_settlement_streak,
+        continuity_generation: waterlines.continuity_generation,
+        continuity_reset: outcome.continuity_reset,
+        candidate_avoidable_tokens_128: outcome.candidate_avoidable_tokens_128,
+        rollback_tokens_128: outcome.rollback_tokens_128,
+        dispatch_seq: ticket.dispatch_seq,
+    }
+}
+
 #[cfg(test)]
 async fn update_provider_prefix_state_with_tail(
     state: &AppState,
@@ -5195,6 +5546,7 @@ async fn observe_provider_prefix_usage(
     }));
     if next.is_some() || learn_family {
         state.journal_runtime_state();
+        state.schedule_prefix_state_maintenance();
     }
     ProviderPrefixUsageObservation {
         gap,
@@ -6066,21 +6418,21 @@ fn maybe_reuse_response_session(
     let Some(lease) = lease else {
         diagnostics.skip_reason = Some("no_session_key".to_string());
         return ResponseSessionReuseOutcome {
-            body: request.clone(),
+            delta_body: None,
             diagnostics,
         };
     };
     let Some(current_input) = request.get("input") else {
         diagnostics.skip_reason = Some("no_input".to_string());
         return ResponseSessionReuseOutcome {
-            body: request.clone(),
+            delta_body: None,
             diagnostics,
         };
     };
     if request.get("previous_response_id").is_some() {
         diagnostics.skip_reason = Some("already_has_previous_response_id".to_string());
         return ResponseSessionReuseOutcome {
-            body: request.clone(),
+            delta_body: None,
             diagnostics,
         };
     }
@@ -6092,7 +6444,7 @@ fn maybe_reuse_response_session(
     {
         diagnostics.skip_reason = Some("stream_delta_disabled".to_string());
         return ResponseSessionReuseOutcome {
-            body: request.clone(),
+            delta_body: None,
             diagnostics,
         };
     }
@@ -6106,7 +6458,7 @@ fn maybe_reuse_response_session(
     if sessions.is_empty() {
         diagnostics.skip_reason = Some("no_candidate".to_string());
         return ResponseSessionReuseOutcome {
-            body: request.clone(),
+            delta_body: None,
             diagnostics,
         };
     }
@@ -6136,13 +6488,13 @@ fn maybe_reuse_response_session(
         ) else {
             diagnostics.skip_reason = Some("request_not_object".to_string());
             return ResponseSessionReuseOutcome {
-                body: request.clone(),
+                delta_body: None,
                 diagnostics,
             };
         };
         diagnostics.skip_reason = None;
         return ResponseSessionReuseOutcome {
-            body: optimized,
+            delta_body: Some(optimized),
             diagnostics,
         };
     }
@@ -6154,7 +6506,7 @@ fn maybe_reuse_response_session(
         Some("no_delta".to_string())
     };
     ResponseSessionReuseOutcome {
-        body: request.clone(),
+        delta_body: None,
         diagnostics,
     }
 }
@@ -6197,7 +6549,7 @@ fn should_attempt_main_response_session_delta(
         decision,
         capability,
         client_requested_stream,
-        request,
+        request.clone(),
         current_tail,
         session_anchor,
     )
@@ -6208,21 +6560,21 @@ fn should_attempt_main_response_session_delta(
 #[derive(Debug)]
 struct MainResponseSessionDeltaEvaluation {
     skip_reason: Option<&'static str>,
-    original_wire_draft: Option<PreparedWireDraft>,
+    original_body: PreparedResponseBody,
 }
 
 impl MainResponseSessionDeltaEvaluation {
-    const fn skipped(skip_reason: &'static str) -> Self {
+    fn skipped(skip_reason: &'static str, original_body: Value) -> Self {
         Self {
             skip_reason: Some(skip_reason),
-            original_wire_draft: None,
+            original_body: PreparedResponseBody::plain(original_body),
         }
     }
 
-    fn measured(skip_reason: Option<&'static str>, original_wire_draft: PreparedWireDraft) -> Self {
+    fn measured(skip_reason: Option<&'static str>, original_body: PreparedResponseBody) -> Self {
         Self {
             skip_reason,
-            original_wire_draft: Some(original_wire_draft),
+            original_body,
         }
     }
 }
@@ -6238,21 +6590,27 @@ fn evaluate_main_response_session_delta(
     decision: &RouteDecision,
     capability: Option<&ProviderResponseSessionReuseCapability>,
     client_requested_stream: bool,
-    request: &Value,
+    request: Value,
     _current_tail: &TailInputDiagnostics,
     session_anchor: &SessionAnchorDiagnostics,
 ) -> MainResponseSessionDeltaEvaluation {
     if !responses_session_reuse_enabled(config) {
-        return MainResponseSessionDeltaEvaluation::skipped("session_reuse_disabled");
+        return MainResponseSessionDeltaEvaluation::skipped("session_reuse_disabled", request);
     }
     if !matches!(decision.upstream_channel, Channel::Responses) {
-        return MainResponseSessionDeltaEvaluation::skipped("upstream_channel_not_responses");
+        return MainResponseSessionDeltaEvaluation::skipped(
+            "upstream_channel_not_responses",
+            request,
+        );
     }
     if !client_requested_stream {
-        return MainResponseSessionDeltaEvaluation::skipped("client_stream_disabled");
+        return MainResponseSessionDeltaEvaluation::skipped("client_stream_disabled", request);
     }
     if !supports_main_response_session_delta(config, decision, capability) {
-        return MainResponseSessionDeltaEvaluation::skipped("provider_session_delta_unverified");
+        return MainResponseSessionDeltaEvaluation::skipped(
+            "provider_session_delta_unverified",
+            request,
+        );
     }
     if session_anchor.source.as_deref() != Some("exact") {
         return MainResponseSessionDeltaEvaluation::skipped(
@@ -6260,21 +6618,32 @@ fn evaluate_main_response_session_delta(
                 Some("new-anchor") => "session_anchor_missing",
                 _ => "session_anchor_not_exact",
             },
+            request,
         );
     }
     if request.get("previous_response_id").is_some() {
-        return MainResponseSessionDeltaEvaluation::skipped("client_previous_response_id_present");
+        return MainResponseSessionDeltaEvaluation::skipped(
+            "client_previous_response_id_present",
+            request,
+        );
     }
     if request.get("store").and_then(Value::as_bool) == Some(false) {
-        return MainResponseSessionDeltaEvaluation::skipped("client_store_disabled");
+        return MainResponseSessionDeltaEvaluation::skipped("client_store_disabled", request);
+    }
+    if !native_responses_verified_delta_schema_is_known(&request) {
+        return MainResponseSessionDeltaEvaluation::skipped(
+            "unknown_response_request_field",
+            request,
+        );
     }
 
-    let original_wire_draft = PreparedWireDraft::from_responses_value(request)
-        .expect("an eligible Responses request must be a JSON object");
-    let body_bytes = original_wire_draft.len() as u64;
+    let original_body = PreparedResponseBody::responses(request);
+    let body_bytes = original_body
+        .initial_wire_len()
+        .expect("an eligible Responses request must be a JSON object") as u64;
     let skip_reason = (body_bytes <= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES)
         .then_some("session_delta_full_body_below_minimum_savings");
-    MainResponseSessionDeltaEvaluation::measured(skip_reason, original_wire_draft)
+    MainResponseSessionDeltaEvaluation::measured(skip_reason, original_body)
 }
 
 #[cfg(test)]
@@ -6292,7 +6661,7 @@ fn main_response_session_delta_skip_reason(
         decision,
         capability,
         client_requested_stream,
-        request,
+        request.clone(),
         current_tail,
         session_anchor,
     )
@@ -6342,20 +6711,20 @@ impl ResponseSessionDeltaBodySizes {
 #[derive(Debug)]
 struct PreparedResponseSessionDelta {
     body_sizes: ResponseSessionDeltaBodySizes,
-    wire_draft: PreparedWireDraft,
+    body: PreparedResponseBody,
 }
 
 fn response_session_delta_benefit(
     original: &Value,
-    delta: &Value,
+    delta: Value,
     original_bytes: u64,
     _current_tail: &TailInputDiagnostics,
 ) -> Option<PreparedResponseSessionDelta> {
-    if !response_session_delta_request(delta, original) {
+    if !response_session_delta_request(&delta, original) {
         return None;
     }
-    let wire_draft = PreparedWireDraft::from_responses_value(delta)?;
-    let delta_bytes = wire_draft.len() as u64;
+    let body = PreparedResponseBody::responses(delta);
+    let delta_bytes = body.initial_wire_len()? as u64;
     if delta_bytes >= original_bytes {
         return None;
     }
@@ -6367,7 +6736,7 @@ fn response_session_delta_benefit(
             original_body_bytes: original_bytes,
             delta_body_bytes: delta_bytes,
         },
-        wire_draft,
+        body,
     })
 }
 
@@ -6378,7 +6747,7 @@ fn response_session_delta_is_beneficial(
     current_tail: &TailInputDiagnostics,
 ) -> bool {
     let original_bytes = serialized_body_len(&Channel::Responses, original);
-    response_session_delta_benefit(original, delta, original_bytes, current_tail).is_some()
+    response_session_delta_benefit(original, delta.clone(), original_bytes, current_tail).is_some()
 }
 
 fn response_session_anchor_diagnostics(lease: Option<&LineageLease>) -> SessionAnchorDiagnostics {
@@ -6393,6 +6762,22 @@ fn response_session_anchor_diagnostics(lease: Option<&LineageLease>) -> SessionA
         changed: Some(false),
         peer_count: Some(0),
     }
+}
+
+fn response_session_lineage_epoch(lease: Option<&LineageLease>) -> Option<u64> {
+    lease.map(LineageLease::epoch)
+}
+
+fn committed_waterline_control_head(
+    lease: Option<&LineageLease>,
+    outcome: Option<&LineageCommitOutcome>,
+    response_id: Option<&str>,
+) -> Option<WaterlineControlHead> {
+    let lease = lease?;
+    let LineageCommitOutcome::Applied { generation } = outcome? else {
+        return None;
+    };
+    WaterlineControlHead::derive(lease.epoch(), *generation, response_id?)
 }
 
 fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionAnchorDiagnostics) {
@@ -6562,29 +6947,30 @@ fn response_input_raw_prefix_delta_start_index(
         .then_some(previous_items.len())
 }
 
-async fn update_response_session(
-    state: &AppState,
-    session_lease: Option<&LineageLease>,
-    parent: &LineageParent,
-    full_response_input: Option<&Value>,
-    bytes: &[u8],
-) -> Option<LineageCommitOutcome> {
-    update_response_session_with_id(
-        state,
-        session_lease,
-        parent,
-        full_response_input,
-        response_id_from_bytes(bytes),
-        response_output_items_from_bytes(bytes),
-    )
-    .await
-}
-
 async fn update_response_session_with_id(
     state: &AppState,
     session_lease: Option<&LineageLease>,
     parent: &LineageParent,
     full_response_input: Option<&Value>,
+    response_id: Option<String>,
+    output_items: Vec<Value>,
+) -> Option<LineageCommitOutcome> {
+    update_response_session_with_owned_input(
+        state,
+        session_lease,
+        parent,
+        full_response_input.cloned(),
+        response_id,
+        output_items,
+    )
+    .await
+}
+
+async fn update_response_session_with_owned_input(
+    state: &AppState,
+    session_lease: Option<&LineageLease>,
+    parent: &LineageParent,
+    full_response_input: Option<Value>,
     response_id: Option<String>,
     output_items: Vec<Value>,
 ) -> Option<LineageCommitOutcome> {
@@ -6598,7 +6984,7 @@ async fn update_response_session_with_id(
         let expected_response_id = lease.head().map(|head| head.response_id.as_str());
         let outcome = state
             .continuation_lineage
-            .invalidate(lease, expected_response_id)
+            .invalidate_fast(lease, expected_response_id)
             .await;
         return Some(match outcome {
             LineageInvalidateOutcome::Applied { generation } => {
@@ -6615,18 +7001,18 @@ async fn update_response_session_with_id(
     };
     let replacement_allowed = lease
         .head()
-        .map(|existing| should_replace_response_session(&existing.input, input))
+        .map(|existing| should_replace_response_session(&existing.input, &input))
         .unwrap_or(true);
     let candidate = ResponseSessionCandidate {
         response_id,
-        input: input.clone(),
+        input,
         output_items,
         finished_at: Instant::now(),
     };
     Some(
         state
             .continuation_lineage
-            .commit(lease, parent, candidate, replacement_allowed)
+            .commit_fast(lease, parent, candidate, replacement_allowed)
             .await,
     )
 }
@@ -6704,7 +7090,13 @@ fn mark_shadow_compaction_boundary(
 }
 
 fn session_identity_source_is_trusted(source: &str) -> bool {
-    matches!(source, "thread-id" | "conversation-id" | "session-id")
+    matches!(
+        source,
+        "direct-composite"
+            | "metadata-composite"
+            | "context-composite"
+            | "client-context-composite"
+    )
 }
 
 fn should_replace_response_session(existing: &Value, next: &Value) -> bool {
@@ -6900,172 +7292,6 @@ async fn begin_agent_upstream_attempt(
         })
         .await
         == Some(token.index() as u64)
-}
-
-fn agent_attempt_finish(
-    outcome: AgentAttemptOutcome,
-    status: Option<u16>,
-    error_scope: Option<String>,
-    terminal_state: Option<String>,
-    total_ms: u64,
-    diagnostics: Option<&UpstreamRequestDiagnostics>,
-) -> AgentAttemptFinish {
-    AgentAttemptFinish {
-        finished_at: Utc::now(),
-        outcome,
-        status,
-        error_scope,
-        terminal_state,
-        total_ms,
-        upstream_headers_ms: diagnostics.map(|item| item.headers_ms),
-        upstream_network_path: diagnostics.map(|item| item.network_path.to_string()),
-        request_body_bytes: diagnostics.map(|item| item.request_body_bytes),
-        sent_body_bytes: diagnostics.map(|item| item.sent_body_bytes),
-        gzip_attempted: diagnostics.map(|item| item.gzip_attempted),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn finalize_agent_generation(
-    state: &AppState,
-    inbound_request_id: &str,
-    attempt_id: Option<String>,
-    mut request_log: RequestLog,
-    attempt_outcome: AgentAttemptOutcome,
-    inbound_outcome: AgentInboundOutcome,
-    status: Option<u16>,
-    error_scope: Option<String>,
-    terminal_state: &str,
-    usage_record: Option<UsageRecord>,
-    usage_cold_start_key: Option<String>,
-    request_errors: Vec<(String, String)>,
-    shadow_affinity: Option<ShadowAffinityDecision>,
-    diagnostics: Option<&UpstreamRequestDiagnostics>,
-) {
-    apply_shadow_affinity_log_fields(&mut request_log, shadow_affinity.as_ref());
-    let validation_ttft_ms = request_log.ttft_ms;
-    let shadow_observation = shadow_affinity.as_ref().map(|_| ShadowObservationInput {
-        success: matches!(inbound_outcome, AgentInboundOutcome::Success),
-        has_usage: request_log.input_tokens.unwrap_or_default() > 0,
-        input_tokens: request_log.input_tokens.unwrap_or_default(),
-        cache_read_tokens: request_log.cache_read_tokens.unwrap_or_default(),
-        giant_tail: request_log.tail_tool_output_chars.unwrap_or_default() >= 80_000
-            || request_log
-                .tail_largest_tool_output_chars
-                .unwrap_or_default()
-                >= 80_000,
-        compaction_boundary: request_log.cache_status == "compact",
-        status: request_log.status,
-        ttft_ms: request_log.ttft_ms,
-        avoidable_gap_tokens: request_log.cache_avoidable_gap_tokens.unwrap_or_default(),
-        provider_unstable_gap_tokens: request_log
-            .cache_provider_unstable_gap_tokens
-            .unwrap_or_default(),
-        attempt_count: request_log
-            .upstream_attempt_total
-            .or(request_log.upstream_attempts)
-            .unwrap_or(1),
-    });
-    let Some(attempt_id) = attempt_id else {
-        state
-            .metrics
-            .record_error(
-                "agent_lifecycle",
-                "Agent generation reached terminal commit without an active attempt",
-            )
-            .await;
-        return;
-    };
-    let mut transaction = MetricsTransaction::agent_terminal(AgentTerminalSettlement {
-        inbound_request_id: inbound_request_id.to_string(),
-        attempt_id,
-        attempt_finish: agent_attempt_finish(
-            attempt_outcome,
-            status,
-            error_scope,
-            Some(terminal_state.to_string()),
-            request_log.total_ms,
-            diagnostics,
-        ),
-        request: request_log,
-        inbound_outcome,
-        terminal_state: Some(terminal_state.to_string()),
-    });
-    if let Some(usage_record) = usage_record {
-        transaction.observe_usage(usage_record, usage_cold_start_key.as_deref());
-    }
-    for (scope, message) in request_errors {
-        transaction.observe_error(scope, message);
-    }
-    if state.metrics.commit(transaction).await != MetricsCommitResult::Applied {
-        return;
-    }
-    if let (Some(decision), Some(observation)) = (shadow_affinity.as_ref(), shadow_observation) {
-        if let Some(run_id) = decision.validation_run_id.as_deref() {
-            state.cache_validation.lock().await.observe(
-                run_id,
-                CacheValidationObservation {
-                    success: observation.success,
-                    input_tokens: observation.input_tokens,
-                    cache_read_tokens: observation.cache_read_tokens,
-                    ttft_ms: validation_ttft_ms,
-                    candidate_applied: decision.decision == "validation_candidate_applied",
-                },
-                Utc::now(),
-            );
-        }
-        let mut store = state.shadow_affinity.lock().await;
-        cache_affinity::observe_shadow_affinity(&mut store, decision, observation, Utc::now());
-        drop(store);
-        state
-            .metrics
-            .record_shadow_observation(
-                observation.success,
-                observation.has_usage,
-                !observation.has_usage || observation.giant_tail,
-            )
-            .await;
-        state.journal_runtime_state();
-    }
-}
-
-fn apply_shadow_affinity_log_fields(
-    request_log: &mut RequestLog,
-    decision: Option<&ShadowAffinityDecision>,
-) {
-    let Some(decision) = decision else {
-        return;
-    };
-    request_log.shadow_affinity_mode = Some(decision.mode.clone());
-    request_log.shadow_affinity_arm = Some(shadow_affinity_arm_label(decision.arm));
-    request_log.shadow_affinity_realm_id = Some(decision.realm_id.clone());
-    request_log.shadow_affinity_cohort_id = Some(decision.cohort_id.clone());
-    request_log.shadow_affinity_lane = Some(shadow_cache_lane_label(decision.lane));
-    request_log.shadow_affinity_shard = Some(decision.shard);
-    request_log.shadow_affinity_policy_epoch = Some(decision.policy_epoch);
-    request_log.shadow_affinity_anchor_epoch = Some(decision.anchor_epoch);
-    request_log.shadow_affinity_trusted_identity = Some(decision.trusted_identity);
-    request_log.shadow_affinity_decision = Some(decision.decision.clone());
-    request_log.shadow_affinity_skip_reason = decision.skip_reason.clone();
-    request_log.shadow_affinity_policy_compute_ms = Some(decision.policy_compute_ms);
-}
-
-fn shadow_cache_lane_label(lane: cache_affinity::ShadowCacheLane) -> String {
-    match lane {
-        cache_affinity::ShadowCacheLane::Steady => "steady",
-        cache_affinity::ShadowCacheLane::ToolBurstQuarantine => "tool_burst_quarantine",
-        cache_affinity::ShadowCacheLane::CompactedAnchor => "compacted_anchor",
-        cache_affinity::ShadowCacheLane::Transparent => "transparent",
-    }
-    .to_string()
-}
-
-fn shadow_affinity_arm_label(arm: cache_affinity::ShadowAffinityArm) -> String {
-    match arm {
-        cache_affinity::ShadowAffinityArm::Baseline => "baseline",
-        cache_affinity::ShadowAffinityArm::Candidate => "candidate",
-    }
-    .to_string()
 }
 
 fn local_response_cache_eligible(
@@ -7268,7 +7494,7 @@ fn trusted_codex_request_metadata(
         .to_str()
         .ok()?
         .trim();
-    trusted_codex_request_metadata_from_raw(raw)
+    trusted_codex_request_metadata_from_raw(raw, TrustedCodexMetadataSource::AdapterHeader)
 }
 
 fn trusted_codex_request_metadata_for_request(
@@ -7276,9 +7502,15 @@ fn trusted_codex_request_metadata_for_request(
     request: &Value,
     authorized_codex_route: bool,
 ) -> Option<TrustedCodexRequestMetadata> {
-    trusted_codex_request_metadata(headers, authorized_codex_route).or_else(|| {
-        trusted_codex_request_metadata_from_client_metadata(request, authorized_codex_route)
-    })
+    if !authorized_codex_route {
+        return None;
+    }
+    if headers.contains_key(X_CODEX_TURN_METADATA_HEADER) {
+        let header_metadata = trusted_codex_request_metadata(headers, true)?;
+        return codex_request_identity_agrees_with_header(request, &header_metadata)
+            .then_some(header_metadata);
+    }
+    trusted_codex_request_metadata_from_client_metadata(request, true)
 }
 
 fn trusted_codex_request_metadata_from_client_metadata(
@@ -7288,48 +7520,157 @@ fn trusted_codex_request_metadata_from_client_metadata(
     if !authorized_codex_route {
         return None;
     }
-    let client_metadata = request.get("client_metadata")?;
-    let client_metadata = match client_metadata {
-        Value::Object(_) => client_metadata.clone(),
-        Value::String(raw) if raw.len() <= 32 * 1024 => serde_json::from_str(raw).ok()?,
-        _ => return None,
+    embedded_codex_turn_metadata(request).ok().flatten()
+}
+
+fn embedded_codex_turn_metadata(
+    request: &Value,
+) -> std::result::Result<Option<TrustedCodexRequestMetadata>, ()> {
+    let Some(client_metadata) = request.get("client_metadata") else {
+        return Ok(None);
     };
-    let turn_metadata = client_metadata
-        .as_object()?
-        .get(X_CODEX_TURN_METADATA_HEADER)?;
-    match turn_metadata {
-        Value::String(raw) => trusted_codex_request_metadata_from_raw(raw),
-        Value::Object(_) => trusted_codex_request_metadata_from_value(turn_metadata),
-        _ => None,
+    match client_metadata {
+        Value::Object(object) => embedded_codex_turn_metadata_from_object(object),
+        Value::String(raw) if raw.len() <= 32 * 1024 => {
+            let parsed = serde_json::from_str::<Value>(raw).map_err(|_| ())?;
+            let object = parsed.as_object().ok_or(())?;
+            embedded_codex_turn_metadata_from_object(object)
+        }
+        _ => Err(()),
     }
 }
 
-fn trusted_codex_request_metadata_from_raw(raw: &str) -> Option<TrustedCodexRequestMetadata> {
+fn embedded_codex_turn_metadata_from_object(
+    client_metadata: &Map<String, Value>,
+) -> std::result::Result<Option<TrustedCodexRequestMetadata>, ()> {
+    let Some(turn_metadata) = client_metadata.get(X_CODEX_TURN_METADATA_HEADER) else {
+        return Ok(None);
+    };
+    match turn_metadata {
+        Value::String(raw) => trusted_codex_request_metadata_from_raw(
+            raw,
+            TrustedCodexMetadataSource::AgentClientMetadata,
+        ),
+        Value::Object(_) => trusted_codex_request_metadata_from_value(
+            turn_metadata,
+            TrustedCodexMetadataSource::AgentClientMetadata,
+        ),
+        _ => None,
+    }
+    .map(Some)
+    .ok_or(())
+}
+
+fn codex_request_identity_agrees_with_header(
+    request: &Value,
+    header: &TrustedCodexRequestMetadata,
+) -> bool {
+    let Some(object) = request.as_object() else {
+        return false;
+    };
+    for (key, expected) in [
+        ("thread_id", header.thread_id.as_deref()),
+        ("conversation_id", header.conversation_id.as_deref()),
+        ("session_id", header.session_id.as_deref()),
+    ] {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        if !bounded_metadata_id(value)
+            .as_deref()
+            .is_some_and(|actual| Some(actual) == expected)
+        {
+            return false;
+        }
+    }
+    if let Some(value) = object.get("request_kind") {
+        let Some(kind) = value
+            .as_str()
+            .filter(|kind| matches!(*kind, "turn" | "compaction"))
+        else {
+            return false;
+        };
+        if header.request_kind.as_deref() != Some(kind) {
+            return false;
+        }
+    }
+    match embedded_codex_turn_metadata(request) {
+        Ok(None) => true,
+        Ok(Some(embedded)) => codex_metadata_identity_matches(header, &embedded),
+        Err(()) => false,
+    }
+}
+
+fn codex_metadata_identity_matches(
+    left: &TrustedCodexRequestMetadata,
+    right: &TrustedCodexRequestMetadata,
+) -> bool {
+    left.thread_id == right.thread_id
+        && left.conversation_id == right.conversation_id
+        && left.session_id == right.session_id
+        && left.request_kind == right.request_kind
+}
+
+fn trusted_codex_request_metadata_from_raw(
+    raw: &str,
+    source: TrustedCodexMetadataSource,
+) -> Option<TrustedCodexRequestMetadata> {
     if raw.is_empty() || raw.len() > 32 * 1024 {
         return None;
     }
     let value = serde_json::from_str::<Value>(raw).ok()?;
-    trusted_codex_request_metadata_from_value(&value)
+    trusted_codex_request_metadata_from_value(&value, source)
 }
 
-fn trusted_codex_request_metadata_from_value(value: &Value) -> Option<TrustedCodexRequestMetadata> {
+fn trusted_codex_request_metadata_from_value(
+    value: &Value,
+    source: TrustedCodexMetadataSource,
+) -> Option<TrustedCodexRequestMetadata> {
     let object = value.as_object()?;
-    let thread_id = object.get("thread_id").and_then(bounded_metadata_id);
-    let session_id = object.get("session_id").and_then(bounded_metadata_id);
-    let compaction_requested =
-        object.get("request_kind").and_then(Value::as_str) == Some("compaction");
-    (thread_id.is_some() || session_id.is_some() || compaction_requested).then_some(
-        TrustedCodexRequestMetadata {
+    // Missing identity dimensions are allowed, but a supplied malformed
+    // dimension must invalidate the whole attestation. Silently dropping a
+    // long/non-string ID could otherwise collapse two distinct sessions onto
+    // the same continuation scope through a remaining shared ID.
+    let thread_id = optional_bounded_metadata_id(object, "thread_id")?;
+    let conversation_id = optional_bounded_metadata_id(object, "conversation_id")?;
+    let session_id = optional_bounded_metadata_id(object, "session_id")?;
+    let request_kind = match object.get("request_kind") {
+        None => None,
+        Some(Value::String(kind)) if matches!(kind.as_str(), "turn" | "compaction") => {
+            Some(kind.clone())
+        }
+        Some(_) => return None,
+    };
+    let compaction_requested = request_kind.as_deref() == Some("compaction");
+    (thread_id.is_some()
+        || conversation_id.is_some()
+        || session_id.is_some()
+        || compaction_requested)
+        .then_some(TrustedCodexRequestMetadata {
             thread_id,
+            conversation_id,
             session_id,
+            request_kind,
             compaction_requested,
-        },
-    )
+            source,
+        })
+}
+
+fn optional_bounded_metadata_id(object: &Map<String, Value>, key: &str) -> Option<Option<String>> {
+    match object.get(key) {
+        None => Some(None),
+        Some(value) => bounded_metadata_id(value).map(Some),
+    }
 }
 
 fn bounded_metadata_id(value: &Value) -> Option<String> {
-    let value = value.as_str()?.trim();
-    (!value.is_empty() && value.len() <= 512).then(|| value.to_string())
+    let raw = value.as_str()?;
+    let value = raw.trim();
+    (!value.is_empty()
+        && value.len() <= 512
+        && value.len() == raw.len()
+        && !raw.chars().any(char::is_control))
+    .then(|| raw.to_string())
 }
 
 fn identity_request_with_codex_metadata(
@@ -7342,6 +7683,12 @@ fn identity_request_with_codex_metadata(
     };
     if let Some(thread_id) = metadata.thread_id.as_ref() {
         object.insert("thread_id".to_string(), Value::String(thread_id.clone()));
+    }
+    if let Some(conversation_id) = metadata.conversation_id.as_ref() {
+        object.insert(
+            "conversation_id".to_string(),
+            Value::String(conversation_id.clone()),
+        );
     }
     if let Some(session_id) = metadata.session_id.as_ref() {
         object.insert("session_id".to_string(), Value::String(session_id.clone()));
@@ -7455,28 +7802,139 @@ fn tail_input_diagnostics_for_session(
     lease: Option<&LineageLease>,
     current_input: Option<&Value>,
 ) -> TailInputDiagnostics {
+    analyze_tail_input_for_session(channel, lease, current_input).diagnostics
+}
+
+fn analyze_tail_input_for_session(
+    channel: &Channel,
+    lease: Option<&LineageLease>,
+    current_input: Option<&Value>,
+) -> TailInputAnalysis {
     if !matches!(channel, Channel::Responses) {
-        return TailInputDiagnostics::default();
+        return TailInputAnalysis {
+            diagnostics: TailInputDiagnostics::default(),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::NoLineage,
+                None,
+                0,
+                0,
+            ),
+        };
     }
     let Some(current_input) = current_input else {
-        return TailInputDiagnostics::default();
+        return TailInputAnalysis {
+            diagnostics: TailInputDiagnostics::default(),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::MissingCurrentInput,
+                None,
+                0,
+                0,
+            ),
+        };
     };
     let Value::Array(current_items) = current_input else {
-        return TailInputDiagnostics::default();
+        return TailInputAnalysis {
+            diagnostics: TailInputDiagnostics::default(),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::MissingCurrentInput,
+                None,
+                0,
+                0,
+            ),
+        };
     };
     if current_items.is_empty() {
-        return TailInputDiagnostics::default();
+        return TailInputAnalysis {
+            diagnostics: TailInputDiagnostics::default(),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::MissingCurrentInput,
+                None,
+                0,
+                0,
+            ),
+        };
     }
 
-    let previous_session = lease.and_then(LineageLease::head).cloned();
-    let tail_start = previous_session
-        .as_ref()
-        .and_then(|session| session.input.as_array())
-        .and_then(|previous_items| response_input_delta_start_index(previous_items, current_items))
-        .unwrap_or(0);
+    let current_input_items = current_items.len() as u64;
+    let Some(lease) = lease else {
+        return TailInputAnalysis {
+            diagnostics: summarize_tail_input_items(current_items),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::NoLineage,
+                None,
+                0,
+                current_input_items,
+            ),
+        };
+    };
+    let Some(previous_session) = lease.head() else {
+        return TailInputAnalysis {
+            diagnostics: summarize_tail_input_items(current_items),
+            predecessor: PredecessorProofReceipt::root(lease.epoch(), current_input_items),
+        };
+    };
+    let Some(control_head) = WaterlineControlHead::derive(
+        lease.epoch(),
+        previous_session.generation,
+        &previous_session.response_id,
+    ) else {
+        return TailInputAnalysis {
+            diagnostics: summarize_tail_input_items(current_items),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::NoLineage,
+                None,
+                0,
+                current_input_items,
+            ),
+        };
+    };
+    let Some(previous_items) = previous_session.input.as_array() else {
+        return TailInputAnalysis {
+            diagnostics: summarize_tail_input_items(current_items),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::MissingPredecessorInput,
+                Some(control_head),
+                0,
+                current_input_items,
+            ),
+        };
+    };
+    if previous_items.is_empty() {
+        return TailInputAnalysis {
+            diagnostics: summarize_tail_input_items(current_items),
+            predecessor: PredecessorProofReceipt::new(
+                PredecessorProofStatus::EmptyPredecessor,
+                Some(control_head),
+                0,
+                current_input_items,
+            ),
+        };
+    }
+
+    // This proof is deliberately about the prior *sent request prefix*: every
+    // previous input item must remain canonically identical at the front
+    // of the current FullReplay. Generated output/tool-chain validation is a
+    // separate, stricter requirement for Native Delta and is not claimed here.
+    let tail_start = response_input_delta_start_index(previous_items, current_items);
+    let proof_status = if previous_items.len() >= current_items.len() {
+        PredecessorProofStatus::NotExtended
+    } else if tail_start.is_some() {
+        PredecessorProofStatus::Exact
+    } else {
+        PredecessorProofStatus::PrefixMismatch
+    };
+    let tail_start = tail_start.unwrap_or(0);
     let mut diagnostics = summarize_tail_input_items(&current_items[tail_start..]);
-    diagnostics.delta_from_session = previous_session.is_some() && tail_start > 0;
-    diagnostics
+    diagnostics.delta_from_session = proof_status == PredecessorProofStatus::Exact;
+    TailInputAnalysis {
+        diagnostics,
+        predecessor: PredecessorProofReceipt::new(
+            proof_status,
+            Some(control_head),
+            previous_items.len() as u64,
+            current_input_items,
+        ),
+    }
 }
 
 fn summarize_tail_input_items(items: &[Value]) -> TailInputDiagnostics {
@@ -7833,6 +8291,7 @@ async fn record_upstream_transport_failure(
     used_response_session: bool,
     response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
     requested_model: Option<String>,
+    final_scope_waterline: Option<FinalScopeWaterlineLog>,
     agent_id: Option<&str>,
     source: &str,
     upstream_attempt_total: u64,
@@ -7861,6 +8320,7 @@ async fn record_upstream_transport_failure(
     let upstream_attempt_total = upstream_attempt_total.max(1);
     log.upstream_attempt_total = Some(upstream_attempt_total);
     log.upstream_attempts = Some(upstream_attempt_total);
+    log.final_scope_waterline = final_scope_waterline;
     log.agent_id = agent_id.map(str::to_string);
     log.agent_label = agent_id.map(str::to_string);
     let mut transaction = MetricsTransaction::upstream(log);
@@ -7941,6 +8401,7 @@ fn upstream_transport_failure_log(
             body,
         ),
         provider_cache_diagnostic: None,
+        final_scope_waterline: None,
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
         shadow_affinity_realm_id: None,
@@ -8147,6 +8608,7 @@ async fn cache_hit_response(
         provider_prefix_fingerprint: None,
         outbound_prefix_fingerprints: None,
         provider_cache_diagnostic: Some("local-replay".to_string()),
+        final_scope_waterline: None,
         shadow_affinity_mode: None,
         shadow_affinity_arm: None,
         shadow_affinity_realm_id: None,
@@ -8274,44 +8736,6 @@ async fn cache_hit_response(
         non_sse_compact_compat,
     );
     raw_response(hit.entry.status, &hit.entry.content_type, body)
-}
-
-async fn insert_cache_entries(
-    state: &AppState,
-    keys: Vec<String>,
-    semantic_text: Option<String>,
-    semantic_shape: Option<String>,
-    content_type: String,
-    status: u16,
-    body: Vec<u8>,
-    decision: &RouteDecision,
-    config: &AppConfig,
-) {
-    let now = Utc::now();
-    let expires_at = now + Duration::seconds(config.cache.max_age_seconds as i64);
-    let entries = keys
-        .into_iter()
-        .map(|key| CacheEntry {
-            key,
-            semantic_text: semantic_text.clone(),
-            semantic_shape: semantic_shape.clone(),
-            semantic_vector: Vec::new(),
-            content_type: content_type.clone(),
-            status,
-            body: body.clone(),
-            created_at: now,
-            expires_at,
-            provider_id: decision.provider.id.clone(),
-            model: decision.model.clone(),
-            workspace_fingerprint: Some(config.workspace_fingerprint.clone()),
-        })
-        .collect();
-    if let Err(err) = state.cache.insert_many(entries, &config.cache).await {
-        state
-            .metrics
-            .record_error("cache_insert", &err.to_string())
-            .await;
-    }
 }
 
 #[cfg(test)]
@@ -10038,14 +10462,18 @@ pub(crate) async fn probe_provider_responses_websocket(
             "provider and actual upstream model are required for WebSocket verification"
         ));
     }
-    let provider = {
+    let (provider, explicit_proxy_url) = {
         let config = state.config.read().await;
-        config
+        let provider = config
             .providers
             .iter()
             .find(|provider| provider.id == provider_id)
             .cloned()
-            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+        let explicit_proxy_url = config
+            .upstream_proxy_url_for(provider.use_system_proxy)
+            .map(str::to_owned);
+        (provider, explicit_proxy_url)
     };
     if !provider.enabled {
         return Err(anyhow!("provider {} is disabled", provider.name));
@@ -10062,6 +10490,7 @@ pub(crate) async fn probe_provider_responses_websocket(
             responses_url: upstream_url(&provider.base_url, &Channel::Responses),
             api_key: selected_key.secret,
             use_system_proxy: provider.use_system_proxy,
+            explicit_proxy_url,
             custom_user_agent: provider.custom_user_agent.clone(),
         },
     )
@@ -10213,7 +10642,15 @@ async fn send_provider_management_probe_request_to_url(
         X_ATOAPI_REQUEST_KIND_HEADER,
         HeaderValue::from_static(request_kind),
     );
-    let plan = RequestPlan::new(provider, url, channel.clone(), body).with_gzip_enabled(false);
+    let explicit_proxy_url = state
+        .config
+        .read()
+        .await
+        .upstream_proxy_url_for(provider.use_system_proxy)
+        .map(str::to_owned);
+    let plan = RequestPlan::new(provider, url, channel.clone(), body)
+        .with_explicit_proxy_url(explicit_proxy_url)
+        .with_gzip_enabled(false);
     let outcome =
         send_main_upstream_request(state, api_key, plan.into_one_shot(), &management_headers)
             .await?;
@@ -10464,7 +10901,9 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
         (None, 0)
     };
     let mut diagnostics = UpstreamRequestDiagnostics {
-        network_path: if plan.use_system_proxy() {
+        network_path: if plan.explicit_proxy_url().is_some() {
+            "explicit-proxy"
+        } else if plan.use_system_proxy() {
             "system-proxy"
         } else {
             "direct"
@@ -10490,7 +10929,20 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
         plan.custom_user_agent(),
         sending_gzip,
     );
-    let client = if agent_transport {
+    // The default direct/system-proxy paths keep their prebuilt references and
+    // pay no pool lock. Only an explicitly configured proxy URL enters the
+    // bounded dynamic pool, whose cloned Client preserves its connection pool.
+    let explicit_proxy_client = plan
+        .explicit_proxy_url()
+        .map(|proxy_url| {
+            state
+                .transport_clients
+                .explicit_proxy_client(proxy_url, agent_transport)
+        })
+        .transpose()?;
+    let client = if let Some(client) = explicit_proxy_client.as_ref() {
+        client
+    } else if agent_transport {
         state
             .transport_clients
             .agent_client(plan.use_system_proxy())
@@ -10764,7 +11216,7 @@ fn serialize_responses_body_for_provider_prefix(body: &Value) -> String {
 }
 
 #[cfg(test)]
-fn legacy_serialize_responses_body_for_provider_prefix(body: &Value) -> String {
+fn current_reference_serialize_responses_body_for_provider_prefix(body: &Value) -> String {
     let Some(map) = body.as_object() else {
         return serde_json::to_string(body).unwrap_or_else(|_| "null".to_string());
     };
@@ -10842,881 +11294,6 @@ fn format_json_member(key: &str, value: &Value) -> String {
     let key = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
     let value = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
     format!("{key}:{value}")
-}
-
-async fn stream_upstream(
-    state: Arc<AppState>,
-    upstream: reqwest::Response,
-    content_type: String,
-    status: u16,
-    started: Instant,
-    request_id: String,
-    client_channel: Channel,
-    decision: RouteDecision,
-    eligible: bool,
-    cache_keys: Vec<String>,
-    metrics_cache_key: String,
-    semantic_text: Option<String>,
-    semantic_shape: Option<String>,
-    provider_prefix_key: Option<String>,
-    provider_prefix_fingerprint: Option<String>,
-    provider_prefix_family_key: Option<String>,
-    route_affinity_key: Option<String>,
-    config: AppConfig,
-    session_reuse_capability: Option<ProviderResponseSessionReuseCapability>,
-    _prefix_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    prefix_state_key: Option<String>,
-    response_session_key: Option<String>,
-    full_response_input: Option<Value>,
-    response_session_lease: Option<LineageLease>,
-    response_session_parent: LineageParent,
-    response_session_starts_compaction_epoch: bool,
-    used_response_session: bool,
-    retried_full_response: bool,
-    diagnostics: BodyDiagnostics,
-    tail_input_diagnostics: TailInputDiagnostics,
-    session_anchor_diagnostics: SessionAnchorDiagnostics,
-    response_session_reuse_diagnostics: ResponseSessionReuseDiagnostics,
-    cross_protocol_tool_context: Option<transform_codex_chat::CodexToolContext>,
-    agent_log_id: Option<String>,
-    agent_log_label: Option<String>,
-    requested_model: Option<String>,
-    prefix_guard_wait: PrefixGuardWaitDiagnostics,
-    local_prepare_ms: u64,
-    upstream_request_diagnostics: UpstreamRequestDiagnostics,
-    upstream_response_headers_at_ms: u64,
-    agent_attempt_id: Option<String>,
-    mut shadow_affinity_decision: Option<ShadowAffinityDecision>,
-    agent_generation: bool,
-    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
-) -> Response {
-    // Streaming must behave like a normal proxy: do not hold prefix/session locks
-    // for the whole SSE response. The guarded section has already covered request
-    // preparation and send; holding it through output serializes unrelated turns
-    // and inflates TTFT/total time.
-    drop(_prefix_guard);
-
-    let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
-        && matches!(decision.upstream_channel, Channel::Chat);
-    let convert_anthropic_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
-        && matches!(decision.upstream_channel, Channel::Anthropic);
-    let convert_anthropic_sse_to_chat_sse = matches!(client_channel, Channel::Chat)
-        && matches!(decision.upstream_channel, Channel::Anthropic);
-    let convert_chat_sse_to_anthropic_sse = matches!(client_channel, Channel::Anthropic)
-        && matches!(decision.upstream_channel, Channel::Chat);
-    let convert_responses_sse_to_chat_sse = matches!(client_channel, Channel::Chat)
-        && matches!(decision.upstream_channel, Channel::Responses);
-    let convert_responses_sse_to_anthropic_sse = matches!(client_channel, Channel::Anthropic)
-        && matches!(decision.upstream_channel, Channel::Responses);
-    let response_content_type = if convert_codex_chat_sse_to_responses_sse
-        || convert_anthropic_sse_to_responses_sse
-        || convert_anthropic_sse_to_chat_sse
-        || convert_chat_sse_to_anthropic_sse
-        || convert_responses_sse_to_chat_sse
-        || convert_responses_sse_to_anthropic_sse
-    {
-        "text/event-stream".to_string()
-    } else {
-        content_type.clone()
-    };
-    let content_type_for_cache = response_content_type.clone();
-    let (downstream_sender, mut downstream_receiver) =
-        mpsc::channel::<Result<RelayBodyChunk, std::io::Error>>(STREAM_RELAY_CHANNEL_CAPACITY);
-    let downstream_byte_budget = Arc::new(Semaphore::new(STREAM_RELAY_BYTE_BUDGET));
-    let relay_tracker = state.relay_tasks.clone();
-    let relay_reservation = if response_handoff.is_none() {
-        match relay_tracker.reserve() {
-            Ok(reservation) => Some(reservation),
-            Err(_) => {
-                // The upstream response head already exists, but no relay may
-                // expose it after shutdown has stopped accepting owners. Record
-                // the failed inbound before returning a local 503.
-                let admission_body = json!({ "stream": true });
-                record_upstream_transport_failure(
-                    &state,
-                    &request_id,
-                    &started,
-                    &client_channel,
-                    &decision.upstream_channel,
-                    &decision,
-                    eligible.then_some(metrics_cache_key.as_str()),
-                    provider_prefix_key.as_deref(),
-                    provider_prefix_fingerprint.as_deref(),
-                    &prefix_guard_wait,
-                    local_prepare_ms,
-                    &diagnostics,
-                    &admission_body,
-                    used_response_session,
-                    &response_session_reuse_diagnostics,
-                    requested_model.clone(),
-                    agent_log_id.as_deref(),
-                    "stream-relay-admission",
-                    upstream_request_diagnostics.attempts,
-                    &[],
-                    "stream_relay_admission",
-                    "proxy relay is shutting down",
-                )
-                .await;
-                return json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "proxy relay is shutting down",
-                );
-            }
-        }
-    } else {
-        None
-    };
-
-    let relay = async move {
-        let raw_stream = upstream.bytes_stream();
-        let mut responses_to_chat_stream_summary = None;
-        let mut responses_to_anthropic_stream_summary = None;
-        let mut chat_to_anthropic_stream_summary = None;
-        let mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>> =
-            if convert_codex_chat_sse_to_responses_sse {
-                let tool_context = cross_protocol_tool_context.clone().unwrap_or_default();
-                Box::pin(
-                    streaming_codex_chat::create_responses_sse_stream_from_chat_with_context_and_model(
-                        raw_stream,
-                        tool_context,
-                        decision.model.clone(),
-                    )
-                    .map(|item| item.map_err(|err| err.to_string())),
-                )
-            } else if convert_anthropic_sse_to_responses_sse {
-                let context = streaming_codex_anthropic::AnthropicResponsesContext {
-                    tool_context: cross_protocol_tool_context.unwrap_or_default(),
-                };
-                Box::pin(
-                    streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(
-                        raw_stream,
-                        context,
-                        decision.model.clone(),
-                    )
-                    .map(|item| item.map_err(|err| err.to_string())),
-                )
-            } else if convert_anthropic_sse_to_chat_sse {
-                // Keep the raw Anthropic stream pull-based: the existing
-                // Anthropic→Responses and Responses→Chat adapters compose
-                // without collecting the body, so the first Chat delta can
-                // leave the owner relay before `message_stop`.
-                let intermediate =
-                    streaming_codex_anthropic::create_responses_sse_stream_from_anthropic(
-                        raw_stream,
-                        streaming_codex_anthropic::AnthropicResponsesContext {
-                            tool_context: transform_codex_chat::CodexToolContext::default(),
-                        },
-                        decision.model.clone(),
-                    );
-                let (adapted, summary) =
-                    streaming_responses_chat::create_chat_sse_stream_from_responses(
-                        intermediate,
-                        decision.model.clone(),
-                        diagnostics.chat_stream_include_usage,
-                    );
-                responses_to_chat_stream_summary = Some(summary);
-                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
-            } else if convert_chat_sse_to_anthropic_sse {
-                let (adapted, summary) =
-                    streaming_chat_anthropic::create_anthropic_sse_stream_from_chat(
-                        raw_stream,
-                        decision.model.clone(),
-                    );
-                chat_to_anthropic_stream_summary = Some(summary);
-                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
-            } else if convert_responses_sse_to_chat_sse {
-                let (adapted, summary) =
-                    streaming_responses_chat::create_chat_sse_stream_from_responses(
-                        raw_stream,
-                        decision.model.clone(),
-                        diagnostics.chat_stream_include_usage,
-                    );
-                responses_to_chat_stream_summary = Some(summary);
-                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
-            } else if convert_responses_sse_to_anthropic_sse {
-                let (adapted, summary) =
-                    streaming_responses_anthropic::create_anthropic_sse_stream_from_responses(
-                        raw_stream,
-                        decision.model.clone(),
-                    );
-                responses_to_anthropic_stream_summary = Some(summary);
-                Box::pin(adapted.map(|item| item.map_err(|err| err.to_string())))
-            } else {
-                Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
-            };
-        let mut first_chunk_at: Option<u64> = None;
-        let mut first_model_output_at: Option<u64> = None;
-        let mut cache_capture = BoundedCacheCapture::new(eligible);
-        let mut session_error_body = Vec::new();
-        let mut stream_state = ResponsesStreamState::default();
-        let mut sse_chunks = 0u64;
-        let mut sse_end_reason = "upstream_eof".to_string();
-        let mut stream_upstream_wait_ms = 0u64;
-        let mut stream_client_backpressure_ms = 0u64;
-        let mut downstream_disconnected = false;
-        let mut downstream_disconnect_stage = None;
-        let mut first_chunk_accepted_by_relay = false;
-        let mut terminal_accepted_by_relay = false;
-        let mut stream_end = StreamEnd::CleanEof;
-        let mut stream_transport_error = None;
-        let mut stream_metric_errors = Vec::<(String, String)>::new();
-        let state_for_stream = state.clone();
-        loop {
-            let upstream_wait_started = Instant::now();
-            let next_chunk = stream.next().await;
-            stream_upstream_wait_ms = stream_upstream_wait_ms
-                .saturating_add(upstream_wait_started.elapsed().as_millis() as u64);
-            let Some(chunk) = next_chunk else {
-                break;
-            };
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    stream_metric_errors.push(("upstream_stream".to_string(), err.clone()));
-                    sse_end_reason = "upstream_stream_error".to_string();
-                    stream_end = StreamEnd::TransportError;
-                    stream_transport_error = Some(err);
-                    break;
-                }
-            };
-            let chunk_received_at = started.elapsed().as_millis() as u64;
-            if first_chunk_at.is_none() {
-                first_chunk_at = Some(chunk_received_at);
-            }
-            sse_chunks += 1;
-            for relay_chunk in relay_chunk_parts(&chunk) {
-                let mut accepted_by_relay = false;
-                if !downstream_disconnected {
-                    let client_backpressure_started = Instant::now();
-                    let permit = downstream_byte_budget
-                        .clone()
-                        .acquire_many_owned(relay_chunk.len() as u32)
-                        .await;
-                    let send_failed = match permit {
-                        Ok(permit) => downstream_sender
-                            .send(Ok(RelayBodyChunk {
-                                bytes: relay_chunk.clone(),
-                                permit,
-                            }))
-                            .await
-                            .is_err(),
-                        Err(_) => true,
-                    };
-                    if send_failed {
-                        downstream_disconnected = true;
-                        downstream_disconnect_stage = Some(
-                            if terminal_accepted_by_relay {
-                                "after_terminal"
-                            } else {
-                                "before_terminal"
-                            }
-                            .to_string(),
-                        );
-                    } else {
-                        accepted_by_relay = true;
-                    }
-                    stream_client_backpressure_ms = stream_client_backpressure_ms
-                        .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
-                }
-                if accepted_by_relay && !first_chunk_accepted_by_relay {
-                    first_chunk_accepted_by_relay = true;
-                    tokio::task::yield_now().await;
-                }
-                let observation = stream_state.ingest(&relay_chunk);
-                if first_model_output_at.is_none() && observation.model_output_started {
-                    first_model_output_at = Some(chunk_received_at);
-                }
-                let terminal_seen = match client_channel {
-                    Channel::Responses => observation.responses_completed_event_seen,
-                    Channel::Anthropic => observation.message_stop_event_seen,
-                    Channel::Chat => observation.done_marker_seen,
-                };
-                if accepted_by_relay && terminal_seen {
-                    terminal_accepted_by_relay = true;
-                }
-                cache_capture.push(&relay_chunk);
-                if used_response_session && session_error_body.len() < 65_536 {
-                    let remaining = 65_536usize.saturating_sub(session_error_body.len());
-                    session_error_body
-                        .extend_from_slice(&relay_chunk[..relay_chunk.len().min(remaining)]);
-                }
-            }
-        }
-        let cache_body = cache_capture.finish();
-        let mut stream_metadata = stream_state.finish();
-        if let Some(summary_handle) = responses_to_chat_stream_summary {
-            if let Ok(summary) = summary_handle.lock() {
-                if summary.usage.has_usage() {
-                    stream_metadata.usage = summary.usage.clone();
-                }
-                if summary.response_id.is_some() {
-                    stream_metadata.response_id = summary.response_id.clone();
-                }
-                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
-                stream_metadata.model_output_seen |= summary.model_output_seen;
-            }
-        }
-        if let Some(summary_handle) = responses_to_anthropic_stream_summary {
-            if let Ok(summary) = summary_handle.lock() {
-                if summary.usage.has_usage() {
-                    stream_metadata.usage = summary.usage.clone();
-                }
-                if summary.response_id.is_some() {
-                    stream_metadata.response_id = summary.response_id.clone();
-                }
-                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
-                stream_metadata.model_output_seen |= summary.model_output_seen;
-            }
-        }
-        if let Some(summary_handle) = chat_to_anthropic_stream_summary {
-            if let Ok(summary) = summary_handle.lock() {
-                if summary.usage.has_usage() {
-                    stream_metadata.usage = summary.usage.clone();
-                }
-                if summary.response_id.is_some() {
-                    stream_metadata.response_id = summary.response_id.clone();
-                }
-                stream_metadata.compaction_output_seen |= summary.compaction_output_seen;
-                stream_metadata.model_output_seen |= summary.model_output_seen;
-            }
-        }
-        let terminal_verdict = evaluate_terminal(
-            &client_channel,
-            TerminalCompatibility::Strict,
-            &stream_metadata,
-            stream_end,
-        );
-        if terminal_verdict.trailing_transport_anomaly {
-            sse_end_reason = "upstream_trailing_transport_anomaly".to_string();
-        } else if let Some(failure) = terminal_verdict.failure {
-            sse_end_reason = match failure {
-                TerminalFailure::ErrorEvent => "upstream_sse_error",
-                TerminalFailure::FrameTooLarge => "upstream_sse_frame_too_large",
-                TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
-                TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
-            }
-            .to_string();
-        }
-        if !downstream_disconnected && !terminal_verdict.success {
-            let relay_error = match terminal_verdict.failure {
-                Some(TerminalFailure::TransportErrorBeforeTerminal) => stream_transport_error
-                    .unwrap_or_else(|| "upstream stream failed before completion".to_string()),
-                Some(TerminalFailure::IncompleteEof) => {
-                    "upstream stream ended before a completion event".to_string()
-                }
-                Some(TerminalFailure::FrameTooLarge) => {
-                    "upstream SSE frame exceeded the inspection limit".to_string()
-                }
-                Some(TerminalFailure::ErrorEvent) | None => String::new(),
-            };
-            if !relay_error.is_empty()
-                && downstream_sender
-                    .send(Err(std::io::Error::other(relay_error)))
-                    .await
-                    .is_err()
-            {
-                downstream_disconnected = true;
-                downstream_disconnect_stage = Some("before_terminal".to_string());
-            }
-        }
-        // The client has received every upstream byte. Close its body before
-        // usage, cache, metrics, and persistence settlement continue.
-        drop(downstream_sender);
-        if !terminal_verdict.success {
-            if let Some(error_summary) = stream_metadata.error_summary.as_deref() {
-                note_runtime_cache_capability_rejection(
-                    &state_for_stream,
-                    &decision,
-                    &decision.upstream_channel,
-                    &upstream_request_diagnostics,
-                    status,
-                    error_summary,
-                )
-                .await;
-            }
-        }
-        if used_response_session
-            && supports_main_response_session_delta(
-                &config,
-                &decision,
-                session_reuse_capability.as_ref(),
-            )
-            && stream_metadata.error_event_seen
-        {
-            let error_summary = upstream_error_summary(&session_error_body);
-            let rejection = response_session_rejection_classification(status, &error_summary);
-            if !error_summary.is_empty() {
-                stream_metric_errors.push((
-                    "verified_response_session_delta_rejected".to_string(),
-                    error_summary.clone(),
-                ));
-            }
-            let cooldown_key =
-                response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
-            note_response_session_error_cooldown_for_rejection(
-                &state_for_stream,
-                cooldown_key.as_deref(),
-                status,
-                &error_summary,
-            )
-            .await;
-            if matches!(
-                rejection,
-                ResponseSessionRejectionClass::StaleReference
-                    | ResponseSessionRejectionClass::Unsupported
-            ) {
-                clear_response_session_reference(
-                    &state_for_stream,
-                    response_session_lease.as_ref(),
-                    response_session_lease
-                        .as_ref()
-                        .and_then(LineageLease::head)
-                        .map(|head| head.response_id.as_str()),
-                )
-                .await;
-            }
-            if rejection == ResponseSessionRejectionClass::Unsupported {
-                invalidate_verified_response_session_reuse(
-                    &state_for_stream,
-                    &decision.provider.id,
-                    &decision.model,
-                    session_reuse_capability.as_ref(),
-                    &error_summary,
-                )
-                .await;
-            }
-        }
-        let stream_success_for_cache = (200..300).contains(&status) && terminal_verdict.success;
-        let confirmed_compaction = confirmed_responses_compaction(
-            &decision.upstream_channel,
-            diagnostics.compaction_trigger_requested,
-            diagnostics.trusted_codex_compaction_requested,
-            stream_metadata.compaction_output_seen,
-            stream_metadata.model_output_seen,
-            (200..300).contains(&status),
-            terminal_verdict.success,
-        );
-        let terminal_error_scope = match terminal_verdict.failure {
-            Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof) => {
-                Some("upstream_sse_error")
-            }
-            Some(TerminalFailure::FrameTooLarge) => Some("upstream_sse_frame_too_large"),
-            Some(TerminalFailure::TransportErrorBeforeTerminal) | None => None,
-        };
-        if !stream_success_for_cache {
-            if let Some(error_scope) = terminal_error_scope {
-                stream_metric_errors.push((error_scope.to_string(), sse_end_reason.clone()));
-            }
-        }
-        let total_ms = started.elapsed().as_millis() as u64;
-        let usage_observation = if stream_success_for_cache {
-            collect_provider_usage_from_record(
-                &state_for_stream,
-                stream_metadata.usage.clone(),
-                &decision,
-                prefix_state_key.as_deref(),
-                used_response_session,
-            )
-            .await
-        } else {
-            None
-        };
-        let usage_record = usage_observation.as_ref().map(|item| item.raw.clone());
-        let prefix_usage_record = usage_observation
-            .as_ref()
-            .map(|item| item.effective.clone());
-        if stream_success_for_cache && !confirmed_compaction {
-            update_response_session_with_id(
-                &state_for_stream,
-                response_session_lease.as_ref(),
-                &response_session_parent,
-                full_response_input.as_ref(),
-                stream_metadata.response_id.clone(),
-                stream_metadata.output_items.clone(),
-            )
-            .await;
-        }
-        let prefix_observation = observe_provider_prefix_usage(
-            &state_for_stream,
-            prefix_state_key.as_deref(),
-            provider_prefix_family_key.as_deref(),
-            usage_record.as_ref(),
-            prefix_usage_record.as_ref(),
-            &tail_input_diagnostics,
-            used_response_session,
-            retried_full_response,
-            prefix_guard_wait.budget_exhausted,
-            stream_success_for_cache,
-        )
-        .await;
-        let gap_breakdown = prefix_observation.gap;
-        let prefix_lag = usage_record
-            .as_ref()
-            .map(|record| {
-                prefix_lag_diagnostics_from_previous(
-                    prefix_observation.previous.as_ref(),
-                    record,
-                    gap_breakdown.as_ref(),
-                    &prefix_guard_wait,
-                    &tail_input_diagnostics,
-                )
-            })
-            .unwrap_or_default();
-        if confirmed_compaction {
-            let shadow_assignment_key =
-                mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
-            let _ = finalize_confirmed_responses_compaction(
-                &state_for_stream,
-                response_session_lease.as_ref(),
-                response_session_starts_compaction_epoch,
-                prefix_state_key.as_deref(),
-                provider_prefix_family_key.as_deref(),
-                shadow_assignment_key.as_deref(),
-            )
-            .await;
-        }
-        if stream_success_for_cache {
-            note_provider_route_affinity(
-                &state_for_stream,
-                route_affinity_key.as_deref(),
-                &decision.provider.id,
-            )
-            .await;
-            clear_prefix_error_cooldown(&state_for_stream, prefix_state_key.as_deref()).await;
-        }
-        let ttft_ms = first_model_output_at.or(first_chunk_at).unwrap_or(total_ms);
-        let upstream_first_chunk_ms = first_chunk_at
-            .unwrap_or(total_ms)
-            .saturating_sub(upstream_response_headers_at_ms);
-        let mut request_log = RequestLog {
-            id: request_id.clone(),
-            at: Utc::now(),
-            inbound_request_id: Some(request_id.clone()),
-            upstream_request_id: Some(Uuid::new_v4().to_string()),
-            upstream_attempt_index: Some(1),
-            upstream_attempt_total: Some(upstream_request_diagnostics.attempts),
-            client_channel: client_channel.label().to_string(),
-            upstream_channel: decision.upstream_channel.label().to_string(),
-            provider: decision.provider.name.clone(),
-            provider_id: Some(decision.provider.id.clone()),
-            model: decision.model.clone(),
-            requested_model,
-            agent_reasoning_effort: None,
-            configured_reasoning_effort: None,
-            effective_reasoning_effort: None,
-            reasoning_effort_source: None,
-            cache_status: if confirmed_compaction {
-                "compact"
-            } else if stream_success_for_cache {
-                if eligible {
-                    "miss"
-                } else {
-                    "bypass"
-                }
-            } else {
-                "error"
-            }
-            .to_string(),
-            cold_start: None,
-            agent_id: agent_log_id.clone(),
-            agent_label: agent_log_label.clone(),
-            upstream_call_kind: Some("stream".to_string()),
-            upstream_call_source: Some(
-                if confirmed_compaction {
-                    "responses-compaction-v2"
-                } else {
-                    "main"
-                }
-                .to_string(),
-            ),
-            cache_key: if eligible && stream_success_for_cache && !confirmed_compaction {
-                Some(metrics_cache_key.clone())
-            } else {
-                None
-            },
-            provider_prefix_key: provider_prefix_key.clone(),
-            provider_prefix_fingerprint: provider_prefix_fingerprint.clone(),
-            outbound_prefix_fingerprints: upstream_request_diagnostics
-                .outbound_prefix_fingerprints
-                .clone(),
-            provider_cache_diagnostic: usage_record.as_ref().map(provider_cache_diagnostic),
-            shadow_affinity_mode: None,
-            shadow_affinity_arm: None,
-            shadow_affinity_realm_id: None,
-            shadow_affinity_cohort_id: None,
-            shadow_affinity_lane: None,
-            shadow_affinity_shard: None,
-            shadow_affinity_policy_epoch: None,
-            shadow_affinity_anchor_epoch: None,
-            shadow_affinity_trusted_identity: None,
-            shadow_affinity_decision: None,
-            shadow_affinity_skip_reason: None,
-            shadow_affinity_policy_compute_ms: None,
-            prefix_guard_wait_ms: Some(prefix_guard_wait.wait_ms),
-            prefix_guard_wait_reason: prefix_guard_wait.reason.clone(),
-            prefix_guard_wait_source: prefix_guard_wait.source.clone(),
-            prefix_guard_state_age_ms: prefix_guard_wait.state_age_ms,
-            prefix_guard_skip_reason: prefix_guard_wait.skip_reason.clone(),
-            prefix_guard_wait_effect: prefix_guard_wait_effect(
-                &prefix_guard_wait,
-                usage_record.as_ref(),
-                gap_breakdown.as_ref(),
-            ),
-            prefix_lag_classification: None,
-            prefix_lag_input_delta_tokens: None,
-            prefix_lag_cache_delta_tokens: None,
-            prefix_lag_previous_gap_tokens: None,
-            prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
-            prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
-            prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
-            status,
-            ttft_ms,
-            first_byte_ms: first_chunk_at,
-            upstream_ttft_ms: Some(upstream_ttft_ms(ttft_ms, Some(prefix_guard_wait.wait_ms))),
-            local_prepare_ms: Some(local_prepare_ms),
-            upstream_headers_ms: Some(upstream_request_diagnostics.headers_ms),
-            upstream_last_attempt_headers_ms: Some(
-                upstream_request_diagnostics.last_attempt_headers_ms,
-            ),
-            upstream_http_version: upstream_request_diagnostics.http_version.clone(),
-            upstream_network_path: Some(upstream_request_diagnostics.network_path.to_string()),
-            upstream_remote_addr: upstream_request_diagnostics.remote_addr.clone(),
-            upstream_pool_diagnostic: upstream_request_diagnostics.pool_diagnostic.clone(),
-            upstream_trace_id: upstream_request_diagnostics.upstream_trace_id.clone(),
-            upstream_trace_source: upstream_request_diagnostics.upstream_trace_source.clone(),
-            upstream_server_timing: upstream_request_diagnostics.server_timing.clone(),
-            upstream_timing_source: upstream_request_diagnostics.timing_source.clone(),
-            upstream_reported_processing_ms: upstream_request_diagnostics.reported_processing_ms,
-            upstream_non_processing_ms: upstream_request_diagnostics.non_processing_ms,
-            upstream_first_chunk_ms: Some(upstream_first_chunk_ms),
-            stream_upstream_wait_ms: Some(stream_upstream_wait_ms),
-            stream_client_backpressure_ms: Some(stream_client_backpressure_ms),
-            aggregate_done_ms: None,
-            upstream_retry_wait_ms: Some(upstream_request_diagnostics.retry_wait_ms),
-            upstream_attempts: Some(upstream_request_diagnostics.attempts),
-            request_body_bytes: Some(upstream_request_diagnostics.request_body_bytes),
-            sent_body_bytes: Some(upstream_request_diagnostics.sent_body_bytes),
-            request_body_encode_ms: Some(upstream_request_diagnostics.request_body_encode_ms),
-            gzip_encode_ms: Some(upstream_request_diagnostics.gzip_encode_ms),
-            gzip_attempted: Some(upstream_request_diagnostics.gzip_attempted),
-            gzip_fallback_used: Some(upstream_request_diagnostics.gzip_fallback_used),
-            upstream_header_wait_class: Some(upstream_header_wait_class(
-                &upstream_request_diagnostics,
-            )),
-            total_ms,
-            input_tokens: usage_record.as_ref().map(|record| record.input_tokens),
-            output_tokens: usage_record.as_ref().map(|record| record.output_tokens),
-            cache_read_tokens: usage_record.as_ref().map(|record| record.cache_read_tokens),
-            cache_shortfall_tokens: usage_record.as_ref().map(provider_cache_shortfall),
-            cache_new_tail_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.new_tail_tokens),
-            cache_avoidable_gap_tokens: gap_breakdown.as_ref().map(|gap| gap.avoidable_tokens),
-            cache_provider_unstable_gap_tokens: gap_breakdown
-                .as_ref()
-                .map(|gap| gap.provider_unstable_tokens),
-            provider_cache_token_ratio: usage_record.as_ref().and_then(provider_cache_ratio),
-            tail_input_items: None,
-            tail_message_chars: None,
-            tail_tool_call_chars: None,
-            tail_tool_output_chars: None,
-            tail_largest_tool_output_chars: None,
-            tail_tool_output_lines: None,
-            tail_tool_output_repeated_line_chars: None,
-            tail_tool_output_timestamp_like_count: None,
-            tail_tool_output_path_like_count: None,
-            tail_tool_output_url_like_count: None,
-            tail_tool_output_hash_like_count: None,
-            tail_tool_output_json_like_chars: None,
-            tail_tool_output_noise_hint: None,
-            tail_source: None,
-            response_session_reused: Some(used_response_session),
-            response_session_candidate_count: Some(
-                response_session_reuse_diagnostics.candidate_count,
-            ),
-            response_session_skip_reason: response_session_reuse_diagnostics.skip_reason.clone(),
-            response_session_exact_key_hit: Some(response_session_reuse_diagnostics.exact_key_hit),
-            response_session_scope_match_count: Some(
-                response_session_reuse_diagnostics.scope_match_count,
-            ),
-            response_session_append_delta_match: Some(
-                response_session_reuse_diagnostics.append_delta_match,
-            ),
-            response_session_delta_items: Some(response_session_reuse_diagnostics.delta_items),
-            response_context_plan: response_session_reuse_diagnostics.context_plan.clone(),
-            response_session_semantic_reuse_items: (response_session_reuse_diagnostics
-                .semantic_reuse_items
-                > 0)
-            .then_some(response_session_reuse_diagnostics.semantic_reuse_items),
-            response_session_wire_saved_bytes: (response_session_reuse_diagnostics
-                .wire_saved_bytes
-                > 0)
-            .then_some(response_session_reuse_diagnostics.wire_saved_bytes),
-            response_session_wire_saved_ratio: response_session_reuse_diagnostics.wire_saved_ratio,
-            response_session_cooldown_active: Some(
-                response_session_reuse_diagnostics.cooldown_active,
-            ),
-            response_session_rejected_status: response_session_reuse_diagnostics.rejected_status,
-            session_anchor_hash: None,
-            session_anchor_source: None,
-            session_anchor_changed: None,
-            session_anchor_peer_count: None,
-            inbound_body_bytes: None,
-            original_body_bytes: None,
-            send_body_bytes: None,
-            send_body_is_delta: None,
-            payload_too_large_rescue_attempted: None,
-            payload_too_large_rescue_used: None,
-            sse_end_reason: Some(sse_end_reason),
-            downstream_disconnected: Some(downstream_disconnected),
-            downstream_disconnect_stage,
-            sse_completed_event_seen: Some(stream_metadata.completed_event_seen),
-            sse_done_marker_seen: Some(stream_metadata.done_marker_seen),
-            sse_chunks: Some(sse_chunks),
-        };
-        apply_prefix_lag_diagnostics(&mut request_log, prefix_lag);
-        apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
-        apply_body_diagnostics(&mut request_log, &diagnostics);
-        apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
-        if agent_generation {
-            let (attempt_outcome, inbound_outcome, error_scope, terminal_state) =
-                if terminal_verdict.success {
-                    (
-                        AgentAttemptOutcome::HttpSuccess,
-                        AgentInboundOutcome::Success,
-                        None,
-                        if terminal_verdict.trailing_transport_anomaly {
-                            "response_completed_with_trailing_transport_anomaly"
-                        } else {
-                            "response_completed"
-                        },
-                    )
-                } else {
-                    match terminal_verdict.failure {
-                        Some(TerminalFailure::IncompleteEof) => (
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::Incomplete,
-                            Some("upstream_incomplete_eof".to_string()),
-                            "incomplete_eof",
-                        ),
-                        Some(TerminalFailure::ErrorEvent) => (
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::StreamError,
-                            Some("upstream_sse_error".to_string()),
-                            "sse_error",
-                        ),
-                        Some(TerminalFailure::FrameTooLarge) => (
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::StreamError,
-                            Some("upstream_sse_frame_too_large".to_string()),
-                            "sse_frame_too_large",
-                        ),
-                        Some(TerminalFailure::TransportErrorBeforeTerminal) => (
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::TransportError,
-                            Some("upstream_stream_error".to_string()),
-                            "transport_error_before_terminal",
-                        ),
-                        None => (
-                            AgentAttemptOutcome::HttpError,
-                            AgentInboundOutcome::HttpError,
-                            Some("upstream_stream".to_string()),
-                            "stream_failed",
-                        ),
-                    }
-                };
-            finalize_agent_generation(
-                &state_for_stream,
-                &request_id,
-                agent_attempt_id,
-                request_log,
-                attempt_outcome,
-                inbound_outcome,
-                Some(status),
-                error_scope,
-                terminal_state,
-                usage_record.clone(),
-                (!confirmed_compaction)
-                    .then(|| {
-                        response_session_key
-                            .clone()
-                            .or(session_anchor_diagnostics.hash.clone())
-                    })
-                    .flatten(),
-                stream_metric_errors.clone(),
-                shadow_affinity_decision,
-                Some(&upstream_request_diagnostics),
-            )
-            .await;
-        } else {
-            let mut transaction = MetricsTransaction::upstream(request_log);
-            if let Some(usage_record) = usage_record {
-                transaction.observe_usage(
-                    usage_record,
-                    (!confirmed_compaction)
-                        .then(|| {
-                            response_session_key
-                                .as_deref()
-                                .or(session_anchor_diagnostics.hash.as_deref())
-                        })
-                        .flatten(),
-                );
-            }
-            for (scope, message) in stream_metric_errors {
-                transaction.observe_error(scope, message);
-            }
-            state_for_stream.metrics.commit(transaction).await;
-        }
-        if eligible && stream_success_for_cache && !confirmed_compaction {
-            let Some(cache_body) = cache_body else {
-                return;
-            };
-            insert_cache_entries(
-                &state_for_stream,
-                cache_keys,
-                semantic_text,
-                semantic_shape,
-                content_type_for_cache,
-                status,
-                cache_body,
-                &decision,
-                &config,
-            )
-            .await;
-        }
-    };
-
-    let stream_body = async_stream::stream! {
-        while let Some(chunk) = downstream_receiver.recv().await {
-            match chunk {
-                Ok(RelayBodyChunk { bytes, permit }) => {
-                    yield Ok::<Bytes, std::io::Error>(bytes);
-                    drop(permit);
-                }
-                Err(error) => yield Err(error),
-            }
-        }
-    };
-
-    let response = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, response_content_type)
-        .body(Body::from_stream(stream_body))
-        .unwrap_or_else(|_| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to build stream response",
-            )
-        });
-
-    if let Some(handoff) = response_handoff {
-        let _ = handoff.send(response);
-        relay.await;
-        Response::new(Body::empty())
-    } else {
-        relay_reservation
-            .expect("normal stream responses reserve a relay owner before body construction")
-            .spawn(relay);
-        response
-    }
 }
 
 async fn authorize_for_agent(
@@ -12611,7 +12188,7 @@ fn request_agent_log_fields(
 /// promoted `prompt_cache_options` record would silently disappear on the
 /// fallback body and make the cache result depend on the error path.
 fn apply_native_cache_controls(
-    request: &mut Value,
+    request: &mut PreparedResponseBody,
     config: &AppConfig,
     decision: &RouteDecision,
     active_channel: &Channel,
@@ -12627,7 +12204,7 @@ fn apply_native_cache_controls(
         active_channel,
         key_id,
     );
-    cache_capability::apply(request, active_channel, native_cache_plan)
+    cache_capability::apply_prepared(request, active_channel, native_cache_plan)
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
@@ -12691,44 +12268,21 @@ struct CandidatePromptCacheRoutingOutcome {
 }
 
 fn apply_candidate_prompt_cache_routing(
-    request: &mut Value,
+    request: &mut PreparedResponseBody,
     decision: &ShadowAffinityDecision,
 ) -> CandidatePromptCacheRoutingOutcome {
-    let Some(object) = request.as_object_mut() else {
-        return CandidatePromptCacheRoutingOutcome::default();
-    };
     if cache_affinity::provider_native_candidate_applied(decision) {
         return CandidatePromptCacheRoutingOutcome {
             applied: true,
-            changed: object.remove("prompt_cache_key").is_some(),
+            changed: request.remove_root("prompt_cache_key"),
         };
     }
     let Some(cache_key) = cache_affinity::static_cohort_prompt_cache_key(decision) else {
         return CandidatePromptCacheRoutingOutcome::default();
     };
-    let next = Value::String(cache_key);
-    let changed = object.get("prompt_cache_key") != Some(&next);
-    if changed {
-        object.insert("prompt_cache_key".to_string(), next);
-    }
     CandidatePromptCacheRoutingOutcome {
         applied: true,
-        changed,
-    }
-}
-
-fn record_prepared_wire_changed_field(changed_fields: &mut Vec<String>, key: &str) {
-    if !changed_fields.iter().any(|field| field == key) {
-        changed_fields.push(key.to_string());
-    }
-}
-
-fn extend_prepared_wire_changed_fields(
-    changed_fields: &mut Vec<String>,
-    additional_fields: impl IntoIterator<Item = String>,
-) {
-    for field in additional_fields {
-        record_prepared_wire_changed_field(changed_fields, &field);
+        changed: request.set_root("prompt_cache_key", Value::String(cache_key)),
     }
 }
 
@@ -16664,11 +16218,7 @@ fn provider_cache_shortfall_128(record: &UsageRecord) -> u64 {
 }
 
 fn provider_cache_bucket_max_128(input_tokens: u64) -> u64 {
-    if input_tokens < 1024 {
-        0
-    } else {
-        1024 + ((input_tokens - 1024) / 128) * 128
-    }
+    (input_tokens / 128) * 128
 }
 
 fn strip_response_session_volatile_fields(value: &mut Value) {
@@ -16818,7 +16368,23 @@ fn provider_cached_tokens(usage: &Value) -> Option<u64> {
     .max()
 }
 
-fn raw_response(status: u16, content_type: &str, body: Vec<u8>) -> Response {
+fn publish_buffered_response(
+    handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
+    status: u16,
+    content_type: &str,
+    body: Bytes,
+) -> Option<Response> {
+    let response = raw_bytes_response(status, content_type, body);
+    match handoff {
+        Some(handoff) => {
+            let _ = handoff.send(response);
+            None
+        }
+        None => Some(response),
+    }
+}
+
+fn raw_bytes_response(status: u16, content_type: &str, body: Bytes) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -16829,6 +16395,10 @@ fn raw_response(status: u16, content_type: &str, body: Vec<u8>) -> Response {
                 "failed to build response",
             )
         })
+}
+
+fn raw_response(status: u16, content_type: &str, body: Vec<u8>) -> Response {
+    raw_bytes_response(status, content_type, Bytes::from(body))
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response {
@@ -16885,6 +16455,29 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn eligible_final_scope_receipt(digest: &str) -> FinalScopeShadowReceipt {
+        FinalScopeShadowReceipt {
+            version: 4,
+            digest: digest.to_string(),
+            eligible_for_shadow_observation: true,
+            missing_attested_scope: false,
+            missing_final_wire_static_projection: false,
+            missing_lineage_epoch: false,
+            unsupported_evidence_version: false,
+            ambiguous_breakpoint_placement: false,
+        }
+    }
+
+    async fn wait_for_final_scope_outcome(state: &AppState, outcome: &str, target: u64) {
+        tokio::time::timeout(TokioDuration::from_secs(2), async {
+            while state.final_scope_observations.outcome_count(outcome) < target {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for final-scope {outcome} >= {target}"));
     }
 
     fn test_session_reuse_capability(
@@ -17174,6 +16767,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             agent_attempt_id,
             None,
@@ -17372,6 +16966,294 @@ mod tests {
             (WARMUP_REQUESTS + SAMPLES) * 2,
             "each direct control and each proxied inbound request must make exactly one upstream call"
         );
+
+        proxy_task.abort();
+        upstream_task.abort();
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn loopback_stream_and_sync_record_lineage_bound_shadow_without_extra_posts() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(_body): Json<Value>| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    let index = upstream_hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (input_tokens, cached_tokens) = if index % 2 == 1 {
+                        (1_024, 0)
+                    } else {
+                        (1_152, 896)
+                    };
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": format!("private-response-id-sentinel-{index}"),
+                            "model": "gpt-5.6-sol",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "id": format!("msg-shadow-{index}"),
+                                "role": "assistant",
+                                "content": [{
+                                    "type": "output_text",
+                                    "text": "done",
+                                    "annotations": []
+                                }]
+                            }],
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": cached_tokens}
+                            }
+                        }
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(format!("data: {completed}\n\ndata: [DONE]\n\n")))
+                        .unwrap()
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "private-local-key-sentinel".to_string();
+        config.workspace_fingerprint = "private-workspace-sentinel".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        config.cache.exact_enabled = false;
+        config.cache.semantic_enabled = false;
+        config.cache.prewarm_enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "loopback-shadow-provider".to_string();
+        provider.api_key_encrypted = Some("private-provider-key-sentinel".to_string());
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "loopback-shadow-provider");
+        let codex_agent_key = agent_injection::agent_local_key(&config.local_key, "codex");
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-final-scope-loopback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_state = state.clone();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(proxy_state))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let metadata =
+            r#"{"thread_id":"private-thread-sentinel","session_id":"private-session-sentinel"}"#;
+        let first_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": "private-stream-content-sentinel"
+        }]);
+        let mut second_items = first_input.as_array().unwrap().clone();
+        second_items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"done","annotations":[]}]
+        }));
+        second_items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }));
+        for input in [first_input, Value::Array(second_items)] {
+            let response = client
+                .post(format!("http://{proxy_addr}/v1/responses"))
+                .bearer_auth(&codex_agent_key)
+                .header(X_CODEX_TURN_METADATA_HEADER, metadata)
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": true,
+                    "input": input
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.bytes().await.unwrap();
+            assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        }
+        wait_for_final_scope_outcome(&state, "settled", 2).await;
+
+        let sync_metadata = r#"{"thread_id":"private-sync-thread-sentinel","session_id":"private-sync-session-sentinel"}"#;
+        let sync_first_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": "private-sync-content-sentinel"
+        }]);
+        let mut sync_second_items = sync_first_input.as_array().unwrap().clone();
+        sync_second_items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"done","annotations":[]}]
+        }));
+        sync_second_items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "sync continue"
+        }));
+        for (index, input) in [sync_first_input, Value::Array(sync_second_items)]
+            .into_iter()
+            .enumerate()
+        {
+            let response = client
+                .post(format!("http://{proxy_addr}/v1/responses"))
+                .bearer_auth(&codex_agent_key)
+                .header(X_CODEX_TURN_METADATA_HEADER, sync_metadata)
+                .json(&json!({
+                    "model": "gpt-5.6-sol",
+                    "stream": false,
+                    "input": input
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.bytes().await.unwrap();
+            let response_json: Value = serde_json::from_slice(&body).unwrap_or_else(|error| {
+                panic!(
+                    "sync response must be JSON ({error}): {}",
+                    String::from_utf8_lossy(&body)
+                )
+            });
+            assert_eq!(response_json["status"], "completed");
+            assert_eq!(
+                extract_response_text(&response_json).as_deref(),
+                Some("done")
+            );
+            assert_eq!(
+                response_json
+                    .pointer("/usage/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64),
+                Some(if index == 0 { 0 } else { 896 })
+            );
+            wait_for_final_scope_outcome(&state, "settled", (index + 3) as u64).await;
+        }
+
+        let snapshot = state.final_scope_observations.snapshot();
+        assert_eq!(snapshot.recent.len(), 4);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 4);
+        let mut groups = std::collections::HashMap::<String, Vec<&FinalScopeWaterlineLog>>::new();
+        for log in &snapshot.recent {
+            groups
+                .entry(log.scope_digest.clone())
+                .or_default()
+                .push(log);
+        }
+        assert_eq!(groups.len(), 2);
+        let mut epochs = Vec::new();
+        for pair in groups.values_mut() {
+            pair.sort_by_key(|log| log.dispatch_seq);
+            assert_eq!(pair.len(), 2);
+            let first = pair[0];
+            let second = pair[1];
+            assert_eq!(first.outcome, "settled");
+            assert_eq!(first.predecessor_proof, "root");
+            assert!(!first.predecessor_bound);
+            assert_eq!(second.outcome, "settled");
+            assert_eq!(second.predecessor_proof, "exact");
+            assert!(second.predecessor_bound);
+            assert_eq!(second.candidate_avoidable_tokens_128, 128);
+            assert_eq!(second.raw_cache_read_tokens, 896);
+            assert!(first.lineage_epoch.is_some());
+            assert_eq!(first.lineage_epoch, second.lineage_epoch);
+            epochs.push(first.lineage_epoch.unwrap());
+        }
+        epochs.sort_unstable();
+        epochs.dedup();
+        assert_eq!(epochs.len(), 2);
+        let admin_snapshot: Value = client
+            .get(format!("http://{proxy_addr}/admin/final-scope-shadow"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(admin_snapshot["version"], 2);
+        assert_eq!(admin_snapshot["ring_dropped"], 0);
+        assert!(admin_snapshot["recent"].as_array().unwrap().len() >= 4);
+        assert!(admin_snapshot["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["outcome"] == "settled" && item["count"] == 4));
+        for log in admin_snapshot["recent"].as_array().unwrap() {
+            let digest = log["scope_digest"].as_str().unwrap();
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(log["lineage_epoch"].as_u64().is_some());
+            assert!(log["dispatch_seq"].as_u64().is_some_and(|seq| seq > 0));
+        }
+        let admin_json = serde_json::to_string(&admin_snapshot).unwrap();
+        for sentinel in [
+            "private-local-key-sentinel",
+            "private-provider-key-sentinel",
+            "private-workspace-sentinel",
+            "private-thread-sentinel",
+            "private-session-sentinel",
+            "private-sync-thread-sentinel",
+            "private-sync-session-sentinel",
+            "private-stream-content-sentinel",
+            "private-sync-content-sentinel",
+            "private-response-id-sentinel",
+        ] {
+            assert!(
+                !admin_json.contains(sentinel),
+                "admin snapshot leaked {sentinel}"
+            );
+        }
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 4);
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics
+                    .recent_requests
+                    .iter()
+                    .filter(|request| request.final_scope_waterline.is_some())
+                    .count()
+                    >= 4
+                {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("sync and stream RequestLog projections should retain shadow evidence");
+        let shadow_logs = metrics
+            .recent_requests
+            .iter()
+            .filter_map(|request| request.final_scope_waterline.as_ref())
+            .collect::<Vec<_>>();
+        assert!(shadow_logs
+            .iter()
+            .any(|log| log.predecessor_proof == "root"));
+        assert!(shadow_logs
+            .iter()
+            .any(|log| log.predecessor_proof == "exact" && log.predecessor_bound));
 
         proxy_task.abort();
         upstream_task.abort();
@@ -19059,14 +18941,14 @@ mod tests {
             Some(identity.provider_cache_key.as_str())
         );
 
-        let mut native_request = json!({
+        let mut native_request = PreparedResponseBody::responses(json!({
             "model": "gpt-5.6",
             "input": [{
                 "type": "message",
                 "role": "user",
                 "content": [{"type": "input_text", "text": "stable"}]
             }]
-        });
+        }));
         let changed = apply_native_cache_controls(
             &mut native_request,
             &config,
@@ -19075,7 +18957,7 @@ mod tests {
             None,
         );
         assert!(changed.iter().any(|field| field == "prompt_cache_options"));
-        assert!(native_request.get("prompt_cache_options").is_some());
+        assert!(native_request.body().get("prompt_cache_options").is_some());
         assert!(smart_hit_enabled(&config));
         assert!(responses_session_reuse_enabled(&config));
         assert_eq!(
@@ -19085,8 +18967,108 @@ mod tests {
     }
 
     #[test]
-    fn automatic_static_cohort_routing_is_disabled_by_default() {
+    fn automatic_static_cohort_routing_requires_isolated_explicit_opt_in() {
         assert!(!AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED);
+        assert!(!automatic_static_cohort_routing_enabled());
+        assert!(!automatic_static_cohort_routing_enabled_value(false, None));
+        assert!(!automatic_static_cohort_routing_enabled_value(
+            true,
+            Some("disabled")
+        ));
+        assert!(!automatic_static_cohort_routing_enabled_value(
+            false,
+            Some("enabled")
+        ));
+        assert!(automatic_static_cohort_routing_enabled_value(
+            true,
+            Some("enabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lock_busy_skips_affinity_without_delaying_the_inbound_plan() {
+        let shadow_affinity =
+            tokio::sync::Mutex::new(cache_affinity::ShadowAffinityStore::default());
+        let identity = affinity_identity::AffinityIdentity {
+            realm_id: "snapshot-lock-realm".to_string(),
+            cohort_id: "snapshot-lock-cohort".to_string(),
+            stable_prefix_digest: "snapshot-lock-prefix".to_string(),
+            trusted_conversation_id: Some("snapshot-lock-conversation".to_string()),
+            trusted_identity_source: Some("thread-id".to_string()),
+        };
+        let held = shadow_affinity.lock().await;
+
+        let started = Instant::now();
+        let (busy, lock_busy) = try_compute_shadow_affinity_without_wait(
+            &shadow_affinity,
+            &identity,
+            None,
+            std::time::Duration::ZERO,
+            Utc::now(),
+            0,
+            0,
+        );
+
+        assert!(lock_busy);
+        assert!(started.elapsed() < TokioDuration::from_millis(5));
+        assert_eq!(busy.mode, "shadow");
+        assert_eq!(busy.decision, "snapshot_lock_busy");
+        assert_eq!(
+            busy.skip_reason.as_deref(),
+            Some("runtime_snapshot_lock_busy")
+        );
+        assert_eq!(busy.lane, cache_affinity::ShadowCacheLane::Transparent);
+        drop(held);
+
+        let (available, lock_busy) = try_compute_shadow_affinity_without_wait(
+            &shadow_affinity,
+            &identity,
+            None,
+            std::time::Duration::ZERO,
+            Utc::now(),
+            0,
+            0,
+        );
+        assert!(!lock_busy);
+        assert!(available.assignment_key.is_some());
+        assert_eq!(available.skip_reason, None);
+    }
+
+    #[tokio::test]
+    async fn snapshot_lock_busy_skips_prefix_guard_without_delaying_the_inbound_plan() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-prefix-snapshot-lock-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(cache_path(&dir)).unwrap(),
+        )
+        .unwrap();
+        let held = state.prefix_states.lock().await;
+
+        let wait = tokio::time::timeout(
+            TokioDuration::from_millis(5),
+            wait_for_provider_prefix_settle(
+                &state,
+                &Channel::Responses,
+                Some("snapshot-prefix"),
+                None,
+                &TailInputDiagnostics::default(),
+                false,
+                Some(TokioDuration::ZERO),
+            ),
+        )
+        .await
+        .expect("a runtime snapshot lock must not delay a Responses request");
+
+        assert_eq!(
+            wait.skip_reason.as_deref(),
+            Some("runtime_snapshot_lock_busy")
+        );
+        drop(held);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -19718,7 +19700,7 @@ mod tests {
         inbound.insert(
             X_CODEX_TURN_METADATA_HEADER,
             HeaderValue::from_static(
-                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"compaction"}"#,
+                r#"{"session_id":"session-a","thread_id":"thread-a","conversation_id":"conversation-a","request_kind":"compaction"}"#,
             ),
         );
 
@@ -20549,7 +20531,7 @@ mod tests {
             let full_bytes = serialized_body_len(&Channel::Responses, &full_request);
             let prepared = response_session_delta_benefit(
                 &full_request,
-                &delta_request,
+                delta_request,
                 full_bytes,
                 &TailInputDiagnostics::default(),
             )
@@ -20695,6 +20677,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_control_lineage_epoch_isolates_headless_slots_with_equal_generations() {
+        let index = crate::continuation_lineage::ContinuationLineageIndex::default();
+
+        let new_a = index.begin("new-a").await;
+        let new_b = index.begin("new-b").await;
+        assert_eq!(new_a.expected_generation(), new_b.expected_generation());
+        assert_ne!(
+            response_session_lineage_epoch(Some(&new_a)),
+            response_session_lineage_epoch(Some(&new_b))
+        );
+
+        let compact_a = index.begin_compaction("compact-a", None).await.into_lease();
+        let compact_b = index.begin_compaction("compact-b", None).await.into_lease();
+        assert!(compact_a.head().is_none());
+        assert!(compact_b.head().is_none());
+        assert_eq!(
+            compact_a.expected_generation(),
+            compact_b.expected_generation()
+        );
+        assert_ne!(
+            response_session_lineage_epoch(Some(&compact_a)),
+            response_session_lineage_epoch(Some(&compact_b))
+        );
+    }
+
+    #[tokio::test]
     async fn response_session_reuse_allows_safe_streaming_main_delta() {
         let config = AppConfig::default();
         let decision = RouteDecision {
@@ -20754,7 +20762,9 @@ mod tests {
 
         let lease = state.continuation_lineage.begin("session-a").await;
         let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
-        let optimized = outcome.body;
+        let optimized = outcome
+            .delta_body
+            .expect("an exact appended request must build a delta body");
 
         assert_eq!(optimized["previous_response_id"], "resp_old");
         assert_eq!(
@@ -20824,7 +20834,8 @@ mod tests {
         let lease = state.continuation_lineage.begin("current-key").await;
         let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
 
-        assert_eq!(outcome.body, request);
+        assert!(outcome.delta_body.is_none());
+        assert_eq!(request["input"].as_array().unwrap().len(), 2);
         assert_eq!(outcome.diagnostics.candidate_count, 0);
         assert_eq!(outcome.diagnostics.scope_match_count, 0);
         assert_eq!(
@@ -20877,7 +20888,7 @@ mod tests {
             serialized_body_len(&Channel::Responses, &beneficial_original);
         let prepared_delta = response_session_delta_benefit(
             &beneficial_original,
-            &delta,
+            delta.clone(),
             beneficial_original_bytes,
             &TailInputDiagnostics::default(),
         )
@@ -20893,7 +20904,7 @@ mod tests {
         );
         assert_eq!(
             prepared_delta.body_sizes.delta_body_bytes,
-            prepared_delta.wire_draft.len() as u64
+            prepared_delta.body.initial_wire_len().unwrap() as u64
         );
         assert!(
             prepared_delta
@@ -21072,17 +21083,32 @@ mod tests {
             &decision,
             Some(&capability),
             true,
-            &request,
+            request.clone(),
             &TailInputDiagnostics::default(),
             &exact_anchor,
         );
         assert_eq!(evaluation.skip_reason, None);
         assert_eq!(
             evaluation
-                .original_wire_draft
-                .as_ref()
-                .map(|draft| draft.len() as u64),
+                .original_body
+                .initial_wire_len()
+                .map(|len| len as u64),
             Some(serialized_body_len(&Channel::Responses, &request))
+        );
+
+        let mut unknown_field_request = request.clone();
+        unknown_field_request["vendor_extension"] = json!({"requires_full_history": true});
+        assert_eq!(
+            main_response_session_delta_skip_reason(
+                &config,
+                &decision,
+                Some(&capability),
+                true,
+                &unknown_field_request,
+                &TailInputDiagnostics::default(),
+                &exact_anchor,
+            ),
+            Some("unknown_response_request_field")
         );
     }
 
@@ -21259,23 +21285,28 @@ mod tests {
         thread_a_headers.insert(
             X_CODEX_TURN_METADATA_HEADER,
             HeaderValue::from_static(
-                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"turn"}"#,
+                r#"{"session_id":"session-a","thread_id":"thread-a","conversation_id":"conversation-a","request_kind":"turn"}"#,
             ),
         );
         let metadata_a = trusted_codex_request_metadata(&thread_a_headers, true).unwrap();
         assert_eq!(metadata_a.thread_id.as_deref(), Some("thread-a"));
+        assert_eq!(
+            metadata_a.conversation_id.as_deref(),
+            Some("conversation-a")
+        );
         assert!(!metadata_a.compaction_requested);
         assert!(trusted_codex_request_metadata(&thread_a_headers, false).is_none());
 
         let projected_a = identity_request_with_codex_metadata(&original, Some(&metadata_a));
         assert_eq!(original.get("thread_id"), None);
         assert_eq!(projected_a["thread_id"], "thread-a");
+        assert_eq!(projected_a["conversation_id"], "conversation-a");
 
         let mut thread_b_headers = HeaderMap::new();
         thread_b_headers.insert(
             X_CODEX_TURN_METADATA_HEADER,
             HeaderValue::from_static(
-                r#"{"session_id":"session-b","thread_id":"thread-b","request_kind":"turn"}"#,
+                r#"{"session_id":"session-b","thread_id":"thread-b","conversation_id":"conversation-b","request_kind":"turn"}"#,
             ),
         );
         let metadata_b = trusted_codex_request_metadata(&thread_b_headers, true).unwrap();
@@ -21304,7 +21335,7 @@ mod tests {
             Some("codex"),
         )
         .unwrap();
-        assert_eq!(session_a.source, "thread-id");
+        assert_eq!(session_a.source, "direct-composite");
         assert_ne!(session_a.anchor_key, session_b.anchor_key);
         assert_ne!(session_a.provider_cache_key, session_b.provider_cache_key);
 
@@ -21337,7 +21368,7 @@ mod tests {
         compact_headers.insert(
             X_CODEX_TURN_METADATA_HEADER,
             HeaderValue::from_static(
-                r#"{"session_id":"session-a","thread_id":"thread-a","request_kind":"compaction"}"#,
+                r#"{"session_id":"session-a","thread_id":"thread-a","conversation_id":"conversation-a","request_kind":"compaction"}"#,
             ),
         );
         let compact_metadata = trusted_codex_request_metadata(&compact_headers, true).unwrap();
@@ -21371,7 +21402,7 @@ mod tests {
             "model": "gpt-5.5",
             "client_metadata": {
                 "x-codex-turn-metadata":
-                    "{\"session_id\":\"session-body\",\"thread_id\":\"thread-body\",\"request_kind\":\"turn\"}"
+                    "{\"session_id\":\"session-body\",\"thread_id\":\"thread-body\",\"conversation_id\":\"conversation-body\",\"request_kind\":\"turn\"}"
             }
         });
         let metadata =
@@ -21379,11 +21410,17 @@ mod tests {
                 .expect("Codex body metadata should be accepted");
         assert_eq!(metadata.session_id.as_deref(), Some("session-body"));
         assert_eq!(metadata.thread_id.as_deref(), Some("thread-body"));
+        assert_eq!(
+            metadata.conversation_id.as_deref(),
+            Some("conversation-body")
+        );
         let projected = identity_request_with_codex_metadata(&request, Some(&metadata));
         assert_eq!(projected["session_id"], "session-body");
         assert_eq!(projected["thread_id"], "thread-body");
+        assert_eq!(projected["conversation_id"], "conversation-body");
         assert!(request.get("session_id").is_none());
         assert!(request.get("thread_id").is_none());
+        assert!(request.get("conversation_id").is_none());
     }
 
     #[test]
@@ -21392,7 +21429,8 @@ mod tests {
             "client_metadata": {
                 "x-codex-turn-metadata": {
                     "session_id": "session-object",
-                    "thread_id": "thread-object"
+                    "thread_id": "thread-object",
+                    "conversation_id": "conversation-object"
                 }
             }
         });
@@ -21405,6 +21443,131 @@ mod tests {
                 .expect("object-form Codex metadata should be accepted");
         assert_eq!(metadata.session_id.as_deref(), Some("session-object"));
         assert_eq!(metadata.thread_id.as_deref(), Some("thread-object"));
+        assert_eq!(
+            metadata.conversation_id.as_deref(),
+            Some("conversation-object")
+        );
+    }
+
+    #[test]
+    fn adapter_header_identity_must_agree_with_every_forwarded_body_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"session-a","thread_id":"thread-a","conversation_id":"conversation-a","request_kind":"turn"}"#,
+            ),
+        );
+        let matching = json!({
+            "thread_id": "thread-a",
+            "session_id": "session-a",
+            "conversation_id": "conversation-a",
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "session_id": "session-a",
+                    "thread_id": "thread-a",
+                    "conversation_id": "conversation-a",
+                    "request_kind": "turn"
+                }
+            }
+        });
+        let trusted = trusted_codex_request_metadata_for_request(&headers, &matching, true)
+            .expect("matching header and body identities should remain attested");
+        assert_eq!(trusted.source, TrustedCodexMetadataSource::AdapterHeader);
+
+        let mut conflicting_top_level = matching.clone();
+        conflicting_top_level["thread_id"] = json!("thread-b");
+        assert!(
+            trusted_codex_request_metadata_for_request(&headers, &conflicting_top_level, true)
+                .is_none()
+        );
+
+        let mut padded_top_level = matching.clone();
+        padded_top_level["thread_id"] = json!("thread-a\t");
+        assert!(
+            trusted_codex_request_metadata_for_request(&headers, &padded_top_level, true).is_none()
+        );
+
+        let mut unknown_embedded_kind = matching.clone();
+        unknown_embedded_kind["client_metadata"][X_CODEX_TURN_METADATA_HEADER]["request_kind"] =
+            json!("review");
+        assert!(
+            trusted_codex_request_metadata_for_request(&headers, &unknown_embedded_kind, true)
+                .is_none()
+        );
+
+        let mut conflicting_top_level_kind = matching.clone();
+        conflicting_top_level_kind["request_kind"] = json!("compaction");
+        assert!(trusted_codex_request_metadata_for_request(
+            &headers,
+            &conflicting_top_level_kind,
+            true,
+        )
+        .is_none());
+
+        let mut conflicting_embedded = matching;
+        conflicting_embedded["client_metadata"][X_CODEX_TURN_METADATA_HEADER]["session_id"] =
+            json!("session-b");
+        assert!(
+            trusted_codex_request_metadata_for_request(&headers, &conflicting_embedded, true)
+                .is_none()
+        );
+
+        let mut invalid_header = HeaderMap::new();
+        invalid_header.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static("not-json"),
+        );
+        assert!(
+            trusted_codex_request_metadata_for_request(
+                &invalid_header,
+                &json!({
+                    "client_metadata": {
+                        "x-codex-turn-metadata": {
+                            "session_id": "session-a",
+                            "thread_id": "thread-a"
+                        }
+                    }
+                }),
+                true,
+            )
+            .is_none(),
+            "an invalid supplied adapter header must not fall back to a different identity source"
+        );
+    }
+
+    #[test]
+    fn codex_turn_metadata_rejects_any_supplied_invalid_identity_dimension() {
+        for invalid_thread in [
+            Value::String(String::new()),
+            Value::String("x".repeat(513)),
+            Value::String("thread\0other".to_string()),
+            Value::String("thread-with-tab\t".to_string()),
+            Value::Number(7.into()),
+            Value::Null,
+        ] {
+            let metadata = json!({
+                "thread_id": invalid_thread,
+                "session_id": "shared-session",
+                "request_kind": "turn"
+            });
+            assert!(
+                trusted_codex_request_metadata_from_value(
+                    &metadata,
+                    TrustedCodexMetadataSource::AdapterHeader,
+                )
+                .is_none(),
+                "an invalid supplied thread_id must not be dropped from an otherwise valid scope"
+            );
+        }
+
+        for invalid_kind in [json!("review"), json!(7), Value::Null] {
+            assert!(trusted_codex_request_metadata_from_value(
+                &json!({"session_id":"shared-session","request_kind":invalid_kind}),
+                TrustedCodexMetadataSource::AdapterHeader,
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -23412,67 +23575,6 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_serialization_keeps_stable_history_before_dynamic_invocation() {
-        let body = json!({
-            "temperature": 0,
-            "reasoning": { "effort": "low" },
-            "previous_response_id": "resp_dynamic",
-            "stream": true,
-            "store": true,
-            "include": ["reasoning.encrypted_content"],
-            "service_tier": "auto",
-            "truncation": "auto",
-            "input": [{ "type": "message", "role": "user", "content": "fresh" }],
-            "tools": [{ "type": "function", "name": "read_file" }],
-            "prompt_cache_key": "stable-cache-key",
-            "model": "gpt-5.5",
-            "instructions": "stable system",
-            "metadata": { "trace": "dynamic" },
-            "z_vendor_extension": { "escaped": "line\n\"雪\"" }
-        });
-
-        let serialized = serialize_responses_body_for_provider_prefix(&body);
-        let legacy = legacy_serialize_responses_body_for_provider_prefix(&body);
-        let serialized_bytes = serialize_responses_body_bytes_for_provider_prefix(&body);
-        let prepared = PreparedWireRequest::from_value(&Channel::Responses, &body);
-
-        let model_at = serialized.find("\"model\"").unwrap();
-        let cache_key_at = serialized.find("\"prompt_cache_key\"").unwrap();
-        let instructions_at = serialized.find("\"instructions\"").unwrap();
-        let tools_at = serialized.find("\"tools\"").unwrap();
-        let input_at = serialized.find("\"input\"").unwrap();
-        let reasoning_at = serialized.find("\"reasoning\"").unwrap();
-        let temperature_at = serialized.find("\"temperature\"").unwrap();
-        let include_at = serialized.find("\"include\"").unwrap();
-        let stream_at = serialized.find("\"stream\"").unwrap();
-        let store_at = serialized.find("\"store\"").unwrap();
-        let service_tier_at = serialized.find("\"service_tier\"").unwrap();
-        let truncation_at = serialized.find("\"truncation\"").unwrap();
-        let previous_response_at = serialized.find("\"previous_response_id\"").unwrap();
-        let metadata_at = serialized.find("\"metadata\"").unwrap();
-
-        assert!(model_at < cache_key_at);
-        assert!(cache_key_at < instructions_at);
-        assert!(instructions_at < tools_at);
-        assert!(tools_at < input_at);
-        assert!(input_at < reasoning_at);
-        assert!(reasoning_at < temperature_at);
-        assert!(temperature_at < include_at);
-        assert!(include_at < stream_at);
-        assert!(stream_at < store_at);
-        assert!(store_at < service_tier_at);
-        assert!(service_tier_at < truncation_at);
-        assert!(truncation_at < previous_response_at);
-        assert!(previous_response_at < metadata_at);
-        assert!(serde_json::from_str::<Value>(&serialized).is_ok());
-        assert_eq!(serialized, legacy);
-        assert_eq!(serialized_bytes.as_slice(), legacy.as_bytes());
-        assert_eq!(prepared.body().as_ref(), serialized.as_bytes());
-        assert_eq!(prepared.len(), serialized.len());
-        assert!(prepared.is_stream());
-    }
-
-    #[test]
     fn request_plan_freezes_transport_channel_and_wire_for_one_shot_dispatch() {
         let mut provider = test_responses_provider("https://example.test/v1".to_string());
         provider.use_system_proxy = true;
@@ -23492,7 +23594,8 @@ mod tests {
             "https://example.test/v1/responses",
             Channel::Responses,
             &body,
-        );
+        )
+        .with_explicit_proxy_url(Some("http://127.0.0.1:7897".to_string()));
         let cached_gzip = plan.wire().cache_gzip_body(Bytes::from(
             gzip_request_body(plan.wire().body()).expect("test wire should gzip"),
         ));
@@ -23505,10 +23608,26 @@ mod tests {
         assert_eq!(plan.url(), "https://example.test/v1/responses");
         assert!(matches!(plan.channel(), Channel::Responses));
         assert!(plan.use_system_proxy());
+        assert_eq!(plan.explicit_proxy_url(), Some("http://127.0.0.1:7897"));
         assert_eq!(plan.custom_user_agent(), Some("Atoapi/test"));
         assert!(plan.request_body_gzip_enabled());
         assert_eq!(plan.wire().body().as_ref(), expected.as_bytes());
         assert_eq!(cached_gzip.as_ptr(), retained_gzip.as_ptr());
+    }
+
+    #[test]
+    fn direct_request_plan_does_not_enter_the_explicit_proxy_pool() {
+        let provider = test_responses_provider("https://example.test/v1".to_string());
+        let plan = RequestPlan::new(
+            &provider,
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            &json!({"model": "gpt-test", "input": "ping"}),
+        )
+        .with_explicit_proxy_url(Some("http://127.0.0.1:7897".to_string()));
+
+        assert!(!plan.use_system_proxy());
+        assert_eq!(plan.explicit_proxy_url(), None);
     }
 
     #[test]
@@ -23531,10 +23650,9 @@ mod tests {
             "z_vendor_extension": { "stable": true }
         });
         reset_draft_member_encodings();
-        let draft = PreparedWireDraft::from_responses_value(&initial)
-            .expect("Responses object should create a draft");
+        let mut prepared_body = PreparedResponseBody::responses(initial.clone());
         assert_eq!(
-            draft.len(),
+            prepared_body.initial_wire_len().unwrap(),
             serialize_responses_body_bytes_for_provider_prefix(&initial).len()
         );
 
@@ -23552,13 +23670,14 @@ mod tests {
             json!({"mode": "implicit", "ttl": "30m"}),
         );
         object.insert("stream".to_string(), Value::Bool(true));
-        let changed_fields = vec![
-            "prompt_cache_key".to_string(),
-            "prompt_cache_retention".to_string(),
-            "prompt_cache_options".to_string(),
-            "stream".to_string(),
-        ];
-        let prepared = draft.freeze(&final_body, &changed_fields);
+        prepared_body.set_root("prompt_cache_key", Value::String("cache-after".to_string()));
+        prepared_body.remove_root("prompt_cache_retention");
+        prepared_body.set_root(
+            "prompt_cache_options",
+            json!({"mode": "implicit", "ttl": "30m"}),
+        );
+        prepared_body.set_root("stream", Value::Bool(true));
+        let (_, prepared) = prepared_body.into_prepared_wire(&Channel::Responses);
         let expected = serialize_responses_body_bytes_for_provider_prefix(&final_body);
         assert_eq!(prepared.body().as_ref(), expected.as_slice());
         assert_eq!(draft_member_encoding_count("input"), 1);
@@ -23591,9 +23710,9 @@ mod tests {
             "input": [{"role": "user", "content": "stable"}],
             "stream": true
         });
-        let draft = PreparedWireDraft::from_responses_value(&body).unwrap();
-        let first_ptr = draft.body_ptr();
-        let prepared = draft.freeze(&body, &[]);
+        let prepared_body = PreparedResponseBody::responses(body.clone());
+        let first_ptr = prepared_body.initial_wire_ptr().unwrap();
+        let (_, prepared) = prepared_body.into_prepared_wire(&Channel::Responses);
 
         assert_eq!(prepared.body().as_ptr(), first_ptr);
         assert_eq!(
@@ -23617,11 +23736,18 @@ mod tests {
             "stream": true
         });
         reset_draft_member_encodings();
-        let draft = PreparedWireDraft::from_responses_value(&initial).unwrap();
         let mut final_body = initial.clone();
         final_body["input"][0]["content"][0]["prompt_cache_breakpoint"] =
             json!({"mode": "explicit"});
-        let prepared = draft.freeze(&final_body, &["input".to_string()]);
+        let mut prepared_body = PreparedResponseBody::responses(initial);
+        prepared_body.mutate_root_if(
+            "input",
+            |input| {
+                input[0]["content"][0]["prompt_cache_breakpoint"] = json!({"mode": "explicit"});
+            },
+            |_| true,
+        );
+        let (_, prepared) = prepared_body.into_prepared_wire(&Channel::Responses);
 
         assert_eq!(
             prepared.body().as_ref(),
@@ -23665,9 +23791,10 @@ mod tests {
                     "content": "summarize for the next turn"
                 }));
 
-            let baseline_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &baseline);
+            let baseline_wire =
+                current_reference_upstream_request_body_bytes(&Channel::Responses, &baseline);
             let compaction_wire =
-                legacy_upstream_request_body_bytes(&Channel::Responses, &compaction);
+                current_reference_upstream_request_body_bytes(&Channel::Responses, &compaction);
             let shared_bytes = baseline_wire
                 .iter()
                 .zip(&compaction_wire)
@@ -23904,8 +24031,10 @@ mod tests {
                 Value::String(candidate_key.clone()),
             );
 
-        let baseline_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &baseline);
-        let candidate_wire = legacy_upstream_request_body_bytes(&Channel::Responses, &candidate);
+        let baseline_wire =
+            current_reference_upstream_request_body_bytes(&Channel::Responses, &baseline);
+        let candidate_wire =
+            current_reference_upstream_request_body_bytes(&Channel::Responses, &candidate);
         assert_ne!(baseline_wire, candidate_wire);
         assert!(String::from_utf8_lossy(&candidate_wire).contains(&candidate_key));
 
@@ -23938,11 +24067,12 @@ mod tests {
         assert_eq!(baseline_headers, candidate_headers);
 
         decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::CohortTwoShard;
-        let mut two_shard = baseline.clone();
+        let mut two_shard = PreparedResponseBody::responses(baseline.clone());
         let two_shard_outcome = apply_candidate_prompt_cache_routing(&mut two_shard, &decision);
         assert!(two_shard_outcome.applied);
         assert!(two_shard_outcome.changed);
         let two_shard_key = two_shard
+            .body()
             .get("prompt_cache_key")
             .and_then(Value::as_str)
             .expect("two-shard candidate must have a cache key");
@@ -23952,24 +24082,67 @@ mod tests {
         assert!(!repeated_two_shard.changed);
         assert_eq!(
             without_key(&baseline_wire),
-            without_key(&legacy_upstream_request_body_bytes(
+            without_key(&current_reference_upstream_request_body_bytes(
                 &Channel::Responses,
-                &two_shard,
+                two_shard.body(),
             ))
         );
 
         decision.candidate_variant = cache_affinity::ShadowCacheCandidateVariant::ProviderNative;
-        let mut provider_native = baseline.clone();
+        let mut provider_native = PreparedResponseBody::responses(baseline.clone());
         let provider_native_outcome =
             apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
         assert!(provider_native_outcome.applied);
         assert!(provider_native_outcome.changed);
-        assert!(provider_native.get("prompt_cache_key").is_none());
+        assert!(provider_native.body().get("prompt_cache_key").is_none());
         let repeated_provider_native =
             apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
         assert!(repeated_provider_native.applied);
         assert!(!repeated_provider_native.changed);
-        assert_eq!(without_key(&baseline_wire), provider_native);
+        assert_eq!(without_key(&baseline_wire), *provider_native.body());
+    }
+
+    #[test]
+    fn shadow_candidate_never_changes_the_frozen_wire_body() {
+        let decision = cache_affinity::ShadowAffinityDecision {
+            mode: "shadow".to_string(),
+            assignment_key: Some("conversation-shadow".to_string()),
+            realm_id: "realm-shadow".to_string(),
+            cohort_id: "cohort-candidate".to_string(),
+            lane: cache_affinity::ShadowCacheLane::Steady,
+            candidate_variant: cache_affinity::ShadowCacheCandidateVariant::CohortKey,
+            arm: cache_affinity::ShadowAffinityArm::Candidate,
+            shard: 0,
+            policy_epoch: cache_affinity::SHADOW_POLICY_EPOCH,
+            anchor_epoch: 0,
+            trusted_identity: true,
+            decision: "assigned".to_string(),
+            skip_reason: None,
+            policy_compute_ms: 0,
+            validation_run_id: None,
+            automatic_canary_status: None,
+            automatic_canary_reason: None,
+        };
+        let baseline = json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "existing-provider-key",
+            "instructions": "stable system",
+            "tools": [{ "type": "function", "name": "read_file" }],
+            "input": [{ "type": "message", "role": "user", "content": "fresh" }],
+            "stream": true
+        });
+        let baseline_wire =
+            current_reference_upstream_request_body_bytes(&Channel::Responses, &baseline);
+        let mut shadow = PreparedResponseBody::responses(baseline);
+
+        let outcome = apply_candidate_prompt_cache_routing(&mut shadow, &decision);
+
+        assert!(!outcome.applied);
+        assert!(!outcome.changed);
+        assert_eq!(
+            current_reference_upstream_request_body_bytes(&Channel::Responses, shadow.body()),
+            baseline_wire
+        );
     }
 
     #[test]
@@ -24018,7 +24191,7 @@ mod tests {
             "stream": true,
             "input": [{ "type": "message", "role": "user", "content": content }]
         });
-        let wire = legacy_upstream_request_body_bytes(&Channel::Responses, &body);
+        let wire = current_reference_upstream_request_body_bytes(&Channel::Responses, &body);
         let fast = gzip_request_body(&wire).expect("selected gzip should succeed");
         let mut default_encoder = GzEncoder::new(Vec::new(), Compression::default());
         default_encoder.write_all(&wire).unwrap();
@@ -24105,7 +24278,7 @@ mod tests {
     }
 
     #[test]
-    fn response_session_delta_usage_counts_as_effective_full_bucket() {
+    fn response_session_delta_effective_usage_stays_distinct_from_raw_telemetry() {
         let raw_delta = UsageRecord {
             input_tokens: 13_396,
             cache_read_tokens: 5_632,
@@ -24114,10 +24287,227 @@ mod tests {
 
         let effective = provider_usage_effective_for_prefix_metrics(&raw_delta, true);
 
+        assert_eq!(raw_delta.input_tokens, 13_396);
+        assert_eq!(raw_delta.cache_read_tokens, 5_632);
+        assert_eq!(provider_cache_shortfall(&raw_delta), 7_680);
         assert_eq!(effective.input_tokens, 13_396);
         assert_eq!(effective.cache_read_tokens, 13_312);
         assert_eq!(provider_cache_shortfall(&effective), 0);
         assert_eq!(provider_cache_diagnostic(&effective), "provider-warm-full");
+        assert_ne!(
+            raw_delta.cache_read_tokens, effective.cache_read_tokens,
+            "session-delta equivalence is synthetic prefix state, not provider telemetry"
+        );
+
+        let mut ledger = final_scope_waterline::FinalScopeWaterlineLedger::default();
+        let ticket = ledger
+            .try_begin("raw-delta-scope", true, false)
+            .expect("eligible shadow scope should issue a ticket");
+        let outcome =
+            ledger.settle_with_outcome(&ticket, WaterlineSettlement::successful(&raw_delta));
+        assert_eq!(outcome.status, "observe_only");
+        assert!(outcome.waterlines.is_none());
+        let shadow_log = final_scope_waterline_log(&ticket, &outcome);
+        assert_eq!(shadow_log.scope_digest, "raw-delta-scope");
+        assert_eq!(shadow_log.entry_generation, ticket.entry_generation);
+        assert_eq!(shadow_log.raw_input_tokens, 13_396);
+        assert_eq!(shadow_log.raw_cache_read_tokens, 5_632);
+        assert_eq!(shadow_log.observed_cache_read_tokens, 0);
+        assert!(ledger.snapshot("raw-delta-scope").is_none());
+        assert_ne!(
+            shadow_log.raw_cache_read_tokens, effective.cache_read_tokens,
+            "the final-scope observation must never consume synthetic effective usage"
+        );
+    }
+
+    #[test]
+    fn ignored_final_scope_log_keeps_prior_control_state_current_ticket_and_root_epoch() {
+        let mut ledger = final_scope_waterline::FinalScopeWaterlineLedger::default();
+        let first_head = WaterlineControlHead::derive(17, 1, "resp-first").unwrap();
+        let first = ledger
+            .try_begin_with_proof("scope-a", true, true, PredecessorProofReceipt::root(17, 1))
+            .unwrap();
+        let first_usage = UsageRecord {
+            input_tokens: 4_096,
+            cache_read_tokens: 3_968,
+            ..UsageRecord::default()
+        };
+        let first_outcome = ledger.settle_with_outcome(
+            &first,
+            WaterlineSettlement {
+                upstream_succeeded: true,
+                compaction: false,
+                raw_usage: Some(&first_usage),
+                committed_head: Some(first_head.clone()),
+            },
+        );
+        let first_log = final_scope_waterline_log(&first, &first_outcome);
+        assert_eq!(first_log.version, 3);
+        assert_eq!(first_log.lineage_epoch, Some(17));
+
+        let second = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                PredecessorProofReceipt::new(PredecessorProofStatus::Exact, Some(first_head), 1, 2),
+            )
+            .unwrap();
+        let failed_outcome = ledger.settle_with_outcome(
+            &second,
+            WaterlineSettlement {
+                upstream_succeeded: false,
+                compaction: false,
+                raw_usage: None,
+                committed_head: None,
+            },
+        );
+        let failed_log = final_scope_waterline_log(&second, &failed_outcome);
+        assert_eq!(failed_log.outcome, "failed");
+        assert_eq!(failed_log.dispatch_seq, second.dispatch_seq);
+        assert_eq!(failed_log.lineage_epoch, Some(17));
+        assert_eq!(failed_log.observed_cache_read_tokens, 3_968);
+        assert_eq!(failed_log.sent_prefix_bucket_tokens_128, 4_096);
+        assert_eq!(failed_log.settled_prefix_bucket_tokens_128, 3_968);
+    }
+
+    #[tokio::test]
+    async fn final_scope_dispatch_guard_finishes_or_drops_each_ticket_once() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-scope-guard-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = Arc::new(
+            AppState::for_test(AppConfig::default(), dir.join("config.toml"), cache).unwrap(),
+        );
+
+        let settled_ticket = begin_final_scope_waterline(
+            &state,
+            Some(&eligible_final_scope_receipt("settled-scope")),
+            true,
+            PredecessorProofReceipt::root(23, 1),
+        )
+        .unwrap();
+        let usage = UsageRecord {
+            input_tokens: 4_096,
+            cache_read_tokens: 3_968,
+            ..UsageRecord::default()
+        };
+        let settled_log = FinalScopeDispatchGuard::new(state.clone(), settled_ticket)
+            .finish(
+                Some(&usage),
+                true,
+                false,
+                WaterlineControlHead::derive(23, 1, "resp-settled"),
+            )
+            .unwrap();
+        assert_eq!(settled_log.outcome, "settled");
+        assert_eq!(state.final_scope_observations.outcome_count("settled"), 1);
+        assert_eq!(state.final_scope_observations.outcome_count("failed"), 0);
+
+        let dropped_ticket = begin_final_scope_waterline(
+            &state,
+            Some(&eligible_final_scope_receipt("dropped-scope")),
+            true,
+            PredecessorProofReceipt::root(24, 1),
+        )
+        .unwrap();
+        drop(FinalScopeDispatchGuard::new(state.clone(), dropped_ticket));
+        assert_eq!(state.final_scope_observations.outcome_count("settled"), 1);
+        assert_eq!(state.final_scope_observations.outcome_count("failed"), 1);
+        let snapshot = state.final_scope_observations.snapshot();
+        assert_eq!(snapshot.recent.len(), 2);
+        assert_eq!(
+            snapshot
+                .recent
+                .iter()
+                .filter(|log| log.outcome == "settled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .recent
+                .iter()
+                .filter(|log| log.outcome == "failed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn final_scope_begin_and_settle_lock_contention_fail_open_truthfully() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-scope-locks-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = Arc::new(
+            AppState::for_test(AppConfig::default(), dir.join("config.toml"), cache).unwrap(),
+        );
+        let receipt = eligible_final_scope_receipt("lock-scope");
+
+        let ledger_guard = state.final_scope_waterlines.lock().unwrap();
+        assert!(begin_final_scope_waterline(
+            &state,
+            Some(&receipt),
+            true,
+            PredecessorProofReceipt::root(31, 1),
+        )
+        .is_none());
+        drop(ledger_guard);
+        assert_eq!(
+            state
+                .final_scope_observations
+                .outcome_count("begin_lock_busy"),
+            1
+        );
+
+        let first_head = WaterlineControlHead::derive(31, 1, "resp-first").unwrap();
+        let first = begin_final_scope_waterline(
+            &state,
+            Some(&receipt),
+            true,
+            PredecessorProofReceipt::root(31, 1),
+        )
+        .unwrap();
+        let usage = UsageRecord {
+            input_tokens: 4_096,
+            cache_read_tokens: 3_968,
+            ..UsageRecord::default()
+        };
+        let first_outcome = settle_final_scope_waterline(
+            &state,
+            &first,
+            Some(&usage),
+            true,
+            false,
+            Some(first_head.clone()),
+        );
+        assert_eq!(first_outcome.status, "settled");
+
+        let second = begin_final_scope_waterline(
+            &state,
+            Some(&receipt),
+            true,
+            PredecessorProofReceipt::new(PredecessorProofStatus::Exact, Some(first_head), 1, 2),
+        )
+        .unwrap();
+        let ledger_guard = state.final_scope_waterlines.lock().unwrap();
+        let lock_busy = settle_final_scope_waterline(&state, &second, None, false, false, None);
+        drop(ledger_guard);
+        assert_eq!(lock_busy.status, "settle_lock_busy");
+        let lock_busy_log = final_scope_waterline_log(&second, &lock_busy);
+        assert_eq!(lock_busy_log.dispatch_seq, second.dispatch_seq);
+        assert_eq!(lock_busy_log.observed_cache_read_tokens, 3_968);
+        assert_eq!(lock_busy_log.sent_prefix_bucket_tokens_128, 4_096);
+        assert_eq!(
+            state
+                .final_scope_observations
+                .outcome_count("settle_lock_busy"),
+            1
+        );
     }
 
     #[tokio::test]
@@ -24856,6 +25246,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             None,
@@ -25079,6 +25470,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             Some(shadow_decision),
@@ -25255,6 +25647,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             None,
@@ -25386,6 +25779,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             None,
@@ -25640,6 +26034,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             None,
@@ -27560,6 +27955,7 @@ mod tests {
             PrefixGuardWaitDiagnostics::default(),
             0,
             UpstreamRequestDiagnostics::default(),
+            None,
             0,
             None,
             None,
@@ -29008,6 +29404,105 @@ mod tests {
 
         assert!(!diagnostics.delta_from_session);
         assert_eq!(diagnostics.input_items, 3);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn final_scope_predecessor_proof_is_exact_and_fail_closed_for_field_drift() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-scope-predecessor-proof-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let previous_input = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": "anchor",
+                "x_unknown": {"phase": null, "error": {"code": "E1"}}
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_exact",
+                "output": {"stdout": "ok", "stderr": "", "exit_code": 0}
+            }
+        ]);
+        state
+            .continuation_lineage
+            .seed_for_test(
+                "proof-anchor",
+                ResponseSessionState {
+                    generation: 4,
+                    parent_generation: Some(3),
+                    response_id: "resp-proof".to_string(),
+                    input: previous_input.clone(),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let lease = state.continuation_lineage.begin("proof-anchor").await;
+        let mut exact_items = previous_input.as_array().unwrap().clone();
+        exact_items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue"
+        }));
+        let exact_input = Value::Array(exact_items.clone());
+
+        let exact =
+            analyze_tail_input_for_session(&Channel::Responses, Some(&lease), Some(&exact_input));
+        assert_eq!(exact.predecessor.status, PredecessorProofStatus::Exact);
+        assert!(exact.predecessor.is_exact());
+        assert_eq!(exact.predecessor.predecessor_input_items, 2);
+        assert_eq!(exact.predecessor.current_input_items, 3);
+
+        let mut unknown_changed = exact_items.clone();
+        unknown_changed[0]["x_unknown"]["error"]["code"] = json!("E2");
+        let unknown_changed = Value::Array(unknown_changed);
+        assert_eq!(
+            analyze_tail_input_for_session(
+                &Channel::Responses,
+                Some(&lease),
+                Some(&unknown_changed),
+            )
+            .predecessor
+            .status,
+            PredecessorProofStatus::PrefixMismatch
+        );
+
+        let mut call_id_changed = exact_items;
+        call_id_changed[1]["call_id"] = json!("call_other");
+        let call_id_changed = Value::Array(call_id_changed);
+        assert_eq!(
+            analyze_tail_input_for_session(
+                &Channel::Responses,
+                Some(&lease),
+                Some(&call_id_changed),
+            )
+            .predecessor
+            .status,
+            PredecessorProofStatus::PrefixMismatch
+        );
+        assert_eq!(
+            analyze_tail_input_for_session(
+                &Channel::Responses,
+                Some(&lease),
+                Some(&previous_input),
+            )
+            .predecessor
+            .status,
+            PredecessorProofStatus::NotExtended
+        );
+        assert_eq!(
+            analyze_tail_input_for_session(&Channel::Responses, Some(&lease), None)
+                .predecessor
+                .status,
+            PredecessorProofStatus::MissingCurrentInput
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -34089,6 +34584,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_agent_non_stream_handoffs_before_lineage_and_metrics_settlement() {
+        let upstream_seen = Arc::new(tokio::sync::Notify::new());
+        let upstream_release = Arc::new(tokio::sync::Notify::new());
+        let upstream_seen_for_route = upstream_seen.clone();
+        let upstream_release_for_route = upstream_release.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_seen = upstream_seen_for_route.clone();
+                let upstream_release = upstream_release_for_route.clone();
+                async move {
+                    upstream_seen.notify_one();
+                    upstream_release.notified().await;
+                    Json(json!({
+                        "id": "resp_sync_early_handoff",
+                        "model": "gpt-5.5",
+                        "usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 2,
+                            "input_tokens_details": {"cached_tokens": 16}
+                        },
+                        "output": [{
+                            "id": "msg_sync_early_handoff",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "ready"}]
+                        }]
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-sync-handoff".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "sync-handoff-provider".to_string();
+        config.providers = vec![provider];
+        config.agent_injections = vec![AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: Some("sync-handoff-provider".to_string()),
+            model_id: None,
+            target_path: None,
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-sync-early-handoff-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"sync-handoff","thread_id":"sync-handoff","request_kind":"turn"}"#,
+            ),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            }))
+            .unwrap(),
+        );
+
+        let request_task = tokio::spawn(handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        ));
+        tokio::time::timeout(TokioDuration::from_secs(1), upstream_seen.notified())
+            .await
+            .expect("request must reach upstream");
+        let lineage_guard = state.continuation_lineage.hold_mutations_for_test().await;
+        upstream_release.notify_waiters();
+
+        let response = tokio::time::timeout(TokioDuration::from_secs(1), request_task)
+            .await
+            .expect("client response must not wait for lineage settlement")
+            .expect("request task must not panic");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("ready"));
+        assert_eq!(
+            state.metrics.snapshot().await.recent_upstream_calls.len(),
+            0
+        );
+        assert!(
+            !state
+                .relay_tasks
+                .wait_for_idle(TokioDuration::from_millis(20))
+                .await
+        );
+
+        drop(lineage_guard);
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(TokioDuration::from_secs(1))
+                .await
+        );
+        assert_eq!(
+            state.metrics.snapshot().await.recent_upstream_calls.len(),
+            1
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn agent_finalization_persists_real_post_burst_observation_fields() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-post-burst-finalize-{}",
@@ -35046,6 +35679,12 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer local-test-key"),
         );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"verified-session","thread_id":"verified-session","request_kind":"turn"}"#,
+            ),
+        );
         let stable_prefix = "stable prior context ".repeat(8_000);
         let first = Bytes::from(
             serde_json::to_vec(&json!({
@@ -35214,7 +35853,7 @@ mod tests {
                 diagnostic_ms.push(started.elapsed().as_micros());
 
                 let started = Instant::now();
-                black_box(legacy_serialize_responses_body_for_provider_prefix(&body));
+                black_box(current_reference_serialize_responses_body_for_provider_prefix(&body));
                 legacy_serialization_ms.push(started.elapsed().as_micros());
 
                 let started = Instant::now();
@@ -35225,7 +35864,8 @@ mod tests {
                 black_box(PreparedWireRequest::from_value(&Channel::Responses, &body));
                 prepared_ms.push(started.elapsed().as_micros());
 
-                let wire = legacy_upstream_request_body_bytes(&Channel::Responses, &body);
+                let wire =
+                    current_reference_upstream_request_body_bytes(&Channel::Responses, &body);
                 let started = Instant::now();
                 let mut diagnostics = body_diagnostics_with_known_inbound_length(
                     &Channel::Responses,
@@ -35277,7 +35917,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "manual PreparedWireDraft accepted-delta encoding baseline"]
+    #[ignore = "manual prepared Responses body accepted-delta encoding baseline"]
     fn prepared_wire_draft_large_delta_baseline() {
         use std::hint::black_box;
 
@@ -35298,7 +35938,6 @@ mod tests {
             });
             let mut final_body = body.clone();
             final_body["prompt_cache_key"] = json!("cache-after");
-            let changed_fields = vec!["prompt_cache_key".to_string()];
             let mut legacy_us = Vec::new();
             let mut draft_us = Vec::new();
 
@@ -35312,8 +35951,9 @@ mod tests {
                 legacy_us.push(started.elapsed().as_micros());
 
                 let started = Instant::now();
-                let draft = PreparedWireDraft::from_responses_value(&body).unwrap();
-                black_box(draft.freeze(&final_body, &changed_fields));
+                let mut prepared_body = PreparedResponseBody::responses(body.clone());
+                prepared_body.set_root("prompt_cache_key", json!("cache-after"));
+                black_box(prepared_body.into_prepared_wire(&Channel::Responses));
                 draft_us.push(started.elapsed().as_micros());
             }
             legacy_us.sort_unstable();
@@ -35428,6 +36068,65 @@ mod tests {
         assert!(!outcome.diagnostics.gzip_fallback_used);
         assert!(outcome.diagnostics.sent_body_bytes < outcome.diagnostics.request_body_bytes);
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn one_shot_dispatch_uses_explicit_proxy_once_and_labels_the_path() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-explicit-proxy-dispatch-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_proxy = hits.clone();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new().fallback(post(move || {
+            let hits = hits_for_proxy.clone();
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "id": "resp_explicit_proxy",
+                        "output": [],
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    })),
+                )
+            }
+        }));
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let mut provider =
+            test_responses_provider("http://atoapi-explicit-upstream.invalid/v1".to_string());
+        provider.use_system_proxy = true;
+        let plan = RequestPlan::new(
+            &provider,
+            "http://atoapi-explicit-upstream.invalid/v1/responses",
+            Channel::Responses,
+            &json!({"model": "gpt-test", "input": "ping", "stream": false}),
+        )
+        .with_explicit_proxy_url(Some(format!("http://{proxy_addr}")));
+        let outcome = send_main_upstream_request(
+            &state,
+            "upstream-key",
+            plan.into_one_shot(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.response.status(), StatusCode::OK);
+        assert_eq!(outcome.diagnostics.network_path, "explicit-proxy");
+        assert_eq!(outcome.diagnostics.attempts, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        proxy_task.abort();
+        let _ = proxy_task.await;
         fs::remove_dir_all(dir).ok();
     }
 
@@ -36468,20 +37167,28 @@ mod tests {
             model: "gpt-5.5".to_string(),
         };
         let config_snapshot = state.config.read().await.clone();
-        let continuation_scope = ContinuationScope::derive(
-            &config_snapshot,
-            &decision,
-            &json!({
-                "thread_id": "compact-thread",
-                "session_id": "compact-session"
-            }),
-            Some("codex"),
-            &SelectedProviderKey {
-                secret: "upstream-key".to_string(),
-                key_id: None,
-            },
-        )
-        .expect("trusted compact metadata should derive the same lineage key");
+        let compact_metadata = trusted_codex_request_metadata(&headers, true).unwrap();
+        let selected_key = SelectedProviderKey {
+            secret: "upstream-key".to_string(),
+            key_id: None,
+        };
+        let continuation_scope = ContinuationScope::from_action_scope(
+            &CompositeActionScope::derive(ActionScopeInput {
+                workspace_fingerprint: &config_snapshot.workspace_fingerprint,
+                agent_id: Some("codex"),
+                provider_id: &decision.provider.id,
+                endpoint: &upstream_url(&decision.provider.base_url, &Channel::Responses),
+                resolved_model: &decision.model,
+                channel: &Channel::Responses,
+                key_realm_id: &affinity_identity::key_realm_id(&selected_key),
+                thread_id: compact_metadata.thread_id.as_deref(),
+                conversation_id: compact_metadata.conversation_id.as_deref(),
+                session_id: compact_metadata.session_id.as_deref(),
+                adapter_attested: compact_metadata.source.action_scope_attested(),
+                identity_source: compact_metadata.source.label(),
+            })
+            .expect("attested compact metadata should derive the lineage key"),
+        );
         state
             .continuation_lineage
             .seed_for_test(
@@ -36546,8 +37253,8 @@ mod tests {
             .await;
         let reuse = maybe_reuse_response_session(&next_request, Some(&lease), &decision, true);
 
-        assert!(reuse.body.get("previous_response_id").is_none());
-        assert_eq!(reuse.body["input"], next_input);
+        assert!(reuse.delta_body.is_none());
+        assert_eq!(next_request["input"], next_input);
         assert_eq!(
             reuse.diagnostics.skip_reason.as_deref(),
             Some("no_candidate")

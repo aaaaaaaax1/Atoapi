@@ -6,6 +6,12 @@ pub(crate) struct SseFrame {
     pub data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SseDecodeEvent {
+    Frame(SseFrame),
+    FrameOverflow,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SseFrameDecoder {
     current_line: Vec<u8>,
@@ -49,7 +55,17 @@ impl SseFrameDecoder {
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        let mut frames = Vec::new();
+        self.push_ordered(chunk)
+            .into_iter()
+            .filter_map(|event| match event {
+                SseDecodeEvent::Frame(frame) => Some(frame),
+                SseDecodeEvent::FrameOverflow => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn push_ordered(&mut self, chunk: &[u8]) -> Vec<SseDecodeEvent> {
+        let mut events = Vec::new();
         for &byte in chunk {
             if self.pending_cr {
                 self.pending_cr = false;
@@ -60,14 +76,14 @@ impl SseFrameDecoder {
 
             match byte {
                 b'\r' => {
-                    self.finish_line(&mut frames);
+                    self.finish_line(&mut events);
                     self.pending_cr = true;
                 }
-                b'\n' => self.finish_line(&mut frames),
-                _ => self.push_line_byte(byte),
+                b'\n' => self.finish_line(&mut events),
+                _ => self.push_line_byte(byte, &mut events),
             }
         }
-        frames
+        events
     }
 
     pub(crate) fn finish(&mut self) -> Vec<SseFrame> {
@@ -84,20 +100,20 @@ impl SseFrameDecoder {
         self.overflowed
     }
 
-    fn push_line_byte(&mut self, byte: u8) {
+    fn push_line_byte(&mut self, byte: u8, events: &mut Vec<SseDecodeEvent>) {
         self.line_had_bytes = true;
         if self.discarding_oversized_frame {
             return;
         }
         if self.frame_bytes.saturating_add(1) > self.max_frame_bytes {
-            self.mark_frame_overflow();
+            self.mark_frame_overflow(events);
             return;
         }
         self.frame_bytes += 1;
         self.current_line.push(byte);
     }
 
-    fn finish_line(&mut self, frames: &mut Vec<SseFrame>) {
+    fn finish_line(&mut self, events: &mut Vec<SseDecodeEvent>) {
         let line_had_bytes = self.line_had_bytes;
         self.line_had_bytes = false;
 
@@ -112,10 +128,10 @@ impl SseFrameDecoder {
 
         if !line_had_bytes {
             if self.has_data {
-                frames.push(SseFrame {
+                events.push(SseDecodeEvent::Frame(SseFrame {
                     event: self.event.take(),
                     data: std::mem::take(&mut self.data),
-                });
+                }));
             }
             self.reset_frame();
             self.first_line = false;
@@ -123,7 +139,7 @@ impl SseFrameDecoder {
         }
 
         if self.frame_bytes.saturating_add(1) > self.max_frame_bytes {
-            self.mark_frame_overflow();
+            self.mark_frame_overflow(events);
             self.current_line.clear();
             self.first_line = false;
             return;
@@ -155,9 +171,10 @@ impl SseFrameDecoder {
         self.current_line.clear();
     }
 
-    fn mark_frame_overflow(&mut self) {
+    fn mark_frame_overflow(&mut self, events: &mut Vec<SseDecodeEvent>) {
         self.overflowed = true;
         self.discarding_oversized_frame = true;
+        events.push(SseDecodeEvent::FrameOverflow);
         self.current_line.clear();
         self.event = None;
         self.data.clear();
@@ -177,7 +194,7 @@ impl SseFrameDecoder {
 
 #[cfg(test)]
 mod tests {
-    use super::{SseFrame, SseFrameDecoder};
+    use super::{SseDecodeEvent, SseFrame, SseFrameDecoder};
 
     #[test]
     fn frame_decoder_combines_data_lines_and_preserves_event_name() {
@@ -303,5 +320,23 @@ mod tests {
         assert!(decoder.overflowed());
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].data, "ok");
+    }
+
+    #[test]
+    fn ordered_decode_events_preserve_frame_and_overflow_order() {
+        let mut frame_then_overflow = SseFrameDecoder::with_max_frame_bytes(16);
+        let events =
+            frame_then_overflow.push_ordered(b"data: ok\n\ndata: this frame is much too large\n\n");
+        assert!(matches!(events.first(), Some(SseDecodeEvent::Frame(_))));
+        assert!(matches!(events.get(1), Some(SseDecodeEvent::FrameOverflow)));
+
+        let mut overflow_then_frame = SseFrameDecoder::with_max_frame_bytes(16);
+        let events =
+            overflow_then_frame.push_ordered(b"data: this frame is much too large\n\ndata: ok\n\n");
+        assert!(matches!(
+            events.first(),
+            Some(SseDecodeEvent::FrameOverflow)
+        ));
+        assert!(matches!(events.get(1), Some(SseDecodeEvent::Frame(_))));
     }
 }

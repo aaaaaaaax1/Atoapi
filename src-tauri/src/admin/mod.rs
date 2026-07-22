@@ -14,10 +14,11 @@ use crate::{
     },
     codex_ui_patch,
     config::{
-        AgentInjectionConfig, AppConfig, CacheConfig, Channel, ModelConfig, ProviderInput,
-        ProviderResponseSessionReuseProbeResult, PublicConfig,
+        normalize_upstream_proxy_url, AgentInjectionConfig, AppConfig, CacheConfig, Channel,
+        ModelConfig, ProviderInput, ProviderResponseSessionReuseProbeResult, PublicConfig,
     },
     metrics::MetricsSnapshot,
+    metrics_history::{MetricsTrendQueryInput, MetricsTrendSnapshot},
     proxy::{
         self,
         cache_validation::{
@@ -49,6 +50,8 @@ pub struct GeneralConfigInput {
     pub port: u16,
     #[serde(default)]
     pub proxy_auto_start: Option<bool>,
+    #[serde(default)]
+    pub upstream_proxy_url: Option<String>,
     pub local_key: String,
     pub default_channel: Channel,
     pub workspace_fingerprint: String,
@@ -162,6 +165,10 @@ pub async fn save_config(
         config.port = input.port;
         if let Some(proxy_auto_start) = input.proxy_auto_start {
             config.proxy_auto_start = proxy_auto_start;
+        }
+        if let Some(upstream_proxy_url) = input.upstream_proxy_url {
+            config.upstream_proxy_url =
+                normalize_upstream_proxy_url(Some(upstream_proxy_url)).map_err(to_command_error)?;
         }
         config.local_key = input.local_key;
         config.default_channel = input.default_channel;
@@ -909,8 +916,12 @@ pub async fn fetch_provider_models(
         }
     }
 
+    let client = state
+        .control_plane_upstream_client(input.use_system_proxy)
+        .await
+        .map_err(to_command_error)?;
     let models = fetch_models_from_upstream_with_options(
-        state.upstream_client(input.use_system_proxy),
+        &client,
         &base_url,
         input.channel,
         upstream_secret.as_deref(),
@@ -935,7 +946,7 @@ async fn diagnose_provider_network_paths_inner(
 
     // Select from a config snapshot so this manual diagnostic never rotates a
     // pool, updates key counters, or otherwise changes the saved provider.
-    let (provider, api_key) = {
+    let (provider, api_key, explicit_proxy_url) = {
         let config = state.config.read().await;
         let provider = config
             .providers
@@ -951,8 +962,21 @@ async fn diagnose_provider_network_paths_inner(
         if selected_key.secret.trim().is_empty() {
             return Err(anyhow!("provider API key is not configured"));
         }
-        (provider, selected_key.secret)
+        (
+            provider,
+            selected_key.secret,
+            config.upstream_proxy_url.clone(),
+        )
     };
+
+    let explicit_proxy_client = explicit_proxy_url
+        .as_deref()
+        .map(|proxy_url| {
+            state
+                .transport_clients
+                .explicit_proxy_client(proxy_url, false)
+        })
+        .transpose()?;
 
     let candidates = model_endpoint_candidates(
         &provider.base_url,
@@ -967,7 +991,7 @@ async fn diagnose_provider_network_paths_inner(
         // Each candidate is compared over the same endpoint and credentials.
         // Only a valid model list can select it; a status-only 200 is not
         // enough to hide a compatibility fallback.
-        let (direct, system_proxy) = tokio::join!(
+        let (direct, system_proxy, explicit_proxy) = tokio::join!(
             diagnose_model_endpoint(
                 "direct",
                 state.upstream_client(false),
@@ -983,10 +1007,33 @@ async fn diagnose_provider_network_paths_inner(
                 &provider.channel,
                 &api_key,
                 custom_user_agent,
-            )
+            ),
+            async {
+                match explicit_proxy_client.as_ref() {
+                    Some(client) => Some(
+                        diagnose_model_endpoint(
+                            "explicit-proxy",
+                            client,
+                            &target_url,
+                            &provider.channel,
+                            &api_key,
+                            custom_user_agent,
+                        )
+                        .await,
+                    ),
+                    None => None,
+                }
+            }
         );
-        let has_valid_model_list = direct.has_valid_model_list || system_proxy.has_valid_model_list;
-        let paths = vec![direct.result, system_proxy.result];
+        let has_valid_model_list = direct.has_valid_model_list
+            || system_proxy.has_valid_model_list
+            || explicit_proxy
+                .as_ref()
+                .is_some_and(|attempt| attempt.has_valid_model_list);
+        let mut paths = vec![direct.result, system_proxy.result];
+        if let Some(explicit_proxy) = explicit_proxy {
+            paths.push(explicit_proxy.result);
+        }
         if has_valid_model_list {
             return Ok(ProviderNetworkPathDiagnosticResult {
                 provider_id: provider_id.to_string(),
@@ -1148,8 +1195,11 @@ async fn test_provider_key_inner(
             models_count: 0,
         });
     };
+    let client = state
+        .control_plane_upstream_client(input.use_system_proxy)
+        .await?;
     let models = fetch_models_from_upstream_with_options(
-        state.upstream_client(input.use_system_proxy),
+        &client,
         &input.base_url,
         input.channel.clone(),
         Some(upstream_secret.as_str()),
@@ -1315,6 +1365,16 @@ pub async fn get_proxy_status(state: State<'_, Arc<AppState>>) -> CommandResult<
 #[tauri::command]
 pub async fn get_metrics(state: State<'_, Arc<AppState>>) -> CommandResult<MetricsSnapshot> {
     Ok(state.metrics.snapshot().await)
+}
+
+/// Reads the independently persisted, time-bucketed cache trend. This is kept
+/// out of `get_metrics` because the live snapshot is refreshed much more often.
+#[tauri::command]
+pub async fn get_metrics_trend(
+    state: State<'_, Arc<AppState>>,
+    input: MetricsTrendQueryInput,
+) -> CommandResult<MetricsTrendSnapshot> {
+    state.metrics.trend(input).map_err(to_command_error)
 }
 
 #[tauri::command]

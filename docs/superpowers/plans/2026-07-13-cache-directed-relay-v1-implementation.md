@@ -32,9 +32,9 @@
 
 Stage 0 is complete when:
 
-- every default Agent inbound produces one actual upstream POST;
-- the existing reasoning-compatibility exception produces at most two labeled
-  attempts within one inbound;
+- every Agent inbound that reaches dispatch produces one actual upstream POST;
+- a proven reasoning rejection preserves the current upstream error and updates
+  only the affected model's next independent request;
 - inbound and upstream-attempt counters are truthful and independent;
 - an Agent request canceled before response headers remains owned and reaches
   one final outcome;
@@ -103,17 +103,17 @@ Steps:
    `record_upstream_call` for non-Agent and compact paths.
 5. Ensure provider `total_requests` counts inbound outcomes while provider
    `upstream_requests` counts actual attempts.
-6. Keep one successful request-row projection per inbound; intermediate
-   reasoning errors remain attempt/error evidence, not extra history rows.
+6. Keep one successful request-row projection per inbound; reasoning errors
+   remain error evidence, not extra history rows or extra attempts.
 
 Tests first:
 
 - one inbound / one success attempt;
 - one inbound / one transport failure;
-- one inbound / two reasoning attempts / success;
-- one inbound / two attempts / final failure;
+- one inbound / explicit reasoning rejection / one failed attempt;
+- the next independent inbound uses the persisted lower compatible effort;
 - duplicate finish is a no-op with a diagnostic;
-- provider total is one while upstream is two;
+- provider total and upstream attempts are both one;
 - maximum and multi-attempt counters are correct.
 
 Verify:
@@ -135,23 +135,19 @@ Interface:
 ```rust
 enum AttemptPolicy {
     Single,
-    ReasoningCompatibility,
 }
 
 enum AttemptReason {
     Primary,
-    ReasoningExplicit,
-    ReasoningOpaque502,
 }
 ```
 
 Steps:
 
 1. Make `AttemptToken` non-cloneable.
-2. Permit one primary token for both policies.
-3. Permit a second token only after classified reasoning evidence.
-4. Reject generic retries, early second-token requests, and every third token.
-5. Give every token a stable inbound ID, unique attempt ID, index, budget, and
+2. Permit exactly one primary token.
+3. Reject every later token request regardless of error classification.
+4. Give the token a stable inbound ID, unique attempt ID, index, budget, and
    reason.
 
 Verify:
@@ -180,14 +176,25 @@ Steps:
 5. Do not include retry loops, gzip fallback, key failover, or protocol
    fallback in this adapter.
 6. Preserve direct/system-proxy pooling and existing wire headers.
+7. Add an optional global explicit HTTP proxy URL for Mihomo-style local
+   listeners; use it only for providers with `use_system_proxy` enabled.
+8. Pool explicit-proxy clients by URL and redirect policy. The unset path must
+   keep using the existing prebuilt references without locking the dynamic
+   pool.
 
 Tests first:
 
 - direct and system-proxy clients stay distinct and reusable;
 - 307/308 responses are returned and not followed;
 - network failure records one attempt;
+- a low-level protocol disconnect opens only one Agent connection and is not
+  retried by reqwest internally;
 - gzip rejection does not resend uncompressed;
 - one token cannot be sent twice.
+- repeated explicit-proxy requests reuse one pooled client;
+- the Agent explicit-proxy client still refuses redirects and sends once;
+- a direct request ignores the optional explicit URL without touching its
+  pool.
 
 Verify:
 
@@ -292,22 +299,23 @@ Files:
 
 Steps:
 
-1. Keep the first non-2xx response private until existing reasoning evidence is
-   classified.
-2. Request the one optional second token only for explicit or strict opaque
+1. Read a non-2xx response only as needed to classify existing reasoning
    evidence.
-3. Label attempts `primary`, `reasoning_explicit`, or
-   `reasoning_opaque_502`.
-4. Never recurse. A second explicit rejection updates only the next request's
-   configured effort.
-5. Finalize one inbound outcome after the authorized budget ends.
+2. Return that original response without requesting another attempt token.
+3. An explicit rejection updates only the exact model's next-request effort and
+   UI state.
+4. An opaque or generic 5xx never authorizes another POST; downgrade only when
+   the strict classifier proves a reasoning-parameter rejection.
+5. Finalize one inbound outcome and one attempt.
 
 Tests first:
 
-- explicit rejection succeeds one level lower with one inbound/two attempts;
-- second rejection persists the next lower level without a third attempt;
-- strict opaque 502 probe succeeds one level lower;
-- ordinary Cloudflare/generic 502 never receives a second attempt;
+- explicit rejection returns unchanged and persists one lower level for the
+  next independent request;
+- repeated explicit rejections step down once per independent request;
+- strict opaque 502 evidence may persist a lower next-request level but never
+  retries the current inbound;
+- ordinary Cloudflare/generic 502 neither retries nor lowers reasoning;
 - model/UI configuration changes only for the affected model.
 
 Verify:
@@ -471,8 +479,8 @@ git diff --check
 
 Then inspect a live metrics snapshot and confirm:
 
-- default Agent inbound-to-attempt ratio is `1:1`;
-- any `2:1` row has only a reasoning-compatibility label;
+- every Agent inbound-to-attempt ratio is `1:1`;
+- no new Agent row has a multi-attempt label;
 - foreground cache wait remains zero;
 - shadow-on and shadow-off wire hashes match;
 - successful history contains one row per successful inbound;

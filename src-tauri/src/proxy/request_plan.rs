@@ -9,6 +9,7 @@ pub(super) struct RequestPlan {
     url: String,
     channel: Channel,
     use_system_proxy: bool,
+    explicit_proxy_url: Option<String>,
     custom_user_agent: Option<String>,
     request_body_gzip_enabled: bool,
     wire: PreparedWireRequest,
@@ -42,6 +43,7 @@ impl RequestPlan {
             url: url.into(),
             channel: wire.channel().clone(),
             use_system_proxy: provider.use_system_proxy,
+            explicit_proxy_url: None,
             custom_user_agent: provider.custom_user_agent.clone(),
             request_body_gzip_enabled: provider.request_body_gzip_enabled,
             wire,
@@ -50,6 +52,11 @@ impl RequestPlan {
 
     pub(super) fn with_gzip_enabled(mut self, enabled: bool) -> Self {
         self.request_body_gzip_enabled = enabled;
+        self
+    }
+
+    pub(super) fn with_explicit_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.explicit_proxy_url = self.use_system_proxy.then_some(proxy_url).flatten();
         self
     }
 
@@ -69,6 +76,10 @@ impl RequestPlan {
 
     pub(super) fn use_system_proxy(&self) -> bool {
         self.use_system_proxy
+    }
+
+    pub(super) fn explicit_proxy_url(&self) -> Option<&str> {
+        self.explicit_proxy_url.as_deref()
     }
 
     pub(super) fn custom_user_agent(&self) -> Option<&str> {
@@ -99,6 +110,10 @@ impl OneShotRequestPlan {
 
     pub(super) fn use_system_proxy(&self) -> bool {
         self.plan.use_system_proxy()
+    }
+
+    pub(super) fn explicit_proxy_url(&self) -> Option<&str> {
+        self.plan.explicit_proxy_url()
     }
 
     pub(super) fn custom_user_agent(&self) -> Option<&str> {

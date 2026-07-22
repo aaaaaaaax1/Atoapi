@@ -21,6 +21,7 @@ pub(crate) struct ResponsesWebSocketProbeTarget {
     pub responses_url: String,
     pub api_key: String,
     pub use_system_proxy: bool,
+    pub explicit_proxy_url: Option<String>,
     pub custom_user_agent: Option<String>,
 }
 
@@ -90,18 +91,21 @@ pub(crate) async fn probe_responses_websocket(
             )
         }
     };
-    let client =
-        match websocket_client(target.use_system_proxy, target.custom_user_agent.as_deref()) {
-            Ok(client) => client,
-            Err(err) => {
-                return finish(
-                    result,
-                    started,
-                    ResponsesWebSocketProbeStatus::Error,
-                    format!("failed to create WebSocket client: {err}"),
-                )
-            }
-        };
+    let client = match websocket_client(
+        target.use_system_proxy,
+        target.explicit_proxy_url.as_deref(),
+        target.custom_user_agent.as_deref(),
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            return finish(
+                result,
+                started,
+                ResponsesWebSocketProbeStatus::Error,
+                format!("failed to create WebSocket client: {err}"),
+            )
+        }
+    };
 
     result.connection_attempts = 1;
     let handshake = client
@@ -239,6 +243,7 @@ pub(crate) async fn probe_responses_websocket(
 
 fn websocket_client(
     use_system_proxy: bool,
+    explicit_proxy_url: Option<&str>,
     custom_user_agent: Option<&str>,
 ) -> reqwest::Result<reqwest::Client> {
     let user_agent = custom_user_agent
@@ -252,7 +257,9 @@ fn websocket_client(
         .connect_timeout(Duration::from_secs(20))
         .tcp_keepalive(Duration::from_secs(30))
         .tcp_nodelay(true);
-    if !use_system_proxy {
+    if let Some(proxy_url) = explicit_proxy_url.filter(|_| use_system_proxy) {
+        builder = builder.no_proxy().proxy(reqwest::Proxy::all(proxy_url)?);
+    } else if !use_system_proxy {
         builder = builder.no_proxy();
     }
     builder.build()
@@ -631,6 +638,7 @@ mod tests {
             responses_url,
             api_key: "test-secret".to_string(),
             use_system_proxy: false,
+            explicit_proxy_url: None,
             custom_user_agent: None,
         }
     }

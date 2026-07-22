@@ -2,11 +2,15 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{BTreeSet, HashMap},
+    fs::{self, OpenOptions},
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::{Duration as StdDuration, Instant},
 };
 use tokio::{
@@ -23,9 +27,13 @@ use crate::{
     },
     continuation_lineage::ContinuationLineageIndex,
     metrics::MetricsStore,
+    metrics_history::metrics_history_path,
     persistence::{WriteBehindCoordinator, WriteOperation},
     proxy::{
-        self, cache_affinity::ShadowAffinityStore, cache_validation::CacheValidationController,
+        self,
+        cache_affinity::ShadowAffinityStore,
+        cache_validation::CacheValidationController,
+        final_scope_waterline::{FinalScopeObservationRegistry, FinalScopeWaterlineLedger},
         DispatchDrainOutcome, DispatchTracker, TransportClients,
     },
 };
@@ -65,8 +73,15 @@ pub struct AppState {
     pub cache: CacheStore,
     pub metrics: MetricsStore,
     pub transport_clients: TransportClients,
-    pub prefix_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub prefix_locks: Mutex<PrefixLockRegistry>,
     pub prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
+    prefix_state_maintenance_operations: AtomicU64,
+    prefix_state_maintenance_running: Arc<AtomicBool>,
+    /// Observe-only, final-wire-scoped cache evidence. It is deliberately
+    /// process-memory-only and is always accessed with `try_lock` by the
+    /// request path so it can never delay upstream dispatch.
+    pub final_scope_waterlines: StdMutex<FinalScopeWaterlineLedger>,
+    pub final_scope_observations: FinalScopeObservationRegistry,
     pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -85,6 +100,110 @@ pub struct AppState {
     proxy_mode_server: Mutex<Option<ProxyServer>>,
     config_persistence: ConfigWriteCoordinator,
     runtime_state_journal: RuntimeStateJournal,
+}
+
+/// Prefix coordination is a latency optimization, never a correctness or
+/// dispatch requirement. Keep its registry bounded so a long stream of unique
+/// prompts cannot turn the short map lock into an unbounded memory and lookup
+/// cost. Active locks are never evicted; when every slot is active, callers
+/// receive an ephemeral lock and proceed without cross-prefix coordination.
+const PREFIX_LOCK_REGISTRY_LIMIT: usize = 2_048;
+const PREFIX_LOCK_EVICTION_SCAN_BUDGET: usize = 32;
+
+#[derive(Debug)]
+pub struct PrefixLockRegistry {
+    entries: HashMap<Arc<str>, PrefixLockEntry>,
+    age_index: BTreeSet<(Instant, Arc<str>)>,
+}
+
+#[derive(Debug)]
+struct PrefixLockEntry {
+    lock: Arc<Mutex<()>>,
+    last_used: Instant,
+}
+
+impl Default for PrefixLockRegistry {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            age_index: BTreeSet::new(),
+        }
+    }
+}
+
+impl PrefixLockRegistry {
+    /// Returns the shared lock for a recent prefix. If every registry slot is
+    /// currently in use, return an untracked lock instead of retaining more
+    /// request-specific state. Losing coordination in that exceptional case is
+    /// safe because callers may never require it to send upstream.
+    pub fn acquire(&mut self, key: &str) -> Arc<Mutex<()>> {
+        let now = Instant::now();
+        if let Some((entry_key, previous_last_used)) = self
+            .entries
+            .get_key_value(key)
+            .map(|(entry_key, entry)| (entry_key.clone(), entry.last_used))
+        {
+            self.age_index
+                .remove(&(previous_last_used, entry_key.clone()));
+            let lock = {
+                let entry = self
+                    .entries
+                    .get_mut(entry_key.as_ref())
+                    .expect("existing prefix-lock entry must remain present");
+                entry.last_used = now;
+                entry.lock.clone()
+            };
+            self.age_index.insert((now, entry_key));
+            return lock;
+        }
+
+        self.evict_idle_entries_for_new_key();
+        if self.entries.len() >= PREFIX_LOCK_REGISTRY_LIMIT {
+            return Arc::new(Mutex::new(()));
+        }
+
+        let lock = Arc::new(Mutex::new(()));
+        let entry_key: Arc<str> = Arc::from(key);
+        self.entries.insert(
+            entry_key.clone(),
+            PrefixLockEntry {
+                lock: lock.clone(),
+                last_used: now,
+            },
+        );
+        self.age_index.insert((now, entry_key));
+        lock
+    }
+
+    fn evict_idle_entries_for_new_key(&mut self) {
+        while self.entries.len() >= PREFIX_LOCK_REGISTRY_LIMIT {
+            let candidate = self
+                .age_index
+                .iter()
+                .take(PREFIX_LOCK_EVICTION_SCAN_BUDGET)
+                .find_map(|(last_used, key)| {
+                    self.entries
+                        .get(key.as_ref())
+                        .is_some_and(|entry| Arc::strong_count(&entry.lock) == 1)
+                        .then(|| (*last_used, key.clone()))
+                });
+            let Some((last_used, key)) = candidate else {
+                break;
+            };
+            self.age_index.remove(&(last_used, key.clone()));
+            self.entries.remove(key.as_ref());
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -271,8 +390,18 @@ impl ConfigWriteCoordinator {
 
 #[derive(Debug, Clone)]
 struct RuntimeStateJournal {
+    state: Arc<StdMutex<RuntimeStateJournalState>>,
     writer: WriteBehindCoordinator,
 }
+
+#[derive(Debug)]
+struct RuntimeStateJournalState {
+    accepting: bool,
+    close_version: Option<u64>,
+}
+
+const RUNTIME_STATE_WRITE_ATTEMPTS: usize = 3;
+const RUNTIME_STATE_RETRY_DELAY_MS: u64 = 10;
 
 impl RuntimeStateJournal {
     fn new(
@@ -282,8 +411,7 @@ impl RuntimeStateJournal {
         shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
         metrics: MetricsStore,
     ) -> Self {
-        let writer = WriteBehindCoordinator::new("runtime_state_save", move |operation| {
-            debug_assert_eq!(operation, WriteOperation::Snapshot);
+        Self::new_with_job(metrics, move || {
             let snapshot = capture_runtime_state(
                 &prefix_states,
                 &response_session_error_cooldowns,
@@ -295,22 +423,94 @@ impl RuntimeStateJournal {
                 &snapshot.response_session_error_cooldowns,
                 &snapshot.shadow_affinity,
             )
+        })
+    }
+
+    fn new_with_job(
+        metrics: MetricsStore,
+        write_job: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        let writer = WriteBehindCoordinator::new("runtime_state_save", move |operation| {
+            debug_assert_eq!(operation, WriteOperation::Snapshot);
+            let mut result = write_job();
+            for attempt in 1..RUNTIME_STATE_WRITE_ATTEMPTS {
+                if result.is_ok() {
+                    return Ok(());
+                }
+                std::thread::sleep(StdDuration::from_millis(
+                    RUNTIME_STATE_RETRY_DELAY_MS * attempt as u64,
+                ));
+                result = write_job();
+            }
+            result.with_context(|| {
+                format!(
+                    "runtime-state persistence failed after {RUNTIME_STATE_WRITE_ATTEMPTS} attempts"
+                )
+            })
         });
         writer.attach_error_reporter(metrics);
-        Self { writer }
+        Self {
+            state: Arc::new(StdMutex::new(RuntimeStateJournalState {
+                accepting: true,
+                close_version: None,
+            })),
+            writer,
+        }
     }
 
-    fn mark_dirty(&self) {
+    fn mark_dirty(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("runtime-state journal gate must not be poisoned");
+        if !state.accepting {
+            return false;
+        }
         self.writer.mark_dirty(WriteOperation::Snapshot);
+        true
     }
 
+    #[cfg(test)]
     async fn flush(&self) -> Result<()> {
-        self.writer.write_now(WriteOperation::Snapshot).await
+        let version = {
+            let state = self
+                .state
+                .lock()
+                .expect("runtime-state journal gate must not be poisoned");
+            if !state.accepting {
+                return Err(anyhow::anyhow!("runtime-state journal is closed"));
+            }
+            self.writer.mark_dirty(WriteOperation::Snapshot)
+        };
+        self.writer.wait_for(version).await
+    }
+
+    async fn close_and_flush(&self) -> Result<()> {
+        let version = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("runtime-state journal gate must not be poisoned");
+            if let Some(version) = state.close_version {
+                version
+            } else {
+                // Close the publication gate before publishing the final
+                // internal snapshot. Any mark_dirty call after this point is
+                // rejected under the same lock and cannot escape the barrier.
+                state.accepting = false;
+                let version = self.writer.mark_dirty(WriteOperation::Snapshot);
+                state.close_version = Some(version);
+                version
+            }
+        };
+        self.writer.wait_for(version).await
     }
 }
 
 const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
+const PREFIX_RUNTIME_STATE_LIMIT: usize = 8_192;
+const PREFIX_RUNTIME_STATE_MAINTENANCE_INTERVAL: u64 = 128;
 
 impl AppState {
     pub fn load() -> Result<Self> {
@@ -326,12 +526,16 @@ impl AppState {
             config.proxy_mode_port = port.saturating_add(1);
         }
         let cache = CacheStore::load(cache_path(&config_dir))?;
-        let metrics = MetricsStore::new();
+        let metrics = MetricsStore::with_history_path(metrics_history_path(&config_dir));
         cache.attach_error_reporter(metrics.clone());
         let config_persistence = ConfigWriteCoordinator::new(config_path.clone(), metrics.clone());
         let runtime_state_path = runtime_state_path(&config_dir);
         let mut runtime_state = load_runtime_state(&runtime_state_path)?;
         migrate_prefix_states_for_config(&mut runtime_state.prefix_states, &config);
+        trim_prefix_runtime_states(&mut runtime_state.prefix_states);
+        crate::proxy::cache_affinity::prepare_shadow_affinity_store(
+            &mut runtime_state.shadow_affinity,
+        );
         let prefix_states = Arc::new(Mutex::new(runtime_state.prefix_states));
         let response_session_error_cooldowns =
             Arc::new(Mutex::new(runtime_state.response_session_error_cooldowns));
@@ -351,8 +555,12 @@ impl AppState {
             cache,
             metrics,
             transport_clients: TransportClients::new(crate::ATOAPI_USER_AGENT)?,
-            prefix_locks: Mutex::new(HashMap::new()),
+            prefix_locks: Mutex::new(PrefixLockRegistry::default()),
             prefix_states,
+            prefix_state_maintenance_operations: AtomicU64::new(0),
+            prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
+            final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
+            final_scope_observations: FinalScopeObservationRegistry::default(),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
@@ -398,8 +606,12 @@ impl AppState {
             cache,
             metrics,
             transport_clients: TransportClients::new("AtoapiTest/0.1")?,
-            prefix_locks: Mutex::new(HashMap::new()),
+            prefix_locks: Mutex::new(PrefixLockRegistry::default()),
             prefix_states,
+            prefix_state_maintenance_operations: AtomicU64::new(0),
+            prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
+            final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
+            final_scope_observations: FinalScopeObservationRegistry::default(),
             prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
@@ -430,6 +642,24 @@ impl AppState {
 
     pub fn upstream_client(&self, use_system_proxy: bool) -> &reqwest::Client {
         self.transport_clients.client(use_system_proxy)
+    }
+
+    pub async fn control_plane_upstream_client(
+        &self,
+        use_system_proxy: bool,
+    ) -> Result<reqwest::Client> {
+        let explicit_proxy_url = self
+            .config
+            .read()
+            .await
+            .upstream_proxy_url_for(use_system_proxy)
+            .map(str::to_owned);
+        match explicit_proxy_url {
+            Some(proxy_url) => self
+                .transport_clients
+                .explicit_proxy_client(&proxy_url, false),
+            None => Ok(self.transport_clients.client(use_system_proxy).clone()),
+        }
     }
 
     pub async fn reload_config(&self) -> Result<PublicConfig> {
@@ -602,14 +832,16 @@ impl AppState {
         // Relay draining fences request-owned runtime mutations. Cache/config
         // also close their own publication gates so concurrent admin commands
         // cannot publish after the final flush target is captured.
-        let (runtime_state, cache, config) = tokio::join!(
-            self.persist_runtime_state(),
+        let (runtime_state, cache, config, metrics_history) = tokio::join!(
+            self.runtime_state_journal.close_and_flush(),
             self.cache.close_and_flush(),
-            self.config_persistence.close_and_flush()
+            self.config_persistence.close_and_flush(),
+            self.metrics.flush_history()
         );
         runtime_state?;
         cache?;
-        config
+        config?;
+        metrics_history
     }
 
     pub async fn proxy_status(&self) -> ProxyStatus {
@@ -663,12 +895,41 @@ impl AppState {
         self.config_persistence.flush().await
     }
 
+    #[cfg(test)]
     pub async fn persist_runtime_state(&self) -> Result<()> {
         self.runtime_state_journal.flush().await
     }
 
     pub fn journal_runtime_state(&self) {
         self.runtime_state_journal.mark_dirty();
+    }
+
+    /// Prefix state is a cache-quality hint, not request truth. Maintenance is
+    /// therefore detached from settlement and bounded; it must never hold up
+    /// an ingress send or grow indefinitely under a stream of novel prompts.
+    pub fn schedule_prefix_state_maintenance(&self) {
+        let operation = self
+            .prefix_state_maintenance_operations
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if operation % PREFIX_RUNTIME_STATE_MAINTENANCE_INTERVAL != 0
+            || self
+                .prefix_state_maintenance_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+
+        let prefix_states = self.prefix_states.clone();
+        let running = self.prefix_state_maintenance_running.clone();
+        tokio::spawn(async move {
+            {
+                let mut states = prefix_states.lock().await;
+                trim_prefix_runtime_states(&mut states);
+            }
+            running.store(false, Ordering::Release);
+        });
     }
 }
 
@@ -677,14 +938,82 @@ pub fn runtime_state_path(config_dir: &Path) -> PathBuf {
 }
 
 fn load_runtime_state(path: &Path) -> Result<RuntimeStateMaps> {
-    if !path.exists() {
+    if path.exists() {
+        match read_runtime_state_file(path) {
+            Ok((runtime, _)) => return Ok(runtime),
+            Err(err) => {
+                eprintln!(
+                    "runtime-state recovery: ignoring damaged {}: {err:#}",
+                    path.display()
+                );
+                quarantine_runtime_state_file(path);
+            }
+        }
+    }
+
+    let backup_path = runtime_state_backup_path(path);
+    if !backup_path.exists() {
         return Ok(RuntimeStateMaps::default());
     }
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let persisted: PersistedRuntimeState = serde_json::from_str(&raw)
+    match read_runtime_state_file(&backup_path) {
+        Ok((runtime, raw)) => {
+            if let Err(err) = write_synced_replacement(path, &raw) {
+                eprintln!(
+                    "runtime-state recovery: loaded {}, but could not restore {}: {err:#}",
+                    backup_path.display(),
+                    path.display()
+                );
+            }
+            Ok(runtime)
+        }
+        Err(err) => {
+            eprintln!(
+                "runtime-state recovery: ignoring damaged backup {}: {err:#}",
+                backup_path.display()
+            );
+            quarantine_runtime_state_file(&backup_path);
+            Ok(RuntimeStateMaps::default())
+        }
+    }
+}
+
+fn read_runtime_state_file(path: &Path) -> Result<(RuntimeStateMaps, Vec<u8>)> {
+    let raw = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let persisted: PersistedRuntimeState = serde_json::from_slice(&raw)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(persisted.into_runtime())
+    Ok((persisted.into_runtime(), raw))
+}
+
+fn runtime_state_backup_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+fn runtime_state_temp_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    path.with_file_name(name)
+}
+
+fn quarantine_runtime_state_file(path: &Path) {
+    if !path.exists() {
+        return;
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".corrupt-{}", uuid::Uuid::new_v4().simple()));
+    let quarantine_path = path.with_file_name(name);
+    if let Err(err) = fs::rename(path, &quarantine_path) {
+        eprintln!(
+            "runtime-state recovery: could not quarantine {} as {}: {err}",
+            path.display(),
+            quarantine_path.display()
+        );
+    }
 }
 
 fn migrate_prefix_states_for_config(
@@ -807,6 +1136,25 @@ fn prefix_state_strength(state: &PrefixWarmState) -> u64 {
         .max(state.cache_read_tokens)
 }
 
+fn trim_prefix_runtime_states(prefix_states: &mut HashMap<String, PrefixWarmState>) {
+    prefix_states.retain(|_, state| state.finished_at.elapsed() <= PREFIX_RUNTIME_STATE_TTL);
+    if prefix_states.len() <= PREFIX_RUNTIME_STATE_LIMIT {
+        return;
+    }
+
+    let mut oldest = prefix_states
+        .iter()
+        .map(|(key, state)| (state.finished_at, key.clone()))
+        .collect::<Vec<_>>();
+    oldest.sort_unstable_by_key(|(finished_at, _)| *finished_at);
+    let overflow = prefix_states
+        .len()
+        .saturating_sub(PREFIX_RUNTIME_STATE_LIMIT);
+    for (_, key) in oldest.into_iter().take(overflow) {
+        prefix_states.remove(&key);
+    }
+}
+
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
@@ -822,7 +1170,66 @@ fn save_runtime_state(
         shadow_affinity,
     );
     let raw = serde_json::to_string_pretty(&persisted)?;
-    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
+    let backup_path = runtime_state_backup_path(path);
+    if let Ok(previous) = fs::read(path) {
+        if serde_json::from_slice::<PersistedRuntimeState>(&previous).is_ok() {
+            write_synced_replacement(&backup_path, &previous).with_context(|| {
+                format!(
+                    "failed to preserve the last good runtime state at {}",
+                    backup_path.display()
+                )
+            })?;
+        }
+    }
+    write_synced_replacement(path, raw.as_bytes())
+        .with_context(|| format!("failed to replace {}", path.display()))
+}
+
+fn write_synced_replacement(path: &Path, raw: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temp_path = runtime_state_temp_path(path);
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        temp.write_all(raw)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        drop(temp);
+        // The temporary file is in the destination directory, so rename is a
+        // same-volume atomic replacement. Rust's Windows implementation uses
+        // replacement semantics when the destination already exists; on a
+        // sharing violation we fail without deleting the last good file and
+        // let the bounded journal retry handle the transient error.
+        fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "failed to atomically replace {} with {}",
+                path.display(),
+                temp_path.display()
+            )
+        })?;
+        sync_runtime_state_parent(parent)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn sync_runtime_state_parent(parent: &Path) -> Result<()> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("failed to sync {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_runtime_state_parent(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -833,31 +1240,31 @@ impl PersistedRuntimeState {
         shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
         let now = Utc::now();
+        let mut prefix_states = prefix_states.clone();
+        trim_prefix_runtime_states(&mut prefix_states);
         let prefix_states = prefix_states
             .iter()
-            .filter_map(|(key, state)| {
-                (state.finished_at.elapsed() <= PREFIX_RUNTIME_STATE_TTL).then(|| {
-                    (
-                        key.clone(),
-                        PersistedPrefixWarmState {
-                            saved_at: now,
-                            input_tokens: state.input_tokens,
-                            cache_read_tokens: state.cache_read_tokens,
-                            shortfall_tokens: state.shortfall_tokens,
-                            seen_bucket_tokens: state.seen_bucket_tokens,
-                            avoidable_shortfall_tokens: state.avoidable_shortfall_tokens,
-                            avoidable_shortfall_streak: state.avoidable_shortfall_streak,
-                            shortfall_tokens_128: state.shortfall_tokens_128,
-                            seen_bucket_tokens_128: state.seen_bucket_tokens_128,
-                            avoidable_shortfall_tokens_128: state.avoidable_shortfall_tokens_128,
-                            small_gap_recovery_streak: state.small_gap_recovery_streak,
-                            cache_instability_score: state.cache_instability_score,
-                            tail_tool_output_chars: state.tail_tool_output_chars,
-                            tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
-                            tail_tool_output_noise_hint: state.tail_tool_output_noise_hint.clone(),
-                        },
-                    )
-                })
+            .map(|(key, state)| {
+                (
+                    key.clone(),
+                    PersistedPrefixWarmState {
+                        saved_at: now,
+                        input_tokens: state.input_tokens,
+                        cache_read_tokens: state.cache_read_tokens,
+                        shortfall_tokens: state.shortfall_tokens,
+                        seen_bucket_tokens: state.seen_bucket_tokens,
+                        avoidable_shortfall_tokens: state.avoidable_shortfall_tokens,
+                        avoidable_shortfall_streak: state.avoidable_shortfall_streak,
+                        shortfall_tokens_128: state.shortfall_tokens_128,
+                        seen_bucket_tokens_128: state.seen_bucket_tokens_128,
+                        avoidable_shortfall_tokens_128: state.avoidable_shortfall_tokens_128,
+                        small_gap_recovery_streak: state.small_gap_recovery_streak,
+                        cache_instability_score: state.cache_instability_score,
+                        tail_tool_output_chars: state.tail_tool_output_chars,
+                        tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
+                        tail_tool_output_noise_hint: state.tail_tool_output_noise_hint.clone(),
+                    },
+                )
             })
             .collect();
         let response_session_error_cooldowns = response_session_error_cooldowns
@@ -900,7 +1307,7 @@ impl PersistedRuntimeState {
     fn into_runtime(self) -> RuntimeStateMaps {
         let now = Utc::now();
         let instant_now = Instant::now();
-        let prefix_states = self
+        let mut prefix_states = self
             .prefix_states
             .into_iter()
             .filter_map(|(key, state)| {
@@ -932,6 +1339,7 @@ impl PersistedRuntimeState {
                 ))
             })
             .collect();
+        trim_prefix_runtime_states(&mut prefix_states);
         // Legacy plaintext response-session snapshots are deliberately not
         // admitted into the active continuation map.  A restart therefore
         // falls back to the Agent's complete request instead of trusting a
@@ -984,7 +1392,7 @@ mod tests {
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
     use crate::proxy::cache_affinity::{
         PostBurstEvidence, PostBurstWindow, ShadowAffinityArm, ShadowAffinityAssignment,
-        ShadowCacheLane, SHADOW_POLICY_EPOCH,
+        ShadowCacheCandidateVariant, ShadowCacheLane, SHADOW_POLICY_EPOCH,
     };
     use serde_json::json;
     use std::{
@@ -993,6 +1401,28 @@ mod tests {
         sync::Mutex as StdMutex,
     };
     use uuid::Uuid;
+
+    fn prefix_state_at(finished_at: Instant) -> PrefixWarmState {
+        PrefixWarmState {
+            finished_at,
+            input_tokens: 131_072,
+            cache_read_tokens: 130_560,
+            shortfall_tokens: 512,
+            seen_bucket_tokens: 130_560,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 512,
+            seen_bucket_tokens_128: 130_560,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
+            cache_instability_score: 0,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+        }
+    }
 
     #[tokio::test]
     async fn exit_shutdown_releases_both_ports_without_disabling_auto_start() {
@@ -1173,6 +1603,297 @@ mod tests {
         .unwrap();
 
         assert!(snapshot.prefix_states.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual FastRelayCore full-capacity runtime snapshot baseline"]
+    fn fastrelay_full_capacity_runtime_snapshot_baseline() {
+        use std::hint::black_box;
+
+        const FULL_SHADOW_ASSIGNMENTS: usize = 4_096;
+        const FULL_POST_BURST_EVIDENCE: usize = 1_536;
+        let prefix_states = Mutex::new(HashMap::new());
+        let response_session_error_cooldowns = Mutex::new(HashMap::new());
+        let shadow_affinity = Mutex::new(ShadowAffinityStore::default());
+        let now = Utc::now();
+
+        {
+            let mut states = prefix_states.blocking_lock();
+            for index in 0..PREFIX_RUNTIME_STATE_LIMIT {
+                states.insert(
+                    format!("snapshot-prefix-{index}"),
+                    prefix_state_at(Instant::now()),
+                );
+            }
+        }
+        {
+            let mut affinity = shadow_affinity.blocking_lock();
+            for index in 0..FULL_SHADOW_ASSIGNMENTS {
+                let conversation_id = format!("snapshot-conversation-{index}");
+                affinity.assignments.insert(
+                    conversation_id.clone(),
+                    ShadowAffinityAssignment {
+                        conversation_id,
+                        cohort_id: format!("snapshot-cohort-{index}"),
+                        realm_id: "snapshot-realm".to_string(),
+                        policy_epoch: SHADOW_POLICY_EPOCH,
+                        lane: ShadowCacheLane::Steady,
+                        arm: ShadowAffinityArm::Baseline,
+                        shard: 0,
+                        anchor_epoch: 0,
+                        created_at: now,
+                        last_seen_at: now,
+                        observations: 1,
+                        successful_observations: 1,
+                        usage_observations: 1,
+                        inconclusive_observations: 0,
+                        input_tokens: 131_072,
+                        cache_read_tokens: 130_560,
+                    },
+                );
+            }
+            for index in 0..FULL_POST_BURST_EVIDENCE {
+                affinity.post_burst.evidence.push_back(PostBurstEvidence {
+                    window_id: index as u64,
+                    conversation_id: format!("snapshot-evidence-conversation-{index}"),
+                    observed_at: now,
+                    followup_index: 1,
+                    realm_id: "snapshot-realm".to_string(),
+                    lane: ShadowCacheLane::Steady,
+                    candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                    arm: ShadowAffinityArm::Baseline,
+                    policy_epoch: SHADOW_POLICY_EPOCH,
+                    anchor_epoch: 0,
+                    success: true,
+                    status: 200,
+                    has_usage: true,
+                    input_tokens: 131_072,
+                    cache_read_tokens: 130_560,
+                    cache_ratio_bps: 9_960,
+                    avoidable_gap_tokens: 0,
+                    provider_unstable_gap_tokens: 0,
+                    ttft_ms: 100,
+                    attempt_count: 1,
+                    candidate_applied: false,
+                });
+            }
+        }
+
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let started = Instant::now();
+            let snapshot = capture_runtime_state(
+                &prefix_states,
+                &response_session_error_cooldowns,
+                &shadow_affinity,
+            );
+            black_box(snapshot);
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let p95_index = ((samples.len() - 1) * 95).div_ceil(100);
+        let p95_us = samples[p95_index];
+        println!(
+            "fastrelay_runtime_snapshot prefixes={PREFIX_RUNTIME_STATE_LIMIT} assignments={FULL_SHADOW_ASSIGNMENTS} evidence={FULL_POST_BURST_EVIDENCE} p95_us={p95_us} samples_us={samples:?}",
+        );
+        assert!(
+            p95_us <= 10_000,
+            "full-capacity runtime snapshot p95 ({p95_us}us) exceeded the 10ms background-writer budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_state_close_fences_late_dirty_publications() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let attempts_for_job = attempts.clone();
+        let started_for_job = started.clone();
+        let release_for_job = release.clone();
+        let journal = RuntimeStateJournal::new_with_job(MetricsStore::new(), move || {
+            attempts_for_job.fetch_add(1, Ordering::SeqCst);
+            started_for_job.store(true, Ordering::Release);
+            while !release_for_job.load(Ordering::Acquire) {
+                std::thread::sleep(StdDuration::from_millis(1));
+            }
+            Ok(())
+        });
+
+        let closing_journal = journal.clone();
+        let closing = tokio::spawn(async move { closing_journal.close_and_flush().await });
+        while !started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!journal.mark_dirty());
+        assert!(journal.flush().await.is_err());
+        release.store(true, Ordering::Release);
+        closing.await.unwrap().unwrap();
+        journal.writer.flush_latest().await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_state_journal_retries_transient_failure_and_stops_at_bound() {
+        let transient_attempts = Arc::new(AtomicUsize::new(0));
+        let transient_attempts_for_job = transient_attempts.clone();
+        let transient = RuntimeStateJournal::new_with_job(MetricsStore::new(), move || {
+            let attempt = transient_attempts_for_job.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                Err(anyhow::anyhow!("transient write failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(transient.mark_dirty());
+        transient.writer.flush_latest().await.unwrap();
+        assert_eq!(transient_attempts.load(Ordering::SeqCst), 3);
+
+        let permanent_attempts = Arc::new(AtomicUsize::new(0));
+        let permanent_attempts_for_job = permanent_attempts.clone();
+        let permanent = RuntimeStateJournal::new_with_job(MetricsStore::new(), move || {
+            permanent_attempts_for_job.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("permanent write failure"))
+        });
+        let error = permanent.flush().await.unwrap_err().to_string();
+        assert!(error.contains("failed after 3 attempts"));
+        assert_eq!(permanent_attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn runtime_state_atomic_replace_keeps_previous_good_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-runtime-state-atomic-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-state.json");
+        let key = "responses:share:gpt-5.5".to_string();
+        let mut cooldowns = HashMap::from([(
+            key.clone(),
+            ResponseSessionCooldownState {
+                until: Instant::now() + StdDuration::from_secs(300),
+                failures: 1,
+                unsupported: true,
+            },
+        )]);
+
+        save_runtime_state(
+            &path,
+            &HashMap::new(),
+            &cooldowns,
+            &ShadowAffinityStore::default(),
+        )
+        .unwrap();
+        cooldowns.get_mut(&key).unwrap().failures = 2;
+        save_runtime_state(
+            &path,
+            &HashMap::new(),
+            &cooldowns,
+            &ShadowAffinityStore::default(),
+        )
+        .unwrap();
+        cooldowns.get_mut(&key).unwrap().failures = 3;
+        save_runtime_state(
+            &path,
+            &HashMap::new(),
+            &cooldowns,
+            &ShadowAffinityStore::default(),
+        )
+        .unwrap();
+
+        let (current, _) = read_runtime_state_file(&path).unwrap();
+        let (previous, _) = read_runtime_state_file(&runtime_state_backup_path(&path)).unwrap();
+        assert_eq!(
+            current
+                .response_session_error_cooldowns
+                .get(&key)
+                .unwrap()
+                .failures,
+            3
+        );
+        assert_eq!(
+            previous
+                .response_session_error_cooldowns
+                .get(&key)
+                .unwrap()
+                .failures,
+            2
+        );
+        assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn runtime_state_recovers_valid_backup_and_quarantines_damaged_primary() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-runtime-state-recovery-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-state.json");
+        let key = "responses:share:gpt-5.5".to_string();
+        let cooldowns = HashMap::from([(
+            key.clone(),
+            ResponseSessionCooldownState {
+                until: Instant::now() + StdDuration::from_secs(300),
+                failures: 7,
+                unsupported: true,
+            },
+        )]);
+        save_runtime_state(
+            &path,
+            &HashMap::new(),
+            &cooldowns,
+            &ShadowAffinityStore::default(),
+        )
+        .unwrap();
+        fs::copy(&path, runtime_state_backup_path(&path)).unwrap();
+        fs::write(&path, b"{damaged-json").unwrap();
+
+        let recovered = load_runtime_state(&path).unwrap();
+
+        assert_eq!(
+            recovered
+                .response_session_error_cooldowns
+                .get(&key)
+                .unwrap()
+                .failures,
+            7
+        );
+        assert!(read_runtime_state_file(&path).is_ok());
+        assert!(fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("runtime-state.json.corrupt-")
+        }));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn damaged_runtime_state_without_backup_starts_with_empty_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-runtime-state-empty-recovery-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("runtime-state.json");
+        fs::write(&path, b"not-json").unwrap();
+
+        let recovered = load_runtime_state(&path).unwrap();
+
+        assert!(recovered.prefix_states.is_empty());
+        assert!(recovered.response_session_error_cooldowns.is_empty());
+        assert!(!path.exists());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -1522,6 +2243,9 @@ mod tests {
                 lane: ShadowCacheLane::ToolBurstQuarantine,
                 candidate_variant:
                     crate::proxy::cache_affinity::ShadowCacheCandidateVariant::CohortKey,
+                realm_id: "realm-a".to_string(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 0,
             },
         );
         shadow_affinity
@@ -1823,5 +2547,89 @@ mod tests {
         assert!(!loaded.prefix_states.contains_key("expired-prefix"));
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn prefix_lock_registry_reuses_active_locks_and_evicts_only_idle_entries() {
+        let mut registry = PrefixLockRegistry::default();
+        let held = registry.acquire("held-prefix");
+        let same = registry.acquire("held-prefix");
+        assert!(std::sync::Arc::ptr_eq(&held, &same));
+
+        for index in 0..(PREFIX_LOCK_REGISTRY_LIMIT - 1) {
+            let _ = registry.acquire(&format!("idle-prefix-{index}"));
+        }
+        assert_eq!(registry.len(), PREFIX_LOCK_REGISTRY_LIMIT);
+
+        let incoming = registry.acquire("incoming-prefix");
+
+        assert_eq!(registry.len(), PREFIX_LOCK_REGISTRY_LIMIT);
+        assert!(registry.contains("held-prefix"));
+        assert!(registry.contains("incoming-prefix"));
+        assert!(!std::sync::Arc::ptr_eq(&held, &incoming));
+    }
+
+    #[test]
+    fn prefix_lock_registry_does_not_grow_when_every_slot_is_active() {
+        let mut registry = PrefixLockRegistry::default();
+        let active = (0..PREFIX_LOCK_REGISTRY_LIMIT)
+            .map(|index| registry.acquire(&format!("active-prefix-{index}")))
+            .collect::<Vec<_>>();
+
+        let overflow = registry.acquire("overflow-prefix");
+
+        assert_eq!(registry.len(), PREFIX_LOCK_REGISTRY_LIMIT);
+        assert!(!registry.contains("overflow-prefix"));
+        assert_eq!(std::sync::Arc::strong_count(&overflow), 1);
+
+        drop(active);
+        let tracked = registry.acquire("overflow-prefix");
+        assert!(registry.contains("overflow-prefix"));
+        assert!(!std::sync::Arc::ptr_eq(&overflow, &tracked));
+    }
+
+    #[test]
+    fn prefix_lock_registry_bounds_a_long_unique_prefix_stream() {
+        let mut registry = PrefixLockRegistry::default();
+        let total = PREFIX_LOCK_REGISTRY_LIMIT * 3;
+        for index in 0..total {
+            let _ = registry.acquire(&format!("unique-prefix-{index}"));
+            assert!(registry.len() <= PREFIX_LOCK_REGISTRY_LIMIT);
+        }
+
+        assert_eq!(registry.len(), PREFIX_LOCK_REGISTRY_LIMIT);
+        assert!(!registry.contains("unique-prefix-0"));
+        assert!(registry.contains(&format!("unique-prefix-{}", total - 1)));
+    }
+
+    #[test]
+    fn prefix_runtime_state_trim_removes_expired_and_keeps_the_freshest_entries() {
+        let now = Instant::now();
+        let mut states = HashMap::new();
+        states.insert(
+            "expired-prefix".to_string(),
+            prefix_state_at(
+                now.checked_sub(PREFIX_RUNTIME_STATE_TTL + StdDuration::from_secs(1))
+                    .unwrap_or(now),
+            ),
+        );
+        let total = PREFIX_RUNTIME_STATE_LIMIT + 96;
+        for index in 0..total {
+            let age_ms = (total - index) as u64;
+            states.insert(
+                format!("prefix-{index}"),
+                prefix_state_at(
+                    now.checked_sub(StdDuration::from_millis(age_ms))
+                        .unwrap_or(now),
+                ),
+            );
+        }
+
+        trim_prefix_runtime_states(&mut states);
+
+        assert_eq!(states.len(), PREFIX_RUNTIME_STATE_LIMIT);
+        assert!(!states.contains_key("expired-prefix"));
+        assert!(!states.contains_key("prefix-0"));
+        assert!(states.contains_key(&format!("prefix-{}", total - 1)));
     }
 }

@@ -1,10 +1,12 @@
-use crate::{
-    config::{AppConfig, SelectedProviderKey},
-    proxy::json_canonical::canonical_json_string,
-};
+use crate::config::{AppConfig, SelectedProviderKey};
+#[cfg(test)]
+use crate::proxy::json_canonical::canonical_json_string;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+#[cfg(test)]
+use serde_json::Map;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::io::{self, Write};
 
 use super::RouteDecision;
 
@@ -32,8 +34,7 @@ pub(super) fn derive(
         .filter(|value| !value.is_empty())
         .unwrap_or("default");
     let realm_id = realm_id(decision, selected_key);
-    let stable_material = stable_prefix_material(upstream_request);
-    let stable_prefix_digest = hash_text(&canonical_json_string(&stable_material));
+    let stable_prefix_digest = stable_prefix_digest(upstream_request);
     let cohort_id = hash_parts(&[
         "cache-cohort-v1",
         &config.workspace_fingerprint,
@@ -153,6 +154,142 @@ fn trusted_value(value: &Value) -> Option<String> {
     }
 }
 
+/// Hash the exact same canonical stable-prefix representation that earlier
+/// releases used for cohort assignment, without cloning or concatenating the
+/// complete instructions/tool schema into a temporary `Value` and `String`.
+///
+/// This is deliberately wire-neutral: the digest is an internal affinity
+/// identity only, and its bytes must remain stable across this optimization so
+/// existing cohort affinity and cache behavior survive an upgrade.
+fn stable_prefix_digest(request: &Value) -> String {
+    let mut hasher = Sha256::new();
+    write_stable_prefix_canonical_json(&mut hasher, request);
+    format!("{:x}", hasher.finalize())
+}
+
+enum StablePrefixEntry<'a> {
+    Direct(&'a Value),
+    FilteredArray(Vec<&'a Value>),
+}
+
+fn stable_prefix_entries(request: &Value) -> Vec<(&'static str, StablePrefixEntry<'_>)> {
+    let Some(object) = request.as_object() else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::with_capacity(10);
+    for key in [
+        "instructions",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "text",
+        "response_format",
+        "system",
+        "system_prompt",
+    ] {
+        if let Some(value) = object.get(key) {
+            entries.push((key, StablePrefixEntry::Direct(value)));
+        }
+    }
+    for key in ["messages", "input"] {
+        let Some(items) = object.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        let stable_items = items
+            .iter()
+            .filter(|item| {
+                item.get("role")
+                    .and_then(Value::as_str)
+                    .is_some_and(|role| matches!(role, "system" | "developer"))
+            })
+            .collect::<Vec<_>>();
+        if !stable_items.is_empty() {
+            entries.push((key, StablePrefixEntry::FilteredArray(stable_items)));
+        }
+    }
+    entries.sort_by_key(|(key, _)| *key);
+    entries
+}
+
+fn write_stable_prefix_canonical_json(hasher: &mut Sha256, request: &Value) {
+    hasher.update(b"{");
+    for (index, (key, entry)) in stable_prefix_entries(request).into_iter().enumerate() {
+        if index > 0 {
+            hasher.update(b",");
+        }
+        write_json_string(hasher, key);
+        hasher.update(b":");
+        match entry {
+            StablePrefixEntry::Direct(value) => write_canonical_json_value(hasher, value),
+            StablePrefixEntry::FilteredArray(values) => {
+                hasher.update(b"[");
+                for (index, value) in values.into_iter().enumerate() {
+                    if index > 0 {
+                        hasher.update(b",");
+                    }
+                    write_canonical_json_value(hasher, value);
+                }
+                hasher.update(b"]");
+            }
+        }
+    }
+    hasher.update(b"}");
+}
+
+fn write_canonical_json_value(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update(b"null"),
+        Value::Bool(value) => hasher.update(value.to_string().as_bytes()),
+        Value::Number(value) => hasher.update(value.to_string().as_bytes()),
+        Value::String(value) => write_json_string(hasher, value),
+        Value::Array(values) => {
+            hasher.update(b"[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                write_canonical_json_value(hasher, value);
+            }
+            hasher.update(b"]");
+        }
+        Value::Object(map) => {
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(key, _)| *key);
+            hasher.update(b"{");
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                write_json_string(hasher, key);
+                hasher.update(b":");
+                write_canonical_json_value(hasher, value);
+            }
+            hasher.update(b"}");
+        }
+    }
+}
+
+fn write_json_string(hasher: &mut Sha256, value: &str) {
+    let mut writer = DigestWriter(hasher);
+    serde_json::to_writer(&mut writer, value)
+        .expect("serializing a JSON string into the affinity digest should not fail");
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 fn stable_prefix_material(request: &Value) -> Value {
     let mut stable = Map::new();
     let Some(object) = request.as_object() else {
@@ -222,6 +359,7 @@ fn hash_text(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{Channel, ProviderConfig};
+    use crate::proxy::cache_affinity::{self, ShadowAffinityStore};
     use chrono::Utc;
     use serde_json::json;
 
@@ -305,6 +443,32 @@ mod tests {
     }
 
     #[test]
+    fn streamed_stable_prefix_digest_matches_legacy_canonical_bytes() {
+        let request = json!({
+            "instructions": "line one\\nquoted \\\"text\\\"",
+            "tools": [{
+                "name": "write_file",
+                "type": "function",
+                "parameters": {"z": [3, {"b": true, "a": null}], "a": 1}
+            }],
+            "messages": [
+                {"role": "user", "content": "tail that must not enter the stable prefix"},
+                {"role": "developer", "content": [{"type": "input_text", "text": "developer prefix"}]},
+                {"role": "system", "content": "system prefix"}
+            ],
+            "input": [
+                {"role": "assistant", "content": "another tail"},
+                {"role": "developer", "content": "input prefix"}
+            ],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"b": 2, "a": 1}}}
+        });
+
+        let legacy = hash_text(&canonical_json_string(&stable_prefix_material(&request)));
+
+        assert_eq!(stable_prefix_digest(&request), legacy);
+    }
+
+    #[test]
     fn prompt_cache_key_is_not_trusted_conversation_identity() {
         let (config, decision, key) = context();
         let request = json!({
@@ -334,5 +498,61 @@ mod tests {
             },
         );
         assert_ne!(first.realm_id, second.realm_id);
+    }
+
+    #[test]
+    #[ignore = "manual FastRelayCore large stable-prefix shadow-policy baseline"]
+    fn fastrelay_shadow_policy_large_stable_prefix_baseline() {
+        use std::{hint::black_box, time::Instant};
+
+        for (target_bytes, p95_budget_us) in [(300_000usize, 5_000u128), (2_000_000, 20_000)] {
+            let (config, decision, key) = context();
+            let request = json!({
+                "thread_id": format!("large-shadow-policy-{target_bytes}"),
+                "instructions": "x".repeat(target_bytes),
+                "tools": [{"type": "function", "name": "read_file"}],
+                "input": [{"role": "user", "content": "new tail"}]
+            });
+
+            // Prime allocator and canonicalization paths before sampling.
+            for _ in 0..3 {
+                let identity = derive(&config, &decision, &request, &request, Some("codex"), &key);
+                let mut store = ShadowAffinityStore::default();
+                black_box(cache_affinity::compute_shadow_affinity(
+                    &mut store,
+                    &identity,
+                    None,
+                    Utc::now(),
+                    0,
+                    0,
+                ));
+            }
+
+            let mut samples = Vec::new();
+            for _ in 0..21 {
+                let started = Instant::now();
+                let identity = derive(&config, &decision, &request, &request, Some("codex"), &key);
+                let mut store = ShadowAffinityStore::default();
+                black_box(cache_affinity::compute_shadow_affinity(
+                    &mut store,
+                    &identity,
+                    None,
+                    Utc::now(),
+                    0,
+                    0,
+                ));
+                samples.push(started.elapsed().as_micros());
+            }
+            samples.sort_unstable();
+            let p95_index = ((samples.len() - 1) * 95).div_ceil(100);
+            let p95_us = samples[p95_index];
+            println!(
+                "fastrelay_shadow_policy body={target_bytes} p95_us={p95_us} samples_us={samples:?}"
+            );
+            assert!(
+                p95_us <= p95_budget_us,
+                "FastRelayCore shadow policy p95 ({p95_us}us) exceeded the {p95_budget_us}us budget for {target_bytes} bytes"
+            );
+        }
     }
 }

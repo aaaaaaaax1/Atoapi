@@ -1,7 +1,11 @@
+use crate::metrics_history::{
+    MetricsHistory, MetricsHistoryObservation, MetricsTrendQueryInput, MetricsTrendSnapshot,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
 };
 use tokio::sync::{Notify, RwLock};
@@ -439,6 +443,22 @@ impl UsageRecord {
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
     }
+
+    /// Merge cumulative provider snapshots from one upstream response.
+    /// Responses/Chat/Anthropic streaming usage is normally repeated or
+    /// monotonically completed, not emitted as independent billable deltas.
+    pub fn merge_provider_snapshot(&mut self, other: UsageRecord) {
+        if self.provider.is_empty() {
+            self.provider = other.provider;
+        }
+        if self.model.is_empty() || self.model == "unknown" {
+            self.model = other.model;
+        }
+        self.input_tokens = self.input_tokens.max(other.input_tokens);
+        self.output_tokens = self.output_tokens.max(other.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.max(other.cache_read_tokens);
+        self.cache_creation_tokens = self.cache_creation_tokens.max(other.cache_creation_tokens);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -551,6 +571,72 @@ pub struct ResponsesWirePrefixFingerprints {
     pub pre_input_wire: String,
 }
 
+/// Shadow-only final-scope cache evidence. These values never contribute to
+/// true cache-hit metrics, request-cache metrics, or cache-gap totals.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinalScopeWaterlineLog {
+    #[serde(default)]
+    pub version: u8,
+    #[serde(default)]
+    pub outcome: String,
+    /// Opaque final-scope identity used only to correlate shadow observations.
+    /// It contains no raw conversation, provider Key, or request content.
+    pub scope_digest: String,
+    pub entry_generation: u64,
+    #[serde(default)]
+    pub sent_prediction_eligible: bool,
+    #[serde(default)]
+    pub predecessor_proof: String,
+    #[serde(default)]
+    pub predecessor_exact: bool,
+    #[serde(default)]
+    pub predecessor_bound: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor_generation: Option<u64>,
+    #[serde(default)]
+    pub predecessor_input_items: u64,
+    #[serde(default)]
+    pub current_input_items: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_settlement_age_ms: Option<u64>,
+    #[serde(default)]
+    pub prior_observed_cache_read_tokens: u64,
+    #[serde(default)]
+    pub prior_sent_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub prior_settled_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub prior_latest_sent_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub prior_latest_settled_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub raw_input_tokens: u64,
+    #[serde(default)]
+    pub raw_cache_read_tokens: u64,
+    pub observed_cache_read_tokens: u64,
+    pub sent_prefix_bucket_tokens_128: u64,
+    pub settled_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub latest_sent_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub latest_settled_prefix_bucket_tokens_128: u64,
+    #[serde(default)]
+    pub cache_regression_streak: u64,
+    #[serde(default)]
+    pub stable_settlement_streak: u64,
+    #[serde(default)]
+    pub continuity_generation: u64,
+    #[serde(default)]
+    pub continuity_reset: bool,
+    #[serde(default)]
+    pub candidate_avoidable_tokens_128: u64,
+    #[serde(default)]
+    pub rollback_tokens_128: u64,
+    pub dispatch_seq: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RequestLog {
     pub id: String,
@@ -603,6 +689,8 @@ pub struct RequestLog {
     pub outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_cache_diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_scope_waterline: Option<FinalScopeWaterlineLog>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow_affinity_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1001,6 +1089,7 @@ struct BackgroundPrewarmAccumulator {
 pub struct MetricsStore {
     inner: Arc<RwLock<MetricsInner>>,
     commit_tracker: Arc<MetricsCommitTracker>,
+    history: MetricsHistory,
 }
 
 #[derive(Debug)]
@@ -1080,7 +1169,16 @@ impl MetricsCommitTracker {
 }
 
 impl MetricsStore {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_history(MetricsHistory::in_memory())
+    }
+
+    pub fn with_history_path(path: PathBuf) -> Self {
+        Self::with_history(MetricsHistory::load(path))
+    }
+
+    fn with_history(history: MetricsHistory) -> Self {
         Self {
             commit_tracker: Arc::new(MetricsCommitTracker {
                 state: StdMutex::new(MetricsCommitTrackerState {
@@ -1139,6 +1237,7 @@ impl MetricsStore {
                 recent_agent_inbound_outcomes: VecDeque::new(),
                 recent_agent_upstream_attempts: VecDeque::new(),
             })),
+            history,
         }
     }
 
@@ -1302,13 +1401,19 @@ impl MetricsStore {
             return false;
         }
         let mut inner = self.inner.write().await;
-        finish_agent_inbound_inner(
+        let (finished, observation) = finish_agent_inbound_inner(
             &mut inner,
             inbound_request_id,
             request,
             outcome,
             terminal_state,
-        )
+            0,
+        );
+        drop(inner);
+        if let Some(observation) = observation {
+            self.history.observe(observation);
+        }
+        finished
     }
 
     #[cfg(test)]
@@ -1322,7 +1427,11 @@ impl MetricsStore {
     #[cfg(test)]
     async fn record_request(&self, log: RequestLog, upstream: bool) {
         let mut inner = self.inner.write().await;
-        record_request_inner(&mut inner, log, upstream);
+        let observation = record_request_inner(&mut inner, log, upstream, 0);
+        drop(inner);
+        if let Some(observation) = observation {
+            self.history.observe(observation);
+        }
     }
 
     #[cfg(test)]
@@ -1350,14 +1459,25 @@ impl MetricsStore {
             return MetricsCommitResult::Rejected;
         };
         if let Ok(mut inner) = self.inner.try_write() {
-            return commit_metrics_transaction(&mut inner, transaction);
+            let outcome = commit_metrics_transaction(&mut inner, transaction);
+            drop(inner);
+            if let Some(observation) = outcome.history_observation {
+                self.history.observe(observation);
+            }
+            return outcome.result;
         }
 
         let inner = self.inner.clone();
+        let history = self.history.clone();
         tokio::spawn(async move {
             let _commit_guard = commit_guard;
             let mut inner = inner.write().await;
-            commit_metrics_transaction(&mut inner, transaction)
+            let outcome = commit_metrics_transaction(&mut inner, transaction);
+            drop(inner);
+            if let Some(observation) = outcome.history_observation {
+                history.observe(observation);
+            }
+            outcome.result
         })
         .await
         .unwrap_or(MetricsCommitResult::Rejected)
@@ -1368,21 +1488,39 @@ impl MetricsStore {
             return false;
         };
         if let Ok(mut inner) = self.inner.try_write() {
-            commit_metrics_transaction(&mut inner, transaction);
+            let outcome = commit_metrics_transaction(&mut inner, transaction);
+            drop(inner);
+            if let Some(observation) = outcome.history_observation {
+                self.history.observe(observation);
+            }
             return true;
         }
 
         let inner = self.inner.clone();
+        let history = self.history.clone();
         tokio::spawn(async move {
             let _commit_guard = commit_guard;
             let mut inner = inner.write().await;
-            commit_metrics_transaction(&mut inner, transaction)
+            let outcome = commit_metrics_transaction(&mut inner, transaction);
+            drop(inner);
+            if let Some(observation) = outcome.history_observation {
+                history.observe(observation);
+            }
+            outcome.result
         });
         true
     }
 
     pub(crate) async fn close_and_wait_for_commits(&self) {
         self.commit_tracker.close_and_wait().await;
+    }
+
+    pub fn trend(&self, input: MetricsTrendQueryInput) -> anyhow::Result<MetricsTrendSnapshot> {
+        self.history.query(input)
+    }
+
+    pub(crate) async fn flush_history(&self) -> anyhow::Result<()> {
+        self.history.flush().await
     }
 
     pub async fn snapshot(&self) -> MetricsSnapshot {
@@ -1471,10 +1609,24 @@ impl MetricsStore {
     }
 }
 
+struct MetricsCommitOutcome {
+    result: MetricsCommitResult,
+    history_observation: Option<MetricsHistoryObservation>,
+}
+
+impl MetricsCommitOutcome {
+    fn without_history(result: MetricsCommitResult) -> Self {
+        Self {
+            result,
+            history_observation: None,
+        }
+    }
+}
+
 fn commit_metrics_transaction(
     inner: &mut MetricsInner,
     transaction: MetricsTransaction,
-) -> MetricsCommitResult {
+) -> MetricsCommitOutcome {
     let MetricsTransaction {
         commit_key,
         terminal,
@@ -1482,10 +1634,10 @@ fn commit_metrics_transaction(
         errors,
     } = transaction;
     if commit_key.is_empty() {
-        return MetricsCommitResult::Rejected;
+        return MetricsCommitOutcome::without_history(MetricsCommitResult::Rejected);
     }
     if inner.completed_transaction_ids.contains(&commit_key) {
-        return MetricsCommitResult::Duplicate;
+        return MetricsCommitOutcome::without_history(MetricsCommitResult::Duplicate);
     }
     if let MetricsTerminal::Agent {
         inbound_request_id,
@@ -1502,7 +1654,7 @@ fn commit_metrics_transaction(
                 ),
                 Utc::now(),
             );
-            return MetricsCommitResult::Rejected;
+            return MetricsCommitOutcome::without_history(MetricsCommitResult::Rejected);
         }
     }
     if let MetricsTerminal::AgentOwnerFailure {
@@ -1514,10 +1666,14 @@ fn commit_metrics_transaction(
             .contains(inbound_request_id)
             && !inner.active_agent_inbounds.contains_key(inbound_request_id)
         {
-            return MetricsCommitResult::Duplicate;
+            return MetricsCommitOutcome::without_history(MetricsCommitResult::Duplicate);
         }
     }
 
+    let cache_creation_tokens = usage
+        .as_ref()
+        .map(|usage| usage.record.cache_creation_tokens)
+        .unwrap_or_default();
     let cold_start = usage.map(|usage| {
         record_usage_inner(
             inner,
@@ -1530,7 +1686,7 @@ fn commit_metrics_transaction(
         record_error_inner(inner, &error.scope, &error.message, error.at);
     }
 
-    match terminal {
+    let history_observation = match terminal {
         MetricsTerminal::Upstream {
             mut request,
             upstream_attempts,
@@ -1538,11 +1694,12 @@ fn commit_metrics_transaction(
             request.cold_start = cold_start;
             let successful = request_log_is_successful_history(&request);
             let projection = request.clone();
-            record_request_inner(inner, request, false);
+            let observation = record_request_inner(inner, request, false, cache_creation_tokens);
             record_upstream_attempts_inner(inner, &projection.provider, upstream_attempts);
             if successful {
                 push_limited(&mut inner.recent_upstream_calls, projection, 400);
             }
+            observation
         }
         MetricsTerminal::LocalCache {
             mut request,
@@ -1552,11 +1709,13 @@ fn commit_metrics_transaction(
             inner.local_proxy_estimated_tokens_saved = inner
                 .local_proxy_estimated_tokens_saved
                 .saturating_add(estimated_tokens_saved);
-            record_request_inner(inner, request, false);
+            let _ = record_request_inner(inner, request, false, cache_creation_tokens);
+            None
         }
         MetricsTerminal::LocalRejection { mut request } => {
             request.cold_start = cold_start;
-            record_request_inner(inner, request, false);
+            let _ = record_request_inner(inner, request, false, cache_creation_tokens);
+            None
         }
         MetricsTerminal::Agent {
             inbound_request_id,
@@ -1575,7 +1734,8 @@ fn commit_metrics_transaction(
                 request,
                 inbound_outcome,
                 terminal_state,
-            );
+                cache_creation_tokens,
+            )
         }
         MetricsTerminal::AgentOwnerFailure {
             inbound_request_id,
@@ -1583,16 +1743,25 @@ fn commit_metrics_transaction(
             terminal_state,
         } => {
             request.cold_start = cold_start;
-            apply_agent_owner_failure_inner(inner, &inbound_request_id, request, terminal_state);
+            apply_agent_owner_failure_inner(
+                inner,
+                &inbound_request_id,
+                request,
+                terminal_state,
+                cache_creation_tokens,
+            )
         }
-    }
+    };
 
     remember_completed_id(
         &mut inner.completed_transaction_ids,
         &mut inner.completed_transaction_order,
         &commit_key,
     );
-    MetricsCommitResult::Applied
+    MetricsCommitOutcome {
+        result: MetricsCommitResult::Applied,
+        history_observation,
+    }
 }
 
 fn finish_agent_attempt_inner(
@@ -1656,7 +1825,8 @@ fn finish_agent_inbound_inner(
     mut request: RequestLog,
     mut outcome: AgentInboundOutcome,
     terminal_state: Option<String>,
-) -> bool {
+    cache_creation_tokens: u64,
+) -> (bool, Option<MetricsHistoryObservation>) {
     if inner
         .completed_agent_inbound_ids
         .contains(inbound_request_id)
@@ -1665,10 +1835,10 @@ fn finish_agent_inbound_inner(
             .values()
             .any(|attempt| attempt.inbound_request_id == inbound_request_id)
     {
-        return false;
+        return (false, None);
     }
     let Some(active) = inner.active_agent_inbounds.remove(inbound_request_id) else {
-        return false;
+        return (false, None);
     };
     {
         let MetricsInner {
@@ -1709,7 +1879,8 @@ fn finish_agent_inbound_inner(
     }
 
     let projection = request.clone();
-    record_request_inner(inner, projection.clone(), false);
+    let history_observation =
+        record_request_inner(inner, projection.clone(), false, cache_creation_tokens);
     if successful {
         push_limited(&mut inner.recent_upstream_calls, projection, 400);
     }
@@ -1727,7 +1898,7 @@ fn finish_agent_inbound_inner(
         },
         200,
     );
-    true
+    (true, history_observation)
 }
 
 fn agent_terminal_is_valid(
@@ -1766,19 +1937,23 @@ fn apply_agent_terminal_inner(
     request: RequestLog,
     inbound_outcome: AgentInboundOutcome,
     terminal_state: Option<String>,
-) {
+    cache_creation_tokens: u64,
+) -> Option<MetricsHistoryObservation> {
     assert!(finish_agent_attempt_inner(
         inner,
         attempt_id,
         attempt_finish
     ));
-    assert!(finish_agent_inbound_inner(
+    let (finished, history_observation) = finish_agent_inbound_inner(
         inner,
         inbound_request_id,
         request,
         inbound_outcome,
         terminal_state,
-    ));
+        cache_creation_tokens,
+    );
+    assert!(finished);
+    history_observation
 }
 
 fn apply_agent_owner_failure_inner(
@@ -1786,7 +1961,8 @@ fn apply_agent_owner_failure_inner(
     inbound_request_id: &str,
     request: RequestLog,
     terminal_state: Option<String>,
-) {
+    cache_creation_tokens: u64,
+) -> Option<MetricsHistoryObservation> {
     let attempt_ids = inner
         .active_agent_attempts
         .values()
@@ -1828,13 +2004,16 @@ fn apply_agent_owner_failure_inner(
         inner.agent_generation.active_inbounds += 1;
     }
 
-    assert!(finish_agent_inbound_inner(
+    let (finished, history_observation) = finish_agent_inbound_inner(
         inner,
         inbound_request_id,
         request,
         AgentInboundOutcome::RelayAborted,
         terminal_state,
-    ));
+        cache_creation_tokens,
+    );
+    assert!(finished);
+    history_observation
 }
 
 fn record_usage_inner(
@@ -1900,7 +2079,13 @@ fn record_error_inner(inner: &mut MetricsInner, scope: &str, message: &str, at: 
     );
 }
 
-fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: bool) {
+fn record_request_inner(
+    inner: &mut MetricsInner,
+    log: RequestLog,
+    upstream: bool,
+    cache_creation_tokens: u64,
+) -> Option<MetricsHistoryObservation> {
+    let history_observation = metrics_history_observation(&log, cache_creation_tokens);
     inner.total_requests += 1;
     if request_log_is_successful_history(&log) {
         inner.successful_requests += 1;
@@ -1954,6 +2139,54 @@ fn record_request_inner(inner: &mut MetricsInner, log: RequestLog, upstream: boo
     } else {
         push_limited(&mut inner.recent_failed_requests, log, 200);
     }
+    history_observation
+}
+
+fn metrics_history_observation(
+    log: &RequestLog,
+    cache_creation_tokens: u64,
+) -> Option<MetricsHistoryObservation> {
+    if !request_log_is_successful_history(log) {
+        return None;
+    }
+    let agent_id = log
+        .agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let provider_id = log
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(MetricsHistoryObservation {
+        at: log.at,
+        agent_id: agent_id.to_string(),
+        provider_id: provider_id.to_string(),
+        input_tokens: log.input_tokens.unwrap_or_default(),
+        output_tokens: log.output_tokens.unwrap_or_default(),
+        cache_read_tokens: log.cache_read_tokens.unwrap_or_default(),
+        cache_creation_tokens,
+        cache_shortfall_tokens: log.cache_shortfall_tokens.unwrap_or_default(),
+        cache_avoidable_gap_tokens: log.cache_avoidable_gap_tokens.unwrap_or_default(),
+        cache_new_tail_gap_tokens: log.cache_new_tail_gap_tokens.unwrap_or_default(),
+        compaction: request_log_is_confirmed_compaction(log),
+        cold_start: log.cold_start == Some(true),
+    })
+}
+
+fn request_log_is_confirmed_compaction(log: &RequestLog) -> bool {
+    log.cache_status == "compact"
+        && matches!(
+            log.upstream_call_source.as_deref(),
+            Some(
+                "responses-compaction-v2"
+                    | "compact"
+                    | "compact-fallback"
+                    | "compact-chat-compat"
+                    | "compact-fallback-chat-compat"
+            )
+        )
 }
 
 impl ProviderTrafficAccumulator {
@@ -2615,6 +2848,7 @@ mod tests {
             provider_prefix_fingerprint: None,
             outbound_prefix_fingerprints: None,
             provider_cache_diagnostic: None,
+            final_scope_waterline: None,
             shadow_affinity_mode: None,
             shadow_affinity_arm: None,
             shadow_affinity_realm_id: None,
@@ -2775,7 +3009,7 @@ mod tests {
     }
 
     #[test]
-    fn request_log_keeps_provider_cache_and_delta_reuse_metrics_separate() {
+    fn request_log_keeps_provider_cache_delta_and_waterline_metrics_separate() {
         let mut log = request_log("hit", Some("cache-key"));
         log.input_tokens = Some(100_000);
         log.cache_read_tokens = Some(81_920);
@@ -2784,6 +3018,15 @@ mod tests {
         log.response_session_semantic_reuse_items = Some(42);
         log.response_session_wire_saved_bytes = Some(65_536);
         log.response_session_wire_saved_ratio = Some(0.75);
+        log.final_scope_waterline = Some(FinalScopeWaterlineLog {
+            scope_digest: "scope-a".to_string(),
+            entry_generation: 3,
+            observed_cache_read_tokens: 80_000,
+            sent_prefix_bucket_tokens_128: 99_968,
+            settled_prefix_bucket_tokens_128: 79_872,
+            dispatch_seq: 7,
+            ..FinalScopeWaterlineLog::default()
+        });
 
         let value = serde_json::to_value(log).unwrap();
         assert_eq!(value["cache_read_tokens"], 81_920);
@@ -2792,6 +3035,119 @@ mod tests {
         assert_eq!(value["response_session_semantic_reuse_items"], 42);
         assert_eq!(value["response_session_wire_saved_bytes"], 65_536);
         assert_eq!(value["response_session_wire_saved_ratio"], 0.75);
+        assert_eq!(value["final_scope_waterline"]["scope_digest"], "scope-a");
+        assert_eq!(value["final_scope_waterline"]["entry_generation"], 3);
+        assert_eq!(
+            value["final_scope_waterline"]["observed_cache_read_tokens"],
+            80_000
+        );
+        assert_eq!(
+            value["final_scope_waterline"]["sent_prefix_bucket_tokens_128"],
+            99_968
+        );
+        assert_eq!(
+            value["cache_read_tokens"], 81_920,
+            "shadow waterlines must not overwrite true upstream cache telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_scope_waterline_is_shadow_only_for_live_and_trend_cache_metrics() {
+        let metrics = MetricsStore::new();
+        let hour_timestamp = Utc::now().timestamp().div_euclid(60 * 60) * 60 * 60;
+        let hour = DateTime::<Utc>::from_timestamp(hour_timestamp, 0)
+            .expect("current UTC hour must be representable");
+
+        let mut request = request_log("bypass", Some("waterline-shadow-only"));
+        request.id = "waterline-shadow-only".to_string();
+        request.at = hour + Duration::seconds(1);
+        request.agent_id = Some("codex".to_string());
+        request.agent_label = Some("Codex".to_string());
+        request.provider_id = Some("provider-a".to_string());
+        request.input_tokens = Some(100_000);
+        request.output_tokens = Some(320);
+        request.cache_read_tokens = Some(81_920);
+        request.cache_shortfall_tokens = Some(18_080);
+        request.cache_avoidable_gap_tokens = Some(8_000);
+        request.cache_new_tail_gap_tokens = Some(10_080);
+        request.provider_cache_token_ratio = Some(0.8192);
+        request.final_scope_waterline = Some(FinalScopeWaterlineLog {
+            scope_digest: "scope-shadow-only".to_string(),
+            entry_generation: 9,
+            // Deliberately impossible values: if any shadow field leaks into a
+            // real aggregate, every assertion below fails by a wide margin.
+            observed_cache_read_tokens: 9_000_000,
+            sent_prefix_bucket_tokens_128: 8_000_000,
+            settled_prefix_bucket_tokens_128: 7_000_000,
+            dispatch_seq: 99,
+            ..FinalScopeWaterlineLog::default()
+        });
+
+        let mut transaction = MetricsTransaction::upstream(request);
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 100_000,
+                output_tokens: 320,
+                cache_read_tokens: 81_920,
+                cache_creation_tokens: 512,
+            },
+            None,
+        );
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.provider_input_tokens, 100_000);
+        assert_eq!(snapshot.provider_cached_tokens, 81_920);
+        assert_eq!(snapshot.provider_cache_token_ratio, 0.8192);
+        assert_eq!(snapshot.usage.input_tokens, 100_000);
+        assert_eq!(snapshot.usage.cache_read_tokens, 81_920);
+        assert_eq!(snapshot.recent_usage.cache_read_tokens, 81_920);
+        assert_eq!(snapshot.recent_usage.cache_token_ratio, 0.8192);
+        assert_eq!(snapshot.recent_requests[0].cache_read_tokens, Some(81_920));
+        assert_eq!(
+            snapshot.recent_requests[0]
+                .final_scope_waterline
+                .as_ref()
+                .map(|waterline| waterline.observed_cache_read_tokens),
+            Some(9_000_000),
+            "shadow evidence remains observable without becoming cache telemetry"
+        );
+        let agent_provider = snapshot
+            .agent_provider_stats
+            .iter()
+            .find(|item| item.agent_id == "codex" && item.provider_id == "provider-a")
+            .expect("agent/provider aggregate should be present");
+        assert_eq!(agent_provider.input_tokens, 100_000);
+        assert_eq!(agent_provider.cache_read_tokens, 81_920);
+        assert_eq!(agent_provider.cache_shortfall_tokens, 18_080);
+        assert_eq!(agent_provider.cache_avoidable_gap_tokens, 8_000);
+        assert_eq!(agent_provider.cache_new_tail_gap_tokens, 10_080);
+
+        let trend = metrics
+            .trend(MetricsTrendQueryInput {
+                start_utc: hour.to_rfc3339(),
+                end_utc: (hour + Duration::hours(1)).to_rfc3339(),
+                agent_id: "codex".to_string(),
+                provider_id: Some("provider-a".to_string()),
+                include_cold_starts: true,
+            })
+            .expect("trend query should succeed");
+        assert_eq!(trend.summary.successful_requests, 1);
+        assert_eq!(trend.summary.input_tokens, 100_000);
+        assert_eq!(trend.summary.cache_read_tokens, 81_920);
+        assert_eq!(trend.summary.cache_miss_tokens, 18_080);
+        assert_eq!(trend.summary.cache_creation_tokens, 512);
+        assert_eq!(trend.summary.cache_shortfall_tokens, 18_080);
+        assert_eq!(trend.summary.cache_avoidable_gap_tokens, 8_000);
+        assert_eq!(trend.summary.cache_new_tail_gap_tokens, 10_080);
+        assert_eq!(trend.summary.cache_hit_rate, 0.8192);
+        assert_eq!(trend.points.len(), 1);
+        assert_eq!(trend.points[0].values, trend.summary);
     }
 
     fn agent_inbound_start(id: &str, policy: &str, budget: u64) -> AgentInboundStart {
@@ -3502,6 +3858,145 @@ mod tests {
         assert_eq!(snapshot.recent_failed_requests[0].status, 503);
         assert_eq!(snapshot.provider_stats[0].successful_requests, 1);
         assert_eq!(snapshot.provider_stats[0].error_statuses, 1);
+    }
+
+    #[tokio::test]
+    async fn persisted_trend_accepts_only_one_successful_applied_transaction() {
+        let metrics = MetricsStore::new();
+        let hour_timestamp = Utc::now().timestamp().div_euclid(60 * 60) * 60 * 60;
+        let hour = DateTime::<Utc>::from_timestamp(hour_timestamp, 0)
+            .expect("current UTC hour must be representable");
+
+        let mut success = request_log("miss", Some("trend-success"));
+        success.id = "trend-success".to_string();
+        success.at = hour + Duration::minutes(1);
+        success.agent_id = Some("codex".to_string());
+        success.agent_label = Some("Codex".to_string());
+        success.provider_id = Some("provider-a".to_string());
+        success.input_tokens = Some(1_000);
+        success.output_tokens = Some(25);
+        success.cache_read_tokens = Some(800);
+        success.cache_shortfall_tokens = Some(200);
+        success.cache_avoidable_gap_tokens = Some(80);
+        success.cache_new_tail_gap_tokens = Some(120);
+        let mut transaction = MetricsTransaction::upstream(success);
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 1_000,
+                output_tokens: 25,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 64,
+            },
+            None,
+        );
+        assert_eq!(
+            metrics.commit(transaction.clone()).await,
+            MetricsCommitResult::Applied
+        );
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Duplicate
+        );
+
+        let mut failed = request_log("error", Some("trend-failed"));
+        failed.id = "trend-failed".to_string();
+        failed.at = hour + Duration::minutes(2);
+        failed.status = 502;
+        failed.agent_id = Some("codex".to_string());
+        failed.provider_id = Some("provider-a".to_string());
+        failed.input_tokens = Some(9_999);
+        failed.cache_read_tokens = Some(9_999);
+        assert_eq!(
+            metrics.commit(MetricsTransaction::upstream(failed)).await,
+            MetricsCommitResult::Applied
+        );
+
+        let trend = metrics
+            .trend(MetricsTrendQueryInput {
+                start_utc: hour.to_rfc3339(),
+                end_utc: (hour + Duration::hours(1)).to_rfc3339(),
+                agent_id: "codex".to_string(),
+                provider_id: Some("provider-a".to_string()),
+                include_cold_starts: true,
+            })
+            .expect("trend query should succeed");
+        assert_eq!(trend.summary.successful_requests, 1);
+        assert_eq!(trend.summary.input_tokens, 1_000);
+        assert_eq!(trend.summary.cache_read_tokens, 800);
+        assert_eq!(trend.summary.cache_miss_tokens, 200);
+        assert_eq!(trend.summary.cache_creation_tokens, 64);
+        assert_eq!(trend.summary.cache_shortfall_tokens, 200);
+        assert_eq!(trend.summary.cache_avoidable_gap_tokens, 80);
+        assert_eq!(trend.summary.cache_new_tail_gap_tokens, 120);
+    }
+
+    #[tokio::test]
+    async fn local_cache_replay_does_not_duplicate_upstream_usage_in_trend() {
+        let metrics = MetricsStore::new();
+        let hour_timestamp = Utc::now().timestamp().div_euclid(60 * 60) * 60 * 60;
+        let hour = DateTime::<Utc>::from_timestamp(hour_timestamp, 0)
+            .expect("current UTC hour must be representable");
+
+        let mut upstream = request_log("miss", Some("trend-local-cache-replay"));
+        upstream.id = "trend-upstream".to_string();
+        upstream.at = hour + Duration::minutes(1);
+        upstream.agent_id = Some("codex".to_string());
+        upstream.agent_label = Some("Codex".to_string());
+        upstream.provider_id = Some("provider-a".to_string());
+        upstream.input_tokens = Some(1_000);
+        upstream.output_tokens = Some(25);
+        upstream.cache_read_tokens = Some(800);
+        let mut transaction = MetricsTransaction::upstream(upstream.clone());
+        transaction.observe_usage(
+            UsageRecord {
+                provider: "provider".to_string(),
+                model: "model".to_string(),
+                input_tokens: 1_000,
+                output_tokens: 25,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 64,
+            },
+            None,
+        );
+        assert_eq!(
+            metrics.commit(transaction).await,
+            MetricsCommitResult::Applied
+        );
+
+        let mut cached = upstream;
+        cached.id = "trend-local-cache-replay".to_string();
+        cached.at = hour + Duration::minutes(2);
+        cached.cache_status = "exact".to_string();
+        assert_eq!(
+            metrics
+                .commit(MetricsTransaction::local_cache(cached, 1_000))
+                .await,
+            MetricsCommitResult::Applied
+        );
+
+        let trend = metrics
+            .trend(MetricsTrendQueryInput {
+                start_utc: hour.to_rfc3339(),
+                end_utc: (hour + Duration::hours(1)).to_rfc3339(),
+                agent_id: "codex".to_string(),
+                provider_id: Some("provider-a".to_string()),
+                include_cold_starts: true,
+            })
+            .expect("trend query should succeed");
+        assert_eq!(trend.summary.successful_requests, 1);
+        assert_eq!(trend.summary.input_tokens, 1_000);
+        assert_eq!(trend.summary.cache_read_tokens, 800);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.total_requests, 2);
+        assert_eq!(snapshot.successful_requests, 2);
+        assert_eq!(snapshot.local_proxy.local_cache_hits, 1);
+        assert_eq!(snapshot.local_proxy.estimated_tokens_saved, 1_000);
+        assert_eq!(snapshot.recent_requests.len(), 2);
+        assert_eq!(snapshot.usage.input_tokens, 1_000);
+        assert_eq!(snapshot.usage.cache_read_tokens, 800);
     }
 
     #[tokio::test]

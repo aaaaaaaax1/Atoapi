@@ -46,7 +46,21 @@ impl SessionIdentity {
         let (identity_material, source) = identity_material_or_fallback(explicit.as_ref(), || {
             fallback_anchor_material(upstream_request)
         });
-        let scope_material = fallback_scope_material(upstream_request);
+        // A trusted composite identity must constrain every scope family. Content
+        // anchoring remains the fallback only when the request has no such identity.
+        let scope_material = explicit
+            .as_ref()
+            .map(|identity| format!("{}\0{}", identity.source, identity.material))
+            .unwrap_or_else(|| fallback_scope_material(upstream_request));
+        // Upstream placement and local prefix-control keys are cache hints,
+        // never continuation credentials. Keep their legacy primary
+        // conversation identity so a stricter v1.3.5 scope (which deliberately
+        // binds every supplied dimension) does not cold-start an otherwise
+        // unchanged upstream cache or reset its local waterline on upgrade.
+        // `anchor_key` and `scope_key` above remain the authoritative, full
+        // composite isolation keys.
+        let cache_control_material = legacy_primary_provider_cache_identity(client_request)
+            .unwrap_or_else(|| identity_material.clone());
         let model = provider_prefix_model_key(decision);
         let provider_group = provider_prefix_provider_group(decision);
         let agent_scope = agent_identity_scope(agent_id);
@@ -74,7 +88,7 @@ impl SessionIdentity {
                 &agent_scope,
                 &provider_group,
                 &model,
-                &identity_material,
+                &cache_control_material,
             ]),
             control_fingerprint: hash_parts(&[
                 "prefix-control-v2",
@@ -82,7 +96,7 @@ impl SessionIdentity {
                 &agent_scope,
                 &decision.provider.id,
                 &model,
-                &identity_material,
+                &cache_control_material,
             ]),
             source,
         })
@@ -91,8 +105,8 @@ impl SessionIdentity {
 
 #[derive(Debug, Clone)]
 struct ExplicitIdentity {
-    kind: &'static str,
-    value: String,
+    source: &'static str,
+    material: String,
 }
 
 fn identity_material_or_fallback(
@@ -101,33 +115,105 @@ fn identity_material_or_fallback(
 ) -> (String, &'static str) {
     match explicit {
         Some(identity) => (
-            format!("{}\0{}", identity.kind, identity.value),
-            identity.kind,
+            format!("{}\0{}", identity.source, identity.material),
+            identity.source,
         ),
         None => (fallback(), "content-anchor"),
     }
 }
 
 fn explicit_identity(request: &Value) -> Option<ExplicitIdentity> {
-    const KEYS: [(&str, &str); 4] = [
+    const KEYS: [(&str, &str); 3] = [
         ("thread-id", "thread_id"),
         ("conversation-id", "conversation_id"),
         ("session-id", "session_id"),
-        ("client-prompt-cache-key", "prompt_cache_key"),
     ];
 
-    for (kind, key) in KEYS {
-        if let Some(value) = request.get(key).and_then(non_empty_identity_value) {
-            return Some(ExplicitIdentity { kind, value });
+    // Identity dimensions can be split across request envelopes. Collect every
+    // allowed location in a deterministic order instead of allowing the first
+    // non-empty container to hide the rest.
+    let containers = [
+        ("direct-composite", Some(request)),
+        ("metadata-composite", request.get("metadata")),
+        ("context-composite", request.get("context")),
+        ("client-context-composite", request.get("client_context")),
+    ];
+    let mut values_by_dimension = [Vec::new(), Vec::new(), Vec::new()];
+    let mut sources = Vec::new();
+
+    for (source, value) in containers {
+        let Some(object) = value.and_then(Value::as_object) else {
+            continue;
+        };
+        let mut contributed = false;
+        for (index, (_, key)) in KEYS.iter().enumerate() {
+            if let Some(value) = object.get(*key).and_then(non_empty_identity_value) {
+                values_by_dimension[index].push(value);
+                contributed = true;
+            }
+        }
+        if contributed {
+            sources.push(source);
         }
     }
-    for container in ["metadata", "context", "client_context"] {
-        let Some(object) = request.get(container) else {
+
+    let mut material = Vec::new();
+    let mut has_conflict = false;
+    for ((kind, _), values) in KEYS.into_iter().zip(values_by_dimension) {
+        let mut values = values;
+        values.sort();
+        values.dedup();
+        match values.as_slice() {
+            [] => {}
+            [value] => material.push(format!("{kind}\0{value}")),
+            values => {
+                has_conflict = true;
+                material.extend(
+                    values
+                        .iter()
+                        .map(|value| format!("conflict:{kind}\0{value}")),
+                );
+            }
+        }
+    }
+
+    let source = if has_conflict {
+        "conflicted-composite"
+    } else {
+        match sources.as_slice() {
+            [source] => *source,
+            _ => "multi-container-composite",
+        }
+    };
+    (!material.is_empty()).then(|| ExplicitIdentity {
+        source,
+        material: material.join("\0"),
+    })
+}
+
+/// Retains the primary identity selection used by the released v1.3.4 cache
+/// key. It intentionally excludes `prompt_cache_key`: client placement hints
+/// must never become a conversation identity. This compatibility material is
+/// used only to choose the provider cache shard; strict session isolation uses
+/// the composite identity above.
+fn legacy_primary_provider_cache_identity(request: &Value) -> Option<String> {
+    const KEYS: [(&str, &str); 3] = [
+        ("thread-id", "thread_id"),
+        ("conversation-id", "conversation_id"),
+        ("session-id", "session_id"),
+    ];
+    for object in [
+        Some(request),
+        request.get("metadata"),
+        request.get("context"),
+        request.get("client_context"),
+    ] {
+        let Some(object) = object.and_then(Value::as_object) else {
             continue;
         };
         for (kind, key) in KEYS {
             if let Some(value) = object.get(key).and_then(non_empty_identity_value) {
-                return Some(ExplicitIdentity { kind, value });
+                return Some(format!("{kind}\0{value}"));
             }
         }
     }
@@ -288,22 +374,22 @@ mod tests {
             main_identity.control_fingerprint,
             review_identity.control_fingerprint
         );
-        assert_eq!(main_identity.source, "thread-id");
+        assert_eq!(main_identity.source, "direct-composite");
     }
 
     #[test]
     fn explicit_identity_does_not_evaluate_fallback_anchor() {
         let explicit = ExplicitIdentity {
-            kind: "thread-id",
-            value: "thread-1".to_string(),
+            source: "direct-composite",
+            material: "thread-id\0thread-1".to_string(),
         };
 
         let (material, source) = identity_material_or_fallback(Some(&explicit), || {
             panic!("explicit identities must not build fallback anchor material")
         });
 
-        assert_eq!(material, "thread-id\0thread-1");
-        assert_eq!(source, "thread-id");
+        assert_eq!(material, "direct-composite\0thread-id\0thread-1");
+        assert_eq!(source, "direct-composite");
     }
 
     #[test]
@@ -344,6 +430,283 @@ mod tests {
         assert_ne!(codex.anchor_key, zcode.anchor_key);
         assert_ne!(codex.scope_key, zcode.scope_key);
         assert_ne!(codex.provider_cache_key, zcode.provider_cache_key);
+    }
+
+    #[test]
+    fn explicit_identity_binds_all_present_conversation_dimensions() {
+        let (config, decision) = context();
+        let base = json!({
+            "thread_id": "thread-a",
+            "conversation_id": "conversation-a",
+            "session_id": "session-a",
+            "input": ["same"]
+        });
+        let baseline = SessionIdentity::derive(&config, &decision, &base, &base).unwrap();
+        for (field, value) in [
+            ("thread_id", "thread-b"),
+            ("conversation_id", "conversation-b"),
+            ("session_id", "session-b"),
+        ] {
+            let mut changed_body = base.clone();
+            changed_body[field] = json!(value);
+            let changed =
+                SessionIdentity::derive(&config, &decision, &changed_body, &changed_body).unwrap();
+
+            assert_ne!(baseline.anchor_key, changed.anchor_key, "{field}");
+            assert_ne!(baseline.scope_key, changed.scope_key, "{field}");
+            if field == "thread_id" {
+                assert_ne!(
+                    baseline.provider_cache_key, changed.provider_cache_key,
+                    "{field}"
+                );
+            } else {
+                assert_eq!(
+                    baseline.provider_cache_key, changed.provider_cache_key,
+                    "provider cache placement follows the stable primary thread"
+                );
+                assert_eq!(
+                    baseline.control_fingerprint, changed.control_fingerprint,
+                    "prefix control follows the stable primary thread"
+                );
+            }
+            if field == "thread_id" {
+                assert_ne!(
+                    baseline.control_fingerprint, changed.control_fingerprint,
+                    "{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_identity_merges_conversation_dimensions_across_allowed_containers() {
+        let (config, decision) = context();
+        let base = json!({
+            "thread_id": "thread-a",
+            "metadata": {
+                "conversation_id": "conversation-a",
+                "session_id": "session-a"
+            },
+            "input": ["same"]
+        });
+        let mut changed = base.clone();
+        changed["metadata"]["session_id"] = json!("session-b");
+
+        let base = SessionIdentity::derive(&config, &decision, &base, &base).unwrap();
+        let changed = SessionIdentity::derive(&config, &decision, &changed, &changed).unwrap();
+
+        assert_eq!(base.source, "multi-container-composite");
+        assert_ne!(base.anchor_key, changed.anchor_key);
+        assert_ne!(base.scope_key, changed.scope_key);
+        assert_eq!(base.provider_cache_key, changed.provider_cache_key);
+        assert_eq!(base.control_fingerprint, changed.control_fingerprint);
+    }
+
+    #[test]
+    fn conflicting_explicit_identity_is_not_an_unambiguous_conversation_scope() {
+        let (config, decision) = context();
+        let left = json!({
+            "thread_id": "thread-a",
+            "metadata": { "thread_id": "thread-b", "session_id": "session-a" },
+            "input": ["same"]
+        });
+        let right = json!({
+            "thread_id": "thread-a",
+            "metadata": { "thread_id": "thread-c", "session_id": "session-a" },
+            "input": ["same"]
+        });
+
+        let left = SessionIdentity::derive(&config, &decision, &left, &left).unwrap();
+        let right = SessionIdentity::derive(&config, &decision, &right, &right).unwrap();
+
+        assert_eq!(left.source, "conflicted-composite");
+        assert!(!super::super::session_identity_source_is_trusted(
+            left.source
+        ));
+        assert_ne!(left.anchor_key, right.anchor_key);
+        assert_ne!(left.scope_key, right.scope_key);
+        assert_eq!(left.provider_cache_key, right.provider_cache_key);
+        assert_eq!(left.control_fingerprint, right.control_fingerprint);
+    }
+
+    #[test]
+    fn provider_cache_key_preserves_v1_3_4_primary_thread_identity() {
+        let (config, decision) = context();
+        let request = json!({
+            "thread_id": "thread-a",
+            "metadata": {
+                "thread_id": "thread-a",
+                "session_id": "session-a"
+            },
+            "input": ["same"]
+        });
+        let identity = SessionIdentity::derive_for_agent(
+            &config,
+            &decision,
+            &request,
+            &request,
+            Some("codex"),
+        )
+        .unwrap();
+        let expected = hash_parts(&[
+            "provider-cache-v2",
+            &config.workspace_fingerprint,
+            "agent:codex",
+            &provider_prefix_provider_group(&decision),
+            &provider_prefix_model_key(&decision),
+            "thread-id\0thread-a",
+        ]);
+
+        assert_eq!(identity.provider_cache_key, expected);
+        let expected_control = hash_parts(&[
+            "prefix-control-v2",
+            &config.workspace_fingerprint,
+            "agent:codex",
+            &decision.provider.id,
+            &provider_prefix_model_key(&decision),
+            "thread-id\0thread-a",
+        ]);
+        assert_eq!(identity.control_fingerprint, expected_control);
+        assert_eq!(identity.source, "multi-container-composite");
+    }
+
+    #[test]
+    fn provider_cache_key_stays_compatible_for_all_normal_v1_3_4_identity_locations() {
+        let (config, decision) = context();
+        let fixtures = [
+            json!({
+                "thread_id": "direct-thread",
+                "metadata": { "session_id": "direct-session" },
+                "input": ["same"]
+            }),
+            json!({
+                "metadata": {
+                    "thread_id": "metadata-thread",
+                    "session_id": "metadata-session"
+                },
+                "input": ["same"]
+            }),
+            json!({
+                "context": { "conversation_id": "context-conversation" },
+                "input": ["same"]
+            }),
+            json!({
+                "client_context": { "session_id": "client-session" },
+                "input": ["same"]
+            }),
+        ];
+
+        for request in fixtures {
+            let current = SessionIdentity::derive_for_agent(
+                &config,
+                &decision,
+                &request,
+                &request,
+                Some("codex"),
+            )
+            .unwrap();
+            assert_eq!(
+                current.provider_cache_key,
+                v1_3_4_provider_cache_key_for_test(&config, &decision, &request, Some("codex")),
+                "normal conversation identities must retain the cache key produced by v1.3.4"
+            );
+            assert_eq!(
+                current.control_fingerprint,
+                v1_3_4_prefix_control_fingerprint_for_test(
+                    &config,
+                    &decision,
+                    &request,
+                    Some("codex"),
+                ),
+                "normal conversation identities must retain the prefix control key produced by v1.3.4"
+            );
+        }
+    }
+
+    fn v1_3_4_provider_cache_key_for_test(
+        config: &AppConfig,
+        decision: &RouteDecision,
+        request: &Value,
+        agent_id: Option<&str>,
+    ) -> String {
+        let identity_material = v1_3_4_primary_identity_material_for_test(request)
+            .unwrap_or_else(|| fallback_anchor_material(request));
+        let model = provider_prefix_model_key(decision);
+        let provider_group = provider_prefix_provider_group(decision);
+        let agent_scope = agent_identity_scope(agent_id);
+        hash_parts(&[
+            "provider-cache-v2",
+            &config.workspace_fingerprint,
+            &agent_scope,
+            &provider_group,
+            &model,
+            &identity_material,
+        ])
+    }
+
+    fn v1_3_4_primary_identity_material_for_test(request: &Value) -> Option<String> {
+        const KEYS: [(&str, &str); 3] = [
+            ("thread-id", "thread_id"),
+            ("conversation-id", "conversation_id"),
+            ("session-id", "session_id"),
+        ];
+        [
+            Some(request),
+            request.get("metadata"),
+            request.get("context"),
+            request.get("client_context"),
+        ]
+        .into_iter()
+        .find_map(|candidate| {
+            let object = candidate.and_then(Value::as_object)?;
+            KEYS.into_iter().find_map(|(kind, key)| {
+                object
+                    .get(key)
+                    .and_then(non_empty_identity_value)
+                    .map(|value| format!("{kind}\0{value}"))
+            })
+        })
+    }
+
+    fn v1_3_4_prefix_control_fingerprint_for_test(
+        config: &AppConfig,
+        decision: &RouteDecision,
+        request: &Value,
+        agent_id: Option<&str>,
+    ) -> String {
+        let identity_material = v1_3_4_primary_identity_material_for_test(request)
+            .unwrap_or_else(|| fallback_anchor_material(request));
+        let model = provider_prefix_model_key(decision);
+        let agent_scope = agent_identity_scope(agent_id);
+        hash_parts(&[
+            "prefix-control-v2",
+            &config.workspace_fingerprint,
+            &agent_scope,
+            &decision.provider.id,
+            &model,
+            &identity_material,
+        ])
+    }
+
+    #[test]
+    fn prompt_cache_key_is_a_placement_hint_not_a_session_identity() {
+        let (config, decision) = context();
+        let left = json!({
+            "prompt_cache_key": "placement-a",
+            "instructions": "stable",
+            "input": [{"role": "user", "content": "same"}]
+        });
+        let mut right = left.clone();
+        right["prompt_cache_key"] = json!("placement-b");
+
+        let left = SessionIdentity::derive(&config, &decision, &left, &left).unwrap();
+        let right = SessionIdentity::derive(&config, &decision, &right, &right).unwrap();
+
+        assert_eq!(left.source, "content-anchor");
+        assert_eq!(left.anchor_key, right.anchor_key);
+        assert_eq!(left.scope_key, right.scope_key);
+        assert_eq!(left.provider_cache_key, right.provider_cache_key);
+        assert_eq!(left.control_fingerprint, right.control_fingerprint);
     }
 
     #[test]

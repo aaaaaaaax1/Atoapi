@@ -10,6 +10,23 @@ if (patcherBuild.status !== 0) {
   process.exit(patcherBuild.status || 1);
 }
 
+// A bundle is only allowed after the deterministic FastRelayCore gate.  It
+// never starts the desktop instance or talks to the configured upstream; the
+// separate release workflow may additionally request the isolated wire/cache
+// evidence when an old baseline executable is available.
+const preflight = spawnSync(process.execPath, [join("scripts", "verify-fastrelay-core.mjs")], {
+  stdio: "inherit",
+  shell: false
+});
+if (preflight.status !== 0) {
+  process.exit(preflight.status || 1);
+}
+
+const scriptArgs = process.argv.slice(2);
+if (scriptArgs.includes("--preflight-only")) {
+  process.exit(0);
+}
+
 const home = process.env.USERPROFILE || process.env.HOME || "";
 const candidateDirs = [
   process.env.CARGO_HOME ? join(process.env.CARGO_HOME, "bin") : "",
@@ -58,7 +75,6 @@ const tauriBin = process.platform === "win32"
   ? join("node_modules", ".bin", "tauri.cmd")
   : join("node_modules", ".bin", "tauri");
 
-const scriptArgs = process.argv.slice(2);
 const tauriArgs = scriptArgs.includes("--all")
   ? ["build"]
   : ["build", ...(scriptArgs.length > 0 ? scriptArgs : ["--bundles", "nsis"])];

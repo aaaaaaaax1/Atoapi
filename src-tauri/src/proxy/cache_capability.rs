@@ -3,6 +3,8 @@ use crate::config::{
 };
 use serde_json::{json, Value};
 
+use super::prepared_wire_request::PreparedResponseBody;
+
 pub(super) const PROVIDER_CACHE_METADATA_FIELDS: [&str; 4] = [
     "prompt_cache_key",
     "prompt_cache_retention",
@@ -66,6 +68,7 @@ pub(super) fn plan(
     }
 }
 
+#[cfg(test)]
 pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePlan) -> Vec<String> {
     let mut changed_fields = Vec::new();
     if let Some(object) = request.as_object_mut() {
@@ -96,6 +99,53 @@ pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePla
         }
     } else {
         record_removed_cache_breakpoint_fields(request, &mut changed_fields);
+    }
+    changed_fields
+}
+
+/// Applies the same cache-control plan through the final wire holder. Every
+/// mutation is constrained to a named root, so a late cache control cannot
+/// leave the semantic body ahead of a retained draft member.
+pub(super) fn apply_prepared(
+    request: &mut PreparedResponseBody,
+    channel: &Channel,
+    plan: NativeCachePlan,
+) -> Vec<String> {
+    let mut changed_fields = Vec::new();
+    if !plan.preserve_prompt_cache_key && request.remove_root("prompt_cache_key") {
+        mark_changed_field(&mut changed_fields, "prompt_cache_key");
+    }
+    if !plan.preserve_legacy_retention && request.remove_root("prompt_cache_retention") {
+        mark_changed_field(&mut changed_fields, "prompt_cache_retention");
+    }
+    if plan.enable_modern_options {
+        if request.body().get("prompt_cache_options").is_none()
+            && request.set_root(
+                "prompt_cache_options",
+                json!({"mode": "implicit", "ttl": "30m"}),
+            )
+        {
+            mark_changed_field(&mut changed_fields, "prompt_cache_options");
+        }
+    } else if request.remove_root("prompt_cache_options") {
+        mark_changed_field(&mut changed_fields, "prompt_cache_options");
+    }
+
+    if plan.enable_explicit_breakpoint {
+        if let Some(root_key) = cache_payload_root_key(channel) {
+            let changed = request
+                .mutate_root_if(
+                    root_key,
+                    |root| add_safe_explicit_breakpoint_in_root(root, channel),
+                    |changed| *changed,
+                )
+                .unwrap_or(false);
+            if changed {
+                mark_changed_field(&mut changed_fields, root_key);
+            }
+        }
+    } else {
+        record_removed_cache_breakpoint_fields_from_prepared(request, &mut changed_fields);
     }
     changed_fields
 }
@@ -142,6 +192,7 @@ fn cache_payload_root_key(channel: &Channel) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn record_removed_cache_breakpoint_fields(request: &mut Value, changed_fields: &mut Vec<String>) {
     let Some(object) = request.as_object_mut() else {
         remove_cache_breakpoints(request);
@@ -158,6 +209,23 @@ fn record_removed_cache_breakpoint_fields(request: &mut Value, changed_fields: &
     }
     for key in nested_changed {
         mark_changed_field(changed_fields, &key);
+    }
+}
+
+fn record_removed_cache_breakpoint_fields_from_prepared(
+    request: &mut PreparedResponseBody,
+    changed_fields: &mut Vec<String>,
+) {
+    if request.remove_root("prompt_cache_breakpoint") {
+        mark_changed_field(changed_fields, "prompt_cache_breakpoint");
+    }
+    for key in request.root_keys() {
+        let changed = request
+            .mutate_root_if(&key, remove_cache_breakpoints, |changed| *changed)
+            .unwrap_or(false);
+        if changed {
+            mark_changed_field(changed_fields, &key);
+        }
     }
 }
 
@@ -345,6 +413,7 @@ fn model_uses_modern_prompt_cache_controls(model: &str) -> bool {
     matches!((major, minor), (Some(major), Some(minor)) if major > 5 || (major == 5 && minor >= 6))
 }
 
+#[cfg(test)]
 fn add_safe_explicit_breakpoint(request: &mut Value, channel: &Channel) -> bool {
     if contains_cache_breakpoint(request) {
         return false;
@@ -357,6 +426,10 @@ fn add_safe_explicit_breakpoint(request: &mut Value, channel: &Channel) -> bool 
     let Some(root) = request.get_mut(root_key) else {
         return false;
     };
+    add_safe_explicit_breakpoint_in_root(root, channel)
+}
+
+fn add_safe_explicit_breakpoint_in_root(root: &mut Value, channel: &Channel) -> bool {
     let mut seen = 0usize;
     mark_penultimate_supported_block(root, channel, &mut seen)
 }
@@ -600,6 +673,34 @@ mod tests {
         assert!(body["input"][0]["content"][1]
             .get("prompt_cache_breakpoint")
             .is_none());
+    }
+
+    #[test]
+    fn prepared_cache_control_application_matches_the_plain_value_path() {
+        let config = AppConfig::default();
+        let plan = plan(
+            &config,
+            &provider("https://api.openai.com/v1"),
+            "gpt-5.6",
+            &Channel::Responses,
+            None,
+        );
+        let initial = json!({
+            "prompt_cache_key": "stable",
+            "prompt_cache_retention": "24h",
+            "input": [{"type":"message","role":"user","content":[
+                {"type":"input_text","text":"stable"},
+                {"type":"input_text","text":"dynamic"}
+            ]}]
+        });
+        let mut expected = initial.clone();
+        let expected_changed = apply(&mut expected, &Channel::Responses, plan);
+
+        let mut prepared = PreparedResponseBody::plain(initial);
+        let actual_changed = apply_prepared(&mut prepared, &Channel::Responses, plan);
+
+        assert_eq!(actual_changed, expected_changed);
+        assert_eq!(prepared.body(), &expected);
     }
 
     #[test]

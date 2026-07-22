@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
 };
@@ -124,11 +126,7 @@ impl CacheWriteCoordinator {
             CacheWriteRequest::Snapshot(snapshot) => {
                 write_cache_snapshot(&path, snapshot.as_ref().clone())
             }
-            CacheWriteRequest::Delete => match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(err.into()),
-            },
+            CacheWriteRequest::Delete => remove_cache_snapshot(&path),
         })
     }
 
@@ -266,6 +264,7 @@ impl CacheStore {
     }
 
     pub async fn load_from_disk(&self) -> Result<()> {
+        recover_interrupted_cache_replacement(&self.path)?;
         if !self.path.exists() {
             return Ok(());
         }
@@ -279,6 +278,11 @@ impl CacheStore {
             ensure_semantic_vector(&mut entry);
             guard.insert(entry.key.clone(), Arc::new(entry));
         }
+        // A previous file only survives when the process stopped after the new
+        // snapshot was promoted but before cleanup. Remove it only after the
+        // promoted snapshot has been decrypted and parsed successfully.
+        remove_file_if_exists(&cache_previous_path(&self.path)).ok();
+        remove_file_if_exists(&cache_temp_path(&self.path)).ok();
         Ok(())
     }
 
@@ -430,10 +434,155 @@ fn write_cache_snapshot(path: &Path, entries: Vec<Arc<CacheEntry>>) -> Result<()
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    recover_interrupted_cache_replacement(path)?;
     let entries = entries.iter().map(Arc::as_ref).collect::<Vec<_>>();
     let raw = serde_json::to_vec(&entries)?;
     let encrypted = crypto::encrypt_cache_bytes(&raw)?;
-    fs::write(path, encrypted)?;
+    let temp = cache_temp_path(path);
+    remove_file_if_exists(&temp)
+        .with_context(|| format!("failed to remove stale cache temp {}", temp.display()))?;
+
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp)
+            .with_context(|| format!("failed to create cache temp {}", temp.display()))?;
+        file.write_all(&encrypted)
+            .with_context(|| format!("failed to write cache temp {}", temp.display()))?;
+        // The staged file must be durable before the last known-good snapshot
+        // is moved aside on Windows.
+        file.sync_all()
+            .with_context(|| format!("failed to sync cache temp {}", temp.display()))?;
+        drop(file);
+        replace_cache_snapshot(path, &temp)
+    })();
+
+    if write_result.is_err() {
+        // The replacement helper has already restored the old target when it
+        // can. A failed restore deliberately leaves `.previous` in place for
+        // startup recovery; the uncommitted candidate is never authoritative.
+        remove_file_if_exists(&temp).ok();
+    }
+    write_result
+}
+
+fn cache_temp_path(path: &Path) -> PathBuf {
+    cache_sibling_path(path, ".tmp")
+}
+
+fn cache_previous_path(path: &Path) -> PathBuf {
+    cache_sibling_path(path, ".previous")
+}
+
+fn cache_sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| "response-cache.bin".into());
+    file_name.push(suffix);
+    path.with_file_name(file_name)
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_cache_snapshot(path: &Path) -> Result<()> {
+    // Remove recovery artifacts before the authoritative target. If the
+    // process stops midway, it can leave an old cache in place but cannot
+    // resurrect a cache that was already cleared.
+    for artifact in [cache_temp_path(path), cache_previous_path(path)] {
+        remove_file_if_exists(&artifact)
+            .with_context(|| format!("failed to remove cache artifact {}", artifact.display()))?;
+    }
+    remove_file_if_exists(path)
+        .with_context(|| format!("failed to remove response cache {}", path.display()))?;
+    Ok(())
+}
+
+fn recover_interrupted_cache_replacement(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    let previous = cache_previous_path(path);
+    if !previous.exists() {
+        return Ok(());
+    }
+    fs::rename(&previous, path).with_context(|| {
+        format!(
+            "failed to restore previous response cache {} to {}",
+            previous.display(),
+            path.display()
+        )
+    })
+}
+
+fn replace_cache_snapshot(path: &Path, temp: &Path) -> Result<()> {
+    replace_cache_snapshot_with(path, temp, |from, to| fs::rename(from, to))
+}
+
+fn replace_cache_snapshot_with(
+    path: &Path,
+    temp: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match rename(temp, path) {
+        Ok(()) => {
+            // `rename` replaces atomically on platforms that support it. A
+            // stale Windows recovery file is no longer needed after commit.
+            remove_file_if_exists(&cache_previous_path(path)).ok();
+            return Ok(());
+        }
+        Err(error) if !path.exists() => {
+            return Err(error)
+                .with_context(|| format!("failed to promote response cache {}", path.display()));
+        }
+        Err(_) => {}
+    }
+
+    // Windows `std::fs::rename` does not replace an existing target. Keep the
+    // old snapshot beside it until the durable temp file has been promoted.
+    let previous = cache_previous_path(path);
+    remove_file_if_exists(&previous).with_context(|| {
+        format!(
+            "failed to remove stale response cache backup {}",
+            previous.display()
+        )
+    })?;
+    rename(path, &previous).with_context(|| {
+        format!(
+            "failed to stage response cache {} for replacement",
+            path.display()
+        )
+    })?;
+
+    if let Err(replace_error) = rename(temp, path) {
+        if let Err(restore_error) = rename(&previous, path) {
+            return Err(anyhow::anyhow!(
+                "failed to replace response cache {}: {}; failed to restore last good snapshot from {}: {}",
+                path.display(),
+                replace_error,
+                previous.display(),
+                restore_error
+            ));
+        }
+        return Err(replace_error).with_context(|| {
+            format!(
+                "failed to replace response cache {}; restored the last good snapshot",
+                path.display()
+            )
+        });
+    }
+
+    // Cleanup is best effort: if the process stops here, load_from_disk first
+    // validates the promoted target and then removes this recovery artifact.
+    remove_file_if_exists(&previous).ok();
     Ok(())
 }
 
@@ -990,10 +1139,88 @@ mod tests {
     use super::*;
     use crate::config::CacheMode;
     use serde_json::json;
+    use std::io::ErrorKind;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Barrier, Mutex as StdMutex,
     };
+    use uuid::Uuid;
+
+    #[test]
+    fn windows_style_cache_replace_promotes_temp_and_removes_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cache-atomic-replace-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("response-cache.bin");
+        let temp = cache_temp_path(&path);
+        let previous = cache_previous_path(&path);
+        fs::write(&path, b"last-good").unwrap();
+        fs::write(&temp, b"new-complete").unwrap();
+
+        let mut rename_count = 0usize;
+        replace_cache_snapshot_with(&path, &temp, |from, to| {
+            rename_count += 1;
+            if rename_count == 1 {
+                // Match Windows: rename cannot replace an existing target.
+                Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "simulated Windows target-exists failure",
+                ))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new-complete");
+        assert!(!temp.exists());
+        assert!(!previous.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn interrupted_cache_replace_recovers_last_good_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-cache-replace-recovery-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("response-cache.bin");
+        let temp = cache_temp_path(&path);
+        let previous = cache_previous_path(&path);
+        fs::write(&path, b"last-good").unwrap();
+        fs::write(&temp, b"uncommitted-candidate").unwrap();
+
+        let mut rename_count = 0usize;
+        let result = replace_cache_snapshot_with(&path, &temp, |from, to| {
+            rename_count += 1;
+            match rename_count {
+                1 => Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "simulated Windows target-exists failure",
+                )),
+                3 => Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "simulated candidate promotion failure",
+                )),
+                4 => Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "simulated immediate restore failure",
+                )),
+                _ => fs::rename(from, to),
+            }
+        });
+
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert_eq!(fs::read(&previous).unwrap(), b"last-good");
+        recover_interrupted_cache_replacement(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"last-good");
+        assert!(!previous.exists());
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn cache_key_is_stable_for_reordered_objects() {

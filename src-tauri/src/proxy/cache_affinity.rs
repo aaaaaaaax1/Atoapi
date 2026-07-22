@@ -1,7 +1,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::Instant;
 
 use super::affinity_identity::AffinityIdentity;
@@ -19,6 +19,8 @@ const POST_BURST_WINDOW_TTL_HOURS: i64 = 4;
 const POST_BURST_EVIDENCE_TTL_HOURS: i64 = 24;
 const POST_BURST_WINDOW_LIMIT: usize = 512;
 const POST_BURST_EVIDENCE_LIMIT: usize = 1536;
+const POST_BURST_READINESS_MAX_AGE_HOURS: i64 = POST_BURST_EVIDENCE_TTL_HOURS;
+const SHADOW_SETTLEMENT_MAINTENANCE_BUDGET: usize = 32;
 const POST_BURST_MIN_ARM_OBSERVATIONS: u64 = 9;
 const POST_BURST_MIN_CANARY_OBSERVATIONS: u64 = 3;
 const POST_BURST_MIN_EFFICACY_OBSERVATIONS: u64 = 9;
@@ -106,13 +108,19 @@ pub(crate) struct PostBurstWindow {
     pub(crate) lane: ShadowCacheLane,
     #[serde(default)]
     pub(crate) candidate_variant: ShadowCacheCandidateVariant,
+    #[serde(default)]
+    pub(crate) realm_id: String,
+    #[serde(default)]
+    pub(crate) policy_epoch: u64,
+    #[serde(default)]
+    pub(crate) anchor_epoch: u64,
 }
 
 fn default_post_burst_window_lane() -> ShadowCacheLane {
     ShadowCacheLane::ToolBurstQuarantine
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PostBurstEvidence {
     pub(crate) window_id: u64,
     pub(crate) conversation_id: String,
@@ -209,6 +217,10 @@ pub(crate) struct PostBurstReadiness {
     pub(crate) canary_baseline: PostBurstArmSummary,
     pub(crate) candidate_applied: PostBurstArmSummary,
     pub(crate) updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) evidence_generation: u64,
+    #[serde(default)]
+    pub(crate) valid_until: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -223,6 +235,18 @@ pub(crate) struct PostBurstEvidenceLedger {
     pub(crate) readiness: HashMap<String, PostBurstReadiness>,
     #[serde(default)]
     pub(crate) rollbacks: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) evidence_generations: HashMap<String, u64>,
+    #[serde(skip)]
+    window_age_index: BTreeSet<(DateTime<Utc>, String)>,
+    #[serde(skip)]
+    evidence_scope_latest_expiry: HashMap<String, DateTime<Utc>>,
+    #[serde(skip)]
+    evidence_scope_expiries: HashMap<String, BTreeMap<DateTime<Utc>, u32>>,
+    #[serde(skip)]
+    evidence_scope_indexed_len: usize,
+    #[serde(skip)]
+    evidence_scope_records: HashMap<String, VecDeque<PostBurstEvidence>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +263,8 @@ pub(crate) struct ShadowAffinityStore {
     pub assignments: HashMap<String, ShadowAffinityAssignment>,
     #[serde(default)]
     pub(crate) post_burst: PostBurstEvidenceLedger,
+    #[serde(skip)]
+    assignment_age_index: BTreeSet<(DateTime<Utc>, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -263,6 +289,36 @@ pub(super) struct ShadowAffinityDecision {
     pub automatic_canary_status: Option<PostBurstReadinessStatus>,
     #[serde(default)]
     pub automatic_canary_reason: Option<String>,
+}
+
+/// A lock-free fallback for the request hot path.  Affinity is an optimization
+/// and its persisted state is never conversation truth, so a background
+/// runtime snapshot must not hold an inbound request before the first upstream
+/// byte.  The caller records this decision as shadow-only and skips controlled
+/// candidate routing for this one request.
+pub(super) fn shadow_affinity_snapshot_lock_busy(
+    identity: &AffinityIdentity,
+    policy_compute_ms: u64,
+) -> ShadowAffinityDecision {
+    ShadowAffinityDecision {
+        mode: "shadow".to_string(),
+        assignment_key: None,
+        realm_id: identity.realm_id.clone(),
+        cohort_id: identity.cohort_id.clone(),
+        lane: ShadowCacheLane::Transparent,
+        candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+        arm: ShadowAffinityArm::Baseline,
+        shard: 0,
+        policy_epoch: SHADOW_POLICY_EPOCH,
+        anchor_epoch: 0,
+        trusted_identity: identity.trusted_conversation_id.is_some(),
+        decision: "snapshot_lock_busy".to_string(),
+        skip_reason: Some("runtime_snapshot_lock_busy".to_string()),
+        policy_compute_ms,
+        validation_run_id: None,
+        automatic_canary_status: None,
+        automatic_canary_reason: None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -340,39 +396,440 @@ fn post_burst_comparison_key_for_candidate(
     )
 }
 
-fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime<Utc>) {
+fn post_burst_evidence_scope_key(observation: &PostBurstEvidence) -> String {
+    post_burst_comparison_key_for_candidate(
+        &observation.realm_id,
+        observation.lane,
+        observation.candidate_variant,
+    )
+}
+
+fn evidence_generation(ledger: &PostBurstEvidenceLedger, comparison_key: &str) -> u64 {
     ledger
-        .windows
-        .retain(|_, window| window.expires_at >= now && window.remaining_requests > 0);
-    while ledger.windows.len() > POST_BURST_WINDOW_LIMIT {
-        let oldest = ledger
+        .evidence_generations
+        .get(comparison_key)
+        .copied()
+        .unwrap_or_default()
+}
+
+fn bump_evidence_generation(ledger: &mut PostBurstEvidenceLedger, comparison_key: &str) {
+    let generation = ledger
+        .evidence_generations
+        .entry(comparison_key.to_string())
+        .or_default();
+    *generation = generation.saturating_add(1);
+}
+
+fn rebuild_evidence_scope_index(ledger: &mut PostBurstEvidenceLedger) {
+    ledger.evidence_scope_latest_expiry.clear();
+    ledger.evidence_scope_expiries.clear();
+    ledger.evidence_scope_records.clear();
+    for observation in &ledger.evidence {
+        let comparison_key = post_burst_evidence_scope_key(observation);
+        let expires_at = observation.observed_at + Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
+        ledger
+            .evidence_scope_latest_expiry
+            .entry(comparison_key.clone())
+            .and_modify(|current| *current = (*current).max(expires_at))
+            .or_insert(expires_at);
+        ledger
+            .evidence_scope_expiries
+            .entry(comparison_key.clone())
+            .or_default()
+            .entry(expires_at)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+        ledger
+            .evidence_scope_records
+            .entry(comparison_key)
+            .or_default()
+            .push_back(observation.clone());
+    }
+    ledger.evidence_scope_indexed_len = ledger.evidence.len();
+}
+
+fn ensure_evidence_scope_index(ledger: &mut PostBurstEvidenceLedger) {
+    if ledger.evidence_scope_indexed_len != ledger.evidence.len() {
+        rebuild_evidence_scope_index(ledger);
+    }
+}
+
+fn record_evidence_scope(ledger: &mut PostBurstEvidenceLedger, observation: &PostBurstEvidence) {
+    ensure_evidence_scope_index(ledger);
+    let comparison_key = post_burst_evidence_scope_key(observation);
+    let expires_at = observation.observed_at + Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
+    ledger
+        .evidence_scope_latest_expiry
+        .entry(comparison_key.clone())
+        .and_modify(|current| *current = (*current).max(expires_at))
+        .or_insert(expires_at);
+    ledger
+        .evidence_scope_expiries
+        .entry(comparison_key.clone())
+        .or_default()
+        .entry(expires_at)
+        .and_modify(|count| *count = count.saturating_add(1))
+        .or_insert(1);
+    ledger
+        .evidence_scope_records
+        .entry(comparison_key)
+        .or_default()
+        .push_back(observation.clone());
+    ledger.evidence_scope_indexed_len = ledger.evidence_scope_indexed_len.saturating_add(1);
+}
+
+/// Remove one globally evicted evidence item from its scope index in O(log n).
+/// The caller removes from `ledger.evidence` immediately before this call, so
+/// the index length is intentionally one ahead until this function settles it.
+/// Any unexpected ordering mismatch is safe: rebuild the small bounded index
+/// instead of retaining stale readiness evidence.
+fn remove_evidence_scope(ledger: &mut PostBurstEvidenceLedger, observation: &PostBurstEvidence) {
+    let comparison_key = post_burst_evidence_scope_key(observation);
+    let front_matches = ledger
+        .evidence_scope_records
+        .get(&comparison_key)
+        .and_then(VecDeque::front)
+        .is_some_and(|front| front == observation);
+    if !front_matches {
+        rebuild_evidence_scope_index(ledger);
+        return;
+    }
+
+    let Some(records) = ledger.evidence_scope_records.get_mut(&comparison_key) else {
+        rebuild_evidence_scope_index(ledger);
+        return;
+    };
+    let remove_scope = {
+        records.pop_front();
+        records.is_empty()
+    };
+    if remove_scope {
+        ledger.evidence_scope_records.remove(&comparison_key);
+    }
+
+    let expires_at = observation.observed_at + Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
+    let expiry_update = ledger
+        .evidence_scope_expiries
+        .get_mut(&comparison_key)
+        .and_then(|expiries| {
+            let count = expiries.get_mut(&expires_at)?;
+            let remove_expiry = *count <= 1;
+            if remove_expiry {
+                expiries.remove(&expires_at);
+            } else {
+                *count -= 1;
+            }
+            Some(expiries.last_key_value().map(|(expiry, _)| *expiry))
+        });
+    let Some(latest_expiry) = expiry_update else {
+        rebuild_evidence_scope_index(ledger);
+        return;
+    };
+    if let Some(latest_expiry) = latest_expiry {
+        ledger
+            .evidence_scope_latest_expiry
+            .insert(comparison_key.clone(), latest_expiry);
+    } else {
+        ledger.evidence_scope_expiries.remove(&comparison_key);
+        ledger.evidence_scope_latest_expiry.remove(&comparison_key);
+    }
+    ledger.evidence_scope_indexed_len = ledger.evidence_scope_indexed_len.saturating_sub(1);
+}
+
+fn has_fresh_evidence_for_scope(
+    ledger: &mut PostBurstEvidenceLedger,
+    comparison_key: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    ensure_evidence_scope_index(ledger);
+    ledger
+        .evidence_scope_latest_expiry
+        .get(comparison_key)
+        .is_some_and(|expires_at| *expires_at >= now)
+}
+
+fn prune_evidence_scope_state(ledger: &mut PostBurstEvidenceLedger) {
+    ensure_evidence_scope_index(ledger);
+    ledger.readiness.retain(|key, _| {
+        ledger.evidence_scope_latest_expiry.contains_key(key) || ledger.rollbacks.contains_key(key)
+    });
+    ledger.evidence_generations.retain(|key, _| {
+        ledger.readiness.contains_key(key)
+            || ledger.rollbacks.contains_key(key)
+            || ledger.evidence_scope_latest_expiry.contains_key(key)
+    });
+    ledger
+        .evidence_scope_records
+        .retain(|key, _| ledger.evidence_scope_latest_expiry.contains_key(key));
+    ledger
+        .evidence_scope_expiries
+        .retain(|key, _| ledger.evidence_scope_latest_expiry.contains_key(key));
+}
+
+fn rebuild_assignment_age_index(store: &mut ShadowAffinityStore) {
+    store.assignment_age_index.clear();
+    store.assignment_age_index.extend(
+        store
+            .assignments
+            .iter()
+            .map(|(key, assignment)| (assignment.last_seen_at, key.clone())),
+    );
+}
+
+fn ensure_assignment_age_index(store: &mut ShadowAffinityStore) {
+    if store.assignment_age_index.len() != store.assignments.len() {
+        rebuild_assignment_age_index(store);
+    }
+}
+
+fn rebuild_post_burst_window_age_index(ledger: &mut PostBurstEvidenceLedger) {
+    ledger.window_age_index.clear();
+    ledger.window_age_index.extend(
+        ledger
             .windows
             .iter()
-            .min_by_key(|(_, window)| window.opened_at)
-            .map(|(key, _)| key.clone());
-        if let Some(oldest) = oldest {
-            ledger.windows.remove(&oldest);
-        } else {
+            .map(|(key, window)| (window.opened_at, key.clone())),
+    );
+}
+
+fn ensure_post_burst_window_age_index(ledger: &mut PostBurstEvidenceLedger) {
+    if ledger.window_age_index.len() != ledger.windows.len() {
+        rebuild_post_burst_window_age_index(ledger);
+    }
+}
+
+pub(crate) fn prepare_shadow_affinity_store(store: &mut ShadowAffinityStore) {
+    rebuild_assignment_age_index(store);
+    rebuild_post_burst_window_age_index(&mut store.post_burst);
+    rebuild_evidence_scope_index(&mut store.post_burst);
+    evict_assignments(store, Utc::now());
+}
+
+fn remove_post_burst_window(
+    ledger: &mut PostBurstEvidenceLedger,
+    conversation_id: &str,
+) -> Option<PostBurstWindow> {
+    ensure_post_burst_window_age_index(ledger);
+    let window = ledger.windows.remove(conversation_id)?;
+    ledger
+        .window_age_index
+        .remove(&(window.opened_at, conversation_id.to_string()));
+    Some(window)
+}
+
+fn evict_oldest_post_burst_window(ledger: &mut PostBurstEvidenceLedger) -> bool {
+    ensure_post_burst_window_age_index(ledger);
+    let Some((_, oldest)) = ledger.window_age_index.first().cloned() else {
+        return false;
+    };
+    remove_post_burst_window(ledger, &oldest).is_some()
+}
+
+/// Make room before a new window is inserted.  The incoming conversation is
+/// deliberately absent from the index at this point, so eviction never needs
+/// a protected-key scan on the request/settlement path.
+fn make_room_for_new_post_burst_window(ledger: &mut PostBurstEvidenceLedger) {
+    while ledger.windows.len() >= POST_BURST_WINDOW_LIMIT {
+        if !evict_oldest_post_burst_window(ledger) {
             break;
         }
     }
+}
+
+/// Cold-path recovery for restored or otherwise over-limit state.  Normal
+/// insertions make room before mutation and never call this helper.
+fn enforce_post_burst_window_capacity(ledger: &mut PostBurstEvidenceLedger) {
+    while ledger.windows.len() > POST_BURST_WINDOW_LIMIT {
+        if !evict_oldest_post_burst_window(ledger) {
+            break;
+        }
+    }
+}
+
+fn insert_post_burst_window(
+    ledger: &mut PostBurstEvidenceLedger,
+    conversation_id: String,
+    window: PostBurstWindow,
+) {
+    ensure_post_burst_window_age_index(ledger);
+    if !ledger.windows.contains_key(&conversation_id) {
+        make_room_for_new_post_burst_window(ledger);
+    }
+    if let Some(replaced) = ledger
+        .windows
+        .insert(conversation_id.clone(), window.clone())
+    {
+        ledger
+            .window_age_index
+            .remove(&(replaced.opened_at, conversation_id.clone()));
+    }
+    ledger
+        .window_age_index
+        .insert((window.opened_at, conversation_id.clone()));
+}
+
+fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime<Utc>) {
+    let expired_windows = ledger
+        .windows
+        .iter()
+        .filter(|(_, window)| {
+            window.expires_at < now
+                || window.remaining_requests == 0
+                || window.realm_id.is_empty()
+                || window.policy_epoch != SHADOW_POLICY_EPOCH
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for conversation_id in expired_windows {
+        remove_post_burst_window(ledger, &conversation_id);
+    }
+    enforce_post_burst_window_capacity(ledger);
 
     let cutoff = now - Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
-    ledger.evidence.retain(|observation| {
-        observation.observed_at >= cutoff && observation.policy_epoch == SHADOW_POLICY_EPOCH
-    });
-    while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
-        ledger.evidence.pop_front();
+    let mut invalidated_scopes = BTreeSet::new();
+    let mut retained = VecDeque::with_capacity(ledger.evidence.len());
+    for observation in ledger.evidence.drain(..) {
+        if observation.observed_at >= cutoff && observation.policy_epoch == SHADOW_POLICY_EPOCH {
+            retained.push_back(observation);
+        } else {
+            invalidated_scopes.insert(post_burst_evidence_scope_key(&observation));
+        }
     }
-    ledger.readiness.retain(|key, _| {
-        ledger.evidence.iter().any(|observation| {
-            post_burst_comparison_key_for_candidate(
-                &observation.realm_id,
-                observation.lane,
-                observation.candidate_variant,
-            ) == *key
-        })
+    ledger.evidence = retained;
+    while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
+        if let Some(observation) = ledger.evidence.pop_front() {
+            invalidated_scopes.insert(post_burst_evidence_scope_key(&observation));
+        }
+    }
+    rebuild_evidence_scope_index(ledger);
+    for comparison_key in invalidated_scopes {
+        bump_evidence_generation(ledger, &comparison_key);
+        ledger.readiness.remove(&comparison_key);
+    }
+    prune_evidence_scope_state(ledger);
+}
+
+fn assignment_is_current(assignment: &ShadowAffinityAssignment, now: DateTime<Utc>) -> bool {
+    assignment.policy_epoch == SHADOW_POLICY_EPOCH
+        && assignment.last_seen_at >= now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS)
+}
+
+fn discard_inactive_assignment_for_scope(
+    store: &mut ShadowAffinityStore,
+    conversation_id: &str,
+    realm_id: &str,
+    now: DateTime<Utc>,
+) {
+    let inactive = store
+        .assignments
+        .get(conversation_id)
+        .is_some_and(|assignment| {
+            !assignment_is_current(assignment, now) || assignment.realm_id != realm_id
+        });
+    if inactive {
+        remove_assignment(store, conversation_id);
+    }
+}
+
+fn remove_assignment(
+    store: &mut ShadowAffinityStore,
+    conversation_id: &str,
+) -> Option<ShadowAffinityAssignment> {
+    ensure_assignment_age_index(store);
+    let assignment = store.assignments.remove(conversation_id)?;
+    store
+        .assignment_age_index
+        .remove(&(assignment.last_seen_at, conversation_id.to_string()));
+    remove_post_burst_window(&mut store.post_burst, conversation_id);
+    Some(assignment)
+}
+
+fn active_post_burst_window_for_scope(
+    ledger: &mut PostBurstEvidenceLedger,
+    conversation_id: &str,
+    realm_id: &str,
+    policy_epoch: u64,
+    anchor_epoch: u64,
+    now: DateTime<Utc>,
+) -> Option<(ShadowCacheLane, ShadowCacheCandidateVariant)> {
+    let invalid = ledger.windows.get(conversation_id).is_some_and(|window| {
+        window.conversation_id != conversation_id
+            || window.expires_at < now
+            || window.remaining_requests == 0
+            || window.realm_id != realm_id
+            || window.policy_epoch != policy_epoch
+            || window.anchor_epoch != anchor_epoch
     });
+    if invalid {
+        remove_post_burst_window(ledger, conversation_id);
+        return None;
+    }
+    ledger
+        .windows
+        .get(conversation_id)
+        .map(|window| (window.lane, window.candidate_variant))
+}
+
+fn evict_oldest_assignment(store: &mut ShadowAffinityStore) -> bool {
+    ensure_assignment_age_index(store);
+    let Some((_, oldest)) = store.assignment_age_index.first().cloned() else {
+        return false;
+    };
+    remove_assignment(store, &oldest).is_some()
+}
+
+/// Make room before a new assignment is inserted.  This keeps the hot path at
+/// O(log n): no protected-key search and no capacity sweep after insertion.
+fn make_room_for_new_assignment(store: &mut ShadowAffinityStore) {
+    while store.assignments.len() >= SHADOW_ASSIGNMENT_LIMIT {
+        if !evict_oldest_assignment(store) {
+            break;
+        }
+    }
+}
+
+/// Cold-path recovery for a restored state that is already over capacity.
+fn enforce_assignment_capacity(store: &mut ShadowAffinityStore) {
+    while store.assignments.len() > SHADOW_ASSIGNMENT_LIMIT {
+        if !evict_oldest_assignment(store) {
+            break;
+        }
+    }
+}
+
+fn maintain_shadow_affinity_after_settlement(store: &mut ShadowAffinityStore, now: DateTime<Utc>) {
+    ensure_assignment_age_index(store);
+    let assignment_cutoff = now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS);
+    for _ in 0..SHADOW_SETTLEMENT_MAINTENANCE_BUDGET {
+        let Some((last_seen_at, conversation_id)) = store.assignment_age_index.first().cloned()
+        else {
+            break;
+        };
+        if last_seen_at >= assignment_cutoff {
+            break;
+        }
+        remove_assignment(store, &conversation_id);
+    }
+
+    ensure_post_burst_window_age_index(&mut store.post_burst);
+    for _ in 0..SHADOW_SETTLEMENT_MAINTENANCE_BUDGET {
+        let Some((_, conversation_id)) = store.post_burst.window_age_index.first().cloned() else {
+            break;
+        };
+        let removable = store
+            .post_burst
+            .windows
+            .get(&conversation_id)
+            .is_some_and(|window| {
+                window.expires_at < now
+                    || window.realm_id.is_empty()
+                    || window.policy_epoch != SHADOW_POLICY_EPOCH
+            });
+        if !removable {
+            break;
+        }
+        remove_post_burst_window(&mut store.post_burst, &conversation_id);
+    }
 }
 
 fn summarize_post_burst_arm<'a>(
@@ -625,40 +1082,44 @@ fn evaluate_post_burst_readiness(
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
     let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
+    let current_evidence_generation = evidence_generation(ledger, &comparison_key);
+    let cutoff = now - Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS);
+    let scoped_evidence = ledger.evidence_scope_records.get(&comparison_key);
     let matching = |observation: &&PostBurstEvidence| {
         observation.realm_id == realm_id
             && observation.lane == lane
             && observation.candidate_variant == candidate_variant
             && observation.policy_epoch == SHADOW_POLICY_EPOCH
+            && observation.observed_at >= cutoff
     };
     let baseline = summarize_post_burst_arm(
-        ledger
-            .evidence
+        scoped_evidence
             .iter()
+            .flat_map(|records| records.iter())
             .filter(matching)
             .filter(|observation| observation.arm == ShadowAffinityArm::Baseline),
     );
     let candidate_shadow = summarize_post_burst_arm(
-        ledger
-            .evidence
+        scoped_evidence
             .iter()
+            .flat_map(|records| records.iter())
             .filter(matching)
             .filter(|observation| {
                 observation.arm == ShadowAffinityArm::Candidate && !observation.candidate_applied
             }),
     );
     let candidate_applied = summarize_post_burst_arm(
-        ledger
-            .evidence
+        scoped_evidence
             .iter()
+            .flat_map(|records| records.iter())
             .filter(matching)
             .filter(|observation| {
                 observation.arm == ShadowAffinityArm::Candidate && observation.candidate_applied
             }),
     );
-    let canary_baseline = ledger
-        .evidence
+    let canary_baseline = scoped_evidence
         .iter()
+        .flat_map(|records| records.iter())
         .filter(matching)
         .filter(|observation| {
             observation.arm == ShadowAffinityArm::Candidate && observation.candidate_applied
@@ -666,9 +1127,9 @@ fn evaluate_post_burst_readiness(
         .map(|observation| observation.observed_at)
         .min()
         .map(|canary_started_at| {
-            let contemporaneous = ledger
-                .evidence
+            let contemporaneous = scoped_evidence
                 .iter()
+                .flat_map(|records| records.iter())
                 .filter(matching)
                 .filter(|observation| {
                     observation.arm == ShadowAffinityArm::Baseline
@@ -778,6 +1239,18 @@ fn evaluate_post_burst_readiness(
         canary_baseline,
         candidate_applied,
         updated_at: now,
+        evidence_generation: current_evidence_generation,
+        valid_until: Some(
+            scoped_evidence
+                .iter()
+                .flat_map(|records| records.iter())
+                .filter(matching)
+                .map(|observation| {
+                    observation.observed_at + Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS)
+                })
+                .min()
+                .unwrap_or_else(|| now + Duration::hours(POST_BURST_READINESS_MAX_AGE_HOURS)),
+        ),
     }
 }
 
@@ -788,6 +1261,12 @@ fn refresh_post_burst_readiness(
     candidate_variant: ShadowCacheCandidateVariant,
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
+    let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
+    if !has_fresh_evidence_for_scope(ledger, &comparison_key, now)
+        && !ledger.rollbacks.contains_key(&comparison_key)
+    {
+        return empty_post_burst_readiness(ledger, realm_id, lane, candidate_variant, now);
+    }
     let readiness = evaluate_post_burst_readiness(ledger, realm_id, lane, candidate_variant, now);
     if readiness.status == PostBurstReadinessStatus::RollbackRequired {
         ledger
@@ -801,16 +1280,77 @@ fn refresh_post_burst_readiness(
     readiness
 }
 
+fn empty_post_burst_readiness(
+    ledger: &PostBurstEvidenceLedger,
+    realm_id: &str,
+    lane: ShadowCacheLane,
+    candidate_variant: ShadowCacheCandidateVariant,
+    now: DateTime<Utc>,
+) -> PostBurstReadiness {
+    PostBurstReadiness {
+        comparison_key: post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant),
+        realm_id: realm_id.to_string(),
+        lane,
+        candidate_variant,
+        status: PostBurstReadinessStatus::InsufficientEvidence,
+        reason: "insufficient_arm_observations".to_string(),
+        baseline: PostBurstArmSummary::default(),
+        candidate_shadow: PostBurstArmSummary::default(),
+        canary_baseline: PostBurstArmSummary::default(),
+        candidate_applied: PostBurstArmSummary::default(),
+        updated_at: now,
+        evidence_generation: evidence_generation(
+            ledger,
+            &post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant),
+        ),
+        valid_until: None,
+    }
+}
+
+fn current_post_burst_readiness(
+    ledger: &mut PostBurstEvidenceLedger,
+    realm_id: &str,
+    lane: ShadowCacheLane,
+    candidate_variant: ShadowCacheCandidateVariant,
+    now: DateTime<Utc>,
+) -> PostBurstReadiness {
+    let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
+    let has_evidence = has_fresh_evidence_for_scope(ledger, &comparison_key, now);
+    let has_rollback = ledger.rollbacks.contains_key(&comparison_key);
+    if !has_evidence && !has_rollback {
+        return empty_post_burst_readiness(ledger, realm_id, lane, candidate_variant, now);
+    }
+    if let Some(readiness) = ledger.readiness.get(&comparison_key).filter(|readiness| {
+        let rollback_matches = ledger.rollbacks.contains_key(&comparison_key)
+            == (readiness.status == PostBurstReadinessStatus::RollbackRequired);
+        readiness.evidence_generation == evidence_generation(ledger, &comparison_key)
+            && readiness
+                .valid_until
+                .is_some_and(|valid_until| valid_until > now)
+            && rollback_matches
+    }) {
+        return readiness.clone();
+    }
+    refresh_post_burst_readiness(ledger, realm_id, lane, candidate_variant, now)
+}
+
 fn observe_post_burst_evidence(
     ledger: &mut PostBurstEvidenceLedger,
     decision: &ShadowAffinityDecision,
     input: ShadowObservationInput,
     now: DateTime<Utc>,
 ) {
-    evict_post_burst_evidence(ledger, now);
     let Some(conversation_id) = decision.assignment_key.as_deref() else {
         return;
     };
+    active_post_burst_window_for_scope(
+        ledger,
+        conversation_id,
+        &decision.realm_id,
+        decision.policy_epoch,
+        decision.anchor_epoch,
+        now,
+    );
 
     let captured = (!input.compaction_boundary)
         .then(|| {
@@ -829,7 +1369,7 @@ fn observe_post_burst_evidence(
         .flatten();
     if let Some((window_id, followup_index, finished, evidence_lane, candidate_variant)) = captured
     {
-        ledger.evidence.push_back(PostBurstEvidence {
+        let observation = PostBurstEvidence {
             window_id,
             conversation_id: conversation_id.to_string(),
             observed_at: now,
@@ -852,13 +1392,25 @@ fn observe_post_burst_evidence(
             attempt_count: input.attempt_count.max(1),
             candidate_applied: decision.arm == ShadowAffinityArm::Candidate
                 && matches!(decision.mode.as_str(), "applied" | "validation_applied"),
-        });
+        };
+        let comparison_key = post_burst_evidence_scope_key(&observation);
+        record_evidence_scope(ledger, &observation);
+        ledger.evidence.push_back(observation);
         if finished {
-            ledger.windows.remove(conversation_id);
+            remove_post_burst_window(ledger, conversation_id);
         }
+        let mut invalidated_scopes = BTreeSet::from([comparison_key]);
         while ledger.evidence.len() > POST_BURST_EVIDENCE_LIMIT {
-            ledger.evidence.pop_front();
+            if let Some(removed) = ledger.evidence.pop_front() {
+                let removed_comparison_key = post_burst_evidence_scope_key(&removed);
+                remove_evidence_scope(ledger, &removed);
+                invalidated_scopes.insert(removed_comparison_key);
+            }
         }
+        for comparison_key in invalidated_scopes {
+            bump_evidence_generation(ledger, &comparison_key);
+        }
+        prune_evidence_scope_state(ledger);
         refresh_post_burst_readiness(
             ledger,
             &decision.realm_id,
@@ -870,7 +1422,8 @@ fn observe_post_burst_evidence(
 
     if input.giant_tail {
         ledger.next_window_id = ledger.next_window_id.saturating_add(1).max(1);
-        ledger.windows.insert(
+        insert_post_burst_window(
+            ledger,
             conversation_id.to_string(),
             PostBurstWindow {
                 window_id: ledger.next_window_id,
@@ -881,6 +1434,9 @@ fn observe_post_burst_evidence(
                 captured_requests: 0,
                 lane: ShadowCacheLane::ToolBurstQuarantine,
                 candidate_variant: decision.candidate_variant,
+                realm_id: decision.realm_id.clone(),
+                policy_epoch: decision.policy_epoch,
+                anchor_epoch: decision.anchor_epoch,
             },
         );
     }
@@ -940,7 +1496,7 @@ fn active_candidate_for_realm(
     lane: ShadowCacheLane,
     now: DateTime<Utc>,
 ) -> (ShadowCacheCandidateVariant, PostBurstReadiness) {
-    let cohort = refresh_post_burst_readiness(
+    let cohort = current_post_burst_readiness(
         ledger,
         realm_id,
         lane,
@@ -952,7 +1508,7 @@ fn active_candidate_for_realm(
     {
         return (ShadowCacheCandidateVariant::CohortKey, cohort);
     }
-    let cohort_two_shard = refresh_post_burst_readiness(
+    let cohort_two_shard = current_post_burst_readiness(
         ledger,
         realm_id,
         lane,
@@ -967,7 +1523,7 @@ fn active_candidate_for_realm(
             cohort_two_shard,
         );
     }
-    let provider_native = refresh_post_burst_readiness(
+    let provider_native = current_post_burst_readiness(
         ledger,
         realm_id,
         lane,
@@ -1062,14 +1618,21 @@ pub(super) fn compute_shadow_affinity(
         };
     };
 
+    discard_inactive_assignment_for_scope(store, &conversation_id, &identity.realm_id, now);
+    ensure_assignment_age_index(store);
+    if !store.assignments.contains_key(&conversation_id) {
+        make_room_for_new_assignment(store);
+    }
+    if let Some(previous_last_seen_at) = store
+        .assignments
+        .get(&conversation_id)
+        .map(|assignment| assignment.last_seen_at)
+    {
+        store
+            .assignment_age_index
+            .remove(&(previous_last_seen_at, conversation_id.clone()));
+    }
     let (realm_id, cohort_id, assignment_lane, arm, shard, policy_epoch, anchor_epoch) = {
-        if store
-            .assignments
-            .get(&conversation_id)
-            .is_some_and(|assignment| assignment.policy_epoch != SHADOW_POLICY_EPOCH)
-        {
-            store.assignments.remove(&conversation_id);
-        }
         let assignment = store
             .assignments
             .entry(conversation_id.clone())
@@ -1111,16 +1674,24 @@ pub(super) fn compute_shadow_affinity(
             assignment.anchor_epoch,
         )
     };
-    let active_window = store.post_burst.windows.get(&conversation_id);
+    store
+        .assignment_age_index
+        .insert((now, conversation_id.clone()));
+    let active_window = active_post_burst_window_for_scope(
+        &mut store.post_burst,
+        &conversation_id,
+        &realm_id,
+        policy_epoch,
+        anchor_epoch,
+        now,
+    );
     let lane = active_window
-        .map(|window| window.lane)
+        .map(|(lane, _)| lane)
         .unwrap_or(assignment_lane);
-    let window_candidate_variant = active_window.map(|window| window.candidate_variant);
-    evict_assignments(store, now);
-    evict_post_burst_evidence(&mut store.post_burst, now);
+    let window_candidate_variant = active_window.map(|(_, candidate_variant)| candidate_variant);
     let forced_candidate_variant = forced_isolated_candidate_variant();
     let (candidate_variant, readiness) = if let Some(candidate_variant) = window_candidate_variant {
-        let readiness = refresh_post_burst_readiness(
+        let readiness = current_post_burst_readiness(
             &mut store.post_burst,
             &realm_id,
             lane,
@@ -1129,7 +1700,7 @@ pub(super) fn compute_shadow_affinity(
         );
         (candidate_variant, readiness)
     } else if let Some(candidate_variant) = forced_candidate_variant {
-        let readiness = refresh_post_burst_readiness(
+        let readiness = current_post_burst_readiness(
             &mut store.post_burst,
             &realm_id,
             lane,
@@ -1377,10 +1948,19 @@ pub(super) fn observe_shadow_affinity(
     let Some(key) = decision.assignment_key.as_deref() else {
         return;
     };
+    ensure_assignment_age_index(store);
+    let Some(previous_last_seen_at) = store
+        .assignments
+        .get(key)
+        .map(|assignment| assignment.last_seen_at)
+    else {
+        return;
+    };
+    store
+        .assignment_age_index
+        .remove(&(previous_last_seen_at, key.to_string()));
     {
-        let Some(assignment) = store.assignments.get_mut(key) else {
-            return;
-        };
+        let assignment = store.assignments.get_mut(key).expect("checked above");
         assignment.last_seen_at = now;
         assignment.observations += 1;
         if input.success {
@@ -1408,7 +1988,9 @@ pub(super) fn observe_shadow_affinity(
             };
         }
     }
+    store.assignment_age_index.insert((now, key.to_string()));
     observe_post_burst_evidence(&mut store.post_burst, decision, input, now);
+    maintain_shadow_affinity_after_settlement(store, now);
 }
 
 pub(super) fn reset_anchor(
@@ -1416,20 +1998,41 @@ pub(super) fn reset_anchor(
     conversation_id: &str,
     now: DateTime<Utc>,
 ) {
-    let opened = if let Some(assignment) = store.assignments.get_mut(conversation_id) {
+    ensure_assignment_age_index(store);
+    let opened = if let Some(previous_last_seen_at) = store
+        .assignments
+        .get(conversation_id)
+        .map(|assignment| assignment.last_seen_at)
+    {
+        store
+            .assignment_age_index
+            .remove(&(previous_last_seen_at, conversation_id.to_string()));
+        let assignment = store
+            .assignments
+            .get_mut(conversation_id)
+            .expect("checked above");
         assignment.anchor_epoch = assignment.anchor_epoch.saturating_add(1);
         assignment.lane = ShadowCacheLane::CompactedAnchor;
         assignment.last_seen_at = now;
-        true
+        Some((
+            assignment.realm_id.clone(),
+            assignment.policy_epoch,
+            assignment.anchor_epoch,
+        ))
     } else {
-        false
+        None
     };
-    if opened {
+    if let Some((realm_id, policy_epoch, anchor_epoch)) = opened {
+        store
+            .assignment_age_index
+            .insert((now, conversation_id.to_string()));
         store.post_burst.next_window_id = store.post_burst.next_window_id.saturating_add(1).max(1);
-        store.post_burst.windows.insert(
+        let window_id = store.post_burst.next_window_id;
+        insert_post_burst_window(
+            &mut store.post_burst,
             conversation_id.to_string(),
             PostBurstWindow {
-                window_id: store.post_burst.next_window_id,
+                window_id,
                 conversation_id: conversation_id.to_string(),
                 opened_at: now,
                 expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
@@ -1437,28 +2040,26 @@ pub(super) fn reset_anchor(
                 captured_requests: 0,
                 lane: ShadowCacheLane::CompactedAnchor,
                 candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id,
+                policy_epoch,
+                anchor_epoch,
             },
         );
     }
 }
 
 pub(crate) fn evict_assignments(store: &mut ShadowAffinityStore, now: DateTime<Utc>) {
-    let cutoff = now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS);
-    store.assignments.retain(|_, assignment| {
-        assignment.last_seen_at >= cutoff && assignment.policy_epoch == SHADOW_POLICY_EPOCH
-    });
-    while store.assignments.len() > SHADOW_ASSIGNMENT_LIMIT {
-        let oldest = store
-            .assignments
-            .iter()
-            .min_by_key(|(_, assignment)| assignment.last_seen_at)
-            .map(|(key, _)| key.clone());
-        if let Some(oldest) = oldest {
-            store.assignments.remove(&oldest);
-        } else {
-            break;
-        }
+    let expired = store
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| !assignment_is_current(assignment, now))
+        .map(|(conversation_id, _)| conversation_id.clone())
+        .collect::<Vec<_>>();
+    for conversation_id in expired {
+        remove_assignment(store, &conversation_id);
     }
+    enforce_assignment_capacity(store);
+    rebuild_assignment_age_index(store);
     evict_post_burst_evidence(&mut store.post_burst, now);
 }
 
@@ -1505,6 +2106,40 @@ mod tests {
                 key_id: Some("key".to_string()),
             },
         )
+    }
+
+    fn append_scope_evidence(
+        ledger: &mut PostBurstEvidenceLedger,
+        realm_id: &str,
+        now: DateTime<Utc>,
+    ) -> String {
+        let observation = PostBurstEvidence {
+            window_id: 1,
+            conversation_id: format!("{realm_id}-conversation"),
+            observed_at: now,
+            followup_index: 1,
+            realm_id: realm_id.to_string(),
+            lane: ShadowCacheLane::Steady,
+            candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+            arm: ShadowAffinityArm::Baseline,
+            policy_epoch: SHADOW_POLICY_EPOCH,
+            anchor_epoch: 0,
+            success: true,
+            status: 200,
+            has_usage: true,
+            input_tokens: 16_384,
+            cache_read_tokens: 15_360,
+            cache_ratio_bps: 9_375,
+            avoidable_gap_tokens: 0,
+            provider_unstable_gap_tokens: 0,
+            ttft_ms: 100,
+            attempt_count: 1,
+            candidate_applied: false,
+        };
+        let comparison_key = post_burst_evidence_scope_key(&observation);
+        record_evidence_scope(ledger, &observation);
+        ledger.evidence.push_back(observation);
+        comparison_key
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3473,5 +4108,574 @@ mod tests {
         }
         evict_assignments(&mut store, now + Duration::seconds(10_000));
         assert!(store.assignments.len() <= SHADOW_ASSIGNMENT_LIMIT);
+    }
+
+    #[test]
+    fn current_scope_expiration_does_not_sweep_unrelated_assignments_on_the_send_path() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let current = identity("current-expired-scope");
+        let unrelated = identity("unrelated-expired-scope");
+        let current_decision = compute_shadow_affinity(
+            &mut store,
+            &current,
+            None,
+            now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS + 1),
+            0,
+            0,
+        );
+        let unrelated_decision = compute_shadow_affinity(
+            &mut store,
+            &unrelated,
+            None,
+            now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS + 1),
+            0,
+            0,
+        );
+        let current_key = current_decision.assignment_key.unwrap();
+        let unrelated_key = unrelated_decision.assignment_key.unwrap();
+        let stale_current = store.assignments.get_mut(&current_key).unwrap();
+        stale_current.lane = ShadowCacheLane::CompactedAnchor;
+        stale_current.anchor_epoch = 77;
+
+        let recovered = compute_shadow_affinity(&mut store, &current, None, now, 0, 0);
+
+        assert_eq!(recovered.lane, ShadowCacheLane::Steady);
+        assert_eq!(recovered.anchor_epoch, 0);
+        assert_eq!(store.assignments[&current_key].anchor_epoch, 0);
+        assert!(
+            store.assignments.contains_key(&unrelated_key),
+            "the request hot path must not scan and evict unrelated scopes"
+        );
+    }
+
+    #[test]
+    fn expired_current_post_burst_window_is_ignored_without_sweeping_other_windows() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let current = identity("current-expired-window");
+        let initial = compute_shadow_affinity(&mut store, &current, None, now, 0, 0);
+        let current_key = initial.assignment_key.unwrap();
+        let expired_at = now - Duration::seconds(1);
+        store.post_burst.windows.insert(
+            current_key.clone(),
+            PostBurstWindow {
+                window_id: 1,
+                conversation_id: current_key.clone(),
+                opened_at: expired_at - Duration::minutes(1),
+                expires_at: expired_at,
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::CompactedAnchor,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id: String::new(),
+                policy_epoch: 0,
+                anchor_epoch: 0,
+            },
+        );
+        store.post_burst.windows.insert(
+            "unrelated-expired-window".to_string(),
+            PostBurstWindow {
+                window_id: 2,
+                conversation_id: "unrelated-expired-window".to_string(),
+                opened_at: expired_at - Duration::minutes(1),
+                expires_at: expired_at,
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::ToolBurstQuarantine,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id: String::new(),
+                policy_epoch: 0,
+                anchor_epoch: 0,
+            },
+        );
+
+        let recovered = compute_shadow_affinity(&mut store, &current, None, now, 0, 0);
+
+        assert_eq!(recovered.lane, ShadowCacheLane::Steady);
+        assert!(!store.post_burst.windows.contains_key(&current_key));
+        assert!(
+            store
+                .post_burst
+                .windows
+                .contains_key("unrelated-expired-window"),
+            "the request hot path must only clean the current conversation window"
+        );
+    }
+
+    #[test]
+    fn key_realm_change_resets_assignment_and_its_open_post_burst_window() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let initial_identity = identity("realm-change-thread");
+        let initial = compute_shadow_affinity(&mut store, &initial_identity, None, now, 0, 0);
+        let assignment_key = initial.assignment_key.unwrap();
+        let assignment = store.assignments.get_mut(&assignment_key).unwrap();
+        assignment.lane = ShadowCacheLane::CompactedAnchor;
+        assignment.anchor_epoch = 9;
+        store.post_burst.windows.insert(
+            assignment_key.clone(),
+            PostBurstWindow {
+                window_id: 1,
+                conversation_id: assignment_key.clone(),
+                opened_at: now,
+                expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::CompactedAnchor,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id: initial_identity.realm_id.clone(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 9,
+            },
+        );
+        let mut different_key_realm = initial_identity.clone();
+        different_key_realm.realm_id = "different-selected-key-realm".to_string();
+        different_key_realm.cohort_id = "different-selected-key-cohort".to_string();
+
+        let recovered = compute_shadow_affinity(
+            &mut store,
+            &different_key_realm,
+            None,
+            now + Duration::seconds(1),
+            0,
+            0,
+        );
+
+        assert_eq!(recovered.lane, ShadowCacheLane::Steady);
+        assert_eq!(recovered.anchor_epoch, 0);
+        assert_eq!(
+            store.assignments[&assignment_key].realm_id,
+            "different-selected-key-realm"
+        );
+        assert!(!store.post_burst.windows.contains_key(&assignment_key));
+    }
+
+    #[test]
+    fn capacity_eviction_removes_the_displaced_window_and_keeps_the_current_scope() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let oldest_key = format!("capacity-{}", SHADOW_ASSIGNMENT_LIMIT - 1);
+        for index in 0..SHADOW_ASSIGNMENT_LIMIT {
+            let conversation_id = format!("capacity-{index}");
+            store.assignments.insert(
+                conversation_id.clone(),
+                ShadowAffinityAssignment {
+                    conversation_id,
+                    cohort_id: "cohort".to_string(),
+                    realm_id: "realm".to_string(),
+                    policy_epoch: SHADOW_POLICY_EPOCH,
+                    lane: ShadowCacheLane::Steady,
+                    arm: ShadowAffinityArm::Baseline,
+                    shard: 0,
+                    anchor_epoch: 0,
+                    created_at: now,
+                    last_seen_at: now - Duration::seconds(index as i64 + 1),
+                    observations: 0,
+                    successful_observations: 0,
+                    usage_observations: 0,
+                    inconclusive_observations: 0,
+                    input_tokens: 0,
+                    cache_read_tokens: 0,
+                },
+            );
+        }
+        store.post_burst.windows.insert(
+            oldest_key.clone(),
+            PostBurstWindow {
+                window_id: 1,
+                conversation_id: oldest_key.clone(),
+                opened_at: now - Duration::minutes(1),
+                expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::ToolBurstQuarantine,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id: "realm".to_string(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 0,
+            },
+        );
+        prepare_shadow_affinity_store(&mut store);
+
+        let current =
+            compute_shadow_affinity(&mut store, &identity("capacity-current"), None, now, 0, 0);
+        let current_key = current.assignment_key.unwrap();
+
+        assert!(store.assignments.contains_key(&current_key));
+        assert!(store.assignments.len() <= SHADOW_ASSIGNMENT_LIMIT);
+        assert!(!store.assignments.contains_key(&oldest_key));
+        assert!(!store.post_burst.windows.contains_key(&oldest_key));
+    }
+
+    #[test]
+    fn settlement_maintenance_prunes_expired_assignments_and_windows_with_a_bounded_index() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let conversation_id = "expired-maintenance-scope".to_string();
+        store.assignments.insert(
+            conversation_id.clone(),
+            ShadowAffinityAssignment {
+                conversation_id: conversation_id.clone(),
+                cohort_id: "cohort".to_string(),
+                realm_id: "realm".to_string(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                lane: ShadowCacheLane::Steady,
+                arm: ShadowAffinityArm::Baseline,
+                shard: 0,
+                anchor_epoch: 0,
+                created_at: now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS + 1),
+                last_seen_at: now - Duration::hours(SHADOW_ASSIGNMENT_TTL_HOURS + 1),
+                observations: 0,
+                successful_observations: 0,
+                usage_observations: 0,
+                inconclusive_observations: 0,
+                input_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        );
+        store.post_burst.windows.insert(
+            conversation_id.clone(),
+            PostBurstWindow {
+                window_id: 1,
+                conversation_id: conversation_id.clone(),
+                opened_at: now - Duration::hours(POST_BURST_WINDOW_TTL_HOURS + 1),
+                expires_at: now - Duration::seconds(1),
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::Steady,
+                candidate_variant: ShadowCacheCandidateVariant::CohortKey,
+                realm_id: "realm".to_string(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 0,
+            },
+        );
+        rebuild_assignment_age_index(&mut store);
+        rebuild_post_burst_window_age_index(&mut store.post_burst);
+
+        maintain_shadow_affinity_after_settlement(&mut store, now);
+
+        assert!(store.assignments.is_empty());
+        assert!(store.post_burst.windows.is_empty());
+    }
+
+    #[test]
+    fn evidence_scope_index_tracks_push_and_capacity_pop_without_double_counting() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        let first_key = append_scope_evidence(&mut ledger, "first-realm", now);
+        let second_key = append_scope_evidence(&mut ledger, "second-realm", now);
+        assert_eq!(ledger.evidence_scope_indexed_len, ledger.evidence.len());
+        assert!(ledger.evidence_scope_latest_expiry.contains_key(&first_key));
+        assert!(ledger
+            .evidence_scope_latest_expiry
+            .contains_key(&second_key));
+
+        let removed = ledger.evidence.pop_front().unwrap();
+        remove_evidence_scope(&mut ledger, &removed);
+
+        assert_eq!(ledger.evidence_scope_indexed_len, 1);
+        assert!(!ledger.evidence_scope_latest_expiry.contains_key(&first_key));
+        assert!(ledger
+            .evidence_scope_latest_expiry
+            .contains_key(&second_key));
+    }
+
+    #[test]
+    fn evidence_scope_incremental_eviction_preserves_the_newest_expiry() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        let comparison_key = append_scope_evidence(&mut ledger, "same-realm", now);
+        append_scope_evidence(&mut ledger, "same-realm", now + Duration::seconds(1));
+
+        let removed = ledger.evidence.pop_front().unwrap();
+        remove_evidence_scope(&mut ledger, &removed);
+
+        assert_eq!(ledger.evidence_scope_indexed_len, ledger.evidence.len());
+        assert_eq!(
+            ledger.evidence_scope_latest_expiry[&comparison_key],
+            now + Duration::seconds(1) + Duration::hours(POST_BURST_EVIDENCE_TTL_HOURS)
+        );
+        assert_eq!(ledger.evidence_scope_records[&comparison_key].len(), 1);
+        assert_eq!(
+            ledger.evidence_scope_records[&comparison_key]
+                .front()
+                .unwrap()
+                .observed_at,
+            now + Duration::seconds(1)
+        );
+    }
+
+    #[test]
+    fn legacy_store_window_and_readiness_fields_fail_closed_after_restore() {
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        let identity = identity("legacy-store-thread");
+        let initial = compute_shadow_affinity(&mut store, &identity, None, now, 0, 0);
+        let assignment_key = initial.assignment_key.unwrap();
+        store.post_burst.windows.insert(
+            assignment_key.clone(),
+            PostBurstWindow {
+                window_id: 1,
+                conversation_id: assignment_key.clone(),
+                opened_at: now,
+                expires_at: now + Duration::hours(POST_BURST_WINDOW_TTL_HOURS),
+                remaining_requests: 1,
+                captured_requests: 0,
+                lane: ShadowCacheLane::ToolBurstQuarantine,
+                candidate_variant: ShadowCacheCandidateVariant::CohortTwoShard,
+                realm_id: identity.realm_id.clone(),
+                policy_epoch: SHADOW_POLICY_EPOCH,
+                anchor_epoch: 0,
+            },
+        );
+        append_scope_evidence(&mut store.post_burst, &identity.realm_id, now);
+        current_post_burst_readiness(
+            &mut store.post_burst,
+            &identity.realm_id,
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now,
+        );
+        let mut legacy = serde_json::to_value(&store).unwrap();
+        let post_burst = legacy
+            .pointer_mut("/post_burst")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap();
+        post_burst.remove("evidence_generations");
+        for window in post_burst
+            .get_mut("windows")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .values_mut()
+        {
+            let window = window.as_object_mut().unwrap();
+            window.remove("realm_id");
+            window.remove("policy_epoch");
+            window.remove("anchor_epoch");
+        }
+        for readiness in post_burst
+            .get_mut("readiness")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .values_mut()
+        {
+            let readiness = readiness.as_object_mut().unwrap();
+            readiness.remove("evidence_generation");
+            readiness.remove("valid_until");
+        }
+        let mut restored: ShadowAffinityStore = serde_json::from_value(legacy).unwrap();
+        prepare_shadow_affinity_store(&mut restored);
+
+        let recovered = compute_shadow_affinity(
+            &mut restored,
+            &identity,
+            None,
+            now + Duration::seconds(1),
+            0,
+            0,
+        );
+
+        assert_eq!(recovered.lane, ShadowCacheLane::Steady);
+        assert_eq!(
+            recovered.candidate_variant,
+            ShadowCacheCandidateVariant::CohortKey
+        );
+        assert!(!restored.post_burst.windows.contains_key(&assignment_key));
+    }
+
+    #[test]
+    fn no_evidence_readiness_is_transient_and_does_not_grow_the_ledger() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        for index in 0..512 {
+            let readiness = current_post_burst_readiness(
+                &mut ledger,
+                &format!("empty-realm-{index}"),
+                ShadowCacheLane::Steady,
+                ShadowCacheCandidateVariant::CohortKey,
+                now,
+            );
+            assert_eq!(
+                readiness.status,
+                PostBurstReadinessStatus::InsufficientEvidence
+            );
+        }
+        assert!(ledger.readiness.is_empty());
+        assert!(ledger.evidence_generations.is_empty());
+    }
+
+    #[test]
+    fn readiness_cache_is_reused_only_until_the_evidence_changes_or_expires() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        let comparison_key = append_scope_evidence(&mut ledger, "realm", now);
+        let first = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now,
+        );
+        let reused = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now + Duration::seconds(1),
+        );
+        assert_eq!(reused.updated_at, first.updated_at);
+
+        let unrelated_comparison_key =
+            append_scope_evidence(&mut ledger, "unrelated-realm", now + Duration::seconds(2));
+        bump_evidence_generation(&mut ledger, &unrelated_comparison_key);
+        let still_reused = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now + Duration::seconds(2),
+        );
+        assert_eq!(still_reused.updated_at, first.updated_at);
+
+        bump_evidence_generation(&mut ledger, &comparison_key);
+        let after_evidence_change = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now + Duration::seconds(3),
+        );
+        assert_eq!(after_evidence_change.updated_at, now + Duration::seconds(3));
+        assert_eq!(
+            after_evidence_change.evidence_generation,
+            evidence_generation(&ledger, &comparison_key)
+        );
+
+        let after_expiry = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now + Duration::hours(POST_BURST_READINESS_MAX_AGE_HOURS) + Duration::seconds(4),
+        );
+        assert_eq!(
+            after_expiry.updated_at,
+            now + Duration::hours(POST_BURST_READINESS_MAX_AGE_HOURS) + Duration::seconds(4)
+        );
+    }
+
+    #[test]
+    #[ignore = "manual FastRelayCore full-capacity affinity hot-path baseline"]
+    fn fastrelay_full_capacity_affinity_hot_path_baseline() {
+        use std::hint::black_box;
+
+        let mut store = ShadowAffinityStore::default();
+        let now = Utc::now();
+        for index in 0..SHADOW_ASSIGNMENT_LIMIT {
+            let seed = identity(&format!("capacity-seed-{index}"));
+            black_box(compute_shadow_affinity(
+                &mut store,
+                &seed,
+                None,
+                now + Duration::microseconds(index as i64),
+                0,
+                0,
+            ));
+        }
+        assert_eq!(store.assignments.len(), SHADOW_ASSIGNMENT_LIMIT);
+
+        let mut samples = Vec::new();
+        for index in 0..21 {
+            let incoming = identity(&format!("capacity-incoming-{index}"));
+            let started = Instant::now();
+            black_box(compute_shadow_affinity(
+                &mut store,
+                &incoming,
+                None,
+                now + Duration::seconds(index as i64 + 1),
+                0,
+                0,
+            ));
+            samples.push(started.elapsed().as_micros());
+            assert_eq!(store.assignments.len(), SHADOW_ASSIGNMENT_LIMIT);
+        }
+        samples.sort_unstable();
+        let p95_index = ((samples.len() - 1) * 95).div_ceil(100);
+        let p95_us = samples[p95_index];
+        println!(
+            "fastrelay_affinity_capacity assignments={SHADOW_ASSIGNMENT_LIMIT} p95_us={p95_us} samples_us={samples:?}"
+        );
+        assert!(
+            p95_us <= 5_000,
+            "full-capacity affinity p95 ({p95_us}us) exceeded the 5ms hot-path budget"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual FastRelayCore full-capacity readiness refresh baseline"]
+    fn fastrelay_full_capacity_readiness_refresh_baseline() {
+        use std::hint::black_box;
+
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        let mut comparison_key = String::new();
+        for index in 0..POST_BURST_EVIDENCE_LIMIT {
+            comparison_key = append_scope_evidence(
+                &mut ledger,
+                "full-capacity-realm",
+                now + Duration::microseconds(index as i64),
+            );
+        }
+        assert_eq!(ledger.evidence.len(), POST_BURST_EVIDENCE_LIMIT);
+        assert_eq!(ledger.evidence_scope_indexed_len, POST_BURST_EVIDENCE_LIMIT);
+
+        let mut samples = Vec::new();
+        for index in 0..21 {
+            bump_evidence_generation(&mut ledger, &comparison_key);
+            let started = Instant::now();
+            black_box(current_post_burst_readiness(
+                &mut ledger,
+                "full-capacity-realm",
+                ShadowCacheLane::Steady,
+                ShadowCacheCandidateVariant::CohortKey,
+                now + Duration::seconds(index as i64 + 1),
+            ));
+            samples.push(started.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let p95_index = ((samples.len() - 1) * 95).div_ceil(100);
+        let p95_us = samples[p95_index];
+        println!(
+            "fastrelay_readiness_refresh evidence={POST_BURST_EVIDENCE_LIMIT} p95_us={p95_us} samples_us={samples:?}"
+        );
+        assert!(
+            p95_us <= 5_000,
+            "full-capacity readiness refresh p95 ({p95_us}us) exceeded the 5ms bounded-settlement budget"
+        );
+    }
+
+    #[test]
+    fn persisted_readiness_without_hot_path_fields_remains_backward_compatible() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        append_scope_evidence(&mut ledger, "realm", now);
+        let readiness = current_post_burst_readiness(
+            &mut ledger,
+            "realm",
+            ShadowCacheLane::Steady,
+            ShadowCacheCandidateVariant::CohortKey,
+            now,
+        );
+        let mut legacy = serde_json::to_value(readiness).unwrap();
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("evidence_generation");
+        legacy.remove("valid_until");
+
+        let restored: PostBurstReadiness =
+            serde_json::from_value(serde_json::Value::Object(legacy.clone())).unwrap();
+
+        assert_eq!(restored.evidence_generation, 0);
+        assert_eq!(restored.valid_until, None);
     }
 }

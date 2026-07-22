@@ -1,14 +1,63 @@
+#[cfg(test)]
+use crate::config::AppConfig;
 use crate::config::{
-    AppConfig, Channel, ProviderResponseSessionReuseCapability, ResponseSessionReuseStreamShape,
+    Channel, ProviderResponseSessionReuseCapability, ResponseSessionReuseStreamShape,
     SelectedProviderKey, RESPONSE_SESSION_REUSE_EVIDENCE_VERSION,
 };
 use serde_json::Value;
+#[cfg(test)]
 use sha2::{Digest, Sha256};
 
-use super::{affinity_identity, upstream_url, RouteDecision};
+use super::{action_scope::CompositeActionScope, affinity_identity, upstream_url, RouteDecision};
 
+#[cfg(test)]
 const CONTINUATION_SCOPE_VERSION: &str = "continuation-scope-v1";
+#[cfg(test)]
 const DELTA_ALGORITHM_VERSION: &str = "exact-lineage-v1";
+
+// Keep this list closed: a field must have explicit Responses semantics and be
+// safe for the delta builder to rewrite as a lineage member or carry forward
+// unchanged. New or provider-only fields stay on FullReplay until verified.
+const NATIVE_RESPONSES_VERIFIED_DELTA_TOP_LEVEL_FIELDS: &[&str] = &[
+    "background",
+    "client_metadata",
+    "conversation_id",
+    "include",
+    "input",
+    "instructions",
+    "max_output_tokens",
+    "metadata",
+    "model",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "prompt_cache_breakpoint",
+    "prompt_cache_key",
+    "prompt_cache_options",
+    "prompt_cache_retention",
+    "reasoning",
+    "response_format",
+    "safety_identifier",
+    "service_tier",
+    "store",
+    "stream",
+    "session_id",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "thread_id",
+    "truncation",
+    "user",
+];
+
+pub(super) fn native_responses_verified_delta_schema_is_known(request: &Value) -> bool {
+    request.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .all(|key| NATIVE_RESPONSES_VERIFIED_DELTA_TOP_LEVEL_FIELDS.contains(&key.as_str()))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ContinuationScope {
@@ -16,6 +65,13 @@ pub(super) struct ContinuationScope {
 }
 
 impl ContinuationScope {
+    pub(super) fn from_action_scope(scope: &CompositeActionScope) -> Self {
+        Self {
+            anchor_key: scope.anchor_key.clone(),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn derive(
         config: &AppConfig,
         decision: &RouteDecision,
@@ -75,12 +131,14 @@ fn normalized_endpoint(endpoint: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 struct TrustedConversationIdentity {
     thread_id: Option<String>,
     conversation_id: Option<String>,
     session_id: Option<String>,
 }
 
+#[cfg(test)]
 impl TrustedConversationIdentity {
     fn derive(request: &Value) -> Option<Self> {
         let identity = Self {
@@ -107,6 +165,7 @@ impl TrustedConversationIdentity {
     }
 }
 
+#[cfg(test)]
 fn identity_value(request: &Value, key: &str) -> Option<String> {
     request
         .get(key)
@@ -123,6 +182,7 @@ fn identity_value(request: &Value, key: &str) -> Option<String> {
         })
 }
 
+#[cfg(test)]
 fn bounded_identity_value(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => {
@@ -134,6 +194,7 @@ fn bounded_identity_value(value: &Value) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn hash_parts(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for part in parts {
@@ -286,5 +347,50 @@ mod tests {
         let mut chat = decision.clone();
         chat.upstream_channel = Channel::Chat;
         assert!(ContinuationScope::derive(&config, &chat, &request, Some("codex"), &key).is_none());
+    }
+
+    #[test]
+    fn native_responses_verified_delta_schema_rejects_vendor_extension() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "continue"}],
+            "vendor_extension": {"enabled": true}
+        });
+
+        assert!(!native_responses_verified_delta_schema_is_known(&request));
+    }
+
+    #[test]
+    fn native_responses_verified_delta_schema_accepts_common_complete_request() {
+        let request = json!({
+            "model": "gpt-5.5",
+            "input": [{"role": "user", "content": "continue"}],
+            "instructions": "Be concise.",
+            "stream": true,
+            "store": false,
+            "tools": [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "reasoning": {"effort": "medium"},
+            "max_output_tokens": 1024,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "truncation": "auto",
+            "metadata": {"tenant": "test"},
+            "include": ["reasoning.encrypted_content"],
+            "previous_response_id": "resp_previous",
+            "prompt_cache_key": "cache-key",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"mode": "implicit"},
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+            "background": false,
+            "safety_identifier": "safety-user",
+            "service_tier": "auto",
+            "text": {"format": {"type": "text"}},
+            "response_format": {"type": "text"},
+            "user": "user-123"
+        });
+
+        assert!(native_responses_verified_delta_schema_is_known(&request));
     }
 }

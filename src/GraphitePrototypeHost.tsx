@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import graphitePrototypeHtml from "../prototype/atoapi-graphite-ui.html?raw";
 import lucideUmdUrl from "lucide/dist/umd/lucide.min.js?url";
+import { command } from "./lib/api";
 import type {
   AgentInjectionConfig,
   AppConfig,
   Channel,
   MetricsSnapshot,
+  MetricsTrendInput,
+  MetricsTrendSnapshot,
   ProxyStatus,
   ProviderConfig
 } from "./lib/api";
@@ -143,6 +146,53 @@ const bridgeSource = String.raw`
   let fetchedModelIds = [];
   let requestScopeId = "";
   let requestPage = 1;
+  let lastTrendContextKey = "";
+
+  const trendController = () => window.__atoapiTrend;
+
+  function syncTrendController(loadWhenChanged = false) {
+    const controller = trendController();
+    if (!controller) return;
+    const metricState = host.state?.metrics || {};
+    const scope = activeRequestScope(metricState);
+    const agent = currentAgent();
+    const contextKey = [
+      agent?.sourceId || agent?.id || "",
+      scope?.id || "all",
+      metricState.includeColdStarts !== false ? "cold-in" : "cold-out"
+    ].join("|");
+    controller.setContextKey(contextKey);
+    controller.syncScopes(metricState.scopes || [], scope?.id || "all");
+    const overviewVisible = !$bridge("#metricsView")?.hidden && !$bridge("#overviewPanel")?.hidden;
+    if (loadWhenChanged && overviewVisible && contextKey !== lastTrendContextKey) {
+      controller.request("context");
+    }
+    lastTrendContextKey = contextKey;
+  }
+
+  trendController()?.setExternalLoader((query) => {
+    const metricState = host.state?.metrics || {};
+    const scope = activeRequestScope(metricState);
+    const agent = currentAgent();
+    send("load-metrics-trend", {
+      sequence: query.sequence,
+      rangeKey: query.rangeKey,
+      input: {
+        start_utc: query.startUtc,
+        end_utc: query.endUtc,
+        agent_id: agent?.sourceId || agent?.id || "",
+        provider_id: scope?.providerId || null,
+        include_cold_starts: metricState.includeColdStarts !== false
+      }
+    });
+  });
+
+  trendController()?.setScopeHandler(() => {
+    requestPage = 1;
+    renderRequests();
+    applyMetrics(host.state);
+    syncTrendController(false);
+  });
 
   function setKeyPoolEnabled(enabled) {
     const toggle = $bridge("#providerKeyPoolEnabled");
@@ -211,6 +261,8 @@ const bridgeSource = String.raw`
       reasoning: model.reasoning_effort_override_enabled ? (model.reasoning_effort || "") : "",
       supportedReasoningEfforts: model.supported_reasoning_efforts || []
     })));
+    const compatibilityModel = $bridge("#providerSessionReuseModelInput");
+    if (compatibilityModel) compatibilityModel.value = preferredCompatibilityModelId(detail);
     replace(keyPool, (detail?.keys || []).map((item, index) => ({
       id: item.id || "key-" + index,
       name: item.alias || "Key " + (index + 1),
@@ -387,14 +439,29 @@ const bridgeSource = String.raw`
     };
   }
 
+  function compatibilityModelId() {
+    return $bridge("#providerSessionReuseModelInput")?.value.trim() || "";
+  }
+
+  function preferredCompatibilityModelId(detail) {
+    const records = detail?.response_session_reuse_models || [];
+    return records.find((item) => item.enabled)?.model_id
+      || records[0]?.model_id
+      || mappings[0]?.actual
+      || detail?.models?.[0]?.id
+      || "";
+  }
+
   function applyCompatibility(detail) {
-    const modelId = mappings[0]?.actual || detail?.models?.[0]?.id || "";
+    const modelId = compatibilityModelId();
     const reuse = (detail?.response_session_reuse_models || []).find((item) => item.model_id === modelId) || null;
     const band = $bridge("#providerCompatibility .status-band");
     const enableSwitch = $bridge('[aria-label="启用会话复用"]');
     if (!band) return;
     const title = reuse?.status === "verified" ? "已验证" : reuse?.status === "error" ? "验证失败" : reuse?.status === "unsupported" ? "上游不支持" : "尚未验证";
-    const detailText = reuse?.last_error || (reuse?.status === "verified" ? "已验证后才允许增量请求" : "点击重新验证，不会影响正常转发");
+    const detailText = !modelId
+      ? "选择或输入实际模型后再验证"
+      : reuse?.last_error || (reuse?.status === "verified" ? modelId + " · 已验证后才允许增量请求" : modelId + " · 点击重新验证，不会影响正常转发");
     band.querySelector("b").textContent = title;
     band.querySelector("small").textContent = detailText;
     if (enableSwitch) {
@@ -411,7 +478,7 @@ const bridgeSource = String.raw`
       return;
     }
     description.textContent = diagnostic.paths.map((path) => {
-      const label = path.path === "direct" ? "直连" : path.path === "system-proxy" ? "系统代理" : path.path;
+      const label = path.path === "direct" ? "直连" : path.path === "system-proxy" ? "系统代理" : path.path === "explicit-proxy" ? "显式代理" : path.path;
       return label + " " + (path.ok ? path.elapsed_ms + "ms" : "失败");
     }).join(" · ");
   }
@@ -497,10 +564,12 @@ const bridgeSource = String.raw`
     const host = byFieldLabel(proxy, "监听地址");
     const port = byFieldLabel(proxy, "端口");
     const localKey = $bridge("#settingsLocalKeyInput");
+    const upstreamProxyUrl = $bridge("#settingsUpstreamProxyUrlInput");
     const defaultChannel = byFieldLabel(app, "默认通道", "select");
     if (host) host.value = settings.host || "127.0.0.1";
     if (port) port.value = settings.port || "18883";
     if (localKey) { localKey.value = ""; localKey.placeholder = settings.hasLocalKey ? "已保存本地 Key（留空则不修改）" : "输入本地 Key"; }
+    if (upstreamProxyUrl) upstreamProxyUrl.value = settings.upstreamProxyUrl || "";
     if (defaultChannel) {
       const expected = ({ responses: "Responses", chat: "Chat", anthropic: "Anthropic" }[settings.defaultChannel] || "Auto");
       const option = Array.from(defaultChannel.options).find((item) => item.textContent?.trim() === expected);
@@ -617,6 +686,7 @@ const bridgeSource = String.raw`
     applyMetrics(nextState);
     applySettings(nextState);
     applyProxyStatus(nextState);
+    syncTrendController(true);
   }
 
   window.addEventListener("message", (event) => {
@@ -640,6 +710,11 @@ const bridgeSource = String.raw`
       }
       if (message.payload?.compatibility) applyCompatibility(message.payload.compatibility);
       if (message.payload?.networkDiagnostic) applyNetworkDiagnostic(message.payload.networkDiagnostic);
+      if (message.payload?.metricsTrend) {
+        const trend = message.payload.metricsTrend;
+        if (trend.error) trendController()?.setError(trend.error, trend.sequence, trend.rangeKey);
+        else trendController()?.setData(trend.data, trend.sequence, trend.rangeKey);
+      }
       if (message.notice) showToast(message.notice);
       if (message.error) showToast(message.error);
     }
@@ -666,8 +741,16 @@ const bridgeSource = String.raw`
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("button, [data-bind-provider], [data-edit-provider], [data-delete-provider]") : null;
     if (!target) return;
-    if (target.id === "refreshButton" || target.id === "metricsRefreshButton") {
+    if (target.id === "refreshButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("refresh"); return;
+    }
+    if (target.id === "metricsRefreshButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      // The live metric snapshot and the persisted trend are independent.
+      // Refresh both explicitly; the trend loader has its own stale guard.
+      trendController()?.request("refresh");
+      send("refresh");
+      return;
     }
     if (target.id === "agentEnabledSwitch") {
       event.preventDefault(); event.stopImmediatePropagation();
@@ -712,6 +795,13 @@ const bridgeSource = String.raw`
     }
     if (target.id === "saveProviderButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("save-provider", serializeEditor()); return;
+    }
+    if (target.id === "fetchCompatibilityModelsButton") {
+      event.preventDefault(); event.stopImmediatePropagation(); send("fetch-models", { provider: serializeEditor() }); return;
+    }
+    if (target.id === "probeSessionReuseButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("probe-session-reuse", { providerId: selectedProviderId(), modelId: compatibilityModelId() }); return;
     }
     if (target.id === "addKeyButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBlankKey(); return;
@@ -761,7 +851,6 @@ const bridgeSource = String.raw`
       if (target.closest("#providerModels")) send("fetch-models", { provider: serializeEditor() });
       else if (target.closest("#providerKeys")) send("test-provider-key-pool", { providerId: selectedProviderId() });
       else if (target.closest("#providerGeneral")) send("diagnose-network-paths", { providerId: selectedProviderId() });
-      else if (target.closest("#providerCompatibility")) send("probe-session-reuse", { providerId: selectedProviderId(), modelId: mappings[0]?.actual || "" });
       else if (target.closest("#settingsProxy")) send("restart-main-proxy");
       else if (target.closest("#settingsData")) send("clear-cache");
       return;
@@ -769,8 +858,14 @@ const bridgeSource = String.raw`
     if (target.getAttribute("aria-label") === "启用会话复用") {
       event.preventDefault(); event.stopImmediatePropagation();
       const providerId = selectedProviderId();
-      send("set-session-reuse", { providerId, modelId: mappings[0]?.actual || "", enabled: target.getAttribute("aria-checked") !== "true" }); return;
+      send("set-session-reuse", { providerId, modelId: compatibilityModelId(), enabled: target.getAttribute("aria-checked") !== "true" }); return;
     }
+  }, true);
+
+  document.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement) || target.id !== "providerSessionReuseModelInput") return;
+    applyCompatibility(host.state?.providerDetails?.[selectedProviderId()] || {});
   }, true);
 
   function serializeSettings() {
@@ -782,7 +877,8 @@ const bridgeSource = String.raw`
       local_key: $bridge("#settingsLocalKeyInput")?.value || "",
       default_channel: ({ Auto: "responses", Responses: "responses", Chat: "chat", Anthropic: "anthropic" }[byFieldLabel(app, "默认通道", "select")?.value || ""] || "responses"),
       refresh_policy: $bridge("#settingsRefreshPolicy")?.value || "visible-1s",
-      proxy_auto_start: $bridge('[aria-label="开机自动启动代理"]')?.getAttribute("aria-checked") === "true"
+      proxy_auto_start: $bridge('[aria-label="开机自动启动代理"]')?.getAttribute("aria-checked") === "true",
+      upstream_proxy_url: $bridge("#settingsUpstreamProxyUrlInput")?.value.trim() || ""
     };
   }
 
@@ -837,8 +933,12 @@ const bridgeSource = String.raw`
         requestPage = 1;
         renderRequests();
         applyMetrics(host.state);
+        trendController()?.syncScope(requestScopeId);
+        syncTrendController(false);
+        trendController()?.request("request-scope");
       };
     });
+    trendController()?.syncScopes(scopes, active.id);
   }
 
   renderRequests = function() {
@@ -1430,6 +1530,7 @@ function buildState(
     hasLocalKey: Boolean(config?.local_key),
     defaultChannel: config?.default_channel ?? "responses",
     proxyAutoStart: config?.proxy_auto_start ?? false,
+    upstreamProxyUrl: config?.upstream_proxy_url ?? "",
     refreshPolicy: metricsRefreshPolicy,
     workspaceFingerprint: config?.workspace_fingerprint ?? "",
     updatedAt: config?.updated_at ?? "",
@@ -1484,6 +1585,29 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
       const acknowledge = (response?: GraphiteBridgeResponse) =>
         send({ kind: "ack", requestId: event.data.requestId, ...response });
       const run = async () => {
+        if (action === "load-metrics-trend") {
+          const sequence = Number(payload.sequence ?? 0);
+          const rangeKey = String(payload.rangeKey ?? "");
+          const input = payload.input as unknown as MetricsTrendInput | undefined;
+          try {
+            if (!input?.start_utc || !input.end_utc || !input.agent_id || !rangeKey) {
+              throw new Error("缓存趋势查询范围不完整");
+            }
+            const data = await command<MetricsTrendSnapshot>("get_metrics_trend", { input });
+            acknowledge({ payload: { metricsTrend: { sequence, rangeKey, data } } });
+          } catch (error) {
+            acknowledge({
+              payload: {
+                metricsTrend: {
+                  sequence,
+                  rangeKey,
+                  error: error instanceof Error ? error.message : String(error)
+                }
+              }
+            });
+          }
+          return;
+        }
         try {
           const response = await props.onBridgeAction(action, payload);
           acknowledge(response ?? undefined);

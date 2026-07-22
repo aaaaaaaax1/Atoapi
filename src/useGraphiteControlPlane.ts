@@ -23,7 +23,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.3.4";
+const APP_VERSION = "v1.3.5";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -379,7 +379,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         } satisfies FetchModelsInput
       });
       return {
-        notice: models.length ? `已获取 ${models.length} 个模型，可在映射行直接选择或输入` : "未返回模型；不添加映射也可直接转发",
+        notice: models.length ? `已获取 ${models.length} 个模型，可在实际模型框或映射行选择，也可继续手动输入` : "未返回模型；仍可手动填写实际模型 ID",
         payload: { models: models.map((item) => ({ id: item.id })) }
       };
     }
@@ -457,7 +457,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     if (action === "probe-session-reuse") {
       const providerId = text("providerId");
       const modelId = text("modelId");
-      if (!providerId || !modelId) throw new Error("请先填写一个实际模型 ID，再验证会话复用");
+      if (!providerId) throw new Error("请先保存上游，再验证会话复用");
+      if (!modelId) throw new Error("请选择或填写一个实际模型 ID，再验证会话复用");
       const result = await command<ProviderResponseSessionReuseProbeResult>(
         "probe_provider_response_session_reuse",
         { input: { provider_id: providerId, model_id: modelId } }
@@ -472,7 +473,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     if (action === "set-session-reuse") {
       const providerId = text("providerId");
       const modelId = text("modelId");
-      if (!providerId || !modelId) throw new Error("未找到会话复用对应的上游或模型");
+      if (!providerId) throw new Error("未找到会话复用对应的上游");
+      if (!modelId) throw new Error("请选择或填写会话复用对应的实际模型 ID");
       const enabled = payload.enabled === true;
       const nextConfig = await command<AppConfig>("set_provider_response_session_reuse_enabled", {
         providerId,
@@ -527,6 +529,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       }
       if (!isChannel(defaultChannel)) throw new Error("默认通道不合法");
       const localKey = String(settings.local_key ?? "").trim() || config.local_key;
+      const upstreamProxyUrl = String(settings.upstream_proxy_url ?? "").trim();
       const refreshPolicy = String(settings.refresh_policy ?? metricsRefreshPolicy) as MetricsRefreshPolicy;
       if (!isMetricsRefreshPolicy(refreshPolicy)) throw new Error("统计刷新策略不合法");
       const nextConfig = await command<AppConfig>("save_config", {
@@ -534,6 +537,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
           host,
           port,
           proxy_auto_start: settings.proxy_auto_start === true,
+          upstream_proxy_url: upstreamProxyUrl,
           local_key: localKey,
           default_channel: defaultChannel,
           workspace_fingerprint: config.workspace_fingerprint,
