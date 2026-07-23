@@ -28,7 +28,11 @@ fn default_prompt_cache_retention_enabled() -> bool {
 }
 
 fn default_request_body_gzip_enabled() -> bool {
-    false
+    true
+}
+
+fn default_use_system_proxy() -> bool {
+    true
 }
 
 fn default_compact_compatibility_mode() -> CompactCompatibilityMode {
@@ -100,6 +104,8 @@ pub struct AppConfig {
     #[serde(default = "default_agent_injections")]
     pub agent_injections: Vec<AgentInjectionConfig>,
     #[serde(default)]
+    pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
+    #[serde(default)]
     pub provider_key_pools: Vec<ProviderKeyPoolConfig>,
     #[serde(default)]
     pub provider_compact_modes: Vec<ProviderCompactModeConfig>,
@@ -128,7 +134,7 @@ pub struct ProviderConfig {
     pub prompt_cache_retention_enabled: bool,
     #[serde(default = "default_request_body_gzip_enabled")]
     pub request_body_gzip_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_use_system_proxy")]
     pub use_system_proxy: bool,
     pub api_key_encrypted: Option<String>,
     pub models: Vec<ModelConfig>,
@@ -140,6 +146,10 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInput {
     pub id: Option<String>,
+    /// Ephemeral UI ownership hint used by the control plane before this input
+    /// is persisted as a provider record.
+    #[serde(default)]
+    pub owner_agent_id: Option<String>,
     pub name: String,
     pub base_url: String,
     pub models_url: Option<String>,
@@ -153,7 +163,7 @@ pub struct ProviderInput {
     pub prompt_cache_retention_enabled: bool,
     #[serde(default = "default_request_body_gzip_enabled")]
     pub request_body_gzip_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_use_system_proxy")]
     pub use_system_proxy: bool,
     #[serde(default)]
     pub non_sse_compact_compat_enabled: bool,
@@ -366,6 +376,11 @@ pub struct ProviderCacheCapabilityConfig {
     pub channel: Channel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_id: Option<String>,
+    /// Opaque exact realm and request-shape identifier for measured cache
+    /// effect evidence. Capability acceptance remains key-scoped, while a
+    /// promoted control may only affect the wire shape that proved it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_scope_id: Option<String>,
     pub field: ProviderCacheCapabilityField,
     #[serde(default)]
     pub evidence_version: u32,
@@ -397,6 +412,38 @@ pub struct ProviderCacheCapabilityConfig {
 fn provider_cache_capability_evidence_is_current(item: &ProviderCacheCapabilityConfig) -> bool {
     item.field != ProviderCacheCapabilityField::PromptCacheBreakpoint
         || item.evidence_version >= PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION
+}
+
+/// A promoted cache control must name the exact key realm, stream/store shape,
+/// and final-wire breakpoint placement used by its validation. v1 records did
+/// not bind that last dimension and can never authorize ordinary traffic.
+fn provider_cache_effect_scope_is_current_v2(
+    scope: Option<&str>,
+    field: ProviderCacheCapabilityField,
+) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let Some((base, breakpoint)) = scope.rsplit_once(":bp=") else {
+        return false;
+    };
+    if breakpoint.is_empty() || breakpoint.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = base.split(':');
+    let version = parts.next();
+    let realm = parts.next();
+    let stream = parts.next();
+    let store = parts.next();
+    if parts.next().is_some()
+        || version != Some("cache-effect-v2")
+        || realm.is_none_or(str::is_empty)
+        || !matches!(stream, Some("stream" | "sync" | "stream-absent"))
+        || !matches!(store, Some("store" | "no-store" | "store-absent"))
+    {
+        return false;
+    }
+    field != ProviderCacheCapabilityField::PromptCacheBreakpoint || breakpoint != "none"
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -821,6 +868,16 @@ pub struct AgentInjectionConfig {
     pub hidden_provider_ids: Vec<String>,
 }
 
+/// Presentation-only provider order. Keeping it outside the Agent injection
+/// record avoids changing routing semantics and preserves each Agent's list
+/// independently from the global provider collection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProviderOrderConfig {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicProvider {
     pub id: String,
@@ -895,6 +952,7 @@ pub struct PublicConfig {
     pub route_profiles: Vec<RouteProfile>,
     pub cache: CacheConfig,
     pub agent_injections: Vec<AgentInjectionConfig>,
+    pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
     pub provider_key_pools: Vec<PublicProviderKeyPoolEntry>,
     pub updated_at: DateTime<Utc>,
     pub config_path: PathBuf,
@@ -951,6 +1009,7 @@ impl Default for AppConfig {
             ],
             cache: CacheConfig::smart_max_hit(),
             agent_injections: default_agent_injections(),
+            agent_provider_orders: Vec::new(),
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
             provider_channel_modes: Vec::new(),
@@ -1099,6 +1158,7 @@ impl AppConfig {
                     item
                 })
                 .collect(),
+            agent_provider_orders: self.agent_provider_orders.clone(),
             provider_key_pools: self
                 .provider_key_pools
                 .iter()
@@ -1405,6 +1465,7 @@ impl AppConfig {
         self.cache_capability_verified_for_key(provider_id, model_id, channel, None, field)
     }
 
+    #[cfg(test)]
     pub fn cache_capability_verified_for_key(
         &self,
         provider_id: &str,
@@ -1423,6 +1484,56 @@ impl AppConfig {
                 && item.enabled
                 && item.status == ProviderCacheCapabilityStatus::Verified
         })
+    }
+
+    /// A successful capability probe proves only that the exact upstream
+    /// accepted a field.  It does not prove that the field improves cache
+    /// behavior, so callers must use this only for an explicit controlled
+    /// validation run, never for ordinary request routing.
+    pub fn cache_capability_probe_accepted_for_key(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+    ) -> bool {
+        self.provider_cache_capabilities.iter().any(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && &item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && item.field == field
+                && provider_cache_capability_evidence_is_current(item)
+                && item.status == ProviderCacheCapabilityStatus::Verified
+        })
+    }
+
+    /// Same as [`Self::cache_capability_effect_promoted_for_key`], but binds
+    /// production use to the exact opaque key realm and request shape that
+    /// produced the measured cache evidence.
+    pub fn cache_capability_effect_promoted_for_scope(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        effect_scope_id: Option<&str>,
+        field: ProviderCacheCapabilityField,
+    ) -> bool {
+        field != ProviderCacheCapabilityField::PromptCacheKey
+            && provider_cache_effect_scope_is_current_v2(effect_scope_id, field)
+            && self.provider_cache_capabilities.iter().any(|item| {
+                item.provider_id == provider_id
+                    && item.model_id == model_id
+                    && &item.channel == channel
+                    && item.key_id.as_deref() == key_id
+                    && item.effect_scope_id.as_deref() == effect_scope_id
+                    && item.field == field
+                    && provider_cache_capability_evidence_is_current(item)
+                    && item.status == ProviderCacheCapabilityStatus::Verified
+                    && item.effect_status == ProviderCacheEffectStatus::Promoted
+            })
     }
 
     pub fn cache_capability_probe_target(
@@ -1493,6 +1604,7 @@ impl AppConfig {
                 if item.status != ProviderCacheCapabilityStatus::Verified {
                     item.enabled = false;
                     item.effect_status = ProviderCacheEffectStatus::Unverified;
+                    item.effect_scope_id = None;
                     item.effect_checked_at = None;
                     item.effect_message = None;
                     item.baseline_cache_read_tokens = None;
@@ -1513,6 +1625,7 @@ impl AppConfig {
                     model_id: model_id.to_string(),
                     channel,
                     key_id: clean_optional_string(key_id.map(ToOwned::to_owned)),
+                    effect_scope_id: None,
                     field,
                     evidence_version: PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION,
                     enabled: false,
@@ -1548,6 +1661,38 @@ impl AppConfig {
         baseline_ttft_ms: Option<u64>,
         candidate_ttft_ms: Option<u64>,
     ) {
+        self.record_cache_capability_effect_for_scope(
+            provider_id,
+            model_id,
+            channel,
+            key_id,
+            None,
+            fields,
+            effect_status,
+            message,
+            baseline_cache_read_tokens,
+            candidate_cache_read_tokens,
+            baseline_ttft_ms,
+            candidate_ttft_ms,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_cache_capability_effect_for_scope(
+        &mut self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        effect_scope_id: Option<&str>,
+        fields: &[ProviderCacheCapabilityField],
+        effect_status: ProviderCacheEffectStatus,
+        message: Option<String>,
+        baseline_cache_read_tokens: Option<u64>,
+        candidate_cache_read_tokens: Option<u64>,
+        baseline_ttft_ms: Option<u64>,
+        candidate_ttft_ms: Option<u64>,
+    ) {
         let now = Utc::now();
         for item in self.provider_cache_capabilities.iter_mut().filter(|item| {
             item.provider_id == provider_id
@@ -1566,14 +1711,36 @@ impl AppConfig {
                 item.updated_at = now;
                 continue;
             }
-            item.effect_status = effect_status;
-            item.enabled = effect_status == ProviderCacheEffectStatus::Promoted;
-            item.effect_message = clean_optional_string(message.clone());
+            let scope_is_current =
+                provider_cache_effect_scope_is_current_v2(effect_scope_id, item.field);
+            let invalid_promoted_scope =
+                effect_status == ProviderCacheEffectStatus::Promoted && !scope_is_current;
+            item.effect_status = if invalid_promoted_scope {
+                ProviderCacheEffectStatus::Unverified
+            } else {
+                effect_status
+            };
+            item.effect_scope_id = scope_is_current
+                .then(|| clean_optional_string(effect_scope_id.map(ToOwned::to_owned)))
+                .flatten();
+            // A caller-controlled `prompt_cache_key` can be useful evidence
+            // in an explicit validation run, but never becomes a normal
+            // request rule.  Other fields need both acceptance and a positive
+            // measured effect before they are enabled.
+            item.enabled = item.effect_status == ProviderCacheEffectStatus::Promoted
+                && item.field != ProviderCacheCapabilityField::PromptCacheKey;
+            item.effect_message = (!invalid_promoted_scope)
+                .then(|| clean_optional_string(message.clone()))
+                .flatten();
             item.baseline_cache_read_tokens = baseline_cache_read_tokens;
             item.candidate_cache_read_tokens = candidate_cache_read_tokens;
             item.baseline_ttft_ms = baseline_ttft_ms;
             item.candidate_ttft_ms = candidate_ttft_ms;
-            if effect_status == ProviderCacheEffectStatus::Error {
+            if invalid_promoted_scope {
+                item.last_error = Some(
+                    "cache effect promotion requires a v2 exact-scope certificate".to_string(),
+                );
+            } else if effect_status == ProviderCacheEffectStatus::Error {
                 item.last_error = clean_optional_string(message.clone());
             } else {
                 item.last_error = None;
@@ -1607,9 +1774,39 @@ impl AppConfig {
                 item.updated_at = now;
                 changed = true;
             }
-            let promoted = item.effect_status == ProviderCacheEffectStatus::Promoted
+            // Older effect records predate the exact key-realm, request-shape
+            // and frozen-breakpoint binding. They cannot authorize ordinary
+            // traffic: retain field acceptance only and require a new paired
+            // baseline/candidate validation.
+            if item.effect_status == ProviderCacheEffectStatus::Promoted
+                && !provider_cache_effect_scope_is_current_v2(
+                    item.effect_scope_id.as_deref(),
+                    item.field,
+                )
+            {
+                item.enabled = false;
+                item.effect_status = ProviderCacheEffectStatus::Unverified;
+                item.effect_checked_at = None;
+                item.effect_message = None;
+                item.baseline_cache_read_tokens = None;
+                item.candidate_cache_read_tokens = None;
+                item.baseline_ttft_ms = None;
+                item.candidate_ttft_ms = None;
+                item.last_error = Some(
+                    "legacy cache effect evidence requires v2 exact-scope re-verification"
+                        .to_string(),
+                );
+                item.updated_at = now;
+                changed = true;
+            }
+            let promoted = item.field != ProviderCacheCapabilityField::PromptCacheKey
+                && item.effect_status == ProviderCacheEffectStatus::Promoted
                 && item.status == ProviderCacheCapabilityStatus::Verified
-                && provider_cache_capability_evidence_is_current(item);
+                && provider_cache_capability_evidence_is_current(item)
+                && provider_cache_effect_scope_is_current_v2(
+                    item.effect_scope_id.as_deref(),
+                    item.field,
+                );
             if item.enabled != promoted {
                 item.enabled = promoted;
                 changed = true;
@@ -2627,7 +2824,8 @@ updated_at = "2026-06-21T00:00:00Z"
 "#;
         let provider: ProviderConfig = toml::from_str(raw).expect("legacy provider should parse");
         assert!(provider.prompt_cache_retention_enabled);
-        assert!(!provider.use_system_proxy);
+        assert!(provider.request_body_gzip_enabled);
+        assert!(provider.use_system_proxy);
     }
 
     #[test]
@@ -2727,11 +2925,12 @@ updated_at = "2026-06-21T00:00:00Z"
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        config.record_cache_capability_effect_for_key(
+        config.record_cache_capability_effect_for_scope(
             "provider-a",
             "gpt-5.6-luna",
             &Channel::Responses,
             None,
+            Some("cache-effect-v2:test-realm:stream:no-store:bp=none"),
             &[ProviderCacheCapabilityField::PromptCacheOptions],
             ProviderCacheEffectStatus::Promoted,
             Some("effect verified".to_string()),
@@ -2749,11 +2948,12 @@ updated_at = "2026-06-21T00:00:00Z"
             ProviderCacheCapabilityStatus::Error,
             Some("opaque HTTP 502".to_string()),
         );
-        config.record_cache_capability_effect_for_key(
+        config.record_cache_capability_effect_for_scope(
             "provider-a",
             "gpt-5.6-luna",
             &Channel::Responses,
             None,
+            Some("cache-effect-v2:test-realm:stream:no-store:bp=none"),
             &[ProviderCacheCapabilityField::PromptCacheOptions],
             ProviderCacheEffectStatus::Error,
             Some("temporary effect HTTP 502".to_string()),
@@ -2793,11 +2993,12 @@ updated_at = "2026-06-21T00:00:00Z"
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        config.record_cache_capability_effect_for_key(
+        config.record_cache_capability_effect_for_scope(
             "provider-a",
             "gpt-5.6-luna",
             &Channel::Responses,
             Some("key-a"),
+            Some("cache-effect-v2:test-realm:stream:no-store:bp=none"),
             &[ProviderCacheCapabilityField::PromptCacheOptions],
             ProviderCacheEffectStatus::Promoted,
             None,
@@ -2824,6 +3025,59 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
+    fn promoted_cache_control_requires_the_measured_effect_scope() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe_for_key(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            Some("cache-effect-v2:realm-a:stream:no-store:bp=none"),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            Some("measured exact wire shape".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+
+        assert!(config.cache_capability_effect_promoted_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            Some("cache-effect-v2:realm-a:stream:no-store:bp=none"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert!(!config.cache_capability_effect_promoted_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            Some("cache-effect-v2:realm-a:sync:no-store:bp=none"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+        assert!(!config.cache_capability_effect_promoted_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            Some("key-a"),
+            Some("cache-effect-v2:realm-a:stream:store:bp=none"),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ));
+    }
+
+    #[test]
     fn legacy_enabled_cache_capability_requires_effect_reverification() {
         let mut config = AppConfig::default();
         config.record_cache_capability_probe(
@@ -2844,7 +3098,7 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
-    fn legacy_promoted_breakpoint_requires_reverification_without_disabling_other_fields() {
+    fn legacy_unscoped_promoted_controls_require_exact_scope_reverification() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-legacy-breakpoint-evidence-{}",
             Uuid::new_v4().simple()
@@ -2923,8 +3177,16 @@ updated_at = "2026-06-21T00:00:00Z"
             )
             .unwrap();
         assert_eq!(options.status, ProviderCacheCapabilityStatus::Verified);
-        assert_eq!(options.effect_status, ProviderCacheEffectStatus::Promoted);
-        assert!(options.enabled);
+        assert_eq!(
+            options.effect_status,
+            ProviderCacheEffectStatus::Unverified,
+            "a promoted result without its key realm and wire shape cannot be reused"
+        );
+        assert!(!options.enabled);
+        assert!(options
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("v2 exact-scope")));
 
         loaded.record_cache_capability_probe(
             "provider-a",
@@ -2934,11 +3196,12 @@ updated_at = "2026-06-21T00:00:00Z"
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        loaded.record_cache_capability_effect_for_key(
+        loaded.record_cache_capability_effect_for_scope(
             "provider-a",
             "gpt-5.6-terra",
             &Channel::Responses,
             None,
+            Some("cache-effect-v2:test-realm:stream:no-store:bp=v1:test-placement"),
             &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
             ProviderCacheEffectStatus::Promoted,
             Some("re-verified".to_string()),
@@ -3741,6 +4004,7 @@ enabled = true
     fn provider_input(key_pool: Option<ProviderKeyPoolInput>) -> ProviderInput {
         ProviderInput {
             id: Some("share".to_string()),
+            owner_agent_id: None,
             name: "share".to_string(),
             base_url: "https://share.example/v1".to_string(),
             models_url: None,

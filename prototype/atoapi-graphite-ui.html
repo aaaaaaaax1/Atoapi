@@ -6288,6 +6288,19 @@
         transition-duration: 0.01ms !important;
       }
     }
+    .provider-mark[data-provider-drag] {
+      cursor: grab !important;
+      touch-action: none;
+    }
+
+    .provider-row.is-dragging {
+      opacity: .58;
+    }
+
+    .provider-row.is-drag-over {
+      background: rgba(120, 200, 157, .075) !important;
+      box-shadow: inset 0 1px 0 rgba(120, 200, 157, .52);
+    }
   </style>
 </head>
 <body>
@@ -6604,7 +6617,7 @@
                 </div>
               </div>
               <div class="form-section">
-                <div class="form-section-head"><div><h3>网络路径</h3><p>诊断只在用户点击后执行。</p></div><button class="secondary-button" type="button" data-mock-action="模拟诊断完成：直连 188ms，系统代理 241ms"><i class="icon" data-lucide="activity"></i>测试路径</button></div>
+                <div class="form-section-head"><div><h3>连接测试</h3><p>可直接使用当前填写的 URL 与 Key，不必先保存。</p></div><button class="secondary-button" type="button" data-mock-action="测试当前连接"><i class="icon" data-lucide="activity"></i>测试连接</button></div>
                 <div class="option-row"><div><b>使用系统代理</b><small>当前选择：直连</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="false" aria-label="使用系统代理"></button></div>
               </div>
             </section>
@@ -6668,7 +6681,7 @@
       <footer class="drawer-foot">
         <button class="danger-button" id="deleteFromEditorButton" type="button">删除</button>
         <button class="secondary-button" type="button" data-close="providerOverlay">取消</button>
-        <button class="primary-button" id="saveProviderButton" type="button">保存并绑定</button>
+        <button class="primary-button" id="saveProviderButton" type="button">保存上游</button>
       </footer>
     </section>
   </div>
@@ -6849,7 +6862,10 @@
         const start = new Date(data?.start_utc || query.startUtc);
         const end = new Date(data?.end_utc || query.endUtc);
         const dateOptions = { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false };
-        rangeSummary.textContent = `${scopeLabel} · ${start.toLocaleString("zh-CN", dateOptions)} → ${end.toLocaleString("zh-CN", dateOptions)} · [start, end)`;
+        const legacyCompactionNote = data?.compaction_filter_complete === false
+          ? " · 旧压缩数据未分离"
+          : "";
+        rangeSummary.textContent = `${scopeLabel} · ${start.toLocaleString("zh-CN", dateOptions)} → ${end.toLocaleString("zh-CN", dateOptions)} · [start, end)${legacyCompactionNote}`;
       }
 
       function closeScopeMenu({ restoreFocus = false } = {}) {
@@ -7673,7 +7689,7 @@
       editingProviderId = providerId;
       const provider = providers.find((item) => item.id === providerId);
       $("#providerEditorTitle").textContent = provider ? "编辑上游" : "新增上游";
-      $("#providerEditorSubtitle").textContent = provider ? `${provider.name} · ${provider.channel}` : "新建并绑定到当前 Agent";
+      $("#providerEditorSubtitle").textContent = provider ? `${provider.name} · ${provider.channel}` : "加入当前 Agent 的独立上游列表，不改变当前使用上游";
       $("#providerNameInput").value = provider?.name || "新上游";
       $("#providerUrlInput").value = provider?.url || "https://api.example.com/v1";
       $("#deleteFromEditorButton").style.display = provider ? "inline-flex" : "none";
@@ -7812,7 +7828,7 @@
       }
       closeOverlay("providerOverlay");
       renderAll();
-      showToast(`${name} 已模拟保存并绑定`);
+      showToast(`${name} 已模拟保存，当前使用上游未改变`);
     });
 
     $("#deleteFromEditorButton").addEventListener("click", () => {

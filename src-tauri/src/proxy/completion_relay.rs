@@ -96,6 +96,7 @@ pub(super) async fn stream_upstream(
     mut shadow_affinity_decision: Option<ShadowAffinityDecision>,
     agent_generation: bool,
     response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
+    client_prompt_cache_key_for_redaction: Option<String>,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
     // for the whole SSE response. The guarded section has already covered request
@@ -420,6 +421,12 @@ pub(super) async fn stream_upstream(
                 stream_metadata.model_output_seen |= summary.model_output_seen;
             }
         }
+        if let Some(error_summary) = stream_metadata.error_summary.as_mut() {
+            *error_summary = summarize_client_prompt_cache_key_error(
+                std::mem::take(error_summary),
+                client_prompt_cache_key_for_redaction.as_deref(),
+            );
+        }
         let terminal_verdict = evaluate_terminal(
             &client_channel,
             TerminalCompatibility::Strict,
@@ -496,11 +503,21 @@ pub(super) async fn stream_upstream(
         // in-memory lineage and waterline control state before releasing its
         // per-lineage publication fence. Slow metrics/persistence remain below.
         let response_session_update = if stream_success_for_cache && !confirmed_compaction {
+            let breakpoint_placement_digest = upstream_request_diagnostics
+                .final_wire_receipt
+                .as_ref()
+                .and_then(|receipt| {
+                    receipt
+                        .cache_controls
+                        .breakpoint_placement_digest()
+                        .map(ToOwned::to_owned)
+                });
             update_response_session_with_owned_input(
                 &state_for_stream,
                 response_session_lease.as_ref(),
                 &response_session_parent,
                 full_response_input.take(),
+                breakpoint_placement_digest,
                 response_session_response_id.clone(),
                 std::mem::take(&mut stream_metadata.output_items),
             )
@@ -536,6 +553,7 @@ pub(super) async fn stream_upstream(
                     &upstream_request_diagnostics,
                     status,
                     error_summary,
+                    &stream_metadata.cache_capability_rejection_fields,
                 )
                 .await;
             }
@@ -548,7 +566,10 @@ pub(super) async fn stream_upstream(
             )
             && stream_metadata.error_event_seen
         {
-            let error_summary = upstream_error_summary(&session_error_body);
+            let error_summary = upstream_error_summary_redacting(
+                &session_error_body,
+                client_prompt_cache_key_for_redaction.as_deref(),
+            );
             let rejection = response_session_rejection_classification(status, &error_summary);
             if !error_summary.is_empty() {
                 stream_metric_errors.push((
@@ -620,6 +641,19 @@ pub(super) async fn stream_upstream(
         let prefix_usage_record = usage_observation
             .as_ref()
             .map(|item| item.effective.clone());
+        let final_responses_static_projection =
+            if matches!(decision.upstream_channel, Channel::Responses) {
+                FinalResponsesStaticProjection::Observed(
+                    upstream_request_diagnostics
+                        .final_wire_receipt
+                        .as_ref()
+                        .and_then(|receipt| {
+                            receipt.wire.responses_static_projection_digest.as_deref()
+                        }),
+                )
+            } else {
+                FinalResponsesStaticProjection::NotApplicable
+            };
         let prefix_observation = observe_provider_prefix_usage(
             &state_for_stream,
             prefix_state_key.as_deref(),
@@ -627,6 +661,7 @@ pub(super) async fn stream_upstream(
             usage_record.as_ref(),
             prefix_usage_record.as_ref(),
             &tail_input_diagnostics,
+            final_responses_static_projection,
             used_response_session,
             retried_full_response,
             prefix_guard_wait.budget_exhausted,
@@ -634,7 +669,7 @@ pub(super) async fn stream_upstream(
         )
         .await;
         let gap_breakdown = prefix_observation.gap;
-        let prefix_lag = usage_record
+        let mut prefix_lag = usage_record
             .as_ref()
             .map(|record| {
                 prefix_lag_diagnostics_from_previous(
@@ -646,6 +681,9 @@ pub(super) async fn stream_upstream(
                 )
             })
             .unwrap_or_default();
+        if prefix_observation.static_wire_drift {
+            prefix_lag.classification = Some("static_wire_drift".to_string());
+        }
         if confirmed_compaction {
             let shadow_assignment_key =
                 mark_shadow_compaction_boundary(&mut shadow_affinity_decision);

@@ -1,0 +1,137 @@
+- iframe [active] [ref=e3]:
+  - generic [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e7] [cursor=pointer]:
+            - strong [ref=f1e8]: Atoapi
+            - generic [ref=f1e9]: Graphite · v1.3.6
+        - tablist "Agent 列表" [ref=f1e10]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e48] [cursor=pointer]:
+            - generic [ref=f1e54]:
+              - generic [ref=f1e55]: Claude Code
+              - generic [ref=f1e56]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e58] [cursor=pointer]:
+            - generic [ref=f1e62]:
+              - generic [ref=f1e63]: Claude Desktop
+              - generic [ref=f1e64]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e66] [cursor=pointer]:
+            - generic [ref=f1e71]:
+              - generic [ref=f1e72]: Codex
+              - generic [ref=f1e73]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e75] [cursor=pointer]:
+            - generic [ref=f1e79]:
+              - generic [ref=f1e80]: Gemini
+              - generic [ref=f1e81]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e83] [cursor=pointer]:
+            - generic [ref=f1e88]:
+              - generic [ref=f1e89]: OpenCode
+              - generic [ref=f1e90]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e92] [cursor=pointer]:
+            - generic [ref=f1e97]:
+              - generic [ref=f1e98]: OpenClaw
+              - generic [ref=f1e99]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e101] [cursor=pointer]:
+            - generic [ref=f1e109]:
+              - generic [ref=f1e110]: Hermes
+              - generic [ref=f1e111]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e113] [cursor=pointer]:
+            - generic [ref=f1e122]:
+              - generic [ref=f1e123]: 本地代理模式
+              - generic [ref=f1e124]: 已关闭
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]:
+            - generic [ref=f1e13]: 代理运行中
+            - generic [ref=f1e14]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e15] [cursor=pointer]
+      - region [ref=f1e131]:
+        - generic [ref=f1e18]:
+          - switch "启用当前 Agent" [ref=f1e19] [cursor=pointer]
+          - generic [ref=f1e20]:
+            - heading "Claude Code" [level=1] [ref=f1e132]
+            - paragraph [ref=f1e22]: 未选择上游
+        - generic [ref=f1e23]:
+          - generic [ref=f1e133]:
+            - generic [ref=f1e134]: Base URL
+            - code [ref=f1e135]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f1e136] [cursor=pointer]
+          - generic [ref=f1e140]:
+            - generic [ref=f1e141]: Local Key
+            - code [ref=f1e142]: ato-local-preview
+            - button "复制本地 Key" [ref=f1e143] [cursor=pointer]
+        - button "新增上游" [ref=f1e25] [cursor=pointer]
+      - main [ref=f1e28]:
+        - generic [ref=f1e29]:
+          - generic [ref=f1e30]:
+            - generic [ref=f1e31]:
+              - heading "上游路由" [level=2] [ref=f1e32]
+              - paragraph [ref=f1e33]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f1e34]:
+              - generic [ref=f1e35]: 0 个可用上游
+              - generic [ref=f1e36]: 一次入站 · 一次上游
+          - generic [ref=f1e37]: 当前没有上游配置
+      - contentinfo [ref=f1e38]:
+        - button "打开缓存统计与请求记录" [ref=f1e39] [cursor=pointer]:
+          - generic [ref=f1e41]: 缓存与记录
+          - generic [ref=f1e42]:
+            - text: 命中率
+            - strong [ref=f1e153]: —
+          - generic [ref=f1e44]: — 成功
+    - dialog [ref=f1e204]:
+      - banner [ref=f1e205]:
+        - generic [ref=f1e206]:
+          - heading "新增上游" [level=2] [ref=f1e207]
+          - paragraph [ref=f1e208]: 新建并绑定到当前 Agent
+        - button "关闭上游编辑器" [ref=f1e209] [cursor=pointer]
+      - generic [ref=f1e214]:
+        - tablist "上游配置分类" [ref=f1e215]:
+          - tab "连接信息" [ref=f1e216] [cursor=pointer]
+          - tab "模型映射" [ref=f1e217] [cursor=pointer]
+          - tab "多 Key" [ref=f1e218] [cursor=pointer]
+          - tab "传输与缓存" [ref=f1e219] [cursor=pointer]
+          - tab "兼容性" [active] [selected] [ref=f1e220] [cursor=pointer]
+        - generic [ref=f1e265]:
+          - generic [ref=f1e266]:
+            - generic [ref=f1e268]:
+              - heading "Responses 会话复用" [level=3] [ref=f1e269]
+              - paragraph [ref=f1e270]: 验证通过后才可启用增量请求。
+            - generic [ref=f1e272]:
+              - generic [ref=f1e273]: 实际模型 ID
+              - generic [ref=f1e274]:
+                - combobox "实际模型 ID" [ref=f1e275]
+                - button "获取模型" [ref=f1e276] [cursor=pointer]
+              - generic [ref=f1e282]: 使用实际上游模型进行资格验证；不要求先添加模型映射。
+            - generic [ref=f1e283]:
+              - generic [ref=f1e288]:
+                - generic [ref=f1e289]: 尚未验证
+                - generic [ref=f1e290]: 选择或输入实际模型后再验证
+              - button "重新验证" [ref=f1e291] [cursor=pointer]
+            - generic [ref=f1e292]:
+              - generic [ref=f1e293]:
+                - generic [ref=f1e294]: 启用会话复用
+                - generic [ref=f1e295]: 当前由能力验证门控
+              - switch "启用会话复用" [disabled] [ref=f1e296] [cursor=pointer]
+          - generic [ref=f1e297]:
+            - generic [ref=f1e299]:
+              - heading "缓存规则验证" [level=3] [ref=f1e300]
+              - paragraph [ref=f1e301]: 仅在手动点击时探测；普通转发不会附加缓存键或增加请求。
+            - generic [ref=f1e303]:
+              - generic [ref=f1e304]: 实际模型 ID
+              - generic [ref=f1e305]:
+                - combobox "实际模型 ID" [ref=f1e306]
+                - button "获取模型" [ref=f1e307] [cursor=pointer]
+              - generic [ref=f1e313]: 先探测字段支持，再依次运行基线与候选；候选每次只验证一个字段。
+            - generic [ref=f1e314]:
+              - generic [ref=f1e319]:
+                - generic [ref=f1e320]: 尚未验证
+                - generic [ref=f1e321]: 选择实际模型后手动探测缓存字段。
+              - button "探测字段" [disabled] [ref=f1e322]
+            - generic [ref=f1e330]:
+              - button "基线" [disabled] [ref=f1e331]
+              - button "候选" [disabled] [ref=f1e332]
+              - button "停止" [disabled] [ref=f1e333]
+      - contentinfo [ref=f1e262]:
+        - button "取消" [ref=f1e263] [cursor=pointer]
+        - button "保存并绑定" [ref=f1e264] [cursor=pointer]
+    - status

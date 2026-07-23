@@ -28,6 +28,15 @@ pub struct MetricsTrendQueryInput {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub include_cold_starts: bool,
+    /// Compatibility requests from an older UI omit this field.  Those
+    /// requests must retain the historical all-traffic view rather than
+    /// silently filtering a category they do not know about.
+    #[serde(default = "default_include_compactions")]
+    pub include_compactions: bool,
+}
+
+fn default_include_compactions() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -59,6 +68,10 @@ pub struct MetricsTrendSnapshot {
     pub end_utc: String,
     pub agent_id: String,
     pub provider_id: Option<String>,
+    /// `false` only when a selected legacy hour contains compaction traffic
+    /// recorded before compaction token sub-buckets existed.  We never fake a
+    /// subtraction for those old records.
+    pub compaction_filter_complete: bool,
     pub summary: MetricsTrendValues,
     pub points: Vec<MetricsTrendPoint>,
 }
@@ -202,6 +215,15 @@ struct ScopeCounters {
     total: TrendCounters,
     #[serde(default)]
     cold_start: TrendCounters,
+    #[serde(default)]
+    compaction: TrendCounters,
+    #[serde(default)]
+    cold_start_compaction: TrendCounters,
+    /// Older persisted history only has `total` and `cold_start`, so its
+    /// compaction request count cannot be split back into precise token
+    /// values.  New scopes set this before their first observation.
+    #[serde(default)]
+    compaction_breakdown_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -250,9 +272,22 @@ impl PersistedMetricsHistory {
             .or_default()
             .entry(provider_id.to_string())
             .or_default();
+        if scope.total.successful_requests == 0
+            && scope.cold_start.successful_requests == 0
+            && scope.compaction.successful_requests == 0
+            && scope.cold_start_compaction.successful_requests == 0
+        {
+            scope.compaction_breakdown_complete = true;
+        }
         scope.total.add_assign(counters);
         if observation.cold_start {
             scope.cold_start.add_assign(counters);
+        }
+        if observation.compaction {
+            scope.compaction.add_assign(counters);
+            if observation.cold_start {
+                scope.cold_start_compaction.add_assign(counters);
+            }
         }
         true
     }
@@ -269,8 +304,10 @@ impl PersistedMetricsHistory {
         agent_id: &str,
         provider_id: Option<&str>,
         include_cold_starts: bool,
+        include_compactions: bool,
     ) -> MetricsTrendSnapshot {
         let mut summary = TrendCounters::default();
+        let mut compaction_filter_complete = true;
         let mut points = Vec::with_capacity(((end - start).num_hours().max(0)) as usize);
         let mut bucket_start = start.timestamp();
         while bucket_start < end.timestamp() {
@@ -282,11 +319,17 @@ impl PersistedMetricsHistory {
             {
                 if let Some(provider_id) = provider_id {
                     if let Some(scope) = agent_scopes.get(provider_id) {
-                        counters.add_assign(effective_counters(scope, include_cold_starts));
+                        let (effective, complete) =
+                            effective_counters(scope, include_cold_starts, include_compactions);
+                        counters.add_assign(effective);
+                        compaction_filter_complete &= complete;
                     }
                 } else {
                     for scope in agent_scopes.values() {
-                        counters.add_assign(effective_counters(scope, include_cold_starts));
+                        let (effective, complete) =
+                            effective_counters(scope, include_cold_starts, include_compactions);
+                        counters.add_assign(effective);
+                        compaction_filter_complete &= complete;
                     }
                 }
             }
@@ -303,18 +346,44 @@ impl PersistedMetricsHistory {
             end_utc: timestamp_to_rfc3339(end.timestamp()),
             agent_id: agent_id.to_string(),
             provider_id: provider_id.map(str::to_string),
+            compaction_filter_complete,
             summary: summary.into_values(),
             points,
         }
     }
 }
 
-fn effective_counters(scope: &ScopeCounters, include_cold_starts: bool) -> TrendCounters {
-    if include_cold_starts {
-        scope.total
-    } else {
-        scope.total.saturating_sub(scope.cold_start)
+fn effective_counters(
+    scope: &ScopeCounters,
+    include_cold_starts: bool,
+    include_compactions: bool,
+) -> (TrendCounters, bool) {
+    let mut effective = scope.total;
+    if !include_cold_starts {
+        effective = effective.saturating_sub(scope.cold_start);
     }
+
+    // Compaction and cold-start are overlapping request categories.  Apply
+    // inclusion-exclusion so a compacted cold read is never deducted twice.
+    let compaction_filter_complete = include_compactions
+        || scope.compaction_breakdown_complete
+        || scope.total.compaction_requests == 0;
+    if !include_compactions && scope.compaction_breakdown_complete {
+        effective = effective.saturating_sub(scope.compaction);
+        if !include_cold_starts {
+            effective.add_assign(scope.cold_start_compaction);
+        }
+    }
+    // Category counters describe the selected population, not the source
+    // population.  The union add-back above restores ordinary usage only;
+    // neither excluded category should remain visible as included work.
+    if !include_cold_starts {
+        effective.cold_start_requests = 0;
+    }
+    if !include_compactions && scope.compaction_breakdown_complete {
+        effective.compaction_requests = 0;
+    }
+    (effective, compaction_filter_complete)
 }
 
 #[derive(Clone)]
@@ -456,7 +525,14 @@ impl MetricsHistory {
             .state
             .lock()
             .expect("metrics history lock must not be poisoned")
-            .query(start, end, agent_id, provider_id, input.include_cold_starts))
+            .query(
+                start,
+                end,
+                agent_id,
+                provider_id,
+                input.include_cold_starts,
+                input.include_compactions,
+            ))
     }
 
     pub(crate) async fn flush(&self) -> Result<()> {
@@ -636,6 +712,19 @@ mod tests {
             agent_id: "codex".to_string(),
             provider_id: provider_id.map(str::to_string),
             include_cold_starts,
+            include_compactions: true,
+        }
+    }
+
+    fn query_with_filters(
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        include_cold_starts: bool,
+        include_compactions: bool,
+    ) -> MetricsTrendQueryInput {
+        MetricsTrendQueryInput {
+            include_compactions,
+            ..query(start, end, None, include_cold_starts)
         }
     }
 
@@ -693,6 +782,143 @@ mod tests {
         assert_eq!(excluded.summary.successful_requests, 1);
         assert_eq!(excluded.summary.cold_start_requests, 0);
         assert_eq!(excluded.summary.cache_creation_tokens, 128);
+    }
+
+    #[test]
+    fn cold_start_and_compaction_filters_use_exact_union() {
+        let history = MetricsHistory::in_memory();
+        let start = hour_now() - Duration::hours(1);
+
+        let normal = observation(start, "provider-a", false);
+        let cold_only = observation(start, "provider-a", true);
+        let mut compact_only = observation(start, "provider-a", false);
+        compact_only.compaction = true;
+        let mut compact_cold = observation(start, "provider-a", true);
+        compact_cold.compaction = true;
+
+        history.observe(normal);
+        history.observe(cold_only);
+        history.observe(compact_only);
+        history.observe(compact_cold);
+
+        let all = history
+            .query(query_with_filters(
+                start,
+                start + Duration::hours(1),
+                true,
+                true,
+            ))
+            .unwrap();
+        assert_eq!(all.summary.successful_requests, 4);
+        assert_eq!(all.summary.input_tokens, 4_000);
+        assert_eq!(all.summary.compaction_requests, 2);
+
+        let without_cold = history
+            .query(query_with_filters(
+                start,
+                start + Duration::hours(1),
+                false,
+                true,
+            ))
+            .unwrap();
+        assert_eq!(without_cold.summary.successful_requests, 2);
+        assert_eq!(without_cold.summary.input_tokens, 2_000);
+        assert_eq!(without_cold.summary.compaction_requests, 1);
+
+        let without_compaction = history
+            .query(query_with_filters(
+                start,
+                start + Duration::hours(1),
+                true,
+                false,
+            ))
+            .unwrap();
+        assert_eq!(without_compaction.summary.successful_requests, 2);
+        assert_eq!(without_compaction.summary.input_tokens, 2_000);
+        assert_eq!(without_compaction.summary.compaction_requests, 0);
+
+        let without_union = history
+            .query(query_with_filters(
+                start,
+                start + Duration::hours(1),
+                false,
+                false,
+            ))
+            .unwrap();
+        assert_eq!(without_union.summary.successful_requests, 1);
+        assert_eq!(without_union.summary.input_tokens, 1_000);
+        assert_eq!(without_union.summary.compaction_requests, 0);
+        assert!(without_union.compaction_filter_complete);
+    }
+
+    #[test]
+    fn legacy_compaction_totals_are_not_falsely_subtracted() {
+        let start = hour_now() - Duration::hours(1);
+        let mut history = PersistedMetricsHistory::default();
+        let mut total = TrendCounters::default();
+        total.successful_requests = 1;
+        total.input_tokens = 1_000;
+        total.cache_read_tokens = 100;
+        total.cache_miss_tokens = 900;
+        total.compaction_requests = 1;
+        history
+            .buckets
+            .entry(hour_start_timestamp(start))
+            .or_default()
+            .by_agent_provider
+            .entry("codex".to_string())
+            .or_default()
+            .insert(
+                "provider-a".to_string(),
+                ScopeCounters {
+                    total,
+                    // This is what an existing v1 JSON record deserializes
+                    // to: no compaction token subset and no completeness bit.
+                    ..ScopeCounters::default()
+                },
+            );
+
+        let snapshot = history.query(
+            start,
+            start + Duration::hours(1),
+            "codex",
+            None,
+            true,
+            false,
+        );
+        assert_eq!(snapshot.summary.successful_requests, 1);
+        assert_eq!(snapshot.summary.input_tokens, 1_000);
+        assert_eq!(snapshot.summary.compaction_requests, 1);
+        assert!(!snapshot.compaction_filter_complete);
+    }
+
+    #[test]
+    fn deserialized_legacy_history_and_omitted_filter_stay_conservative() {
+        let start = hour_now() - Duration::hours(1);
+        let timestamp = hour_start_timestamp(start);
+        let raw = format!(
+            r#"{{"version":1,"buckets":{{"{timestamp}":{{"by_agent_provider":{{"codex":{{"provider-a":{{"total":{{"successful_requests":1,"input_tokens":1000,"output_tokens":0,"cache_read_tokens":100,"cache_miss_tokens":900,"cache_creation_tokens":0,"cache_shortfall_tokens":900,"cache_avoidable_gap_tokens":0,"cache_new_tail_gap_tokens":900,"compaction_requests":1,"cold_start_requests":0}}}}}}}}}}}}}}"#
+        );
+        let history: PersistedMetricsHistory = serde_json::from_str(&raw)
+            .expect("a pre-compaction-split history record must deserialize");
+        let snapshot = history.query(
+            start,
+            start + Duration::hours(1),
+            "codex",
+            None,
+            true,
+            false,
+        );
+        assert_eq!(snapshot.summary.input_tokens, 1_000);
+        assert!(!snapshot.compaction_filter_complete);
+
+        let query: MetricsTrendQueryInput = serde_json::from_str(&format!(
+            r#"{{"start_utc":"{}","end_utc":"{}","agent_id":"codex","include_cold_starts":true}}"#,
+            start.to_rfc3339(),
+            (start + Duration::hours(1)).to_rfc3339()
+        ))
+        .expect("an older UI query must deserialize");
+        assert!(query.include_compactions);
     }
 
     #[test]

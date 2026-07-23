@@ -516,6 +516,12 @@ pub struct AgentProviderTrafficStats {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub compaction_requests: u64,
+    pub compaction_input_tokens: u64,
+    pub compaction_output_tokens: u64,
+    pub compaction_cache_read_tokens: u64,
+    pub compaction_cache_shortfall_tokens: u64,
+    pub compaction_cache_avoidable_gap_tokens: u64,
+    pub compaction_cache_new_tail_gap_tokens: u64,
     pub cache_shortfall_tokens: u64,
     pub cache_avoidable_gap_tokens: u64,
     pub cache_new_tail_gap_tokens: u64,
@@ -526,6 +532,13 @@ pub struct AgentProviderTrafficStats {
     pub cold_start_cache_shortfall_tokens: u64,
     pub cold_start_cache_avoidable_gap_tokens: u64,
     pub cold_start_cache_new_tail_gap_tokens: u64,
+    pub cold_start_compaction_requests: u64,
+    pub cold_start_compaction_input_tokens: u64,
+    pub cold_start_compaction_output_tokens: u64,
+    pub cold_start_compaction_cache_read_tokens: u64,
+    pub cold_start_compaction_cache_shortfall_tokens: u64,
+    pub cold_start_compaction_cache_avoidable_gap_tokens: u64,
+    pub cold_start_compaction_cache_new_tail_gap_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1043,6 +1056,12 @@ struct AgentProviderTrafficAccumulator {
     output_tokens: u64,
     cache_read_tokens: u64,
     compaction_requests: u64,
+    compaction_input_tokens: u64,
+    compaction_output_tokens: u64,
+    compaction_cache_read_tokens: u64,
+    compaction_cache_shortfall_tokens: u64,
+    compaction_cache_avoidable_gap_tokens: u64,
+    compaction_cache_new_tail_gap_tokens: u64,
     cache_shortfall_tokens: u64,
     cache_avoidable_gap_tokens: u64,
     cache_new_tail_gap_tokens: u64,
@@ -1053,6 +1072,13 @@ struct AgentProviderTrafficAccumulator {
     cold_start_cache_shortfall_tokens: u64,
     cold_start_cache_avoidable_gap_tokens: u64,
     cold_start_cache_new_tail_gap_tokens: u64,
+    cold_start_compaction_requests: u64,
+    cold_start_compaction_input_tokens: u64,
+    cold_start_compaction_output_tokens: u64,
+    cold_start_compaction_cache_read_tokens: u64,
+    cold_start_compaction_cache_shortfall_tokens: u64,
+    cold_start_compaction_cache_avoidable_gap_tokens: u64,
+    cold_start_compaction_cache_new_tail_gap_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2176,17 +2202,10 @@ fn metrics_history_observation(
 }
 
 fn request_log_is_confirmed_compaction(log: &RequestLog) -> bool {
+    // `cache_status=compact` is emitted only after the relay has confirmed a
+    // compaction boundary. Treat it as the durable category marker so a new
+    // relay source cannot silently bypass the user's compaction filter.
     log.cache_status == "compact"
-        && matches!(
-            log.upstream_call_source.as_deref(),
-            Some(
-                "responses-compaction-v2"
-                    | "compact"
-                    | "compact-fallback"
-                    | "compact-chat-compat"
-                    | "compact-fallback-chat-compat"
-            )
-        )
 }
 
 impl ProviderTrafficAccumulator {
@@ -2231,6 +2250,12 @@ impl AgentProviderTrafficAccumulator {
             output_tokens: self.output_tokens,
             cache_read_tokens: self.cache_read_tokens,
             compaction_requests: self.compaction_requests,
+            compaction_input_tokens: self.compaction_input_tokens,
+            compaction_output_tokens: self.compaction_output_tokens,
+            compaction_cache_read_tokens: self.compaction_cache_read_tokens,
+            compaction_cache_shortfall_tokens: self.compaction_cache_shortfall_tokens,
+            compaction_cache_avoidable_gap_tokens: self.compaction_cache_avoidable_gap_tokens,
+            compaction_cache_new_tail_gap_tokens: self.compaction_cache_new_tail_gap_tokens,
             cache_shortfall_tokens: self.cache_shortfall_tokens,
             cache_avoidable_gap_tokens: self.cache_avoidable_gap_tokens,
             cache_new_tail_gap_tokens: self.cache_new_tail_gap_tokens,
@@ -2241,6 +2266,16 @@ impl AgentProviderTrafficAccumulator {
             cold_start_cache_shortfall_tokens: self.cold_start_cache_shortfall_tokens,
             cold_start_cache_avoidable_gap_tokens: self.cold_start_cache_avoidable_gap_tokens,
             cold_start_cache_new_tail_gap_tokens: self.cold_start_cache_new_tail_gap_tokens,
+            cold_start_compaction_requests: self.cold_start_compaction_requests,
+            cold_start_compaction_input_tokens: self.cold_start_compaction_input_tokens,
+            cold_start_compaction_output_tokens: self.cold_start_compaction_output_tokens,
+            cold_start_compaction_cache_read_tokens: self.cold_start_compaction_cache_read_tokens,
+            cold_start_compaction_cache_shortfall_tokens: self
+                .cold_start_compaction_cache_shortfall_tokens,
+            cold_start_compaction_cache_avoidable_gap_tokens: self
+                .cold_start_compaction_cache_avoidable_gap_tokens,
+            cold_start_compaction_cache_new_tail_gap_tokens: self
+                .cold_start_compaction_cache_new_tail_gap_tokens,
         }
     }
 }
@@ -2427,30 +2462,50 @@ fn upsert_agent_provider_traffic(
     group.total_requests += 1;
     let successful = request_log_is_successful_history(log);
     if successful {
+        let confirmed_compaction = request_log_is_confirmed_compaction(log);
+        let input_tokens = log.input_tokens.unwrap_or_default();
+        let output_tokens = log.output_tokens.unwrap_or_default();
+        let cache_read_tokens = log.cache_read_tokens.unwrap_or_default();
+        let cache_shortfall_tokens = log.cache_shortfall_tokens.unwrap_or_default();
+        let cache_avoidable_gap_tokens = log.cache_avoidable_gap_tokens.unwrap_or_default();
+        let cache_new_tail_gap_tokens = log.cache_new_tail_gap_tokens.unwrap_or_default();
         group.successful_requests += 1;
         // These are the same successful-request usage totals shown by the
         // request dashboard. Failed attempts remain visible through
         // `error_statuses`, but must not inflate cache-hit/token statistics.
-        group.input_tokens += log.input_tokens.unwrap_or_default();
-        group.output_tokens += log.output_tokens.unwrap_or_default();
-        group.cache_read_tokens += log.cache_read_tokens.unwrap_or_default();
-        if log.cache_status == "compact" {
+        group.input_tokens += input_tokens;
+        group.output_tokens += output_tokens;
+        group.cache_read_tokens += cache_read_tokens;
+        if confirmed_compaction {
             group.compaction_requests += 1;
+            group.compaction_input_tokens += input_tokens;
+            group.compaction_output_tokens += output_tokens;
+            group.compaction_cache_read_tokens += cache_read_tokens;
+            group.compaction_cache_shortfall_tokens += cache_shortfall_tokens;
+            group.compaction_cache_avoidable_gap_tokens += cache_avoidable_gap_tokens;
+            group.compaction_cache_new_tail_gap_tokens += cache_new_tail_gap_tokens;
         }
-        group.cache_shortfall_tokens += log.cache_shortfall_tokens.unwrap_or_default();
-        group.cache_avoidable_gap_tokens += log.cache_avoidable_gap_tokens.unwrap_or_default();
-        group.cache_new_tail_gap_tokens += log.cache_new_tail_gap_tokens.unwrap_or_default();
+        group.cache_shortfall_tokens += cache_shortfall_tokens;
+        group.cache_avoidable_gap_tokens += cache_avoidable_gap_tokens;
+        group.cache_new_tail_gap_tokens += cache_new_tail_gap_tokens;
         if log.cold_start == Some(true) {
             group.cold_start_requests += 1;
-            group.cold_start_input_tokens += log.input_tokens.unwrap_or_default();
-            group.cold_start_output_tokens += log.output_tokens.unwrap_or_default();
-            group.cold_start_cache_read_tokens += log.cache_read_tokens.unwrap_or_default();
-            group.cold_start_cache_shortfall_tokens +=
-                log.cache_shortfall_tokens.unwrap_or_default();
-            group.cold_start_cache_avoidable_gap_tokens +=
-                log.cache_avoidable_gap_tokens.unwrap_or_default();
-            group.cold_start_cache_new_tail_gap_tokens +=
-                log.cache_new_tail_gap_tokens.unwrap_or_default();
+            group.cold_start_input_tokens += input_tokens;
+            group.cold_start_output_tokens += output_tokens;
+            group.cold_start_cache_read_tokens += cache_read_tokens;
+            group.cold_start_cache_shortfall_tokens += cache_shortfall_tokens;
+            group.cold_start_cache_avoidable_gap_tokens += cache_avoidable_gap_tokens;
+            group.cold_start_cache_new_tail_gap_tokens += cache_new_tail_gap_tokens;
+            if confirmed_compaction {
+                group.cold_start_compaction_requests += 1;
+                group.cold_start_compaction_input_tokens += input_tokens;
+                group.cold_start_compaction_output_tokens += output_tokens;
+                group.cold_start_compaction_cache_read_tokens += cache_read_tokens;
+                group.cold_start_compaction_cache_shortfall_tokens += cache_shortfall_tokens;
+                group.cold_start_compaction_cache_avoidable_gap_tokens +=
+                    cache_avoidable_gap_tokens;
+                group.cold_start_compaction_cache_new_tail_gap_tokens += cache_new_tail_gap_tokens;
+            }
         }
     }
     if log.status >= 400 || log.cache_status == "error" {
@@ -3135,6 +3190,7 @@ mod tests {
                 agent_id: "codex".to_string(),
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
+                include_compactions: true,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);
@@ -3920,6 +3976,7 @@ mod tests {
                 agent_id: "codex".to_string(),
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
+                include_compactions: true,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);
@@ -3983,6 +4040,7 @@ mod tests {
                 agent_id: "codex".to_string(),
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
+                include_compactions: true,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);
@@ -4057,6 +4115,12 @@ mod tests {
         assert_eq!(codex.output_tokens, 402);
         assert_eq!(codex.cache_read_tokens, 1_809);
         assert_eq!(codex.compaction_requests, 1);
+        assert_eq!(codex.compaction_input_tokens, 10);
+        assert_eq!(codex.compaction_output_tokens, 2);
+        assert_eq!(codex.compaction_cache_read_tokens, 9);
+        assert_eq!(codex.compaction_cache_shortfall_tokens, 10);
+        assert_eq!(codex.compaction_cache_avoidable_gap_tokens, 3);
+        assert_eq!(codex.compaction_cache_new_tail_gap_tokens, 7);
         assert_eq!(codex.cache_shortfall_tokens, 2_010);
         assert_eq!(codex.cache_avoidable_gap_tokens, 603);
         assert_eq!(codex.cache_new_tail_gap_tokens, 1_407);
@@ -4064,6 +4128,13 @@ mod tests {
         assert_eq!(codex.cold_start_cache_shortfall_tokens, 10);
         assert_eq!(codex.cold_start_cache_avoidable_gap_tokens, 3);
         assert_eq!(codex.cold_start_cache_new_tail_gap_tokens, 7);
+        assert_eq!(codex.cold_start_compaction_requests, 1);
+        assert_eq!(codex.cold_start_compaction_input_tokens, 10);
+        assert_eq!(codex.cold_start_compaction_output_tokens, 2);
+        assert_eq!(codex.cold_start_compaction_cache_read_tokens, 9);
+        assert_eq!(codex.cold_start_compaction_cache_shortfall_tokens, 10);
+        assert_eq!(codex.cold_start_compaction_cache_avoidable_gap_tokens, 3);
+        assert_eq!(codex.cold_start_compaction_cache_new_tail_gap_tokens, 7);
         let claude = snapshot
             .agent_provider_stats
             .iter()
@@ -4090,6 +4161,13 @@ mod tests {
         assert_eq!(snapshot.recent_requests[0].cache_status, "compact");
         assert_eq!(snapshot.recent_requests[0].cold_start, None);
         assert_eq!(snapshot.recent_upstream_calls[0].cold_start, None);
+    }
+
+    #[test]
+    fn compact_status_remains_filterable_when_a_new_relay_source_is_added() {
+        let mut compact = request_log("compact", Some("future-compact-source"));
+        compact.upstream_call_source = Some("future-compaction-relay".to_string());
+        assert!(request_log_is_confirmed_compaction(&compact));
     }
 
     #[tokio::test]

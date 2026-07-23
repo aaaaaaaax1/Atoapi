@@ -1,8 +1,15 @@
 use serde_json::Value;
 
-use crate::{config::Channel, metrics::UsageRecord};
+use crate::{
+    config::{Channel, ProviderCacheCapabilityField},
+    metrics::UsageRecord,
+};
+use std::collections::HashSet;
 
-use super::{provider_usage_from_value, response_id_from_value, sse};
+use super::{
+    cache_capability_rejection_fields_from_value, provider_usage_from_value,
+    response_id_from_value, sse,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct StreamObservation {
@@ -24,6 +31,7 @@ pub(super) struct StreamSummary {
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
     pub error_summary: Option<String>,
+    pub cache_capability_rejection_fields: HashSet<ProviderCacheCapabilityField>,
     pub compaction_output_seen: bool,
     pub model_output_seen: bool,
     pub frame_overflowed: bool,
@@ -375,6 +383,9 @@ impl ResponsesStreamState {
             self.process_event_type(event_type, sequence);
         }
         let effective_event_type = payload_event_type.or(frame.event.as_deref());
+        let frame_has_error = value.get("error").is_some_and(|error| !error.is_null())
+            || frame.event.as_deref().is_some_and(is_error_event_type)
+            || payload_event_type.is_some_and(is_error_event_type);
         self.capture_output_items(&value, effective_event_type);
         self.summary.model_output_seen |= value_has_model_output(&value);
         self.summary.compaction_output_seen |= value_has_compaction_output(&value);
@@ -382,8 +393,16 @@ impl ResponsesStreamState {
             self.summary.error_event_seen = true;
             self.summary.error_event_sequence.get_or_insert(sequence);
         }
+        if frame_has_error {
+            self.summary
+                .cache_capability_rejection_fields
+                .extend(cache_capability_rejection_fields_from_value(&value));
+        }
         if self.summary.error_event_seen && self.summary.error_summary.is_none() {
-            let summary = super::upstream_error_summary_from_value(&value);
+            // Keep a small extra in-memory window so the relay owner can
+            // redact a caller-owned cache key before applying the persisted
+            // summary limit. This value never leaves the relay unredacted.
+            let summary = super::upstream_error_summary_from_value_for_client_key_redaction(&value);
             if !summary.is_empty() {
                 self.summary.error_summary = Some(summary);
             }

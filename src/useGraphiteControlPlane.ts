@@ -5,11 +5,14 @@ import {
   type AgentInjectionConfig,
   type AgentInjectionResult,
   type AppConfig,
+  type CacheValidationMode,
+  type CacheValidationStatus,
   type Channel,
   type FetchModelsInput,
   type MetricsSnapshot,
   type ModelConfig,
   type ProviderConfig,
+  type ProviderCacheCapabilityProbeResult,
   type ProviderInput,
   type ProviderKeyTestResult,
   type ProviderNetworkPathDiagnosticResult,
@@ -23,7 +26,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.3.6";
+const APP_VERSION = "v1.3.7";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -37,12 +40,14 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState("");
   const [includeColdStarts, setIncludeColdStarts] = useState(true);
+  const [includeCompactions, setIncludeCompactions] = useState(true);
   const [showDetailedErrors, setShowDetailedErrors] = useState(false);
   const [providerConnectionStatus, setProviderConnectionStatus] = useState<Record<string, string>>({});
   const [metricsRefreshPolicy, setMetricsRefreshPolicy] = useState<MetricsRefreshPolicy>("visible-1s");
   const [proxyStatus, setProxyStatus] = useState<ProxyStatus | null>(null);
   const [networkPathDiagnostic, setNetworkPathDiagnostic] =
     useState<ProviderNetworkPathDiagnosticResult | null>(null);
+  const [cacheValidation, setCacheValidation] = useState<CacheValidationStatus | null>(null);
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const reasoningFallbackSyncing = useRef(false);
@@ -51,14 +56,16 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
   async function refreshAll() {
     setError("");
     try {
-      const [nextConfig, nextMetrics, nextProxyStatus] = await Promise.all([
+      const [nextConfig, nextMetrics, nextProxyStatus, nextCacheValidation] = await Promise.all([
         command<AppConfig>("reload_config"),
         command<MetricsSnapshot>("get_metrics"),
-        command<ProxyStatus>("get_proxy_status")
+        command<ProxyStatus>("get_proxy_status"),
+        command<CacheValidationStatus>("get_cache_validation_status")
       ]);
       setConfig(nextConfig);
       setMetrics(nextMetrics);
       setProxyStatus(nextProxyStatus);
+      setCacheValidation(nextCacheValidation);
       const agents = visibleAgentInjections(nextConfig.agent_injections);
       setSelectedAgentId((current) => {
         if (current && agents.some((agent) => agent.id === current)) return current;
@@ -71,7 +78,12 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
 
   async function refreshMetrics() {
     try {
-      setMetrics(await command<MetricsSnapshot>("get_metrics"));
+      const [nextMetrics, nextCacheValidation] = await Promise.all([
+        command<MetricsSnapshot>("get_metrics"),
+        command<CacheValidationStatus>("get_cache_validation_status")
+      ]);
+      setMetrics(nextMetrics);
+      setCacheValidation(nextCacheValidation);
     } catch {
       // Keep the last verified snapshot visible when a transient refresh fails.
     }
@@ -132,24 +144,19 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
 
     setError("");
     setNotice("");
-    let editablePayload = payload;
+    const editablePayload = payload;
     let existing = config?.providers.find((provider) => provider.id === editablePayload.id) ?? null;
-    if (agentId && existing && !providerBelongsToAgent(existing.id, agentId)) {
-      if (existing.id.startsWith("agent-")) {
-        throw new Error("不能编辑其他 Agent 的独立上游");
-      }
-      const clonedConfig = await command<AppConfig>("clone_provider_for_agent", {
-        input: { agent_id: agentId, provider_id: existing.id, model_id: null }
-      });
-      const clonedProviderId = clonedConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id;
-      if (!clonedProviderId) throw new Error("无法创建当前 Agent 的独立上游");
-      editablePayload = { ...payload, id: clonedProviderId };
-      existing = clonedConfig.providers.find((provider) => provider.id === clonedProviderId) ?? null;
+    const editingBoundLegacyProvider = Boolean(
+      agentId && existing && !providerBelongsToAgent(existing.id, agentId)
+    );
+    if (editingBoundLegacyProvider && existing?.id.startsWith("agent-")) {
+      throw new Error("不能编辑其他 Agent 的独立上游");
     }
 
     const existingKeys = new Map((existing?.key_pool?.keys ?? []).map((key) => [key.id, key]));
     const input: ProviderInput = {
       id: editablePayload.id ?? undefined,
+      owner_agent_id: agentId || undefined,
       name,
       base_url: baseUrl,
       models_url: cleanOptionalText(editablePayload.models_url) ?? undefined,
@@ -192,6 +199,11 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       let nextConfig = await command<AppConfig>("add_or_update_provider", { input });
       let savedProvider =
         nextConfig.providers.find((provider) => provider.id === editablePayload.id) ??
+        (editingBoundLegacyProvider
+          ? nextConfig.providers.find((provider) =>
+              provider.id === nextConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id
+            )
+          : undefined) ??
         nextConfig.providers.find((provider) => provider.name === name && provider.base_url === baseUrl);
       if (!savedProvider) throw new Error("上游保存后未返回配置记录");
 
@@ -225,21 +237,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
           });
         }
       }
-      if (agentId) {
-        const boundProviderId = nextConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id;
-        if (boundProviderId !== savedProvider.id) {
-          await command<AgentInjectionResult[]>("update_agent_injection_route", {
-            input: { id: agentId, provider_id: savedProvider.id }
-          });
-          nextConfig = await command<AppConfig>("get_config");
-        }
-        const boundProvider = nextConfig.providers.find(
-          (provider) => provider.id === nextConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id
-        );
-        if (boundProvider) savedProvider = boundProvider;
-      }
       setConfig(nextConfig);
-      setNotice("上游配置已保存并绑定到当前 Agent");
+      setNotice("上游配置已保存，当前 Agent 的使用上游未改变");
     } catch (cause) {
       const message = String(cause);
       setError(message);
@@ -347,12 +346,24 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       if (!agent || !provider) throw new Error("未找到 Agent 或上游配置");
       return { notice: await activateAgentProvider(agent, provider) };
     }
+    if (action === "reorder-providers") {
+      const agentId = text("agentId");
+      const providerIds = Array.isArray(payload.providerIds)
+        ? payload.providerIds.map((providerId) => String(providerId).trim()).filter(Boolean)
+        : [];
+      if (!agentId || !providerIds.length) throw new Error("上游排序数据不完整");
+      const nextConfig = await command<AppConfig>("reorder_agent_providers", {
+        input: { agent_id: agentId, provider_ids: providerIds }
+      });
+      setConfig(nextConfig);
+      return { notice: "当前 Agent 的上游顺序已保存" };
+    }
     if (action === "save-provider") {
       await saveProviderFromGraphite(
         String(payload.agentId ?? ""),
         payload as unknown as GraphiteProviderPayload
       );
-      return { notice: "上游已保存并绑定", closeOverlay: "providerOverlay" };
+      return { notice: "上游已保存，当前使用上游未改变", closeOverlay: "providerOverlay" };
     }
     if (action === "delete-provider") {
       await deleteProviderFromGraphite(text("agentId"), text("providerId"));
@@ -385,6 +396,23 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
     if (action === "test-provider") {
       const provider = config?.providers.find((item) => item.id === text("providerId"));
+      if (!provider) {
+        const draft = providerPayload();
+        const input = draftProviderTestInput(draft, null);
+        if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
+        if (!input.api_key?.trim()) throw new Error("请先填写 API Key");
+        const startedAt = performance.now();
+        const result = await command<ProviderKeyTestResult>("test_provider_key", { input });
+        const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+        const statusKey = `draft:${draft.name || draft.base_url}`;
+        setProviderConnectionStatus((current) => ({
+          ...current,
+          [statusKey]: result.ok ? `刚刚成功 · ${elapsedMs}ms` : `失败 · ${elapsedMs}ms`
+        }));
+        return result.ok
+          ? { notice: `${draft.name || "未保存上游"} 连通正常${result.models_count ? ` · ${result.models_count} 个模型` : ""}` }
+          : { error: result.message };
+      }
       if (!provider) throw new Error("请先保存上游，再测试连通性");
       const startedAt = performance.now();
       const result = await command<ProviderKeyTestResult>("test_provider_key", {
@@ -403,6 +431,15 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     if (action === "test-provider-key") {
       const provider = config?.providers.find((item) => item.id === text("providerId"));
       const keyId = text("keyId");
+      if (!provider) {
+        const draft = providerPayload();
+        const key = draft.keys.find((item) => item.id === keyId)?.key;
+        if (!keyId || !cleanOptionalText(key)) throw new Error("请先填写待测试的 Key");
+        const result = await command<ProviderKeyTestResult>("test_provider_key", {
+          input: draftProviderTestInput(draft, key)
+        });
+        return result.ok ? { notice: result.message } : { error: result.message };
+      }
       if (!provider || !keyId) throw new Error("未找到待测试的上游 Key");
       const result = await command<ProviderKeyTestResult>("test_provider_key", {
         input: providerTestInput(provider, keyId)
@@ -489,6 +526,46 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         payload: { compatibility: nextConfig.providers.find((provider) => provider.id === providerId) }
       };
     }
+    if (action === "probe-cache-capabilities") {
+      const providerId = text("providerId");
+      const modelId = text("modelId");
+      if (!providerId) throw new Error("请先保存上游，再验证缓存控制字段");
+      if (!modelId) throw new Error("请选择或填写实际上游模型 ID，再验证缓存控制字段");
+      const result = await command<ProviderCacheCapabilityProbeResult>(
+        "probe_provider_cache_capabilities",
+        { input: { provider_id: providerId, model_id: modelId, channel: null } }
+      );
+      const nextConfig = await command<AppConfig>("get_config");
+      setConfig(nextConfig);
+      const accepted = result.fields.filter((field) => field.status === "verified").length;
+      return {
+        notice: `${modelId} 已完成缓存字段探测：${accepted}/${result.fields.length} 可用于手动验证`,
+        payload: { compatibility: nextConfig.providers.find((provider) => provider.id === providerId) }
+      };
+    }
+    if (action === "set-cache-validation") {
+      const mode = String(payload.mode ?? "auto") as CacheValidationMode;
+      if (mode !== "auto" && mode !== "baseline" && mode !== "candidate") {
+        throw new Error("缓存验证模式无效");
+      }
+      const providerId = text("providerId");
+      const modelId = text("modelId");
+      if (mode !== "auto" && !providerId) throw new Error("请先保存上游，再开始缓存验证");
+      if (mode !== "auto" && !modelId) throw new Error("请选择或填写实际上游模型 ID，再开始缓存验证");
+      const status = await command<CacheValidationStatus>("set_cache_validation_mode", {
+        input: {
+          mode,
+          provider_id: mode === "auto" ? null : providerId,
+          model: mode === "auto" ? null : modelId
+        }
+      });
+      setCacheValidation(status);
+      if (mode === "auto") return { notice: "缓存验证已停止；正常转发不受影响" };
+      return {
+        notice: mode === "baseline" ? "缓存基线已开始，后续正常请求会被被动统计" : "缓存候选已开始，仅测试一个已探测字段",
+        payload: { cacheValidation: status }
+      };
+    }
     if (action === "save-proxy-mode") {
       const host = text("host");
       const port = Number(payload.port);
@@ -512,6 +589,11 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       const enabled = payload.enabled === true;
       setIncludeColdStarts(enabled);
       return { notice: enabled ? "统计已计入冷启动" : "统计已排除冷启动" };
+    }
+    if (action === "set-include-compactions") {
+      const enabled = payload.enabled === true;
+      setIncludeCompactions(enabled);
+      return { notice: enabled ? "统计已计入压缩" : "统计已排除压缩" };
     }
     if (action === "set-show-detailed-errors") {
       const enabled = payload.enabled === true;
@@ -571,11 +653,13 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     metrics,
     selectedAgentId,
     includeColdStarts,
+    includeCompactions,
     showDetailedErrors,
     providerConnectionStatus,
     metricsRefreshPolicy,
     proxyStatus,
     networkPathDiagnostic,
+    cacheValidation,
     appVersion: APP_VERSION,
     notice,
     error,
@@ -648,5 +732,19 @@ function providerTestInput(provider: ProviderConfig, keyId: string | null) {
     custom_user_agent: provider.custom_user_agent ?? null,
     channel: provider.channel,
     use_system_proxy: provider.use_system_proxy
+  };
+}
+
+function draftProviderTestInput(provider: GraphiteProviderPayload, key: string | null | undefined) {
+  return {
+    provider_id: provider.id ?? null,
+    key_id: null,
+    api_key: key ?? cleanOptionalText(provider.api_key),
+    base_url: provider.base_url ?? "",
+    models_url: cleanOptionalText(provider.models_url),
+    is_full_url: false,
+    custom_user_agent: cleanOptionalText(provider.custom_user_agent),
+    channel: provider.channel || "responses",
+    use_system_proxy: provider.use_system_proxy ?? true
   };
 }

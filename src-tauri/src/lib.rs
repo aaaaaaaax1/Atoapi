@@ -18,11 +18,12 @@ use admin::{
     apply_enabled_agent_injections, clear_cache, clone_provider_for_agent, delete_model,
     delete_provider, diagnose_provider_network_paths, fetch_provider_models, get_agent_injections,
     get_cache_validation_status, get_config, get_metrics, get_metrics_trend, get_proxy_mode_status,
-    get_proxy_status, probe_provider_response_session_reuse, reload_config,
-    reveal_provider_api_key, reveal_provider_key, save_cache_policy, save_config,
-    save_proxy_mode_config, select_provider, set_agent_injection_enabled,
-    set_cache_validation_mode, set_provider_response_session_reuse_enabled, start_proxy,
-    stop_proxy, test_provider_key, test_provider_key_pool, update_agent_injection_route,
+    get_proxy_status, probe_provider_cache_capabilities, probe_provider_response_session_reuse,
+    reload_config, reorder_agent_providers, reveal_provider_api_key, reveal_provider_key,
+    save_cache_policy, save_config, save_proxy_mode_config, select_provider,
+    set_agent_injection_enabled, set_cache_validation_mode,
+    set_provider_response_session_reuse_enabled, start_proxy, stop_proxy, test_provider_key,
+    test_provider_key_pool, update_agent_injection_route,
 };
 use config::isolated_test_instance;
 use state::AppState;
@@ -85,6 +86,7 @@ pub fn run() {
             select_provider,
             clone_provider_for_agent,
             add_or_update_provider,
+            reorder_agent_providers,
             delete_provider,
             reveal_provider_api_key,
             reveal_provider_key,
@@ -92,6 +94,7 @@ pub fn run() {
             diagnose_provider_network_paths,
             test_provider_key,
             test_provider_key_pool,
+            probe_provider_cache_capabilities,
             probe_provider_response_session_reuse,
             set_provider_response_session_reuse_enabled,
             add_or_update_model,

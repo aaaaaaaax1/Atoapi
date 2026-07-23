@@ -88,6 +88,11 @@ pub struct AppState {
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_endpoint_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    /// Process-local, opaque cooldowns for caller-provided native Responses
+    /// placement keys rejected by an upstream. These must never be persisted:
+    /// a caller key is wire-only data and a new process gets one fresh chance
+    /// after configuration or upstream capability changes.
+    pub client_prompt_cache_key_rejection_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
     pub response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
     pub continuation_lineage: ContinuationLineageIndex,
@@ -227,6 +232,10 @@ pub struct PrefixWarmState {
     pub tail_tool_output_chars: u64,
     pub tail_largest_tool_output_chars: u64,
     pub tail_tool_output_noise_hint: Option<String>,
+    /// Opaque digest of the frozen Responses wire outside the append-only
+    /// `input` member. It prevents a static request-shape change from being
+    /// interpreted as a cache-settlement gap for the old prefix.
+    pub responses_static_projection_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +279,8 @@ struct PersistedPrefixWarmState {
     tail_largest_tool_output_chars: u64,
     #[serde(default)]
     tail_tool_output_noise_hint: Option<String>,
+    #[serde(default)]
+    responses_static_projection_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,6 +578,7 @@ impl AppState {
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns,
             continuation_lineage,
@@ -618,6 +630,7 @@ impl AppState {
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             response_session_error_cooldowns,
             continuation_lineage,
@@ -1263,6 +1276,9 @@ impl PersistedRuntimeState {
                         tail_tool_output_chars: state.tail_tool_output_chars,
                         tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
                         tail_tool_output_noise_hint: state.tail_tool_output_noise_hint.clone(),
+                        responses_static_projection_digest: state
+                            .responses_static_projection_digest
+                            .clone(),
                     },
                 )
             })
@@ -1335,6 +1351,8 @@ impl PersistedRuntimeState {
                         tail_tool_output_chars: state.tail_tool_output_chars,
                         tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
                         tail_tool_output_noise_hint: state.tail_tool_output_noise_hint,
+                        responses_static_projection_digest: state
+                            .responses_static_projection_digest,
                     },
                 ))
             })
@@ -1421,6 +1439,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         }
     }
 
@@ -2181,6 +2200,7 @@ mod tests {
                 tail_tool_output_chars: 0,
                 tail_largest_tool_output_chars: 0,
                 tail_tool_output_noise_hint: None,
+                responses_static_projection_digest: Some("static-projection-a".to_string()),
             },
         );
         state
@@ -2381,6 +2401,7 @@ mod tests {
                 tail_tool_output_chars: 0,
                 tail_largest_tool_output_chars: 0,
                 tail_tool_output_noise_hint: None,
+                responses_static_projection_digest: None,
             },
         );
 
@@ -2453,6 +2474,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let mut prefix_states = HashMap::from([
             (
@@ -2550,6 +2572,7 @@ mod tests {
                 tail_tool_output_chars: 0,
                 tail_largest_tool_output_chars: 0,
                 tail_tool_output_noise_hint: None,
+                responses_static_projection_digest: None,
             },
         );
 

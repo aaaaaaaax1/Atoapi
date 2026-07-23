@@ -3,6 +3,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    collections::HashSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -15,7 +16,8 @@ use crate::{
     codex_ui_patch,
     config::{
         normalize_upstream_proxy_url, AgentInjectionConfig, AppConfig, CacheConfig, Channel,
-        ModelConfig, ProviderInput, ProviderResponseSessionReuseProbeResult, PublicConfig,
+        ModelConfig, ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
+        ProviderInput, ProviderResponseSessionReuseProbeResult, PublicConfig,
     },
     metrics::MetricsSnapshot,
     metrics_history::{MetricsTrendQueryInput, MetricsTrendSnapshot},
@@ -141,6 +143,13 @@ pub struct AgentProviderCloneInput {
     pub provider_id: String,
     #[serde(default)]
     pub model_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProviderOrderInput {
+    pub agent_id: String,
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,13 +427,21 @@ fn clone_provider_for_agent_config(
         })
         .map(ToOwned::to_owned);
 
-    let agent = &mut config.agent_injections[agent_index];
-    agent
-        .hidden_provider_ids
-        .retain(|provider_id| provider_id != source_provider_id);
-    agent.provider_id = Some(target_provider_id.clone());
-    agent.model_id = selected_model;
-    agent.last_status = Some("已绑定当前 Agent 独立上游".to_string());
+    {
+        let agent = &mut config.agent_injections[agent_index];
+        agent
+            .hidden_provider_ids
+            .retain(|provider_id| provider_id != source_provider_id);
+        agent.provider_id = Some(target_provider_id.clone());
+        agent.model_id = selected_model;
+        agent.last_status = Some("已绑定当前 Agent 独立上游".to_string());
+    }
+    replace_or_append_agent_provider_order(
+        config,
+        agent_id,
+        source_provider_id,
+        &target_provider_id,
+    );
     Ok(target_provider_id)
 }
 
@@ -508,11 +525,21 @@ fn provider_clone_matches_source(provider_id: &str, source_id: &str, agent_id: &
 #[tauri::command]
 pub async fn add_or_update_provider(
     state: State<'_, Arc<AppState>>,
-    input: ProviderInput,
+    mut input: ProviderInput,
 ) -> CommandResult<PublicConfig> {
     let version = {
         let mut config = state.config.write().await;
+        let owner_agent_id = input
+            .owner_agent_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        prepare_agent_owned_provider_input(&mut config, &mut input).map_err(to_command_error)?;
         let id = config.upsert_provider(input).map_err(to_command_error)?;
+        if let Some(agent_id) = owner_agent_id.as_deref() {
+            append_agent_provider_order(&mut config, agent_id, &id);
+        }
         if config.active_provider_id.is_none() {
             config.active_provider_id = Some(id.clone());
         }
@@ -528,6 +555,213 @@ pub async fn add_or_update_provider(
     Ok(state.public_config().await)
 }
 
+fn prepare_agent_owned_provider_input(
+    config: &mut AppConfig,
+    input: &mut ProviderInput,
+) -> anyhow::Result<()> {
+    let Some(agent_id) = input
+        .owner_agent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if !config
+        .agent_injections
+        .iter()
+        .any(|agent| agent.id == agent_id)
+    {
+        anyhow::bail!("agent injection {agent_id} was not found");
+    }
+
+    let requested_id = input
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_id = match requested_id {
+        Some(provider_id) if provider_belongs_to_agent(provider_id, agent_id) => {
+            provider_id.to_string()
+        }
+        Some(provider_id) => {
+            let selected_model_id = config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .and_then(|agent| {
+                    (agent.provider_id.as_deref() == Some(provider_id))
+                        .then(|| agent.model_id.clone())
+                        .flatten()
+                });
+            if selected_model_id.is_none()
+                && !config.agent_injections.iter().any(|agent| {
+                    agent.id == agent_id && agent.provider_id.as_deref() == Some(provider_id)
+                })
+            {
+                anyhow::bail!("provider {provider_id} is not available to agent {agent_id}");
+            }
+            clone_provider_for_agent_config(
+                config,
+                agent_id,
+                provider_id,
+                selected_model_id.as_deref(),
+            )?
+        }
+        None => unique_agent_provider_id(config, &sanitize_provider_id_part(&input.name), agent_id),
+    };
+    input.id = Some(provider_id);
+    input.owner_agent_id = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn reorder_agent_providers(
+    state: State<'_, Arc<AppState>>,
+    input: AgentProviderOrderInput,
+) -> CommandResult<PublicConfig> {
+    let version = {
+        let mut config = state.config.write().await;
+        reorder_agent_providers_config(&mut config, &input).map_err(to_command_error)?;
+        config.updated_at = Utc::now();
+        state
+            .publish_config_snapshot(&config)
+            .map_err(to_command_error)?
+    };
+    state
+        .wait_for_config_snapshot(version)
+        .await
+        .map_err(to_command_error)?;
+    Ok(state.public_config().await)
+}
+
+fn reorder_agent_providers_config(
+    config: &mut AppConfig,
+    input: &AgentProviderOrderInput,
+) -> anyhow::Result<()> {
+    let agent_id = input.agent_id.trim();
+    if agent_id.is_empty() {
+        anyhow::bail!("agent id is required");
+    }
+    let expected = visible_provider_ids_for_agent(config, agent_id)?;
+    let received = input
+        .provider_ids
+        .iter()
+        .map(|provider_id| provider_id.trim())
+        .collect::<Vec<_>>();
+    if received.iter().any(|provider_id| provider_id.is_empty()) {
+        anyhow::bail!("provider order cannot contain an empty id");
+    }
+    let expected_set = expected.iter().map(String::as_str).collect::<HashSet<_>>();
+    let received_set = received.iter().copied().collect::<HashSet<_>>();
+    if received.len() != expected.len()
+        || received_set.len() != received.len()
+        || expected_set != received_set
+    {
+        anyhow::bail!("provider order must contain exactly the current agent providers");
+    }
+
+    let provider_ids = received.into_iter().map(ToOwned::to_owned).collect();
+    if let Some(order) = config
+        .agent_provider_orders
+        .iter_mut()
+        .find(|order| order.agent_id == agent_id)
+    {
+        order.provider_ids = provider_ids;
+    } else {
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: agent_id.to_string(),
+                provider_ids,
+            });
+    }
+    Ok(())
+}
+
+fn visible_provider_ids_for_agent(
+    config: &AppConfig,
+    agent_id: &str,
+) -> anyhow::Result<Vec<String>> {
+    let agent = config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
+    Ok(config
+        .providers
+        .iter()
+        .filter(|provider| {
+            provider_belongs_to_agent(&provider.id, agent_id)
+                || agent.provider_id.as_deref() == Some(provider.id.as_str())
+        })
+        .map(|provider| provider.id.clone())
+        .collect())
+}
+
+fn append_agent_provider_order(config: &mut AppConfig, agent_id: &str, provider_id: &str) {
+    if let Some(order) = config
+        .agent_provider_orders
+        .iter_mut()
+        .find(|order| order.agent_id == agent_id)
+    {
+        if !order.provider_ids.iter().any(|id| id == provider_id) {
+            order.provider_ids.push(provider_id.to_string());
+        }
+        return;
+    }
+
+    let mut provider_ids = visible_provider_ids_for_agent(config, agent_id).unwrap_or_default();
+    if !provider_ids.iter().any(|id| id == provider_id) {
+        provider_ids.push(provider_id.to_string());
+    }
+    config
+        .agent_provider_orders
+        .push(crate::config::AgentProviderOrderConfig {
+            agent_id: agent_id.to_string(),
+            provider_ids,
+        });
+}
+
+fn replace_or_append_agent_provider_order(
+    config: &mut AppConfig,
+    agent_id: &str,
+    source_provider_id: &str,
+    target_provider_id: &str,
+) {
+    if let Some(order) = config
+        .agent_provider_orders
+        .iter_mut()
+        .find(|order| order.agent_id == agent_id)
+    {
+        if let Some(source_index) = order
+            .provider_ids
+            .iter()
+            .position(|provider_id| provider_id == source_provider_id)
+        {
+            order.provider_ids[source_index] = target_provider_id.to_string();
+        } else if !order
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == target_provider_id)
+        {
+            order.provider_ids.push(target_provider_id.to_string());
+        }
+        return;
+    }
+
+    let mut provider_ids = visible_provider_ids_for_agent(config, agent_id).unwrap_or_default();
+    if !provider_ids.iter().any(|id| id == target_provider_id) {
+        provider_ids.push(target_provider_id.to_string());
+    }
+    config
+        .agent_provider_orders
+        .push(crate::config::AgentProviderOrderConfig {
+            agent_id: agent_id.to_string(),
+            provider_ids,
+        });
+}
+
 #[tauri::command]
 pub async fn probe_provider_response_session_reuse(
     state: State<'_, Arc<AppState>>,
@@ -537,6 +771,21 @@ pub async fn probe_provider_response_session_reuse(
         &state,
         input.provider_id.trim(),
         input.model_id.trim(),
+    )
+    .await
+    .map_err(to_command_error)
+}
+
+#[tauri::command]
+pub async fn probe_provider_cache_capabilities(
+    state: State<'_, Arc<AppState>>,
+    input: ProviderCacheCapabilityProbeInput,
+) -> CommandResult<ProviderCacheCapabilityProbeResult> {
+    proxy::probe_and_record_provider_cache_capabilities(
+        &state,
+        input.provider_id.trim(),
+        input.model_id.trim(),
+        input.channel,
     )
     .await
     .map_err(to_command_error)
@@ -716,6 +965,12 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
             .hidden_provider_ids
             .retain(|hidden_id| hidden_id != provider_id);
     }
+    for order in &mut config.agent_provider_orders {
+        order.provider_ids.retain(|id| id != provider_id);
+    }
+    config
+        .agent_provider_orders
+        .retain(|order| !order.provider_ids.is_empty());
 }
 
 fn hide_provider_for_agent(agent: &mut AgentInjectionConfig, provider_id: &str) {
@@ -2007,6 +2262,147 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn agent_owned_edit_clones_a_bound_legacy_provider_without_losing_its_key() {
+        let mut config = AppConfig::default();
+        let mut shared = test_provider("shared");
+        shared.api_key_encrypted = Some("shared-secret".to_string());
+        config.providers.push(shared);
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.provider_id = Some("shared".to_string());
+
+        let mut input = ProviderInput {
+            id: Some("shared".to_string()),
+            owner_agent_id: Some("codex".to_string()),
+            name: "Codex private".to_string(),
+            base_url: "https://private.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel_mode: crate::config::ProviderChannelMode::Auto,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: true,
+            non_sse_compact_compat_enabled: false,
+            api_key: None,
+            key_pool: None,
+            enabled: true,
+        };
+
+        prepare_agent_owned_provider_input(&mut config, &mut input).unwrap();
+        let private_id = input.id.clone().unwrap();
+        assert_eq!(private_id, "agent-codex-shared");
+        assert_eq!(input.owner_agent_id, None);
+        assert_eq!(
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "codex")
+                .and_then(|agent| agent.provider_id.as_deref()),
+            Some(private_id.as_str())
+        );
+
+        config.upsert_provider(input).unwrap();
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == private_id)
+                .and_then(|provider| provider.api_key_encrypted.as_deref()),
+            Some("shared-secret")
+        );
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == "shared")
+                .map(|provider| provider.name.as_str()),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn agent_provider_order_is_isolated_and_requires_the_complete_visible_set() {
+        let mut config = AppConfig::default();
+        config.providers.extend([
+            test_provider("agent-codex-first"),
+            test_provider("agent-codex-second"),
+            test_provider("agent-opencode-other"),
+        ]);
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some("agent-codex-first".to_string());
+
+        reorder_agent_providers_config(
+            &mut config,
+            &AgentProviderOrderInput {
+                agent_id: "codex".to_string(),
+                provider_ids: vec![
+                    "agent-codex-second".to_string(),
+                    "agent-codex-first".to_string(),
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config
+                .agent_provider_orders
+                .iter()
+                .find(|order| order.agent_id == "codex")
+                .map(|order| order.provider_ids.as_slice()),
+            Some(
+                [
+                    "agent-codex-second".to_string(),
+                    "agent-codex-first".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert!(reorder_agent_providers_config(
+            &mut config,
+            &AgentProviderOrderInput {
+                agent_id: "codex".to_string(),
+                provider_ids: vec![
+                    "agent-codex-first".to_string(),
+                    "agent-opencode-other".to_string(),
+                ],
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn first_private_provider_append_preserves_the_current_legacy_provider_position() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some("shared".to_string());
+        config.providers.push(test_provider("agent-codex-new"));
+
+        append_agent_provider_order(&mut config, "codex", "agent-codex-new");
+
+        assert_eq!(
+            config
+                .agent_provider_orders
+                .iter()
+                .find(|order| order.agent_id == "codex")
+                .map(|order| order.provider_ids.clone()),
+            Some(vec!["shared".to_string(), "agent-codex-new".to_string(),])
+        );
     }
 
     #[test]

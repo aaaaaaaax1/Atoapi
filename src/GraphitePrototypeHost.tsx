@@ -4,7 +4,9 @@ import lucideUmdUrl from "lucide/dist/umd/lucide.min.js?url";
 import { command } from "./lib/api";
 import type {
   AgentInjectionConfig,
+  AgentProviderTrafficStats,
   AppConfig,
+  CacheValidationStatus,
   Channel,
   MetricsSnapshot,
   MetricsTrendInput,
@@ -75,6 +77,7 @@ export interface GraphitePrototypeHostProps {
   metrics: MetricsSnapshot | null;
   selectedAgentId: string;
   includeColdStarts: boolean;
+  includeCompactions: boolean;
   showDetailedErrors: boolean;
   providerConnectionStatus: Record<string, string>;
   metricsRefreshPolicy: "visible-1s" | "5s" | "manual";
@@ -83,6 +86,7 @@ export interface GraphitePrototypeHostProps {
     provider_id: string;
     paths: Array<{ path: string; ok: boolean; elapsed_ms: number; status?: number | null; error?: string | null }>;
   } | null;
+  cacheValidation: CacheValidationStatus | null;
   appVersion: string;
   notice?: string;
   error?: string;
@@ -108,7 +112,7 @@ const bridgeSource = String.raw`
   const clone = (value) => JSON.parse(JSON.stringify(value ?? []));
   const replace = (target, source) => target.splice(0, target.length, ...clone(source));
   const pendingActions = new Map();
-  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-session-reuse", "set-session-reuse", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
+  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-session-reuse", "set-session-reuse", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
     const requestId = "graphite-" + Date.now() + "-" + Math.random().toString(16).slice(2);
     const source = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
@@ -138,6 +142,18 @@ const bridgeSource = String.raw`
     node.setAttribute("aria-checked", String(Boolean(checked)));
     if (typeof disabled === "boolean") node.disabled = disabled;
   };
+  const ensureCompactionPolicySwitch = () => {
+    const existing = $bridge('[aria-label="计入压缩"]');
+    if (existing) return existing;
+    const coldStartSwitch = $bridge('[aria-label="计入冷启动"]');
+    const coldStartRow = coldStartSwitch?.closest(".policy-row");
+    if (!coldStartRow?.parentElement) return null;
+    const row = document.createElement("div");
+    row.className = "policy-row";
+    row.innerHTML = '<div><b>计入压缩</b><small>仅影响当前统计视图；压缩后冷读单独标记</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="计入压缩"></button>';
+    coldStartRow.insertAdjacentElement("afterend", row);
+    return row.querySelector('[aria-label="计入压缩"]');
+  };
   const strategyToUi = (value) => ({ "round-robin": "轮询", priority: "优先级", "least-used": "最低使用", random: "随机", sequential: "顺序" }[value] || "轮询");
   const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "round-robin");
   const selectedProviderId = () => editingProviderId || currentAgent()?.provider || "";
@@ -147,6 +163,7 @@ const bridgeSource = String.raw`
   let requestScopeId = "";
   let requestPage = 1;
   let lastTrendContextKey = "";
+  let draggingProviderId = "";
 
   const trendController = () => window.__atoapiTrend;
 
@@ -159,7 +176,8 @@ const bridgeSource = String.raw`
     const contextKey = [
       agent?.sourceId || agent?.id || "",
       scope?.id || "all",
-      metricState.includeColdStarts !== false ? "cold-in" : "cold-out"
+      metricState.includeColdStarts !== false ? "cold-in" : "cold-out",
+      metricState.includeCompactions !== false ? "compact-in" : "compact-out"
     ].join("|");
     controller.setContextKey(contextKey);
     controller.syncScopes(metricState.scopes || [], scope?.id || "all");
@@ -182,7 +200,8 @@ const bridgeSource = String.raw`
         end_utc: query.endUtc,
         agent_id: agent?.sourceId || agent?.id || "",
         provider_id: scope?.providerId || null,
-        include_cold_starts: metricState.includeColdStarts !== false
+        include_cold_starts: metricState.includeColdStarts !== false,
+        include_compactions: metricState.includeCompactions !== false
       }
     });
   });
@@ -287,12 +306,13 @@ const bridgeSource = String.raw`
       keyStrategy.value = strategyLabel;
     }
     if (failureThreshold) failureThreshold.value = String(detail?.key_pool?.failure_threshold ?? 3);
-    setSwitch("使用系统代理", detail?.use_system_proxy || false);
-    setSwitch("prompt cache retention", detail?.prompt_cache_retention_enabled || false);
-    setSwitch("大请求体 gzip", detail?.request_body_gzip_enabled || false);
+    setSwitch("使用系统代理", detail?.use_system_proxy ?? true);
+    setSwitch("prompt cache retention", detail?.prompt_cache_retention_enabled ?? true);
+    setSwitch("大请求体 gzip", detail?.request_body_gzip_enabled ?? true);
     setSwitch("非 SSE compact 兼容", detail?.non_sse_compact_compat_enabled || false);
     setKeyPoolEnabled(detail?.key_pool?.enabled === true);
     applyCompatibility(detail);
+    applyCacheValidation(detail);
     applyNetworkDiagnostic(detail?.network_diagnostic);
     renderModelCandidates();
     renderMappings();
@@ -384,6 +404,27 @@ const bridgeSource = String.raw`
     renderEditedKeyPool();
   }
 
+  function clearProviderDragState() {
+    draggingProviderId = "";
+    document.querySelectorAll(".provider-row.is-dragging, .provider-row.is-drag-over").forEach((row) => {
+      row.classList.remove("is-dragging", "is-drag-over");
+    });
+  }
+
+  function reorderProvidersFromBridge(draggedId, targetId) {
+    const fromIndex = providers.findIndex((provider) => provider.id === draggedId);
+    const targetIndex = providers.findIndex((provider) => provider.id === targetId);
+    if (fromIndex < 0 || targetIndex < 0 || fromIndex === targetIndex) return;
+    const providerIds = providers.map((provider) => provider.id);
+    const [dragged] = providerIds.splice(fromIndex, 1);
+    providerIds.splice(targetIndex, 0, dragged);
+    const agent = currentAgent();
+    send("reorder-providers", {
+      agentId: agent?.sourceId || agent?.id || "",
+      providerIds
+    });
+  }
+
   function serializeEditor() {
     const selected = currentAgent();
     const detail = host.state?.providerDetails?.[editingProviderId] || {};
@@ -424,9 +465,9 @@ const bridgeSource = String.raw`
       custom_user_agent: $bridge("#providerCustomUserAgentInput")?.value.trim() || "",
       channel,
       channel_mode: modeValue === "auto" ? "auto" : "manual",
-      use_system_proxy: switchState("使用系统代理", detail.use_system_proxy || false),
-      prompt_cache_retention_enabled: switchState("prompt cache retention", detail.prompt_cache_retention_enabled || false),
-      request_body_gzip_enabled: switchState("大请求体 gzip", detail.request_body_gzip_enabled || false),
+      use_system_proxy: switchState("使用系统代理", detail.use_system_proxy ?? true),
+      prompt_cache_retention_enabled: switchState("prompt cache retention", detail.prompt_cache_retention_enabled ?? true),
+      request_body_gzip_enabled: switchState("大请求体 gzip", detail.request_body_gzip_enabled ?? true),
       non_sse_compact_compat_enabled: switchState("非 SSE compact 兼容", detail.non_sse_compact_compat_enabled || false),
       models: formModels,
       keys,
@@ -468,6 +509,66 @@ const bridgeSource = String.raw`
       enableSwitch.disabled = reuse?.status !== "verified";
       enableSwitch.setAttribute("aria-checked", String(Boolean(reuse?.enabled)));
     }
+  }
+
+  function cacheValidationModelId() {
+    const input = $bridge("#providerCacheValidationModelInput");
+    return String(input?.value || compatibilityModelId() || "").trim();
+  }
+
+  function ensureCacheValidationPanel() {
+    const existing = $bridge("#providerCacheValidationSection");
+    if (existing) return existing;
+    const compatibility = $bridge("#providerCompatibility");
+    if (!compatibility) return null;
+    const section = document.createElement("div");
+    section.className = "form-section";
+    section.id = "providerCacheValidationSection";
+    section.innerHTML = '<div class="form-section-head"><div><h3>缓存规则验证</h3><p>仅在手动点击时探测；普通转发不会附加缓存键或增加请求。</p></div></div>'
+      + '<div class="compatibility-model-control"><div class="field wide compatibility-model-field"><label for="providerCacheValidationModelInput">实际模型 ID</label><span class="compatibility-model-input-row"><input id="providerCacheValidationModelInput" list="providerModelCandidates" placeholder="选择已获取模型或直接输入" autocomplete="off" spellcheck="false" /><button class="secondary-button" id="fetchCacheValidationModelsButton" type="button"><i class="icon" data-lucide="refresh-cw"></i>获取模型</button></span><small>先探测字段支持，再依次运行基线与候选；候选每次只验证一个字段。</small></div></div>'
+      + '<div class="status-band" id="providerCacheValidationStatus"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>尚未验证</b><small>选择实际模型后手动探测缓存字段。</small></div><button class="secondary-button" id="probeCacheCapabilitiesButton" type="button"><i class="icon" data-lucide="scan-search"></i>探测字段</button></div>'
+      + '<div class="key-pool-actions"><button class="secondary-button" id="startCacheBaselineButton" type="button">基线</button><button class="secondary-button" id="startCacheCandidateButton" type="button">候选</button><button class="secondary-button" id="stopCacheValidationButton" type="button">停止</button></div>';
+    compatibility.append(section);
+    return section;
+  }
+
+  function applyCacheValidation(detail) {
+    const section = ensureCacheValidationPanel();
+    if (!section) return;
+    const modelInput = $bridge("#providerCacheValidationModelInput", section);
+    if (modelInput && !modelInput.value) modelInput.value = preferredCompatibilityModelId(detail);
+    const modelId = cacheValidationModelId();
+    const validation = host.state?.cacheValidation || {};
+    const providerId = selectedProviderId();
+    const active = validation.mode && validation.mode !== "auto" && validation.provider_id === providerId && validation.model === modelId;
+    const records = (detail?.cache_capabilities || []).filter((record) => record.model_id === modelId);
+    const accepted = records.filter((record) => record.status === "verified");
+    const baselineReady = validation?.baseline_reference?.provider_id === providerId
+      && validation?.baseline_reference?.model === modelId
+      && validation?.baseline_reference?.completion_reason === "target_reached";
+    const status = $bridge("#providerCacheValidationStatus", section);
+    const title = status?.querySelector("b");
+    const detailText = status?.querySelector("small");
+    const success = Number(validation.successful_requests || 0);
+    const usage = Number(validation.usage_observations || 0);
+    const inputTokens = Number(validation.input_tokens || 0);
+    if (title) title.textContent = active
+      ? (validation.mode === "baseline" ? "正在记录基线" : "正在验证候选")
+      : accepted.length ? "字段已探测" : "尚未验证";
+    if (detailText) {
+      if (active) detailText.textContent = usage + "/" + (validation.target_successful_requests || 50) + " 条真实 usage · " + inputTokens.toLocaleString("zh-CN") + "/" + Number(validation.target_input_tokens || 5000000).toLocaleString("zh-CN") + " tokens";
+      else if (baselineReady) detailText.textContent = "基线已完成，可开始候选；候选仅测试一个已探测字段。";
+      else if (accepted.length) detailText.textContent = "已探测 " + accepted.length + " 个字段；先完成基线后才可启动候选。";
+      else detailText.textContent = modelId ? "先探测字段支持；探测结果不会自动改变普通请求。" : "选择实际模型后手动探测缓存字段。";
+    }
+    const probe = $bridge("#probeCacheCapabilitiesButton", section);
+    const baseline = $bridge("#startCacheBaselineButton", section);
+    const candidate = $bridge("#startCacheCandidateButton", section);
+    const stop = $bridge("#stopCacheValidationButton", section);
+    if (probe) probe.disabled = !modelId || active;
+    if (baseline) baseline.disabled = !modelId || active;
+    if (candidate) candidate.disabled = !modelId || active || !baselineReady || !accepted.length;
+    if (stop) stop.disabled = !active;
   }
 
   function applyNetworkDiagnostic(diagnostic) {
@@ -520,7 +621,9 @@ const bridgeSource = String.raw`
     if (labels[3]) labels[3].textContent = hasErrors ? "成功 / error" : "成功请求";
     const successDetails = $bridge("#successMetricDetails");
     if (successDetails) {
-      successDetails.textContent = "压缩 " + (metric.compactionRequests ?? "—") + " · 冷启动 " + (metric.coldStartRequests ?? "—");
+      const compactionSuffix = metric.compactionExclusion || "";
+      const coldStartSuffix = metric.coldStartExclusion || "";
+      successDetails.textContent = "压缩 " + (metric.compactionRequests ?? "—") + compactionSuffix + " · 冷启动 " + (metric.coldStartRequests ?? "—") + coldStartSuffix;
     }
     const rate = metric.cacheRate || "—";
     const overview = $bridge("#overviewPanel");
@@ -540,6 +643,8 @@ const bridgeSource = String.raw`
       }
       setSwitch("智能缓存", metricState.cacheEnabled !== false);
       setSwitch("计入冷启动", metricState.includeColdStarts !== false);
+      ensureCompactionPolicySwitch();
+      setSwitch("计入压缩", metricState.includeCompactions !== false);
       setSwitch("提示详细错误", metricState.showDetailedErrors === true);
     }
     const dock = $bridge("#cacheButton");
@@ -684,6 +789,7 @@ const bridgeSource = String.raw`
       renderAll();
     }
     applyMetrics(nextState);
+    applyCacheValidation(host.state?.providerDetails?.[selectedProviderId()] || {});
     applySettings(nextState);
     applyProxyStatus(nextState);
     syncTrendController(true);
@@ -728,6 +834,33 @@ const bridgeSource = String.raw`
     addBulkKeysFromBridge();
   }, true);
 
+  document.addEventListener("dragstart", (event) => {
+    const handle = event.target instanceof Element ? event.target.closest("[data-provider-drag]") : null;
+    const providerId = handle?.getAttribute("data-provider-drag") || "";
+    if (!providerId) return;
+    draggingProviderId = providerId;
+    event.dataTransfer?.setData("application/x-atoapi-provider", providerId);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
+    handle.closest(".provider-row")?.classList.add("is-dragging");
+  }, true);
+
+  document.addEventListener("dragover", (event) => {
+    if (!draggingProviderId) return;
+    const row = event.target instanceof Element ? event.target.closest(".provider-row[data-provider-id]") : null;
+    const targetId = row?.getAttribute("data-provider-id") || "";
+    if (!targetId || targetId === draggingProviderId) return;
+    event.preventDefault();
+    document.querySelectorAll(".provider-row.is-drag-over").forEach((item) => item.classList.remove("is-drag-over"));
+    row.classList.add("is-drag-over");
+  }, true);
+
+  document.addEventListener("dragleave", (event) => {
+    const row = event.target instanceof Element ? event.target.closest(".provider-row.is-drag-over") : null;
+    if (row && !row.contains(event.relatedTarget instanceof Node ? event.relatedTarget : null)) {
+      row.classList.remove("is-drag-over");
+    }
+  }, true);
+
   document.addEventListener("drop", (event) => {
     const row = event.target instanceof Element ? event.target.closest(".key-editor-row") : null;
     const targetId = row?.dataset.keyId;
@@ -737,6 +870,22 @@ const bridgeSource = String.raw`
     event.stopImmediatePropagation();
     reorderKeyFromBridge(draggedId, targetId);
   }, true);
+
+  document.addEventListener("drop", (event) => {
+    const row = event.target instanceof Element ? event.target.closest(".provider-row[data-provider-id]") : null;
+    const targetId = row?.getAttribute("data-provider-id") || "";
+    const draggedId = event.dataTransfer?.getData("application/x-atoapi-provider") || draggingProviderId;
+    if (!targetId || !draggedId || targetId === draggedId) {
+      clearProviderDragState();
+      return;
+    }
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    reorderProvidersFromBridge(draggedId, targetId);
+    clearProviderDragState();
+  }, true);
+
+  document.addEventListener("dragend", clearProviderDragState, true);
 
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("button, [data-bind-provider], [data-edit-provider], [data-delete-provider]") : null;
@@ -768,6 +917,10 @@ const bridgeSource = String.raw`
     if (target.getAttribute("aria-label") === "计入冷启动") {
       event.preventDefault(); event.stopImmediatePropagation();
       send("set-include-cold-starts", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
+    }
+    if (target.getAttribute("aria-label") === "计入压缩") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("set-include-compactions", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
     }
     if (target.getAttribute("aria-label") === "提示详细错误") {
       event.preventDefault(); event.stopImmediatePropagation();
@@ -803,6 +956,24 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation();
       send("probe-session-reuse", { providerId: selectedProviderId(), modelId: compatibilityModelId() }); return;
     }
+    if (target.id === "fetchCacheValidationModelsButton") {
+      event.preventDefault(); event.stopImmediatePropagation(); send("fetch-models", { provider: serializeEditor() }); return;
+    }
+    if (target.id === "probeCacheCapabilitiesButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("probe-cache-capabilities", { providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
+    }
+    if (target.id === "startCacheBaselineButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("set-cache-validation", { mode: "baseline", providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
+    }
+    if (target.id === "startCacheCandidateButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("set-cache-validation", { mode: "candidate", providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
+    }
+    if (target.id === "stopCacheValidationButton") {
+      event.preventDefault(); event.stopImmediatePropagation(); send("set-cache-validation", { mode: "auto" }); return;
+    }
     if (target.id === "addKeyButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBlankKey(); return;
     }
@@ -825,7 +996,7 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation(); send("test-provider", { providerId: target.dataset.testProvider }); return;
     }
     if (target.dataset.keyTest) {
-      event.preventDefault(); event.stopImmediatePropagation(); send("test-provider-key", { providerId: selectedProviderId(), keyId: target.dataset.keyTest }); return;
+      event.preventDefault(); event.stopImmediatePropagation(); send("test-provider-key", { providerId: selectedProviderId(), keyId: target.dataset.keyTest, provider: serializeEditor() }); return;
     }
     if (target.dataset.secretToggle) {
       const input = document.getElementById(target.dataset.secretToggle);
@@ -850,7 +1021,7 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation();
       if (target.closest("#providerModels")) send("fetch-models", { provider: serializeEditor() });
       else if (target.closest("#providerKeys")) send("test-provider-key-pool", { providerId: selectedProviderId() });
-      else if (target.closest("#providerGeneral")) send("diagnose-network-paths", { providerId: selectedProviderId() });
+      else if (target.closest("#providerGeneral")) send("test-provider", { provider: serializeEditor() });
       else if (target.closest("#settingsProxy")) send("restart-main-proxy");
       else if (target.closest("#settingsData")) send("clear-cache");
       return;
@@ -864,8 +1035,13 @@ const bridgeSource = String.raw`
 
   document.addEventListener("input", (event) => {
     const target = event.target;
-    if (!(target instanceof HTMLInputElement) || target.id !== "providerSessionReuseModelInput") return;
-    applyCompatibility(host.state?.providerDetails?.[selectedProviderId()] || {});
+    if (!(target instanceof HTMLInputElement)) return;
+    if (target.id === "providerSessionReuseModelInput") {
+      applyCompatibility(host.state?.providerDetails?.[selectedProviderId()] || {});
+    }
+    if (target.id === "providerCacheValidationModelInput") {
+      applyCacheValidation(host.state?.providerDetails?.[selectedProviderId()] || {});
+    }
   }, true);
 
   function serializeSettings() {
@@ -888,7 +1064,7 @@ const bridgeSource = String.raw`
     $bridge("#providerCountTag").textContent = providers.length + " 个可用上游";
     $bridge("#providerList").innerHTML = providers.length ? providers.map((provider) =>
       '<article class="provider-row ' + (provider.active ? "active" : "") + '" data-provider-id="' + escape(provider.id) + '">' +
-      '<span class="provider-mark">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
+      '<span class="provider-mark" draggable="true" data-provider-drag="' + escape(provider.id) + '" title="拖动调整上游顺序" style="cursor:grab">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
       '<div class="provider-copy"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small></div>' +
       '<div class="provider-meta"><div class="provider-tags"><span class="tag">' + escape(provider.channel) + '</span><span class="tag">' + (provider.mappings ? escape(provider.mappings + " 个映射") : "Agent 直传") + '</span><span class="tag">' + escape(provider.keys + " Key") + '</span></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
       '<div class="provider-actions"><button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>' +
@@ -1179,6 +1355,118 @@ function formatTokenCount(value?: number | null): string {
   return (value ?? 0).toLocaleString("en-US");
 }
 
+function cacheGapDetail(shortfall: number, avoidable: number, newTail: number): string {
+  const segments: string[] = [];
+  const append = (label: string, value: number) => {
+    const safe = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+    if (safe > 0) segments.push(`${label} ${formatTokenCount(safe)}`);
+  };
+  append("缺", shortfall);
+  append("可", avoidable);
+  append("新", newTail);
+  return segments.length > 0 ? segments.join(" · ") : "满桶";
+}
+
+const confirmedCompactionSources = new Set([
+  "responses-compaction-v2",
+  "compact",
+  "compact-fallback",
+  "compact-chat-compat",
+  "compact-fallback-chat-compat"
+]);
+
+function requestIsConfirmedCompaction(
+  request: Pick<MetricsSnapshot["recent_requests"][number], "cache_status" | "upstream_call_source">
+): boolean {
+  return request.cache_status?.trim().toLowerCase() === "compact" &&
+    confirmedCompactionSources.has(request.upstream_call_source?.trim().toLowerCase() ?? "");
+}
+
+type CompactionTrafficTotals = {
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens: number;
+  cacheShortfallTokens: number;
+  cacheAvoidableGapTokens: number;
+  cacheNewTailGapTokens: number;
+  coldStartRequests: number;
+  coldStartInputTokens: number;
+  coldStartOutputTokens: number;
+  coldStartCachedTokens: number;
+  coldStartCacheShortfallTokens: number;
+  coldStartCacheAvoidableGapTokens: number;
+  coldStartCacheNewTailGapTokens: number;
+};
+
+const emptyCompactionTraffic: CompactionTrafficTotals = {
+  requests: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cachedTokens: 0,
+  cacheShortfallTokens: 0,
+  cacheAvoidableGapTokens: 0,
+  cacheNewTailGapTokens: 0,
+  coldStartRequests: 0,
+  coldStartInputTokens: 0,
+  coldStartOutputTokens: 0,
+  coldStartCachedTokens: 0,
+  coldStartCacheShortfallTokens: 0,
+  coldStartCacheAvoidableGapTokens: 0,
+  coldStartCacheNewTailGapTokens: 0
+};
+
+function metricCount(value?: number | null): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+function compactionTrafficForScope(
+  records: readonly AgentProviderTrafficStats[] | null | undefined,
+  agentId: string | null | undefined,
+  providerId: string | null
+): CompactionTrafficTotals {
+  if (!records || !agentId) return emptyCompactionTraffic;
+  return records
+    .filter((record) => record.agent_id === agentId && (!providerId || record.provider_id === providerId))
+    .reduce<CompactionTrafficTotals>((total, record) => ({
+      requests: total.requests + metricCount(record.compaction_requests),
+      inputTokens: total.inputTokens + metricCount(record.compaction_input_tokens),
+      outputTokens: total.outputTokens + metricCount(record.compaction_output_tokens),
+      cachedTokens: total.cachedTokens + metricCount(record.compaction_cache_read_tokens),
+      cacheShortfallTokens: total.cacheShortfallTokens + metricCount(record.compaction_cache_shortfall_tokens),
+      cacheAvoidableGapTokens: total.cacheAvoidableGapTokens + metricCount(record.compaction_cache_avoidable_gap_tokens),
+      cacheNewTailGapTokens: total.cacheNewTailGapTokens + metricCount(record.compaction_cache_new_tail_gap_tokens),
+      coldStartRequests: total.coldStartRequests + metricCount(record.cold_start_compaction_requests),
+      coldStartInputTokens: total.coldStartInputTokens + metricCount(record.cold_start_compaction_input_tokens),
+      coldStartOutputTokens: total.coldStartOutputTokens + metricCount(record.cold_start_compaction_output_tokens),
+      coldStartCachedTokens: total.coldStartCachedTokens + metricCount(record.cold_start_compaction_cache_read_tokens),
+      coldStartCacheShortfallTokens: total.coldStartCacheShortfallTokens + metricCount(record.cold_start_compaction_cache_shortfall_tokens),
+      coldStartCacheAvoidableGapTokens: total.coldStartCacheAvoidableGapTokens + metricCount(record.cold_start_compaction_cache_avoidable_gap_tokens),
+      coldStartCacheNewTailGapTokens: total.coldStartCacheNewTailGapTokens + metricCount(record.cold_start_compaction_cache_new_tail_gap_tokens)
+    }), emptyCompactionTraffic);
+}
+
+function filteredMetricValue(
+  total: number,
+  coldStart: number,
+  compaction: number,
+  coldStartCompaction: number,
+  includeColdStarts: boolean,
+  includeCompactions: boolean
+): number {
+  const safeTotal = metricCount(total);
+  if (includeColdStarts && includeCompactions) return safeTotal;
+  const cold = metricCount(coldStart);
+  const compact = metricCount(compaction);
+  const overlap = Math.min(cold, compact, metricCount(coldStartCompaction));
+  const excluded = !includeColdStarts && !includeCompactions
+    ? cold + compact - overlap
+    : !includeColdStarts
+      ? cold
+      : compact;
+  return Math.max(0, safeTotal - excluded);
+}
+
 function formatDuration(value?: number | null): string {
   if (!value || value <= 0) return "—";
   return `${(value / 1000).toFixed(2)}s`;
@@ -1201,19 +1489,24 @@ function buildState(
   metrics: MetricsSnapshot | null,
   selectedAgentId: string,
   includeColdStarts: boolean,
+  includeCompactions: boolean,
   showDetailedErrors: boolean,
   providerConnectionStatus: Record<string, string>,
   metricsRefreshPolicy: "visible-1s" | "5s" | "manual",
   proxyStatus: ProxyStatus | null,
   networkPathDiagnostic: GraphitePrototypeHostProps["networkPathDiagnostic"],
+  cacheValidation: CacheValidationStatus | null,
   appVersion: string
 ) {
   const providers = config?.providers ?? [];
   const agentConfigs = config?.agent_injections ?? [];
   const providerMap = new Map(providers.map((provider) => [provider.id, provider]));
   const selectedAgent = agentConfigs.find((agent) => agent.id === selectedAgentId) ?? null;
+  const selectedProviderOrder = selectedAgent
+    ? config?.agent_provider_orders?.find((entry) => entry.agent_id === selectedAgent.id)?.provider_ids ?? []
+    : [];
   const visibleProviders = selectedAgent
-    ? providersForGraphiteAgent(providers, selectedAgent)
+    ? providersForGraphiteAgent(providers, selectedAgent, selectedProviderOrder)
     : providers;
   const agents = agentConfigs.map((agent) => {
     const provider = agent.provider_id ? providerMap.get(agent.provider_id) : undefined;
@@ -1267,6 +1560,7 @@ function buildState(
         }
       : null,
     response_session_reuse_models: provider.response_session_reuse_models ?? [],
+    cache_capabilities: provider.cache_capabilities ?? [],
     network_diagnostic: networkPathDiagnostic?.provider_id === provider.id ? networkPathDiagnostic : null,
     models: provider.models.map((model) => ({
       id: model.id,
@@ -1384,7 +1678,11 @@ function buildState(
       cacheNewTailGapTokens: request.cache_new_tail_gap_tokens ?? 0,
       reasoning: request.effective_reasoning_effort ?? request.configured_reasoning_effort ?? request.agent_reasoning_effort ?? "—",
       ratio,
-      detail: `缺 ${(request.cache_shortfall_tokens ?? 0).toLocaleString("zh-CN")} · 可 ${(request.cache_avoidable_gap_tokens ?? 0).toLocaleString("zh-CN")} · 新 ${(request.cache_new_tail_gap_tokens ?? 0).toLocaleString("zh-CN")}`,
+      detail: cacheGapDetail(
+        request.cache_shortfall_tokens ?? 0,
+        request.cache_avoidable_gap_tokens ?? 0,
+        request.cache_new_tail_gap_tokens ?? 0
+      ),
       errorDetail: request.status >= 400 || request.cache_status === "error"
         ? `上游返回 HTTP ${request.status || "错误"}`
         : "",
@@ -1445,48 +1743,93 @@ function buildState(
     successfulRequestSource.filter((request) => isForProvider(request, providerId));
   const consideredSuccessfulForScope = (providerId: string | null) => {
     const successes = successfulForScope(providerId);
-    return includeColdStarts
-      ? successes
-      : successes.filter((request) => !requestRecordIsBackendColdStart({ coldStart: request.cold_start }));
+    return successes.filter((request) =>
+      (includeColdStarts || !requestRecordIsBackendColdStart({ coldStart: request.cold_start })) &&
+      (includeCompactions || !requestIsConfirmedCompaction(request))
+    );
   };
   const metricForScope = (providerId: string | null) => {
-    const successes = successfulForScope(providerId);
     const failures = failedRequestSource.filter((request) => isForProvider(request, providerId));
-    const considered = consideredSuccessfulForScope(providerId);
     const aggregate = trafficForAgentScope(
       metrics?.agent_provider_stats,
       selectedAgent?.id,
       providerId
     );
-    const inputTokens = aggregate
-      ? Math.max(0, aggregate.inputTokens - (includeColdStarts ? 0 : aggregate.coldStartInputTokens))
-      : 0;
-    const outputTokens = aggregate
-      ? Math.max(0, aggregate.outputTokens - (includeColdStarts ? 0 : aggregate.coldStartOutputTokens))
-      : 0;
-    const cachedTokens = aggregate
-      ? Math.max(0, aggregate.cachedTokens - (includeColdStarts ? 0 : aggregate.coldStartCachedTokens))
-      : 0;
-    const cacheShortfall = aggregate
-      ? Math.max(0, aggregate.cacheShortfallTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheShortfallTokens))
-      : 0;
-    const cacheAvoidable = aggregate
-      ? Math.max(0, aggregate.cacheAvoidableGapTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheAvoidableGapTokens))
-      : 0;
-    const cacheNewTail = aggregate
-      ? Math.max(0, aggregate.cacheNewTailGapTokens - (includeColdStarts ? 0 : aggregate.coldStartCacheNewTailGapTokens))
-      : 0;
+    const compaction = compactionTrafficForScope(metrics?.agent_provider_stats, selectedAgent?.id, providerId);
+    const inputTokens = aggregate ? filteredMetricValue(
+      aggregate.inputTokens,
+      aggregate.coldStartInputTokens,
+      compaction.inputTokens,
+      compaction.coldStartInputTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
+    const outputTokens = aggregate ? filteredMetricValue(
+      aggregate.outputTokens,
+      aggregate.coldStartOutputTokens,
+      compaction.outputTokens,
+      compaction.coldStartOutputTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
+    const cachedTokens = aggregate ? filteredMetricValue(
+      aggregate.cachedTokens,
+      aggregate.coldStartCachedTokens,
+      compaction.cachedTokens,
+      compaction.coldStartCachedTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
+    const cacheShortfall = aggregate ? filteredMetricValue(
+      aggregate.cacheShortfallTokens,
+      aggregate.coldStartCacheShortfallTokens,
+      compaction.cacheShortfallTokens,
+      compaction.coldStartCacheShortfallTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
+    const cacheAvoidable = aggregate ? filteredMetricValue(
+      aggregate.cacheAvoidableGapTokens,
+      aggregate.coldStartCacheAvoidableGapTokens,
+      compaction.cacheAvoidableGapTokens,
+      compaction.coldStartCacheAvoidableGapTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
+    const cacheNewTail = aggregate ? filteredMetricValue(
+      aggregate.cacheNewTailGapTokens,
+      aggregate.coldStartCacheNewTailGapTokens,
+      compaction.cacheNewTailGapTokens,
+      compaction.coldStartCacheNewTailGapTokens,
+      includeColdStarts,
+      includeCompactions
+    ) : 0;
     return {
       cacheRate: aggregate && inputTokens > 0 ? formatPercent(cachedTokens / inputTokens) : "—",
       inputTokens: aggregate ? formatTokens(inputTokens) : "—",
       outputTokens: aggregate ? formatTokens(outputTokens) : "—",
       cachedTokens: aggregate ? formatTokens(cachedTokens) : "—",
-      successfulRequests: aggregate
-        ? Math.max(0, aggregate.successfulRequests - (includeColdStarts ? 0 : aggregate.coldStartRequests))
-        : "—",
+      successfulRequests: aggregate ? filteredMetricValue(
+        aggregate.successfulRequests,
+        aggregate.coldStartRequests,
+        compaction.requests,
+        compaction.coldStartRequests,
+        includeColdStarts,
+        includeCompactions
+      ) : "—",
       errors: aggregate?.errors ?? "—",
       compactionRequests: aggregate?.compactionRequests ?? "—",
       coldStartRequests: aggregate?.coldStartRequests ?? "—",
+      compactionExclusion: !includeCompactions
+        ? "（已排除）"
+        : !includeColdStarts && compaction.coldStartRequests > 0
+          ? "（部分已排除）"
+          : "",
+      coldStartExclusion: !includeColdStarts
+        ? "（已排除）"
+        : !includeCompactions && compaction.coldStartRequests > 0
+          ? "（部分已排除）"
+          : "",
       cacheShortfall: aggregate ? formatTokens(cacheShortfall) : "—",
       cacheAvoidable: aggregate ? formatTokens(cacheAvoidable) : "—",
       cacheNewTail: aggregate ? formatTokens(cacheNewTail) : "—"
@@ -1521,6 +1864,7 @@ function buildState(
     })),
     cacheEnabled: config?.cache.enabled ?? false,
     includeColdStarts,
+    includeCompactions,
     showDetailedErrors,
     providerRows
   };
@@ -1544,6 +1888,7 @@ function buildState(
     providerDetails,
     requests: requestItems,
     metrics: metricsState,
+    cacheValidation,
     settings,
     proxyStatus,
     appVersion,
@@ -1556,8 +1901,8 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   const [ready, setReady] = useState(false);
   const documentSource = useMemo(() => createDocument(), [graphitePrototypeHtml, bridgeSource]);
   const state = useMemo(
-    () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.showDetailedErrors, props.providerConnectionStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.appVersion),
-    [props.appVersion, props.config, props.includeColdStarts, props.metrics, props.metricsRefreshPolicy, props.networkPathDiagnostic, props.providerConnectionStatus, props.proxyStatus, props.selectedAgentId, props.showDetailedErrors]
+    () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.includeCompactions, props.showDetailedErrors, props.providerConnectionStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.cacheValidation, props.appVersion),
+    [props.appVersion, props.cacheValidation, props.config, props.includeColdStarts, props.includeCompactions, props.metrics, props.metricsRefreshPolicy, props.networkPathDiagnostic, props.providerConnectionStatus, props.proxyStatus, props.selectedAgentId, props.showDetailedErrors]
   );
 
   useLayoutEffect(() => {

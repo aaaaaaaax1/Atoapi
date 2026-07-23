@@ -164,6 +164,7 @@ export interface AppConfig {
     background_prewarm_enabled: boolean;
   };
   agent_injections: AgentInjectionConfig[];
+  agent_provider_orders?: AgentProviderOrderConfig[];
   provider_key_pools?: Array<{ provider_id: string; pool: PublicProviderKeyPool }>;
   updated_at: string;
   config_path: string;
@@ -181,6 +182,11 @@ export interface AgentInjectionConfig {
   last_status?: string | null;
   local_key?: string | null;
   hidden_provider_ids?: string[];
+}
+
+export interface AgentProviderOrderConfig {
+  agent_id: string;
+  provider_ids: string[];
 }
 
 export interface AgentInjectionResult {
@@ -222,6 +228,8 @@ export interface CacheValidationRunSummary {
   cache_ratio: number;
   error_rate: number;
   ttft_p95_ms: number;
+  usage_observations: number;
+  inconclusive_observations: number;
   candidate_applied_requests: number;
   candidate_skipped_requests: number;
 }
@@ -241,6 +249,8 @@ export interface CacheValidationStatus {
   cache_ratio: number;
   error_rate: number;
   ttft_p95_ms: number;
+  usage_observations: number;
+  inconclusive_observations: number;
   candidate_applied_requests: number;
   candidate_skipped_requests: number;
   target_input_tokens: number;
@@ -529,6 +539,7 @@ export interface MetricsTrendInput {
   agent_id: string;
   provider_id?: string | null;
   include_cold_starts: boolean;
+  include_compactions: boolean;
 }
 
 export interface MetricsTrendValues {
@@ -555,6 +566,8 @@ export interface MetricsTrendSnapshot {
   end_utc: string;
   agent_id: string;
   provider_id?: string | null;
+  /** False when selected legacy history cannot precisely exclude compactions. */
+  compaction_filter_complete?: boolean;
   summary: MetricsTrendValues;
   points: MetricsTrendPoint[];
 }
@@ -594,6 +607,12 @@ export interface AgentProviderTrafficStats {
   output_tokens: number;
   cache_read_tokens: number;
   compaction_requests: number;
+  compaction_input_tokens?: number;
+  compaction_output_tokens?: number;
+  compaction_cache_read_tokens?: number;
+  compaction_cache_shortfall_tokens?: number;
+  compaction_cache_avoidable_gap_tokens?: number;
+  compaction_cache_new_tail_gap_tokens?: number;
   cache_shortfall_tokens: number;
   cache_avoidable_gap_tokens: number;
   cache_new_tail_gap_tokens: number;
@@ -604,6 +623,17 @@ export interface AgentProviderTrafficStats {
   cold_start_cache_shortfall_tokens: number;
   cold_start_cache_avoidable_gap_tokens: number;
   cold_start_cache_new_tail_gap_tokens: number;
+  /**
+   * Exact intersection of confirmed compaction and backend-classified cold
+   * start. The UI subtracts this once when both filters are disabled.
+   */
+  cold_start_compaction_requests?: number;
+  cold_start_compaction_input_tokens?: number;
+  cold_start_compaction_output_tokens?: number;
+  cold_start_compaction_cache_read_tokens?: number;
+  cold_start_compaction_cache_shortfall_tokens?: number;
+  cold_start_compaction_cache_avoidable_gap_tokens?: number;
+  cold_start_compaction_cache_new_tail_gap_tokens?: number;
 }
 
 export interface GapBucketStats {
@@ -694,6 +724,9 @@ export interface RequestBodyBucketStats {
 
 export interface ProviderInput {
   id?: string;
+  /** UI-only ownership hint. The backend turns new Agent-page providers into
+   * an Agent-private record before persistence. */
+  owner_agent_id?: string;
   name: string;
   base_url: string;
   models_url?: string;
@@ -873,6 +906,8 @@ let fallbackCacheValidation: CacheValidationStatus = {
   cache_ratio: 0,
   error_rate: 0,
   ttft_p95_ms: 0,
+  usage_observations: 0,
+  inconclusive_observations: 0,
   candidate_applied_requests: 0,
   candidate_skipped_requests: 0,
   target_input_tokens: 5_000_000,
@@ -1006,10 +1041,37 @@ function fallback(name: string, args?: Record<string, unknown>) {
       cache_ratio: 0,
       error_rate: 0,
       ttft_p95_ms: 0,
+      usage_observations: 0,
+      inconclusive_observations: 0,
       candidate_applied_requests: 0,
       candidate_skipped_requests: 0
     };
     return fallbackCacheValidation;
+  }
+  if (name === "probe_provider_cache_capabilities") {
+    const input = args?.input as ProviderCacheCapabilityProbeInput | undefined;
+    const fields: ProviderCacheCapabilityField[] = [
+      "prompt-cache-key",
+      "prompt-cache-retention",
+      "prompt-cache-options",
+      "prompt-cache-breakpoint"
+    ];
+    return {
+      provider_id: input?.provider_id ?? "",
+      model_id: input?.model_id ?? "",
+      channel: input?.channel ?? "responses",
+      key_id: null,
+      baseline_status: null,
+      fields: fields.map((field) => ({
+        field,
+        status: "error" as const,
+        enabled: false,
+        effect_status: "unverified" as const,
+        message: "预览模式不会向外部上游发送缓存字段探测请求",
+        http_status: null
+      })),
+      checked_at: new Date().toISOString()
+    } satisfies ProviderCacheCapabilityProbeResult;
   }
   if (name === "diagnose_provider_network_paths") {
     throw new Error("网络路径诊断仅在桌面代理运行时可用");
@@ -1158,6 +1220,11 @@ function fallback(name: string, args?: Record<string, unknown>) {
             }
           : item
       ),
+      agent_provider_orders: updatePreviewAgentProviderOrder(
+        fallbackConfig.agent_provider_orders,
+        agentId,
+        id
+      ),
       updated_at: now
     };
     return fallbackConfig;
@@ -1165,7 +1232,10 @@ function fallback(name: string, args?: Record<string, unknown>) {
   if (name === "add_or_update_provider") {
     const input = args?.input as ProviderInput | undefined;
     if (!input) return fallbackConfig;
-    const id = input.id || slugify(input.name);
+    const ownerAgentId = input.owner_agent_id?.trim() || "";
+    const id = input.id || (ownerAgentId
+      ? uniquePreviewProviderId(`agent-${slugify(ownerAgentId)}-${slugify(input.name)}`)
+      : slugify(input.name));
     const existing = fallbackConfig.providers.find((item) => item.id === id);
     const now = new Date().toISOString();
     if (input.api_key) {
@@ -1186,8 +1256,8 @@ function fallback(name: string, args?: Record<string, unknown>) {
       channel_mode: input.channel_mode ?? existing?.channel_mode ?? "auto",
       channel: input.channel,
       prompt_cache_retention_enabled: input.prompt_cache_retention_enabled ?? true,
-      request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? false,
-      use_system_proxy: input.use_system_proxy ?? existing?.use_system_proxy ?? false,
+      request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? true,
+      use_system_proxy: input.use_system_proxy ?? existing?.use_system_proxy ?? true,
       non_sse_compact_compat_enabled: input.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
       response_session_reuse_models: existing?.response_session_reuse_models ?? [],
       has_api_key: Boolean(input.api_key) || existing?.has_api_key || false,
@@ -1211,7 +1281,25 @@ function fallback(name: string, args?: Record<string, unknown>) {
       providers: existing
         ? fallbackConfig.providers.map((item) => (item.id === id ? provider : item))
         : [...fallbackConfig.providers, provider],
+      agent_provider_orders: ownerAgentId
+        ? updatePreviewAgentProviderOrder(fallbackConfig.agent_provider_orders, ownerAgentId, id)
+        : fallbackConfig.agent_provider_orders,
       updated_at: now
+    };
+    return fallbackConfig;
+  }
+  if (name === "reorder_agent_providers") {
+    const input = args?.input as { agent_id?: string; provider_ids?: string[] } | undefined;
+    const agentId = input?.agent_id?.trim() || "";
+    const providerIds = (input?.provider_ids ?? []).map((providerId) => providerId.trim()).filter(Boolean);
+    if (!agentId || !providerIds.length) return fallbackConfig;
+    fallbackConfig = {
+      ...fallbackConfig,
+      agent_provider_orders: [
+        ...(fallbackConfig.agent_provider_orders ?? []).filter((order) => order.agent_id !== agentId),
+        { agent_id: agentId, provider_ids: providerIds }
+      ],
+      updated_at: new Date().toISOString()
     };
     return fallbackConfig;
   }
@@ -1448,6 +1536,7 @@ export interface ProviderCacheCapabilityConfig {
   model_id: string;
   channel: Channel;
   key_id?: string | null;
+  effect_scope_id?: string | null;
   field: ProviderCacheCapabilityField;
   enabled: boolean;
   status: ProviderCacheCapabilityStatus;
@@ -1551,6 +1640,7 @@ function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKey
 function fallbackMetricsTrend(input?: MetricsTrendInput): MetricsTrendSnapshot {
   const end = validDate(input?.end_utc) ?? new Date();
   const start = validDate(input?.start_utc) ?? new Date(end.getTime() - 24 * 60 * 60 * 1000);
+  const includeCompactions = input?.include_compactions !== false;
   const duration = Math.max(60_000, end.getTime() - start.getTime());
   const pointCount = Math.min(48, Math.max(12, Math.ceil(duration / (6 * 60 * 60 * 1000))));
   const step = duration / pointCount;
@@ -1605,6 +1695,9 @@ function fallbackMetricsTrend(input?: MetricsTrendInput): MetricsTrendSnapshot {
     end_utc: end.toISOString(),
     agent_id: input?.agent_id || "codex",
     provider_id: input?.provider_id ?? null,
+    // The browser-only fallback has no historical compaction token split. Do
+    // not imply that disabling the filter produced an exact aggregate.
+    compaction_filter_complete: includeCompactions,
     summary,
     points
   };
@@ -1657,6 +1750,25 @@ function uniquePreviewProviderId(base: string) {
     index += 1;
   }
   return candidate;
+}
+
+function updatePreviewAgentProviderOrder(
+  orders: AgentProviderOrderConfig[] | undefined,
+  agentId: string,
+  providerId: string
+) {
+  const existingOrder = orders?.find((order) => order.agent_id === agentId)?.provider_ids;
+  const current = existingOrder ?? fallbackConfig.providers
+    .filter((provider) =>
+      providerBelongsToAgentPreview(provider.id, agentId) ||
+      fallbackConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id === provider.id
+    )
+    .map((provider) => provider.id);
+  const provider_ids = current.includes(providerId) ? current : [...current, providerId];
+  return [
+    ...(orders ?? []).filter((order) => order.agent_id !== agentId),
+    { agent_id: agentId, provider_ids }
+  ];
 }
 
 function uniquePreviewProviderName(base: string) {

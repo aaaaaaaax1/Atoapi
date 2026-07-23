@@ -9,7 +9,7 @@ use std::{
 
 use crate::{config::Channel, metrics::ResponsesWirePrefixFingerprints};
 
-use super::{maybe_responses_wire_prefix_fingerprints, request_body_stream_flag};
+use super::{cache_capability, maybe_responses_wire_prefix_fingerprints, request_body_stream_flag};
 
 pub(super) const RESPONSES_WIRE_ORDERED_KEYS: [&str; 23] = [
     "model",
@@ -37,49 +37,34 @@ pub(super) const RESPONSES_WIRE_ORDERED_KEYS: [&str; 23] = [
     "user",
 ];
 
-const PROMPT_CACHE_BREAKPOINT_MEMBER: &[u8] = b"\"prompt_cache_breakpoint\":";
-
-struct BreakpointDetectingWriter<'a> {
-    output: &'a mut Vec<u8>,
-    matched: usize,
-    found: bool,
+/// Evidence sealed from the exact final request bytes.  A cache controller
+/// must never upgrade a marker merely because an earlier mutable JSON value
+/// happened to contain a similarly named member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ProtocolBreakpointProvenance {
+    /// The frozen wire has no protocol-level cache breakpoint.
+    Absent,
+    /// The frozen Responses wire has one exact, legal Atoapi marker.
+    AtoapiInjected { placement_digest: String },
+    /// A marker exists but it is foreign, duplicated, malformed, or cannot
+    /// be proven to be a single legal Atoapi placement.
+    AmbiguousOrForeign,
 }
 
-impl<'a> BreakpointDetectingWriter<'a> {
-    fn new(output: &'a mut Vec<u8>) -> Self {
-        Self {
-            output,
-            matched: 0,
-            found: false,
+impl ProtocolBreakpointProvenance {
+    pub(super) const fn is_present(&self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+
+    pub(super) const fn is_atoapi_injected(&self) -> bool {
+        matches!(self, Self::AtoapiInjected { .. })
+    }
+
+    pub(super) fn placement_digest(&self) -> Option<&str> {
+        match self {
+            Self::AtoapiInjected { placement_digest } => Some(placement_digest),
+            Self::Absent | Self::AmbiguousOrForeign => None,
         }
-    }
-
-    fn found(&self) -> bool {
-        self.found
-    }
-}
-
-impl std::io::Write for BreakpointDetectingWriter<'_> {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if !self.found {
-            for byte in buffer {
-                if *byte == PROMPT_CACHE_BREAKPOINT_MEMBER[self.matched] {
-                    self.matched += 1;
-                    if self.matched == PROMPT_CACHE_BREAKPOINT_MEMBER.len() {
-                        self.found = true;
-                        break;
-                    }
-                } else {
-                    self.matched = usize::from(*byte == PROMPT_CACHE_BREAKPOINT_MEMBER[0]);
-                }
-            }
-        }
-        self.output.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 
@@ -87,7 +72,6 @@ impl std::io::Write for BreakpointDetectingWriter<'_> {
 struct PreparedWireMember {
     key: String,
     range: Range<usize>,
-    breakpoint_present: bool,
 }
 
 /// Retains the first canonical Responses encoding so late, explicitly tracked
@@ -101,7 +85,6 @@ struct PreparedWireDraft {
     body: Bytes,
     members: Vec<PreparedWireMember>,
     responses_static_projection_digest: Option<String>,
-    prompt_cache_breakpoint_present: bool,
     encode_ms: u64,
 }
 
@@ -112,20 +95,16 @@ impl PreparedWireDraft {
         let mut output = Vec::new();
         let mut members = Vec::with_capacity(map.len());
         let mut static_projection = ResponsesStaticProjectionHasher::for_body(map);
-        let mut prompt_cache_breakpoint_present = false;
         output.push(b'{');
         let mut first = true;
         for_each_responses_wire_member(map, |key, value| {
-            let (range, member_breakpoint_present) =
-                write_draft_json_member(&mut output, &mut first, key, value);
-            prompt_cache_breakpoint_present |= member_breakpoint_present;
+            let range = write_draft_json_member(&mut output, &mut first, key, value);
             if let Some(projection) = static_projection.as_mut() {
                 projection.observe_member(key, &output[range.clone()]);
             }
             members.push(PreparedWireMember {
                 key: key.to_string(),
                 range,
-                breakpoint_present: member_breakpoint_present,
             });
         });
         output.push(b'}');
@@ -136,7 +115,6 @@ impl PreparedWireDraft {
             body: Bytes::from(output),
             members,
             responses_static_projection_digest,
-            prompt_cache_breakpoint_present,
             encode_ms: encode_started.elapsed().as_millis() as u64,
         })
     }
@@ -150,7 +128,12 @@ impl PreparedWireDraft {
         self.body.as_ptr()
     }
 
-    fn freeze_tracked(self, final_body: &Value, changed_fields: &[String]) -> PreparedWireRequest {
+    fn freeze_tracked(
+        self,
+        final_body: &Value,
+        changed_fields: &[String],
+        atoapi_injected_protocol_breakpoint: bool,
+    ) -> PreparedWireRequest {
         let Some(map) = final_body.as_object() else {
             return PreparedWireRequest::from_value(&Channel::Responses, final_body);
         };
@@ -165,7 +148,7 @@ impl PreparedWireDraft {
                 final_body,
                 self.body,
                 self.responses_static_projection_digest,
-                self.prompt_cache_breakpoint_present,
+                atoapi_injected_protocol_breakpoint,
                 self.encode_ms,
             );
         }
@@ -173,7 +156,6 @@ impl PreparedWireDraft {
         let freeze_started = Instant::now();
         let mut output = Vec::with_capacity(self.body.len());
         let mut static_projection = ResponsesStaticProjectionHasher::for_body(map);
-        let mut prompt_cache_breakpoint_present = false;
         output.push(b'{');
         let mut first = true;
         for_each_responses_wire_member(map, |key, value| {
@@ -184,20 +166,11 @@ impl PreparedWireDraft {
                     .find(|member| member.key == key)
                     .map(|member| &self.body[member.range.clone()])
             });
-            let (range, member_breakpoint_present) = if let Some(Some(bytes)) = retained {
-                let member = self
-                    .members
-                    .iter()
-                    .find(|member| member.key == key)
-                    .expect("a retained member must have draft metadata");
-                (
-                    write_prepared_member_bytes(&mut output, &mut first, bytes),
-                    member.breakpoint_present,
-                )
+            let range = if let Some(Some(bytes)) = retained {
+                write_prepared_member_bytes(&mut output, &mut first, bytes)
             } else {
                 write_draft_json_member(&mut output, &mut first, key, value)
             };
-            prompt_cache_breakpoint_present |= member_breakpoint_present;
             if let Some(projection) = static_projection.as_mut() {
                 projection.observe_member(key, &output[range]);
             }
@@ -211,7 +184,7 @@ impl PreparedWireDraft {
             final_body,
             Bytes::from(output),
             responses_static_projection_digest,
-            prompt_cache_breakpoint_present,
+            atoapi_injected_protocol_breakpoint,
             self.encode_ms
                 .saturating_add(freeze_started.elapsed().as_millis() as u64),
         )
@@ -229,6 +202,10 @@ pub(super) struct PreparedResponseBody {
     wire_draft: Option<PreparedWireDraft>,
     changed_fields: Vec<String>,
     requires_full_freeze: bool,
+    // This is an in-memory witness, not a wire field. It is set only by the
+    // cache-control mutator after it inserts the marker, and is invalidated by
+    // every later input mutation before the body is frozen.
+    atoapi_injected_protocol_breakpoint: bool,
 }
 
 impl PreparedResponseBody {
@@ -242,6 +219,7 @@ impl PreparedResponseBody {
             wire_draft: None,
             changed_fields: Vec::new(),
             requires_full_freeze: false,
+            atoapi_injected_protocol_breakpoint: false,
         }
     }
 
@@ -258,6 +236,7 @@ impl PreparedResponseBody {
             wire_draft,
             changed_fields: Vec::new(),
             requires_full_freeze: false,
+            atoapi_injected_protocol_breakpoint: false,
         }
     }
 
@@ -317,13 +296,6 @@ impl PreparedResponseBody {
         Some(result)
     }
 
-    pub(super) fn root_keys(&self) -> Vec<String> {
-        self.body
-            .as_object()
-            .map(|object| object.keys().cloned().collect())
-            .unwrap_or_default()
-    }
-
     /// Whether a root still has the exact semantic value owned when this
     /// prepared body was created. This is used to carry an already-computed
     /// predecessor proof through late top-level mutations without rescanning a
@@ -338,7 +310,14 @@ impl PreparedResponseBody {
     #[allow(dead_code)] // Compatibility escape hatch; tests cover its full-freeze contract.
     pub(super) fn mutate_unknown<R>(&mut self, mutation: impl FnOnce(&mut Value) -> R) -> R {
         self.requires_full_freeze = true;
+        self.atoapi_injected_protocol_breakpoint = false;
         mutation(&mut self.body)
+    }
+
+    /// Records a marker inserted by Atoapi itself. The witness is carried to
+    /// the immutable wire and never serializes into the user request.
+    pub(super) fn mark_atoapi_protocol_breakpoint_injected(&mut self) {
+        self.atoapi_injected_protocol_breakpoint = true;
     }
 
     pub(super) fn into_prepared_wire(self, channel: &Channel) -> (Value, PreparedWireRequest) {
@@ -347,12 +326,17 @@ impl PreparedResponseBody {
             wire_draft,
             changed_fields,
             requires_full_freeze,
+            atoapi_injected_protocol_breakpoint,
         } = self;
         let wire = match (channel, wire_draft, requires_full_freeze) {
             (Channel::Responses, Some(draft), false) => {
-                draft.freeze_tracked(&body, &changed_fields)
+                draft.freeze_tracked(&body, &changed_fields, atoapi_injected_protocol_breakpoint)
             }
-            _ => PreparedWireRequest::from_value(channel, &body),
+            _ => PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
+                channel,
+                &body,
+                atoapi_injected_protocol_breakpoint,
+            ),
         };
         (body, wire)
     }
@@ -363,6 +347,9 @@ impl PreparedResponseBody {
     }
 
     fn mark_changed_root(&mut self, key: &str) {
+        if key == "input" {
+            self.atoapi_injected_protocol_breakpoint = false;
+        }
         if !self.changed_fields.iter().any(|field| field == key) {
             self.changed_fields.push(key.to_string());
         }
@@ -586,8 +573,8 @@ mod tests {
     }
 
     #[test]
-    fn final_wire_detects_breakpoint_member_without_recursive_value_walk() {
-        let nested = PreparedWireRequest::from_value(
+    fn final_wire_detects_only_protocol_breakpoint_positions() {
+        let protocol_breakpoint = PreparedWireRequest::from_value(
             &Channel::Responses,
             &json!({
                 "model":"gpt-test",
@@ -612,8 +599,21 @@ mod tests {
             }),
         );
 
-        assert!(nested.prompt_cache_breakpoint_present());
+        let tool_output_property = PreparedWireRequest::from_value(
+            &Channel::Responses,
+            &json!({
+                "model":"gpt-test",
+                "input":[{
+                    "type":"function_call_output",
+                    "call_id":"call-a",
+                    "output":{"prompt_cache_breakpoint":{"mode":"data"}}
+                }]
+            }),
+        );
+
+        assert!(protocol_breakpoint.prompt_cache_breakpoint_present());
         assert!(!string_only.prompt_cache_breakpoint_present());
+        assert!(!tool_output_property.prompt_cache_breakpoint_present());
     }
 }
 
@@ -630,29 +630,36 @@ pub(super) struct PreparedWireRequest {
     /// bytes. Appending Agent input therefore stays stable without treating an
     /// unclassified static field as equivalent.
     responses_static_projection_digest: Option<String>,
-    prompt_cache_breakpoint_present: bool,
+    protocol_breakpoint_provenance: ProtocolBreakpointProvenance,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
 
 impl PreparedWireRequest {
     pub(super) fn from_value(channel: &Channel, body: &Value) -> Self {
+        Self::from_value_with_protocol_breakpoint_witness(channel, body, false)
+    }
+
+    fn from_value_with_protocol_breakpoint_witness(
+        channel: &Channel,
+        body: &Value,
+        atoapi_injected_protocol_breakpoint: bool,
+    ) -> Self {
         let encode_started = Instant::now();
-        let (encoded, responses_static_projection_digest, prompt_cache_breakpoint_present) =
-            if matches!(channel, Channel::Responses) {
-                serialize_responses_body_with_static_projection(body)
-            } else {
-                (
-                    serde_json::to_vec(body).unwrap_or_else(|_| b"null".to_vec()),
-                    None,
-                    false,
-                )
-            };
+        let (encoded, responses_static_projection_digest) = if matches!(channel, Channel::Responses)
+        {
+            serialize_responses_body_with_static_projection(body)
+        } else {
+            (
+                serde_json::to_vec(body).unwrap_or_else(|_| b"null".to_vec()),
+                None,
+            )
+        };
         Self::from_encoded(
             channel,
             body,
             Bytes::from(encoded),
             responses_static_projection_digest,
-            prompt_cache_breakpoint_present,
+            atoapi_injected_protocol_breakpoint,
             encode_started.elapsed().as_millis() as u64,
         )
     }
@@ -662,7 +669,7 @@ impl PreparedWireRequest {
         body: &Value,
         encoded: Bytes,
         responses_static_projection_digest: Option<String>,
-        prompt_cache_breakpoint_present: bool,
+        atoapi_injected_protocol_breakpoint: bool,
         encode_ms: u64,
     ) -> Self {
         let finalize_started = Instant::now();
@@ -675,7 +682,11 @@ impl PreparedWireRequest {
             stream,
             encode_ms: encode_ms.saturating_add(finalize_started.elapsed().as_millis() as u64),
             responses_static_projection_digest,
-            prompt_cache_breakpoint_present,
+            protocol_breakpoint_provenance: protocol_breakpoint_provenance(
+                channel,
+                body,
+                atoapi_injected_protocol_breakpoint,
+            ),
             outbound_prefix_fingerprints,
         }
     }
@@ -705,7 +716,11 @@ impl PreparedWireRequest {
     }
 
     pub(super) fn prompt_cache_breakpoint_present(&self) -> bool {
-        self.prompt_cache_breakpoint_present
+        self.protocol_breakpoint_provenance.is_present()
+    }
+
+    pub(super) fn protocol_breakpoint_provenance(&self) -> &ProtocolBreakpointProvenance {
+        &self.protocol_breakpoint_provenance
     }
 
     pub(super) fn outbound_prefix_fingerprints(&self) -> Option<&ResponsesWirePrefixFingerprints> {
@@ -728,6 +743,30 @@ impl PreparedWireRequest {
     }
 }
 
+fn protocol_breakpoint_provenance(
+    channel: &Channel,
+    body: &Value,
+    atoapi_injected_protocol_breakpoint: bool,
+) -> ProtocolBreakpointProvenance {
+    let present = cache_capability::contains_protocol_cache_breakpoint(body, channel);
+    if !present && !atoapi_injected_protocol_breakpoint {
+        return ProtocolBreakpointProvenance::Absent;
+    }
+
+    // Only the mutation witness plus a single legal final Responses marker
+    // proves ownership. A marker supplied by a caller may look structurally
+    // identical, so it remains foreign unless this request inserted it.
+    if matches!(channel, Channel::Responses) && atoapi_injected_protocol_breakpoint {
+        if let Some(placement_digest) =
+            cache_capability::responses_protocol_breakpoint_placement_digest(body)
+        {
+            return ProtocolBreakpointProvenance::AtoapiInjected { placement_digest };
+        }
+    }
+
+    ProtocolBreakpointProvenance::AmbiguousOrForeign
+}
+
 pub(super) fn serialize_responses_body_bytes_for_provider_prefix(body: &Value) -> Vec<u8> {
     let Some(map) = body.as_object() else {
         return serde_json::to_vec(body).unwrap_or_else(|_| b"null".to_vec());
@@ -743,26 +782,20 @@ pub(super) fn serialize_responses_body_bytes_for_provider_prefix(body: &Value) -
     output
 }
 
-fn serialize_responses_body_with_static_projection(
-    body: &Value,
-) -> (Vec<u8>, Option<String>, bool) {
+fn serialize_responses_body_with_static_projection(body: &Value) -> (Vec<u8>, Option<String>) {
     let Some(map) = body.as_object() else {
         return (
             serde_json::to_vec(body).unwrap_or_else(|_| b"null".to_vec()),
             None,
-            false,
         );
     };
 
     let mut output = Vec::new();
     let mut static_projection = ResponsesStaticProjectionHasher::for_body(map);
-    let mut prompt_cache_breakpoint_present = false;
     output.push(b'{');
     let mut first = true;
     for_each_responses_wire_member(map, |key, value| {
-        let (range, member_breakpoint_present) =
-            write_json_member_with_breakpoint(&mut output, &mut first, key, value);
-        prompt_cache_breakpoint_present |= member_breakpoint_present;
+        let range = write_json_member(&mut output, &mut first, key, value);
         if let Some(projection) = static_projection.as_mut() {
             projection.observe_member(key, &output[range]);
         }
@@ -770,11 +803,7 @@ fn serialize_responses_body_with_static_projection(
     output.push(b'}');
     let static_projection_digest =
         static_projection.and_then(ResponsesStaticProjectionHasher::finish);
-    (
-        output,
-        static_projection_digest,
-        prompt_cache_breakpoint_present,
-    )
+    (output, static_projection_digest)
 }
 
 struct ResponsesStaticProjectionHasher {
@@ -861,37 +890,14 @@ fn write_json_member(
     start..output.len()
 }
 
-fn write_json_member_with_breakpoint(
-    output: &mut Vec<u8>,
-    first: &mut bool,
-    key: &str,
-    value: &Value,
-) -> (Range<usize>, bool) {
-    if *first {
-        *first = false;
-    } else {
-        output.push(b',');
-    }
-    let start = output.len();
-    serde_json::to_writer(&mut *output, key)
-        .expect("serializing a JSON object key into memory must succeed");
-    output.push(b':');
-    let mut writer = BreakpointDetectingWriter::new(output);
-    serde_json::to_writer(&mut writer, value)
-        .expect("serializing a JSON value into memory must succeed");
-    let breakpoint_present = key == "prompt_cache_breakpoint" || writer.found();
-    let end = writer.output.len();
-    (start..end, breakpoint_present)
-}
-
 fn write_draft_json_member(
     output: &mut Vec<u8>,
     first: &mut bool,
     key: &str,
     value: &Value,
-) -> (Range<usize>, bool) {
+) -> Range<usize> {
     record_draft_member_encoding(key);
-    write_json_member_with_breakpoint(output, first, key, value)
+    write_json_member(output, first, key, value)
 }
 
 fn write_prepared_member_bytes(

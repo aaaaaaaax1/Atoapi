@@ -110,8 +110,8 @@ use final_scope_waterline::{
 };
 use generation_envelope::GenerationEnvelope;
 use prefix_control::{
-    PrefixControlInput, PrefixController, PrefixGapInput, PrefixStateInput,
-    ProviderCacheGapBreakdown, MIN_CLEAN_TINY_RECOVERY_STREAK,
+    FinalResponsesStaticProjection, PrefixControlInput, PrefixController, PrefixGapInput,
+    PrefixStateInput, ProviderCacheGapBreakdown, MIN_CLEAN_TINY_RECOVERY_STREAK,
 };
 #[cfg(test)]
 use prepared_wire_request::{
@@ -149,6 +149,15 @@ const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
+const LOG_MESSAGE_MAX_CHARS: usize = 700;
+const CLIENT_PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
+// Keep enough pre-redaction context to replace a valid client key that begins
+// immediately before the persisted error-summary cutoff.
+const CLIENT_PROMPT_CACHE_KEY_REDACTION_WINDOW_CHARS: usize =
+    LOG_MESSAGE_MAX_CHARS + CLIENT_PROMPT_CACHE_KEY_MAX_CHARS;
+const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_SECS: u64 = 15 * 60;
+const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_LIMIT: usize = 1_024;
+const REDACTED_CLIENT_PROMPT_CACHE_KEY: &str = "[redacted prompt_cache_key]";
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
@@ -158,45 +167,6 @@ const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
 const PROVIDER_CACHE_MIN_BUCKET_TOKENS: u64 = 128;
 const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
 const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
-// Shadow affinity remains observable by default, but it must not change an
-// ordinary request's provider cache key without an explicit validation run.
-const AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED: bool = false;
-#[cfg(not(test))]
-const ISOLATED_AUTO_CACHE_CANARY_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
-
-/// Production remains permanently shadow-only until an administrator starts a
-/// validation run. The only automatic exception is a separate process that
-/// has opted into the isolated acceptance harness; it has its own temporary
-/// config directory and cannot alter the live desktop instance.
-fn automatic_static_cohort_routing_enabled() -> bool {
-    #[cfg(test)]
-    {
-        AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
-    }
-    #[cfg(not(test))]
-    {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            automatic_static_cohort_routing_enabled_value(
-                crate::config::isolated_test_instance(),
-                std::env::var(ISOLATED_AUTO_CACHE_CANARY_ENV)
-                    .ok()
-                    .as_deref(),
-            )
-        })
-    }
-}
-
-fn automatic_static_cohort_routing_enabled_value(
-    isolated_instance: bool,
-    isolated_canary: Option<&str>,
-) -> bool {
-    AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED
-        || (isolated_instance
-            && isolated_canary
-                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled")))
-}
-
 /// Cache-affinity state is an optional routing/measurement optimization, not
 /// semantic conversation state.  Never queue an inbound Agent request behind a
 /// background runtime snapshot: retain a truthful shadow-only receipt instead.
@@ -230,29 +200,6 @@ fn try_compute_shadow_affinity_without_wait(
     // canonicalization would under-report the actual request-path cost.
     decision.policy_compute_ms = decision.policy_compute_ms.saturating_add(policy_compute_ms);
     (decision, false)
-}
-
-/// Cache affinity is an optional placement optimization.  Do not queue an
-/// inbound request behind its state mutex merely to change a cache hint: if a
-/// settlement owns the snapshot, this request keeps the baseline wire intact.
-fn try_admit_active_cache_route_without_wait(
-    shadow_affinity: &tokio::sync::Mutex<cache_affinity::ShadowAffinityStore>,
-    decision: &mut ShadowAffinityDecision,
-    provider_route_eligible: bool,
-    provider_prompt_cache_key_verified: bool,
-    now: chrono::DateTime<Utc>,
-) -> bool {
-    let Ok(mut shadow_affinity) = shadow_affinity.try_lock() else {
-        decision.skip_reason = Some("active_cache_route_snapshot_lock_busy".to_string());
-        return false;
-    };
-    cache_affinity::admit_active_cache_route(
-        &mut shadow_affinity,
-        decision,
-        provider_route_eligible,
-        provider_prompt_cache_key_verified,
-        now,
-    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,7 +290,11 @@ struct UpstreamRequestDiagnostics {
     sent_body_bytes: u64,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
     sent_cache_capability_fields: Vec<ProviderCacheCapabilityField>,
+    controlled_cache_probe_fields: Vec<ProviderCacheCapabilityField>,
+    controlled_cache_probe_breakpoint_placement_digest: Option<String>,
     cache_capability_key_id: Option<String>,
+    client_owned_prompt_cache_key: bool,
+    client_owned_prompt_cache_key_local_id: Option<String>,
     final_wire_receipt: Option<FinalWireReceipt>,
     final_scope_shadow: Option<FinalScopeShadowReceipt>,
     final_scope_waterline: Option<FinalScopeWaterlineLog>,
@@ -379,8 +330,24 @@ impl UpstreamRequestDiagnostics {
         if !next.sent_cache_capability_fields.is_empty() {
             self.sent_cache_capability_fields = next.sent_cache_capability_fields.clone();
         }
+        if !next.controlled_cache_probe_fields.is_empty() {
+            self.controlled_cache_probe_fields = next.controlled_cache_probe_fields.clone();
+        }
+        if next
+            .controlled_cache_probe_breakpoint_placement_digest
+            .is_some()
+        {
+            self.controlled_cache_probe_breakpoint_placement_digest = next
+                .controlled_cache_probe_breakpoint_placement_digest
+                .clone();
+        }
         if next.cache_capability_key_id.is_some() {
             self.cache_capability_key_id = next.cache_capability_key_id.clone();
+        }
+        self.client_owned_prompt_cache_key |= next.client_owned_prompt_cache_key;
+        if next.client_owned_prompt_cache_key_local_id.is_some() {
+            self.client_owned_prompt_cache_key_local_id =
+                next.client_owned_prompt_cache_key_local_id.clone();
         }
         if next.final_wire_receipt.is_some() {
             self.final_wire_receipt = next.final_wire_receipt.clone();
@@ -592,6 +559,7 @@ struct PrefixLagDiagnostics {
 struct ProviderPrefixUsageObservation {
     gap: Option<ProviderCacheGapBreakdown>,
     previous: Option<PrefixWarmState>,
+    static_wire_drift: bool,
 }
 #[derive(Debug, Clone, Default)]
 struct SessionAnchorDiagnostics {
@@ -1088,32 +1056,14 @@ async fn run_responses_compact_for_authorized_agent(
     );
     let identity_client_request =
         identity_request_with_codex_metadata(&client_request, trusted_codex_metadata.as_ref());
-    let session_identity = SessionIdentity::derive_for_agent(
-        &config,
-        &decision,
-        &identity_client_request,
-        &upstream_body,
-        authorized_agent.as_deref(),
-    );
     if native_responses_passthrough {
         strip_provider_cache_key_fields(&mut upstream_body);
         let mut provider_prefix_body = upstream_body.clone();
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
-        apply_session_provider_cache_key(
-            &mut provider_prefix_body,
-            &config,
-            session_identity.as_ref(),
-        );
-        copy_responses_prefix_cache_fields_for_native(
-            &mut upstream_body,
-            &provider_prefix_body,
-            &config,
-            &decision,
-        );
+        strip_root_provider_cache_metadata_for_native(&mut upstream_body);
     } else {
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
-        apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
     }
     // Compaction may change a lineage epoch, so it must use the same
     // adapter-attested scope as Native Responses continuation. Client-body
@@ -2053,6 +2003,15 @@ async fn run_generation_for_authorized_agent(
     let native_responses_passthrough = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
         && !codex_responses_chat_compat;
+    let client_request_starts_compaction_epoch = responses_request_starts_compaction_epoch(
+        &client_channel,
+        &client_request,
+        trusted_codex_metadata.as_ref(),
+    );
+    // A caller-supplied placement key is never a normal routing rule. Field
+    // acceptance does not prove real cache benefit, and the key is therefore
+    // retained only by an explicit administrator-started probe path.
+    let client_owned_prompt_cache_key: Option<String> = None;
     let (agent_log_id, agent_log_label) =
         request_agent_log_fields(&config, authorized_agent.as_deref());
     let responses_from_incremental_cross_protocol_stream = client_requested_stream
@@ -2115,24 +2074,13 @@ async fn run_generation_for_authorized_agent(
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
-        apply_session_provider_cache_key(&mut upstream_body, &config, session_identity.as_ref());
     }
 
     let mut provider_prefix_body = upstream_body.clone();
     if native_responses_passthrough {
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
-        apply_session_provider_cache_key(
-            &mut provider_prefix_body,
-            &config,
-            session_identity.as_ref(),
-        );
-        copy_responses_prefix_cache_fields_for_native(
-            &mut upstream_body,
-            &provider_prefix_body,
-            &config,
-            &decision,
-        );
+        strip_root_provider_cache_metadata_for_native(&mut upstream_body);
     }
 
     let cross_protocol_stream =
@@ -2154,7 +2102,10 @@ async fn run_generation_for_authorized_agent(
                 &decision.upstream_channel,
             ))
         });
-    let provider_prefix_control_key = provider_prefix_control_key(
+    // Use the realm-neutral key only to keep multi-key selection sticky. All
+    // prefix/cache observations below are rebuilt after the actual Key is
+    // selected so a rotation or failover cannot inherit another Key's state.
+    let provider_prefix_selection_key = provider_prefix_control_key(
         provider_prefix_fingerprint.as_deref(),
         &decision,
         &decision.upstream_channel,
@@ -2166,12 +2117,6 @@ async fn run_generation_for_authorized_agent(
             identity.scope_key.as_str()
         }
     });
-    let provider_prefix_family_key = provider_prefix_family_control_key(
-        provider_prefix_family_identity,
-        &decision,
-        &decision.upstream_channel,
-    );
-
     let no_store = headers
         .get(header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
@@ -2295,7 +2240,7 @@ async fn run_generation_for_authorized_agent(
         &state,
         &decision.provider.id,
         None,
-        provider_prefix_control_key.as_deref(),
+        provider_prefix_selection_key.as_deref(),
     )
     .await
     {
@@ -2319,6 +2264,42 @@ async fn run_generation_for_authorized_agent(
             StatusCode::BAD_REQUEST,
             "provider API key is not configured",
         );
+    }
+    let provider_prefix_control_key = provider_prefix_control_key_for_selected_key(
+        provider_prefix_fingerprint.as_deref(),
+        &decision,
+        &decision.upstream_channel,
+        &selected_provider_key,
+    );
+    let provider_prefix_family_key = provider_prefix_family_control_key_for_selected_key(
+        provider_prefix_family_identity,
+        &decision,
+        &decision.upstream_channel,
+        &selected_provider_key,
+    );
+    let client_owned_prompt_cache_key_local_id =
+        client_owned_prompt_cache_key
+            .as_deref()
+            .and_then(|cache_key| {
+                client_owned_prompt_cache_key_cooldown_local_id(
+                    &config,
+                    &decision,
+                    session_identity.as_ref(),
+                    &selected_provider_key,
+                    authorized_agent.as_deref(),
+                    cache_key,
+                )
+            });
+    let client_owned_prompt_cache_key_cooling_down =
+        client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            client_owned_prompt_cache_key_local_id.as_deref(),
+        );
+    if client_owned_prompt_cache_key_cooling_down {
+        // A prior independent request proved that this exact caller placement
+        // is rejected for this exact Agent/session/Key realm. Keep the current
+        // inbound one-shot, but return to Atoapi's generated placement key.
+        strip_root_provider_cache_metadata_for_native(&mut upstream_body);
     }
     let response_endpoint = upstream_url(&decision.provider.base_url, &Channel::Responses);
     let action_scope = trusted_codex_metadata.as_ref().and_then(|metadata| {
@@ -2419,7 +2400,13 @@ async fn run_generation_for_authorized_agent(
         &decision.upstream_channel,
         authorized_agent.as_deref(),
     );
-    let prefix_guard = if prefix_guard_skip_reason.is_some() {
+    // Responses only read a prefix-state snapshot for their bounded settle
+    // decision. They must not acquire a same-prefix mutex first: another
+    // in-flight local prepare would otherwise make this request bypass the
+    // exact-evidence protection entirely.
+    let responses_prefix_snapshot_enabled = prefix_guard_skip_reason.is_none()
+        && matches!(decision.upstream_channel, Channel::Responses);
+    let prefix_guard = if prefix_guard_skip_reason.is_some() || responses_prefix_snapshot_enabled {
         None
     } else {
         acquire_provider_prefix_guard(
@@ -2437,7 +2424,8 @@ async fn run_generation_for_authorized_agent(
         .map(ToOwned::to_owned);
     let response_session_starts_compaction_epoch =
         matches!(decision.upstream_channel, Channel::Responses)
-            && (responses_request_has_compaction_trigger(&upstream_body)
+            && (client_request_starts_compaction_epoch
+                || responses_request_has_compaction_trigger(&upstream_body)
                 || trusted_codex_metadata
                     .as_ref()
                     .is_some_and(|metadata| metadata.compaction_requested));
@@ -2474,7 +2462,7 @@ async fn run_generation_for_authorized_agent(
     let session_anchor_diagnostics =
         response_session_anchor_diagnostics(response_session_lease.as_ref());
     let local_prepare_ms = started.elapsed().as_millis() as u64;
-    let prefix_guard_wait = if prefix_guard.is_some() {
+    let prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
         wait_for_provider_prefix_settle(
             &state,
             &decision.upstream_channel,
@@ -2724,11 +2712,6 @@ async fn run_generation_for_authorized_agent(
     }
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
     let mut request_metric_errors = Vec::<(String, String)>::new();
-    let explicit_client_prompt_cache_key = client_request
-        .get("prompt_cache_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(provider_prompt_cache_key_is_valid);
     let (mut shadow_affinity_decision, shadow_affinity_lock_busy) =
         if let Some((identity, identity_elapsed)) = shadow_affinity_identity {
             let (decision, lock_busy) = try_compute_shadow_affinity_without_wait(
@@ -2746,121 +2729,144 @@ async fn run_generation_for_authorized_agent(
         } else {
             (None, false)
         };
+    let validation_scope = cache_validation::CacheValidationScope {
+        channel: active_request_channel.clone(),
+        key_id: selected_provider_key.key_id.clone(),
+        realm_id: affinity_identity::realm_id(&decision, &selected_provider_key),
+        stream: active_upstream_body
+            .body()
+            .get("stream")
+            .and_then(Value::as_bool),
+        store: active_upstream_body
+            .body()
+            .get("store")
+            .and_then(Value::as_bool),
+    };
+    let predicted_breakpoint_scope_id =
+        if cfg!(test) && matches!(active_request_channel, Channel::Responses) {
+            cache_capability::predicted_responses_breakpoint_placement_digest(
+                active_upstream_body.body(),
+            )
+            .map(|placement| validation_scope.effect_scope_id(Some(&placement)))
+        } else {
+            None
+        };
+    // An explicit breakpoint may only reuse a certificate for the exact
+    // insertion position. Normal production traffic keeps the `bp=none`
+    // scope, while test-only rejection coverage exercises the same strict
+    // placement check before allowing a controlled marker onto the wire.
+    let cache_effect_scope_id = predicted_breakpoint_scope_id
+        .filter(|scope| {
+            config.cache_capability_effect_promoted_for_scope(
+                &decision.provider.id,
+                &decision.model,
+                &active_request_channel,
+                selected_provider_key.key_id.as_deref(),
+                Some(scope),
+                ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            )
+        })
+        .unwrap_or_else(|| validation_scope.effect_scope_id(None));
     let validation_selection = if agent_generation && !shadow_affinity_lock_busy {
         state.cache_validation.lock().await.selection(
             &decision.provider.id,
             &decision.model,
+            validation_scope.clone(),
             Utc::now(),
         )
     } else {
         None
     };
-    let provider_prompt_cache_key_status = config.cache_capability_status_for_key(
-        &decision.provider.id,
-        &decision.model,
+    let controlled_probe_fields = controlled_cache_probe_fields(
+        &config,
+        &decision,
         &active_request_channel,
         selected_provider_key.key_id.as_deref(),
-        ProviderCacheCapabilityField::PromptCacheKey,
     );
-    let provider_prompt_cache_key_allowed =
-        provider_prompt_cache_key_status != ProviderCacheCapabilityStatus::Unsupported;
-    let provider_prompt_cache_key_verified =
-        provider_prompt_cache_key_status == ProviderCacheCapabilityStatus::Verified;
-    // The production path is a placement-only canary.  It is deliberately
-    // evaluated after manual validation selection so an explicit diagnostic
-    // run remains authoritative, and it never waits for the affinity mutex.
-    let active_cache_route_eligible = agent_generation
-        && !shadow_affinity_lock_busy
-        && validation_selection.is_none()
-        && smart_hit_enabled(&config)
-        // Cache affinity identity currently describes native upstream channel
-        // semantics. Do not apply the new route to a Chat compatibility hop.
-        && matches!(active_request_channel, Channel::Responses)
-        && matches!(
-            provider_prompt_cache_key_status,
-            ProviderCacheCapabilityStatus::Verified | ProviderCacheCapabilityStatus::Unverified
-        )
-        && provider_prompt_cache_key_allowed
-        && !explicit_client_prompt_cache_key;
-    let active_cache_route_selected = shadow_affinity_decision.as_mut().is_some_and(|decision| {
-        try_admit_active_cache_route_without_wait(
-            &state.shadow_affinity,
-            decision,
-            active_cache_route_eligible,
-            provider_prompt_cache_key_verified,
-            Utc::now(),
-        )
-    });
-    let candidate_cache_routing_applied =
+    // `prompt_cache_key` is a diagnostic-only control. Do not admit any
+    // automatic/static cohort route, regardless of an older capability record
+    // or a caller-provided key. The sole mutation path below is a manually
+    // selected candidate run with exact field-acceptance evidence.
+    let candidate_cache_routing_requested =
         shadow_affinity_decision.as_mut().is_some_and(|decision| {
-            let provider_native_candidate = validation_selection.is_none()
-                && decision.candidate_variant
-                    == cache_affinity::ShadowCacheCandidateVariant::ProviderNative;
             let channel_eligible =
                 matches!(active_request_channel, Channel::Responses | Channel::Chat)
-                    && (provider_native_candidate || provider_prompt_cache_key_allowed);
+                    && !controlled_probe_fields.is_empty();
             let can_apply = if let Some(selection) = validation_selection.as_ref() {
+                if selection.mode == cache_validation::CacheValidationMode::Candidate
+                    && controlled_probe_fields
+                        .contains(&ProviderCacheCapabilityField::PromptCacheKey)
+                {
+                    // Explicit key validation needs an actual generated key;
+                    // it must not inherit a provider-native candidate variant
+                    // that would leave the probe wire unchanged.
+                    decision.candidate_variant =
+                        cache_affinity::ShadowCacheCandidateVariant::CohortKey;
+                }
                 cache_validation::apply_controlled_selection(
                     decision,
                     selection,
                     smart_hit_enabled(&config),
                     channel_eligible,
                 )
-            } else if active_cache_route_selected {
-                true
-            } else if active_cache_route_eligible {
-                // A live scope that does not yet have enough baseline evidence
-                // must remain ordinary traffic.  Do not fall through to the
-                // older static cohort route and accidentally broaden it.
-                false
             } else {
-                channel_eligible
-                    && !explicit_client_prompt_cache_key
-                    && automatic_static_cohort_routing_enabled()
-                    && cache_affinity::apply_automatic_static_cohort_canary(
-                        decision,
-                        smart_hit_enabled(&config),
-                    )
+                false
             };
-            if validation_selection.is_none()
-                && !can_apply
-                && explicit_client_prompt_cache_key
-                && decision.arm == cache_affinity::ShadowAffinityArm::Candidate
-            {
-                decision.decision = "candidate_skipped_explicit_cache_key".to_string();
-                decision.skip_reason = Some("explicit_client_prompt_cache_key".to_string());
-            }
             if !can_apply {
                 return false;
             }
-            let outcome = apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
-            if outcome.applied {
-                provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
+            if controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey) {
+                let outcome =
+                    apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
+                if outcome.applied {
+                    provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
+                }
+                return outcome.applied;
             }
-            outcome.applied
+            // Provider-native controls are injected below from the exact
+            // selected field set. Mark the candidate now without altering a
+            // placement key.
+            true
         });
-    if let Some(decision) = shadow_affinity_decision.as_ref() {
-        state
-            .metrics
-            .record_shadow_decision(
-                decision.lane != cache_affinity::ShadowCacheLane::Transparent,
-                decision.policy_compute_ms,
-            )
-            .await;
-    }
-    if candidate_cache_routing_applied {
-        state.metrics.record_shadow_application(true).await;
-    }
+    let cache_control_application = apply_native_cache_controls_with_probe_fields(
+        &mut active_upstream_body,
+        &config,
+        &decision,
+        &active_request_channel,
+        selected_provider_key.key_id.as_deref(),
+        Some(cache_effect_scope_id.as_str()),
+        if candidate_cache_routing_requested {
+            &controlled_probe_fields
+        } else {
+            &[]
+        },
+    );
     if agent_generation {
-        apply_native_cache_controls(
-            &mut active_upstream_body,
-            &config,
-            &decision,
-            &active_request_channel,
-            selected_provider_key.key_id.as_deref(),
-        );
-        provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
+        let final_provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
+        let client_owned_prompt_cache_key_forwarded = client_owned_prompt_cache_key
+            .as_deref()
+            .is_some_and(|client_key| final_provider_prefix_key.as_deref() == Some(client_key));
+        upstream_request_diagnostics.client_owned_prompt_cache_key =
+            client_owned_prompt_cache_key_forwarded;
+        upstream_request_diagnostics.client_owned_prompt_cache_key_local_id =
+            client_owned_prompt_cache_key_forwarded
+                .then(|| client_owned_prompt_cache_key_local_id.clone())
+                .flatten();
+        provider_prefix_key = if client_owned_prompt_cache_key_forwarded {
+            upstream_request_diagnostics
+                .client_owned_prompt_cache_key_local_id
+                .clone()
+        } else {
+            final_provider_prefix_key
+        };
     }
+    let client_prompt_cache_key_for_error_redaction = upstream_request_diagnostics
+        .client_owned_prompt_cache_key
+        .then(|| {
+            client_owned_prompt_cache_key
+                .clone()
+                .expect("a forwarded client key remains available for in-memory redaction")
+        });
     let final_scope_waterline_is_full_replay = native_responses_passthrough
         && matches!(&active_request_channel, Channel::Responses)
         && !active_used_response_session
@@ -2868,7 +2874,12 @@ async fn run_generation_for_authorized_agent(
         && matches!(&response_session_parent, LineageParent::FullReplay);
     if !final_scope_waterline_is_full_replay {
         final_scope_predecessor = final_scope_predecessor.not_full_replay();
-    } else if !active_upstream_body.preserves_initial_root("input") {
+    } else if !active_upstream_body.preserves_initial_root("input")
+        && !responses_input_root_equal_ignoring_protocol_breakpoint(
+            full_response_input.as_ref(),
+            active_upstream_body.body().get("input"),
+        )
+    {
         final_scope_predecessor = final_scope_predecessor.invalidate_final_input();
     }
     let generation_envelope = GenerationEnvelope::freeze(
@@ -2883,6 +2894,67 @@ async fn run_generation_for_authorized_agent(
             .map(str::to_owned),
     );
     let final_wire_receipt = cache_control_plan.seal(&generation_envelope);
+    let response_session_breakpoint_placement = final_wire_receipt
+        .cache_controls
+        .breakpoint_placement_digest()
+        .map(ToOwned::to_owned);
+    // The lineage retains the original semantic input. A final-wire cache
+    // marker is tracked separately, and any change in that exact placement
+    // breaks the observed waterline rather than becoming false continuity.
+    if final_scope_waterline_is_full_replay
+        && !response_session_breakpoint_placement_matches(
+            response_session_lease.as_ref(),
+            response_session_breakpoint_placement.as_deref(),
+        )
+    {
+        final_scope_predecessor = final_scope_predecessor.invalidate_final_input();
+    }
+    // A validation candidate is real only when its one selected field is
+    // present on the frozen wire. Planning or mutating a draft is not enough:
+    // a compatibility path may discard a root field or find no legal content
+    // position for a breakpoint.
+    let actual_controlled_cache_probe_fields = candidate_cache_routing_requested.then(|| {
+        controlled_cache_probe_fields_on_final_wire(
+            &controlled_probe_fields,
+            &final_wire_receipt,
+            Some(&cache_control_application),
+        )
+    });
+    let candidate_cache_routing_applied = actual_controlled_cache_probe_fields
+        .as_ref()
+        .is_some_and(|fields| fields == &controlled_probe_fields);
+    if candidate_cache_routing_requested && !candidate_cache_routing_applied {
+        if let Some(decision) = shadow_affinity_decision.as_mut() {
+            decision.mode = "validation".to_string();
+            decision.decision = "validation_candidate_skipped".to_string();
+            decision.skip_reason = Some("candidate_control_missing_from_final_wire".to_string());
+        }
+    }
+    if let Some(decision) = shadow_affinity_decision.as_ref() {
+        state
+            .metrics
+            .record_shadow_decision(
+                decision.lane != cache_affinity::ShadowCacheLane::Transparent,
+                decision.policy_compute_ms,
+            )
+            .await;
+    }
+    if candidate_cache_routing_applied {
+        state.metrics.record_shadow_application(true).await;
+        upstream_request_diagnostics.controlled_cache_probe_fields =
+            actual_controlled_cache_probe_fields.unwrap_or_default();
+        upstream_request_diagnostics.controlled_cache_probe_breakpoint_placement_digest =
+            upstream_request_diagnostics
+                .controlled_cache_probe_fields
+                .contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint)
+                .then(|| {
+                    final_wire_receipt
+                        .cache_controls
+                        .breakpoint_placement_digest()
+                        .map(ToOwned::to_owned)
+                })
+                .flatten();
+    }
     upstream_request_diagnostics.final_scope_shadow =
         FinalScopeShadow::derive(FinalScopeShadowInput {
             native_responses: native_responses_passthrough,
@@ -3173,7 +3245,10 @@ async fn run_generation_for_authorized_agent(
                     prefix_state_update_key = None;
                     request_metric_errors.push((
                         "reasoning_effort_rejected".to_string(),
-                        upstream_error_summary(&body_read.bytes),
+                        upstream_error_summary_redacting(
+                            &body_read.bytes,
+                            client_prompt_cache_key_for_error_redaction.as_deref(),
+                        ),
                     ));
                 }
             }
@@ -3188,7 +3263,18 @@ async fn run_generation_for_authorized_agent(
         .final_wire_receipt
         .as_ref()
         .map(|receipt| receipt.cache_controls.present_fields())
-        .unwrap_or_else(|| cache_capability::present_fields(&active_upstream_body));
+        .unwrap_or_else(|| {
+            cache_capability::present_fields(&active_upstream_body, &active_request_channel)
+        });
+    // A provider may reject one caller-chosen placement value without
+    // rejecting the `prompt_cache_key` field itself. Never let that response
+    // poison the provider-wide capability record; the inbound attempt remains
+    // one-shot and reports its own upstream error normally.
+    if upstream_request_diagnostics.client_owned_prompt_cache_key {
+        upstream_request_diagnostics
+            .sent_cache_capability_fields
+            .retain(|field| *field != ProviderCacheCapabilityField::PromptCacheKey);
+    }
     upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
     let is_stream = should_proxy_upstream_as_stream(
         is_success_status,
@@ -3259,6 +3345,7 @@ async fn run_generation_for_authorized_agent(
             shadow_affinity_decision,
             agent_generation,
             response_handoff,
+            client_prompt_cache_key_for_error_redaction.clone(),
         )
         .await;
         return response;
@@ -3371,7 +3458,10 @@ async fn run_generation_for_authorized_agent(
         && matches!(active_request_channel, Channel::Responses)
         && active_upstream_body.get("previous_response_id").is_some()
     {
-        let error_summary = upstream_error_summary(&bytes);
+        let error_summary = upstream_error_summary_redacting(
+            &bytes,
+            client_prompt_cache_key_for_error_redaction.as_deref(),
+        );
         let rejection = response_session_rejection_classification(status, &error_summary);
         if automatic_verified_native_delta {
             response_session_reuse_diagnostics.rejected_status = Some(status);
@@ -3492,15 +3582,29 @@ async fn run_generation_for_authorized_agent(
         .unwrap_or(&bytes_for_client);
     let upstream_status_for_cache_capability = status;
     if is_success_status && json_body_has_error(settlement_bytes) {
-        let error_summary = upstream_error_summary(settlement_bytes);
+        let error_summary = upstream_error_summary_redacting(
+            settlement_bytes,
+            client_prompt_cache_key_for_error_redaction.as_deref(),
+        );
         request_metric_errors.push(("upstream_sse_error".to_string(), error_summary));
         status = StatusCode::BAD_GATEWAY.as_u16();
         is_success_status = false;
     }
-    let key_error_summary = (!is_success_status).then(|| upstream_error_summary(settlement_bytes));
-    let cache_capability_rejection_summary = (!is_success_status)
-        .then(|| structured_upstream_error_summary(settlement_bytes))
-        .flatten();
+    let cache_capability_rejected_fields = (!is_success_status)
+        .then(|| cache_capability_rejection_fields_from_error_bytes(settlement_bytes))
+        .unwrap_or_default();
+    // Keep the unredacted classification window local to this settlement. The
+    // persisted/UI summary below is always redacted before the normal cutoff.
+    let key_error_summary_for_classification = (!is_success_status)
+        .then(|| upstream_error_summary_for_client_key_redaction(settlement_bytes));
+    let key_error_summary = key_error_summary_for_classification
+        .as_ref()
+        .map(|summary| {
+            summarize_client_prompt_cache_key_error(
+                summary.clone(),
+                client_prompt_cache_key_for_error_redaction.as_deref(),
+            )
+        });
     let mut response_content_type =
         if matches!(client_channel, Channel::Responses) && !client_requested_stream {
             "application/json".to_string()
@@ -3589,7 +3693,7 @@ async fn run_generation_for_authorized_agent(
             response_bytes.clone(),
         );
     }
-    if let Some(error_summary) = cache_capability_rejection_summary.as_deref() {
+    if let Some(error_summary) = key_error_summary.as_deref() {
         note_runtime_cache_capability_rejection(
             &state,
             &decision,
@@ -3597,6 +3701,7 @@ async fn run_generation_for_authorized_agent(
             &upstream_request_diagnostics,
             upstream_status_for_cache_capability,
             error_summary,
+            &cache_capability_rejected_fields,
         )
         .await;
     }
@@ -3680,6 +3785,7 @@ async fn run_generation_for_authorized_agent(
             response_session_lease.as_ref(),
             &response_session_parent,
             full_response_input.as_ref(),
+            response_session_breakpoint_placement.clone(),
             response_session_response_id.clone(),
             response_output_items_from_bytes(&bytes),
         )
@@ -3701,6 +3807,17 @@ async fn run_generation_for_authorized_agent(
                 committed_head,
             )
         });
+    let final_responses_static_projection = if matches!(active_request_channel, Channel::Responses)
+    {
+        FinalResponsesStaticProjection::Observed(
+            upstream_request_diagnostics
+                .final_wire_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.wire.responses_static_projection_digest.as_deref()),
+        )
+    } else {
+        FinalResponsesStaticProjection::NotApplicable
+    };
     let prefix_observation = observe_provider_prefix_usage(
         &state,
         prefix_state_update_key.as_deref(),
@@ -3708,6 +3825,7 @@ async fn run_generation_for_authorized_agent(
         usage_record.as_ref(),
         prefix_usage_record.as_ref(),
         &tail_input_diagnostics,
+        final_responses_static_projection,
         active_used_response_session,
         retried_full_response,
         prefix_guard_wait.budget_exhausted,
@@ -3715,7 +3833,7 @@ async fn run_generation_for_authorized_agent(
     )
     .await;
     let gap_breakdown = prefix_observation.gap;
-    let prefix_lag = usage_record
+    let mut prefix_lag = usage_record
         .as_ref()
         .map(|record| {
             prefix_lag_diagnostics_from_previous(
@@ -3727,6 +3845,9 @@ async fn run_generation_for_authorized_agent(
             )
         })
         .unwrap_or_default();
+    if prefix_observation.static_wire_drift {
+        prefix_lag.classification = Some("static_wire_drift".to_string());
+    }
     if confirmed_compaction {
         let shadow_assignment_key = mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
         let _ = finalize_confirmed_responses_compaction(
@@ -3740,7 +3861,10 @@ async fn run_generation_for_authorized_agent(
         .await;
     }
     if !is_success_status {
-        let error_summary = upstream_error_summary(settlement_bytes);
+        let error_summary = upstream_error_summary_redacting(
+            settlement_bytes,
+            client_prompt_cache_key_for_error_redaction.as_deref(),
+        );
         if should_cooldown_prefix_after_status(status)
             || (responses_main_retry_guard
                 && should_cooldown_responses_sync_main_after_status(status))
@@ -3960,7 +4084,10 @@ async fn run_generation_for_authorized_agent(
                 "response_completed",
             )
         } else {
-            let summary = upstream_error_summary(settlement_bytes);
+            let summary = upstream_error_summary_redacting(
+                settlement_bytes,
+                client_prompt_cache_key_for_error_redaction.as_deref(),
+            );
             (
                 AgentAttemptOutcome::HttpError,
                 AgentInboundOutcome::HttpError,
@@ -4035,7 +4162,10 @@ async fn acquire_provider_prefix_guard(
     provider_prefix_key: Option<&str>,
     _provider_prefix_family_key: Option<&str>,
 ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-    if !matches!(channel, Channel::Responses | Channel::Chat) {
+    // Responses use a lock-free prefix-state snapshot so concurrent turns
+    // make the same settle decision. Chat keeps its existing preparation
+    // serialization because its compatibility path is not latency-critical.
+    if !matches!(channel, Channel::Chat) {
         return None;
     }
     let key = provider_prefix_key?;
@@ -4043,11 +4173,6 @@ async fn acquire_provider_prefix_guard(
         let mut locks = state.prefix_locks.lock().await;
         locks.acquire(key)
     };
-    if matches!(channel, Channel::Responses) {
-        // Prefix coordination may protect preparation when immediately
-        // available, but it is never allowed to delay a Responses request.
-        return lock.try_lock_owned().ok();
-    }
     Some(lock.lock_owned().await)
 }
 
@@ -4100,6 +4225,9 @@ async fn wait_for_provider_prefix_settle(
                 tiny_instability_recovery_safe: state.recent_clean_tiny_gap_streak
                     >= MIN_CLEAN_TINY_RECOVERY_STREAK
                     && responses_tiny_instability_recovery_tail_is_clean(current_tail),
+                current_tail_is_settle_safe: !responses_current_tail_makes_avoidable_unreliable(
+                    current_tail,
+                ) && !responses_tool_tail_burst(current_tail),
                 settle_after_cold_read: state.settle_after_cold_read,
                 compaction_requested,
                 state_age,
@@ -4231,6 +4359,64 @@ async fn clear_prefix_error_cooldown(state: &AppState, provider_prefix_key: Opti
         return;
     };
     state.prefix_error_cooldowns.lock().await.remove(key);
+}
+
+/// Never wait behind local bookkeeping just to decide whether a caller-owned
+/// placement hint should be forwarded. A busy cooldown map fails open: a
+/// concurrent terminal settlement cannot silently replace a valid caller key
+/// or reduce its upstream cache affinity.
+fn client_prompt_cache_key_rejection_cooldown_active(
+    state: &AppState,
+    local_id: Option<&str>,
+) -> bool {
+    let Some(local_id) = local_id else {
+        return false;
+    };
+    let Ok(mut cooldowns) = state.client_prompt_cache_key_rejection_cooldowns.try_lock() else {
+        // The map is held only while a terminal result is being written. Do not
+        // make a normal inbound request wait or substitute its explicit key.
+        // The one narrow concurrent first-request race is preferable to
+        // degrading a valid cache placement hint.
+        return false;
+    };
+    match cooldowns.get(local_id).copied() {
+        Some(until) if until > Instant::now() => true,
+        Some(_) => {
+            cooldowns.remove(local_id);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Record only a semantic rejection of the caller's own placement value. The
+/// key is an opaque HMAC-like local id, scoped to the actual Agent/session/Key
+/// realm; raw caller input never enters this map or any persisted state.
+async fn note_client_prompt_cache_key_rejection_cooldown(state: &AppState, local_id: Option<&str>) {
+    let Some(local_id) = local_id else {
+        return;
+    };
+    let mut cooldowns = state
+        .client_prompt_cache_key_rejection_cooldowns
+        .lock()
+        .await;
+    let now = Instant::now();
+    cooldowns.retain(|_, until| *until > now);
+    if !cooldowns.contains_key(local_id)
+        && cooldowns.len() >= CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_LIMIT
+    {
+        if let Some(oldest) = cooldowns
+            .iter()
+            .min_by_key(|(_, until)| *until)
+            .map(|(key, _)| key.clone())
+        {
+            cooldowns.remove(&oldest);
+        }
+    }
+    cooldowns.insert(
+        local_id.to_string(),
+        now + TokioDuration::from_secs(CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_SECS),
+    );
 }
 
 fn compact_chat_compat_cooldown_key(decision: &RouteDecision) -> String {
@@ -4806,7 +4992,11 @@ fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
     _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
-    matches!(channel, Channel::Responses).then_some(TokioDuration::ZERO)
+    // The guard is already fail-closed: it only waits on an exact, recent
+    // prefix state after the controller has found a concrete avoidable gap.
+    // Keep the user's latency contract here as the final hard ceiling instead
+    // of disabling that safe recovery path for every Responses request.
+    matches!(channel, Channel::Responses).then_some(responses_foreground_wait_cap())
 }
 
 fn prefix_guard_wait_effect(
@@ -5522,6 +5712,7 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         usage_record,
         usage_record,
         tail_input_diagnostics,
+        FinalResponsesStaticProjection::NotApplicable,
         used_response_session,
         retried_full_response,
         guard_budget_exhausted,
@@ -5538,6 +5729,7 @@ async fn observe_provider_prefix_usage(
     raw_usage: Option<&UsageRecord>,
     effective_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
+    final_responses_static_projection: FinalResponsesStaticProjection<'_>,
     used_response_session: bool,
     retried_full_response: bool,
     guard_budget_exhausted: bool,
@@ -5548,7 +5740,7 @@ async fn observe_provider_prefix_usage(
         clear_recent_clean_tiny_gap_evidence(&mut states, provider_prefix_key);
         return ProviderPrefixUsageObservation::default();
     };
-    let (previous_exact, previous_best, previous_family, next, learn_family) = {
+    let (previous_exact, previous_best, previous_family, next, learn_family, static_wire_drift) = {
         let mut states = state.prefix_states.lock().await;
         let key = provider_prefix_key;
         let previous_exact = key.and_then(|key| states.get(key).cloned());
@@ -5563,6 +5755,7 @@ async fn observe_provider_prefix_usage(
                     used_response_session,
                     retried_full_response,
                     guard_budget_exhausted,
+                    final_responses_static_projection,
                 })
             })
         } else {
@@ -5574,6 +5767,9 @@ async fn observe_provider_prefix_usage(
         let learn_family = state_observation
             .as_ref()
             .is_some_and(|observation| observation.learn_family);
+        let static_wire_drift = state_observation
+            .as_ref()
+            .is_some_and(|observation| observation.static_wire_drift);
         if let (Some(key), Some(next)) = (key, next.as_ref()) {
             states.insert(key.to_string(), next.clone());
             if let Some(alias_key) = provider_prefix_state_alias_key(key) {
@@ -5593,6 +5789,7 @@ async fn observe_provider_prefix_usage(
             previous_family,
             next,
             learn_family,
+            static_wire_drift,
         )
     };
     let gap = Some(PrefixController::classify_gap(PrefixGapInput {
@@ -5602,6 +5799,7 @@ async fn observe_provider_prefix_usage(
         usage: raw,
         tail,
         guard_budget_exhausted,
+        static_wire_drift,
     }));
     if next.is_some() || learn_family {
         state.journal_runtime_state();
@@ -5610,6 +5808,7 @@ async fn observe_provider_prefix_usage(
     ProviderPrefixUsageObservation {
         gap,
         previous: previous_best,
+        static_wire_drift,
     }
 }
 
@@ -6166,18 +6365,45 @@ fn provider_prefix_control_key(
     })
 }
 
-fn provider_prefix_family_control_key(
+/// Prefix observations are local hints, so the Key realm must be selected
+/// before they are read or written. The earlier realm-neutral form is used
+/// only for sticky key selection; this v2 form prevents failover/rotation from
+/// lending one key's cache waterline to another key.
+fn provider_prefix_control_key_for_selected_key(
+    provider_prefix_key: Option<&str>,
+    decision: &RouteDecision,
+    channel: &Channel,
+    selected_provider_key: &SelectedProviderKey,
+) -> Option<String> {
+    let provider_group = provider_prefix_provider_group(decision);
+    let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
+    provider_prefix_key.map(|key| {
+        format!(
+            "prefix-v2\0{}\0{}\0{}\0{}\0{}",
+            key_realm,
+            provider_group,
+            provider_prefix_model_key(decision),
+            channel.label(),
+            key
+        )
+    })
+}
+
+fn provider_prefix_family_control_key_for_selected_key(
     response_session_scope_key: Option<&str>,
     decision: &RouteDecision,
     channel: &Channel,
+    selected_provider_key: &SelectedProviderKey,
 ) -> Option<String> {
     if !matches!(channel, Channel::Responses) {
         return None;
     }
     let provider_group = provider_prefix_provider_group(decision);
+    let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
     response_session_scope_key.map(|scope| {
         format!(
-            "prefix-family\0{}\0{}\0{}\0{}",
+            "prefix-family-v2\0{}\0{}\0{}\0{}\0{}",
+            key_realm,
             provider_group,
             provider_prefix_model_key(decision),
             channel.label(),
@@ -6188,7 +6414,12 @@ fn provider_prefix_family_control_key(
 
 fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     let mut parts = control_key.split('\0');
-    let provider_group = parts.next()?;
+    let first = parts.next()?;
+    let (key_realm, provider_group) = if first == "prefix-v2" {
+        (Some(parts.next()?), parts.next()?)
+    } else {
+        (None, first)
+    };
     let model = parts.next()?;
     let channel = parts.next()?;
     let fingerprint = parts.next()?;
@@ -6200,10 +6431,17 @@ fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     {
         return None;
     }
-    Some(format!(
-        "prefix-alias\0{}\0{}\0{}\0{}",
-        provider_group, model, channel, fingerprint
-    ))
+    match key_realm {
+        Some(key_realm) if !key_realm.is_empty() => Some(format!(
+            "prefix-alias-v2\0{}\0{}\0{}\0{}\0{}",
+            key_realm, provider_group, model, channel, fingerprint
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "prefix-alias\0{}\0{}\0{}\0{}",
+            provider_group, model, channel, fingerprint
+        )),
+    }
 }
 
 fn provider_prefix_provider_group(decision: &RouteDecision) -> String {
@@ -6435,6 +6673,7 @@ async fn provider_cache_gap_breakdown_with_guard(
         guard_budget_exhausted: prefix_guard_wait
             .map(|wait| wait.budget_exhausted)
             .unwrap_or(false),
+        static_wire_drift: false,
     }))
 }
 
@@ -6528,6 +6767,15 @@ fn maybe_reuse_response_session(
             continue;
         }
         saw_unexpired = true;
+        // A protocol cache breakpoint lives in the final upstream input but
+        // is not part of the Agent's next raw replay.  Keep native delta
+        // disabled for that lineage until an upstream-specific proof covers
+        // the complete final wire, rather than treating this control-only
+        // difference as evidence that a delta is safe.
+        if cache_capability::responses_input_contains_protocol_cache_breakpoint(&session.input) {
+            saw_delta_rejected = true;
+            continue;
+        }
         let Some(delta_input) = appended_response_input_delta_for_session(&session, current_input)
         else {
             saw_delta_rejected = true;
@@ -6989,7 +7237,18 @@ fn response_input_delta_start_index(
     previous_items: &[Value],
     current_items: &[Value],
 ) -> Option<usize> {
-    response_input_raw_prefix_delta_start_index(previous_items, current_items)
+    if previous_items.is_empty() || previous_items.len() >= current_items.len() {
+        return None;
+    }
+    previous_items
+        .iter()
+        .zip(current_items.iter())
+        .all(|(previous, current)| {
+            cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(
+                previous, current,
+            )
+        })
+        .then_some(previous_items.len())
 }
 
 fn response_input_raw_prefix_delta_start_index(
@@ -7006,11 +7265,39 @@ fn response_input_raw_prefix_delta_start_index(
         .then_some(previous_items.len())
 }
 
+fn responses_input_root_equal_ignoring_protocol_breakpoint(
+    original: Option<&Value>,
+    final_input: Option<&Value>,
+) -> bool {
+    let (Some(Value::Array(original)), Some(Value::Array(final_input))) = (original, final_input)
+    else {
+        return false;
+    };
+    original.len() == final_input.len()
+        && original.iter().zip(final_input).all(|(left, right)| {
+            cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(left, right)
+        })
+}
+
+fn response_session_breakpoint_placement_matches(
+    session_lease: Option<&LineageLease>,
+    final_breakpoint_placement: Option<&str>,
+) -> bool {
+    let Some(lease) = session_lease else {
+        return true;
+    };
+    if lease.head().is_none() {
+        return true;
+    }
+    lease.breakpoint_placement_digest() == final_breakpoint_placement
+}
+
 async fn update_response_session_with_id(
     state: &AppState,
     session_lease: Option<&LineageLease>,
     parent: &LineageParent,
     full_response_input: Option<&Value>,
+    breakpoint_placement_digest: Option<String>,
     response_id: Option<String>,
     output_items: Vec<Value>,
 ) -> Option<LineageCommitOutcome> {
@@ -7019,6 +7306,7 @@ async fn update_response_session_with_id(
         session_lease,
         parent,
         full_response_input.cloned(),
+        breakpoint_placement_digest,
         response_id,
         output_items,
     )
@@ -7030,6 +7318,7 @@ async fn update_response_session_with_owned_input(
     session_lease: Option<&LineageLease>,
     parent: &LineageParent,
     full_response_input: Option<Value>,
+    breakpoint_placement_digest: Option<String>,
     response_id: Option<String>,
     output_items: Vec<Value>,
 ) -> Option<LineageCommitOutcome> {
@@ -7064,6 +7353,7 @@ async fn update_response_session_with_owned_input(
         .unwrap_or(true);
     let candidate = ResponseSessionCandidate {
         response_id,
+        breakpoint_placement_digest,
         input,
         output_items,
         finished_at: Instant::now(),
@@ -7223,10 +7513,77 @@ fn response_output_items_from_value(value: &Value) -> Vec<Value> {
 }
 
 fn upstream_error_summary(bytes: &[u8]) -> String {
+    upstream_error_summary_with_char_limit(bytes, LOG_MESSAGE_MAX_CHARS)
+}
+
+/// Returns a bounded, in-memory-only error window that is long enough to
+/// redact a valid caller-owned cache key before the normal persisted-summary
+/// limit is applied.
+fn upstream_error_summary_for_client_key_redaction(bytes: &[u8]) -> String {
+    upstream_error_summary_with_char_limit(bytes, CLIENT_PROMPT_CACHE_KEY_REDACTION_WINDOW_CHARS)
+}
+
+fn upstream_error_summary_redacting(bytes: &[u8], raw_client_key: Option<&str>) -> String {
+    summarize_client_prompt_cache_key_error(
+        upstream_error_summary_for_client_key_redaction(bytes),
+        raw_client_key,
+    )
+}
+
+fn upstream_error_summary_with_char_limit(bytes: &[u8], max_chars: usize) -> String {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
-        return upstream_error_summary_from_value(&value);
+        return upstream_error_summary_from_value_with_char_limit(&value, max_chars);
     }
-    truncate_log_message(&String::from_utf8_lossy(bytes))
+    truncate_log_message_to_chars(&String::from_utf8_lossy(bytes), max_chars)
+}
+
+/// Caller-owned placement keys are valid only on the upstream wire. Some
+/// providers echo an invalid value verbatim in error bodies; redact that exact
+/// known value before an error summary reaches metrics, diagnostics, history,
+/// or the desktop UI. The proxy response itself remains protocol-transparent.
+fn redact_client_prompt_cache_key(summary: String, raw_client_key: Option<&str>) -> String {
+    let Some(raw_client_key) = raw_client_key.filter(|key| !key.is_empty()) else {
+        return summary;
+    };
+    if !summary.contains(raw_client_key) {
+        return summary;
+    }
+    summary.replace(raw_client_key, REDACTED_CLIENT_PROMPT_CACHE_KEY)
+}
+
+/// Redact first, then apply the persisted error-summary limit. Doing this in
+/// this order prevents a key which crosses the normal 700-character cutoff
+/// from leaving a partial plaintext prefix in metrics or history.
+pub(super) fn summarize_client_prompt_cache_key_error(
+    summary: String,
+    raw_client_key: Option<&str>,
+) -> String {
+    truncate_client_prompt_cache_key_error(&redact_client_prompt_cache_key(summary, raw_client_key))
+}
+
+fn truncate_client_prompt_cache_key_error(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= LOG_MESSAGE_MAX_CHARS {
+        return normalized;
+    }
+
+    // Do not leave a clipped `[redacted ...]` marker in history/UI. Retain the
+    // whole marker by trading a small amount of preceding non-sensitive text.
+    let marker_len = REDACTED_CLIENT_PROMPT_CACHE_KEY.chars().count();
+    for (marker_start_byte, _) in normalized.match_indices(REDACTED_CLIENT_PROMPT_CACHE_KEY) {
+        let marker_start_chars = normalized[..marker_start_byte].chars().count();
+        if marker_start_chars < LOG_MESSAGE_MAX_CHARS
+            && marker_start_chars.saturating_add(marker_len) > LOG_MESSAGE_MAX_CHARS
+        {
+            let prefix_len = LOG_MESSAGE_MAX_CHARS.saturating_sub(marker_len);
+            let mut truncated = normalized.chars().take(prefix_len).collect::<String>();
+            truncated.push_str(REDACTED_CLIENT_PROMPT_CACHE_KEY);
+            truncated.push_str("...");
+            return truncated;
+        }
+    }
+
+    truncate_log_message_to_chars(&normalized, LOG_MESSAGE_MAX_CHARS)
 }
 
 fn structured_upstream_error_summary(bytes: &[u8]) -> Option<String> {
@@ -7251,7 +7608,7 @@ fn structured_upstream_error_summary(bytes: &[u8]) -> Option<String> {
     })
 }
 
-pub(super) fn upstream_error_summary_from_value(value: &Value) -> String {
+fn upstream_error_message_from_value(value: &Value) -> String {
     if let Some(message) = [
         "/error/message",
         "/response/error/message",
@@ -7263,16 +7620,33 @@ pub(super) fn upstream_error_summary_from_value(value: &Value) -> String {
     .into_iter()
     .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
     {
-        return truncate_log_message(message);
+        return message.to_string();
     }
     if let Some(message) = value
         .get("error")
         .or_else(|| value.pointer("/response/error"))
         .and_then(Value::as_str)
     {
-        return truncate_log_message(message);
+        return message.to_string();
     }
-    truncate_log_message(&value.to_string())
+    value.to_string()
+}
+
+pub(super) fn upstream_error_summary_from_value(value: &Value) -> String {
+    upstream_error_summary_from_value_with_char_limit(value, LOG_MESSAGE_MAX_CHARS)
+}
+
+/// The stream decoder holds this only for the lifetime of a relay so the
+/// owner can redact a caller key before it becomes a persisted summary.
+pub(super) fn upstream_error_summary_from_value_for_client_key_redaction(value: &Value) -> String {
+    upstream_error_summary_from_value_with_char_limit(
+        value,
+        CLIENT_PROMPT_CACHE_KEY_REDACTION_WINDOW_CHARS,
+    )
+}
+
+fn upstream_error_summary_from_value_with_char_limit(value: &Value, max_chars: usize) -> String {
+    truncate_log_message_to_chars(&upstream_error_message_from_value(value), max_chars)
 }
 
 fn upstream_error_scope(status: u16, message: &str) -> &'static str {
@@ -7304,12 +7678,15 @@ fn upstream_error_scope(status: u16, message: &str) -> &'static str {
 }
 
 fn truncate_log_message(message: &str) -> String {
-    const MAX_CHARS: usize = 700;
+    truncate_log_message_to_chars(message, LOG_MESSAGE_MAX_CHARS)
+}
+
+fn truncate_log_message_to_chars(message: &str, max_chars: usize) -> String {
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= MAX_CHARS {
+    if normalized.chars().count() <= max_chars {
         normalized
     } else {
-        let mut truncated = normalized.chars().take(MAX_CHARS).collect::<String>();
+        let mut truncated = normalized.chars().take(max_chars).collect::<String>();
         truncated.push_str("...");
         truncated
     }
@@ -7763,6 +8140,16 @@ fn responses_request_has_compaction_trigger(request: &Value) -> bool {
         .and_then(|item| item.get("type"))
         .and_then(Value::as_str)
         == Some("compaction_trigger")
+}
+
+fn responses_request_starts_compaction_epoch(
+    client_channel: &Channel,
+    request: &Value,
+    trusted_codex_metadata: Option<&TrustedCodexRequestMetadata>,
+) -> bool {
+    matches!(client_channel, Channel::Responses)
+        && (responses_request_has_compaction_trigger(request)
+            || trusted_codex_metadata.is_some_and(|metadata| metadata.compaction_requested))
 }
 
 fn response_body_compaction_evidence(bytes: &[u8], content_type: &str) -> (bool, bool, bool) {
@@ -9379,19 +9766,113 @@ fn explicit_cache_field_rejection(
 
 fn cache_field_rejection_signal(summary: &str, field: ProviderCacheCapabilityField) -> bool {
     let lower = summary.to_ascii_lowercase();
-    lower.contains(field.json_name())
-        && [
-            "unsupported",
-            "not supported",
-            "unknown",
-            "unrecognized",
-            "not permitted",
-            "extra inputs are not permitted",
-            "invalid parameter",
-            "invalid_request",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
+    lower.contains(field.json_name()) && cache_rejection_marker_present(&lower)
+}
+
+fn cache_rejection_marker_present(message: &str) -> bool {
+    [
+        "unsupported",
+        "not supported",
+        "unknown",
+        "unrecognized",
+        "not permitted",
+        "extra inputs are not permitted",
+        "invalid parameter",
+        "invalid_parameter",
+        "invalid_request",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// Derive only field-level rejection evidence from a complete in-memory error
+/// value. The returned set has no caller value or upstream error text, so it
+/// can safely cross the stream settlement seam.
+pub(super) fn cache_capability_rejection_fields_from_value(
+    value: &Value,
+) -> HashSet<ProviderCacheCapabilityField> {
+    let mut evidence = upstream_error_message_from_value(value);
+    // Some compatible Responses gateways put the rejection marker in `code`
+    // and the field name in `param`/`field`, while keeping `message` generic.
+    // Those named fields are authoritative: do not let an echoed unrelated
+    // cache-field name in the message disable another capability.
+    for pointer in [
+        "/error/code",
+        "/response/error/code",
+        "/error/type",
+        "/response/error/type",
+        "/code",
+        "/type",
+    ] {
+        if let Some(fragment) = value.pointer(pointer).and_then(Value::as_str) {
+            evidence.push(' ');
+            evidence.push_str(fragment);
+        }
+    }
+    let mut named_fields = HashSet::new();
+    for pointer in [
+        "/error/param",
+        "/response/error/param",
+        "/error/field",
+        "/response/error/field",
+        "/param",
+        "/field",
+    ] {
+        if let Some(name) = value.pointer(pointer).and_then(Value::as_str) {
+            if let Some(field) = ProviderCacheCapabilityField::ALL
+                .into_iter()
+                .find(|field| name.trim() == field.json_name())
+            {
+                named_fields.insert(field);
+            }
+        }
+    }
+    if !named_fields.is_empty() && cache_rejection_marker_present(&evidence.to_ascii_lowercase()) {
+        return named_fields;
+    }
+    cache_capability_rejection_fields_from_message(&evidence)
+}
+
+fn cache_capability_rejection_fields_from_message(
+    message: &str,
+) -> HashSet<ProviderCacheCapabilityField> {
+    ProviderCacheCapabilityField::ALL
+        .into_iter()
+        .filter(|field| cache_field_rejection_signal(message, *field))
+        .collect()
+}
+
+/// Parse complete structured error payloads before summary redaction or
+/// truncation. Plain gateway/error pages deliberately provide no capability
+/// evidence: a generic HTML 400 must not disable a valid provider field.
+fn cache_capability_rejection_fields_from_error_bytes(
+    bytes: &[u8],
+) -> HashSet<ProviderCacheCapabilityField> {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return cache_capability_rejection_fields_from_value(&value);
+    }
+
+    let mut fields = HashSet::new();
+    let mut decoder = sse::SseFrameDecoder::default();
+    let mut frames = decoder.push(bytes);
+    frames.extend(decoder.finish());
+    for frame in frames {
+        let payload = frame.data.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(payload) {
+            if json_value_has_error(&value)
+                || frame
+                    .event
+                    .as_deref()
+                    .is_some_and(|event| event.ends_with(".failed") || event.ends_with(".error"))
+            {
+                fields.extend(cache_capability_rejection_fields_from_value(&value));
+            }
+        }
+    }
+    fields
 }
 
 async fn note_runtime_cache_capability_rejection(
@@ -9401,12 +9882,36 @@ async fn note_runtime_cache_capability_rejection(
     diagnostics: &UpstreamRequestDiagnostics,
     status: u16,
     error_summary: &str,
+    rejected_fields: &HashSet<ProviderCacheCapabilityField>,
 ) {
+    let is_rejected = |field| {
+        (matches!(status, 400 | 422) || (200..300).contains(&status))
+            && rejected_fields.contains(&field)
+    };
+    if diagnostics.client_owned_prompt_cache_key
+        && is_rejected(ProviderCacheCapabilityField::PromptCacheKey)
+    {
+        // This is a property of one caller-selected value, not evidence that
+        // the provider rejects the field for every session. Cool only the
+        // opaque local scope and let the next independent request fall back to
+        // the generated placement key.
+        note_client_prompt_cache_key_rejection_cooldown(
+            state,
+            diagnostics
+                .client_owned_prompt_cache_key_local_id
+                .as_deref(),
+        )
+        .await;
+    }
     let rejected = diagnostics
         .sent_cache_capability_fields
         .iter()
         .copied()
-        .filter(|field| explicit_cache_field_rejection(status, Some(error_summary), *field))
+        .filter(|field| {
+            !(diagnostics.client_owned_prompt_cache_key
+                && *field == ProviderCacheCapabilityField::PromptCacheKey)
+                && is_rejected(*field)
+        })
         .collect::<Vec<_>>();
     if rejected.is_empty() {
         return;
@@ -11113,10 +11618,10 @@ fn responses_wire_prefix_fingerprints(
         responses_wire_input_fingerprints(&input);
 
     Some(ResponsesWirePrefixFingerprints {
-        version: 2,
+        version: 3,
         cache_metadata: truncated_wire_segment_hash(
             "cache_metadata",
-            responses_wire_selected_members(
+            responses_wire_diagnostic_selected_members(
                 body,
                 &[
                     "prompt_cache_key",
@@ -11227,6 +11732,32 @@ fn responses_wire_selected_members(body: &Value, keys: &[&str]) -> String {
     format!("{{{}}}", members.join(","))
 }
 
+/// Prefix diagnostics may be persisted in request history. Keep cache-key
+/// presence observable, but replace its caller-controlled value before it is
+/// ever hashed so predictable keys cannot be recovered from the digest.
+fn responses_wire_diagnostic_selected_members(body: &Value, keys: &[&str]) -> String {
+    let Some(object) = body.as_object() else {
+        return "null".to_string();
+    };
+    let members = keys
+        .iter()
+        .filter_map(|key| {
+            object
+                .get(*key)
+                .map(|value| responses_wire_diagnostic_member(key, value))
+        })
+        .collect::<Vec<_>>();
+    format!("{{{}}}", members.join(","))
+}
+
+fn responses_wire_diagnostic_member(key: &str, value: &Value) -> String {
+    if key == "prompt_cache_key" {
+        r#""prompt_cache_key":"[redacted]""#.to_string()
+    } else {
+        format_json_member(key, value)
+    }
+}
+
 fn responses_wire_pre_input(body: &Value) -> String {
     let Some(object) = body.as_object() else {
         return "null".to_string();
@@ -11242,7 +11773,11 @@ fn responses_wire_pre_input(body: &Value) -> String {
         "parallel_tool_calls",
     ]
     .iter()
-    .filter_map(|key| object.get(*key).map(|value| format_json_member(key, value)))
+    .filter_map(|key| {
+        object
+            .get(*key)
+            .map(|value| responses_wire_diagnostic_member(key, value))
+    })
     .collect::<Vec<_>>();
     let mut prefix = format!("{{{}", members.join(","));
     if object.contains_key("input") && !members.is_empty() {
@@ -12246,6 +12781,7 @@ fn request_agent_log_fields(
 /// every one-shot fallback must use the same capability decision; otherwise a
 /// promoted `prompt_cache_options` record would silently disappear on the
 /// fallback body and make the cache result depend on the error path.
+#[cfg(test)]
 fn apply_native_cache_controls(
     request: &mut PreparedResponseBody,
     config: &AppConfig,
@@ -12253,47 +12789,143 @@ fn apply_native_cache_controls(
     active_channel: &Channel,
     key_id: Option<&str>,
 ) -> Vec<String> {
+    apply_native_cache_controls_with_probe_fields(
+        request,
+        config,
+        decision,
+        active_channel,
+        key_id,
+        None,
+        &[],
+    )
+    .changed_fields()
+    .to_vec()
+}
+
+fn apply_native_cache_controls_with_probe_fields(
+    request: &mut PreparedResponseBody,
+    config: &AppConfig,
+    decision: &RouteDecision,
+    active_channel: &Channel,
+    key_id: Option<&str>,
+    effect_scope_id: Option<&str>,
+    controlled_probe_fields: &[ProviderCacheCapabilityField],
+) -> cache_capability::CacheControlApplicationReceipt {
     if !smart_hit_enabled(config) || !matches!(active_channel, Channel::Responses | Channel::Chat) {
-        return Vec::new();
+        return cache_capability::CacheControlApplicationReceipt::default();
     }
-    let native_cache_plan = cache_capability::plan(
+    let native_cache_plan = cache_capability::plan_with_effect_scope_and_probe_fields(
         config,
         &decision.provider,
         &decision.model,
         active_channel,
         key_id,
+        effect_scope_id,
+        controlled_probe_fields,
     );
-    cache_capability::apply_prepared(request, active_channel, native_cache_plan)
+    cache_capability::apply_prepared_with_receipt(request, active_channel, native_cache_plan)
+}
+
+/// Select exactly one manual cache-effect probe field. Provider-native
+/// controls are tested one at a time so a positive result can be promoted
+/// without a second field confounding it. The placement key is the final
+/// fallback and remains probe-only.
+fn controlled_cache_probe_fields(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    channel: &Channel,
+    key_id: Option<&str>,
+) -> Vec<ProviderCacheCapabilityField> {
+    let accepted = |field| {
+        config.cache_capability_probe_accepted_for_key(
+            &decision.provider.id,
+            &decision.model,
+            channel,
+            key_id,
+            field,
+        )
+    };
+    let awaiting_effect = |field| {
+        accepted(field)
+            && config
+                .cache_capability_for_key(
+                    &decision.provider.id,
+                    &decision.model,
+                    channel,
+                    key_id,
+                    field,
+                )
+                .is_some_and(|record| record.effect_status == ProviderCacheEffectStatus::Unverified)
+    };
+    if decision.provider.prompt_cache_retention_enabled
+        && awaiting_effect(ProviderCacheCapabilityField::PromptCacheRetention)
+    {
+        return vec![ProviderCacheCapabilityField::PromptCacheRetention];
+    }
+    for field in [ProviderCacheCapabilityField::PromptCacheOptions] {
+        if awaiting_effect(field) {
+            return vec![field];
+        }
+    }
+    accepted(ProviderCacheCapabilityField::PromptCacheKey)
+        .then_some(ProviderCacheCapabilityField::PromptCacheKey)
+        .into_iter()
+        .collect()
+}
+
+/// A cache-validation candidate is only evidence when its one selected
+/// control survived all compatibility rewriting and is present in the frozen
+/// request that the one-shot transport will send.
+fn controlled_cache_probe_fields_on_final_wire(
+    requested_fields: &[ProviderCacheCapabilityField],
+    final_wire_receipt: &FinalWireReceipt,
+    application: Option<&cache_capability::CacheControlApplicationReceipt>,
+) -> Vec<ProviderCacheCapabilityField> {
+    let final_fields = final_wire_receipt.cache_controls.present_fields();
+    requested_fields
+        .iter()
+        .copied()
+        .filter(|field| {
+            if !final_fields.contains(field) {
+                return false;
+            }
+            if *field == ProviderCacheCapabilityField::PromptCacheBreakpoint
+                && (!final_wire_receipt
+                    .cache_controls
+                    .breakpoint_is_atoapi_injected()
+                    || final_wire_receipt
+                        .cache_controls
+                        .breakpoint_placement_digest()
+                        .is_none())
+            {
+                return false;
+            }
+            application.is_none_or(|receipt| {
+                receipt.injected_fields().contains(field)
+                    && (*field != ProviderCacheCapabilityField::PromptCacheBreakpoint
+                        || receipt.injected_breakpoint())
+            })
+        })
+        .collect()
 }
 
 fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &RouteDecision) {
+    // Root-level provider cache metadata is never caller-owned model input.
+    // Keep ordinary traffic neutral on every upstream channel, including a
+    // native Anthropic passthrough where the Responses/Chat control planner is
+    // intentionally not involved. A manual candidate may add one field only
+    // after this point and only on its exact validation wire.
+    strip_provider_cache_key_fields(request);
     if !smart_hit_enabled(config) {
-        strip_provider_cache_key_fields(request);
         return;
     }
 
     match decision.upstream_channel {
         Channel::Chat => {
             stabilize_chat_provider_request(request);
-            let cache_key =
-                provider_prompt_cache_key_for_outbound(config, decision, request, &Channel::Chat);
-            if let Some(object) = request.as_object_mut() {
-                object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
-            }
-            apply_openai_prompt_cache_retention(request, decision);
         }
         Channel::Responses => {
             stabilize_responses_provider_prefix(request);
-            let cache_key = provider_prompt_cache_key_for_outbound(
-                config,
-                decision,
-                request,
-                &Channel::Responses,
-            );
-            if let Some(object) = request.as_object_mut() {
-                object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
-            }
-            apply_openai_prompt_cache_retention(request, decision);
             canonicalize_object_keys(request, "$.responses_prefix");
         }
         Channel::Anthropic => {
@@ -12301,23 +12933,6 @@ fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &
             add_anthropic_cache_control(request);
         }
     }
-}
-
-fn apply_session_provider_cache_key(
-    request: &mut Value,
-    config: &AppConfig,
-    identity: Option<&SessionIdentity>,
-) {
-    if !smart_hit_enabled(config) {
-        return;
-    }
-    let (Some(object), Some(identity)) = (request.as_object_mut(), identity) else {
-        return;
-    };
-    object.insert(
-        "prompt_cache_key".to_string(),
-        Value::String(identity.provider_cache_key.clone()),
-    );
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -12331,37 +12946,23 @@ fn apply_candidate_prompt_cache_routing(
     decision: &ShadowAffinityDecision,
 ) -> CandidatePromptCacheRoutingOutcome {
     if cache_affinity::provider_native_candidate_applied(decision) {
-        return CandidatePromptCacheRoutingOutcome {
-            applied: true,
-            changed: request.remove_root("prompt_cache_key"),
-        };
+        // A provider-native candidate must never silently remove a normal
+        // field from the wire. Manual key probes force the CohortKey variant;
+        // any other candidate remains observe-only.
+        return CandidatePromptCacheRoutingOutcome::default();
     }
     let Some(cache_key) = cache_affinity::static_cohort_prompt_cache_key(decision) else {
         return CandidatePromptCacheRoutingOutcome::default();
     };
+    let changed = request.set_root("prompt_cache_key", Value::String(cache_key));
     CandidatePromptCacheRoutingOutcome {
-        applied: true,
-        changed: request.set_root("prompt_cache_key", Value::String(cache_key)),
+        applied: changed,
+        changed,
     }
 }
 
-fn copy_responses_prefix_cache_fields_for_native(
-    outbound: &mut Value,
-    prefix_body: &Value,
-    config: &AppConfig,
-    decision: &RouteDecision,
-) {
+fn strip_root_provider_cache_metadata_for_native(outbound: &mut Value) {
     strip_provider_cache_key_fields(outbound);
-    if !smart_hit_enabled(config) {
-        return;
-    }
-    let Some(cache_key) = openai_prompt_cache_key(prefix_body) else {
-        return;
-    };
-    if let Some(object) = outbound.as_object_mut() {
-        object.insert("prompt_cache_key".to_string(), Value::String(cache_key));
-    }
-    apply_openai_prompt_cache_retention(outbound, decision);
 }
 
 fn stabilize_responses_provider_prefix(request: &mut Value) {
@@ -12933,6 +13534,7 @@ fn canonical_json_string(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn provider_prompt_cache_key(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -12951,6 +13553,7 @@ fn provider_prompt_cache_key(
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 fn provider_prompt_cache_key_material(request: &Value, channel: &Channel) -> String {
     if !matches!(channel, Channel::Responses) {
         return provider_prefix_sample(request, channel);
@@ -12967,23 +13570,99 @@ fn provider_prompt_cache_key_material(request: &Value, channel: &Channel) -> Str
     serialize_responses_body_for_provider_prefix(&material)
 }
 
-fn provider_prompt_cache_key_for_outbound(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    request: &Value,
-    channel: &Channel,
-) -> String {
-    request
-        .get("prompt_cache_key")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|key| provider_prompt_cache_key_is_valid(key))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| provider_prompt_cache_key(config, decision, request, channel))
+#[cfg(test)]
+fn provider_prompt_cache_key_is_valid(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= CLIENT_PROMPT_CACHE_KEY_MAX_CHARS
+        && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-fn provider_prompt_cache_key_is_valid(key: &str) -> bool {
-    !key.is_empty() && key.len() <= 64
+/// A client-provided cache key is an upstream placement hint, not local
+/// session or continuation truth. Keep its exact bytes only when this is an
+/// untransformed native Responses request; transformations and the compact
+/// endpoint have their own schema and must keep generating their own hint.
+#[cfg(test)]
+fn client_owned_native_prompt_cache_key(
+    request: &Value,
+    native_responses_passthrough: bool,
+    compaction_requested: bool,
+) -> Option<String> {
+    (native_responses_passthrough && !compaction_requested)
+        .then(|| request.get("prompt_cache_key").and_then(Value::as_str))
+        .flatten()
+        .filter(|key| provider_prompt_cache_key_is_valid(key))
+        .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+fn client_owned_prompt_cache_key_is_active(
+    client_key_is_valid: bool,
+    cooling_down: bool,
+    provider_key_is_allowed: bool,
+    active_channel: &Channel,
+) -> bool {
+    client_key_is_valid
+        && !cooling_down
+        && provider_key_is_allowed
+        && matches!(active_channel, Channel::Responses)
+}
+
+/// A caller-owned placement key must never create shared session state from a
+/// content-derived fallback. Only an explicit, non-conflicting conversation
+/// identity can safely scope the local cooldown.
+fn client_owned_prompt_cache_key_cooldown_local_id(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    session_identity: Option<&SessionIdentity>,
+    selected_provider_key: &SelectedProviderKey,
+    agent_id: Option<&str>,
+    cache_key: &str,
+) -> Option<String> {
+    let session_identity =
+        session_identity.filter(|identity| session_identity_source_is_trusted(identity.source))?;
+    Some(client_owned_prompt_cache_key_local_id(
+        config,
+        decision,
+        session_identity,
+        selected_provider_key,
+        agent_id,
+        cache_key,
+    ))
+}
+
+/// Never persist a caller's raw placement key. The key is required on the
+/// outbound wire, but metrics/cold-start accounting only need a stable local
+/// token. Bind that token to the authenticated Agent/session and the actual
+/// upstream key realm so equal client hints cannot merge local state.
+fn client_owned_prompt_cache_key_local_id(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    session_identity: &SessionIdentity,
+    selected_provider_key: &SelectedProviderKey,
+    agent_id: Option<&str>,
+    cache_key: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-client-prompt-cache-key-local-v1\0");
+    hasher.update(config.workspace_fingerprint.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(agent_id.unwrap_or("anonymous").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(decision.provider.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(provider_prefix_model_key(decision).as_bytes());
+    hasher.update(b"\0responses\0");
+    hasher.update(affinity_identity::realm_id(decision, selected_provider_key).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(session_identity.anchor_key.as_bytes());
+    hasher.update(b"\0");
+    // The selected upstream secret is a local-only salt. It is neither
+    // serialized nor logged, and makes the local token non-reversible even
+    // when a caller chooses a predictable cache-key label.
+    hasher.update(selected_provider_key.secret.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(cache_key.as_bytes());
+    format!("client-cache-key:{:x}", hasher.finalize())
 }
 
 fn openai_prompt_cache_key(request: &Value) -> Option<String> {
@@ -13001,6 +13680,7 @@ fn provider_prefix_fingerprint(request: &Value, channel: &Channel) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[cfg(test)]
 fn provider_prefix_sample(request: &Value, channel: &Channel) -> String {
     const SAMPLE_CHARS: usize = 64 * 1024;
 
@@ -13388,27 +14068,6 @@ fn normalize_chat_content_for_prefix(value: &mut Value) {
 
 fn strip_provider_cache_key_fields(value: &mut Value) {
     cache_capability::strip_all(value);
-}
-
-fn apply_openai_prompt_cache_retention(request: &mut Value, decision: &RouteDecision) {
-    if !supports_extended_prompt_cache_retention(decision) {
-        if let Some(object) = request.as_object_mut() {
-            object.remove("prompt_cache_retention");
-        }
-        return;
-    }
-    if let Some(object) = request.as_object_mut() {
-        object
-            .entry("prompt_cache_retention".to_string())
-            .or_insert_with(|| Value::String("24h".to_string()));
-    }
-}
-
-fn supports_extended_prompt_cache_retention(decision: &RouteDecision) -> bool {
-    let model = decision.model.trim().to_ascii_lowercase();
-    let base_url = decision.provider.base_url.trim().to_ascii_lowercase();
-    model.starts_with("gpt-")
-        && (base_url.contains("api.openai.com") || decision.provider.prompt_cache_retention_enabled)
 }
 
 fn add_anthropic_cache_control(request: &mut Value) {
@@ -16518,7 +17177,7 @@ mod tests {
 
     fn eligible_final_scope_receipt(digest: &str) -> FinalScopeShadowReceipt {
         FinalScopeShadowReceipt {
-            version: 4,
+            version: 5,
             digest: digest.to_string(),
             eligible_for_shadow_observation: true,
             missing_attested_scope: false,
@@ -16590,6 +17249,33 @@ mod tests {
         config.providers = vec![provider];
         configure_test_codex_agent(&mut config, provider_id);
         config
+    }
+
+    fn test_responses_effect_scope_id(
+        provider: &ProviderConfig,
+        model: &str,
+        stream: Option<bool>,
+        store: Option<bool>,
+        breakpoint_placement: Option<&str>,
+    ) -> String {
+        let decision = RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Responses,
+            model: model.to_string(),
+        };
+        let selected_key = SelectedProviderKey {
+            secret: provider.api_key_encrypted.clone().unwrap_or_default(),
+            key_id: None,
+        };
+        let realm_id = affinity_identity::realm_id(&decision, &selected_key);
+        cache_validation::CacheValidationScope {
+            channel: Channel::Responses,
+            key_id: None,
+            realm_id,
+            stream,
+            store,
+        }
+        .effect_scope_id(breakpoint_placement)
     }
 
     #[tokio::test]
@@ -16832,8 +17518,153 @@ mod tests {
             None,
             agent_generation,
             None,
+            None,
         )
         .await
+    }
+
+    async fn stream_test_response_with_client_prompt_cache_key(
+        state: Arc<AppState>,
+        upstream: reqwest::Response,
+        request_id: &str,
+        raw_client_key: &str,
+    ) -> Response {
+        stream_upstream(
+            state,
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            request_id.to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider("http://127.0.0.1/v1".to_string()),
+                model: "gpt-5.5".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            Some("client-cache-key:stream-redaction-scope".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            LineageParent::FullReplay,
+            false,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            UpstreamRequestDiagnostics {
+                sent_cache_capability_fields: vec![ProviderCacheCapabilityField::PromptCacheKey],
+                client_owned_prompt_cache_key: true,
+                client_owned_prompt_cache_key_local_id: Some(
+                    "client-cache-key:stream-redaction-scope".to_string(),
+                ),
+                ..UpstreamRequestDiagnostics::default()
+            },
+            None,
+            0,
+            None,
+            None,
+            false,
+            None,
+            Some(raw_client_key.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stream_client_prompt_cache_key_rejection_redacts_metrics_and_cools_scope() {
+        let raw_client_key = "codex-native-stream-placement-key";
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-client-cache-key-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let error_frame = format!(
+            "event: response.failed\n\
+             data: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"message\":\"invalid parameter prompt_cache_key {raw_client_key}\"}}}}}}\n\n"
+        );
+        let upstream_app = Router::new().route(
+            "/stream",
+            post(move || {
+                let error_frame = error_frame.clone();
+                async move { raw_response(200, "text/event-stream", error_frame.into_bytes()) }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response_with_client_prompt_cache_key(
+            state.clone(),
+            upstream,
+            "stream-client-cache-key-rejection",
+            raw_client_key,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(raw_client_key),
+            "identity relay keeps the upstream error protocol-transparent"
+        );
+        let snapshot = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_failed_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stream settlement must complete after downstream EOF");
+        assert!(client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            Some("client-cache-key:stream-redaction-scope"),
+        ));
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains(raw_client_key),
+            "stream error summaries must not persist the raw caller placement key"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     async fn loopback_sse_first_chunk_ms(
@@ -18176,6 +19007,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         }
     }
 
@@ -18863,7 +19695,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_optimizer_overwrites_dynamic_prompt_cache_key() {
+    fn prefix_optimizer_removes_root_prompt_cache_key_from_normal_traffic() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.mode = CacheMode::PrefixPrewarm;
@@ -18898,15 +19730,127 @@ mod tests {
 
         optimize_provider_prefix(&mut request, &config, &decision);
 
-        let key = request
-            .get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .unwrap();
-        assert_eq!(key.len(), 64);
-        assert_eq!(
-            key,
-            provider_prompt_cache_key(&config, &decision, &request, &Channel::Responses)
+        assert!(request.get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn native_anthropic_wire_strips_root_cache_metadata_and_preserves_nested_controls() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider("https://anthropic.example/v1".to_string());
+        provider.channel = Channel::Anthropic;
+        let decision = RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Anthropic,
+            model: "claude-test".to_string(),
+        };
+        let mut request = json!({
+            "model": "claude-test",
+            "prompt_cache_key": "caller-key",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"mode": "implicit", "ttl": "30m"},
+            "prompt_cache_breakpoint": {"mode": "explicit"},
+            "system": [{
+                "type": "text",
+                "text": "system",
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            }],
+            "tools": [{
+                "name": "read_file",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral", "ttl": "5m"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }]
+            }]
+        });
+
+        optimize_provider_prefix(&mut request, &config, &decision);
+        let envelope = GenerationEnvelope::freeze(
+            &provider,
+            "https://anthropic.example/v1/messages",
+            Channel::Anthropic,
+            PreparedResponseBody::plain(request),
         );
+        let wire: Value = serde_json::from_slice(envelope.request_plan().wire().body()).unwrap();
+
+        assert_eq!(wire, *envelope.body());
+        for root in cache_capability::PROVIDER_CACHE_METADATA_FIELDS {
+            assert!(
+                wire.get(root).is_none(),
+                "{root} must not reach normal Anthropic wire"
+            );
+        }
+        for pointer in [
+            "/system/0/cache_control/ttl",
+            "/tools/0/cache_control/ttl",
+            "/messages/0/content/0/cache_control/ttl",
+        ] {
+            assert_eq!(wire.pointer(pointer).and_then(Value::as_str), Some("5m"));
+        }
+    }
+
+    #[test]
+    fn controlled_candidate_fields_follow_the_final_wire_not_the_requested_plan() {
+        let provider = test_responses_provider("https://responses.example/v1".to_string());
+        let retention_envelope = GenerationEnvelope::freeze(
+            &provider,
+            "https://responses.example/v1/responses",
+            Channel::Responses,
+            PreparedResponseBody::responses(json!({
+                "model": "gpt-test",
+                "prompt_cache_retention": "24h",
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            })),
+        );
+        let retention_receipt = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        })
+        .seal(&retention_envelope);
+        assert_eq!(
+            controlled_cache_probe_fields_on_final_wire(
+                &[ProviderCacheCapabilityField::PromptCacheRetention],
+                &retention_receipt,
+                None,
+            ),
+            vec![ProviderCacheCapabilityField::PromptCacheRetention]
+        );
+
+        // A string content payload has no legal location for an explicit
+        // protocol breakpoint. The candidate may have requested it, but the
+        // frozen wire does not contain it and therefore cannot produce effect
+        // evidence.
+        let no_breakpoint_envelope = GenerationEnvelope::freeze(
+            &provider,
+            "https://responses.example/v1/responses",
+            Channel::Responses,
+            PreparedResponseBody::responses(json!({
+                "model": "gpt-test",
+                "input": [{"type": "message", "role": "user", "content": "hello"}]
+            })),
+        );
+        let no_breakpoint_receipt = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        })
+        .seal(&no_breakpoint_envelope);
+        assert!(controlled_cache_probe_fields_on_final_wire(
+            &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            &no_breakpoint_receipt,
+            None,
+        )
+        .is_empty());
     }
 
     #[test]
@@ -18990,15 +19934,8 @@ mod tests {
                 "content": [{"type": "input_text", "text": "stable prefix"}]
             }]
         });
-        let identity = SessionIdentity::derive(&config, &decision, &request, &request).unwrap();
-
         optimize_provider_prefix(&mut request, &config, &decision);
-        assert!(request.get("prompt_cache_key").is_some());
-        apply_session_provider_cache_key(&mut request, &config, Some(&identity));
-        assert_eq!(
-            request.get("prompt_cache_key").and_then(Value::as_str),
-            Some(identity.provider_cache_key.as_str())
-        );
+        assert!(request.get("prompt_cache_key").is_none());
 
         let mut native_request = PreparedResponseBody::responses(json!({
             "model": "gpt-5.6",
@@ -19015,33 +19952,14 @@ mod tests {
             &Channel::Responses,
             None,
         );
-        assert!(changed.iter().any(|field| field == "prompt_cache_options"));
-        assert!(native_request.body().get("prompt_cache_options").is_some());
+        assert!(!changed.iter().any(|field| field == "prompt_cache_options"));
+        assert!(native_request.body().get("prompt_cache_options").is_none());
         assert!(smart_hit_enabled(&config));
         assert!(responses_session_reuse_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
-            Some(TokioDuration::ZERO)
+            Some(TokioDuration::from_millis(500))
         );
-    }
-
-    #[test]
-    fn automatic_static_cohort_routing_requires_isolated_explicit_opt_in() {
-        assert!(!AUTOMATIC_STATIC_COHORT_ROUTING_ENABLED);
-        assert!(!automatic_static_cohort_routing_enabled());
-        assert!(!automatic_static_cohort_routing_enabled_value(false, None));
-        assert!(!automatic_static_cohort_routing_enabled_value(
-            true,
-            Some("disabled")
-        ));
-        assert!(!automatic_static_cohort_routing_enabled_value(
-            false,
-            Some("enabled")
-        ));
-        assert!(automatic_static_cohort_routing_enabled_value(
-            true,
-            Some("enabled")
-        ));
     }
 
     #[tokio::test]
@@ -19131,7 +20049,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_optimizer_preserves_valid_client_prompt_cache_key() {
+    fn prefix_optimizer_strips_valid_client_prompt_cache_key_from_normal_traffic() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.mode = CacheMode::PrefixPrewarm;
@@ -19165,10 +20083,7 @@ mod tests {
 
         optimize_provider_prefix(&mut request, &config, &decision);
 
-        assert_eq!(
-            request.get("prompt_cache_key").and_then(Value::as_str),
-            Some("client-session-cache-key")
-        );
+        assert!(request.get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -19397,16 +20312,17 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
-        let mut request = json!({
+        let request = json!({
             "model": "gpt-5.5",
             "prompt_cache_retention": "24h",
             "input": [{ "role": "user", "content": "hello" }]
         });
 
-        optimize_provider_prefix(&mut request, &config, &decision);
+        let mut prepared = PreparedResponseBody::responses(request);
+        apply_native_cache_controls(&mut prepared, &config, &decision, &Channel::Responses, None);
 
-        assert!(request.get("prompt_cache_key").is_some());
-        assert!(request.get("prompt_cache_retention").is_none());
+        assert!(prepared.body().get("prompt_cache_key").is_none());
+        assert!(prepared.body().get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -19436,15 +20352,50 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
-        let mut request = json!({
+        config.record_cache_capability_probe(
+            "torch",
+            "gpt-5.5",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        let effect_scope_id =
+            test_responses_effect_scope_id(&decision.provider, &decision.model, None, None, None);
+        config.record_cache_capability_effect_for_scope(
+            "torch",
+            "gpt-5.5",
+            &Channel::Responses,
+            None,
+            Some(&effect_scope_id),
+            &[ProviderCacheCapabilityField::PromptCacheRetention],
+            ProviderCacheEffectStatus::Promoted,
+            Some("measured provider retention benefit".to_string()),
+            Some(0),
+            Some(128),
+            Some(100),
+            Some(100),
+        );
+        let request = json!({
             "model": "gpt-5.5",
+            "prompt_cache_retention": "24h",
             "input": [{ "role": "user", "content": "hello" }]
         });
 
-        optimize_provider_prefix(&mut request, &config, &decision);
+        let mut prepared = PreparedResponseBody::responses(request);
+        apply_native_cache_controls_with_probe_fields(
+            &mut prepared,
+            &config,
+            &decision,
+            &Channel::Responses,
+            None,
+            Some(&effect_scope_id),
+            &[],
+        );
 
         assert_eq!(
-            request
+            prepared
+                .body()
                 .get("prompt_cache_retention")
                 .and_then(Value::as_str),
             Some("24h")
@@ -19452,7 +20403,7 @@ mod tests {
     }
 
     #[test]
-    fn official_openai_responses_provider_keeps_prompt_cache_retention() {
+    fn official_openai_responses_provider_does_not_assume_prompt_cache_retention() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.mode = CacheMode::PrefixPrewarm;
@@ -19478,19 +20429,15 @@ mod tests {
             upstream_channel: Channel::Responses,
             model: "gpt-5.5".to_string(),
         };
-        let mut request = json!({
+        let request = json!({
             "model": "gpt-5.5",
             "input": [{ "role": "user", "content": "hello" }]
         });
 
-        optimize_provider_prefix(&mut request, &config, &decision);
+        let mut prepared = PreparedResponseBody::responses(request);
+        apply_native_cache_controls(&mut prepared, &config, &decision, &Channel::Responses, None);
 
-        assert_eq!(
-            request
-                .get("prompt_cache_retention")
-                .and_then(Value::as_str),
-            Some("24h")
-        );
+        assert!(prepared.body().get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -20192,6 +21139,48 @@ mod tests {
         );
 
         assert_ne!(share_key, api_key);
+
+        let first_key = SelectedProviderKey {
+            secret: "first-provider-key".to_string(),
+            key_id: Some("first".to_string()),
+        };
+        let rotated_key = SelectedProviderKey {
+            secret: "rotated-provider-key".to_string(),
+            key_id: Some("rotated".to_string()),
+        };
+        let first_realm_key = provider_prefix_control_key_for_selected_key(
+            Some("stable-provider-key"),
+            &share_decision,
+            &Channel::Responses,
+            &first_key,
+        );
+        let rotated_realm_key = provider_prefix_control_key_for_selected_key(
+            Some("stable-provider-key"),
+            &share_decision,
+            &Channel::Responses,
+            &rotated_key,
+        );
+        assert_ne!(first_realm_key, rotated_realm_key);
+        assert_ne!(
+            provider_prefix_state_alias_key(first_realm_key.as_deref().unwrap()),
+            provider_prefix_state_alias_key(rotated_realm_key.as_deref().unwrap()),
+            "prefix-state aliases must not cross the actual selected Key realm"
+        );
+        assert_ne!(
+            provider_prefix_family_control_key_for_selected_key(
+                Some("stable-session"),
+                &share_decision,
+                &Channel::Responses,
+                &first_key,
+            ),
+            provider_prefix_family_control_key_for_selected_key(
+                Some("stable-session"),
+                &share_decision,
+                &Channel::Responses,
+                &rotated_key,
+            ),
+            "session-family prefix state must also remain inside the selected Key realm"
+        );
     }
 
     #[test]
@@ -20290,6 +21279,52 @@ mod tests {
             response_input_delta_start_index(&previous, &current),
             Some(800)
         );
+    }
+
+    #[tokio::test]
+    async fn final_wire_breakpoint_keeps_semantic_lineage_and_rejects_moved_marker() {
+        let original_input = json!([{
+            "type":"message",
+            "role":"user",
+            "content":[{"type":"input_text","text":"stable prefix"}],
+            "call_id":"call-kept",
+            "x_unknown":{"phase":"before"}
+        }]);
+        let lineage = crate::continuation_lineage::ContinuationLineageIndex::default();
+        let initial = lineage.begin("breakpoint-lineage").await;
+        assert_eq!(
+            lineage
+                .commit_fast(
+                    &initial,
+                    &LineageParent::FullReplay,
+                    ResponseSessionCandidate {
+                        response_id: "resp-breakpoint".to_string(),
+                        breakpoint_placement_digest: Some("v1:stable-first-block".to_string()),
+                        input: original_input.clone(),
+                        output_items: Vec::new(),
+                        finished_at: Instant::now(),
+                    },
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { generation: 1 }
+        );
+
+        let next = lineage.begin("breakpoint-lineage").await;
+        assert_eq!(next.head().unwrap().input, original_input);
+        assert_eq!(
+            next.head().unwrap().input[0]["content"][0].get("prompt_cache_breakpoint"),
+            None,
+            "wire-only metadata must not become semantic replay input"
+        );
+        assert!(response_session_breakpoint_placement_matches(
+            Some(&next),
+            Some("v1:stable-first-block")
+        ));
+        assert!(!response_session_breakpoint_placement_matches(
+            Some(&next),
+            Some("v1:moved-to-tail")
+        ));
     }
 
     #[test]
@@ -21691,6 +22726,7 @@ mod tests {
                 Some(&lease),
                 &LineageParent::ExternalContinuation,
                 Some(&external_input),
+                None,
                 Some("resp-external".to_string()),
                 Vec::new(),
             )
@@ -21738,6 +22774,7 @@ mod tests {
                 Some(&lease),
                 &LineageParent::FullReplay,
                 Some(&next_input),
+                None,
                 None,
                 Vec::new(),
             )
@@ -21800,6 +22837,7 @@ mod tests {
                 Some(&winner),
                 &parent,
                 Some(&winner_input),
+                None,
                 Some("resp-winner".to_string()),
                 Vec::new(),
             )
@@ -21873,6 +22911,7 @@ mod tests {
                 Some(&newer_epoch),
                 &LineageParent::FullReplay,
                 Some(&newer_input),
+                None,
                 Some("resp-new".to_string()),
                 Vec::new(),
             )
@@ -22523,12 +23562,6 @@ mod tests {
 
     #[test]
     fn native_responses_cache_overlay_preserves_lossless_context_fields() {
-        let config = AppConfig::default();
-        let decision = RouteDecision {
-            provider: test_responses_provider("https://example.test/v1".to_string()),
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.6-sol".to_string(),
-        };
         let mut outbound = json!({
             "model": "gpt-5.6-sol",
             "prompt_cache_key": "client-cache-key",
@@ -22554,17 +23587,7 @@ mod tests {
             }]
         });
         let original_context = outbound.clone();
-        let prefix_body = json!({
-            "prompt_cache_key": "atoapi-cache-key",
-            "prompt_cache_retention": "24h"
-        });
-
-        copy_responses_prefix_cache_fields_for_native(
-            &mut outbound,
-            &prefix_body,
-            &config,
-            &decision,
-        );
+        strip_root_provider_cache_metadata_for_native(&mut outbound);
 
         assert_eq!(outbound["metadata"], original_context["metadata"]);
         assert_eq!(
@@ -22572,7 +23595,275 @@ mod tests {
             original_context["vendor_extension"]
         );
         assert_eq!(outbound["input"], original_context["input"]);
-        assert_eq!(outbound["prompt_cache_key"], "atoapi-cache-key");
+        assert!(outbound.get("prompt_cache_key").is_none());
+
+        let mut client_owned_outbound = original_context.clone();
+        strip_root_provider_cache_metadata_for_native(&mut client_owned_outbound);
+        assert_eq!(
+            client_owned_outbound["metadata"],
+            original_context["metadata"]
+        );
+        assert_eq!(client_owned_outbound["input"], original_context["input"]);
+        assert!(client_owned_outbound.get("prompt_cache_key").is_none());
+        assert!(client_owned_outbound
+            .get("prompt_cache_retention")
+            .is_none());
+    }
+
+    #[test]
+    fn client_owned_native_cache_key_is_exact_and_locally_isolated() {
+        let mut config = AppConfig::default();
+        config.workspace_fingerprint = "client-cache-key-test".to_string();
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://example.test/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let request_a = json!({
+            "thread_id": "thread-a",
+            "input": [{"role": "user", "content": "same request"}]
+        });
+        let request_b = json!({
+            "thread_id": "thread-b",
+            "input": [{"role": "user", "content": "same request"}]
+        });
+        let session_a = SessionIdentity::derive(&config, &decision, &request_a, &request_a)
+            .expect("Responses request should derive a session identity");
+        let session_b = SessionIdentity::derive(&config, &decision, &request_b, &request_b)
+            .expect("Responses request should derive a session identity");
+        let key_a = SelectedProviderKey {
+            secret: "upstream-secret-a".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let key_b = SelectedProviderKey {
+            secret: "upstream-secret-b".to_string(),
+            key_id: Some("key-b".to_string()),
+        };
+        let raw = "codex-native-placement-key";
+
+        assert_eq!(
+            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), true, false),
+            Some(raw.to_string())
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": format!(" {raw}")}),
+                true,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": "contains\ncontrol"}),
+                true,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), false, false),
+            None
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), true, true),
+            None,
+            "compaction must use the generated placement path"
+        );
+
+        let agent_a = client_owned_prompt_cache_key_local_id(
+            &config,
+            &decision,
+            &session_a,
+            &key_a,
+            Some("codex"),
+            raw,
+        );
+        let other_session = client_owned_prompt_cache_key_local_id(
+            &config,
+            &decision,
+            &session_b,
+            &key_a,
+            Some("codex"),
+            raw,
+        );
+        let other_agent = client_owned_prompt_cache_key_local_id(
+            &config,
+            &decision,
+            &session_a,
+            &key_a,
+            Some("claude"),
+            raw,
+        );
+        let other_key_realm = client_owned_prompt_cache_key_local_id(
+            &config,
+            &decision,
+            &session_a,
+            &key_b,
+            Some("codex"),
+            raw,
+        );
+        assert_ne!(agent_a, other_session);
+        assert_ne!(agent_a, other_agent);
+        assert_ne!(agent_a, other_key_realm);
+        assert!(!agent_a.contains(raw));
+    }
+
+    #[test]
+    fn client_cache_key_cooldown_requires_explicit_session_identity() {
+        let mut config = AppConfig::default();
+        config.workspace_fingerprint = "client-cache-key-scope-test".to_string();
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://example.test/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-sol".to_string(),
+        };
+        let selected_key = SelectedProviderKey {
+            secret: "upstream-secret".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let fallback_request = json!({
+            "input": [{"role": "user", "content": "same first message"}]
+        });
+        let fallback =
+            SessionIdentity::derive(&config, &decision, &fallback_request, &fallback_request)
+                .expect("Responses request should derive a fallback identity");
+        assert_eq!(fallback.source, "content-anchor");
+        assert!(!session_identity_source_is_trusted(fallback.source));
+        assert!(client_owned_prompt_cache_key_cooldown_local_id(
+            &config,
+            &decision,
+            Some(&fallback),
+            &selected_key,
+            Some("codex"),
+            "caller-placement",
+        )
+        .is_none());
+
+        let explicit_request = json!({
+            "thread_id": "isolated-thread",
+            "input": [{"role": "user", "content": "same first message"}]
+        });
+        let explicit =
+            SessionIdentity::derive(&config, &decision, &explicit_request, &explicit_request)
+                .expect("Responses request should derive an explicit identity");
+        assert!(session_identity_source_is_trusted(explicit.source));
+        assert!(client_owned_prompt_cache_key_cooldown_local_id(
+            &config,
+            &decision,
+            Some(&explicit),
+            &selected_key,
+            Some("codex"),
+            "caller-placement",
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn native_client_cache_key_is_disabled_for_trigger_and_metadata_compaction() {
+        let raw = "codex-native-placement-key";
+        let trigger_request = json!({
+            "prompt_cache_key": raw,
+            "input": [{"type": "compaction_trigger"}]
+        });
+        let trigger_compaction =
+            responses_request_starts_compaction_epoch(&Channel::Responses, &trigger_request, None);
+        assert!(trigger_compaction);
+        assert_eq!(
+            client_owned_native_prompt_cache_key(&trigger_request, true, trigger_compaction),
+            None
+        );
+
+        let ordinary_request = json!({"prompt_cache_key": raw, "input": []});
+        let metadata_compaction = TrustedCodexRequestMetadata {
+            compaction_requested: true,
+            ..TrustedCodexRequestMetadata::default()
+        };
+        let header_compaction = responses_request_starts_compaction_epoch(
+            &Channel::Responses,
+            &ordinary_request,
+            Some(&metadata_compaction),
+        );
+        assert!(header_compaction);
+        assert_eq!(
+            client_owned_native_prompt_cache_key(&ordinary_request, true, header_compaction),
+            None
+        );
+        assert!(!responses_request_starts_compaction_epoch(
+            &Channel::Chat,
+            &trigger_request,
+            Some(&metadata_compaction),
+        ));
+    }
+
+    #[test]
+    fn client_cache_key_only_blocks_routing_when_it_survives_final_responses_wire() {
+        assert!(client_owned_prompt_cache_key_is_active(
+            true,
+            false,
+            true,
+            &Channel::Responses,
+        ));
+        assert!(!client_owned_prompt_cache_key_is_active(
+            true,
+            true,
+            true,
+            &Channel::Responses,
+        ));
+        assert!(!client_owned_prompt_cache_key_is_active(
+            true,
+            false,
+            false,
+            &Channel::Responses,
+        ));
+        assert!(!client_owned_prompt_cache_key_is_active(
+            true,
+            false,
+            true,
+            &Channel::Chat,
+        ));
+        assert!(!client_owned_prompt_cache_key_is_active(
+            false,
+            false,
+            true,
+            &Channel::Responses,
+        ));
+    }
+
+    #[test]
+    fn unsupported_native_prompt_cache_key_is_removed_before_the_wire() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let decision = RouteDecision {
+            provider: test_responses_provider("https://example.test/v1".to_string()),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-sol".to_string(),
+        };
+        config.record_cache_capability_probe(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("field rejected by exact provider/model route".to_string()),
+        );
+        let mut request = PreparedResponseBody::responses(json!({
+            "model": "gpt-5.6-sol",
+            "prompt_cache_key": "codex-native-placement-key",
+            "prompt_cache_retention": "24h",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }]
+        }));
+
+        apply_native_cache_controls(&mut request, &config, &decision, &Channel::Responses, None);
+
+        assert!(request.body().get("prompt_cache_key").is_none());
+        assert!(request.body().get("prompt_cache_retention").is_none());
+        assert!(request.body().get("input").is_some());
     }
 
     #[test]
@@ -23911,7 +25202,7 @@ mod tests {
             let second_hashes = responses_wire_prefix_fingerprints(&Channel::Responses, &second)
                 .expect("Responses requests have wire diagnostics");
 
-            assert_eq!(first_hashes.version, 2);
+            assert_eq!(first_hashes.version, 3);
             assert_eq!(first_hashes.cache_metadata, second_hashes.cache_metadata);
             assert_eq!(first_hashes.instructions, second_hashes.instructions);
             assert_eq!(first_hashes.tools_schema, second_hashes.tools_schema);
@@ -23968,6 +25259,7 @@ mod tests {
         let baseline = json!({
             "model": "gpt-5.6-luna",
             "prompt_cache_key": "cache-a",
+            "prompt_cache_retention": "24h",
             "instructions": "stable instruction",
             "tools": [{ "type": "function", "name": "read_file" }],
             "input": [{ "type": "message", "role": "user", "content": "history" }]
@@ -23979,9 +25271,26 @@ mod tests {
         changed_cache["prompt_cache_key"] = json!("cache-b");
         let changed_cache = responses_wire_prefix_fingerprints(&Channel::Responses, &changed_cache)
             .expect("Responses requests have wire diagnostics");
-        assert_ne!(baseline_hashes.cache_metadata, changed_cache.cache_metadata);
+        assert_eq!(baseline_hashes.cache_metadata, changed_cache.cache_metadata);
+        assert_eq!(baseline_hashes.pre_input_wire, changed_cache.pre_input_wire);
         assert_eq!(baseline_hashes.instructions, changed_cache.instructions);
         assert_eq!(baseline_hashes.tools_schema, changed_cache.tools_schema);
+        assert!(!responses_wire_pre_input(&baseline).contains("cache-a"));
+        assert!(responses_wire_pre_input(&baseline).contains("[redacted]"));
+
+        let mut changed_retention = baseline.clone();
+        changed_retention["prompt_cache_retention"] = json!("none");
+        let changed_retention =
+            responses_wire_prefix_fingerprints(&Channel::Responses, &changed_retention)
+                .expect("Responses requests have wire diagnostics");
+        assert_ne!(
+            baseline_hashes.cache_metadata,
+            changed_retention.cache_metadata
+        );
+        assert_ne!(
+            baseline_hashes.pre_input_wire,
+            changed_retention.pre_input_wire
+        );
 
         let mut changed_instructions = baseline.clone();
         changed_instructions["instructions"] = json!("changed instruction");
@@ -24137,7 +25446,7 @@ mod tests {
             .expect("two-shard candidate must have a cache key");
         assert_ne!(two_shard_key, candidate_key);
         let repeated_two_shard = apply_candidate_prompt_cache_routing(&mut two_shard, &decision);
-        assert!(repeated_two_shard.applied);
+        assert!(!repeated_two_shard.applied);
         assert!(!repeated_two_shard.changed);
         assert_eq!(
             without_key(&baseline_wire),
@@ -24151,14 +25460,17 @@ mod tests {
         let mut provider_native = PreparedResponseBody::responses(baseline.clone());
         let provider_native_outcome =
             apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
-        assert!(provider_native_outcome.applied);
-        assert!(provider_native_outcome.changed);
-        assert!(provider_native.body().get("prompt_cache_key").is_none());
+        assert!(!provider_native_outcome.applied);
+        assert!(!provider_native_outcome.changed);
+        assert_eq!(
+            provider_native.body().get("prompt_cache_key"),
+            baseline.get("prompt_cache_key")
+        );
         let repeated_provider_native =
             apply_candidate_prompt_cache_routing(&mut provider_native, &decision);
-        assert!(repeated_provider_native.applied);
+        assert!(!repeated_provider_native.applied);
         assert!(!repeated_provider_native.changed);
-        assert_eq!(without_key(&baseline_wire), *provider_native.body());
+        assert_eq!(baseline, *provider_native.body());
     }
 
     #[test]
@@ -25070,7 +26382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_provider_prefix_guard_never_waits_for_a_busy_key() {
+    async fn responses_prefix_coordination_does_not_take_a_mutex() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-lock-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -25083,36 +26395,17 @@ mod tests {
             )
             .unwrap(),
         );
-        let held = acquire_provider_prefix_guard(
+        let no_guard = acquire_provider_prefix_guard(
             &state,
             &Channel::Responses,
             Some("same-provider-prefix-key"),
             None,
         )
-        .await
-        .expect("the first request should acquire the prefix guard");
-
-        let skipped = tokio::time::timeout(
-            TokioDuration::from_millis(25),
-            acquire_provider_prefix_guard(
-                &state,
-                &Channel::Responses,
-                Some("same-provider-prefix-key"),
-                None,
-            ),
-        )
-        .await
-        .expect("a busy Responses prefix guard must not delay the request");
-        assert!(skipped.is_none());
-        drop(held);
-        assert!(acquire_provider_prefix_guard(
-            &state,
-            &Channel::Responses,
-            Some("same-provider-prefix-key"),
-            None,
-        )
-        .await
-        .is_some());
+        .await;
+        assert!(
+            no_guard.is_none(),
+            "Responses cache coordination must use a lock-free state snapshot"
+        );
         fs::remove_dir_all(config_dir).ok();
     }
 
@@ -25310,6 +26603,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -25535,6 +26829,7 @@ mod tests {
             Some(shadow_decision),
             false,
             None,
+            None,
         )
         .await;
 
@@ -25712,6 +27007,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -25843,6 +27139,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -26098,6 +27395,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -28020,6 +29318,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -28136,6 +29435,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let cold_after_seen = prefix_state(160_256, 0, 160_256);
 
@@ -28202,6 +29502,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         assert_eq!(
             provider_prefix_settle_delay(&settled),
@@ -28255,6 +29556,7 @@ mod tests {
                 tail_tool_output_chars: 0,
                 tail_largest_tool_output_chars: 0,
                 tail_tool_output_noise_hint: None,
+                responses_static_projection_digest: None,
             },
         );
 
@@ -28513,7 +29815,7 @@ mod tests {
         assert!(active.get("messages").is_some());
         assert!(active.get("input").is_none());
         assert_eq!(active["stream"], true);
-        assert!(active.get("prompt_cache_key").is_some());
+        assert!(active.get("prompt_cache_key").is_none());
         assert!(active.get("tools").is_none());
         assert!(active.get("tool_choice").is_none());
         assert!(active.get("parallel_tool_calls").is_none());
@@ -29000,6 +30302,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
 
         assert_eq!(
@@ -31394,6 +32697,7 @@ mod tests {
                 tail_tool_output_chars: 11_356,
                 tail_largest_tool_output_chars: 11_356,
                 tail_tool_output_noise_hint: Some("path_like".to_string()),
+                responses_static_projection_digest: None,
             },
         );
         let weak_after_old_state = UsageRecord {
@@ -31649,6 +32953,7 @@ mod tests {
                 source: Some("tool_output".to_string()),
                 ..TailInputDiagnostics::default()
             },
+            FinalResponsesStaticProjection::NotApplicable,
             false,
             false,
             false,
@@ -33233,6 +34538,22 @@ mod tests {
             supports_streaming: true,
             enabled: true,
         }];
+        let request_payload = json!({
+            "model": model_id,
+            "stream": true,
+            "store": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "stable prefix" },
+                    { "type": "input_text", "text": "dynamic tail" }
+                ]
+            }]
+        });
+        let breakpoint_placement =
+            cache_capability::predicted_responses_breakpoint_placement_digest(&request_payload)
+                .expect("the test request has one legal breakpoint position");
         config.record_cache_capability_probe(
             provider_id,
             model_id,
@@ -33241,11 +34562,19 @@ mod tests {
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        config.record_cache_capability_effect_for_key(
+        let effect_scope_id = test_responses_effect_scope_id(
+            &config.providers[0],
+            model_id,
+            Some(true),
+            Some(false),
+            Some(&breakpoint_placement),
+        );
+        config.record_cache_capability_effect_for_scope(
             provider_id,
             model_id,
             &Channel::Responses,
             None,
+            Some(&effect_scope_id),
             &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
             ProviderCacheEffectStatus::Promoted,
             Some("previously verified".to_string()),
@@ -33266,24 +34595,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let request_body = || {
-            Bytes::from(
-                serde_json::to_vec(&json!({
-                    "model": model_id,
-                    "stream": true,
-                    "store": false,
-                    "input": [{
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            { "type": "input_text", "text": "stable prefix" },
-                            { "type": "input_text", "text": "dynamic tail" }
-                        ]
-                    }]
-                }))
-                .unwrap(),
-            )
-        };
+        let request_body = || Bytes::from(serde_json::to_vec(&request_payload).unwrap());
 
         let first = handle_generation_for_agent(
             state.clone(),
@@ -33412,6 +34724,22 @@ mod tests {
             supports_streaming: true,
             enabled: true,
         }];
+        let request_payload = json!({
+            "model": model_id,
+            "stream": true,
+            "store": false,
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "stable prefix" },
+                    { "type": "input_text", "text": "dynamic tail" }
+                ]
+            }]
+        });
+        let breakpoint_placement =
+            cache_capability::predicted_responses_breakpoint_placement_digest(&request_payload)
+                .expect("the test request has one legal breakpoint position");
         config.record_cache_capability_probe(
             provider_id,
             model_id,
@@ -33420,11 +34748,19 @@ mod tests {
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        config.record_cache_capability_effect_for_key(
+        let effect_scope_id = test_responses_effect_scope_id(
+            &config.providers[0],
+            model_id,
+            Some(true),
+            Some(false),
+            Some(&breakpoint_placement),
+        );
+        config.record_cache_capability_effect_for_scope(
             provider_id,
             model_id,
             &Channel::Responses,
             None,
+            Some(&effect_scope_id),
             &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
             ProviderCacheEffectStatus::Promoted,
             Some("previously verified".to_string()),
@@ -33445,24 +34781,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let request_body = || {
-            Bytes::from(
-                serde_json::to_vec(&json!({
-                    "model": model_id,
-                    "stream": true,
-                    "store": false,
-                    "input": [{
-                        "type": "message",
-                        "role": "user",
-                        "content": [
-                            { "type": "input_text", "text": "stable prefix" },
-                            { "type": "input_text", "text": "dynamic tail" }
-                        ]
-                    }]
-                }))
-                .unwrap(),
-            )
-        };
+        let request_body = || Bytes::from(serde_json::to_vec(&request_payload).unwrap());
 
         let first = handle_generation_for_agent(
             state.clone(),
@@ -33519,6 +34838,211 @@ mod tests {
         assert!(!serde_json::to_string(&captured[1])
             .unwrap()
             .contains("prompt_cache_breakpoint"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn candidate_retention_counts_only_when_frozen_wire_contains_it() {
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let captured_for_route = captured.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    captured.lock().await.push(body);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_retention_candidate\",\"status\":\"completed\",\"usage\":{\"input_tokens\":100000,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":60000}}}}\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "retention-final-wire-provider";
+        let model_id = "gpt-5.6-terra";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].prompt_cache_retention_enabled = true;
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.record_cache_capability_probe(
+            provider_id,
+            model_id,
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        let provider = config.providers[0].clone();
+        let decision = RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Responses,
+            model: model_id.to_string(),
+        };
+        let selected_key = SelectedProviderKey {
+            secret: provider.api_key_encrypted.clone().unwrap_or_default(),
+            key_id: None,
+        };
+        let validation_scope = cache_validation::CacheValidationScope {
+            channel: Channel::Responses,
+            key_id: None,
+            realm_id: affinity_identity::realm_id(&decision, &selected_key),
+            stream: Some(true),
+            store: Some(false),
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-retention-final-wire-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let now = Utc::now();
+        {
+            let mut validation = state.cache_validation.lock().await;
+            let baseline = validation
+                .configure(
+                    cache_validation::CacheValidationControlInput {
+                        mode: cache_validation::CacheValidationMode::Baseline,
+                        provider_id: Some(provider_id.to_string()),
+                        model: Some(model_id.to_string()),
+                    },
+                    Some(provider.name.clone()),
+                    now,
+                )
+                .unwrap();
+            let baseline_run_id = baseline.run_id.unwrap();
+            assert!(validation
+                .selection(provider_id, model_id, validation_scope.clone(), now,)
+                .is_some());
+            for index in 0..cache_validation::VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+                validation.observe(
+                    &baseline_run_id,
+                    CacheValidationObservation {
+                        success: true,
+                        usage_observed: true,
+                        input_tokens: 100_000,
+                        cache_read_tokens: 50_000,
+                        ttft_ms: 100,
+                        ..CacheValidationObservation::default()
+                    },
+                    now + Duration::seconds(index as i64),
+                );
+            }
+            let candidate_at = now + Duration::minutes(2);
+            let candidate = validation
+                .configure(
+                    cache_validation::CacheValidationControlInput {
+                        mode: cache_validation::CacheValidationMode::Candidate,
+                        provider_id: Some(provider_id.to_string()),
+                        model: Some(model_id.to_string()),
+                    },
+                    Some(provider.name.clone()),
+                    candidate_at,
+                )
+                .unwrap();
+            assert!(validation
+                .selection(provider_id, model_id, validation_scope, candidate_at)
+                .is_some());
+            assert_eq!(
+                candidate.mode,
+                cache_validation::CacheValidationMode::Candidate
+            );
+        }
+
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"thread_id":"retention-thread","session_id":"retention-session"}"#,
+            ),
+        );
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": model_id,
+                "stream": true,
+                "store": false,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "stable prefix"},
+                        {"type": "input_text", "text": "dynamic tail"}
+                    ]
+                }]
+            }))
+            .unwrap(),
+        );
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response_body).contains("response.completed"));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let status = state.cache_validation.lock().await.status(Utc::now());
+                if status.candidate_applied_requests == 1 && status.successful_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the settled candidate must be counted after its frozen wire is sent");
+
+        let captured = captured.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0]
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h")
+        );
+        let status = state.cache_validation.lock().await.status(Utc::now());
+        assert_eq!(status.candidate_applied_requests, 1);
+        assert_eq!(status.candidate_skipped_requests, 0);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -37027,7 +38551,6 @@ mod tests {
             )
             .unwrap(),
         );
-
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -37321,7 +38844,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_responses_provider_uses_native_responses_path() {
+    async fn codex_native_responses_strips_client_cache_key_without_losing_context() {
         let responses_hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
         let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
@@ -37430,7 +38953,7 @@ mod tests {
             is_full_url: false,
             custom_user_agent: None,
             channel: Channel::Responses,
-            prompt_cache_retention_enabled: false,
+            prompt_cache_retention_enabled: true,
             request_body_gzip_enabled: false,
             use_system_proxy: false,
             api_key_encrypted: Some("upstream-key".to_string()),
@@ -37459,11 +38982,40 @@ mod tests {
             ProviderCacheCapabilityStatus::Verified,
             None,
         );
-        config.record_cache_capability_effect_for_key(
+        config.record_cache_capability_probe(
+            "mock-responses",
+            "gpt-5.5",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        let validation_scope = cache_validation::CacheValidationScope {
+            channel: Channel::Responses,
+            key_id: None,
+            realm_id: affinity_identity::realm_id(
+                &RouteDecision {
+                    provider: config.providers[0].clone(),
+                    upstream_channel: Channel::Responses,
+                    model: "gpt-5.5".to_string(),
+                },
+                &SelectedProviderKey {
+                    secret: "upstream-key".to_string(),
+                    key_id: None,
+                },
+            ),
+            // Codex native Responses is forwarded as an SSE stream even when
+            // the client omitted or set `stream: false`.
+            stream: Some(true),
+            store: None,
+        };
+        let effect_scope_id = validation_scope.effect_scope_id(None);
+        config.record_cache_capability_effect_for_scope(
             "mock-responses",
             "gpt-5.5",
             &Channel::Responses,
             None,
+            Some(&effect_scope_id),
             &[ProviderCacheCapabilityField::PromptCacheOptions],
             ProviderCacheEffectStatus::Promoted,
             Some("mock outbound options verified".to_string()),
@@ -37498,21 +39050,55 @@ mod tests {
             )
             .unwrap(),
         );
-        state
-            .cache_validation
-            .lock()
-            .await
-            .configure(
-                cache_validation::CacheValidationControlInput {
-                    mode: cache_validation::CacheValidationMode::Candidate,
-                    provider_id: Some("mock-responses".to_string()),
-                    model: Some("gpt-5.5".to_string()),
-                },
-                Some("Mock Responses".to_string()),
-                Utc::now(),
-            )
-            .unwrap();
-
+        let validation_started_at = Utc::now();
+        {
+            let mut validation = state.cache_validation.lock().await;
+            let baseline = validation
+                .configure(
+                    cache_validation::CacheValidationControlInput {
+                        mode: cache_validation::CacheValidationMode::Baseline,
+                        provider_id: Some("mock-responses".to_string()),
+                        model: Some("gpt-5.5".to_string()),
+                    },
+                    Some("Mock Responses".to_string()),
+                    validation_started_at,
+                )
+                .unwrap();
+            let baseline_run_id = baseline.run_id.expect("baseline must have an id");
+            assert!(validation
+                .selection(
+                    "mock-responses",
+                    "gpt-5.5",
+                    validation_scope.clone(),
+                    validation_started_at,
+                )
+                .is_some());
+            for index in 0..cache_validation::VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+                validation.observe(
+                    &baseline_run_id,
+                    cache_validation::CacheValidationObservation {
+                        success: true,
+                        usage_observed: true,
+                        input_tokens: 100_000,
+                        cache_read_tokens: 50_000,
+                        ttft_ms: 100,
+                        ..cache_validation::CacheValidationObservation::default()
+                    },
+                    validation_started_at + chrono::Duration::seconds(index as i64),
+                );
+            }
+            validation
+                .configure(
+                    cache_validation::CacheValidationControlInput {
+                        mode: cache_validation::CacheValidationMode::Candidate,
+                        provider_id: Some("mock-responses".to_string()),
+                        model: Some("gpt-5.5".to_string()),
+                    },
+                    Some("Mock Responses".to_string()),
+                    validation_started_at + chrono::Duration::minutes(1),
+                )
+                .unwrap();
+        }
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -37528,7 +39114,7 @@ mod tests {
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",
                 "stream": false,
-                "prompt_cache_key": "client-key-must-not-be-forwarded",
+                "prompt_cache_key": "codex-native-placement-key",
                 "prompt_cache_retention": "24h",
                 "metadata": { "wire_fidelity": "preserve-me" },
                 "vendor_extension": {
@@ -37582,7 +39168,17 @@ mod tests {
 
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let validation = state.cache_validation.lock().await.status(Utc::now());
+                if validation.candidate_applied_requests == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the detached stream owner must settle the retention candidate");
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
         let captured = captured_responses_body.lock().await.clone();
@@ -37614,17 +39210,12 @@ mod tests {
             "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
         );
         assert_eq!(captured["input"][2]["vendor_output"]["exit_code"], 0);
-        let forwarded_cache_key = captured
-            .get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .unwrap();
-        assert_ne!(forwarded_cache_key, "client-key-must-not-be-forwarded");
-        assert!(provider_prompt_cache_key_is_valid(forwarded_cache_key));
+        assert!(captured.get("prompt_cache_key").is_none());
         assert_eq!(
             captured
                 .get("prompt_cache_retention")
                 .and_then(Value::as_str),
-            None
+            Some("24h")
         );
         assert_eq!(
             captured
@@ -37648,26 +39239,14 @@ mod tests {
         );
 
         let metrics = state.metrics.snapshot().await;
-        assert_eq!(
-            metrics.recent_requests[0]
-                .shadow_affinity_decision
-                .as_deref(),
-            Some("validation_candidate_applied")
-        );
+        assert!(metrics.recent_requests[0]
+            .shadow_affinity_decision
+            .is_some());
         assert_eq!(
             metrics.recent_requests[0].shadow_affinity_trusted_identity,
             Some(true)
         );
-        assert_ne!(
-            metrics.recent_requests[0].provider_prefix_key.as_deref(),
-            metrics.recent_requests[0]
-                .shadow_affinity_cohort_id
-                .as_deref()
-        );
-        assert_eq!(
-            metrics.recent_requests[0].provider_prefix_key.as_deref(),
-            Some(forwarded_cache_key)
-        );
+        assert!(metrics.recent_requests[0].provider_prefix_key.is_none());
         let validation = state.cache_validation.lock().await.status(Utc::now());
         assert_eq!(
             validation.mode,
@@ -40491,6 +42070,466 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
             unrelated_reasoning.as_deref(),
             ProviderCacheCapabilityField::PromptCacheBreakpoint,
         ));
+
+        let plain_html_400 = b"<html><body>invalid_parameter prompt_cache_key</body></html>";
+        assert!(cache_capability_rejection_fields_from_error_bytes(plain_html_400).is_empty());
+    }
+
+    #[test]
+    fn cache_capability_rejection_uses_exact_structured_param_without_field_spread() {
+        let fields = cache_capability_rejection_fields_from_value(&json!({
+            "error": {
+                "code": "invalid_parameter",
+                "param": "prompt_cache_key",
+                "message": "prompt_cache_options was present in the echoed request"
+            }
+        }));
+        assert_eq!(
+            fields,
+            HashSet::from([ProviderCacheCapabilityField::PromptCacheKey])
+        );
+    }
+
+    #[tokio::test]
+    async fn client_owned_cache_key_rejection_never_poison_provider_capability() {
+        let mut config = AppConfig::default();
+        let decision = reasoning_test_decision(None, &[]);
+        config.providers.push(decision.provider.clone());
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-cache-key-rejection-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let client_owned = UpstreamRequestDiagnostics {
+            sent_cache_capability_fields: vec![ProviderCacheCapabilityField::PromptCacheKey],
+            client_owned_prompt_cache_key: true,
+            client_owned_prompt_cache_key_local_id: Some(
+                "client-cache-key:opaque-test-scope".to_string(),
+            ),
+            ..UpstreamRequestDiagnostics::default()
+        };
+        let error = "invalid parameter prompt_cache_key codex-native-placement-key";
+        let rejected_fields = cache_capability_rejection_fields_from_message(error);
+
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &client_owned,
+            400,
+            error,
+            &rejected_fields,
+        )
+        .await;
+        assert_eq!(
+            state.config.read().await.cache_capability_status_for_key(
+                &decision.provider.id,
+                &decision.model,
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            ProviderCacheCapabilityStatus::Unverified
+        );
+        assert!(client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            client_owned
+                .client_owned_prompt_cache_key_local_id
+                .as_deref(),
+        ));
+        let cooldown_keys = state
+            .client_prompt_cache_key_rejection_cooldowns
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(cooldown_keys, vec!["client-cache-key:opaque-test-scope"]);
+        assert!(cooldown_keys
+            .iter()
+            .all(|key| !key.contains("codex-native-placement-key")));
+
+        let generated = UpstreamRequestDiagnostics {
+            sent_cache_capability_fields: vec![ProviderCacheCapabilityField::PromptCacheKey],
+            ..UpstreamRequestDiagnostics::default()
+        };
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &generated,
+            400,
+            error,
+            &rejected_fields,
+        )
+        .await;
+        assert_eq!(
+            state.config.read().await.cache_capability_status_for_key(
+                &decision.provider.id,
+                &decision.model,
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            ProviderCacheCapabilityStatus::Unsupported
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn client_prompt_cache_key_cooldown_ignores_generic_or_unrelated_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-cache-key-cooldown-errors-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let diagnostics = UpstreamRequestDiagnostics {
+            client_owned_prompt_cache_key: true,
+            client_owned_prompt_cache_key_local_id: Some(
+                "client-cache-key:error-scope".to_string(),
+            ),
+            ..UpstreamRequestDiagnostics::default()
+        };
+        let decision = reasoning_test_decision(None, &[]);
+        let generic_rejected_fields = cache_capability_rejection_fields_from_message("bad gateway");
+        let reasoning_rejected_fields = cache_capability_rejection_fields_from_message(
+            "invalid parameter reasoning.effort is not supported",
+        );
+
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &diagnostics,
+            502,
+            "bad gateway",
+            &generic_rejected_fields,
+        )
+        .await;
+        assert!(!client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            diagnostics
+                .client_owned_prompt_cache_key_local_id
+                .as_deref(),
+        ));
+
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &diagnostics,
+            400,
+            "invalid parameter reasoning.effort is not supported",
+            &reasoning_rejected_fields,
+        )
+        .await;
+        assert!(!client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            diagnostics
+                .client_owned_prompt_cache_key_local_id
+                .as_deref(),
+        ));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn client_prompt_cache_key_error_redaction_removes_only_the_known_wire_value() {
+        let raw = "codex-native-placement-key";
+        let summary = summarize_client_prompt_cache_key_error(
+            format!("invalid parameter prompt_cache_key={raw}; retry with another key"),
+            Some(raw),
+        );
+        assert!(!summary.contains(raw));
+        assert!(summary.contains("[redacted prompt_cache_key]"));
+        assert_eq!(
+            summarize_client_prompt_cache_key_error(
+                "unrelated provider error".to_string(),
+                Some(raw),
+            ),
+            "unrelated provider error"
+        );
+    }
+
+    #[test]
+    fn client_prompt_cache_key_redaction_precedes_cutoff_for_buffered_and_sse_errors() {
+        let raw = format!("k{}", "a".repeat(CLIENT_PROMPT_CACHE_KEY_MAX_CHARS - 1));
+        assert_eq!(raw.len(), CLIENT_PROMPT_CACHE_KEY_MAX_CHARS);
+        let message = format!("{}{} trailing upstream detail", "x".repeat(694), raw);
+        let buffered = upstream_error_summary_redacting(
+            &serde_json::to_vec(&json!({"error": {"message": message}})).unwrap(),
+            Some(&raw),
+        );
+        assert!(buffered.contains("[redacted prompt_cache_key]"));
+        assert!(!buffered.contains(&raw));
+        assert!(
+            !buffered.contains(&raw[..8]),
+            "a key crossing the persisted cutoff must not leave a plaintext prefix"
+        );
+
+        let frame = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.failed",
+                "response": {"error": {"message": message}}
+            })
+        );
+        let mut stream = ResponsesStreamState::default();
+        stream.ingest(frame.as_bytes());
+        let captured = stream
+            .finish()
+            .error_summary
+            .expect("the stream error must retain the bounded redaction window");
+        assert!(captured.contains(&raw));
+        let streamed = summarize_client_prompt_cache_key_error(captured, Some(&raw));
+        assert!(streamed.contains("[redacted prompt_cache_key]"));
+        assert!(!streamed.contains(&raw));
+        assert!(
+            !streamed.contains(&raw[..8]),
+            "SSE settlement must redact before its persisted cutoff"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_cache_key_rejection_classifies_before_redaction() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-cache-key-redaction-classification-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let diagnostics = UpstreamRequestDiagnostics {
+            client_owned_prompt_cache_key: true,
+            client_owned_prompt_cache_key_local_id: Some(
+                "client-cache-key:redaction-classification".to_string(),
+            ),
+            ..UpstreamRequestDiagnostics::default()
+        };
+        let raw_client_key = "invalid_parameter";
+        let raw_error = "invalid_parameter prompt_cache_key";
+        let rejected_fields = cache_capability_rejection_fields_from_message(raw_error);
+        let persisted_error =
+            summarize_client_prompt_cache_key_error(raw_error.to_string(), Some(raw_client_key));
+        assert!(
+            !explicit_cache_field_rejection(
+                400,
+                Some(&persisted_error),
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            "the regression requires redaction to remove the only rejection marker"
+        );
+
+        note_runtime_cache_capability_rejection(
+            &state,
+            &reasoning_test_decision(None, &[]),
+            &Channel::Responses,
+            &diagnostics,
+            400,
+            &persisted_error,
+            &rejected_fields,
+        )
+        .await;
+        assert!(client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            diagnostics
+                .client_owned_prompt_cache_key_local_id
+                .as_deref(),
+        ));
+        assert!(!serde_json::to_string(&state.metrics.snapshot().await)
+            .unwrap()
+            .contains(raw_client_key));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn cache_capability_rejection_reads_structured_error_code_and_param() {
+        let fields = cache_capability_rejection_fields_from_value(&json!({
+            "error": {
+                "code": "invalid_parameter",
+                "param": "prompt_cache_key",
+                "message": "request validation failed"
+            }
+        }));
+        assert!(fields.contains(&ProviderCacheCapabilityField::PromptCacheKey));
+    }
+
+    #[tokio::test]
+    async fn client_cache_key_cooldown_lock_contention_preserves_explicit_key() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-cache-key-cooldown-lock-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let guard = state
+            .client_prompt_cache_key_rejection_cooldowns
+            .lock()
+            .await;
+        assert!(
+            !client_prompt_cache_key_rejection_cooldown_active(
+                &state,
+                Some("client-cache-key:concurrent-scope"),
+            ),
+            "a brief local write must not replace a valid caller-owned cache key"
+        );
+        drop(guard);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn client_cache_key_is_stripped_before_a_normal_one_shot_wire() {
+        // Use a value that would cause a field-specific rejection if it ever
+        // crossed the normal wire. The normal request must instead succeed in
+        // one POST with no cooldown state.
+        let raw_client_key = "invalid_parameter";
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let captured_bodies_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                let captured_bodies = captured_bodies_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let cache_key = body
+                        .get("prompt_cache_key")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    captured_bodies.lock().await.push(body);
+                    if cache_key == raw_client_key {
+                        return raw_response(
+                            400,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": {
+                                    "message": format!(
+                                        "{raw_client_key} prompt_cache_key"
+                                    )
+                                }
+                            }))
+                            .unwrap(),
+                        );
+                    }
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_generated_key\",\"usage\":{\"input_tokens\":1024,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":896}}}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-client-key-test".to_string();
+        config.workspace_fingerprint = "client-key-cooldown-workspace".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "client-key-cooldown-provider".to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "client-key-cooldown-provider");
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-cache-key-wire-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-client-key-test"),
+        );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"thread_id":"client-key-thread","session_id":"client-key-session"}"#,
+            ),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "prompt_cache_key": raw_client_key,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "preserve the native client placement"}]
+                }]
+            }))
+            .unwrap(),
+        );
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request.clone(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "each inbound request must create exactly one upstream POST"
+        );
+        let captured_bodies = captured_bodies.lock().await;
+        assert_eq!(captured_bodies.len(), 1);
+        assert!(captured_bodies[0].get("prompt_cache_key").is_none());
+        drop(captured_bodies);
+
+        let cooldown_keys = state
+            .client_prompt_cache_key_rejection_cooldowns
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(cooldown_keys.is_empty());
+        let metrics_json = serde_json::to_string(&state.metrics.snapshot().await).unwrap();
+        assert!(
+            !metrics_json.contains(raw_client_key),
+            "upstream error echoes must not reach metrics/history UI data"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

@@ -109,6 +109,8 @@ try {
   const fastrelay = newRun.upstreamBody;
   const differingPaths = diffPaths(baseline, fastrelay);
   const identity = compareIdentityMarkers(oldRun.identityMarkers, newRun.identityMarkers);
+  const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders);
+  const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders);
   const report = {
     pass: oldRun.oneInboundOnePost &&
       newRun.oneInboundOnePost &&
@@ -121,7 +123,7 @@ try {
     wire_equal: differingPaths.length === 0,
     differing_paths: differingPaths,
     differing_controls: summarizeControlDifferences(baseline, fastrelay, differingPaths),
-    headers_equal: JSON.stringify(oldRun.upstreamHeaders) === JSON.stringify(newRun.upstreamHeaders),
+    headers_equal: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
     baseline_headers: oldRun.upstreamHeaders,
     fastrelay_headers: newRun.upstreamHeaders,
     shadow_identity_equal: identity.equal,
@@ -134,7 +136,11 @@ try {
     "each isolated inbound must make exactly one upstream POST"
   );
   assert.equal(report.wire_equal, true, "FastRelay must preserve the v1.3.4 upstream wire body");
-  assert.equal(report.headers_equal, true, "FastRelay must preserve the v1.3.4 upstream headers");
+  assert.equal(
+    report.headers_equal,
+    true,
+    "FastRelay must preserve upstream protocol headers apart from its intentional product-version token"
+  );
   assert.equal(
     report.shadow_identity_equal,
     true,
@@ -381,6 +387,16 @@ function safeHeaders(headers) {
     "x-atoapi-request-kind"
   ];
   return Object.fromEntries(allowed.map((name) => [name, headers[name] ?? null]));
+}
+
+function comparableProtocolHeaders(headers) {
+  const userAgent = String(headers["user-agent"] ?? "");
+  return {
+    ...headers,
+    "user-agent": /^Atoapi\/\d+(?:\.\d+){1,3}$/u.test(userAgent)
+      ? "Atoapi/<version>"
+      : userAgent
+  };
 }
 
 function summarizeControls(body) {

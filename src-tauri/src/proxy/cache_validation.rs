@@ -2,11 +2,14 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::config::{Channel, ProviderCacheCapabilityField, ProviderCacheEffectStatus};
+
 use super::cache_affinity::{ShadowAffinityArm, ShadowAffinityDecision, ShadowCacheLane};
 
 pub(crate) const VALIDATION_TARGET_INPUT_TOKENS: u64 = 5_000_000;
 pub(crate) const VALIDATION_TARGET_SUCCESSFUL_REQUESTS: u64 = 50;
 const VALIDATION_MAX_HOURS: i64 = 4;
+const VALIDATION_BASELINE_MAX_AGE_HOURS: i64 = 4;
 const VALIDATION_MIN_COMPARISON_REQUESTS: u64 = 20;
 const VALIDATION_MAX_CONSECUTIVE_FAILURES: u64 = 3;
 const VALIDATION_MAX_SKIPPED_REQUESTS: u64 = 3;
@@ -46,8 +49,12 @@ pub struct CacheValidationRunSummary {
     pub cache_ratio: f64,
     pub error_rate: f64,
     pub ttft_p95_ms: u64,
+    pub usage_observations: u64,
+    pub inconclusive_observations: u64,
     pub candidate_applied_requests: u64,
     pub candidate_skipped_requests: u64,
+    #[serde(skip)]
+    pub(super) scope: Option<CacheValidationScope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +73,8 @@ pub struct CacheValidationStatus {
     pub cache_ratio: f64,
     pub error_rate: f64,
     pub ttft_p95_ms: u64,
+    pub usage_observations: u64,
+    pub inconclusive_observations: u64,
     pub candidate_applied_requests: u64,
     pub candidate_skipped_requests: u64,
     pub target_input_tokens: u64,
@@ -78,6 +87,135 @@ pub struct CacheValidationStatus {
 pub(super) struct CacheValidationSelection {
     pub run_id: String,
     pub mode: CacheValidationMode,
+}
+
+/// Exact upstream scope for a manually controlled validation run. The realm
+/// digest binds the deployment, channel, resolved model, and selected key
+/// without persisting the secret itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CacheValidationScope {
+    pub(super) channel: Channel,
+    pub(super) key_id: Option<String>,
+    pub(super) realm_id: String,
+    pub(super) stream: Option<bool>,
+    pub(super) store: Option<bool>,
+}
+
+impl CacheValidationScope {
+    pub(super) fn effect_scope_id(&self, breakpoint_placement_digest: Option<&str>) -> String {
+        let stream = match self.stream {
+            Some(true) => "stream",
+            Some(false) => "sync",
+            None => "stream-absent",
+        };
+        let store = match self.store {
+            Some(true) => "store",
+            Some(false) => "no-store",
+            None => "store-absent",
+        };
+        let breakpoint = breakpoint_placement_digest.unwrap_or("none");
+        format!(
+            "cache-effect-v2:{}:{}:{}:bp={breakpoint}",
+            self.realm_id, stream, store
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CacheValidationCompletion {
+    pub(super) summary: CacheValidationRunSummary,
+    pub(super) baseline: Option<CacheValidationRunSummary>,
+    pub(super) scope: Option<CacheValidationScope>,
+    pub(super) candidate_fields: Vec<ProviderCacheCapabilityField>,
+    pub(super) candidate_breakpoint_placement_digest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct CacheValidationEffectEvidence {
+    pub(super) provider_id: String,
+    pub(super) model: String,
+    pub(super) channel: Channel,
+    pub(super) key_id: Option<String>,
+    pub(super) effect_scope_id: String,
+    pub(super) fields: Vec<ProviderCacheCapabilityField>,
+    pub(super) status: ProviderCacheEffectStatus,
+    pub(super) message: String,
+    pub(super) baseline_cache_read_tokens: u64,
+    pub(super) candidate_cache_read_tokens: u64,
+    pub(super) baseline_ttft_ms: u64,
+    pub(super) candidate_ttft_ms: u64,
+}
+
+impl CacheValidationCompletion {
+    /// Effect evidence is intentionally emitted only after both arms reached
+    /// their normal traffic targets in one exact upstream realm. A positive
+    /// key result remains probe-only when persisted by AppConfig.
+    pub(super) fn effect_evidence(&self) -> Option<CacheValidationEffectEvidence> {
+        let candidate = &self.summary;
+        let baseline = self.baseline.as_ref()?;
+        let scope = self.scope.as_ref()?;
+        if candidate.mode != CacheValidationMode::Candidate
+            || !validation_target_reached(candidate)
+            || !validation_target_reached(baseline)
+            || self.candidate_fields.is_empty()
+        {
+            return None;
+        }
+        if self
+            .candidate_fields
+            .contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint)
+            && self.candidate_breakpoint_placement_digest.is_none()
+        {
+            return None;
+        }
+
+        // Compare cache reads at the candidate's observed input volume, then
+        // require one full 128-token bucket of real gain. This avoids calling
+        // a tiny rounding difference a provider rule improvement.
+        let expected_baseline_reads = (baseline.cache_read_tokens as u128)
+            .saturating_mul(candidate.input_tokens as u128)
+            / baseline.input_tokens.max(1) as u128;
+        let candidate_reads = candidate.cache_read_tokens as u128;
+        let gained_tokens = candidate_reads.saturating_sub(expected_baseline_reads);
+        let positive = candidate_reads > expected_baseline_reads && gained_tokens >= 128;
+        let non_regressing = candidate.error_rate <= baseline.error_rate
+            && candidate.ttft_p95_ms <= baseline.ttft_p95_ms;
+        let status = if positive && non_regressing {
+            ProviderCacheEffectStatus::Promoted
+        } else {
+            ProviderCacheEffectStatus::NoBenefit
+        };
+        let message = if positive && non_regressing {
+            format!(
+                "controlled validation improved real cached tokens by {gained_tokens} at the candidate input volume"
+            )
+        } else if !non_regressing {
+            format!(
+                "controlled validation gained cached tokens but regressed error rate ({:.4} vs {:.4}) or p95 TTFT ({}ms vs {}ms)",
+                candidate.error_rate,
+                baseline.error_rate,
+                candidate.ttft_p95_ms,
+                baseline.ttft_p95_ms,
+            )
+        } else {
+            "controlled validation reached target without a 128-token real cache gain".to_string()
+        };
+        Some(CacheValidationEffectEvidence {
+            provider_id: candidate.provider_id.clone(),
+            model: candidate.model.clone(),
+            channel: scope.channel.clone(),
+            key_id: scope.key_id.clone(),
+            effect_scope_id: scope
+                .effect_scope_id(self.candidate_breakpoint_placement_digest.as_deref()),
+            fields: self.candidate_fields.clone(),
+            status,
+            message,
+            baseline_cache_read_tokens: baseline.cache_read_tokens,
+            candidate_cache_read_tokens: candidate.cache_read_tokens,
+            baseline_ttft_ms: baseline.ttft_p95_ms,
+            candidate_ttft_ms: candidate.ttft_p95_ms,
+        })
+    }
 }
 
 pub(super) fn apply_controlled_selection(
@@ -120,13 +258,18 @@ pub(super) fn apply_controlled_selection(
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct CacheValidationObservation {
     pub success: bool,
+    pub usage_observed: bool,
     pub input_tokens: u64,
     pub cache_read_tokens: u64,
     pub ttft_ms: u64,
     pub candidate_applied: bool,
+    pub candidate_fields: Vec<ProviderCacheCapabilityField>,
+    /// The exact final-wire placement for a breakpoint candidate. `None` is
+    /// meaningful for non-breakpoint candidates and is bound on first use.
+    pub candidate_breakpoint_placement_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +289,11 @@ struct ActiveValidationRun {
     ttft_samples: Vec<u64>,
     candidate_applied_requests: u64,
     candidate_skipped_requests: u64,
+    usage_observations: u64,
+    inconclusive_observations: u64,
+    scope: Option<CacheValidationScope>,
+    candidate_fields: Option<Vec<ProviderCacheCapabilityField>>,
+    candidate_breakpoint_placement_digest: Option<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +335,11 @@ impl CacheValidationController {
             ttft_samples: Vec::new(),
             candidate_applied_requests: 0,
             candidate_skipped_requests: 0,
+            usage_observations: 0,
+            inconclusive_observations: 0,
+            scope: None,
+            candidate_fields: None,
+            candidate_breakpoint_placement_digest: None,
         });
         Ok(self.status(now))
     }
@@ -195,15 +348,41 @@ impl CacheValidationController {
         &mut self,
         provider_id: &str,
         model: &str,
+        scope: CacheValidationScope,
         now: DateTime<Utc>,
     ) -> Option<CacheValidationSelection> {
         self.expire_if_needed(now);
         let active = self.active.as_ref()?;
-        (active.provider_id == provider_id && active.model.eq_ignore_ascii_case(model)).then(|| {
-            CacheValidationSelection {
-                run_id: active.run_id.clone(),
-                mode: active.mode,
-            }
+        if active.provider_id != provider_id || active.model != model {
+            return None;
+        }
+        let incompatible_scope = active.scope.as_ref().is_some_and(|bound| bound != &scope);
+        let missing_or_incompatible_baseline = active.mode == CacheValidationMode::Candidate
+            && active.scope.is_none()
+            && self.baseline_reference.as_ref().is_none_or(|baseline| {
+                !baseline_is_ready_for_scope(baseline, provider_id, model, &scope, now)
+            });
+        if incompatible_scope {
+            self.finish_active("scope_mismatch", now);
+            return None;
+        }
+        if missing_or_incompatible_baseline {
+            self.finish_active("baseline_scope_mismatch", now);
+            return None;
+        }
+
+        let active = self
+            .active
+            .as_mut()
+            .expect("active validation was checked before scope handling");
+        if active.scope.is_none() {
+            active.scope = Some(scope);
+        } else {
+            debug_assert_eq!(active.scope.as_ref(), Some(&scope));
+        }
+        Some(CacheValidationSelection {
+            run_id: active.run_id.clone(),
+            mode: active.mode,
         })
     }
 
@@ -212,10 +391,10 @@ impl CacheValidationController {
         run_id: &str,
         observation: CacheValidationObservation,
         now: DateTime<Utc>,
-    ) {
+    ) -> Option<CacheValidationCompletion> {
         self.expire_if_needed(now);
         let Some(active) = self.active.as_mut().filter(|run| run.run_id == run_id) else {
-            return;
+            return None;
         };
 
         if active.mode == CacheValidationMode::Candidate && !observation.candidate_applied {
@@ -223,34 +402,83 @@ impl CacheValidationController {
             if active.candidate_skipped_requests >= VALIDATION_MAX_SKIPPED_REQUESTS
                 && active.candidate_applied_requests == 0
             {
-                self.finish_active("candidate_not_applicable", now);
+                return self.finish_active("candidate_not_applicable", now);
             }
-            return;
+            return None;
         }
 
         if active.mode == CacheValidationMode::Candidate {
+            let mut fields = observation.candidate_fields;
+            fields.sort_by_key(|field| field.json_name());
+            fields.dedup();
+            if fields.is_empty() {
+                active.candidate_skipped_requests += 1;
+                if active.candidate_skipped_requests >= VALIDATION_MAX_SKIPPED_REQUESTS
+                    && active.candidate_applied_requests == 0
+                {
+                    return self.finish_active("candidate_missing_controls", now);
+                }
+                return None;
+            }
+            if fields.len() != 1 {
+                return self.finish_active("candidate_multiple_controls", now);
+            }
+            if active
+                .candidate_fields
+                .as_ref()
+                .is_some_and(|previous| previous != &fields)
+            {
+                return self.finish_active("candidate_wire_changed", now);
+            }
+            let breakpoint_candidate =
+                fields.contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint);
+            if breakpoint_candidate && observation.candidate_breakpoint_placement_digest.is_none() {
+                return self.finish_active("candidate_breakpoint_missing_placement", now);
+            }
+            if active
+                .candidate_breakpoint_placement_digest
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous != &observation.candidate_breakpoint_placement_digest
+                })
+            {
+                return self.finish_active("candidate_breakpoint_placement_changed", now);
+            }
+            if active.candidate_breakpoint_placement_digest.is_none() {
+                active.candidate_breakpoint_placement_digest =
+                    Some(observation.candidate_breakpoint_placement_digest);
+            }
+            active.candidate_fields = Some(fields);
             active.candidate_applied_requests += 1;
         }
         if observation.success {
             active.successful_requests += 1;
             active.consecutive_failures = 0;
             active.ttft_samples.push(observation.ttft_ms);
+            if observation.usage_observed {
+                active.usage_observations += 1;
+                active.input_tokens = active.input_tokens.saturating_add(observation.input_tokens);
+                active.cache_read_tokens = active
+                    .cache_read_tokens
+                    .saturating_add(observation.cache_read_tokens);
+            } else {
+                active.inconclusive_observations += 1;
+            }
         } else {
             active.failed_requests += 1;
             active.consecutive_failures += 1;
         }
-        active.input_tokens = active.input_tokens.saturating_add(observation.input_tokens);
-        active.cache_read_tokens = active
-            .cache_read_tokens
-            .saturating_add(observation.cache_read_tokens);
 
         let should_complete = active.successful_requests >= VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+            && active.usage_observations >= VALIDATION_TARGET_SUCCESSFUL_REQUESTS
             && active.input_tokens >= VALIDATION_TARGET_INPUT_TOKENS;
         let rollback_reason = self.candidate_rollback_reason();
         if let Some(reason) = rollback_reason {
-            self.finish_active(reason, now);
+            self.finish_active(reason, now)
         } else if should_complete {
-            self.finish_active("target_reached", now);
+            self.finish_active("target_reached", now)
+        } else {
+            None
         }
     }
 
@@ -286,6 +514,10 @@ impl CacheValidationController {
             cache_ratio,
             error_rate,
             ttft_p95_ms,
+            usage_observations: active.map(|run| run.usage_observations).unwrap_or_default(),
+            inconclusive_observations: active
+                .map(|run| run.inconclusive_observations)
+                .unwrap_or_default(),
             candidate_applied_requests: active
                 .map(|run| run.candidate_applied_requests)
                 .unwrap_or_default(),
@@ -344,9 +576,13 @@ impl CacheValidationController {
         None
     }
 
-    fn finish_active(&mut self, reason: &str, now: DateTime<Utc>) {
+    fn finish_active(
+        &mut self,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Option<CacheValidationCompletion> {
         let Some(active) = self.active.take() else {
-            return;
+            return None;
         };
         let attempts = active.successful_requests + active.failed_requests;
         let summary = CacheValidationRunSummary {
@@ -365,14 +601,52 @@ impl CacheValidationController {
             cache_ratio: ratio(active.cache_read_tokens, active.input_tokens),
             error_rate: ratio(active.failed_requests, attempts),
             ttft_p95_ms: percentile_95(&active.ttft_samples),
+            usage_observations: active.usage_observations,
+            inconclusive_observations: active.inconclusive_observations,
             candidate_applied_requests: active.candidate_applied_requests,
             candidate_skipped_requests: active.candidate_skipped_requests,
+            scope: active.scope.clone(),
         };
-        if summary.mode == CacheValidationMode::Baseline && summary.successful_requests > 0 {
+        if summary.mode == CacheValidationMode::Baseline && validation_target_reached(&summary) {
             self.baseline_reference = Some(summary.clone());
         }
         self.last_run = Some(summary);
+        let summary = self
+            .last_run
+            .clone()
+            .expect("finished run must be retained");
+        (summary.mode == CacheValidationMode::Candidate).then(|| CacheValidationCompletion {
+            baseline: self.baseline_reference.clone(),
+            scope: active.scope,
+            candidate_fields: active.candidate_fields.unwrap_or_default(),
+            candidate_breakpoint_placement_digest: active
+                .candidate_breakpoint_placement_digest
+                .unwrap_or(None),
+            summary,
+        })
     }
+}
+
+fn validation_target_reached(summary: &CacheValidationRunSummary) -> bool {
+    summary.completion_reason == "target_reached"
+        && summary.successful_requests >= VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+        && summary.usage_observations >= VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+        && summary.input_tokens >= VALIDATION_TARGET_INPUT_TOKENS
+}
+
+fn baseline_is_ready_for_scope(
+    baseline: &CacheValidationRunSummary,
+    provider_id: &str,
+    model: &str,
+    scope: &CacheValidationScope,
+    now: DateTime<Utc>,
+) -> bool {
+    baseline.mode == CacheValidationMode::Baseline
+        && baseline.provider_id == provider_id
+        && baseline.model == model
+        && baseline.scope.as_ref() == Some(scope)
+        && validation_target_reached(baseline)
+        && now <= baseline.finished_at + Duration::hours(VALIDATION_BASELINE_MAX_AGE_HOURS)
 }
 
 fn required_value(value: Option<String>, field: &str) -> Result<String, String> {
@@ -411,6 +685,16 @@ mod tests {
             mode,
             provider_id: Some("provider-a".to_string()),
             model: Some("gpt-main".to_string()),
+        }
+    }
+
+    fn scope(realm_id: &str) -> CacheValidationScope {
+        CacheValidationScope {
+            channel: Channel::Responses,
+            key_id: Some("key-a".to_string()),
+            realm_id: realm_id.to_string(),
+            stream: Some(true),
+            store: Some(false),
         }
     }
 
@@ -478,22 +762,41 @@ mod tests {
     fn validation_scope_is_exact_and_never_persists_as_default() {
         let now = Utc::now();
         let mut controller = CacheValidationController::default();
-        controller
+        let baseline = controller
             .configure(
-                input(CacheValidationMode::Candidate),
+                input(CacheValidationMode::Baseline),
                 Some("A".to_string()),
                 now,
             )
             .unwrap();
-
         assert!(controller
-            .selection("provider-a", "gpt-main", now)
+            .selection("provider-a", "gpt-main", scope("realm-a"), now)
             .is_some());
+        controller.observe(
+            &baseline.run_id.unwrap(),
+            CacheValidationObservation {
+                success: true,
+                usage_observed: true,
+                input_tokens: 1,
+                ..CacheValidationObservation::default()
+            },
+            now,
+        );
+        controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::seconds(1),
+            )
+            .unwrap();
         assert!(controller
-            .selection("provider-b", "gpt-main", now)
+            .selection("provider-b", "gpt-main", scope("realm-a"), now)
             .is_none());
         assert!(controller
-            .selection("provider-a", "gpt-side", now)
+            .selection("provider-a", "gpt-side", scope("realm-a"), now)
+            .is_none());
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope("realm-b"), now)
             .is_none());
         assert_eq!(
             controller
@@ -548,6 +851,7 @@ mod tests {
                 &run_id,
                 CacheValidationObservation {
                     candidate_applied: true,
+                    candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheKey],
                     ..CacheValidationObservation::default()
                 },
                 now + Duration::seconds(index as i64),
@@ -563,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_reference_is_kept_for_candidate_comparison() {
+    fn incomplete_baseline_is_not_kept_for_candidate_comparison() {
         let now = Utc::now();
         let mut controller = CacheValidationController::default();
         let baseline = controller
@@ -582,6 +886,8 @@ mod tests {
                 cache_read_tokens: 800,
                 ttft_ms: 500,
                 candidate_applied: false,
+                usage_observed: true,
+                ..CacheValidationObservation::default()
             },
             now,
         );
@@ -594,6 +900,497 @@ mod tests {
             .unwrap();
 
         let status = controller.status(now + Duration::minutes(1));
-        assert_eq!(status.baseline_reference.unwrap().successful_requests, 1);
+        assert!(status.baseline_reference.is_none());
+    }
+
+    #[test]
+    fn missing_usage_cannot_complete_a_baseline() {
+        let now = Utc::now();
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope("realm-a"), now)
+            .is_some());
+
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &run_id,
+                CacheValidationObservation {
+                    success: true,
+                    input_tokens: 100_000,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let status = controller.status(now + Duration::minutes(1));
+        assert_eq!(status.mode, CacheValidationMode::Baseline);
+        assert_eq!(
+            status.successful_requests,
+            VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+        );
+        assert_eq!(status.usage_observations, 0);
+        assert!(status.baseline_reference.is_none());
+    }
+
+    #[test]
+    fn candidate_rejects_an_expired_complete_baseline() {
+        let now = Utc::now();
+        let validation_scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", validation_scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate_at = now + Duration::hours(VALIDATION_BASELINE_MAX_AGE_HOURS + 1);
+        controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                candidate_at,
+            )
+            .unwrap();
+
+        assert!(controller
+            .selection("provider-a", "gpt-main", validation_scope, candidate_at,)
+            .is_none());
+        let status = controller.status(candidate_at);
+        assert_eq!(status.mode, CacheValidationMode::Auto);
+        assert_eq!(
+            status.last_run.unwrap().completion_reason,
+            "baseline_scope_mismatch"
+        );
+    }
+
+    #[test]
+    fn effect_scope_id_distinguishes_stream_and_store_shape() {
+        let stream_no_store = scope("realm-a");
+        let sync_no_store = CacheValidationScope {
+            stream: Some(false),
+            ..stream_no_store.clone()
+        };
+        let stream_store = CacheValidationScope {
+            store: Some(true),
+            ..stream_no_store.clone()
+        };
+
+        assert_ne!(
+            stream_no_store.effect_scope_id(None),
+            sync_no_store.effect_scope_id(None)
+        );
+        assert_ne!(
+            stream_no_store.effect_scope_id(None),
+            stream_store.effect_scope_id(None)
+        );
+    }
+
+    #[test]
+    fn candidate_without_usage_cannot_complete_or_emit_effect_evidence() {
+        let now = Utc::now();
+        let validation_scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", validation_scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::minutes(2),
+            )
+            .unwrap();
+        let candidate_run_id = candidate.run_id.unwrap();
+        assert!(controller
+            .selection(
+                "provider-a",
+                "gpt-main",
+                validation_scope,
+                now + Duration::minutes(2),
+            )
+            .is_some());
+
+        let mut completion = None;
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            completion = controller.observe(
+                &candidate_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 60_000,
+                    ttft_ms: 100,
+                    candidate_applied: true,
+                    candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheRetention],
+                    candidate_breakpoint_placement_digest: None,
+                    // A successful response that omits usage cannot establish
+                    // a real cache gain and must remain inconclusive.
+                    usage_observed: false,
+                },
+                now + Duration::minutes(2) + Duration::seconds(index as i64),
+            );
+        }
+
+        assert!(completion.is_none());
+        let status = controller.status(now + Duration::minutes(4));
+        assert_eq!(status.mode, CacheValidationMode::Candidate);
+        assert_eq!(
+            status.successful_requests,
+            VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+        );
+        assert_eq!(status.usage_observations, 0);
+        assert_eq!(
+            status.candidate_applied_requests,
+            VALIDATION_TARGET_SUCCESSFUL_REQUESTS
+        );
+        assert_eq!(
+            status.last_run.as_ref().map(|run| run.mode),
+            Some(CacheValidationMode::Baseline),
+            "the active candidate has not finished; the retained completed baseline remains historical evidence"
+        );
+    }
+
+    #[test]
+    fn candidate_rejects_more_than_one_control_field() {
+        let now = Utc::now();
+        let mut controller = CacheValidationController::default();
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+
+        controller.observe(
+            &candidate.run_id.unwrap(),
+            CacheValidationObservation {
+                candidate_applied: true,
+                candidate_fields: vec![
+                    ProviderCacheCapabilityField::PromptCacheOptions,
+                    ProviderCacheCapabilityField::PromptCacheBreakpoint,
+                ],
+                ..CacheValidationObservation::default()
+            },
+            now,
+        );
+
+        let status = controller.status(now + Duration::seconds(1));
+        assert_eq!(status.mode, CacheValidationMode::Auto);
+        assert_eq!(
+            status.last_run.unwrap().completion_reason,
+            "candidate_multiple_controls"
+        );
+    }
+
+    #[test]
+    fn breakpoint_candidate_cannot_mix_final_wire_placements() {
+        let now = Utc::now();
+        let validation_scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", validation_scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::minutes(2),
+            )
+            .unwrap();
+        let candidate_run_id = candidate.run_id.unwrap();
+        assert!(controller
+            .selection(
+                "provider-a",
+                "gpt-main",
+                validation_scope,
+                now + Duration::minutes(2),
+            )
+            .is_some());
+        let first = CacheValidationObservation {
+            success: true,
+            usage_observed: true,
+            input_tokens: 100_000,
+            cache_read_tokens: 60_000,
+            ttft_ms: 100,
+            candidate_applied: true,
+            candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            candidate_breakpoint_placement_digest: Some("v2:placement-a".to_string()),
+        };
+        assert!(controller
+            .observe(&candidate_run_id, first, now + Duration::minutes(2))
+            .is_none());
+        let changed = CacheValidationObservation {
+            candidate_breakpoint_placement_digest: Some("v2:placement-b".to_string()),
+            ..CacheValidationObservation {
+                success: true,
+                usage_observed: true,
+                input_tokens: 100_000,
+                cache_read_tokens: 60_000,
+                ttft_ms: 100,
+                candidate_applied: true,
+                candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheBreakpoint],
+                candidate_breakpoint_placement_digest: None,
+            }
+        };
+        let completed = controller
+            .observe(
+                &candidate_run_id,
+                changed,
+                now + Duration::minutes(2) + Duration::seconds(1),
+            )
+            .expect("a moved breakpoint must end the candidate before promotion");
+        assert_eq!(
+            completed.summary.completion_reason,
+            "candidate_breakpoint_placement_changed"
+        );
+    }
+
+    #[test]
+    fn matching_scope_with_real_gain_emits_promotable_effect_evidence() {
+        let now = Utc::now();
+        let scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::minutes(2),
+            )
+            .unwrap();
+        let candidate_run_id = candidate.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope.clone(), now)
+            .is_some());
+        let mut completion = None;
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            completion = controller.observe(
+                &candidate_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 60_000,
+                    ttft_ms: 100,
+                    candidate_applied: true,
+                    candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheOptions],
+                    candidate_breakpoint_placement_digest: None,
+                },
+                now + Duration::minutes(2) + Duration::seconds(index as i64),
+            );
+        }
+        let evidence = completion
+            .and_then(|completion| completion.effect_evidence())
+            .expect("matching baseline/candidate targets must yield effect evidence");
+        assert_eq!(evidence.status, ProviderCacheEffectStatus::Promoted);
+        assert_eq!(
+            evidence.fields,
+            vec![ProviderCacheCapabilityField::PromptCacheOptions]
+        );
+        assert_eq!(evidence.channel, Channel::Responses);
+    }
+
+    #[test]
+    fn cache_gain_with_ttft_regression_is_not_promoted() {
+        let now = Utc::now();
+        let scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::minutes(2),
+            )
+            .unwrap();
+        let candidate_run_id = candidate.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope, now + Duration::minutes(2))
+            .is_some());
+        let mut completion = None;
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            completion = controller.observe(
+                &candidate_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 60_000,
+                    ttft_ms: 101,
+                    candidate_applied: true,
+                    candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheOptions],
+                    candidate_breakpoint_placement_digest: None,
+                },
+                now + Duration::minutes(2) + Duration::seconds(index as i64),
+            );
+        }
+
+        let evidence = completion
+            .and_then(|completion| completion.effect_evidence())
+            .expect("completed candidate must produce a non-promotion result");
+        assert_eq!(evidence.status, ProviderCacheEffectStatus::NoBenefit);
+    }
+
+    #[test]
+    fn candidate_scope_mismatch_cannot_consume_a_baseline() {
+        let now = Utc::now();
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        let baseline_scope = scope("realm-a");
+        assert!(controller
+            .selection("provider-a", "gpt-main", baseline_scope, now)
+            .is_some());
+        controller.observe(
+            &baseline_run_id,
+            CacheValidationObservation {
+                success: true,
+                usage_observed: true,
+                input_tokens: 1,
+                ..CacheValidationObservation::default()
+            },
+            now,
+        );
+        controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::seconds(1),
+            )
+            .unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", scope("realm-b"), now)
+            .is_none());
     }
 }

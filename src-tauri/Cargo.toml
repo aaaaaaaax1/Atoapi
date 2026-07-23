@@ -1,6 +1,6 @@
 [package]
 name = "atoapi"
-version = "1.3.6"
+version = "1.3.7"
 description = "Local desktop AI agent proxy with protocol switching, caching, and metrics."
 authors = ["Atoapi"]
 edition = "2021"

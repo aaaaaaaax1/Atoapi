@@ -70,7 +70,8 @@ for (const field of [
   "end_utc",
   "agent_id",
   "provider_id",
-  "include_cold_starts"
+  "include_cold_starts",
+  "include_compactions"
 ]) {
   assert.match(
     trendInput,
@@ -95,7 +96,8 @@ for (const field of [
   "end_utc",
   "agent_id",
   "provider_id",
-  "include_cold_starts"
+  "include_cold_starts",
+  "include_compactions"
 ]) {
   assert.match(
     trendBridgeRequest,
@@ -200,6 +202,22 @@ assert.match(
   host,
   /target\.id === "metricsRefreshButton"[\s\S]{0,360}trendController\(\)\?\.request\("refresh"\)/,
   "the visible metrics refresh action must reload the independent trend as well"
+);
+
+assert.match(
+  api,
+  /const includeCompactions = input\?\.include_compactions !== false/,
+  "the browser fallback must honor the compaction-filter input"
+);
+assert.match(
+  api,
+  /compaction_filter_complete:\s*includeCompactions/,
+  "the browser fallback must mark compaction-excluded data as inexact"
+);
+assert.match(
+  host,
+  /compactionExclusion:[\s\S]{0,220}coldStartExclusion:/,
+  "combined cold-start and compaction filters must label partial overlap exclusions"
 );
 
 assert.match(

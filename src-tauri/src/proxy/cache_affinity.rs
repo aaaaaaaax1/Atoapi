@@ -10,8 +10,6 @@ pub(crate) const SHADOW_POLICY_EPOCH: u64 = 2;
 pub(super) const SHADOW_ASSIGNMENT_LIMIT: usize = 4096;
 pub(super) const SHADOW_ASSIGNMENT_TTL_HOURS: i64 = 24;
 pub(super) const STATIC_COHORT_CANARY_PERCENT: u8 = 5;
-#[cfg(not(test))]
-const AUTOMATIC_STATIC_COHORT_ADMISSION_ENV: &str = "ATOAPI_AUTOMATIC_CACHE_CANARY";
 const GIANT_TAIL_CHARS: u64 = 80_000;
 const POST_BURST_FOLLOWUP_REQUESTS: u8 = 3;
 const POST_COMPACTION_FOLLOWUP_REQUESTS: u8 = 4;
@@ -39,8 +37,11 @@ const POST_BURST_RESIDUAL_CACHE_GAP_BPS: u64 = 9_995;
 // The live route is deliberately tiny: one current scope per exact upstream
 // realm.  It is a placement-only experiment, so it must earn the right to
 // remain enabled from the upstream's real usage before it can stay sticky.
+#[cfg(test)]
 const ACTIVE_CACHE_ROUTE_MIN_BASELINE_SUCCESSFUL_OBSERVATIONS: u64 = 4;
+#[cfg(test)]
 const ACTIVE_CACHE_ROUTE_MIN_BASELINE_USAGE_OBSERVATIONS: u64 = 4;
+#[cfg(test)]
 const ACTIVE_CACHE_ROUTE_MIN_BASELINE_INPUT_TOKENS: u64 = 32 * 1024;
 const ACTIVE_CACHE_ROUTE_MIN_CANDIDATE_SUCCESSFUL_OBSERVATIONS: u64 = 18;
 const ACTIVE_CACHE_ROUTE_MAX_INCONCLUSIVE_OBSERVATIONS: u64 = 3;
@@ -432,6 +433,7 @@ fn active_cache_route_ratio_is_strictly_higher(
     )
 }
 
+#[cfg(test)]
 fn active_cache_route_ratio_is_below_target(
     evidence: &ActiveCacheRouteEvidence,
     target_bps: u64,
@@ -486,6 +488,7 @@ fn record_active_cache_route_evidence(
 /// making the user create another twenty sessions.  No synthetic usage is
 /// introduced: missing historical TTFT samples simply leave the TTFT guard
 /// inactive until fresh evidence arrives.
+#[cfg(test)]
 fn seed_active_cache_route_baseline(assignment: &mut ShadowAffinityAssignment) {
     if assignment.active_cache_route_baseline.observations > 0
         || assignment.active_cache_route_legacy_seed_consumed
@@ -505,6 +508,7 @@ fn seed_active_cache_route_baseline(assignment: &mut ShadowAffinityAssignment) {
     assignment.active_cache_route_legacy_seed_consumed = true;
 }
 
+#[cfg(test)]
 fn active_cache_route_baseline_is_eligible(evidence: &ActiveCacheRouteEvidence) -> bool {
     evidence.successful_observations >= ACTIVE_CACHE_ROUTE_MIN_BASELINE_SUCCESSFUL_OBSERVATIONS
         && evidence.usage_observations >= ACTIVE_CACHE_ROUTE_MIN_BASELINE_USAGE_OBSERVATIONS
@@ -1883,6 +1887,7 @@ fn forced_isolated_candidate_variant() -> Option<ShadowCacheCandidateVariant> {
 /// have established that the client did not supply a cache key. This function
 /// is synchronous and intended to run only while a caller holds a `try_lock`;
 /// it never waits for disk, another request, or upstream I/O.
+#[cfg(test)]
 pub(super) fn admit_active_cache_route(
     store: &mut ShadowAffinityStore,
     decision: &mut ShadowAffinityDecision,
@@ -2313,6 +2318,7 @@ pub(super) fn apply_static_cohort_canary(
     true
 }
 
+#[cfg(test)]
 pub(super) fn apply_automatic_static_cohort_canary(
     decision: &mut ShadowAffinityDecision,
     smart_hit_enabled: bool,
@@ -2324,53 +2330,22 @@ pub(super) fn apply_automatic_static_cohort_canary(
     )
 }
 
+#[cfg(test)]
 fn automatic_static_cohort_admission_enabled() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        !std::env::var(AUTOMATIC_STATIC_COHORT_ADMISSION_ENV)
-            .ok()
-            .is_some_and(|value| matches!(value.trim(), "0" | "false" | "off" | "disabled"))
-    }
+    false
 }
 
+#[cfg(test)]
 fn automatic_static_cohort_force_no_gap_enabled() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        let isolated = std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
-            .ok()
-            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"));
-        isolated
-            && std::env::var("ATOAPI_FORCE_CACHE_CANARY")
-                .ok()
-                .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
-    }
+    false
 }
 
+#[cfg(test)]
 fn provider_native_candidate_isolation_override_enabled() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        let isolated = std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
-            .ok()
-            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"));
-        isolated
-            && std::env::var("ATOAPI_FORCE_CACHE_CANDIDATE")
-                .ok()
-                .is_some_and(|value| value.trim() == "provider_native")
-    }
+    false
 }
 
+#[cfg(test)]
 fn apply_automatic_static_cohort_canary_with_switch(
     decision: &mut ShadowAffinityDecision,
     smart_hit_enabled: bool,

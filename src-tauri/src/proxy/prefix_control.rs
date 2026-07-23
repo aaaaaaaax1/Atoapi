@@ -31,6 +31,7 @@ pub(super) struct PrefixControlInput {
     pub avoidable_shortfall_streak: u32,
     pub cache_instability_score: u32,
     pub tiny_instability_recovery_safe: bool,
+    pub current_tail_is_settle_safe: bool,
     pub settle_after_cold_read: bool,
     pub compaction_requested: bool,
     pub state_age: Duration,
@@ -63,6 +64,19 @@ pub(super) struct PrefixGapInput<'a> {
     pub usage: &'a UsageRecord,
     pub tail: &'a TailInputDiagnostics,
     pub guard_budget_exhausted: bool,
+    /// True only when the current frozen native Responses wire changed a
+    /// non-`input` projection relative to the state being compared.
+    pub static_wire_drift: bool,
+}
+
+/// The final wire is the only trustworthy source for a Responses static
+/// projection. `NotApplicable` keeps non-Responses channels from changing a
+/// stored Responses receipt; `Observed(None)` is a real but unprojectable
+/// Responses wire and deliberately fails closed against a prior digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FinalResponsesStaticProjection<'a> {
+    NotApplicable,
+    Observed(Option<&'a str>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,12 +87,14 @@ pub(super) struct PrefixStateInput<'a> {
     pub used_response_session: bool,
     pub retried_full_response: bool,
     pub guard_budget_exhausted: bool,
+    pub final_responses_static_projection: FinalResponsesStaticProjection<'a>,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct PrefixStateObservation {
     pub next: Option<PrefixWarmState>,
     pub learn_family: bool,
+    pub static_wire_drift: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -135,6 +151,33 @@ impl PrefixController {
             return skip("avoidable_evidence_expired", false);
         }
         if input.avoidable_shortfall_streak < MIN_REPEATED_AVOIDABLE_STREAK {
+            // A just-settled exact prefix can expose a first cache-lag gap
+            // before there is enough history to call it a repeated pattern.
+            // Give only that narrow case the remainder of the 500 ms settle
+            // window.  This never delays an ordinary request without an exact
+            // observed gap, and avoids waiting on large/ambiguous tails.
+            if input.state_age < MAX_FOREGROUND_WAIT
+                && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
+                && input.avoidable_tokens <= 4_096
+                && input.fine_avoidable_tokens > 0
+                && input.fine_avoidable_tokens <= 4_096
+            {
+                if !input.current_tail_is_settle_safe {
+                    return skip("avoidable_gap_current_tail_unreliable", false);
+                }
+                let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
+                if request_budget.is_zero() {
+                    return skip("local_guard_budget_exhausted", true);
+                }
+                let requested = MAX_FOREGROUND_WAIT.saturating_sub(input.state_age);
+                let wait = requested.min(request_budget);
+                return PrefixControlDecision {
+                    wait,
+                    reason: Some("responses_first_exact_avoidable_settle"),
+                    skip_reason: None,
+                    budget_exhausted: wait < requested,
+                };
+            }
             return skip("avoidable_gap_not_repeated", false);
         }
         let wait_avoidable_tokens = if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE
@@ -178,6 +221,17 @@ impl PrefixController {
         }
 
         let total_tokens = provider_cache_shortfall(record);
+        if input.static_wire_drift {
+            // The prior waterline belongs to a different frozen wire shape.
+            // Its gap can be useful diagnostic evidence, but it is neither a
+            // tail miss nor a local settle opportunity for this request.
+            return ProviderCacheGapBreakdown {
+                total_tokens,
+                new_tail_tokens: total_tokens,
+                avoidable_tokens: 0,
+                provider_unstable_tokens: 0,
+            };
+        }
         let cold_read_has_unreliable_dynamic_tail =
             responses_current_tail_makes_avoidable_unreliable(input.tail)
                 || responses_tool_tail_burst(input.tail)
@@ -236,6 +290,42 @@ impl PrefixController {
             return PrefixStateObservation {
                 next: None,
                 learn_family: false,
+                static_wire_drift: false,
+            };
+        }
+
+        let responses_static_projection_digest = static_projection_digest_for_next(
+            input.previous,
+            input.final_responses_static_projection,
+        );
+        if static_projection_drifted(input.previous, input.final_responses_static_projection) {
+            // Do not retain the old waterline or its settle/wait evidence
+            // after any static frozen-wire change. The current request starts
+            // a fresh baseline, so the next turn can only learn from matching
+            // static wire evidence.
+            return PrefixStateObservation {
+                next: Some(PrefixWarmState {
+                    finished_at: Instant::now(),
+                    input_tokens: record.input_tokens,
+                    cache_read_tokens: record.cache_read_tokens,
+                    shortfall_tokens: provider_cache_shortfall(record),
+                    seen_bucket_tokens: record.cache_read_tokens,
+                    avoidable_shortfall_tokens: 0,
+                    avoidable_shortfall_streak: 0,
+                    shortfall_tokens_128: provider_cache_shortfall_128(record),
+                    seen_bucket_tokens_128: record.cache_read_tokens,
+                    avoidable_shortfall_tokens_128: 0,
+                    small_gap_recovery_streak: 0,
+                    recent_clean_tiny_gap_streak: 0,
+                    cache_instability_score: 0,
+                    settle_after_cold_read: false,
+                    tail_tool_output_chars: input.tail.tool_output_chars,
+                    tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
+                    tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
+                    responses_static_projection_digest,
+                }),
+                learn_family: false,
+                static_wire_drift: true,
             };
         }
 
@@ -273,6 +363,7 @@ impl PrefixController {
                 tail_tool_output_chars: input.tail.tool_output_chars,
                 tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
                 tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
+                responses_static_projection_digest: responses_static_projection_digest.clone(),
             });
             preserved.finished_at = Instant::now();
             let instability_bump = if prefix_break_after_warm || huge_dynamic_history_cold_read {
@@ -296,9 +387,11 @@ impl PrefixController {
             preserved.tail_tool_output_chars = input.tail.tool_output_chars;
             preserved.tail_largest_tool_output_chars = input.tail.largest_tool_output_chars;
             preserved.tail_tool_output_noise_hint = input.tail.tool_output_noise_hint.clone();
+            preserved.responses_static_projection_digest = responses_static_projection_digest;
             return PrefixStateObservation {
                 next: Some(preserved),
                 learn_family: false,
+                static_wire_drift: false,
             };
         }
 
@@ -311,6 +404,7 @@ impl PrefixController {
             return PrefixStateObservation {
                 next: None,
                 learn_family: false,
+                static_wire_drift: false,
             };
         }
 
@@ -450,13 +544,38 @@ impl PrefixController {
             tail_tool_output_chars: input.tail.tool_output_chars,
             tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
             tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
+            responses_static_projection_digest,
         };
 
         PrefixStateObservation {
             next: Some(next),
             learn_family: !evidence.provider_rollback
                 && should_learn_provider_prefix_family_state(record, input.tail),
+            static_wire_drift: false,
         }
+    }
+}
+
+fn static_projection_drifted(
+    previous: Option<&PrefixWarmState>,
+    final_projection: FinalResponsesStaticProjection<'_>,
+) -> bool {
+    let FinalResponsesStaticProjection::Observed(current) = final_projection else {
+        return false;
+    };
+    previous
+        .is_some_and(|previous| previous.responses_static_projection_digest.as_deref() != current)
+}
+
+fn static_projection_digest_for_next(
+    previous: Option<&PrefixWarmState>,
+    final_projection: FinalResponsesStaticProjection<'_>,
+) -> Option<String> {
+    match final_projection {
+        FinalResponsesStaticProjection::NotApplicable => {
+            previous.and_then(|previous| previous.responses_static_projection_digest.clone())
+        }
+        FinalResponsesStaticProjection::Observed(digest) => digest.map(ToOwned::to_owned),
     }
 }
 
@@ -642,6 +761,7 @@ mod tests {
             avoidable_shortfall_streak: 0,
             cache_instability_score: 0,
             tiny_instability_recovery_safe: false,
+            current_tail_is_settle_safe: true,
             settle_after_cold_read: false,
             compaction_requested: false,
             state_age: Duration::ZERO,
@@ -718,6 +838,34 @@ mod tests {
         });
         assert_eq!(decision.wait, Duration::ZERO);
         assert_eq!(decision.skip_reason, Some("avoidable_gap_not_repeated"));
+    }
+
+    #[test]
+    fn fresh_first_exact_avoidable_evidence_waits_for_the_settle_window() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            state_age: Duration::from_millis(140),
+            ..input(256)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(360));
+        assert_eq!(
+            decision.reason,
+            Some("responses_first_exact_avoidable_settle")
+        );
+        assert!(!decision.budget_exhausted);
+    }
+
+    #[test]
+    fn fresh_first_exact_avoidable_evidence_skips_an_unreliable_current_tail() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            state_age: Duration::from_millis(140),
+            current_tail_is_settle_safe: false,
+            ..input(256)
+        });
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert_eq!(
+            decision.skip_reason,
+            Some("avoidable_gap_current_tail_unreliable")
+        );
     }
 
     #[test]
@@ -867,6 +1015,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 261_880,
@@ -880,6 +1029,7 @@ mod tests {
             usage: &record,
             tail: &TailInputDiagnostics::default(),
             guard_budget_exhausted: false,
+            static_wire_drift: false,
         });
 
         assert_eq!(gap.total_tokens, 26_674);
@@ -894,6 +1044,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next
@@ -905,6 +1056,70 @@ mod tests {
         assert_eq!(next.avoidable_shortfall_streak, 0);
         assert_eq!(next.recent_clean_tiny_gap_streak, 0);
         assert!(!observation.learn_family);
+    }
+
+    #[test]
+    fn static_wire_drift_resets_the_waterline_without_creating_avoidable_gap() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 100_000,
+            cache_read_tokens: 99_840,
+            shortfall_tokens: 160,
+            seen_bucket_tokens: 99_840,
+            avoidable_shortfall_tokens: 128,
+            avoidable_shortfall_streak: 2,
+            shortfall_tokens_128: 160,
+            seen_bucket_tokens_128: 99_840,
+            avoidable_shortfall_tokens_128: 128,
+            small_gap_recovery_streak: 2,
+            recent_clean_tiny_gap_streak: MIN_CLEAN_TINY_RECOVERY_STREAK,
+            cache_instability_score: 1,
+            settle_after_cold_read: true,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: Some("static-a".to_string()),
+        };
+        let record = UsageRecord {
+            input_tokens: 100_512,
+            cache_read_tokens: 96_000,
+            ..UsageRecord::default()
+        };
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::Observed(Some(
+                "static-b",
+            )),
+        });
+
+        assert!(observation.static_wire_drift);
+        assert!(!observation.learn_family);
+        let next = observation.next.expect("drift must seed a fresh baseline");
+        assert_eq!(
+            next.responses_static_projection_digest.as_deref(),
+            Some("static-b")
+        );
+        assert_eq!(next.avoidable_shortfall_tokens, 0);
+        assert_eq!(next.avoidable_shortfall_tokens_128, 0);
+        assert!(!next.settle_after_cold_read);
+
+        let gap = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            guard_budget_exhausted: false,
+            static_wire_drift: true,
+        });
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, gap.total_tokens);
     }
 
     #[test]
@@ -927,6 +1142,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let cold_read = UsageRecord {
             input_tokens: 64_512,
@@ -941,6 +1157,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next
@@ -968,6 +1185,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 100_000,
@@ -982,6 +1200,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next
@@ -1004,6 +1223,7 @@ mod tests {
             cache_instability_score: next.cache_instability_score,
             tiny_instability_recovery_safe: next.recent_clean_tiny_gap_streak
                 >= MIN_CLEAN_TINY_RECOVERY_STREAK,
+            current_tail_is_settle_safe: true,
             settle_after_cold_read: next.settle_after_cold_read,
             compaction_requested: false,
             state_age: Duration::ZERO,
@@ -1033,6 +1253,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 100_000,
@@ -1052,6 +1273,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next
@@ -1079,6 +1301,7 @@ mod tests {
             tail_tool_output_chars: 40_000,
             tail_largest_tool_output_chars: 40_000,
             tail_tool_output_noise_hint: Some("path_like".to_string()),
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 252_000,
@@ -1099,6 +1322,7 @@ mod tests {
             usage: &record,
             tail: &tail,
             guard_budget_exhausted: false,
+            static_wire_drift: false,
         });
 
         assert_eq!(gap.provider_unstable_tokens, 0);
@@ -1126,6 +1350,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 200_048,
@@ -1140,6 +1365,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next
@@ -1167,6 +1393,7 @@ mod tests {
             tail_tool_output_chars: 0,
             tail_largest_tool_output_chars: 0,
             tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
         };
         let record = UsageRecord {
             input_tokens: 200_048,
@@ -1188,6 +1415,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
             .next

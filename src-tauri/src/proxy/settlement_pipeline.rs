@@ -185,17 +185,39 @@ pub(super) async fn finalize_agent_generation(
     }
     if let (Some(decision), Some(observation)) = (shadow_affinity.as_ref(), shadow_observation) {
         if let Some(run_id) = decision.validation_run_id.as_deref() {
-            state.cache_validation.lock().await.observe(
+            let candidate_fields = diagnostics
+                .and_then(|diagnostics| {
+                    diagnostics.final_wire_receipt.as_ref().map(|receipt| {
+                        controlled_cache_probe_fields_on_final_wire(
+                            &diagnostics.controlled_cache_probe_fields,
+                            receipt,
+                            None,
+                        )
+                    })
+                })
+                .unwrap_or_default();
+            let completion = state.cache_validation.lock().await.observe(
                 run_id,
                 CacheValidationObservation {
                     success: observation.success,
+                    usage_observed: observation.has_usage,
                     input_tokens: observation.input_tokens,
                     cache_read_tokens: observation.cache_read_tokens,
                     ttft_ms: validation_ttft_ms,
-                    candidate_applied: decision.decision == "validation_candidate_applied",
+                    candidate_applied: decision.decision == "validation_candidate_applied"
+                        && !candidate_fields.is_empty(),
+                    candidate_fields,
+                    candidate_breakpoint_placement_digest: diagnostics.and_then(|diagnostics| {
+                        diagnostics
+                            .controlled_cache_probe_breakpoint_placement_digest
+                            .clone()
+                    }),
                 },
                 Utc::now(),
             );
+            if let Some(evidence) = completion.and_then(|completion| completion.effect_evidence()) {
+                record_cache_validation_effect(state, evidence).await;
+            }
         }
         let mut store = state.shadow_affinity.lock().await;
         cache_affinity::observe_shadow_affinity(&mut store, decision, observation, Utc::now());
@@ -210,6 +232,31 @@ pub(super) async fn finalize_agent_generation(
             .await;
         state.journal_runtime_state();
     }
+}
+
+async fn record_cache_validation_effect(
+    state: &AppState,
+    evidence: cache_validation::CacheValidationEffectEvidence,
+) {
+    let mut config = state.config.write().await;
+    config.record_cache_capability_effect_for_scope(
+        &evidence.provider_id,
+        &evidence.model,
+        &evidence.channel,
+        evidence.key_id.as_deref(),
+        Some(&evidence.effect_scope_id),
+        &evidence.fields,
+        evidence.status,
+        Some(evidence.message),
+        Some(evidence.baseline_cache_read_tokens),
+        Some(evidence.candidate_cache_read_tokens),
+        Some(evidence.baseline_ttft_ms),
+        Some(evidence.candidate_ttft_ms),
+    );
+    // Settlement runs after the terminal metric commit and must not wait for
+    // disk. The versioned write-behind journal preserves ordering while the
+    // stream owner remains free to finish other work.
+    state.journal_config(&config);
 }
 
 fn apply_shadow_affinity_log_fields(

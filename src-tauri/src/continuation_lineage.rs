@@ -33,6 +33,9 @@ pub struct ResponseSessionState {
 #[derive(Debug, Clone)]
 pub struct ResponseSessionCandidate {
     pub response_id: String,
+    /// Final-wire metadata is kept next to, not inside, the semantic input.
+    /// It is never a substitute for the original full replay input.
+    pub breakpoint_placement_digest: Option<String>,
     pub input: Value,
     pub output_items: Vec<Value>,
     pub finished_at: Instant,
@@ -44,6 +47,7 @@ pub struct LineageLease {
     epoch: u64,
     expected_generation: u64,
     head: Option<Arc<ResponseSessionState>>,
+    breakpoint_placement_digest: Option<String>,
 }
 
 impl LineageLease {
@@ -66,6 +70,12 @@ impl LineageLease {
 
     pub fn head(&self) -> Option<&Arc<ResponseSessionState>> {
         self.head.as_ref()
+    }
+
+    /// The exact final-wire cache-control position associated with this head.
+    /// `None` is a real value and must match the next FullReplay exactly.
+    pub fn breakpoint_placement_digest(&self) -> Option<&str> {
+        self.breakpoint_placement_digest.as_deref()
     }
 }
 
@@ -145,6 +155,7 @@ pub(crate) struct LineageSlot {
     epoch: u64,
     generation: u64,
     head: Option<Arc<ResponseSessionState>>,
+    breakpoint_placement_digest: Option<String>,
     updated_at: Instant,
 }
 
@@ -278,6 +289,9 @@ impl ContinuationLineageIndex {
             // stale lineage; the generation/epoch CAS still prevents a late
             // sibling from overwriting newer state.
             head: publication_completed.then(|| slot.head.clone()).flatten(),
+            breakpoint_placement_digest: publication_completed
+                .then(|| slot.breakpoint_placement_digest.clone())
+                .flatten(),
         };
         let slot_count = slots.len();
         drop(slots);
@@ -310,6 +324,7 @@ impl ContinuationLineageIndex {
             epoch: slot.epoch,
             expected_generation: slot.generation,
             head: None,
+            breakpoint_placement_digest: None,
         };
         slots.insert(key.to_string(), slot);
         let slot_count = slots.len();
@@ -337,6 +352,7 @@ impl ContinuationLineageIndex {
             epoch: slot.epoch,
             expected_generation: slot.generation,
             head: None,
+            breakpoint_placement_digest: None,
         };
         slots.insert(lease.key.clone(), slot);
         let slot_count = slots.len();
@@ -488,6 +504,7 @@ impl ContinuationLineageIndex {
                 epoch: self.allocate_epoch(),
                 generation,
                 head: Some(Arc::new(state)),
+                breakpoint_placement_digest: None,
                 updated_at: Instant::now(),
             },
         );
@@ -509,6 +526,7 @@ impl ContinuationLineageIndex {
             epoch: self.allocate_epoch(),
             generation,
             head,
+            breakpoint_placement_digest: None,
             updated_at: Instant::now(),
         }
     }
@@ -612,6 +630,7 @@ fn apply_commit(
     });
     slot.generation = generation;
     slot.head = Some(head);
+    slot.breakpoint_placement_digest = candidate.breakpoint_placement_digest;
     slot.updated_at = Instant::now();
     LineageCommitOutcome::Applied { generation }
 }
@@ -663,6 +682,7 @@ mod tests {
     fn candidate(response_id: &str, input: &str) -> ResponseSessionCandidate {
         ResponseSessionCandidate {
             response_id: response_id.to_string(),
+            breakpoint_placement_digest: None,
             input: json!([{"type":"message","role":"user","content":input}]),
             output_items: Vec::new(),
             finished_at: Instant::now(),

@@ -3,7 +3,10 @@ use crate::{
     metrics::ResponsesWirePrefixFingerprints,
 };
 
-use super::{action_scope::CompositeActionScope, generation_envelope::GenerationEnvelope};
+use super::{
+    action_scope::CompositeActionScope, generation_envelope::GenerationEnvelope,
+    prepared_wire_request::ProtocolBreakpointProvenance,
+};
 
 /// A deep, observe-only cache-control seam. It owns no mutable state, waits,
 /// locks, persistence, or network client. Future phases may use its receipts
@@ -71,7 +74,9 @@ pub(super) struct PreparedWireDigest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FinalCacheControls {
     pub(super) present_field_mask: u8,
-    pub(super) breakpoint_present: bool,
+    /// Source and exact placement are bound to the frozen wire. A caller's
+    /// lookalike marker can therefore never authorize a cache rule.
+    pub(super) breakpoint_provenance: ProtocolBreakpointProvenance,
 }
 
 impl FinalCacheControls {
@@ -86,6 +91,18 @@ impl FinalCacheControls {
         .enumerate()
         .filter_map(|(bit, field)| ((self.present_field_mask & (1 << bit)) != 0).then_some(field))
         .collect()
+    }
+
+    pub(super) const fn breakpoint_present(&self) -> bool {
+        self.breakpoint_provenance.is_present()
+    }
+
+    pub(super) const fn breakpoint_is_atoapi_injected(&self) -> bool {
+        self.breakpoint_provenance.is_atoapi_injected()
+    }
+
+    pub(super) fn breakpoint_placement_digest(&self) -> Option<&str> {
+        self.breakpoint_provenance.placement_digest()
     }
 }
 
@@ -122,13 +139,13 @@ impl CacheControlPlan {
         let plan = envelope.request_plan();
         let prepared = plan.wire();
         let body = envelope.body();
-        // Breakpoint presence is captured from the exact frozen JSON bytes by
-        // the prepared wire. This avoids a recursive Value walk over a large
-        // Agent input before dispatch.
-        let breakpoint_present = prepared.prompt_cache_breakpoint_present();
+        // Breakpoint provenance is captured while the final wire is frozen.
+        // Do not rescan the mutable body: source ownership matters as much as
+        // its protocol position for any future cache promotion.
+        let breakpoint_provenance = prepared.protocol_breakpoint_provenance().clone();
         let cache_controls = FinalCacheControls {
-            present_field_mask: cache_control_mask(body, breakpoint_present),
-            breakpoint_present,
+            present_field_mask: cache_control_mask(body, breakpoint_provenance.is_present()),
+            breakpoint_provenance,
         };
         // This receipt intentionally carries only the strict lineage tuple.
         // Exact request bytes are already owned immutably by GenerationEnvelope;
@@ -308,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn frozen_cache_control_receipt_reuses_exact_wire_breakpoint_presence() {
+    fn frozen_cache_control_receipt_rejects_caller_owned_breakpoint() {
         let nested = receipt(
             json!({
                 "model":"gpt-test",
@@ -324,12 +341,50 @@ mod tests {
             CacheContextMode::FullReplay,
         );
 
-        assert!(nested.cache_controls.breakpoint_present);
+        assert!(nested.cache_controls.breakpoint_present());
+        assert!(!nested.cache_controls.breakpoint_is_atoapi_injected());
+        assert!(nested
+            .cache_controls
+            .breakpoint_placement_digest()
+            .is_none());
         assert_eq!(nested.cache_controls.present_field_mask, 1 << 3);
         assert_eq!(
             nested.cache_controls.present_fields(),
             vec![ProviderCacheCapabilityField::PromptCacheBreakpoint]
         );
+    }
+
+    #[test]
+    fn frozen_cache_control_receipt_accepts_only_the_insertion_witness() {
+        let body = json!({
+            "model":"gpt-test",
+            "input":[{"type":"message","content":[{
+                "type":"input_text",
+                "text":"stable",
+                "prompt_cache_breakpoint":{"mode":"explicit"}
+            }]}]
+        });
+        let mut prepared = PreparedResponseBody::responses(body);
+        prepared.mark_atoapi_protocol_breakpoint_injected();
+        let envelope = GenerationEnvelope::freeze(
+            &provider(),
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            prepared,
+        );
+        let receipt = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: Some(&action_scope()),
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: Some(3),
+        })
+        .seal(&envelope);
+
+        assert!(receipt.cache_controls.breakpoint_is_atoapi_injected());
+        assert!(receipt
+            .cache_controls
+            .breakpoint_placement_digest()
+            .is_some());
     }
 
     #[test]

@@ -18,28 +18,25 @@ export function providerCloneMatchesSource(
 
 export function providersForGraphiteAgent(
   providers: ProviderConfig[],
-  agent: AgentInjectionConfig
+  agent: AgentInjectionConfig,
+  providerOrder: readonly string[] = []
 ): ProviderConfig[] {
-  const hiddenProviderIds = new Set(agent.hidden_provider_ids ?? []);
-  const ownedProviders = providers.filter((provider) => providerBelongsToAgent(provider.id, agent.id));
-  const sharedProviders = providers.filter((provider) => !provider.id.startsWith("agent-"));
-  const clonedSourceIds = new Set(
-    ownedProviders
-      .map((privateProvider) =>
-        sharedProviders
-          .slice()
-          .sort((left, right) => right.id.length - left.id.length)
-          .find((sharedProvider) =>
-            providerCloneMatchesSource(privateProvider.id, sharedProvider.id, agent.id)
-          )?.id
-      )
-      .filter((id): id is string => Boolean(id))
-  );
-
-  return providers.filter((provider) => {
-    if (provider.id.startsWith("agent-")) return providerBelongsToAgent(provider.id, agent.id);
-    return !clonedSourceIds.has(provider.id) && !hiddenProviderIds.has(provider.id);
-  });
+  // New providers are private to the Agent page that created them. Retain a
+  // legacy shared provider only when this Agent is still explicitly bound to
+  // it, so a user can select/clone it without suddenly seeing every other
+  // Agent's historical provider list.
+  const orderIndex = new Map(providerOrder.map((providerId, index) => [providerId, index]));
+  return providers
+    .map((provider, sourceIndex) => ({ provider, sourceIndex }))
+    .filter(({ provider }) =>
+    providerBelongsToAgent(provider.id, agent.id) || provider.id === agent.provider_id
+    )
+    .sort((left, right) => {
+      const leftOrder = orderIndex.get(left.provider.id) ?? Number.MAX_SAFE_INTEGER;
+      const rightOrder = orderIndex.get(right.provider.id) ?? Number.MAX_SAFE_INTEGER;
+      return leftOrder - rightOrder || left.sourceIndex - right.sourceIndex;
+    })
+    .map(({ provider }) => provider);
 }
 
 function providerIdPart(value: string): string {

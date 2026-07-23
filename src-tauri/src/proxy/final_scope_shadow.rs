@@ -4,7 +4,7 @@ use crate::config::Channel;
 
 use super::cache_control_core::FinalWireReceipt;
 
-const FINAL_SCOPE_SHADOW_VERSION: u8 = 4;
+const FINAL_SCOPE_SHADOW_VERSION: u8 = 6;
 
 /// Derives request-local evidence for a future final-scope cache controller.
 /// This module is deliberately observe-only: it owns no mutable state and
@@ -32,6 +32,8 @@ pub(super) struct FinalScopeShadowReceipt {
     /// compaction or recreated session and therefore must remain ineligible.
     pub(super) missing_lineage_epoch: bool,
     pub(super) unsupported_evidence_version: bool,
+    /// A breakpoint on the final wire is safe to observe only when its exact
+    /// protocol placement was sealed with the frozen request.
     pub(super) ambiguous_breakpoint_placement: bool,
 }
 
@@ -58,7 +60,15 @@ impl FinalScopeShadow {
         let unsupported_evidence_version = scope.version != 1
             || input.final_wire.semantic.version != 2
             || input.final_wire.wire.version != 2;
-        let ambiguous_breakpoint_placement = input.final_wire.cache_controls.breakpoint_present;
+        let breakpoint_placement = input
+            .final_wire
+            .cache_controls
+            .breakpoint_placement_digest();
+        let ambiguous_breakpoint_placement = input.final_wire.cache_controls.breakpoint_present()
+            && !input
+                .final_wire
+                .cache_controls
+                .breakpoint_is_atoapi_injected();
         let scope_version = scope.version.to_string();
         let wire_version = input.final_wire.wire.version.to_string();
         let semantic_version = input.final_wire.semantic.version.to_string();
@@ -74,13 +84,14 @@ impl FinalScopeShadow {
             .map(|epoch| epoch.to_string())
             .unwrap_or_else(|| "none".to_string());
         let digest = hash_parts(&[
-            "final-prefix-scope-shadow-v4",
+            "final-prefix-scope-shadow-v6",
             &scope_version,
             scope_digest.unwrap_or("unscoped"),
             key_realm.unwrap_or("unscoped-key"),
             &wire_version,
             final_wire_static_projection.unwrap_or("missing-final-wire-static-projection"),
             &cache_control_mask,
+            breakpoint_placement.unwrap_or("no-breakpoint-placement"),
             &semantic_version,
             &input.final_wire.semantic.context_mode,
             &lineage_epoch,
@@ -148,7 +159,8 @@ mod tests {
             },
             cache_controls: FinalCacheControls {
                 present_field_mask: 1,
-                breakpoint_present: false,
+                breakpoint_provenance:
+                    crate::proxy::prepared_wire_request::ProtocolBreakpointProvenance::Absent,
             },
         }
     }
@@ -307,10 +319,19 @@ mod tests {
         assert!(!missing.eligible_for_shadow_observation);
 
         let mut breakpoint = receipt();
-        breakpoint.cache_controls.breakpoint_present = true;
+        breakpoint.cache_controls.breakpoint_provenance =
+            crate::proxy::prepared_wire_request::ProtocolBreakpointProvenance::AmbiguousOrForeign;
         let ambiguous = FinalScopeShadow::derive(input(&breakpoint)).unwrap();
         assert!(ambiguous.ambiguous_breakpoint_placement);
         assert!(!ambiguous.eligible_for_shadow_observation);
+
+        breakpoint.cache_controls.breakpoint_provenance =
+            crate::proxy::prepared_wire_request::ProtocolBreakpointProvenance::AtoapiInjected {
+                placement_digest: "v1:stable-placement".to_string(),
+            };
+        let precise = FinalScopeShadow::derive(input(&breakpoint)).unwrap();
+        assert!(!precise.ambiguous_breakpoint_placement);
+        assert!(precise.eligible_for_shadow_observation);
 
         let mut future_wire_version = receipt();
         future_wire_version.wire.version = 3;
