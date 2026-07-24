@@ -99,6 +99,10 @@ pub(super) struct CacheValidationScope {
     pub(super) realm_id: String,
     pub(super) stream: Option<bool>,
     pub(super) store: Option<bool>,
+    /// Present only for generated prompt-cache-key validation. This is a
+    /// one-way digest of the exact trusted session placement identity, so a
+    /// baseline from one conversation cannot promote another conversation.
+    pub(super) generated_key_session_scope_id: Option<String>,
 }
 
 impl CacheValidationScope {
@@ -118,6 +122,27 @@ impl CacheValidationScope {
             "cache-effect-v2:{}:{}:{}:bp={breakpoint}",
             self.realm_id, stream, store
         )
+    }
+
+    /// Prompt-cache keys use a distinct certificate because the field is
+    /// generated from the selected Key realm and session identity, rather
+    /// than forwarded from the caller or shared with another control.
+    pub(super) fn generated_prompt_cache_key_effect_scope_id(&self) -> Option<String> {
+        let session_scope = self.generated_key_session_scope_id.as_deref()?;
+        let stream = match self.stream {
+            Some(true) => "stream",
+            Some(false) => "sync",
+            None => "stream-absent",
+        };
+        let store = match self.store {
+            Some(true) => "store",
+            Some(false) => "no-store",
+            None => "store-absent",
+        };
+        Some(format!(
+            "cache-effect-v4:{}:{}:{}:pk=realm-session-v1:sid={session_scope}",
+            self.realm_id, stream, store
+        ))
     }
 }
 
@@ -149,7 +174,7 @@ pub(super) struct CacheValidationEffectEvidence {
 impl CacheValidationCompletion {
     /// Effect evidence is intentionally emitted only after both arms reached
     /// their normal traffic targets in one exact upstream realm. A positive
-    /// key result remains probe-only when persisted by AppConfig.
+    /// generated-key result receives its own strategy-bound certificate.
     pub(super) fn effect_evidence(&self) -> Option<CacheValidationEffectEvidence> {
         let candidate = &self.summary;
         let baseline = self.baseline.as_ref()?;
@@ -200,13 +225,20 @@ impl CacheValidationCompletion {
         } else {
             "controlled validation reached target without a 128-token real cache gain".to_string()
         };
+        let effect_scope_id = if self
+            .candidate_fields
+            .contains(&ProviderCacheCapabilityField::PromptCacheKey)
+        {
+            scope.generated_prompt_cache_key_effect_scope_id()?
+        } else {
+            scope.effect_scope_id(self.candidate_breakpoint_placement_digest.as_deref())
+        };
         Some(CacheValidationEffectEvidence {
             provider_id: candidate.provider_id.clone(),
             model: candidate.model.clone(),
             channel: scope.channel.clone(),
             key_id: scope.key_id.clone(),
-            effect_scope_id: scope
-                .effect_scope_id(self.candidate_breakpoint_placement_digest.as_deref()),
+            effect_scope_id,
             fields: self.candidate_fields.clone(),
             status,
             message,
@@ -695,6 +727,7 @@ mod tests {
             realm_id: realm_id.to_string(),
             stream: Some(true),
             store: Some(false),
+            generated_key_session_scope_id: Some("a".repeat(64)),
         }
     }
 
@@ -804,6 +837,32 @@ mod tests {
                 .mode,
             CacheValidationMode::Auto
         );
+    }
+
+    #[test]
+    fn generated_key_validation_never_crosses_session_scope() {
+        let now = Utc::now();
+        let mut controller = CacheValidationController::default();
+        controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+
+        let trusted_session_a = scope("realm-a");
+        let trusted_session_b = CacheValidationScope {
+            generated_key_session_scope_id: Some("b".repeat(64)),
+            ..trusted_session_a.clone()
+        };
+
+        assert!(controller
+            .selection("provider-a", "gpt-main", trusted_session_a, now)
+            .is_some());
+        assert!(controller
+            .selection("provider-a", "gpt-main", trusted_session_b, now)
+            .is_none());
     }
 
     #[test]
@@ -1011,6 +1070,25 @@ mod tests {
         assert_ne!(
             stream_no_store.effect_scope_id(None),
             stream_store.effect_scope_id(None)
+        );
+        assert_eq!(
+            stream_no_store.generated_prompt_cache_key_effect_scope_id(),
+            Some(
+                "cache-effect-v4:realm-a:stream:no-store:pk=realm-session-v1:sid=".to_string()
+                    + &"a".repeat(64)
+            )
+        );
+        assert_ne!(
+            stream_no_store.generated_prompt_cache_key_effect_scope_id(),
+            Some(stream_no_store.effect_scope_id(None))
+        );
+        assert_eq!(
+            CacheValidationScope {
+                generated_key_session_scope_id: None,
+                ..stream_no_store.clone()
+            }
+            .generated_prompt_cache_key_effect_scope_id(),
+            None
         );
     }
 

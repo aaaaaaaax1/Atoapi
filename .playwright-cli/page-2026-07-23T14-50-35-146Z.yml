@@ -1,0 +1,154 @@
+- iframe [active] [ref=e3]:
+  - generic [active] [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e9] [cursor=pointer]:
+            - strong [ref=f1e10]: Atoapi
+            - generic [ref=f1e11]: Graphite · v1.3.7
+        - tablist "Agent 列表" [ref=f1e12]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e447] [cursor=pointer]:
+            - generic [ref=f1e453]:
+              - generic [ref=f1e454]: Claude Code
+              - generic [ref=f1e455]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e457] [cursor=pointer]:
+            - generic [ref=f1e461]:
+              - generic [ref=f1e462]: Claude Desktop
+              - generic [ref=f1e463]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e465] [cursor=pointer]:
+            - generic [ref=f1e470]:
+              - generic [ref=f1e471]: Codex
+              - generic [ref=f1e472]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e474] [cursor=pointer]:
+            - generic [ref=f1e478]:
+              - generic [ref=f1e479]: Gemini
+              - generic [ref=f1e480]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e482] [cursor=pointer]:
+            - generic [ref=f1e487]:
+              - generic [ref=f1e488]: OpenCode
+              - generic [ref=f1e489]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e491] [cursor=pointer]:
+            - generic [ref=f1e496]:
+              - generic [ref=f1e497]: OpenClaw
+              - generic [ref=f1e498]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e500] [cursor=pointer]:
+            - generic [ref=f1e508]:
+              - generic [ref=f1e509]: Hermes
+              - generic [ref=f1e510]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e512] [cursor=pointer]:
+            - generic [ref=f1e521]:
+              - generic [ref=f1e522]: 本地代理模式
+              - generic [ref=f1e523]: 已关闭
+        - generic [ref=f1e71]:
+          - generic [ref=f1e72]:
+            - generic [ref=f1e73]: 代理运行中
+            - generic [ref=f1e74]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e75] [cursor=pointer]
+      - region [ref=f1e310]:
+        - generic [ref=f1e82]:
+          - switch "启用当前 Agent" [ref=f1e83] [cursor=pointer]
+          - generic [ref=f1e84]:
+            - heading "Claude Code" [level=1] [ref=f1e311]
+            - paragraph [ref=f1e86]: 未选择上游
+        - generic [ref=f1e87]:
+          - generic [ref=f1e530]:
+            - generic [ref=f1e531]: Base URL
+            - code [ref=f1e532]: http://127.0.0.1:18883/v1
+            - button "复制 Base URL" [ref=f1e533] [cursor=pointer]
+          - generic [ref=f1e537]:
+            - generic [ref=f1e538]: Local Key
+            - code [ref=f1e539]: ato-local-preview
+            - button "复制本地 Key" [ref=f1e540] [cursor=pointer]
+        - button "新增上游" [ref=f1e103] [cursor=pointer]
+      - main [ref=f1e106]:
+        - generic [ref=f1e107]:
+          - generic [ref=f1e108]:
+            - generic [ref=f1e109]:
+              - heading "上游路由" [level=2] [ref=f1e110]
+              - paragraph [ref=f1e111]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f1e112]:
+              - generic [ref=f1e113]: 1 个可用上游
+              - generic [ref=f1e114]: 一次入站 · 一次上游
+          - article [ref=f1e545]:
+            - generic "拖动调整上游顺序" [ref=f1e546]
+            - generic [ref=f1e550]:
+              - generic [ref=f1e551]: Key repro provider
+              - generic [ref=f1e552]: https://example.test/v1
+            - generic [ref=f1e553]:
+              - generic [ref=f1e554]:
+                - generic [ref=f1e555]: Responses
+                - generic [ref=f1e556]: · Agent 直传
+                - generic [ref=f1e557]: · 1 Key
+              - generic [ref=f1e558]:
+                - generic [ref=f1e559]: 最近连通
+                - generic [ref=f1e560]: 未检测
+            - generic [ref=f1e561]:
+              - button "使用" [ref=f1e562] [cursor=pointer]
+              - button "测试 Key repro provider 连通性" [ref=f1e567] [cursor=pointer]
+              - button "编辑 Key repro provider" [ref=f1e570] [cursor=pointer]
+              - button "删除 Key repro provider" [ref=f1e574] [cursor=pointer]
+      - contentinfo [ref=f1e214]:
+        - button "打开缓存统计与请求记录" [ref=f1e215] [cursor=pointer]:
+          - generic [ref=f1e220]: 缓存与记录
+          - generic [ref=f1e221]:
+            - text: 命中率
+            - strong [ref=f1e582]: —
+          - generic [ref=f1e223]: — 成功
+    - dialog [ref=f1e647]:
+      - banner [ref=f1e384]:
+        - generic [ref=f1e385]:
+          - heading "编辑上游" [level=2] [ref=f1e648]
+          - paragraph [ref=f1e387]: Key repro provider · Responses
+        - button "关闭上游编辑器" [ref=f1e388] [cursor=pointer]
+      - generic [ref=f1e393]:
+        - tablist "上游配置分类" [ref=f1e394]:
+          - tab "连接信息" [selected] [ref=f1e395] [cursor=pointer]
+          - tab "模型映射" [ref=f1e396] [cursor=pointer]
+          - tab "多 Key" [ref=f1e397] [cursor=pointer]
+          - tab "传输与缓存" [ref=f1e398] [cursor=pointer]
+          - tab "兼容性" [ref=f1e399] [cursor=pointer]
+        - generic [ref=f1e401]:
+          - generic [ref=f1e402]:
+            - generic [ref=f1e404]:
+              - heading "连接信息" [level=3] [ref=f1e405]
+              - paragraph [ref=f1e406]: 模型列表仅用于辅助添加映射，不影响基础代理。
+            - generic [ref=f1e407]:
+              - generic [ref=f1e408]:
+                - generic [ref=f1e409]: 上游名称
+                - textbox "上游名称" [ref=f1e410]: Key repro provider
+              - generic [ref=f1e411]:
+                - generic [ref=f1e412]: 通道
+                - combobox "通道" [ref=f1e413]:
+                  - option "Auto"
+                  - option "Responses" [selected]
+                  - option "Chat"
+                  - option "Anthropic"
+              - generic [ref=f1e414]:
+                - generic [ref=f1e415]: Base URL
+                - textbox "Base URL" [ref=f1e416]: https://example.test/v1
+              - generic [ref=f1e417]:
+                - generic [ref=f1e418]: API Key
+                - generic [ref=f1e419]:
+                  - textbox "API Key 显示 API Key" [ref=f1e420]:
+                    - /placeholder: 已保存 Key（留空则不修改）
+                  - button "显示 API Key" [ref=f1e421] [cursor=pointer]
+              - generic [ref=f1e425]:
+                - generic [ref=f1e426]: Models URL（可选）
+                - textbox "Models URL（可选）" [ref=f1e427]
+          - generic [ref=f1e428]:
+            - generic [ref=f1e429]:
+              - generic [ref=f1e430]:
+                - heading "连接测试" [level=3] [ref=f1e431]
+                - paragraph [ref=f1e432]: 诊断只在用户点击后执行。
+              - button "测试连接" [ref=f1e433] [cursor=pointer]
+            - generic [ref=f1e436]:
+              - generic [ref=f1e437]:
+                - generic [ref=f1e438]: 使用系统代理
+                - generic [ref=f1e439]: 当前选择：直连
+              - switch "使用系统代理" [checked] [ref=f1e440] [cursor=pointer]
+      - contentinfo [ref=f1e441]:
+        - button "删除" [ref=f1e657] [cursor=pointer]
+        - button "取消" [ref=f1e442] [cursor=pointer]
+        - button "保存上游" [ref=f1e443] [cursor=pointer]
+    - status: "Error: 请先填写 API Key"

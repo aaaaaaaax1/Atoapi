@@ -2421,6 +2421,7 @@ fn apply_automatic_static_cohort_canary_with_switch(
     true
 }
 
+#[cfg(test)]
 pub(super) fn static_cohort_prompt_cache_key(decision: &ShadowAffinityDecision) -> Option<String> {
     if !matches!(decision.mode.as_str(), "applied" | "validation_applied") {
         return None;
@@ -2446,6 +2447,7 @@ fn cohort_two_shard_index(assignment_key: &str) -> u8 {
     Sha256::digest(assignment_key.as_bytes())[0] % 2
 }
 
+#[cfg(test)]
 pub(super) fn provider_native_candidate_applied(decision: &ShadowAffinityDecision) -> bool {
     matches!(decision.mode.as_str(), "applied" | "validation_applied")
         && decision.candidate_variant == ShadowCacheCandidateVariant::ProviderNative

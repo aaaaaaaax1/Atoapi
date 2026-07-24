@@ -13,6 +13,7 @@ import {
   type ModelConfig,
   type ProviderConfig,
   type ProviderCacheCapabilityProbeResult,
+  type ProviderConnectionPathTestResult,
   type ProviderInput,
   type ProviderKeyTestResult,
   type ProviderNetworkPathDiagnosticResult,
@@ -26,7 +27,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.3.7";
+const APP_VERSION = "v1.3.8";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -395,37 +396,57 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       };
     }
     if (action === "test-provider") {
-      const provider = config?.providers.find((item) => item.id === text("providerId"));
+      const draft = providerPayload();
+      const providerId = text("providerId") || draft.id || "";
+      const provider = config?.providers.find((item) => item.id === providerId);
       if (!provider) {
-        const draft = providerPayload();
         const input = draftProviderTestInput(draft, null);
         if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
-        if (!input.api_key?.trim()) throw new Error("请先填写 API Key");
+        const savedProvider = input.provider_id
+          ? config?.providers.find((item) => item.id === input.provider_id)
+          : undefined;
+        if (!input.api_key?.trim() && !savedProvider) throw new Error("请先填写 API Key");
         const startedAt = performance.now();
-        const result = await command<ProviderKeyTestResult>("test_provider_key", { input });
+        const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", { input });
         const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+        const selectedPath = result.paths.find((path) =>
+          result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
+        );
+        const pathLabel = result.recommended_use_system_proxy ? "系统代理" : "直连";
         const statusKey = `draft:${draft.name || draft.base_url}`;
         setProviderConnectionStatus((current) => ({
           ...current,
-          [statusKey]: result.ok ? `刚刚成功 · ${elapsedMs}ms` : `失败 · ${elapsedMs}ms`
+          [statusKey]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
         }));
         return result.ok
-          ? { notice: `${draft.name || "未保存上游"} 连通正常${result.models_count ? ` · ${result.models_count} 个模型` : ""}` }
+          ? {
+              notice: `${draft.name || "未保存上游"} 连通正常 · ${pathLabel}更快${selectedPath ? ` ${selectedPath.elapsed_ms}ms` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；已更新当前开关，保存后生效`,
+              payload: { connectionTest: result }
+            }
           : { error: result.message };
       }
-      if (!provider) throw new Error("请先保存上游，再测试连通性");
+      const input = draft.id === provider.id
+        ? draftProviderTestInput(draft, null)
+        : providerTestInput(provider, null);
+      if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
       const startedAt = performance.now();
-      const result = await command<ProviderKeyTestResult>("test_provider_key", {
-        input: providerTestInput(provider, null)
+      const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", {
+        input
       });
       const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+      const selectedPath = result.paths.find((path) =>
+        result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
+      );
+      const pathLabel = result.recommended_use_system_proxy ? "系统代理" : "直连";
       setProviderConnectionStatus((current) => ({
         ...current,
-        [provider.id]: result.ok ? `刚刚成功 · ${elapsedMs}ms` : `失败 · ${elapsedMs}ms`
+        [provider.id]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
       }));
-      await refreshAll();
       return result.ok
-        ? { notice: `${provider.name} 连通正常${result.models_count ? ` · ${result.models_count} 个模型` : ""}` }
+        ? {
+            notice: `${provider.name} 连通正常 · ${pathLabel}更快${selectedPath ? ` ${selectedPath.elapsed_ms}ms` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；已更新当前开关，保存后生效`,
+            payload: { connectionTest: result }
+          }
         : { error: result.message };
     }
     if (action === "test-provider-key") {

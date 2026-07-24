@@ -2729,6 +2729,29 @@ async fn run_generation_for_authorized_agent(
         } else {
             (None, false)
         };
+    // A generated cache placement key is only safe when the request carries a
+    // trusted explicit conversation identity. Content anchors are useful for
+    // local diagnostics, but cannot authorize upstream cache sharing.
+    let trusted_generated_cache_identity = session_identity
+        .as_ref()
+        .filter(|identity| session_identity_source_is_trusted(identity.source));
+    let generated_prompt_cache_key_value = trusted_generated_cache_identity
+        .map(|identity| generated_prompt_cache_key(identity, &decision, &selected_provider_key));
+    let generated_key_session_scope_id = generated_prompt_cache_key_value
+        .as_deref()
+        .map(generated_prompt_cache_key_session_scope_id);
+    // Only the generated-key experiment has session-scoped evidence. Retention
+    // and options candidates must continue to compare within their ordinary
+    // selected-Key realm; attaching a generated-key digest to those runs would
+    // make a valid baseline look like a different scope.
+    let controlled_probe_fields = controlled_cache_probe_fields(
+        &config,
+        &decision,
+        &active_request_channel,
+        selected_provider_key.key_id.as_deref(),
+    );
+    let validation_uses_generated_key_scope =
+        controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
     let validation_scope = cache_validation::CacheValidationScope {
         channel: active_request_channel.clone(),
         key_id: selected_provider_key.key_id.clone(),
@@ -2741,7 +2764,30 @@ async fn run_generation_for_authorized_agent(
             .body()
             .get("store")
             .and_then(Value::as_bool),
+        generated_key_session_scope_id: validation_uses_generated_key_scope
+            .then(|| generated_key_session_scope_id.clone())
+            .flatten(),
     };
+    let generated_prompt_cache_key_scope_id = cache_validation::CacheValidationScope {
+        generated_key_session_scope_id: generated_key_session_scope_id.clone(),
+        ..validation_scope.clone()
+    }
+    .generated_prompt_cache_key_effect_scope_id();
+    let generated_prompt_cache_key_eligible = agent_generation
+        && native_responses_passthrough
+        && matches!(active_request_channel, Channel::Responses)
+        && !active_used_response_session
+        && !response_session_starts_compaction_epoch
+        && matches!(&response_session_parent, LineageParent::FullReplay)
+        && trusted_generated_cache_identity.is_some();
+    let generated_prompt_cache_key_promoted = generated_prompt_cache_key_eligible
+        && config.generated_prompt_cache_key_promoted_for_scope(
+            &decision.provider.id,
+            &decision.model,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+            generated_prompt_cache_key_scope_id.as_deref(),
+        );
     let predicted_breakpoint_scope_id =
         if cfg!(test) && matches!(active_request_channel, Channel::Responses) {
             cache_capability::predicted_responses_breakpoint_placement_digest(
@@ -2777,16 +2823,25 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
-    let controlled_probe_fields = controlled_cache_probe_fields(
-        &config,
-        &decision,
-        &active_request_channel,
-        selected_provider_key.key_id.as_deref(),
-    );
-    // `prompt_cache_key` is a diagnostic-only control. Do not admit any
-    // automatic/static cohort route, regardless of an older capability record
-    // or a caller-provided key. The sole mutation path below is a manually
-    // selected candidate run with exact field-acceptance evidence.
+    // Restore the v1.3.6 placement behavior only for an Atoapi-generated key
+    // in a trusted, selected-Key realm. An explicit field rejection records
+    // `Unsupported` for this exact scope and turns this path off without a
+    // retry. Manual key validation still gets a clean no-key baseline.
+    let generated_prompt_cache_key_recovery_enabled = generated_prompt_cache_key_eligible
+        && smart_hit_enabled(&config)
+        && generated_prompt_cache_key_compatibility_allowed(
+            &config,
+            &decision,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        )
+        && !validation_selection.as_ref().is_some_and(|selection| {
+            selection.mode == cache_validation::CacheValidationMode::Baseline
+                && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey)
+        });
+    // A generated placement key may also be measured in an explicit candidate
+    // run. Promotion certificates remain exact-session scoped, so they cannot
+    // make a different conversation eligible.
     let candidate_cache_routing_requested =
         shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let channel_eligible =
@@ -2797,9 +2852,16 @@ async fn run_generation_for_authorized_agent(
                     && controlled_probe_fields
                         .contains(&ProviderCacheCapabilityField::PromptCacheKey)
                 {
-                    // Explicit key validation needs an actual generated key;
-                    // it must not inherit a provider-native candidate variant
-                    // that would leave the probe wire unchanged.
+                    if !generated_prompt_cache_key_eligible {
+                        decision.mode = "validation".to_string();
+                        decision.decision = "validation_candidate_skipped".to_string();
+                        decision.skip_reason = Some(
+                            "generated_prompt_cache_key_requires_native_full_replay".to_string(),
+                        );
+                        return false;
+                    }
+                    // The candidate uses the same selected-realm/session key
+                    // that a later promotion will send on ordinary traffic.
                     decision.candidate_variant =
                         cache_affinity::ShadowCacheCandidateVariant::CohortKey;
                 }
@@ -2815,20 +2877,12 @@ async fn run_generation_for_authorized_agent(
             if !can_apply {
                 return false;
             }
-            if controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey) {
-                let outcome =
-                    apply_candidate_prompt_cache_routing(&mut active_upstream_body, decision);
-                if outcome.applied {
-                    provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
-                }
-                return outcome.applied;
-            }
             // Provider-native controls are injected below from the exact
             // selected field set. Mark the candidate now without altering a
             // placement key.
             true
         });
-    let cache_control_application = apply_native_cache_controls_with_probe_fields(
+    let mut cache_control_application = apply_native_cache_controls_with_probe_fields(
         &mut active_upstream_body,
         &config,
         &decision,
@@ -2841,6 +2895,22 @@ async fn run_generation_for_authorized_agent(
             &[]
         },
     );
+    let generated_prompt_cache_key_requested = candidate_cache_routing_requested
+        && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
+    if (generated_prompt_cache_key_recovery_enabled
+        || generated_prompt_cache_key_requested
+        || generated_prompt_cache_key_promoted)
+        && generated_prompt_cache_key_eligible
+    {
+        if let Some(cache_key) = generated_prompt_cache_key_value.as_ref() {
+            cache_capability::apply_generated_prompt_cache_key(
+                &mut active_upstream_body,
+                cache_key,
+                &mut cache_control_application,
+            );
+            provider_prefix_key = Some(cache_key.clone());
+        }
+    }
     if agent_generation {
         let final_provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
         let client_owned_prompt_cache_key_forwarded = client_owned_prompt_cache_key
@@ -12935,12 +13005,14 @@ fn optimize_provider_prefix(request: &mut Value, config: &AppConfig, decision: &
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CandidatePromptCacheRoutingOutcome {
     applied: bool,
     changed: bool,
 }
 
+#[cfg(test)]
 fn apply_candidate_prompt_cache_routing(
     request: &mut PreparedResponseBody,
     decision: &ShadowAffinityDecision,
@@ -12959,6 +13031,62 @@ fn apply_candidate_prompt_cache_routing(
         applied: changed,
         changed,
     }
+}
+
+/// The compatibility recovery path is opt-out only after the exact upstream
+/// realm explicitly rejects the field. Unknown and transient probe failures
+/// must not be treated as schema rejection, otherwise a 5xx would silently
+/// erase the v1.3.6 cache-affinity behavior.
+fn generated_prompt_cache_key_compatibility_allowed(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    channel: &Channel,
+    key_id: Option<&str>,
+) -> bool {
+    config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        channel,
+        key_id,
+        ProviderCacheCapabilityField::PromptCacheKey,
+    ) != ProviderCacheCapabilityStatus::Unsupported
+}
+
+/// The production placement key is fully Atoapi-owned. It combines a stable
+/// session cache identity with the actual selected-Key realm, so two keys,
+/// deployments, models, channels, or agents cannot share an upstream cache
+/// placement by accident. The raw secret never appears in this material.
+fn generated_prompt_cache_key(
+    session_identity: &SessionIdentity,
+    decision: &RouteDecision,
+    selected_provider_key: &SelectedProviderKey,
+) -> String {
+    let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-generated-prompt-cache-key-v1\0");
+    hasher.update(decision.provider.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(decision.model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(decision.upstream_channel.label().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key_realm.as_bytes());
+    hasher.update(b"\0");
+    // `scope_key` contains every trusted explicit identity dimension. The
+    // historical `provider_cache_key` intentionally used a legacy primary
+    // dimension for cache continuity, which is too broad for a new upstream
+    // placement key.
+    hasher.update(session_identity.scope_key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Persisted capability evidence uses a distinct one-way digest. It binds the
+/// exact generated placement key without storing the key itself in config.
+fn generated_prompt_cache_key_session_scope_id(cache_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-generated-prompt-cache-key-validation-scope-v1\0");
+    hasher.update(cache_key.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn strip_root_provider_cache_metadata_for_native(outbound: &mut Value) {
@@ -17274,6 +17402,7 @@ mod tests {
             realm_id,
             stream,
             store,
+            generated_key_session_scope_id: None,
         }
         .effect_scope_id(breakpoint_placement)
     }
@@ -20682,6 +20811,41 @@ mod tests {
             provider_prefix_fingerprint(&first, &Channel::Responses),
             provider_prefix_fingerprint(&different_session, &Channel::Responses)
         );
+    }
+
+    #[test]
+    fn generated_prompt_cache_key_is_stable_and_selected_key_realm_isolated() {
+        let decision = reasoning_test_decision(None, &[]);
+        let identity = SessionIdentity {
+            anchor_key: "anchor".to_string(),
+            scope_key: "scope".to_string(),
+            provider_cache_key: "stable-session-placement".to_string(),
+            control_fingerprint: "fingerprint".to_string(),
+            source: "thread-id",
+        };
+        let first_key = SelectedProviderKey {
+            secret: "first-upstream-secret".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let rotated_key = SelectedProviderKey {
+            secret: "rotated-upstream-secret".to_string(),
+            // Rotation can retain the operator-facing key ID. The realm also
+            // includes the secret digest, so it must still create a distinct
+            // upstream cache placement.
+            key_id: Some("key-a".to_string()),
+        };
+
+        let first = generated_prompt_cache_key(&identity, &decision, &first_key);
+        assert_eq!(
+            first,
+            generated_prompt_cache_key(&identity, &decision, &first_key)
+        );
+        assert_eq!(first.len(), 64);
+        assert_ne!(
+            first,
+            generated_prompt_cache_key(&identity, &decision, &rotated_key)
+        );
+        assert!(!first.contains("first-upstream-secret"));
     }
 
     #[test]
@@ -34916,6 +35080,7 @@ mod tests {
             realm_id: affinity_identity::realm_id(&decision, &selected_key),
             stream: Some(true),
             store: Some(false),
+            generated_key_session_scope_id: None,
         };
         let dir = std::env::temp_dir().join(format!(
             "atoapi-retention-final-wire-{}",
@@ -38892,6 +39057,10 @@ mod tests {
                             .pointer("/metadata/atoapi_test_upstream_502")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
+                        let rejects_prompt_cache_key = body
+                            .pointer("/metadata/atoapi_test_reject_prompt_cache_key")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                         *captured.lock().await = body;
                         *captured_accept.lock().await = headers
                             .get(header::ACCEPT)
@@ -38906,6 +39075,13 @@ mod tests {
                                 502,
                                 "text/html",
                                 b"upstream edge returned 502".to_vec(),
+                            );
+                        }
+                        if rejects_prompt_cache_key {
+                            return raw_response(
+                                400,
+                                "application/json",
+                                br#"{"error":{"code":"invalid_parameter","message":"prompt_cache_key is not supported on this model"}}"#.to_vec(),
                             );
                         }
                         raw_response(
@@ -38974,56 +39150,6 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }];
-        config.record_cache_capability_probe(
-            "mock-responses",
-            "gpt-5.5",
-            Channel::Responses,
-            ProviderCacheCapabilityField::PromptCacheOptions,
-            ProviderCacheCapabilityStatus::Verified,
-            None,
-        );
-        config.record_cache_capability_probe(
-            "mock-responses",
-            "gpt-5.5",
-            Channel::Responses,
-            ProviderCacheCapabilityField::PromptCacheRetention,
-            ProviderCacheCapabilityStatus::Verified,
-            None,
-        );
-        let validation_scope = cache_validation::CacheValidationScope {
-            channel: Channel::Responses,
-            key_id: None,
-            realm_id: affinity_identity::realm_id(
-                &RouteDecision {
-                    provider: config.providers[0].clone(),
-                    upstream_channel: Channel::Responses,
-                    model: "gpt-5.5".to_string(),
-                },
-                &SelectedProviderKey {
-                    secret: "upstream-key".to_string(),
-                    key_id: None,
-                },
-            ),
-            // Codex native Responses is forwarded as an SSE stream even when
-            // the client omitted or set `stream: false`.
-            stream: Some(true),
-            store: None,
-        };
-        let effect_scope_id = validation_scope.effect_scope_id(None);
-        config.record_cache_capability_effect_for_scope(
-            "mock-responses",
-            "gpt-5.5",
-            &Channel::Responses,
-            None,
-            Some(&effect_scope_id),
-            &[ProviderCacheCapabilityField::PromptCacheOptions],
-            ProviderCacheEffectStatus::Promoted,
-            Some("mock outbound options verified".to_string()),
-            Some(0),
-            Some(512),
-            Some(100),
-            Some(90),
-        );
         config.agent_injections = vec![AgentInjectionConfig {
             id: "codex".to_string(),
             label: "Codex".to_string(),
@@ -39050,55 +39176,6 @@ mod tests {
             )
             .unwrap(),
         );
-        let validation_started_at = Utc::now();
-        {
-            let mut validation = state.cache_validation.lock().await;
-            let baseline = validation
-                .configure(
-                    cache_validation::CacheValidationControlInput {
-                        mode: cache_validation::CacheValidationMode::Baseline,
-                        provider_id: Some("mock-responses".to_string()),
-                        model: Some("gpt-5.5".to_string()),
-                    },
-                    Some("Mock Responses".to_string()),
-                    validation_started_at,
-                )
-                .unwrap();
-            let baseline_run_id = baseline.run_id.expect("baseline must have an id");
-            assert!(validation
-                .selection(
-                    "mock-responses",
-                    "gpt-5.5",
-                    validation_scope.clone(),
-                    validation_started_at,
-                )
-                .is_some());
-            for index in 0..cache_validation::VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
-                validation.observe(
-                    &baseline_run_id,
-                    cache_validation::CacheValidationObservation {
-                        success: true,
-                        usage_observed: true,
-                        input_tokens: 100_000,
-                        cache_read_tokens: 50_000,
-                        ttft_ms: 100,
-                        ..cache_validation::CacheValidationObservation::default()
-                    },
-                    validation_started_at + chrono::Duration::seconds(index as i64),
-                );
-            }
-            validation
-                .configure(
-                    cache_validation::CacheValidationControlInput {
-                        mode: cache_validation::CacheValidationMode::Candidate,
-                        provider_id: Some("mock-responses".to_string()),
-                        model: Some("gpt-5.5".to_string()),
-                    },
-                    Some("Mock Responses".to_string()),
-                    validation_started_at + chrono::Duration::minutes(1),
-                )
-                .unwrap();
-        }
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
@@ -39168,17 +39245,6 @@ mod tests {
 
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let validation = state.cache_validation.lock().await.status(Utc::now());
-                if validation.candidate_applied_requests == 1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the detached stream owner must settle the retention candidate");
         assert_eq!(responses_hits.load(Ordering::SeqCst), 1);
         assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
         let captured = captured_responses_body.lock().await.clone();
@@ -39210,25 +39276,14 @@ mod tests {
             "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
         );
         assert_eq!(captured["input"][2]["vendor_output"]["exit_code"], 0);
-        assert!(captured.get("prompt_cache_key").is_none());
-        assert_eq!(
-            captured
-                .get("prompt_cache_retention")
-                .and_then(Value::as_str),
-            Some("24h")
-        );
-        assert_eq!(
-            captured
-                .pointer("/prompt_cache_options/mode")
-                .and_then(Value::as_str),
-            Some("implicit")
-        );
-        assert_eq!(
-            captured
-                .pointer("/prompt_cache_options/ttl")
-                .and_then(Value::as_str),
-            Some("30m")
-        );
+        let generated_key = captured
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .expect("generated key must reach the one frozen upstream wire");
+        assert_eq!(generated_key.len(), 64);
+        assert_ne!(generated_key, "codex-native-placement-key");
+        assert!(captured.get("prompt_cache_retention").is_none());
+        assert!(captured.get("prompt_cache_options").is_none());
         assert_eq!(
             captured_responses_accept.lock().await.as_deref(),
             Some("text/event-stream")
@@ -39246,14 +39301,13 @@ mod tests {
             metrics.recent_requests[0].shadow_affinity_trusted_identity,
             Some(true)
         );
-        assert!(metrics.recent_requests[0].provider_prefix_key.is_none());
-        let validation = state.cache_validation.lock().await.status(Utc::now());
         assert_eq!(
-            validation.mode,
-            cache_validation::CacheValidationMode::Candidate
+            metrics.recent_requests[0].provider_prefix_key.as_deref(),
+            Some(generated_key)
         );
-        assert_eq!(validation.successful_requests, 1);
-        assert_eq!(validation.candidate_applied_requests, 1);
+        let validation = state.cache_validation.lock().await.status(Utc::now());
+        assert_eq!(validation.mode, cache_validation::CacheValidationMode::Auto);
+        assert_eq!(validation.candidate_applied_requests, 0);
         assert_eq!(
             metrics.recent_requests[0].upstream_call_kind.as_deref(),
             Some("stream")
@@ -39283,7 +39337,7 @@ mod tests {
         );
         let failed_response = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             failed_body,
             Channel::Responses,
             Some("codex"),
@@ -39321,6 +39375,143 @@ mod tests {
                 .as_deref(),
             Some("shared-client:pool-enabled-hit-not-exposed")
         );
+
+        // A generic 5xx is not a field rejection. The next trusted request
+        // must keep the same generated placement key and still use one POST.
+        let after_502_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "input": [{ "type": "message", "role": "user", "content": "after transient failure" }]
+            }))
+            .unwrap(),
+        );
+        let after_502_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            after_502_body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(after_502_response.status(), StatusCode::OK);
+        axum::body::to_bytes(after_502_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            captured_responses_body
+                .lock()
+                .await
+                .get("prompt_cache_key")
+                .and_then(Value::as_str),
+            Some(generated_key)
+        );
+
+        // An explicit field rejection disables only this selected-Key scope;
+        // no retry is sent for the rejected request, and later traffic falls
+        // back to the neutral wire.
+        let rejected_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "metadata": { "atoapi_test_reject_prompt_cache_key": true },
+                "input": [{ "type": "message", "role": "user", "content": "reject generated cache key" }]
+            }))
+            .unwrap(),
+        );
+        let rejected_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            rejected_body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(rejected_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 4);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let config = state.config.read().await;
+                if config.cache_capability_status_for_key(
+                    "mock-responses",
+                    "gpt-5.5",
+                    &Channel::Responses,
+                    None,
+                    ProviderCacheCapabilityField::PromptCacheKey,
+                ) == ProviderCacheCapabilityStatus::Unsupported
+                {
+                    break;
+                }
+                drop(config);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the explicit field rejection must disable the exact cache-key scope");
+
+        let neutral_after_rejection = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "input": [{ "type": "message", "role": "user", "content": "neutral after explicit rejection" }]
+            }))
+            .unwrap(),
+        );
+        let neutral_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            neutral_after_rejection,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(neutral_response.status(), StatusCode::OK);
+        axum::body::to_bytes(neutral_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 5);
+        assert!(captured_responses_body
+            .lock()
+            .await
+            .get("prompt_cache_key")
+            .is_none());
+
+        // A content-derived fallback has no trusted session identity. It must
+        // not receive an Atoapi-generated placement key, even if a caller
+        // supplied one.
+        let mut untrusted_headers = HeaderMap::new();
+        untrusted_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        let untrusted_body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": false,
+                "prompt_cache_key": "caller-key-must-not-pass-through",
+                "input": [{ "type": "message", "role": "user", "content": "no trusted turn identity" }]
+            }))
+            .unwrap(),
+        );
+        let untrusted_response = handle_generation_for_agent(
+            state.clone(),
+            untrusted_headers,
+            untrusted_body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(untrusted_response.status(), StatusCode::OK);
+        axum::body::to_bytes(untrusted_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 6);
+        assert!(captured_responses_body
+            .lock()
+            .await
+            .get("prompt_cache_key")
+            .is_none());
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -42391,7 +42582,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
     }
 
     #[tokio::test]
-    async fn client_cache_key_is_stripped_before_a_normal_one_shot_wire() {
+    async fn client_cache_key_is_replaced_before_a_normal_one_shot_wire() {
         // Use a value that would cause a field-specific rejection if it ever
         // crossed the normal wire. The normal request must instead succeed in
         // one POST with no cooldown state.
@@ -42513,7 +42704,13 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
         );
         let captured_bodies = captured_bodies.lock().await;
         assert_eq!(captured_bodies.len(), 1);
-        assert!(captured_bodies[0].get("prompt_cache_key").is_none());
+        let forwarded_key = captured_bodies[0]
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .expect("trusted native full replay receives only the generated placement key");
+        assert_ne!(forwarded_key, raw_client_key);
+        assert_eq!(forwarded_key.len(), 64);
+        assert!(forwarded_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
         drop(captured_bodies);
 
         let cooldown_keys = state

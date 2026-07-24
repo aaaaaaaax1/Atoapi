@@ -258,6 +258,23 @@ pub(super) fn apply_prepared_with_receipt(
     receipt
 }
 
+/// Adds the only production prompt-cache key that may survive final wire
+/// cleanup. Its caller owns derivation from an exact selected-Key realm; this
+/// helper only records that the frozen request received an Atoapi-generated
+/// field, never a caller-provided placement hint.
+pub(super) fn apply_generated_prompt_cache_key(
+    request: &mut PreparedResponseBody,
+    cache_key: &str,
+    receipt: &mut CacheControlApplicationReceipt,
+) -> bool {
+    let changed = request.set_root("prompt_cache_key", Value::String(cache_key.to_string()));
+    if changed {
+        receipt.mark_changed("prompt_cache_key");
+    }
+    receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheKey);
+    changed
+}
+
 pub(super) fn present_fields(
     request: &Value,
     channel: &Channel,
@@ -1682,6 +1699,32 @@ mod tests {
             None,
             ProviderCacheCapabilityField::PromptCacheKey,
         ));
+    }
+
+    #[test]
+    fn generated_prompt_cache_key_is_present_and_receipted_on_the_final_body() {
+        let mut prepared = PreparedResponseBody::responses(json!({
+            "model": "gpt-5.6-luna",
+            "input": [{"role": "user", "content": "stable"}]
+        }));
+        let mut receipt = CacheControlApplicationReceipt::default();
+
+        assert!(apply_generated_prompt_cache_key(
+            &mut prepared,
+            "a".repeat(64).as_str(),
+            &mut receipt,
+        ));
+        assert_eq!(
+            prepared
+                .body()
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+        assert!(receipt
+            .injected_fields()
+            .contains(&ProviderCacheCapabilityField::PromptCacheKey));
     }
 
     #[test]

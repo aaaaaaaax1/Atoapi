@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.3.7",
+  "version": "1.3.8",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,8 @@
     "test:request-state": "node scripts/test-request-record-state.mjs",
     "test:provider-display": "node scripts/test-graphite-provider-display.mjs",
     "test:metrics-trend-ui": "node scripts/test-graphite-metrics-trend-ui.mjs",
+    "test:secret-field-ui": "node scripts/test-graphite-secret-field-ui.mjs",
+    "test:provider-connection-path-ui": "node scripts/test-provider-connection-path-ui.mjs",
     "test:session-reuse-ui": "node scripts/test-graphite-session-reuse-ui.mjs",
     "test:isolated-wire-compat": "node scripts/verify-isolated-wire-compat.mjs",
     "test:isolated-wire-stress": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12",

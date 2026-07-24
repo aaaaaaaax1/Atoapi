@@ -104,6 +104,20 @@ pub struct ProviderKeyTestResult {
     pub models_count: usize,
 }
 
+/// Result of an editor-triggered connection test. Both direct and system
+/// proxy paths are measured against the same draft endpoint and credential;
+/// the recommendation only updates the editor until the user saves it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConnectionPathTestResult {
+    pub provider_id: Option<String>,
+    pub key_id: Option<String>,
+    pub ok: bool,
+    pub recommended_use_system_proxy: bool,
+    pub models_count: usize,
+    pub message: String,
+    pub paths: Vec<ProviderNetworkPathResult>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderNetworkPathDiagnosticResult {
     pub provider_id: String,
@@ -129,6 +143,7 @@ pub struct ProviderNetworkPathResult {
 struct ProviderNetworkPathAttempt {
     result: ProviderNetworkPathResult,
     has_valid_model_list: bool,
+    models_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1023,6 +1038,19 @@ pub async fn test_provider_key(
     result.map_err(to_command_error)
 }
 
+/// Tests the editable connection over both direct and system-proxy paths.
+/// This command intentionally has no config side effects: the UI applies the
+/// fastest successful recommendation to its unsaved draft only.
+#[tauri::command]
+pub async fn test_provider_connection_paths(
+    state: State<'_, Arc<AppState>>,
+    input: ProviderKeyTestInput,
+) -> CommandResult<ProviderConnectionPathTestResult> {
+    test_provider_connection_paths_inner(state.inner(), &input)
+        .await
+        .map_err(to_command_error)
+}
+
 #[tauri::command]
 pub async fn test_provider_key_pool(
     state: State<'_, Arc<AppState>>,
@@ -1341,6 +1369,7 @@ async fn diagnose_model_endpoint(
                 return ProviderNetworkPathAttempt {
                     result,
                     has_valid_model_list: false,
+                    models_count: 0,
                 };
             }
 
@@ -1354,6 +1383,7 @@ async fn diagnose_model_endpoint(
                     return ProviderNetworkPathAttempt {
                         result,
                         has_valid_model_list: false,
+                        models_count: 0,
                     };
                 }
                 Err(_) => {
@@ -1364,6 +1394,7 @@ async fn diagnose_model_endpoint(
                     return ProviderNetworkPathAttempt {
                         result,
                         has_valid_model_list: false,
+                        models_count: 0,
                     };
                 }
             };
@@ -1374,6 +1405,7 @@ async fn diagnose_model_endpoint(
                     return ProviderNetworkPathAttempt {
                         result,
                         has_valid_model_list: false,
+                        models_count: 0,
                     };
                 }
             };
@@ -1382,10 +1414,12 @@ async fn diagnose_model_endpoint(
                 return ProviderNetworkPathAttempt {
                     result,
                     has_valid_model_list: false,
+                    models_count: 0,
                 };
             }
 
-            let has_valid_model_list = !parse_models(value).is_empty();
+            let models_count = parse_models(value).len();
+            let has_valid_model_list = models_count > 0;
             result.ok = has_valid_model_list;
             if !has_valid_model_list {
                 result.error = Some("response did not contain model records".to_string());
@@ -1393,6 +1427,7 @@ async fn diagnose_model_endpoint(
             ProviderNetworkPathAttempt {
                 result,
                 has_valid_model_list,
+                models_count,
             }
         }
         Ok(Err(err)) => ProviderNetworkPathAttempt {
@@ -1406,6 +1441,7 @@ async fn diagnose_model_endpoint(
                 error: Some(err.to_string()),
             },
             has_valid_model_list: false,
+            models_count: 0,
         },
         Err(_) => ProviderNetworkPathAttempt {
             result: ProviderNetworkPathResult {
@@ -1421,6 +1457,7 @@ async fn diagnose_model_endpoint(
                 )),
             },
             has_valid_model_list: false,
+            models_count: 0,
         },
     }
 }
@@ -1478,6 +1515,125 @@ async fn test_provider_key_inner(
             message: err.to_string(),
             models_count: 0,
         }),
+    }
+}
+
+/// Runs the connection test across the two paths that a saved provider can
+/// actually use. This deliberately keeps the edited endpoint and channel
+/// supplied by the UI, while an empty secret may be resolved from the saved
+/// provider on the backend.
+async fn test_provider_connection_paths_inner(
+    state: &AppState,
+    input: &ProviderKeyTestInput,
+) -> Result<ProviderConnectionPathTestResult> {
+    let mut upstream_secret = input
+        .api_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .map(ToOwned::to_owned);
+    if upstream_secret.is_none() {
+        if let Some(provider_id) = input.provider_id.as_deref() {
+            let config = state.config.read().await;
+            upstream_secret =
+                configured_provider_test_secret(&config, provider_id, input.key_id.as_deref())?;
+        }
+    }
+    let Some(upstream_secret) = upstream_secret else {
+        return Ok(ProviderConnectionPathTestResult {
+            provider_id: input.provider_id.clone(),
+            key_id: input.key_id.clone(),
+            ok: false,
+            recommended_use_system_proxy: input.use_system_proxy,
+            models_count: 0,
+            message: "key is empty".to_string(),
+            paths: Vec::new(),
+        });
+    };
+
+    let candidates = model_endpoint_candidates(
+        &input.base_url,
+        input.is_full_url,
+        input.models_url.as_deref(),
+    )?;
+    let direct_client = state.control_plane_upstream_client(false).await?;
+    let system_proxy_client = state.control_plane_upstream_client(true).await?;
+    let mut last_paths = Vec::new();
+
+    for target_url in candidates {
+        let (direct, system_proxy) = tokio::join!(
+            diagnose_model_endpoint(
+                "direct",
+                &direct_client,
+                &target_url,
+                &input.channel,
+                &upstream_secret,
+                input.custom_user_agent.as_deref(),
+            ),
+            diagnose_model_endpoint(
+                "system-proxy",
+                &system_proxy_client,
+                &target_url,
+                &input.channel,
+                &upstream_secret,
+                input.custom_user_agent.as_deref(),
+            ),
+        );
+        let recommended_use_system_proxy = fastest_connection_path(&direct, &system_proxy);
+        let models_count = recommended_use_system_proxy
+            .map(|use_system_proxy| {
+                if use_system_proxy {
+                    system_proxy.models_count
+                } else {
+                    direct.models_count
+                }
+            })
+            .unwrap_or_default();
+        let paths = vec![direct.result, system_proxy.result];
+        if let Some(recommended_use_system_proxy) = recommended_use_system_proxy {
+            let path_name = if recommended_use_system_proxy {
+                "system proxy"
+            } else {
+                "direct"
+            };
+            return Ok(ProviderConnectionPathTestResult {
+                provider_id: input.provider_id.clone(),
+                key_id: input.key_id.clone(),
+                ok: true,
+                recommended_use_system_proxy,
+                models_count,
+                message: format!("{path_name} path returned a valid model list"),
+                paths,
+            });
+        }
+        last_paths = paths;
+    }
+
+    Ok(ProviderConnectionPathTestResult {
+        provider_id: input.provider_id.clone(),
+        key_id: input.key_id.clone(),
+        ok: false,
+        recommended_use_system_proxy: input.use_system_proxy,
+        models_count: 0,
+        message: "neither direct nor system-proxy path returned a valid model list".to_string(),
+        paths: last_paths,
+    })
+}
+
+/// Returns the faster successful path. A tie intentionally preserves direct
+/// routing because it has fewer moving parts; an existing saved setting is not
+/// mutated until the user explicitly saves the editor.
+fn fastest_connection_path(
+    direct: &ProviderNetworkPathAttempt,
+    system_proxy: &ProviderNetworkPathAttempt,
+) -> Option<bool> {
+    match (
+        direct.has_valid_model_list,
+        system_proxy.has_valid_model_list,
+    ) {
+        (true, true) => Some(system_proxy.result.elapsed_ms < direct.result.elapsed_ms),
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        (false, false) => None,
     }
 }
 
@@ -2634,6 +2790,42 @@ mod tests {
         let serialized = serde_json::to_string(&result).unwrap();
         assert!(!serialized.contains("diagnostic-secret"));
 
+        let connection_test = test_provider_connection_paths_inner(
+            &state,
+            &ProviderKeyTestInput {
+                provider_id: Some("network-diagnostic".to_string()),
+                key_id: None,
+                api_key: None,
+                base_url: format!("http://{address}/v1"),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: Some("AtoapiNetworkDiagnosticTest/1.0".to_string()),
+                channel: Channel::Responses,
+                use_system_proxy: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(connection_test.ok);
+        assert_eq!(connection_test.paths.len(), 2);
+        assert!(connection_test
+            .paths
+            .iter()
+            .any(|path| path.path == "direct" && path.ok));
+        assert!(connection_test
+            .paths
+            .iter()
+            .any(|path| path.path == "system-proxy" && path.ok));
+        let selected_path = if connection_test.recommended_use_system_proxy {
+            "system-proxy"
+        } else {
+            "direct"
+        };
+        assert!(connection_test
+            .paths
+            .iter()
+            .any(|path| path.path == selected_path && path.ok));
+
         let config_after = {
             let config = state.config.read().await;
             toml::to_string(&*config).unwrap()
@@ -2641,7 +2833,7 @@ mod tests {
         assert_eq!(config_after, config_before);
 
         let seen_headers = seen_headers.lock().await;
-        assert_eq!(seen_headers.len(), 2);
+        assert_eq!(seen_headers.len(), 4);
         assert!(seen_headers.iter().all(|(authorization, user_agent)| {
             authorization == "Bearer diagnostic-secret"
                 && user_agent == "AtoapiNetworkDiagnosticTest/1.0"
@@ -2712,6 +2904,39 @@ mod tests {
         assert_eq!(fallback_candidate_hits.load(Ordering::SeqCst), 2);
 
         std::fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[test]
+    fn fastest_connection_path_prefers_the_fastest_successful_route() {
+        let attempt = |path: &str, ok: bool, elapsed_ms: u64| ProviderNetworkPathAttempt {
+            result: ProviderNetworkPathResult {
+                path: path.to_string(),
+                ok,
+                status: ok.then_some(200),
+                elapsed_ms,
+                http_version: None,
+                remote_addr: None,
+                error: (!ok).then_some("failed".to_string()),
+            },
+            has_valid_model_list: ok,
+            models_count: if ok { 1 } else { 0 },
+        };
+
+        let direct = attempt("direct", true, 120);
+        let system_proxy = attempt("system-proxy", true, 80);
+        assert_eq!(fastest_connection_path(&direct, &system_proxy), Some(true));
+
+        let direct = attempt("direct", true, 80);
+        let system_proxy = attempt("system-proxy", true, 80);
+        assert_eq!(fastest_connection_path(&direct, &system_proxy), Some(false));
+
+        let direct = attempt("direct", false, 1);
+        let system_proxy = attempt("system-proxy", true, 200);
+        assert_eq!(fastest_connection_path(&direct, &system_proxy), Some(true));
+
+        let direct = attempt("direct", false, 1);
+        let system_proxy = attempt("system-proxy", false, 1);
+        assert_eq!(fastest_connection_path(&direct, &system_proxy), None);
     }
 
     #[test]

@@ -73,6 +73,7 @@ export interface PublicProviderKey {
   id: string;
   alias?: string | null;
   preview: string;
+  has_saved_secret: boolean;
   enabled: boolean;
   priority: number;
   status: ProviderKeyStatus;
@@ -113,6 +114,16 @@ export interface ProviderKeyTestResult {
   ok: boolean;
   message: string;
   models_count: number;
+}
+
+export interface ProviderConnectionPathTestResult {
+  provider_id?: string | null;
+  key_id?: string | null;
+  ok: boolean;
+  recommended_use_system_proxy: boolean;
+  models_count: number;
+  message: string;
+  paths: ProviderNetworkPathResult[];
 }
 
 export interface ProviderNetworkPathResult {
@@ -1095,6 +1106,27 @@ function fallback(name: string, args?: Record<string, unknown>) {
       models_count: usable ? models.length : 0
     };
   }
+  if (name === "test_provider_connection_paths") {
+    const input = args?.input as { provider_id?: string; key_id?: string; api_key?: string; base_url?: string; channel?: Channel; use_system_proxy?: boolean } | undefined;
+    const provider = input?.provider_id
+      ? fallbackConfig.providers.find((item) => item.id === input.provider_id)
+      : undefined;
+    const usable = Boolean(input?.api_key || input?.key_id || provider?.has_api_key);
+    const models = inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
+    const recommendedUseSystemProxy = Boolean(input?.use_system_proxy);
+    return {
+      provider_id: input?.provider_id ?? null,
+      key_id: input?.key_id ?? null,
+      ok: usable,
+      recommended_use_system_proxy: recommendedUseSystemProxy,
+      models_count: usable ? models.length : 0,
+      message: usable ? "预览模式：两条路径均可用" : "Key 为空",
+      paths: [
+        { path: "direct", ok: usable, elapsed_ms: 118, status: usable ? 200 : null, error: usable ? null : "Key 为空" },
+        { path: "system-proxy", ok: usable, elapsed_ms: 132, status: usable ? 200 : null, error: usable ? null : "Key 为空" }
+      ]
+    } satisfies ProviderConnectionPathTestResult;
+  }
   if (name === "test_provider_key_pool") {
     const providerId = String(args?.providerId ?? args?.provider_id ?? "");
     const provider = fallbackConfig.providers.find((item) => item.id === providerId);
@@ -1616,6 +1648,7 @@ function previewKeyPool(input: ProviderKeyPoolInput, existing: PublicProviderKey
       id,
       alias: key.alias ?? previous?.alias ?? null,
       preview: key.key ? maskKeyPreview(key.key) : previous?.preview ?? "未保存",
+      has_saved_secret: Boolean(key.key?.trim()) || previous?.has_saved_secret === true,
       enabled: key.enabled,
       priority: key.priority,
       status: key.status,

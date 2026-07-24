@@ -22,8 +22,9 @@ use admin::{
     reload_config, reorder_agent_providers, reveal_provider_api_key, reveal_provider_key,
     save_cache_policy, save_config, save_proxy_mode_config, select_provider,
     set_agent_injection_enabled, set_cache_validation_mode,
-    set_provider_response_session_reuse_enabled, start_proxy, stop_proxy, test_provider_key,
-    test_provider_key_pool, update_agent_injection_route,
+    set_provider_response_session_reuse_enabled, start_proxy, stop_proxy,
+    test_provider_connection_paths, test_provider_key, test_provider_key_pool,
+    update_agent_injection_route,
 };
 use config::isolated_test_instance;
 use state::AppState;
@@ -92,6 +93,7 @@ pub fn run() {
             reveal_provider_key,
             fetch_provider_models,
             diagnose_provider_network_paths,
+            test_provider_connection_paths,
             test_provider_key,
             test_provider_key_pool,
             probe_provider_cache_capabilities,

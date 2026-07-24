@@ -111,6 +111,32 @@ const bridgeSource = String.raw`
   const $bridge = (selector, root = document) => root.querySelector(selector);
   const clone = (value) => JSON.parse(JSON.stringify(value ?? []));
   const replace = (target, source) => target.splice(0, target.length, ...clone(source));
+  const SAVED_SECRET_MASK = "••••••••••••";
+  function setSecretInputState(input, hasSavedSecret, emptyPlaceholder, resetValue = false) {
+    if (!input) return;
+    if (resetValue) input.value = "";
+    input.type = "password";
+    const masked = Boolean(hasSavedSecret) && !input.value;
+    input.classList.toggle("has-saved-secret", masked);
+    if (masked) {
+      input.setAttribute("data-saved-secret", "true");
+      input.placeholder = SAVED_SECRET_MASK;
+    } else {
+      input.removeAttribute("data-saved-secret");
+      input.placeholder = emptyPlaceholder;
+    }
+  }
+  function syncKeyPoolSecretInputs() {
+    keyPool.forEach((key) => {
+      const input = document.getElementById("keySecret-" + key.id);
+      setSecretInputState(input, key.hasSavedSecret === true, "输入 Key");
+    });
+  }
+  const prototypeRenderKeyPool = renderKeyPool;
+  renderKeyPool = function renderKeyPoolWithSavedSecretMasks() {
+    prototypeRenderKeyPool();
+    syncKeyPoolSecretInputs();
+  };
   const pendingActions = new Map();
   const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-session-reuse", "set-session-reuse", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
@@ -269,7 +295,7 @@ const bridgeSource = String.raw`
     fetchedModelIds = [];
     if (name) name.value = detail?.name || provider?.name || "新上游";
     if (url) url.value = detail?.base_url || provider?.url || "";
-    if (key) { key.value = ""; key.placeholder = detail?.has_api_key ? "已保存 Key（留空则不修改）" : "输入上游 API Key"; }
+    setSecretInputState(key, Boolean(detail?.has_api_key), "输入上游 API Key", true);
     if (modelsUrl) modelsUrl.value = detail?.models_url || "";
     if (userAgent) userAgent.value = detail?.custom_user_agent || "";
     if (channel) channel.value = detail?.channel_mode === "auto" ? "auto" : (detail?.channel || "responses");
@@ -286,6 +312,7 @@ const bridgeSource = String.raw`
       id: item.id || "key-" + index,
       name: item.alias || "Key " + (index + 1),
       secret: "",
+      hasSavedSecret: item.has_saved_secret === true,
       priority: item.priority || 0,
       status: item.status || "未读取"
     })));
@@ -584,6 +611,21 @@ const bridgeSource = String.raw`
     }).join(" · ");
   }
 
+  function applyConnectionPathTest(result) {
+    if (!result?.paths?.length) return;
+    const useSystemProxy = result.recommended_use_system_proxy === true;
+    setSwitch("使用系统代理", useSystemProxy);
+    applyNetworkDiagnostic({ paths: result.paths });
+    const description = $bridge("#providerGeneral .form-section:nth-of-type(2) .form-section-head p");
+    if (description && result.ok) {
+      const selected = result.paths.find((path) => useSystemProxy
+        ? path.path === "system-proxy"
+        : path.path === "direct");
+      const label = useSystemProxy ? "系统代理" : "直连";
+      description.textContent = "已选择更快的" + label + "路径" + (selected ? " · " + selected.elapsed_ms + "ms" : "") + "，保存后生效。";
+    }
+  }
+
   function activeRequestScope(metric) {
     const scopes = Array.isArray(metric?.scopes) ? metric.scopes : [];
     if (!scopes.length) return {
@@ -673,7 +715,7 @@ const bridgeSource = String.raw`
     const defaultChannel = byFieldLabel(app, "默认通道", "select");
     if (host) host.value = settings.host || "127.0.0.1";
     if (port) port.value = settings.port || "18883";
-    if (localKey) { localKey.value = ""; localKey.placeholder = settings.hasLocalKey ? "已保存本地 Key（留空则不修改）" : "输入本地 Key"; }
+    setSecretInputState(localKey, Boolean(settings.hasLocalKey), "输入本地 Key", true);
     if (upstreamProxyUrl) upstreamProxyUrl.value = settings.upstreamProxyUrl || "";
     if (defaultChannel) {
       const expected = ({ responses: "Responses", chat: "Chat", anthropic: "Anthropic" }[settings.defaultChannel] || "Auto");
@@ -812,10 +854,16 @@ const bridgeSource = String.raw`
       }
       if (message.payload?.secret) {
         const input = message.payload.targetId ? document.getElementById(message.payload.targetId) : null;
-        if (input) { input.value = message.payload.secret; input.type = "text"; }
+        if (input) {
+          input.value = message.payload.secret;
+          input.type = "text";
+          input.classList.remove("has-saved-secret");
+          input.removeAttribute("data-saved-secret");
+        }
       }
       if (message.payload?.compatibility) applyCompatibility(message.payload.compatibility);
       if (message.payload?.networkDiagnostic) applyNetworkDiagnostic(message.payload.networkDiagnostic);
+      if (message.payload?.connectionTest) applyConnectionPathTest(message.payload.connectionTest);
       if (message.payload?.metricsTrend) {
         const trend = message.payload.metricsTrend;
         if (trend.error) trendController()?.setError(trend.error, trend.sequence, trend.rangeKey);
@@ -1036,6 +1084,12 @@ const bridgeSource = String.raw`
   document.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
+    if (target.matches("[data-saved-secret=true]") && target.value) {
+      target.classList.remove("has-saved-secret");
+      target.removeAttribute("data-saved-secret");
+      const key = keyPool.find((item) => item.id === target.dataset.keySecret);
+      if (key) key.hasSavedSecret = false;
+    }
     if (target.id === "providerSessionReuseModelInput") {
       applyCompatibility(host.state?.providerDetails?.[selectedProviderId()] || {});
     }
@@ -1573,6 +1627,7 @@ function buildState(
     keys: (provider.key_pool?.keys ?? []).map((key) => ({
       id: key.id,
       alias: key.alias ?? "",
+      has_saved_secret: key.has_saved_secret,
       priority: key.priority,
       status: key.status
     }))
