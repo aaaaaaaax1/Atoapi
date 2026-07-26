@@ -31,6 +31,7 @@ pub(super) struct StreamSummary {
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
     pub error_summary: Option<String>,
+    pub canonical_responses_failure_seen: bool,
     pub cache_capability_rejection_fields: HashSet<ProviderCacheCapabilityField>,
     pub compaction_output_seen: bool,
     pub model_output_seen: bool,
@@ -368,6 +369,16 @@ impl ResponsesStreamState {
             return;
         }
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            if frame.event.as_deref().is_some_and(is_error_event_type) {
+                self.summary.error_event_seen = true;
+                self.summary.error_event_sequence.get_or_insert(sequence);
+                if self.summary.error_summary.is_none() {
+                    let summary = super::truncate_log_message(payload);
+                    if !summary.is_empty() {
+                        self.summary.error_summary = Some(summary);
+                    }
+                }
+            }
             return;
         };
 
@@ -383,6 +394,11 @@ impl ResponsesStreamState {
             self.process_event_type(event_type, sequence);
         }
         let effective_event_type = payload_event_type.or(frame.event.as_deref());
+        if effective_event_type == Some("response.failed")
+            && value.get("response").is_some_and(Value::is_object)
+        {
+            self.summary.canonical_responses_failure_seen = true;
+        }
         let frame_has_error = value.get("error").is_some_and(|error| !error.is_null())
             || frame.event.as_deref().is_some_and(is_error_event_type)
             || payload_event_type.is_some_and(is_error_event_type);
@@ -815,6 +831,32 @@ data: {"id":"resp-top-level","object":"response","output":[{"type":"function_cal
         assert_eq!(summary.error_summary.as_deref(), Some("bad"));
         assert!(summary.done_marker_seen);
         assert!(!summary.completed_event_seen);
+    }
+
+    #[test]
+    fn records_plain_text_error_event_with_a_bounded_summary() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(b"event: error\ndata: upstream overloaded\n\n");
+
+        let summary = state.finish();
+        assert!(summary.error_event_seen);
+        assert_eq!(
+            summary.error_summary.as_deref(),
+            Some("upstream overloaded")
+        );
+        assert!(!summary.canonical_responses_failure_seen);
+    }
+
+    #[test]
+    fn recognizes_a_complete_native_responses_failure_frame() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"message\":\"busy\"}}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.error_event_seen);
+        assert!(summary.canonical_responses_failure_seen);
     }
 
     #[test]

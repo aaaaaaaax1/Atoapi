@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { build } from "esbuild";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const sourcePath = fileURLToPath(new URL("../src/graphite/providerDisplay.ts", import.meta.url));
@@ -62,6 +63,29 @@ assert.deepEqual(
 assert.deepEqual(
   requestAgentBadge("open-code", "OpenCode", []),
   { label: "OpenCode", tone: "opencode" }
+);
+
+const controlPlaneSource = await readFile(
+  fileURLToPath(new URL("../src/useGraphiteControlPlane.ts", import.meta.url)),
+  "utf8"
+);
+const toggleStart = controlPlaneSource.indexOf("async function toggleAgentInjection");
+const toggleEnd = controlPlaneSource.indexOf("async function activateAgentProvider", toggleStart);
+const toggleSource = controlPlaneSource.slice(toggleStart, toggleEnd);
+assert.doesNotMatch(
+  toggleSource,
+  /active_provider_id|providers\[0\]/,
+  "an unbound Agent must not silently inherit the global upstream"
+);
+assert.match(
+  controlPlaneSource,
+  /provider_id:\s*provider\.id,[\s\S]*?model_id:/,
+  "an Agent route switch must send an explicit model selection or null"
+);
+assert.doesNotMatch(
+  controlPlaneSource,
+  /persist:\s*Boolean\(existingProvider\)/,
+  "fetching model candidates must not persist them before the user adds a mapping"
 );
 
 console.log("graphite provider display regression tests passed");

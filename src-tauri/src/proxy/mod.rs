@@ -1936,6 +1936,12 @@ async fn run_generation_for_authorized_agent(
         forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
     );
     let config = state.config.read().await.clone();
+    let runtime_primary_model = runtime_primary_model_for_internal_codex_request(
+        &state,
+        &config,
+        &client_request,
+        authorized_agent.as_deref(),
+    );
     let route_is_agent_bound = route_is_agent_provider_bound(
         &config,
         &client_request,
@@ -1950,15 +1956,29 @@ async fn run_generation_for_authorized_agent(
         route_is_agent_bound,
     )
     .await;
-    let mut decision = match decide_route(
+    let mut decision = match decide_route_with_runtime_model(
         &config,
         &client_request,
         &client_channel,
         authorized_agent.as_deref(),
+        runtime_primary_model.as_deref(),
     ) {
         Ok(decision) => decision,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
+        Err(err) => {
+            let status = if err.starts_with("agent_route_") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return json_error(status, &err);
+        }
     };
+    note_agent_runtime_model_for_primary_request(
+        &state,
+        &client_request,
+        authorized_agent.as_deref(),
+        &decision,
+    );
     if !route_is_agent_bound {
         decision = apply_provider_route_affinity(
             &config,
@@ -2332,6 +2352,35 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
+    let stale_external_continuation = match (
+        continuation_scope.as_ref(),
+        upstream_body
+            .get("previous_response_id")
+            .and_then(Value::as_str),
+    ) {
+        (Some(scope), Some(response_id)) => {
+            state
+                .continuation_lineage
+                .managed_response_in_other_scope(&scope.anchor_key, response_id)
+                .await
+        }
+        _ => None,
+    };
+    let stale_external_continuation_after_route_switch = stale_external_continuation.is_some();
+    if let Some(stale_session) = stale_external_continuation {
+        // A local managed head carries the old provider/model/key-realm in
+        // its scope. Forwarding it after a hot switch leaks an invalid remote
+        // reference into the selected route. Rebuild the safe full replay
+        // when the incoming turn is only an incremental continuation.
+        if let Some(request) = upstream_body.as_object_mut() {
+            if let Some(input) =
+                full_replay_input_after_route_switch(&stale_session, request.get("input"))
+            {
+                request.insert("input".to_string(), input);
+            }
+            request.remove("previous_response_id");
+        }
+    }
 
     let skip_prefix_guard_for_sync_responses = responses_sync_main_skips_prefix_guard(
         &client_channel,
@@ -2538,7 +2587,9 @@ async fn run_generation_for_authorized_agent(
         && matches!(decision.upstream_channel, Channel::Responses)
     {
         response_session_reuse_diagnostics.context_plan = Some(
-            if client_supplied_previous_response_id.is_some()
+            if stale_external_continuation_after_route_switch {
+                "full_replay_after_route_switch"
+            } else if client_supplied_previous_response_id.is_some()
                 && !response_session_starts_compaction_epoch
             {
                 "external_continuation"
@@ -7315,6 +7366,38 @@ fn previous_response_id_from_request(request: &Value) -> Option<String> {
         .get("previous_response_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn full_replay_input_after_route_switch(
+    session: &ResponseSessionState,
+    current: Option<&Value>,
+) -> Option<Value> {
+    let (Value::Array(previous_items), Value::Array(current_items)) = (&session.input, current?)
+    else {
+        return None;
+    };
+    if response_input_starts_with(current_items, previous_items) {
+        return Some(Value::Array(current_items.clone()));
+    }
+
+    let mut replay = Vec::with_capacity(
+        previous_items
+            .len()
+            .saturating_add(session.output_items.len())
+            .saturating_add(current_items.len()),
+    );
+    replay.extend(previous_items.iter().cloned());
+    replay.extend(session.output_items.iter().cloned());
+    replay.extend(current_items.iter().cloned());
+    Some(Value::Array(replay))
+}
+
+fn response_input_starts_with(current: &[Value], prefix: &[Value]) -> bool {
+    current.len() >= prefix.len()
+        && prefix
+            .iter()
+            .zip(current.iter())
+            .all(|(expected, current)| expected == current)
 }
 
 fn appended_response_input_delta_for_session(
@@ -12198,7 +12281,6 @@ fn route_is_agent_provider_bound(
                 .iter()
                 .find(|agent| agent.id == agent_id && agent.enabled)
         })
-        .and_then(|agent| agent.provider_id.as_deref())
         .is_some()
 }
 
@@ -12209,11 +12291,14 @@ async fn provider_route_affinity_for_request(
     client_channel: &Channel,
     route_is_agent_bound: bool,
 ) -> (Option<String>, Option<String>) {
-    let key = provider_route_affinity_key(config, request, client_channel);
     if route_is_agent_bound {
-        return (key, None);
+        // Agent routes are isolated from global provider affinity. Generating a
+        // key here used to let settlement write an Agent route into the global
+        // affinity map, where a later ordinary request could inherit it.
+        return (None, None);
     }
 
+    let key = provider_route_affinity_key(config, request, client_channel);
     let provider_id = lookup_provider_route_affinity(state, config, key.as_deref()).await;
     (key, provider_id)
 }
@@ -12392,6 +12477,16 @@ fn decide_route(
     client_channel: &Channel,
     authorized_agent_id: Option<&str>,
 ) -> Result<RouteDecision, String> {
+    decide_route_with_runtime_model(config, request, client_channel, authorized_agent_id, None)
+}
+
+fn decide_route_with_runtime_model(
+    config: &AppConfig,
+    request: &Value,
+    client_channel: &Channel,
+    authorized_agent_id: Option<&str>,
+    runtime_primary_model: Option<&str>,
+) -> Result<RouteDecision, String> {
     let requested_model = request
         .get("model")
         .and_then(Value::as_str)
@@ -12419,14 +12514,33 @@ fn decide_route(
         .or_else(|| profile.map(|profile| profile.upstream_channel.clone()))
         .unwrap_or_else(|| client_channel.clone());
 
-    let agent_provider = authorized_agent
-        .and_then(|agent| agent.provider_id.as_deref())
-        .and_then(|provider_id| {
-            config
-                .providers
-                .iter()
-                .find(|provider| provider.id == provider_id && provider.enabled)
-        });
+    let agent_provider = if let Some(agent) = authorized_agent {
+        let provider_id = agent.provider_id.as_deref().ok_or_else(|| {
+            format!(
+                "agent_route_unbound: {} has no upstream binding; choose an upstream before enabling injection",
+                agent.label
+            )
+        })?;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| {
+                format!(
+                    "agent_route_unavailable: {} is bound to missing upstream {provider_id}",
+                    agent.label
+                )
+            })?;
+        if !provider.enabled {
+            return Err(format!(
+                "agent_route_unavailable: {} is bound to disabled upstream {}",
+                agent.label, provider.name
+            ));
+        }
+        Some(provider)
+    } else {
+        None
+    };
 
     let configured_provider = agent_provider.or_else(|| {
         config
@@ -12477,12 +12591,34 @@ fn decide_route(
     let agent_model = authorized_agent
         .and_then(|agent| agent.model_id.clone())
         .and_then(|model| resolve_provider_model_id(provider, &model));
-    let requested_model_for_provider = requested_model
-        .as_deref()
-        .and_then(|model| resolve_provider_model_id(provider, model));
+    let is_codex_internal_auxiliary_request = authorized_agent
+        .is_some_and(|agent| agent.id == "codex")
+        && requested_model
+            .as_deref()
+            .is_some_and(is_codex_internal_auxiliary_model);
+    let requested_model_for_provider = if is_codex_internal_auxiliary_request {
+        Some(
+            resolve_codex_auxiliary_model(provider, authorized_agent, runtime_primary_model)
+                .ok_or_else(|| {
+                    format!(
+                        "agent_internal_model_unavailable: {} needs a current or mapped primary model before Codex automatic review can be forwarded",
+                        authorized_agent.map(|agent| agent.label.as_str()).unwrap_or("Codex")
+                    )
+                })?,
+        )
+    } else {
+        requested_model
+            .as_deref()
+            .and_then(|model| resolve_provider_model_id(provider, model))
+    };
+    let raw_requested_model = if is_codex_internal_auxiliary_request {
+        None
+    } else {
+        requested_model.clone()
+    };
 
     let model = requested_model_for_provider
-        .or(requested_model)
+        .or(raw_requested_model)
         .or(agent_model)
         .or_else(|| {
             profile
@@ -12503,6 +12639,97 @@ fn decide_route(
         provider: provider.clone(),
         model,
     })
+}
+
+fn is_codex_internal_auxiliary_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("codex-auto-review")
+}
+
+fn resolve_codex_auxiliary_model(
+    provider: &ProviderConfig,
+    agent: Option<&AgentInjectionConfig>,
+    runtime_primary_model: Option<&str>,
+) -> Option<String> {
+    // An explicit model alias is the only static override for the helper.
+    // Do not use resolve_provider_model_id on an empty catalog: it treats an
+    // unknown name as pass-through, which would recreate the original bug.
+    if !provider.models.is_empty() {
+        if let Some(mapped) = resolve_provider_model_id(provider, "codex-auto-review") {
+            return Some(mapped);
+        }
+    }
+
+    runtime_primary_model
+        .and_then(|model| resolve_provider_model_id(provider, model))
+        .or_else(|| {
+            agent
+                .and_then(|agent| agent.model_id.as_deref())
+                .and_then(|model| resolve_provider_model_id(provider, model))
+        })
+        .or_else(|| {
+            provider
+                .models
+                .iter()
+                .find(|model| model.enabled)
+                .map(|model| model.id.clone())
+        })
+}
+
+fn agent_runtime_model_key(agent_id: &str, provider_id: &str) -> String {
+    format!("{agent_id}\0{provider_id}")
+}
+
+fn runtime_primary_model_for_internal_codex_request(
+    state: &AppState,
+    config: &AppConfig,
+    request: &Value,
+    authorized_agent_id: Option<&str>,
+) -> Option<String> {
+    if authorized_agent_id != Some("codex")
+        || !request
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_codex_internal_auxiliary_model)
+    {
+        return None;
+    }
+    let provider_id = config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == "codex" && agent.enabled)
+        .and_then(|agent| agent.provider_id.as_deref())?;
+    state
+        .agent_runtime_models
+        .try_lock()
+        .ok()
+        .and_then(|models| {
+            models
+                .get(&agent_runtime_model_key("codex", provider_id))
+                .cloned()
+        })
+}
+
+fn note_agent_runtime_model_for_primary_request(
+    state: &AppState,
+    request: &Value,
+    authorized_agent_id: Option<&str>,
+    decision: &RouteDecision,
+) {
+    let Some(agent_id) = authorized_agent_id else {
+        return;
+    };
+    let Some(requested_model) = request.get("model").and_then(Value::as_str) else {
+        return;
+    };
+    if is_codex_internal_auxiliary_model(requested_model) {
+        return;
+    }
+    if let Ok(mut models) = state.agent_runtime_models.try_lock() {
+        models.insert(
+            agent_runtime_model_key(agent_id, &decision.provider.id),
+            decision.model.clone(),
+        );
+    }
 }
 
 fn effective_upstream_channel_for_provider(
@@ -24586,7 +24813,7 @@ mod tests {
             true,
         )
         .await;
-        assert!(affinity_key.is_some());
+        assert!(affinity_key.is_none());
         assert!(preferred_provider.is_none());
         let final_decision =
             if route_is_agent_provider_bound(&config, &request, &Channel::Responses, Some("codex"))
@@ -24604,6 +24831,79 @@ mod tests {
 
         assert_eq!(final_decision.provider.id, "bizd");
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_auto_review_uses_runtime_primary_model_instead_of_internal_name() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://review.example/v1".to_string());
+        provider.id = "agent-codex-review".to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.6-sol".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-sol".to_string(),
+            context_window: Some(372_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "agent-codex-review");
+
+        let decision = decide_route_with_runtime_model(
+            &config,
+            &json!({ "model": "codex-auto-review", "input": "review this edit" }),
+            &Channel::Responses,
+            Some("codex"),
+            Some("gpt-5.6-sol"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.provider.id, "agent-codex-review");
+        assert_eq!(decision.model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn codex_auto_review_without_a_safe_primary_model_fails_locally() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://review.example/v1".to_string());
+        provider.id = "agent-codex-review".to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "agent-codex-review");
+
+        let error = decide_route(
+            &config,
+            &json!({ "model": "codex-auto-review", "input": "review this edit" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("agent_internal_model_unavailable"));
+    }
+
+    #[test]
+    fn ordinary_unmapped_codex_model_stays_unchanged() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://review.example/v1".to_string());
+        provider.id = "agent-codex-review".to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "agent-codex-review");
+
+        let decision = decide_route_with_runtime_model(
+            &config,
+            &json!({ "model": "gpt-5.6-luna", "input": "continue" }),
+            &Channel::Responses,
+            Some("codex"),
+            Some("gpt-5.6-sol"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.model, "gpt-5.6-luna");
     }
     #[test]
     fn requested_model_provider_wins_when_active_provider_lacks_model() {
@@ -25020,6 +25320,74 @@ mod tests {
 
         assert_eq!(decision.provider.id, "share");
         assert_eq!(decision.model, "gpt-5.5");
+    }
+
+    #[test]
+    fn authorized_agent_without_provider_fails_closed_instead_of_using_global_route() {
+        let mut config = AppConfig::default();
+        let mut global = test_responses_provider("https://global.example/v1".to_string());
+        global.id = "global".to_string();
+        global.models = vec![ModelConfig {
+            id: "gpt-5.6-sol".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-sol".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![global];
+        config.active_provider_id = Some("global".to_string());
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = None;
+
+        let error = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.6-sol", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("agent_route_unbound"));
+    }
+
+    #[test]
+    fn authorized_agent_with_disabled_provider_fails_closed_instead_of_using_global_route() {
+        let mut config = AppConfig::default();
+        let mut disabled = test_responses_provider("https://disabled.example/v1".to_string());
+        disabled.id = "disabled-agent-route".to_string();
+        disabled.enabled = false;
+        let mut global = test_responses_provider("https://global.example/v1".to_string());
+        global.id = "global".to_string();
+        config.providers = vec![disabled, global];
+        config.active_provider_id = Some("global".to_string());
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("disabled-agent-route".to_string());
+
+        let error = decide_route(
+            &config,
+            &json!({ "model": "gpt-5.6-sol", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("agent_route_unavailable"));
     }
 
     #[test]
@@ -27206,6 +27574,353 @@ mod tests {
         assert!(next_lookup.is_some());
         writer_release.store(true, Ordering::Release);
         state.cache.flush().await.unwrap();
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_emits_one_native_failure_after_a_truncated_responses_stream() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-truncated-responses-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        for index in 0..94 {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk-{index}\"}}\n\n"
+                            )));
+                        }
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header("x-request-id", "upstream-trace-94")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let mut upstream_diagnostics = UpstreamRequestDiagnostics::default();
+        upstream_diagnostics.upstream_trace_source = Some("x-request-id".to_string());
+        upstream_diagnostics.upstream_trace_id = Some("upstream-trace-94".to_string());
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "stream-94-trace".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.6-terra".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            LineageParent::FullReplay,
+            false,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            upstream_diagnostics,
+            None,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text.matches("event: response.output_text.delta").count(),
+            94
+        );
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("\"code\":\"upstream_incomplete_eof\""));
+        assert!(text.contains("atoapi_trace_id=stream-94-trace"));
+        assert!(text.contains("upstream_trace=x-request-id:upstream-trace-94"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("truncated stream settlement must complete");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(
+            metrics.recent_failed_requests[0].sse_end_reason.as_deref(),
+            Some("upstream_incomplete_eof")
+        );
+        assert_eq!(
+            metrics.recent_failed_requests[0]
+                .upstream_trace_id
+                .as_deref(),
+            Some("upstream-trace-94")
+        );
+        assert!(metrics
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "upstream_sse_error"));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_route_switch_drops_a_managed_previous_response_from_the_old_scope() {
+        let old_hits = Arc::new(AtomicUsize::new(0));
+        let new_hits = Arc::new(AtomicUsize::new(0));
+        let new_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let old_hits_for_route = old_hits.clone();
+        let new_hits_for_route = new_hits.clone();
+        let new_bodies_for_route = new_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/old/v1/responses",
+                post(move || {
+                    let old_hits = old_hits_for_route.clone();
+                    async move {
+                        old_hits.fetch_add(1, Ordering::SeqCst);
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"old\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_old_route\",\"status\":\"completed\"}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/new/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let new_hits = new_hits_for_route.clone();
+                    let new_bodies = new_bodies_for_route.clone();
+                    async move {
+                        new_hits.fetch_add(1, Ordering::SeqCst);
+                        new_bodies.lock().await.push(body);
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "event: response.output_text.delta\n",
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"new\"}\n\n",
+                                "event: response.completed\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_new_route\",\"status\":\"completed\"}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "codex-route-switch-workspace".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut old_provider = test_responses_provider(format!("http://{upstream_addr}/old/v1"));
+        old_provider.id = "codex-old-route".to_string();
+        let mut new_provider = test_responses_provider(format!("http://{upstream_addr}/new/v1"));
+        new_provider.id = "codex-new-route".to_string();
+        config.providers = vec![old_provider, new_provider];
+        configure_test_codex_agent(&mut config, "codex-old-route");
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-route-switch-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"route-switch-session","thread_id":"route-switch-thread","request_kind":"turn"}"#,
+            ),
+        );
+
+        let first_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": [{"type": "message", "role": "user", "content": "before switch"}]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state
+                    .continuation_lineage
+                    .snapshot_heads()
+                    .await
+                    .values()
+                    .any(|head| head.response_id == "resp_old_route")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old route must publish its managed response head");
+
+        {
+            let mut live_config = state.config.write().await;
+            live_config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == "codex")
+                .unwrap()
+                .provider_id = Some("codex-new-route".to_string());
+        }
+
+        let second_response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_old_route",
+                    "input": [{"type": "message", "role": "user", "content": "after switch"}]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(second_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(old_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(new_hits.load(Ordering::SeqCst), 1);
+        let new_bodies = new_bodies.lock().await.clone();
+        assert_eq!(new_bodies.len(), 1);
+        assert!(
+            new_bodies[0].get("previous_response_id").is_none(),
+            "a response reference from the old provider/model scope must not leak into the hot-switched route"
+        );
+        assert_eq!(
+            new_bodies[0]["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before switch"},
+                {"type": "message", "role": "user", "content": "after switch"}
+            ]),
+            "the safe hot-switch fallback must replay managed context instead of silently dropping it"
+        );
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 2 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both one-shot route requests must settle");
+        assert!(metrics.recent_requests.iter().any(|request| {
+            request.response_context_plan.as_deref() == Some("full_replay_after_route_switch")
+        }));
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -29536,12 +30251,13 @@ mod tests {
             true,
         )
         .await;
-        assert!(
-            axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .is_err(),
-            "the downstream body must expose the inspection failure"
-        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("the Responses client must receive the native failure terminal");
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("\"code\":\"upstream_sse_frame_too_large\""));
 
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             loop {

@@ -266,6 +266,9 @@ pub async fn select_provider(
             .find(|provider| provider.id == provider_id)
             .ok_or_else(|| format!("provider {provider_id} was not found"))?
             .clone();
+        if !provider.enabled {
+            return Err(format!("provider {provider_id} is disabled"));
+        }
         config.active_provider_id = Some(provider.id.clone());
         config.default_channel = provider.channel.clone();
         config.updated_at = Utc::now();
@@ -289,24 +292,27 @@ pub async fn clone_provider_for_agent(
     let source_provider_id = input.provider_id.trim().to_string();
     let (should_start_proxy, version) = {
         let mut config = state.config.write().await;
+        let mut staged = config.clone();
         clone_provider_for_agent_config(
-            &mut config,
+            &mut staged,
             &agent_id,
             &source_provider_id,
             input.model_id.as_deref(),
         )
         .map_err(to_command_error)?;
-        let agent_index = config
+        let agent_index = staged
             .agent_injections
             .iter()
             .position(|agent| agent.id == agent_id)
             .ok_or_else(|| format!("agent injection {agent_id} was not found"))?;
         let now = Utc::now();
-        config.updated_at = now;
+        staged.updated_at = now;
         let version = state
-            .publish_config_snapshot(&config)
+            .publish_config_snapshot(&staged)
             .map_err(to_command_error)?;
-        (config.agent_injections[agent_index].enabled, version)
+        let should_start_proxy = staged.agent_injections[agent_index].enabled;
+        *config = staged;
+        (should_start_proxy, version)
     };
     state
         .wait_for_config_snapshot(version)
@@ -345,10 +351,11 @@ fn clone_provider_for_agent_config(
         .ok_or_else(|| anyhow::anyhow!("provider {source_provider_id} was not found"))?;
 
     let target_provider_id =
-        if provider_belongs_to_agent(source_provider_id, agent_id) {
+        if provider_is_registered_to_agent(config, source_provider_id, agent_id) {
             source_provider_id.to_string()
         } else if let Some(existing) = config.providers.iter().find(|provider| {
             provider_clone_matches_source(&provider.id, source_provider_id, agent_id)
+                && provider_is_registered_to_agent(config, &provider.id, agent_id)
         }) {
             existing.id.clone()
         } else {
@@ -527,6 +534,20 @@ fn provider_belongs_to_agent(provider_id: &str, agent_id: &str) -> bool {
     provider_id.starts_with(&agent_provider_prefix(agent_id))
 }
 
+fn provider_is_registered_to_agent(config: &AppConfig, provider_id: &str, agent_id: &str) -> bool {
+    config.agent_provider_orders.iter().any(|order| {
+        order.agent_id == agent_id
+            && order
+                .provider_ids
+                .iter()
+                .any(|registered| registered == provider_id)
+    }) || (provider_belongs_to_agent(provider_id, agent_id)
+        && config
+            .agent_injections
+            .iter()
+            .any(|agent| agent.id == agent_id && agent.provider_id.as_deref() == Some(provider_id)))
+}
+
 fn provider_clone_matches_source(provider_id: &str, source_id: &str, agent_id: &str) -> bool {
     let base = format!(
         "{}{}",
@@ -598,7 +619,7 @@ fn prepare_agent_owned_provider_input(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let provider_id = match requested_id {
-        Some(provider_id) if provider_belongs_to_agent(provider_id, agent_id) => {
+        Some(provider_id) if provider_is_registered_to_agent(config, provider_id, agent_id) => {
             provider_id.to_string()
         }
         Some(provider_id) => {
@@ -728,7 +749,7 @@ fn append_agent_provider_order(config: &mut AppConfig, agent_id: &str, provider_
         return;
     }
 
-    let mut provider_ids = visible_provider_ids_for_agent(config, agent_id).unwrap_or_default();
+    let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
     if !provider_ids.iter().any(|id| id == provider_id) {
         provider_ids.push(provider_id.to_string());
     }
@@ -767,7 +788,7 @@ fn replace_or_append_agent_provider_order(
         return;
     }
 
-    let mut provider_ids = visible_provider_ids_for_agent(config, agent_id).unwrap_or_default();
+    let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
     if !provider_ids.iter().any(|id| id == target_provider_id) {
         provider_ids.push(target_provider_id.to_string());
     }
@@ -777,6 +798,16 @@ fn replace_or_append_agent_provider_order(
             agent_id: agent_id.to_string(),
             provider_ids,
         });
+}
+
+fn bound_provider_ids_for_agent(config: &AppConfig, agent_id: &str) -> Vec<String> {
+    config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == agent_id)
+        .and_then(|agent| agent.provider_id.clone())
+        .into_iter()
+        .collect()
 }
 
 #[tauri::command]
@@ -873,7 +904,7 @@ fn delete_provider_config(
             .position(|agent| agent.id == agent_id)
             .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
 
-        if !provider_belongs_to_agent(provider_id, agent_id) {
+        if !provider_is_registered_to_agent(config, provider_id, agent_id) {
             let agent = &mut config.agent_injections[agent_index];
             hide_provider_for_agent(agent, provider_id);
             if agent.provider_id.as_deref() == Some(provider_id) {
@@ -1786,7 +1817,21 @@ pub async fn delete_model(
         }
         config.clear_response_session_reuse_for_model(&provider_id, &model_id);
         config.clear_cache_capabilities_for_model(&provider_id, &model_id);
+        for agent in config
+            .agent_injections
+            .iter_mut()
+            .filter(|agent| agent.provider_id.as_deref() == Some(provider_id.as_str()))
+        {
+            if agent.model_id.as_deref() == Some(model_id.as_str()) {
+                agent.model_id = None;
+                agent.last_status = Some(
+                    "已移除 Agent 默认模型映射，后续请求将原样使用 Agent 选择的模型".to_string(),
+                );
+            }
+        }
         config.updated_at = Utc::now();
+        refresh_enabled_injections_for_provider(&mut config, &provider_id)
+            .map_err(to_command_error)?;
         state
             .publish_config_snapshot(&config)
             .map_err(to_command_error)?
@@ -1925,15 +1970,6 @@ pub async fn set_agent_injection_enabled(
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let enabled = input.enabled;
     let agent_id = input.id.clone();
-    let previous_enabled = {
-        let config = state.config.read().await;
-        config
-            .agent_injections
-            .iter()
-            .find(|item| item.id == agent_id)
-            .map(|item| item.enabled)
-            .unwrap_or(false)
-    };
     let (mut results, version) = {
         let mut config = state.config.write().await;
         let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
@@ -1963,9 +1999,9 @@ pub async fn set_agent_injection_enabled(
     } else if enabled {
         state.start_proxy().await.map_err(to_command_error)?;
     }
-    if agent_id == "codex" && previous_enabled != enabled {
-        let patch_status = codex_ui_patch_notice(enabled, codex_ui_patch::set_enabled(enabled));
-        attach_codex_ui_patch_status(&mut results, enabled, patch_status);
+    if agent_id == "codex" && !enabled && codex_ui_patch::has_managed_patch() {
+        let patch_status = codex_ui_patch_notice(false, codex_ui_patch::set_enabled(false));
+        attach_codex_ui_patch_status(&mut results, false, patch_status);
     }
     Ok(results)
 }
@@ -1975,7 +2011,7 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let (mut results, version) = {
+    let (results, version) = {
         let mut config = state.config.write().await;
         let results =
             agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
@@ -1997,10 +2033,6 @@ pub async fn apply_agent_injection(
     } else {
         state.start_proxy().await.map_err(to_command_error)?;
     }
-    if id == "codex" {
-        let patch_status = codex_ui_patch_notice(true, codex_ui_patch::set_enabled(true));
-        attach_codex_ui_patch_status(&mut results, true, patch_status);
-    }
     Ok(results)
 }
 
@@ -2008,15 +2040,7 @@ pub async fn apply_agent_injection(
 pub async fn apply_enabled_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let (codex_enabled, reconcile_codex_ui) = {
-        let config = state.config.read().await;
-        let enabled = config
-            .agent_injections
-            .iter()
-            .any(|item| item.id == "codex" && item.enabled);
-        (enabled, enabled || codex_ui_patch::has_managed_patch())
-    };
-    let (mut results, version) = {
+    let (results, version) = {
         let mut config = state.config.write().await;
         let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
         config.updated_at = Utc::now();
@@ -2037,11 +2061,6 @@ pub async fn apply_enabled_agent_injections(
     }
     if results.iter().any(|item| item.id != "proxy-mode") {
         state.start_proxy().await.map_err(to_command_error)?;
-    }
-    if reconcile_codex_ui {
-        let patch_status =
-            codex_ui_patch_notice(codex_enabled, codex_ui_patch::set_enabled(codex_enabled));
-        attach_codex_ui_patch_status(&mut results, codex_enabled, patch_status);
     }
     Ok(results)
 }
@@ -2086,7 +2105,7 @@ fn attach_codex_ui_patch_status(
 #[tauri::command]
 pub async fn update_agent_injection_route(
     state: State<'_, Arc<AppState>>,
-    mut input: AgentInjectionRouteUpdate,
+    input: AgentInjectionRouteUpdate,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let agent_id = input.id.clone();
     let should_start_proxy = {
@@ -2098,24 +2117,13 @@ pub async fn update_agent_injection_route(
     };
     let (results, version) = {
         let mut config = state.config.write().await;
-        if let Some(provider_id) = input.provider_id.clone() {
-            if !provider_belongs_to_agent(&provider_id, &agent_id) {
-                let private_provider_id = clone_provider_for_agent_config(
-                    &mut config,
-                    &agent_id,
-                    &provider_id,
-                    input.model_id.as_deref(),
-                )
-                .map_err(to_command_error)?;
-                input.provider_id = Some(private_provider_id);
-            }
-        }
-        let results =
-            agent_injection::update_route(&mut config, input).map_err(to_command_error)?;
-        config.updated_at = Utc::now();
+        let (mut staged, results) =
+            stage_agent_injection_route_update(&config, input).map_err(to_command_error)?;
+        staged.updated_at = Utc::now();
         let version = state
-            .publish_config_snapshot(&config)
+            .publish_config_snapshot(&staged)
             .map_err(to_command_error)?;
+        *config = staged;
         (results, version)
     };
     state
@@ -2133,6 +2141,27 @@ pub async fn update_agent_injection_route(
         }
     }
     Ok(results)
+}
+
+fn stage_agent_injection_route_update(
+    config: &AppConfig,
+    mut input: AgentInjectionRouteUpdate,
+) -> Result<(AppConfig, Vec<AgentInjectionResult>)> {
+    let agent_id = input.id.clone();
+    let mut staged = config.clone();
+    if let Some(provider_id) = input.provider_id.clone() {
+        if !provider_is_registered_to_agent(&staged, &provider_id, &agent_id) {
+            let private_provider_id = clone_provider_for_agent_config(
+                &mut staged,
+                &agent_id,
+                &provider_id,
+                input.model_id.as_deref(),
+            )?;
+            input.provider_id = Some(private_provider_id);
+        }
+    }
+    let results = agent_injection::update_route(&mut staged, input)?;
+    Ok((staged, results))
 }
 
 fn model_list_request(
@@ -2521,6 +2550,38 @@ mod tests {
                 .find(|provider| provider.id == "shared")
                 .map(|provider| provider.name.as_str()),
             Some("shared")
+        );
+    }
+
+    #[test]
+    fn manual_agent_like_id_is_not_reused_as_a_private_clone() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        config.providers.push(test_provider("agent-codex-shared"));
+
+        let private_id =
+            clone_provider_for_agent_config(&mut config, "codex", "shared", None).unwrap();
+        assert_eq!(private_id, "agent-codex-shared-2");
+        assert!(provider_is_registered_to_agent(
+            &config,
+            &private_id,
+            "codex"
+        ));
+        assert!(!provider_is_registered_to_agent(
+            &config,
+            "agent-codex-shared",
+            "codex"
+        ));
+
+        let reused = clone_provider_for_agent_config(&mut config, "codex", "shared", None).unwrap();
+        assert_eq!(reused, private_id);
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .filter(|provider| provider.id.starts_with("agent-codex-shared"))
+                .count(),
+            2
         );
     }
 
@@ -3116,5 +3177,39 @@ mod tests {
             .unwrap();
         assert!(codex.hidden_provider_ids.is_empty());
         assert_eq!(codex.provider_id.as_deref(), Some(provider_id.as_str()));
+    }
+
+    #[test]
+    fn failed_agent_route_switch_does_not_leave_private_provider_records() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        let agent = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        agent.kind = crate::config::AgentInjectionKind::Gemini;
+        agent.enabled = true;
+        agent.provider_id = Some("shared".to_string());
+
+        let before = toml::to_string(&config).unwrap();
+        let result = stage_agent_injection_route_update(
+            &config,
+            AgentInjectionRouteUpdate {
+                id: "codex".to_string(),
+                provider_id: Some("shared".to_string()),
+                model_id: None,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.provider_key_pools.is_empty());
+        assert!(config.provider_compact_modes.is_empty());
+        assert!(config.provider_channel_modes.is_empty());
+        assert!(config.provider_response_session_reuse.is_empty());
+        assert!(config.provider_cache_capabilities.is_empty());
+        assert!(config.agent_provider_orders.is_empty());
     }
 }

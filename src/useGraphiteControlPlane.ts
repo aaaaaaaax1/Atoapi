@@ -27,7 +27,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.3.9";
+const APP_VERSION = "v1.4.1";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -268,14 +268,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
 
   async function toggleAgentInjection(agent: AgentInjectionConfig): Promise<string> {
     if (!agent.enabled && !agent.provider_id) {
-      const defaultProvider =
-        config?.providers.find((provider) => provider.id === config.active_provider_id) ??
-        config?.providers[0];
-      if (!defaultProvider) {
-        setSelectedAgentId(agent.id);
-        throw new Error("请先添加一个上游，然后再开启这个 Agent。");
-      }
-      return activateAgentProvider(agent, defaultProvider, true);
+      setSelectedAgentId(agent.id);
+      throw new Error("请先为当前 Agent 明确选择上游，然后再开启注入。");
     }
     setError("");
     setNotice("");
@@ -300,7 +294,13 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     setNotice("");
     try {
       await command<AgentInjectionResult[]>("update_agent_injection_route", {
-        input: { id: agent.id, provider_id: provider.id }
+        input: {
+          id: agent.id,
+          provider_id: provider.id,
+          model_id: agent.model_id && provider.models.some((model) =>
+            model.enabled && (model.id === agent.model_id || model.request_model_id === agent.model_id)
+          ) ? agent.model_id : null
+        }
       });
       let latestConfig = await command<AppConfig>("get_config");
       const latestAgent = latestConfig.agent_injections.find((item) => item.id === agent.id);
@@ -391,7 +391,9 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         } satisfies FetchModelsInput
       });
       return {
-        notice: models.length ? `已获取 ${models.length} 个模型，可在实际模型框或映射行选择，也可继续手动输入` : "未返回模型；仍可手动填写实际模型 ID",
+        notice: models.length
+          ? `已获取 ${models.length} 个模型；选择并添加后才会保存，也可继续手动输入`
+          : "未返回模型；仍可手动填写实际模型 ID",
         payload: { models: models.map((item) => ({ id: item.id })) }
       };
     }

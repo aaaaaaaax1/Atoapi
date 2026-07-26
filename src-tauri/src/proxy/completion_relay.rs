@@ -39,6 +39,41 @@ impl BoundedCacheCapture {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{canonical_responses_failure_frame, terminal_failure_message, TerminalFailure};
+
+    #[test]
+    fn canonical_failure_frame_keeps_the_upstream_summary_and_native_shape() {
+        let frame = canonical_responses_failure_frame(
+            "gpt-test",
+            Some("resp_upstream"),
+            TerminalFailure::ErrorEvent,
+            Some("provider overloaded"),
+            "local-trace",
+            Some("x-request-id"),
+            Some("upstream-trace"),
+        );
+        let frame = std::str::from_utf8(&frame).expect("failure frame must be UTF-8");
+        assert!(frame.starts_with("event: response.failed\n"));
+        assert!(frame.contains("\"type\":\"response.failed\""));
+        assert!(frame.contains("\"id\":\"resp_upstream\""));
+        assert!(frame.contains("\"status\":\"failed\""));
+        assert!(frame.contains("\"code\":\"upstream_sse_error\""));
+        assert!(frame.contains("provider overloaded"));
+        assert!(frame.contains("atoapi_trace_id=local-trace"));
+        assert!(frame.contains("upstream_trace=x-request-id:upstream-trace"));
+    }
+
+    #[test]
+    fn terminal_failure_message_uses_a_stable_local_explanation_when_missing() {
+        assert_eq!(
+            terminal_failure_message(TerminalFailure::IncompleteEof, None),
+            "upstream stream ended before a completion event"
+        );
+    }
+}
+
 pub(super) fn relay_chunk_parts(chunk: &Bytes) -> impl Iterator<Item = Bytes> + '_ {
     (0..chunk.len())
         .step_by(STREAM_RELAY_BYTE_BUDGET)
@@ -48,6 +83,108 @@ pub(super) fn relay_chunk_parts(chunk: &Bytes) -> impl Iterator<Item = Bytes> + 
                 .min(chunk.len());
             chunk.slice(start..end)
         })
+}
+
+fn terminal_failure_message(failure: TerminalFailure, upstream_summary: Option<&str>) -> String {
+    let fallback = match failure {
+        TerminalFailure::ErrorEvent => "upstream returned an SSE error before completion",
+        TerminalFailure::FrameTooLarge => "upstream SSE frame exceeded the inspection limit",
+        TerminalFailure::IncompleteEof => "upstream stream ended before a completion event",
+        TerminalFailure::TransportErrorBeforeTerminal => {
+            "upstream stream connection ended before completion"
+        }
+    };
+    upstream_summary
+        .map(str::trim)
+        .filter(|summary| !summary.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn terminal_failure_message_with_trace(
+    failure: TerminalFailure,
+    upstream_summary: Option<&str>,
+    request_id: &str,
+    upstream_trace_source: Option<&str>,
+    upstream_trace_id: Option<&str>,
+) -> String {
+    let mut message = terminal_failure_message(failure, upstream_summary);
+    let mut trace = Vec::new();
+    if let Some(request_id) = trace_component(request_id) {
+        trace.push(format!("atoapi_trace_id={request_id}"));
+    }
+    if let (Some(source), Some(trace_id)) = (
+        upstream_trace_source.and_then(trace_component),
+        upstream_trace_id.and_then(trace_component),
+    ) {
+        trace.push(format!("upstream_trace={source}:{trace_id}"));
+    }
+    if !trace.is_empty() {
+        message.push_str(" [trace: ");
+        message.push_str(&trace.join(", "));
+        message.push(']');
+    }
+    message
+}
+
+fn trace_component(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(256)
+        .collect::<String>();
+    (!value.is_empty()).then_some(value)
+}
+
+fn terminal_failure_type(failure: TerminalFailure) -> &'static str {
+    match failure {
+        TerminalFailure::ErrorEvent => "upstream_sse_error",
+        TerminalFailure::FrameTooLarge => "upstream_sse_frame_too_large",
+        TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
+        TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
+    }
+}
+
+fn canonical_responses_failure_frame(
+    model: &str,
+    response_id: Option<&str>,
+    failure: TerminalFailure,
+    upstream_summary: Option<&str>,
+    request_id: &str,
+    upstream_trace_source: Option<&str>,
+    upstream_trace_id: Option<&str>,
+) -> Bytes {
+    let response_id = response_id
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("resp_atoapi_{}", Uuid::new_v4().simple()));
+    let payload = serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "status": "failed",
+            "model": model,
+            "output": [],
+            "error": {
+                "type": terminal_failure_type(failure),
+                "code": terminal_failure_type(failure),
+                "message": terminal_failure_message_with_trace(
+                    failure,
+                    upstream_summary,
+                    request_id,
+                    upstream_trace_source,
+                    upstream_trace_id,
+                ),
+            },
+        },
+    });
+    let payload = serde_json::to_string(&payload).unwrap_or_else(|_| {
+        "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
+    });
+    Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"))
 }
 
 pub(super) async fn stream_upstream(
@@ -462,7 +599,48 @@ pub(super) async fn stream_upstream(
             }
             .to_string();
         }
-        if !downstream_disconnected && !terminal_verdict.success {
+        let mut canonical_failure_enqueued = false;
+        if !downstream_disconnected
+            && !terminal_verdict.success
+            && matches!(client_channel, Channel::Responses)
+            && matches!(decision.upstream_channel, Channel::Responses)
+            && !stream_metadata.canonical_responses_failure_seen
+        {
+            if let Some(failure) = terminal_verdict.failure {
+                let failure_frame = canonical_responses_failure_frame(
+                    &decision.model,
+                    stream_metadata.response_id.as_deref(),
+                    failure,
+                    stream_metadata.error_summary.as_deref(),
+                    &request_id,
+                    upstream_request_diagnostics
+                        .upstream_trace_source
+                        .as_deref(),
+                    upstream_request_diagnostics.upstream_trace_id.as_deref(),
+                );
+                let send_failed = match downstream_byte_budget
+                    .clone()
+                    .acquire_many_owned(failure_frame.len() as u32)
+                    .await
+                {
+                    Ok(permit) => downstream_sender
+                        .send(Ok(RelayBodyChunk {
+                            bytes: failure_frame,
+                            permit,
+                        }))
+                        .await
+                        .is_err(),
+                    Err(_) => true,
+                };
+                if send_failed {
+                    downstream_disconnected = true;
+                    downstream_disconnect_stage = Some("before_terminal".to_string());
+                } else {
+                    canonical_failure_enqueued = true;
+                }
+            }
+        }
+        if !downstream_disconnected && !terminal_verdict.success && !canonical_failure_enqueued {
             let relay_error = match terminal_verdict.failure {
                 Some(TerminalFailure::TransportErrorBeforeTerminal) => stream_transport_error
                     .unwrap_or_else(|| "upstream stream failed before completion".to_string()),
@@ -621,7 +799,21 @@ pub(super) async fn stream_upstream(
         };
         if !stream_success_for_cache {
             if let Some(error_scope) = terminal_error_scope {
-                stream_metric_errors.push((error_scope.to_string(), sse_end_reason.clone()));
+                let detail = terminal_verdict
+                    .failure
+                    .map(|failure| {
+                        terminal_failure_message_with_trace(
+                            failure,
+                            stream_metadata.error_summary.as_deref(),
+                            &request_id,
+                            upstream_request_diagnostics
+                                .upstream_trace_source
+                                .as_deref(),
+                            upstream_request_diagnostics.upstream_trace_id.as_deref(),
+                        )
+                    })
+                    .unwrap_or_else(|| sse_end_reason.clone());
+                stream_metric_errors.push((error_scope.to_string(), detail));
             }
         }
         let total_ms = client_completed_ms;

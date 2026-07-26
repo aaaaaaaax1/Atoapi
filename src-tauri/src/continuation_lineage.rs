@@ -456,6 +456,27 @@ impl ContinuationLineageIndex {
             })
     }
 
+    /// A managed response id is valid only for the scope that produced it.
+    /// This returns the local replay material when an Agent carries a
+    /// provider/model-bound `previous_response_id` across a hot route switch.
+    pub async fn managed_response_in_other_scope(
+        &self,
+        current_key: &str,
+        response_id: &str,
+    ) -> Option<ResponseSessionState> {
+        let response_id = response_id.trim();
+        if response_id.is_empty() {
+            return None;
+        }
+        self.slots.lock().await.iter().find_map(|(key, slot)| {
+            (key != current_key)
+                .then(|| slot.head.as_ref())
+                .flatten()
+                .filter(|head| head.response_id == response_id)
+                .map(|head| (**head).clone())
+        })
+    }
+
     #[cfg(test)]
     pub async fn head(&self, key: &str) -> Option<Arc<ResponseSessionState>> {
         self.slots

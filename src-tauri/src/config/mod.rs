@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashSet,
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -886,7 +887,7 @@ pub enum AgentInjectionKind {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentInjectionConfig {
     pub id: String,
     pub label: String,
@@ -911,7 +912,7 @@ pub struct AgentInjectionConfig {
 /// Presentation-only provider order. Keeping it outside the Agent injection
 /// record avoids changing routing semantics and preserves each Agent's list
 /// independently from the global provider collection.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProviderOrderConfig {
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1106,6 +1107,15 @@ impl AppConfig {
             if strip_builtin_demo_provider(&mut config) {
                 changed = true;
             }
+            let previous_agent_injections = config.agent_injections.clone();
+            normalize_agent_injections(&mut config.agent_injections);
+            if config.agent_injections != previous_agent_injections {
+                config.updated_at = Utc::now();
+                changed = true;
+            }
+            if config.prune_orphaned_references() {
+                changed = true;
+            }
             if changed {
                 config.save(path)?;
             }
@@ -1147,6 +1157,123 @@ impl AppConfig {
         let raw = toml::to_string_pretty(self)?;
         fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
+    }
+
+    /// Remove route and presentation references that can no longer be selected
+    /// because their provider or Agent was deleted. Provider-scoped keys and
+    /// capability evidence are deliberately retained: a user may restore a
+    /// provider with the same id and should not lose its saved credentials or
+    /// verified compatibility state merely because it is temporarily absent.
+    fn prune_orphaned_references(&mut self) -> bool {
+        let provider_ids = self
+            .providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect::<HashSet<_>>();
+        let agent_ids = self
+            .agent_injections
+            .iter()
+            .map(|agent| agent.id.clone())
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+
+        if self
+            .active_provider_id
+            .as_deref()
+            .is_some_and(|provider_id| !provider_ids.contains(provider_id))
+        {
+            self.active_provider_id = None;
+            changed = true;
+        }
+
+        for profile in &mut self.route_profiles {
+            if profile
+                .provider_id
+                .as_deref()
+                .is_some_and(|provider_id| !provider_ids.contains(provider_id))
+            {
+                // The alias was scoped to the missing provider.  Leaving it
+                // behind would make a future fallback route look intentional.
+                profile.provider_id = None;
+                profile.model_alias = None;
+                changed = true;
+            }
+        }
+
+        for agent in &mut self.agent_injections {
+            let mut hidden_seen = HashSet::new();
+            let hidden_before = agent.hidden_provider_ids.len();
+            agent.hidden_provider_ids.retain(|provider_id| {
+                provider_ids.contains(provider_id) && hidden_seen.insert(provider_id.clone())
+            });
+            changed |= agent.hidden_provider_ids.len() != hidden_before;
+
+            if agent
+                .provider_id
+                .as_deref()
+                .is_some_and(|provider_id| !provider_ids.contains(provider_id))
+            {
+                // A missing route was already unable to inject safely.  Make
+                // the inactive state explicit rather than retaining a stale
+                // binding that could be mistaken for a working route.
+                agent.provider_id = None;
+                agent.model_id = None;
+                agent.enabled = false;
+                agent.last_status = None;
+                changed = true;
+            }
+        }
+
+        let previous_orders = self.agent_provider_orders.clone();
+        let mut normalized_orders = Vec::with_capacity(previous_orders.len());
+        for order in previous_orders.iter() {
+            if !agent_ids.contains(&order.agent_id) {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let provider_ids = order
+                .provider_ids
+                .iter()
+                .filter(|provider_id| {
+                    provider_ids.contains(*provider_id) && seen.insert((*provider_id).clone())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if provider_ids.is_empty() {
+                continue;
+            }
+            if let Some(existing) =
+                normalized_orders
+                    .iter_mut()
+                    .find(|existing: &&mut AgentProviderOrderConfig| {
+                        existing.agent_id == order.agent_id
+                    })
+            {
+                for provider_id in provider_ids {
+                    if !existing
+                        .provider_ids
+                        .iter()
+                        .any(|existing_id| existing_id == &provider_id)
+                    {
+                        existing.provider_ids.push(provider_id);
+                    }
+                }
+            } else {
+                normalized_orders.push(AgentProviderOrderConfig {
+                    agent_id: order.agent_id.clone(),
+                    provider_ids,
+                });
+            }
+        }
+        if normalized_orders != previous_orders {
+            self.agent_provider_orders = normalized_orders;
+            changed = true;
+        }
+
+        if changed {
+            self.updated_at = Utc::now();
+        }
+        changed
     }
 
     pub fn public_view(&self, config_path: PathBuf) -> PublicConfig {
@@ -2785,7 +2912,13 @@ pub fn app_config_dir() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("failed to locate user config directory"))?;
     let current = base.join("Atoapi");
     let legacy = base.join("AgentProxy");
-    if !current.exists() && legacy.exists() {
+    if legacy_agentproxy_import_enabled(
+        std::env::var("ATOAPI_IMPORT_LEGACY_AGENTPROXY")
+            .ok()
+            .as_deref(),
+    ) && !current.exists()
+        && legacy.exists()
+    {
         fs::create_dir_all(&current)?;
         copy_if_exists(&legacy.join("config.toml"), &current.join("config.toml"))?;
         copy_if_exists(
@@ -2811,6 +2944,10 @@ pub fn isolated_test_listen_port() -> Option<u16> {
 
 fn isolated_test_flag_enabled(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "on" | "enabled")
+}
+
+fn legacy_agentproxy_import_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(isolated_test_flag_enabled)
 }
 
 fn parse_isolated_test_listen_port(isolated: bool, value: Option<&str>) -> Option<u16> {
@@ -4413,6 +4550,90 @@ enabled = true
         assert_eq!(parse_isolated_test_listen_port(false, Some("18885")), None);
         assert_eq!(parse_isolated_test_listen_port(true, Some("0")), None);
         assert_eq!(parse_isolated_test_listen_port(true, Some("invalid")), None);
+    }
+
+    #[test]
+    fn legacy_agentproxy_import_is_opt_in() {
+        assert!(!legacy_agentproxy_import_enabled(None));
+        assert!(!legacy_agentproxy_import_enabled(Some("0")));
+        assert!(legacy_agentproxy_import_enabled(Some("true")));
+        assert!(legacy_agentproxy_import_enabled(Some("enabled")));
+    }
+
+    #[test]
+    fn loading_config_prunes_orphaned_route_references_without_touching_provider_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-config-prune-orphans-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let live_provider_id = config.upsert_provider(provider_input(None)).unwrap();
+
+        config.active_provider_id = Some("removed-provider".to_string());
+        config.route_profiles[0].provider_id = Some("removed-provider".to_string());
+        config.route_profiles[0].model_alias = Some("old-route-model".to_string());
+
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.enabled = true;
+        codex.provider_id = Some("removed-provider".to_string());
+        codex.model_id = Some("old-route-model".to_string());
+        codex.last_status = Some("previously applied".to_string());
+        codex.hidden_provider_ids = vec![
+            live_provider_id.clone(),
+            "removed-provider".to_string(),
+            live_provider_id.clone(),
+        ];
+        config.agent_provider_orders = vec![
+            AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec![
+                    live_provider_id.clone(),
+                    "removed-provider".to_string(),
+                    live_provider_id.clone(),
+                ],
+            },
+            AgentProviderOrderConfig {
+                agent_id: "removed-agent".to_string(),
+                provider_ids: vec![live_provider_id.clone()],
+            },
+        ];
+
+        config.save(&path).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded.providers.len(), 1);
+        assert_eq!(loaded.providers[0].id, live_provider_id);
+        assert!(loaded.active_provider_id.is_none());
+        assert!(loaded.route_profiles[0].provider_id.is_none());
+        assert!(loaded.route_profiles[0].model_alias.is_none());
+
+        let codex = loaded
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        assert!(!codex.enabled);
+        assert!(codex.provider_id.is_none());
+        assert!(codex.model_id.is_none());
+        assert!(codex.last_status.is_none());
+        assert_eq!(codex.hidden_provider_ids, vec![live_provider_id.clone()]);
+        assert_eq!(
+            loaded.agent_provider_orders,
+            vec![AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec![live_provider_id.clone()],
+            }]
+        );
+
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("removed-provider"));
+        assert!(!persisted.contains("removed-agent"));
+        fs::remove_dir_all(dir).ok();
     }
 
     fn provider_input(key_pool: Option<ProviderKeyPoolInput>) -> ProviderInput {

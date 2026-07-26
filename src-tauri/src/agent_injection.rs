@@ -7,18 +7,30 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 use toml_edit::{value, DocumentMut};
+use uuid::Uuid;
 
 use crate::config::{
     app_config_dir, codex_model_alias, model_request_alias, normalize_agent_injections,
-    normalize_reasoning_effort, AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig,
-    ProviderConfig, REASONING_EFFORT_VALUES,
+    AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
-const CODEX_MODEL_CATALOG_FILE: &str = "atoapi-model-catalog.json";
+const CODEX_MODEL_CATALOG_LEGACY_FILE: &str = "atoapi-model-catalog.json";
+const CODEX_MODEL_CATALOG_FILE_PREFIX: &str = "atoapi-model-catalog-";
+const CODEX_RESTORE_STATE_FILE: &str = "atoapi-codex-restore-state.json";
+const CODEX_RESTORE_STATE_VERSION: u32 = 1;
+const CODEX_MANAGED_ROOT_FIELDS: [&str; 6] = [
+    "model_provider",
+    "model_catalog_json",
+    "disable_response_storage",
+    "model",
+    "model_reasoning_effort",
+    "model_context_window",
+];
+const CODEX_MANAGED_MODEL_FIELDS: [&str; 3] =
+    ["model", "model_reasoning_effort", "model_context_window"];
 const OFFICIAL_CODEX_MODELS_JSON: &str = include_str!("../resources/codex-models.json");
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000345600";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "Atoapi";
@@ -60,40 +72,22 @@ struct InjectionContext {
     codex_models: Vec<ModelConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexRestoreEnvelope {
+    schema_version: u32,
+    encrypted_payload: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexRestoreState {
+    schema_version: u32,
+    target_path: PathBuf,
+    target_existed: bool,
+    fragment_toml: String,
+}
+
 pub fn ensure_defaults(config: &mut AppConfig) {
     normalize_agent_injections(&mut config.agent_injections);
-    ensure_enabled_agents_have_provider(config);
-}
-
-fn ensure_enabled_agents_have_provider(config: &mut AppConfig) {
-    let Some(default_provider) = default_agent_provider(config).cloned() else {
-        return;
-    };
-    for item in config
-        .agent_injections
-        .iter_mut()
-        .filter(|item| item.enabled)
-    {
-        if item.provider_id.is_some() {
-            continue;
-        }
-        item.provider_id = Some(default_provider.id.clone());
-        item.last_status = Some(format!("已默认绑定 {}", default_provider.name));
-    }
-}
-
-fn default_agent_provider(config: &AppConfig) -> Option<&ProviderConfig> {
-    config
-        .active_provider_id
-        .as_deref()
-        .and_then(|id| {
-            config
-                .providers
-                .iter()
-                .find(|provider| provider.id == id && provider.enabled)
-        })
-        .or_else(|| config.providers.iter().find(|provider| provider.enabled))
-        .or_else(|| config.providers.first())
 }
 
 pub fn set_enabled(
@@ -102,11 +96,6 @@ pub fn set_enabled(
     enabled: bool,
 ) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
-    let default_provider = if enabled {
-        default_agent_provider(config).cloned()
-    } else {
-        None
-    };
     let Some(index) = config
         .agent_injections
         .iter()
@@ -115,19 +104,27 @@ pub fn set_enabled(
         return Err(anyhow!("agent injection {id} was not found"));
     };
     let previous = config.agent_injections[index].clone();
+    if !enabled {
+        let target_path = remove_item(&previous)?;
+        let item = &mut config.agent_injections[index];
+        item.enabled = false;
+        item.last_status = Some("已关闭自动注入并恢复本机 Agent 路由".to_string());
+        item.last_injected_at = Some(Utc::now());
+        return Ok(vec![AgentInjectionResult {
+            id: item.id.clone(),
+            label: item.label.clone(),
+            enabled: false,
+            target_path,
+            backup_path: None,
+            status: item.last_status.clone().unwrap_or_default(),
+            injected_at: Utc::now().to_rfc3339(),
+        }]);
+    }
+
+    ensure_agent_route_is_ready(config, &config.agent_injections[index])?;
     {
         let item = &mut config.agent_injections[index];
         item.enabled = enabled;
-        if enabled && item.provider_id.is_none() {
-            if let Some(provider) = default_provider.as_ref() {
-                item.provider_id = Some(provider.id.clone());
-            }
-        }
-        if !enabled {
-            item.last_status = Some("已关闭自动注入".to_string());
-            item.last_injected_at = Some(Utc::now());
-            return Ok(Vec::new());
-        }
     }
     match apply_one_by_id(config, id) {
         Ok(results) => Ok(results),
@@ -146,6 +143,7 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
     else {
         return Err(anyhow!("agent injection {id} was not found"));
     };
+    ensure_agent_route_is_ready(config, &config.agent_injections[index])?;
     let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
     let result = apply_item(&config.agent_injections[index], &context)?;
     {
@@ -175,6 +173,10 @@ pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>
         else {
             continue;
         };
+        if let Err(error) = ensure_agent_route_is_ready(config, &config.agent_injections[index]) {
+            config.agent_injections[index].last_status = Some(format!("未应用本地注入：{error}"));
+            continue;
+        }
         let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
         let result = apply_item(&config.agent_injections[index], &context)?;
         let item = &mut config.agent_injections[index];
@@ -200,8 +202,9 @@ pub fn update_route(
     };
 
     let provider_id = clean_optional(input.provider_id);
-    let model_id = clean_optional(input.model_id);
-    if let Some(provider_id) = provider_id.as_deref() {
+    let requested_model_id = clean_optional(input.model_id);
+    let previous = config.agent_injections[index].clone();
+    let model_id = if let Some(provider_id) = provider_id.as_deref() {
         let Some(provider) = config
             .providers
             .iter()
@@ -210,17 +213,33 @@ pub fn update_route(
         else {
             return Err(anyhow!("provider {provider_id} was not found"));
         };
-        if let Some(model_id) = model_id.as_deref() {
-            if !provider.models.iter().any(|model| model.id == model_id) {
-                return Err(anyhow!(
-                    "model {model_id} was not found in provider {}",
-                    provider.name
-                ));
-            }
+        if !provider.enabled {
+            return Err(anyhow!("provider {provider_id} is disabled"));
         }
-    }
-
-    let previous = config.agent_injections[index].clone();
+        requested_model_id
+            .as_deref()
+            .map(|model_id| {
+                provider
+                    .models
+                    .iter()
+                    .find(|model| model.enabled && injection_model_matches(model, model_id))
+                    .map(|model| model.id.clone())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "model {model_id} was not found in provider {}",
+                            provider.name
+                        )
+                    })
+            })
+            .transpose()?
+    } else {
+        if config.agent_injections[index].enabled {
+            return Err(anyhow!(
+                "cannot clear an enabled Agent route; disable the injection first"
+            ));
+        }
+        None
+    };
     config.agent_injections[index].provider_id = provider_id;
     config.agent_injections[index].model_id = model_id;
 
@@ -234,6 +253,304 @@ pub fn update_route(
         }
     } else {
         Ok(Vec::new())
+    }
+}
+
+fn ensure_agent_route_is_ready(config: &AppConfig, item: &AgentInjectionConfig) -> Result<()> {
+    let provider_id = item.provider_id.as_deref().ok_or_else(|| {
+        anyhow!(
+            "agent_route_unbound: {} has no upstream binding; choose an upstream before enabling injection",
+            item.label
+        )
+    })?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "agent_route_unavailable: {} is bound to missing upstream {provider_id}",
+                item.label
+            )
+        })?;
+    if !provider.enabled {
+        return Err(anyhow!(
+            "agent_route_unavailable: {} is bound to disabled upstream {}",
+            item.label,
+            provider.name
+        ));
+    }
+    Ok(())
+}
+
+fn remove_item(item: &AgentInjectionConfig) -> Result<Option<PathBuf>> {
+    match item.kind {
+        AgentInjectionKind::Codex => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+            remove_codex_config_injection(&target)?;
+            Ok(Some(target))
+        }
+        _ => Ok(item.target_path.clone()),
+    }
+}
+
+fn remove_codex_config_injection(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    let mut doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| anyhow!("Codex config.toml parse error: {error}"))?;
+    let managed_provider = codex_document_has_atoapi_provider(&doc);
+    let managed_catalog_path = managed_codex_catalog_path(&doc, path);
+    let managed_catalog = managed_catalog_path.is_some();
+    if !managed_provider && !managed_catalog {
+        return Ok(());
+    }
+    let restore_path = codex_restore_state_path(path)?;
+    let restore_state = match load_codex_restore_state(&restore_path, path)? {
+        Some(state) => state,
+        None => {
+            let legacy_fragment = capture_codex_model_fragment(&doc);
+            capture_codex_restore_state(&restore_path, path, true, &legacy_fragment)?
+        }
+    };
+    let fragment = parse_codex_restore_fragment(&restore_state)?;
+    restore_codex_root_fields(&mut doc, &fragment, &CODEX_MANAGED_ROOT_FIELDS);
+    restore_codex_custom_provider(&mut doc, &fragment);
+    write_text(path, &doc.to_string())?;
+    if let Some(catalog_path) = managed_catalog_path {
+        fs::remove_file(catalog_path).ok();
+    }
+    cleanup_all_codex_catalogs(path);
+    fs::remove_file(restore_path).ok();
+    Ok(())
+}
+
+fn codex_document_has_atoapi_provider(doc: &DocumentMut) -> bool {
+    doc.as_table()
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+        .and_then(|item| item.as_table())
+        .is_some_and(|provider| {
+            provider.get("name").and_then(|item| item.as_str()) == Some("Atoapi")
+                && provider
+                    .get("base_url")
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|url| {
+                        url.starts_with("http://127.0.0.1:") && url.ends_with("/codex/v1")
+                    })
+        })
+}
+
+fn managed_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<PathBuf> {
+    let configured = doc
+        .as_table()
+        .get("model_catalog_json")
+        .and_then(|item| item.as_str())?
+        .trim();
+    if configured.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(configured);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(path)
+    };
+    is_managed_codex_catalog_path(&path).then_some(path)
+}
+
+fn is_managed_codex_catalog_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|file| file.to_str())
+        .is_some_and(|file| {
+            file == CODEX_MODEL_CATALOG_LEGACY_FILE
+                || (file.starts_with(CODEX_MODEL_CATALOG_FILE_PREFIX) && file.ends_with(".json"))
+        })
+}
+
+#[cfg(not(test))]
+fn codex_restore_state_path(_target_path: &Path) -> Result<PathBuf> {
+    Ok(app_config_dir()?.join(CODEX_RESTORE_STATE_FILE))
+}
+
+#[cfg(test)]
+fn codex_restore_state_path(target_path: &Path) -> Result<PathBuf> {
+    Ok(target_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(CODEX_RESTORE_STATE_FILE))
+}
+
+fn absolute_codex_target_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn same_codex_target(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn capture_codex_restore_fragment(doc: &DocumentMut) -> DocumentMut {
+    let mut fragment = DocumentMut::new();
+    for field in CODEX_MANAGED_ROOT_FIELDS {
+        if let Some(item) = doc.as_table().get(field) {
+            fragment.as_table_mut().insert(field, item.clone());
+        }
+    }
+    if let Some(custom) = doc
+        .as_table()
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+    {
+        fragment["model_providers"] = toml_edit::table();
+        fragment["model_providers"][CODEX_PROVIDER_ID] = custom.clone();
+    }
+    fragment
+}
+
+fn capture_codex_model_fragment(doc: &DocumentMut) -> DocumentMut {
+    let mut fragment = DocumentMut::new();
+    for field in CODEX_MANAGED_MODEL_FIELDS {
+        if let Some(item) = doc.as_table().get(field) {
+            fragment.as_table_mut().insert(field, item.clone());
+        }
+    }
+    fragment
+}
+
+fn capture_codex_restore_state(
+    state_path: &Path,
+    target_path: &Path,
+    target_existed: bool,
+    doc: &DocumentMut,
+) -> Result<CodexRestoreState> {
+    let state = CodexRestoreState {
+        schema_version: CODEX_RESTORE_STATE_VERSION,
+        target_path: absolute_codex_target_path(target_path)?,
+        target_existed,
+        fragment_toml: capture_codex_restore_fragment(doc).to_string(),
+    };
+    save_codex_restore_state(state_path, &state)?;
+    Ok(state)
+}
+
+fn save_codex_restore_state(path: &Path, state: &CodexRestoreState) -> Result<()> {
+    let payload = serde_json::to_string(state)?;
+    let encrypted_payload = crate::crypto::encrypt_secret(&payload)?;
+    if !encrypted_payload.starts_with("dpapi:") {
+        return Err(anyhow!("Codex restore state encryption did not use DPAPI"));
+    }
+    let envelope = CodexRestoreEnvelope {
+        schema_version: CODEX_RESTORE_STATE_VERSION,
+        encrypted_payload,
+    };
+    write_json_pretty(path, &serde_json::to_value(envelope)?)
+}
+
+fn load_codex_restore_state(
+    state_path: &Path,
+    target_path: &Path,
+) -> Result<Option<CodexRestoreState>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+    let envelope: CodexRestoreEnvelope = serde_json::from_str(&fs::read_to_string(state_path)?)
+        .context("Codex restore state envelope is invalid")?;
+    if envelope.schema_version != CODEX_RESTORE_STATE_VERSION
+        || !envelope.encrypted_payload.starts_with("dpapi:")
+    {
+        return Err(anyhow!(
+            "Codex restore state envelope is unsupported or unencrypted"
+        ));
+    }
+    let payload = crate::crypto::decrypt_secret(&envelope.encrypted_payload)?;
+    let state: CodexRestoreState =
+        serde_json::from_str(&payload).context("Codex restore state payload is invalid")?;
+    if state.schema_version != CODEX_RESTORE_STATE_VERSION {
+        return Err(anyhow!(
+            "Codex restore state payload version is unsupported"
+        ));
+    }
+    let expected = absolute_codex_target_path(target_path)?;
+    if !same_codex_target(&state.target_path, &expected) {
+        return Err(anyhow!(
+            "Codex restore state belongs to a different config path; the current file was left unchanged"
+        ));
+    }
+    Ok(Some(state))
+}
+
+fn parse_codex_restore_fragment(state: &CodexRestoreState) -> Result<DocumentMut> {
+    if state.fragment_toml.trim().is_empty() {
+        return Ok(DocumentMut::new());
+    }
+    state
+        .fragment_toml
+        .parse::<DocumentMut>()
+        .context("Codex restore state TOML fragment is invalid")
+}
+
+fn restore_codex_root_fields(doc: &mut DocumentMut, fragment: &DocumentMut, fields: &[&str]) {
+    for field in fields {
+        doc.as_table_mut().remove(field);
+        if let Some(original) = fragment.as_table().get(field) {
+            doc.as_table_mut().insert(field, original.clone());
+        }
+    }
+}
+
+fn restore_codex_custom_provider(doc: &mut DocumentMut, fragment: &DocumentMut) {
+    let original = fragment
+        .as_table()
+        .get("model_providers")
+        .and_then(|item| item.as_table())
+        .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+        .cloned();
+    let mut remove_parent = false;
+    if let Some(providers) = doc
+        .as_table_mut()
+        .get_mut("model_providers")
+        .and_then(|item| item.as_table_mut())
+    {
+        providers.remove(CODEX_PROVIDER_ID);
+        remove_parent = providers.is_empty();
+    }
+    if remove_parent {
+        doc.as_table_mut().remove("model_providers");
+    }
+    if let Some(original) = original {
+        if !doc.as_table().contains_key("model_providers") {
+            doc["model_providers"] = toml_edit::table();
+        }
+        if let Some(providers) = doc["model_providers"].as_table_mut() {
+            providers.insert(CODEX_PROVIDER_ID, original);
+        }
     }
 }
 
@@ -261,11 +578,10 @@ fn apply_item(
                 .target_path
                 .clone()
                 .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
-            let backup = backup_file(&target)?;
             write_codex_config(&target, context)?;
             (
                 Some(target),
-                backup,
+                None,
                 "Codex 已注入本地 Responses 中转".to_string(),
             )
         }
@@ -382,13 +698,13 @@ impl InjectionContext {
             source_host
         };
         let base = format!("http://{}:{}", host, source_port);
-        let configured_provider_id = item
-            .and_then(|item| item.provider_id.as_deref())
-            .or(config.active_provider_id.as_deref());
-        let provider = configured_provider_id
-            .as_deref()
-            .and_then(|id| config.providers.iter().find(|provider| provider.id == id))
-            .or_else(|| config.providers.iter().find(|provider| provider.enabled));
+        let configured_provider_id = item.and_then(|item| item.provider_id.as_deref());
+        let provider = configured_provider_id.as_deref().and_then(|id| {
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == id && provider.enabled)
+        });
         let configured_model_id = item.and_then(|item| item.model_id.as_deref());
         let explicit_model_config = provider.and_then(|provider| {
             configured_model_id.and_then(|model_id| {
@@ -461,6 +777,42 @@ pub(crate) fn agent_local_key(local_key: &str, agent_id: &str) -> String {
     format!("ato-agent-{}", &digest[..32])
 }
 
+/// Codex can issue a short-lived internal request such as `codex-auto-review`
+/// after a primary request. Keep only the current configured primary model as
+/// a process-local fallback so that helper request never escapes to a third
+/// party as an unsupported internal model name.
+pub(crate) fn codex_runtime_model_bindings(config: &AppConfig) -> HashMap<String, String> {
+    config
+        .agent_injections
+        .iter()
+        .filter(|item| item.enabled && item.kind == AgentInjectionKind::Codex)
+        .filter_map(|item| {
+            let provider_id = item.provider_id.as_deref()?.trim();
+            if provider_id.is_empty() {
+                return None;
+            }
+            let model = configured_codex_primary_model(item)?;
+            Some((format!("{}\0{}", item.id, provider_id), model))
+        })
+        .collect()
+}
+
+fn configured_codex_primary_model(item: &AgentInjectionConfig) -> Option<String> {
+    let target = item
+        .target_path
+        .clone()
+        .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+    let text = fs::read_to_string(target).ok()?;
+    let document = text.parse::<DocumentMut>().ok()?;
+    document
+        .as_table()
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "codex-auto-review")
+        .map(ToOwned::to_owned)
+}
+
 fn clean_optional(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
@@ -499,6 +851,7 @@ fn write_claude_code_settings(path: &Path, context: &InjectionContext) -> Result
 }
 
 fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
+    let target_existed = path.exists();
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut doc = if text.trim().is_empty() {
         DocumentMut::new()
@@ -507,16 +860,47 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
             .map_err(|err| anyhow!("Codex config.toml parse error: {err}"))?
     };
 
+    let restore_path = codex_restore_state_path(path)?;
+    let restore_state = if codex_document_has_atoapi_provider(&doc) {
+        match load_codex_restore_state(&restore_path, path)? {
+            Some(state) => Some(state),
+            None => {
+                let legacy_fragment = capture_codex_model_fragment(&doc);
+                Some(capture_codex_restore_state(
+                    &restore_path,
+                    path,
+                    target_existed,
+                    &legacy_fragment,
+                )?)
+            }
+        }
+    } else {
+        if restore_path.exists() {
+            load_codex_restore_state(&restore_path, path)?;
+        }
+        Some(capture_codex_restore_state(
+            &restore_path,
+            path,
+            target_existed,
+            &doc,
+        )?)
+    };
+    let restore_fragment = restore_state
+        .as_ref()
+        .map(parse_codex_restore_fragment)
+        .transpose()?;
+    let previous_catalog_path = managed_codex_catalog_path(&doc, path);
+    let model_catalog_path = write_codex_model_catalog(path, context)?;
+
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["disable_response_storage"] = value(true);
-    let model_catalog_path = write_codex_model_catalog(path, context)?;
     doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
     if context.default_model_is_explicit {
         doc["model"] = value(context.default_model.as_str());
         if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
             doc["model_context_window"] = value(i64::from(context_window));
-        } else {
-            doc.as_table_mut().remove("model_context_window");
+        } else if let Some(fragment) = restore_fragment.as_ref() {
+            restore_codex_root_fields(&mut doc, fragment, &["model_context_window"]);
         }
         if let Some(reasoning_effort) = context
             .codex_models
@@ -527,9 +911,11 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
             .and_then(crate::config::normalize_reasoning_effort)
         {
             doc["model_reasoning_effort"] = value(reasoning_effort);
+        } else if let Some(fragment) = restore_fragment.as_ref() {
+            restore_codex_root_fields(&mut doc, fragment, &["model_reasoning_effort"]);
         }
-    } else {
-        repair_unmapped_codex_reasoning_effort(&mut doc, context);
+    } else if let Some(fragment) = restore_fragment.as_ref() {
+        restore_codex_root_fields(&mut doc, fragment, &CODEX_MANAGED_MODEL_FIELDS);
     }
 
     if !doc.as_table().contains_key("model_providers") {
@@ -549,100 +935,16 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
         provider["experimental_bearer_token"] = value(context.local_key.as_str());
     }
 
-    write_text(path, &doc.to_string())
-}
-
-fn repair_unmapped_codex_reasoning_effort(doc: &mut DocumentMut, context: &InjectionContext) {
-    let Some(model) = doc
-        .as_table()
-        .get("model")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-    else {
-        return;
-    };
-    let Some(current) = doc
-        .as_table()
-        .get("model_reasoning_effort")
-        .and_then(|item| item.as_str())
-        .and_then(normalize_reasoning_effort)
-    else {
-        return;
-    };
-    let supported = context
-        .codex_models
-        .iter()
-        .find(|candidate| injection_model_matches(candidate, model))
-        .filter(|candidate| !candidate.supported_reasoning_efforts.is_empty())
-        .map(|candidate| candidate.supported_reasoning_efforts.clone())
-        .or_else(|| official_reasoning_efforts_for_model(model));
-    let Some(supported) = supported else {
-        return;
-    };
-    let Some(next) = strongest_supported_reasoning_effort_at_or_below(&current, &supported) else {
-        return;
-    };
-    if next != current {
-        doc["model_reasoning_effort"] = value(next);
+    if let Err(error) = write_text(path, &doc.to_string()) {
+        fs::remove_file(&model_catalog_path).ok();
+        return Err(error);
     }
-}
-
-fn strongest_supported_reasoning_effort_at_or_below(
-    requested: &str,
-    supported: &[String],
-) -> Option<String> {
-    let requested_rank = REASONING_EFFORT_VALUES
-        .iter()
-        .position(|candidate| *candidate == requested)?;
-    supported
-        .iter()
-        .filter_map(|effort| normalize_reasoning_effort(effort))
-        .filter_map(|effort| {
-            REASONING_EFFORT_VALUES
-                .iter()
-                .position(|candidate| *candidate == effort)
-                .filter(|rank| *rank <= requested_rank)
-                .map(|rank| (rank, effort))
-        })
-        .max_by_key(|(rank, _)| *rank)
-        .map(|(_, effort)| effort)
-}
-
-pub(crate) fn official_reasoning_efforts_for_model(model: &str) -> Option<Vec<String>> {
-    static CAPABILITIES: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
-    let capabilities = CAPABILITIES.get_or_init(|| {
-        let Ok(catalog) = serde_json::from_str::<Value>(OFFICIAL_CODEX_MODELS_JSON) else {
-            return HashMap::new();
-        };
-        let Some(models) = catalog.get("models").and_then(Value::as_array) else {
-            return HashMap::new();
-        };
-        models
-            .iter()
-            .filter_map(|entry| {
-                let slug = entry.get("slug").and_then(Value::as_str)?.trim();
-                if slug.is_empty() {
-                    return None;
-                }
-                let efforts = entry
-                    .get("supported_reasoning_levels")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|level| level.get("effort").and_then(Value::as_str))
-                    .filter_map(normalize_reasoning_effort)
-                    .collect::<Vec<_>>();
-                (!efforts.is_empty()).then_some((slug.to_ascii_lowercase(), efforts))
-            })
-            .collect()
-    });
-
-    let model = model.trim();
-    let alias = model.rsplit('/').next().unwrap_or(model).trim();
-    (!alias.is_empty())
-        .then(|| capabilities.get(&alias.to_ascii_lowercase()).cloned())
-        .flatten()
+    cleanup_unreferenced_codex_catalogs(
+        path,
+        &model_catalog_path,
+        previous_catalog_path.as_deref(),
+    );
+    Ok(())
 }
 
 fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> Result<PathBuf> {
@@ -658,6 +960,9 @@ fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> 
         .or_else(|| models.first())
         .cloned()
         .ok_or_else(|| anyhow!("bundled Codex model catalog is empty"))?;
+    for model in models.iter_mut() {
+        sanitize_codex_catalog_transport(model);
+    }
     let mut priority = models
         .iter()
         .filter_map(|model| model.get("priority").and_then(Value::as_i64))
@@ -705,7 +1010,11 @@ fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> 
     }
 
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let catalog_path = parent.join(CODEX_MODEL_CATALOG_FILE);
+    let catalog_path = parent.join(format!(
+        "{}{}.json",
+        CODEX_MODEL_CATALOG_FILE_PREFIX,
+        Uuid::new_v4().simple()
+    ));
     let catalog_path = if catalog_path.is_absolute() {
         catalog_path
     } else {
@@ -717,6 +1026,108 @@ fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> 
     Ok(catalog_path)
 }
 
+fn cleanup_unreferenced_codex_catalogs(
+    config_path: &Path,
+    active_catalog_path: &Path,
+    previous_catalog_path: Option<&Path>,
+) {
+    let Some(parent) = config_path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if candidate != active_catalog_path
+            && previous_catalog_path != Some(candidate.as_path())
+            && is_managed_codex_catalog_path(&candidate)
+        {
+            fs::remove_file(candidate).ok();
+        }
+    }
+}
+
+fn cleanup_all_codex_catalogs(config_path: &Path) {
+    let Some(parent) = config_path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if is_managed_codex_catalog_path(&candidate) {
+            fs::remove_file(candidate).ok();
+        }
+    }
+}
+
+/// Removes only Atoapi-owned Codex artifacts that are no longer referenced by
+/// the current Codex config.  It never changes Codex's config.toml, its active
+/// catalog, or the encrypted restore state for an active Atoapi injection.
+///
+/// This reconciliation is deliberately separate from injection writes: the
+/// write path keeps one previous catalog as a short handoff guard, while a
+/// later startup can safely remove the now-unreferenced file.
+pub fn cleanup_stale_codex_artifacts(config: &AppConfig) {
+    let Some(codex) = config
+        .agent_injections
+        .iter()
+        .find(|item| item.kind == AgentInjectionKind::Codex)
+    else {
+        return;
+    };
+    let target = codex
+        .target_path
+        .clone()
+        .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+    let _ = cleanup_stale_codex_artifacts_for_target(&target);
+}
+
+fn cleanup_stale_codex_artifacts_for_target(config_path: &Path) -> Result<()> {
+    let restore_path = codex_restore_state_path(config_path)?;
+    if !config_path.exists() {
+        cleanup_codex_catalogs_except(config_path, None);
+        fs::remove_file(restore_path).ok();
+        return Ok(());
+    }
+
+    let text = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    if text.trim().is_empty() {
+        cleanup_codex_catalogs_except(config_path, None);
+        fs::remove_file(restore_path).ok();
+        return Ok(());
+    }
+    let doc = text
+        .parse::<DocumentMut>()
+        .map_err(|error| anyhow!("Codex config.toml parse error: {error}"))?;
+    let active_catalog = managed_codex_catalog_path(&doc, config_path);
+    let managed_injection = codex_document_has_atoapi_provider(&doc) || active_catalog.is_some();
+
+    cleanup_codex_catalogs_except(config_path, active_catalog.as_deref());
+    if !managed_injection {
+        fs::remove_file(restore_path).ok();
+    }
+    Ok(())
+}
+
+fn cleanup_codex_catalogs_except(config_path: &Path, keep: Option<&Path>) {
+    let Some(parent) = config_path.parent() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let candidate = entry.path();
+        if keep != Some(candidate.as_path()) && is_managed_codex_catalog_path(&candidate) {
+            fs::remove_file(candidate).ok();
+        }
+    }
+}
+
 fn codex_catalog_model(
     template: &Value,
     model: &ModelConfig,
@@ -725,6 +1136,7 @@ fn codex_catalog_model(
     inherits_official_capabilities: bool,
 ) -> Value {
     let mut catalog_model = template.clone();
+    sanitize_codex_catalog_transport(&mut catalog_model);
     catalog_model["slug"] = json!(slug);
     let display_name = if model_request_alias(model).is_some() {
         slug
@@ -745,12 +1157,7 @@ fn codex_catalog_model(
     catalog_model["upgrade"] = Value::Null;
     catalog_model["auto_review_model_override"] = Value::Null;
     if !inherits_official_capabilities {
-        catalog_model["use_responses_lite"] = json!(false);
         catalog_model["multi_agent_version"] = Value::Null;
-        catalog_model["additional_speed_tiers"] = json!([]);
-        catalog_model["service_tiers"] = json!([]);
-        catalog_model["default_service_tier"] = Value::Null;
-        catalog_model["comp_hash"] = Value::Null;
         catalog_model["auto_compact_token_limit"] = Value::Null;
     }
     catalog_model["supports_parallel_tool_calls"] = json!(model.supports_tools);
@@ -830,6 +1237,18 @@ fn codex_catalog_model(
         default_effort.map(Value::String).unwrap_or(Value::Null);
     catalog_model["supports_reasoning_summaries"] = json!(supports_reasoning);
     catalog_model
+}
+
+/// The catalog is a local UI/capability declaration. Transport-specific flags
+/// from an official template must never make a custom Atoapi provider attempt
+/// an official Responses Lite or websocket route.
+fn sanitize_codex_catalog_transport(model: &mut Value) {
+    model["use_responses_lite"] = json!(false);
+    model["prefer_websockets"] = json!(false);
+    model["additional_speed_tiers"] = json!([]);
+    model["service_tiers"] = json!([]);
+    model["default_service_tier"] = Value::Null;
+    model["comp_hash"] = Value::Null;
 }
 
 fn write_opencode_config(path: &Path, context: &InjectionContext) -> Result<()> {
@@ -1254,18 +1673,28 @@ fn yaml_string(value: &str) -> serde_yaml::Value {
 }
 
 fn write_text(path: &Path, text: &str) -> Result<()> {
+    write_text_with_replace(path, text, |temporary, target| {
+        fs::rename(temporary, target)
+    })
+}
+
+fn write_text_with_replace(
+    path: &Path,
+    text: &str,
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("{}.tmp", Uuid::new_v4().simple()));
     fs::write(&tmp, text)?;
-    fs::rename(&tmp, path)
-        .or_else(|_| {
-            fs::remove_file(path).ok();
-            fs::rename(&tmp, path)
-        })
-        .with_context(|| format!("failed to write {}", path.display()))?;
-    Ok(())
+    match replace(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            fs::remove_file(&tmp).ok();
+            Err(error).with_context(|| format!("failed to write {}", path.display()))
+        }
+    }
 }
 
 fn opencode_config_path() -> PathBuf {
@@ -1314,6 +1743,7 @@ fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
 
     #[test]
     fn codex_injection_preserves_other_tables() {
@@ -1360,6 +1790,13 @@ command = "npx"
         };
 
         write_codex_config(&path, &context).unwrap();
+        let first_document: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let first_catalog_path = first_document
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+            .expect("first Codex injection should write model_catalog_json");
         write_codex_config(&path, &context).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -1389,6 +1826,18 @@ command = "npx"
             .map(PathBuf::from)
             .expect("Codex injection should write model_catalog_json");
         assert!(catalog_path.is_absolute());
+        assert!(is_managed_codex_catalog_path(&catalog_path));
+        assert_ne!(catalog_path, first_catalog_path);
+        assert!(first_catalog_path.exists());
+        let active_catalogs = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|candidate| is_managed_codex_catalog_path(candidate))
+            .collect::<Vec<_>>();
+        assert_eq!(active_catalogs.len(), 2);
+        assert!(active_catalogs.contains(&first_catalog_path));
+        assert!(active_catalogs.contains(&catalog_path));
         let catalog: Value =
             serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
         let models = catalog["models"].as_array().unwrap();
@@ -1401,30 +1850,16 @@ command = "npx"
             .unwrap()
             .iter()
             .any(|level| level["effort"] == "ultra"));
-        assert!(sol["service_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
-        assert!(sol["additional_speed_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier == "fast"));
+        assert!(sol["service_tiers"].as_array().unwrap().is_empty());
+        assert_eq!(sol["use_responses_lite"], false);
+        assert_eq!(sol["prefer_websockets"], false);
         let terra = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-terra")
             .expect("official GPT-5.6 Terra should be present");
-        assert!(terra["service_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
-        assert!(terra["additional_speed_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier == "fast"));
+        assert!(terra["service_tiers"].as_array().unwrap().is_empty());
+        assert_eq!(terra["use_responses_lite"], false);
+        assert_eq!(terra["prefer_websockets"], false);
         let luna = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-luna")
@@ -1439,16 +1874,9 @@ command = "npx"
             .unwrap()
             .iter()
             .any(|level| level["effort"] == "ultra"));
-        assert!(luna["service_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
-        assert!(luna["additional_speed_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier == "fast"));
+        assert!(luna["service_tiers"].as_array().unwrap().is_empty());
+        assert_eq!(luna["use_responses_lite"], false);
+        assert_eq!(luna["prefer_websockets"], false);
         let custom = models
             .iter()
             .filter(|model| model["slug"] == "gpt-custom")
@@ -1465,7 +1893,310 @@ command = "npx"
             .as_array()
             .unwrap()
             .is_empty());
+        assert_eq!(custom[0]["use_responses_lite"], false);
+        assert_eq!(custom[0]["prefer_websockets"], false);
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn startup_artifact_reconciliation_removes_only_unreferenced_codex_catalogs() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-artifact-cleanup-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        let active_catalog = dir.join("atoapi-model-catalog-active.json");
+        let stale_catalog = dir.join("atoapi-model-catalog.json");
+        let stale_unique_catalog = dir.join("atoapi-model-catalog-old.json");
+        let mut app_config = AppConfig::default();
+        app_config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .target_path = Some(path.clone());
+        fs::create_dir_all(&dir).unwrap();
+        write_text(&active_catalog, "{}\n").unwrap();
+        write_text(&stale_catalog, "{}\n").unwrap();
+        write_text(&stale_unique_catalog, "{}\n").unwrap();
+
+        let mut doc = DocumentMut::new();
+        doc["model_provider"] = value(CODEX_PROVIDER_ID);
+        doc["model_catalog_json"] = value(active_catalog.to_string_lossy().as_ref());
+        doc["model_providers"] = toml_edit::table();
+        doc["model_providers"][CODEX_PROVIDER_ID] = toml_edit::table();
+        let provider = doc["model_providers"][CODEX_PROVIDER_ID]
+            .as_table_mut()
+            .unwrap();
+        provider["name"] = value("Atoapi");
+        provider["base_url"] = value("http://127.0.0.1:18883/codex/v1");
+        write_text(&path, &doc.to_string()).unwrap();
+
+        let restore_path = codex_restore_state_path(&path).unwrap();
+        capture_codex_restore_state(&restore_path, &path, true, &doc).unwrap();
+        cleanup_stale_codex_artifacts(&app_config);
+
+        assert!(active_catalog.exists());
+        assert!(!stale_catalog.exists());
+        assert!(!stale_unique_catalog.exists());
+        assert!(restore_path.exists());
+
+        let later_stale_catalog = dir.join("atoapi-model-catalog-later.json");
+        write_text(&later_stale_catalog, "{}\n").unwrap();
+        write_text(&path, "model_provider = \"native\"\n").unwrap();
+        cleanup_stale_codex_artifacts(&app_config);
+
+        assert!(!active_catalog.exists());
+        assert!(!later_stale_catalog.exists());
+        assert!(!restore_path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn disabled_codex_injection_restores_original_fields_and_preserves_new_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-disable-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        write_text(
+            &path,
+            r#"model = "gpt-original"
+model_provider = "native"
+model_catalog_json = "native-models.json"
+disable_response_storage = false
+model_reasoning_effort = "ultra"
+model_context_window = 999000
+
+[model_providers.custom]
+name = "Native custom"
+base_url = "https://native.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "secret-marker"
+
+[mcp_servers.context7]
+command = "npx"
+"#,
+        )
+        .unwrap();
+
+        let context = InjectionContext {
+            anthropic_base_url: "http://127.0.0.1:18883".to_string(),
+            openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
+            local_key: "ato-test".to_string(),
+            default_channel: "responses".to_string(),
+            default_model: "gpt-test".to_string(),
+            default_model_is_explicit: true,
+            model_context_window: Some(128_000),
+            codex_models: Vec::new(),
+        };
+        write_codex_config(&path, &context).unwrap();
+        let managed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let managed_catalog_path = managed
+            .get("model_catalog_json")
+            .and_then(toml::Value::as_str)
+            .map(PathBuf::from)
+            .unwrap();
+        let restore_path = codex_restore_state_path(&path).unwrap();
+        let envelope = fs::read_to_string(&restore_path).unwrap();
+        assert!(envelope.contains("dpapi:"));
+        assert!(!envelope.contains("secret-marker"));
+        assert!(!envelope.contains("gpt-original"));
+        assert!(!envelope.contains("native.example"));
+
+        let mut injected = fs::read_to_string(&path).unwrap();
+        injected.push_str("\n[mcp_servers.added_later]\ncommand = \"node\"\n");
+        write_text(&path, &injected).unwrap();
+
+        remove_codex_config_injection(&path).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-original")
+        );
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("ultra")
+        );
+        assert_eq!(
+            parsed
+                .get("model_context_window")
+                .and_then(toml::Value::as_integer),
+            Some(999_000)
+        );
+        assert_eq!(
+            parsed.get("model_provider").and_then(toml::Value::as_str),
+            Some("native")
+        );
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some("native-models.json")
+        );
+        assert_eq!(
+            parsed
+                .get("disable_response_storage")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(toml::Value::as_str),
+            Some("https://native.example/v1")
+        );
+        assert!(parsed.get("mcp_servers").is_some());
+        assert!(parsed
+            .get("mcp_servers")
+            .and_then(|servers| servers.get("added_later"))
+            .is_some());
+        assert!(!managed_catalog_path.exists());
+        assert!(!restore_path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_restore_state_leaves_managed_codex_config_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-invalid-restore-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        let original = r#"model_provider = "custom"
+model_catalog_json = "atoapi-model-catalog.json"
+
+[model_providers.custom]
+name = "Atoapi"
+base_url = "http://127.0.0.1:18883/codex/v1"
+"#;
+        write_text(&path, original).unwrap();
+        write_text(
+            &codex_restore_state_path(&path).unwrap(),
+            r#"{"schema_version":1,"encrypted_payload":"plaintext"}
+"#,
+        )
+        .unwrap();
+
+        let error = remove_codex_config_injection(&path).unwrap_err();
+
+        assert!(error.to_string().contains("unencrypted"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn legacy_managed_codex_config_migrates_before_disable() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-legacy-disable-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        write_text(
+            &path,
+            r#"model = "gpt-5.6-luna"
+model_reasoning_effort = "ultra"
+model_provider = "custom"
+model_catalog_json = "atoapi-model-catalog.json"
+disable_response_storage = true
+
+[model_providers.custom]
+name = "Atoapi"
+base_url = "http://127.0.0.1:18883/codex/v1"
+
+[mcp_servers.context7]
+command = "npx"
+"#,
+        )
+        .unwrap();
+
+        remove_codex_config_injection(&path).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            parsed
+                .get("model_reasoning_effort")
+                .and_then(toml::Value::as_str),
+            Some("ultra")
+        );
+        assert!(parsed.get("model_provider").is_none());
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(parsed.get("disable_response_storage").is_none());
+        assert!(parsed.get("mcp_servers").is_some());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn failed_config_replace_keeps_the_previous_file_intact() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-config-replace-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        write_text(&path, "model = \"before\"\n").unwrap();
+
+        let error = write_text_with_replace(&path, "model = \"after\"\n", |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated locked config",
+            ))
+        });
+
+        assert!(error.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"before\"\n");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unconfigured_agent_route_keeps_the_agent_model_passthrough() {
+        let mut config = AppConfig::default();
+        config.providers.push(ProviderConfig {
+            id: "passthrough".to_string(),
+            name: "passthrough".to_string(),
+            base_url: "https://example.test/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: crate::config::Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: true,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        });
+
+        update_route(
+            &mut config,
+            AgentInjectionRouteUpdate {
+                id: "codex".to_string(),
+                provider_id: Some("passthrough".to_string()),
+                model_id: None,
+            },
+        )
+        .unwrap();
+
+        let codex = config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        assert_eq!(codex.provider_id.as_deref(), Some("passthrough"));
+        assert!(codex.model_id.is_none());
     }
 
     #[test]
@@ -1542,7 +2273,7 @@ model_context_window = 888000
             parsed
                 .get("model_reasoning_effort")
                 .and_then(toml::Value::as_str),
-            Some("max")
+            Some("ultra")
         );
         assert_eq!(
             parsed
@@ -1772,16 +2503,14 @@ model_reasoning_effort = "max"
             .unwrap()
             .iter()
             .any(|level| level["effort"] == "ultra"));
-        assert!(mapped["service_tiers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tier| tier["id"] == "priority" && tier["name"] == "Fast"));
+        assert!(mapped["service_tiers"].as_array().unwrap().is_empty());
+        assert_eq!(mapped["use_responses_lite"], false);
+        assert_eq!(mapped["prefer_websockets"], false);
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
-    fn enabled_agent_without_provider_defaults_to_active_provider_without_forcing_model() {
+    fn enabled_agent_without_provider_stays_unbound() {
         let mut config = AppConfig::default();
         config.providers.push(ProviderConfig {
             id: "torch".to_string(),
@@ -1829,7 +2558,7 @@ model_reasoning_effort = "max"
             .iter()
             .find(|item| item.id == "codex")
             .unwrap();
-        assert_eq!(codex.provider_id.as_deref(), Some("torch"));
+        assert_eq!(codex.provider_id, None);
         assert_eq!(codex.model_id, None);
     }
 
