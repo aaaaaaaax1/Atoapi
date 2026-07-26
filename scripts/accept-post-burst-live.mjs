@@ -1396,6 +1396,10 @@ function hashParts(parts) {
 }
 
 function runSelfTest() {
+  assert.deepEqual(
+    parseArgs(["--long-lived-requests=10", "--mode", "long_lived"]),
+    { "long-lived-requests": "10", mode: "long_lived" }
+  );
   const config = [
     'workspace_fingerprint = "default-workspace"',
     "",
@@ -1681,7 +1685,11 @@ function parseArgs(items) {
   for (let index = 0; index < items.length; index += 1) {
     const item = items[index];
     if (!item.startsWith("--")) continue;
-    const key = item.slice(2);
+    const [key, inlineValue] = item.slice(2).split("=", 2);
+    if (inlineValue !== undefined) {
+      parsed[key] = inlineValue;
+      continue;
+    }
     const next = items[index + 1];
     if (next && !next.startsWith("--")) {
       parsed[key] = next;

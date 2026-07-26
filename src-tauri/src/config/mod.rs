@@ -1278,6 +1278,8 @@ impl AppConfig {
                                     key.priority,
                                     std::cmp::Reverse(key.total_requests),
                                     key.successes,
+                                    // Keep equal-priority, equal-load keys in the editor order.
+                                    std::cmp::Reverse(*index),
                                 )
                             })
                             .unwrap_or(0),
@@ -1320,7 +1322,9 @@ impl AppConfig {
             // An enabled pool is an explicit routing boundary: its health and
             // load-balancing rules own key selection. Falling back to the
             // connection-info key here would silently bypass that boundary.
-            return Ok(None);
+            return Err(anyhow!(
+                "provider API key is not configured: provider key pool has no enabled usable key"
+            ));
         }
 
         self.provider_api_key(provider_id).map(|key| {
@@ -1352,7 +1356,7 @@ impl AppConfig {
         provider_id: &str,
         key_id: Option<&str>,
         message: &str,
-        force_disable: bool,
+        force_cooldown: bool,
     ) {
         let Some(key_id) = key_id else {
             return;
@@ -1371,8 +1375,10 @@ impl AppConfig {
             key.status = ProviderKeyStatus::Unhealthy;
             key.last_checked_at = Some(now);
             key.last_error = Some(message.chars().take(180).collect());
-            if force_disable || key.failures >= failure_threshold as u64 {
-                key.enabled = false;
+            if force_cooldown || key.failures >= failure_threshold as u64 {
+                // `enabled` is the user's routing switch. Health failures only
+                // apply a temporary circuit-breaker cooldown, so a recovered
+                // key becomes selectable again without a settings rewrite.
                 key.disabled_until = Some(now + chrono::Duration::minutes(recovery_minutes as i64));
             }
             key.updated_at = now;
@@ -2365,10 +2371,10 @@ impl AppConfig {
                 let existing = existing_pool
                     .as_ref()
                     .and_then(|pool| pool.keys.iter().find(|key| key.id == id));
-                let encrypted = item
-                    .key
-                    .as_deref()
-                    .filter(|key| !key.trim().is_empty())
+                let re_enabled = existing.is_some_and(|key| !key.enabled) && item.enabled;
+                let supplied_secret = item.key.as_deref().filter(|key| !key.trim().is_empty());
+                let health_reset = re_enabled || supplied_secret.is_some();
+                let encrypted = supplied_secret
                     .map(encrypt_secret)
                     .transpose()?
                     .or_else(|| existing.and_then(|key| key.key_encrypted.clone()));
@@ -2378,18 +2384,69 @@ impl AppConfig {
                     key_encrypted: encrypted,
                     enabled: item.enabled,
                     priority: item.priority,
-                    status: item.status,
-                    total_requests: item.total_requests,
-                    successes: item.successes,
-                    failures: item.failures,
-                    last_checked_at: item.last_checked_at,
-                    last_error: clean_optional_string(item.last_error),
-                    disabled_until: item.disabled_until,
+                    // Health is owned by the runtime. An editor opened before
+                    // an actual request must not overwrite fresh health data
+                    // when it saves an unrelated alias/order change.
+                    status: if health_reset {
+                        ProviderKeyStatus::Unknown
+                    } else {
+                        existing
+                            .map(|key| key.status.clone())
+                            .unwrap_or(item.status)
+                    },
+                    total_requests: if health_reset {
+                        0
+                    } else {
+                        existing
+                            .map(|key| key.total_requests)
+                            .unwrap_or(item.total_requests)
+                    },
+                    successes: if health_reset {
+                        0
+                    } else {
+                        existing.map(|key| key.successes).unwrap_or(item.successes)
+                    },
+                    failures: if health_reset {
+                        0
+                    } else {
+                        existing.map(|key| key.failures).unwrap_or(item.failures)
+                    },
+                    last_checked_at: if health_reset {
+                        None
+                    } else {
+                        existing
+                            .and_then(|key| key.last_checked_at)
+                            .or(item.last_checked_at)
+                    },
+                    last_error: if health_reset {
+                        None
+                    } else {
+                        existing
+                            .and_then(|key| key.last_error.clone())
+                            .or_else(|| clean_optional_string(item.last_error))
+                    },
+                    disabled_until: if health_reset {
+                        None
+                    } else {
+                        existing
+                            .and_then(|key| key.disabled_until)
+                            .or(item.disabled_until)
+                    },
                     created_at: existing.map(|key| key.created_at).unwrap_or(now),
                     updated_at: now,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+
+        let selection_order_changed = existing_pool.as_ref().is_some_and(|existing| {
+            existing.strategy != input.strategy
+                || existing.keys.len() != keys.len()
+                || existing
+                    .keys
+                    .iter()
+                    .zip(&keys)
+                    .any(|(before, after)| before.id != after.id)
+        });
 
         if let Some(pool) = self
             .provider_key_pools
@@ -2401,7 +2458,12 @@ impl AppConfig {
             pool.failure_threshold = input.failure_threshold.max(1);
             pool.recovery_minutes = input.recovery_minutes.max(1);
             pool.keys = keys;
-            if !pool.keys.is_empty() {
+            if selection_order_changed {
+                // The round-robin cursor addresses positions in this vector.
+                // A reordered or strategy-changed pool must begin from its
+                // newly declared order rather than a stale numeric position.
+                pool.next_index = 0;
+            } else if !pool.keys.is_empty() {
                 pool.next_index %= pool.keys.len();
             } else {
                 pool.next_index = 0;
@@ -2436,7 +2498,7 @@ fn provider_key_pool_connection_changed(
                     .is_some_and(|secret| !secret.trim().is_empty())
             });
     };
-    if existing.enabled != input.enabled || existing.strategy != input.strategy {
+    if existing.enabled != input.enabled {
         return true;
     }
     if existing.keys.len() != input.keys.len() {
@@ -2454,8 +2516,6 @@ fn provider_key_pool_connection_changed(
             .as_deref()
             .is_some_and(|secret| !secret.trim().is_empty())
             || existing_key.enabled != input_key.enabled
-            || existing_key.priority != input_key.priority
-            || existing_key.disabled_until != input_key.disabled_until
     })
 }
 
@@ -3564,6 +3624,148 @@ enabled = true
     }
 
     #[test]
+    fn provider_key_health_cooldown_preserves_the_user_enabled_switch() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![key_input("key-a", Some("sk-a"), true, 5)],
+            })))
+            .expect("provider should save");
+
+        config.mark_provider_key_failure(&provider_id, Some("key-a"), "HTTP 429", true);
+        let failed = config
+            .provider_key(&provider_id, "key-a")
+            .expect("key should exist");
+        assert!(
+            failed.enabled,
+            "health failure must not change the user switch"
+        );
+        assert!(
+            failed.disabled_until.is_some(),
+            "health failure should apply cooldown"
+        );
+        assert!(config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .is_err());
+
+        config.mark_provider_key_success(&provider_id, Some("key-a"));
+        let recovered = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("recovered key selection should work")
+            .expect("recovered key should be selectable");
+        assert_eq!(recovered.key_id.as_deref(), Some("key-a"));
+    }
+
+    #[test]
+    fn re_enabling_a_key_clears_stale_health_cooldown_and_error() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![key_input("key-a", Some("sk-a"), false, 5)],
+            })))
+            .expect("provider should save");
+        let stale_cooldown = Utc::now() + chrono::Duration::minutes(5);
+        {
+            let key = config
+                .provider_key_mut(&provider_id, "key-a")
+                .expect("key should exist");
+            key.status = ProviderKeyStatus::Unhealthy;
+            key.failures = 3;
+            key.last_checked_at = Some(Utc::now());
+            key.last_error = Some("old quota failure".to_string());
+            key.disabled_until = Some(stale_cooldown);
+        }
+
+        let mut re_enabled = key_input("key-a", None, true, 5);
+        re_enabled.status = ProviderKeyStatus::Unhealthy;
+        re_enabled.failures = 3;
+        re_enabled.last_checked_at = Some(Utc::now());
+        re_enabled.last_error = Some("old quota failure".to_string());
+        re_enabled.disabled_until = Some(stale_cooldown);
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 3,
+                    recovery_minutes: 5,
+                    keys: vec![re_enabled],
+                },
+            )
+            .expect("key should re-enable");
+
+        let key = config
+            .provider_key(&provider_id, "key-a")
+            .expect("key should exist");
+        assert!(key.enabled);
+        assert_eq!(key.status, ProviderKeyStatus::Unknown);
+        assert_eq!(key.failures, 0);
+        assert!(key.last_checked_at.is_none());
+        assert!(key.last_error.is_none());
+        assert!(key.disabled_until.is_none());
+        assert!(config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("re-enabled key selection should work")
+            .is_some());
+    }
+
+    #[test]
+    fn stale_editor_save_preserves_runtime_key_health() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![key_input("key-a", Some("sk-a"), true, 5)],
+            })))
+            .expect("provider should save");
+
+        config.mark_provider_key_failure(&provider_id, Some("key-a"), "HTTP 429", true);
+        let stale_editor_draft = ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 3,
+            recovery_minutes: 5,
+            // This is the stale state a previously opened editor would send
+            // while changing only ordering or aliases. Its missing cooldown
+            // must not invalidate the provider's cache/session evidence.
+            keys: vec![key_input("key-a", None, true, 9)],
+        };
+        assert!(
+            !provider_key_pool_connection_changed(
+                config
+                    .provider_key_pools
+                    .iter()
+                    .find(|pool| pool.provider_id == provider_id),
+                &stale_editor_draft,
+            ),
+            "runtime health and ordering are not connection changes"
+        );
+        config
+            .upsert_provider_key_pool(&provider_id, stale_editor_draft)
+            .expect("stale editor save should work");
+
+        let key = config
+            .provider_key(&provider_id, "key-a")
+            .expect("key should exist");
+        assert_eq!(key.priority, 9);
+        assert_eq!(key.status, ProviderKeyStatus::Unhealthy);
+        assert_eq!(key.failures, 1);
+        assert!(key.disabled_until.is_some());
+    }
+
+    #[test]
     fn enabled_provider_key_pool_never_falls_back_to_connection_key() {
         let mut config = AppConfig::default();
         let mut input = provider_input(Some(ProviderKeyPoolInput {
@@ -3576,13 +3778,14 @@ enabled = true
         input.api_key = Some("sk-connection".to_string());
         let provider_id = config.upsert_provider(input).expect("provider should save");
 
-        let selected = config
+        let err = config
             .select_provider_key_for_request(&provider_id, None, None)
-            .expect("selection should not fail");
-        assert!(
-            selected.is_none(),
-            "an enabled pool with no eligible key must not fall back to the connection key"
-        );
+            .expect_err(
+                "an enabled pool with no eligible key must not fall back to the connection key",
+            );
+        assert!(err
+            .to_string()
+            .contains("provider key pool has no enabled usable key"));
 
         config
             .upsert_provider_key_pool(
@@ -3623,6 +3826,82 @@ enabled = true
             .expect("connection key should be available");
         assert_eq!(selected.key_id, None);
         assert_eq!(selected.secret, "sk-connection");
+    }
+
+    #[test]
+    fn provider_key_pool_reorder_resets_round_robin_and_priority_ties_use_editor_order() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::RoundRobin,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![
+                    key_input("key-a", Some("sk-a"), true, 5),
+                    key_input("key-b", Some("sk-b"), true, 5),
+                    key_input("key-c", Some("sk-c"), true, 5),
+                ],
+            })))
+            .expect("provider should save");
+
+        config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("first selection should work");
+        config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("second selection should work");
+
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::RoundRobin,
+                    failure_threshold: 3,
+                    recovery_minutes: 5,
+                    keys: vec![
+                        key_input("key-c", None, true, 5),
+                        key_input("key-a", None, true, 5),
+                        key_input("key-b", None, true, 5),
+                    ],
+                },
+            )
+            .expect("reordered pool should save");
+        assert_eq!(
+            config
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == provider_id)
+                .expect("pool should exist")
+                .next_index,
+            0
+        );
+        let reordered = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("reordered selection should work")
+            .expect("reordered key should exist");
+        assert_eq!(reordered.key_id.as_deref(), Some("key-c"));
+
+        let mut priority_config = AppConfig::default();
+        let priority_provider_id = priority_config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Priority,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![
+                    key_input("key-a", Some("sk-a"), true, 5),
+                    key_input("key-b", Some("sk-b"), true, 5),
+                    key_input("key-c", Some("sk-c"), true, 5),
+                ],
+            })))
+            .expect("priority provider should save");
+        let priority_selected = priority_config
+            .select_provider_key_for_request(&priority_provider_id, None, None)
+            .expect("priority selection should work")
+            .expect("priority key should exist");
+        assert_eq!(priority_selected.key_id.as_deref(), Some("key-a"));
     }
 
     #[test]

@@ -4803,6 +4803,27 @@
       white-space: nowrap;
     }
 
+    .key-health {
+      min-width: 42px;
+      align-self: center;
+      display: grid;
+      justify-items: center;
+      gap: 4px;
+    }
+
+    .key-health .key-status {
+      align-self: auto;
+      text-align: center;
+    }
+
+    .key-status[data-status="unhealthy"] {
+      color: #e5a0a0;
+    }
+
+    .key-status[data-status="unknown"] {
+      color: var(--muted);
+    }
+
     .key-order-controls {
       display: flex;
       align-items: center;
@@ -4837,7 +4858,7 @@
         grid-column: 2 / 3;
       }
 
-      .key-editor-row .key-status {
+      .key-editor-row .key-health {
         grid-column: 3 / 4;
       }
 
@@ -6730,8 +6751,8 @@
     ];
 
     let keyPool = [
-      { id: "key-primary", name: "主 Key", secret: "sk-demo-yunzhou-8J2A", priority: 10, status: "正常" },
-      { id: "key-backup", name: "备用 Key", secret: "sk-demo-yunzhou-Q9LM", priority: 5, status: "正常" }
+      { id: "key-primary", name: "主 Key", secret: "sk-demo-yunzhou-8J2A", enabled: true, priority: 10, status: "正常" },
+      { id: "key-backup", name: "备用 Key", secret: "sk-demo-yunzhou-Q9LM", enabled: true, priority: 5, status: "正常" }
     ];
 
     const requests = [
@@ -7500,7 +7521,7 @@
           <label class="key-field key-name"><span>名称</span><input value="${escapeHtml(key.name)}" data-key-name="${key.id}" autocomplete="off" aria-label="${escapeHtml(key.name)} 的名称" /></label>
           <label class="key-field key-value"><span>Key</span><span class="secret-field"><input id="keySecret-${key.id}" value="${escapeHtml(key.secret)}" type="password" data-key-secret="${key.id}" autocomplete="new-password" aria-label="${escapeHtml(key.name)} 的 Key" /><button class="secret-toggle" type="button" data-secret-toggle="keySecret-${key.id}" aria-label="显示 ${escapeHtml(key.name)} 的 Key" title="显示完整 Key">${icon("eye", 14)}</button></span></label>
           <label class="key-field key-priority"><span>优先级</span><input value="${key.priority}" data-key-priority="${key.id}" inputmode="numeric" autocomplete="off" aria-label="${escapeHtml(key.name)} 的优先级" /></label>
-          <span class="key-status">${key.status}</span>
+          <div class="key-health"><button class="switch" type="button" role="switch" aria-checked="${key.enabled !== false}" data-key-enabled="${key.id}" aria-label="启用 ${escapeHtml(key.name)}" title="启用 Key"></button><span class="key-status" data-status="${escapeHtml(key.status)}">${key.status}</span></div>
           <div class="key-order-controls">
             <button class="icon-button" type="button" data-key-test="${key.id}" aria-label="测试 ${escapeHtml(key.name)}" title="测试">${icon("activity", 14)}</button>
             <button class="icon-button" type="button" data-key-move="up" data-key-id="${key.id}" aria-label="${escapeHtml(key.name)} 上移" title="上移" ${index === 0 ? "disabled" : ""}>${icon("arrow-up", 14)}</button>
@@ -7523,6 +7544,14 @@
       $$('[data-key-priority]').forEach((input) => input.addEventListener("input", () => {
         const key = keyPool.find((item) => item.id === input.dataset.keyPriority);
         if (key) key.priority = input.value;
+      }));
+
+      $$('[data-key-enabled]').forEach((button) => button.addEventListener("click", () => {
+        const key = keyPool.find((item) => item.id === button.dataset.keyEnabled);
+        if (!key) return;
+        key.enabled = key.enabled === false;
+        renderKeyPool();
+        hydrateIcons();
       }));
 
       $$('[data-key-test]').forEach((button) => button.addEventListener("click", () => {
@@ -7614,6 +7643,7 @@
           id: `key-${Date.now()}-${index}`,
           name: `Key ${keyPool.length + 1}`,
           secret,
+          enabled: true,
           priority: 0,
           status: "未测试"
         });
@@ -7800,7 +7830,7 @@
 
     $("#addKeyButton").addEventListener("click", () => {
       const id = `key-${Date.now()}`;
-      keyPool.push({ id, name: "新 Key", secret: "sk-demo-new-key", priority: 0, status: "未测试" });
+      keyPool.push({ id, name: "新 Key", secret: "sk-demo-new-key", enabled: true, priority: 0, status: "未测试" });
       renderKeyPool();
       hydrateIcons();
       showToast("已添加新的模拟 Key");

@@ -26,6 +26,10 @@ const STABLE_RECOVERY_MAX_AVOIDABLE_TOKENS: u64 = 1_024;
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PrefixControlInput {
     pub source_is_exact: bool,
+    /// The preceding exact state was already a substantial, stable cache hit.
+    /// Only these states may proactively consume the short settle window
+    /// before the first observable bucket regression exists.
+    pub recent_exact_high_hit: bool,
     pub avoidable_tokens: u64,
     pub fine_avoidable_tokens: u64,
     pub avoidable_shortfall_streak: u32,
@@ -64,6 +68,10 @@ pub(super) struct PrefixGapInput<'a> {
     pub usage: &'a UsageRecord,
     pub tail: &'a TailInputDiagnostics,
     pub guard_budget_exhausted: bool,
+    /// The exact prefix had the whole local 500ms settlement opportunity
+    /// before this request was sent. A remaining reliable regression is
+    /// upstream instability, not a locally avoidable gap.
+    pub exact_settle_window_elapsed: bool,
     /// True only when the current frozen native Responses wire changed a
     /// non-`input` projection relative to the state being compared.
     pub static_wire_drift: bool,
@@ -87,6 +95,7 @@ pub(super) struct PrefixStateInput<'a> {
     pub used_response_session: bool,
     pub retried_full_response: bool,
     pub guard_budget_exhausted: bool,
+    pub exact_settle_window_elapsed: bool,
     pub final_responses_static_projection: FinalResponsesStaticProjection<'a>,
 }
 
@@ -106,6 +115,7 @@ struct GapEvidence {
     avoidable_tokens_128: u64,
     tail_granularity: bool,
     provider_rollback: bool,
+    full_settle_failed: bool,
 }
 
 impl PrefixController {
@@ -145,6 +155,19 @@ impl PrefixController {
             };
         }
         if input.avoidable_tokens == 0 {
+            // A fresh exact high-hit can still be racing the provider's cache
+            // commit even though the prior response had no visible gap. This
+            // is the only proactive wait: it is bounded by the user's 500ms
+            // budget, requires a safe tail, and does not send or rewrite an
+            // upstream request.
+            if !input.compaction_requested
+                && input.recent_exact_high_hit
+                && input.state_age < MAX_FOREGROUND_WAIT
+                && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
+                && input.current_tail_is_settle_safe
+            {
+                return settle_for_remaining_window(input, "responses_fresh_exact_prefix_settle");
+            }
             return skip("no_avoidable_gap", false);
         }
         if input.state_age >= MAX_EXACT_EVIDENCE_AGE {
@@ -152,12 +175,12 @@ impl PrefixController {
         }
         if input.avoidable_shortfall_streak < MIN_REPEATED_AVOIDABLE_STREAK {
             // A just-settled exact prefix can expose a first cache-lag gap
-            // before there is enough history to call it a repeated pattern.
-            // Give only that narrow case the remainder of the 500 ms settle
-            // window.  This never delays an ordinary request without an exact
-            // observed gap, and avoids waiting on large/ambiguous tails.
-            if input.state_age < MAX_FOREGROUND_WAIT
-                && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
+            // before there is enough history to call it repeated. Give this
+            // narrow case the remaining 500ms window, or one complete bounded
+            // settle attempt when the original window is already old. This
+            // never delays an ordinary request without an exact observed gap
+            // and avoids waiting on large or ambiguous tails.
+            if input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
                 && input.avoidable_tokens <= 4_096
                 && input.fine_avoidable_tokens > 0
                 && input.fine_avoidable_tokens <= 4_096
@@ -165,23 +188,14 @@ impl PrefixController {
                 if !input.current_tail_is_settle_safe {
                     return skip("avoidable_gap_current_tail_unreliable", false);
                 }
-                let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
-                if request_budget.is_zero() {
-                    return skip("local_guard_budget_exhausted", true);
-                }
-                let requested = MAX_FOREGROUND_WAIT.saturating_sub(input.state_age);
-                let wait = requested.min(request_budget);
-                return PrefixControlDecision {
-                    wait,
-                    reason: Some("responses_first_exact_avoidable_settle"),
-                    skip_reason: None,
-                    budget_exhausted: wait < requested,
-                };
+                return settle_for_observed_gap_window(
+                    input,
+                    "responses_first_exact_avoidable_settle",
+                );
             }
             return skip("avoidable_gap_not_repeated", false);
         }
-        let wait_avoidable_tokens = if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE
-        {
+        if input.cache_instability_score > MAX_STABLE_INSTABILITY_SCORE {
             if !input.tiny_instability_recovery_safe
                 || input.settle_after_cold_read
                 || !matches!(input.avoidable_tokens, 128 | 256)
@@ -189,24 +203,11 @@ impl PrefixController {
             {
                 return skip("avoidable_gap_unstable", false);
             }
-            input.fine_avoidable_tokens
-        } else {
-            input.avoidable_tokens
-        };
-
-        let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
-        if request_budget.is_zero() {
-            return skip("local_guard_budget_exhausted", true);
         }
-
-        let requested = requested_wait(wait_avoidable_tokens, input.avoidable_shortfall_streak);
-        let wait = requested.min(request_budget);
-        PrefixControlDecision {
-            wait,
-            reason: Some("responses_exact_avoidable_gap"),
-            skip_reason: None,
-            budget_exhausted: wait < requested,
+        if !input.current_tail_is_settle_safe {
+            return skip("avoidable_gap_current_tail_unreliable", false);
         }
+        settle_for_observed_gap_window(input, "responses_exact_avoidable_gap")
     }
 
     pub fn classify_gap(input: PrefixGapInput<'_>) -> ProviderCacheGapBreakdown {
@@ -262,8 +263,10 @@ impl PrefixController {
             record,
             input.tail,
             input.guard_budget_exhausted,
+            input.exact_settle_window_elapsed,
         );
-        let provider_unstable_tokens = if evidence.provider_rollback {
+        let provider_unstable = evidence.provider_rollback || evidence.full_settle_failed;
+        let provider_unstable_tokens = if provider_unstable {
             evidence.direct_avoidable_tokens
         } else {
             0
@@ -413,7 +416,9 @@ impl PrefixController {
             record,
             input.tail,
             input.guard_budget_exhausted,
+            input.exact_settle_window_elapsed,
         );
+        let provider_unstable = evidence.provider_rollback || evidence.full_settle_failed;
         let avoidable_shortfall_streak =
             if evidence.avoidable_tokens > 0 || evidence.avoidable_tokens_128 > 0 {
                 input
@@ -453,7 +458,7 @@ impl PrefixController {
             && record.cache_read_tokens > 0
             && provider_cache_ratio(record).unwrap_or_default() >= STABLE_RECOVERY_MIN_RATIO
             && large_avoidable <= STABLE_RECOVERY_MAX_AVOIDABLE_TOKENS
-            && !evidence.provider_rollback
+            && !provider_unstable
             && !evidence.tail_granularity
             && !responses_current_tail_makes_avoidable_unreliable(input.tail)
             && !responses_tool_tail_burst(input.tail);
@@ -462,7 +467,7 @@ impl PrefixController {
                 || small_context_cold_read);
         let cache_instability_score = if severe_cold_read {
             previous_instability.saturating_add(3).min(8)
-        } else if evidence.provider_rollback {
+        } else if provider_unstable {
             previous_instability.saturating_add(1).min(8)
         } else if stable_recovery {
             previous_instability.saturating_sub(1)
@@ -490,7 +495,7 @@ impl PrefixController {
         } else {
             0
         };
-        let learn_sent_bucket = !evidence.provider_rollback
+        let learn_sent_bucket = !provider_unstable
             && !evidence.tail_granularity
             && should_learn_sent_provider_bucket(
                 input.previous,
@@ -510,7 +515,7 @@ impl PrefixController {
         } else {
             record.cache_read_tokens
         };
-        let seen_bucket_tokens = if evidence.provider_rollback || evidence.tail_granularity {
+        let seen_bucket_tokens = if provider_unstable || evidence.tail_granularity {
             record.cache_read_tokens.max(sent_bucket_tokens)
         } else {
             evidence
@@ -518,7 +523,7 @@ impl PrefixController {
                 .max(record.cache_read_tokens)
                 .max(sent_bucket_tokens)
         };
-        let seen_bucket_tokens_128 = if evidence.provider_rollback || evidence.tail_granularity {
+        let seen_bucket_tokens_128 = if provider_unstable || evidence.tail_granularity {
             record.cache_read_tokens.max(sent_bucket_tokens_128)
         } else {
             evidence
@@ -549,7 +554,7 @@ impl PrefixController {
 
         PrefixStateObservation {
             next: Some(next),
-            learn_family: !evidence.provider_rollback
+            learn_family: !provider_unstable
                 && should_learn_provider_prefix_family_state(record, input.tail),
             static_wire_drift: false,
         }
@@ -584,6 +589,7 @@ fn gap_evidence(
     record: &UsageRecord,
     tail: &TailInputDiagnostics,
     guard_budget_exhausted: bool,
+    exact_settle_window_elapsed: bool,
 ) -> GapEvidence {
     let (previous_seen_bucket, previous_seen_bucket_128) = previous
         .map(|state| provider_prefix_calibrated_previous_seen_buckets(state, record))
@@ -620,7 +626,12 @@ fn gap_evidence(
         direct_avoidable_tokens,
         tail,
     );
-    let suppress_avoidable = provider_rollback || tail_granularity || avoidable_unreliable;
+    let full_settle_failed = exact_settle_window_elapsed
+        && direct_avoidable_tokens > 0
+        && !tail_granularity
+        && !avoidable_unreliable;
+    let suppress_avoidable =
+        provider_rollback || full_settle_failed || tail_granularity || avoidable_unreliable;
 
     GapEvidence {
         previous_seen_bucket,
@@ -634,6 +645,7 @@ fn gap_evidence(
             .unwrap_or(0),
         tail_granularity,
         provider_rollback,
+        full_settle_failed,
     }
 }
 
@@ -726,18 +738,47 @@ fn small_context_cold_read_after_warm(
     current_bucket.saturating_add(1024) >= previous_seen
 }
 
-fn requested_wait(avoidable_tokens: u64, avoidable_shortfall_streak: u32) -> Duration {
-    let gap_ms = avoidable_tokens.min(4_096).saturating_mul(250) / 4_096;
-    let streak_ms = avoidable_shortfall_streak
-        .saturating_sub(MIN_REPEATED_AVOIDABLE_STREAK)
-        .min(5) as u64
-        * 75;
-    Duration::from_millis(
-        100u64
-            .saturating_add(gap_ms)
-            .saturating_add(streak_ms)
-            .min(MAX_FOREGROUND_WAIT.as_millis() as u64),
-    )
+fn settle_for_remaining_window(
+    input: PrefixControlInput,
+    reason: &'static str,
+) -> PrefixControlDecision {
+    let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
+    if request_budget.is_zero() {
+        return skip("local_guard_budget_exhausted", true);
+    }
+    let requested = MAX_FOREGROUND_WAIT.saturating_sub(input.state_age);
+    let wait = requested.min(request_budget);
+    PrefixControlDecision {
+        wait,
+        reason: Some(reason),
+        skip_reason: None,
+        budget_exhausted: wait < requested,
+    }
+}
+
+fn settle_for_observed_gap_window(
+    input: PrefixControlInput,
+    reason: &'static str,
+) -> PrefixControlDecision {
+    let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
+    if request_budget.is_zero() {
+        return skip("local_guard_budget_exhausted", true);
+    }
+    // When the original 500ms period is still open, wait only its remainder.
+    // A known reliable gap that is already older gets one complete bounded
+    // local settle attempt before it can be reported as upstream instability.
+    let requested = if input.state_age < MAX_FOREGROUND_WAIT {
+        MAX_FOREGROUND_WAIT.saturating_sub(input.state_age)
+    } else {
+        MAX_FOREGROUND_WAIT
+    };
+    let wait = requested.min(request_budget);
+    PrefixControlDecision {
+        wait,
+        reason: Some(reason),
+        skip_reason: None,
+        budget_exhausted: wait < requested,
+    }
 }
 
 fn skip(reason: &'static str, budget_exhausted: bool) -> PrefixControlDecision {
@@ -756,6 +797,7 @@ mod tests {
     fn input(avoidable_tokens: u64) -> PrefixControlInput {
         PrefixControlInput {
             source_is_exact: true,
+            recent_exact_high_hit: false,
             avoidable_tokens,
             fine_avoidable_tokens: avoidable_tokens,
             avoidable_shortfall_streak: 0,
@@ -781,6 +823,35 @@ mod tests {
         let decision = PrefixController::before_request(input(0));
         assert_eq!(decision.wait, Duration::ZERO);
         assert_eq!(decision.skip_reason, Some("no_avoidable_gap"));
+    }
+
+    #[test]
+    fn fresh_high_hit_exact_prefix_settles_before_the_first_visible_gap() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            state_age: Duration::from_millis(140),
+            ..input(0)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(360));
+        assert_eq!(decision.reason, Some("responses_fresh_exact_prefix_settle"));
+        assert!(!decision.budget_exhausted);
+
+        let capped = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            state_age: Duration::from_millis(140),
+            request_budget: Duration::from_millis(120),
+            ..input(0)
+        });
+        assert_eq!(capped.wait, Duration::from_millis(120));
+        assert!(capped.budget_exhausted);
+
+        let unsafe_tail = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            current_tail_is_settle_safe: false,
+            ..input(0)
+        });
+        assert_eq!(unsafe_tail.wait, Duration::ZERO);
+        assert_eq!(unsafe_tail.skip_reason, Some("no_avoidable_gap"));
     }
 
     #[test]
@@ -831,13 +902,16 @@ mod tests {
     }
 
     #[test]
-    fn first_exact_avoidable_evidence_does_not_wait() {
+    fn older_first_exact_avoidable_evidence_gets_one_bounded_settle_attempt() {
         let decision = PrefixController::before_request(PrefixControlInput {
             state_age: Duration::from_secs(9),
             ..input(768)
         });
-        assert_eq!(decision.wait, Duration::ZERO);
-        assert_eq!(decision.skip_reason, Some("avoidable_gap_not_repeated"));
+        assert_eq!(decision.wait, MAX_FOREGROUND_WAIT);
+        assert_eq!(
+            decision.reason,
+            Some("responses_first_exact_avoidable_settle")
+        );
     }
 
     #[test]
@@ -869,13 +943,12 @@ mod tests {
     }
 
     #[test]
-    fn repeated_exact_avoidable_evidence_adapts_within_half_second() {
+    fn repeated_exact_avoidable_evidence_uses_the_full_remaining_settle_window() {
         let short = PrefixController::before_request(repeated_input(512, 2));
         let larger = PrefixController::before_request(repeated_input(4_096, 4));
 
-        assert!(short.wait > Duration::ZERO);
-        assert!(larger.wait > short.wait);
-        assert!(larger.wait <= MAX_FOREGROUND_WAIT);
+        assert_eq!(short.wait, MAX_FOREGROUND_WAIT);
+        assert_eq!(larger.wait, MAX_FOREGROUND_WAIT);
         assert_eq!(larger.reason, Some("responses_exact_avoidable_gap"));
     }
 
@@ -1029,6 +1102,7 @@ mod tests {
             usage: &record,
             tail: &TailInputDiagnostics::default(),
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             static_wire_drift: false,
         });
 
@@ -1044,6 +1118,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
@@ -1055,6 +1130,81 @@ mod tests {
         assert_eq!(next.avoidable_shortfall_tokens_128, 0);
         assert_eq!(next.avoidable_shortfall_streak, 0);
         assert_eq!(next.recent_clean_tiny_gap_streak, 0);
+        assert!(!observation.learn_family);
+    }
+
+    #[test]
+    fn residual_after_completed_exact_settle_is_upstream_instability() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 100_000,
+            cache_read_tokens: 99_840,
+            shortfall_tokens: 160,
+            seen_bucket_tokens: 99_840,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 160,
+            seen_bucket_tokens_128: 99_840,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
+            cache_instability_score: 0,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: None,
+        };
+        let record = UsageRecord {
+            input_tokens: 100_512,
+            cache_read_tokens: 99_584,
+            ..UsageRecord::default()
+        };
+
+        let unproven = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            static_wire_drift: false,
+        });
+        assert_eq!(unproven.avoidable_tokens, 256);
+        assert_eq!(unproven.provider_unstable_tokens, 0);
+
+        let proven = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: true,
+            static_wire_drift: false,
+        });
+        assert_eq!(proven.avoidable_tokens, 0);
+        assert_eq!(proven.provider_unstable_tokens, 256);
+        assert_eq!(proven.new_tail_tokens, 512);
+
+        let observation = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: true,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
+        });
+        let next = observation
+            .next
+            .expect("completed settle must update the prefix state");
+        assert_eq!(next.avoidable_shortfall_tokens, 0);
+        assert_eq!(next.avoidable_shortfall_tokens_128, 0);
+        assert_eq!(next.avoidable_shortfall_streak, 0);
+        assert_eq!(next.cache_instability_score, 1);
         assert!(!observation.learn_family);
     }
 
@@ -1092,6 +1242,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::Observed(Some(
                 "static-b",
             )),
@@ -1115,6 +1266,7 @@ mod tests {
             usage: &record,
             tail: &TailInputDiagnostics::default(),
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             static_wire_drift: true,
         });
         assert_eq!(gap.avoidable_tokens, 0);
@@ -1157,6 +1309,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
@@ -1200,6 +1353,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
@@ -1215,6 +1369,7 @@ mod tests {
 
         let decision = PrefixController::before_request(PrefixControlInput {
             source_is_exact: true,
+            recent_exact_high_hit: false,
             avoidable_tokens: next
                 .avoidable_shortfall_tokens
                 .max(next.avoidable_shortfall_tokens_128),
@@ -1273,6 +1428,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
@@ -1322,6 +1478,7 @@ mod tests {
             usage: &record,
             tail: &tail,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             static_wire_drift: false,
         });
 
@@ -1365,6 +1522,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation
@@ -1415,6 +1573,7 @@ mod tests {
             used_response_session: false,
             retried_full_response: false,
             guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
             final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
         });
         let next = observation

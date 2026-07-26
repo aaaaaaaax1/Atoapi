@@ -55,6 +55,7 @@ export interface GraphiteProviderPayload {
     id?: string;
     alias?: string;
     key?: string;
+    enabled: boolean;
     priority: number;
   }>;
   key_pool?: {
@@ -313,6 +314,7 @@ const bridgeSource = String.raw`
       name: item.alias || "Key " + (index + 1),
       secret: "",
       hasSavedSecret: item.has_saved_secret === true,
+      enabled: item.enabled !== false,
       priority: item.priority || 0,
       status: item.status || "未读取"
     })));
@@ -358,11 +360,43 @@ const bridgeSource = String.raw`
     hydrateIcons();
   }
 
+  function toggleKeyEnabled(keyId) {
+    const key = keyPool.find((item) => item.id === keyId);
+    if (!key) return;
+    key.enabled = key.enabled === false;
+    key.enabledDirty = true;
+    renderEditedKeyPool();
+  }
+
+  function mergeKeyPoolHealth(keyPoolHealth) {
+    const providerId = String(keyPoolHealth?.providerId || "");
+    if (!providerId || providerId !== selectedProviderId()) return;
+    const persistedKeys = Array.isArray(keyPoolHealth?.keys) ? keyPoolHealth.keys : [];
+    const persistedById = new Map(persistedKeys.map((key) => [key?.id, key]));
+    let changed = false;
+    keyPool.forEach((key) => {
+      const persisted = persistedById.get(key.id);
+      if (!persisted) return;
+      const status = String(persisted.status || key.status || "unknown");
+      if (key.status !== status) {
+        key.status = status;
+        changed = true;
+      }
+      // A locally toggled Key is still a draft edit. Keep that intent until Save.
+      if (!key.enabledDirty && typeof persisted.enabled === "boolean" && key.enabled !== persisted.enabled) {
+        key.enabled = persisted.enabled;
+        changed = true;
+      }
+    });
+    if (changed) renderEditedKeyPool();
+  }
+
   function addBlankKey() {
     keyPool.push({
       id: "key-" + Date.now() + "-" + Math.random().toString(16).slice(2),
       name: "新 Key " + (keyPool.length + 1),
       secret: "",
+      enabled: true,
       priority: 0,
       status: "待填写",
       isNew: true
@@ -393,6 +427,7 @@ const bridgeSource = String.raw`
         id: "key-" + Date.now() + "-" + index + "-" + Math.random().toString(16).slice(2),
         name: "Key " + (keyPool.length + 1),
         secret,
+        enabled: true,
         priority: 0,
         status: "未测试",
         isNew: true
@@ -474,14 +509,21 @@ const bridgeSource = String.raw`
     }).filter((mapping) => mapping.id);
     const strategy = strategyFromUi($bridge("#providerKeys .form-grid select")?.value || "轮询");
     const failureThreshold = Number($bridge("#providerKeys .form-grid input")?.value) || 3;
-    const keys = keyPool
-      .filter((key) => !key.isNew || String(key.secret || "").trim())
-      .map((key) => ({
+    const orderedKeys = keyPool.filter((key) => !key.isNew || String(key.secret || "").trim());
+    const keys = orderedKeys.map((key, index) => {
+      const priority = Number(key.priority);
+      return {
         id: key.id,
         alias: key.name,
         key: key.secret || undefined,
-        priority: Number(key.priority) || 0
-      }));
+        enabled: key.enabled !== false,
+        // Keep the draft array order for sequential/round-robin strategies and
+        // use a stable rank only when a manually entered priority is invalid.
+        priority: Number.isFinite(priority) && priority >= 0
+          ? Math.trunc(priority)
+          : orderedKeys.length - index
+      };
+    });
     return {
       agentId: selected?.sourceId || selected?.id || "",
       id: editingProviderId || null,
@@ -861,6 +903,7 @@ const bridgeSource = String.raw`
           input.removeAttribute("data-saved-secret");
         }
       }
+      if (message.payload?.keyPoolHealth) mergeKeyPoolHealth(message.payload.keyPoolHealth);
       if (message.payload?.compatibility) applyCompatibility(message.payload.compatibility);
       if (message.payload?.networkDiagnostic) applyNetworkDiagnostic(message.payload.networkDiagnostic);
       if (message.payload?.connectionTest) applyConnectionPathTest(message.payload.connectionTest);
@@ -1028,6 +1071,11 @@ const bridgeSource = String.raw`
     if (target.id === "bulkAddKeysButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBulkKeysFromBridge(); return;
     }
+    if (target.dataset.keyEnabled) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      toggleKeyEnabled(target.dataset.keyEnabled);
+      return;
+    }
     if (target.dataset.keyRemove) {
       event.preventDefault(); event.stopImmediatePropagation(); removeKeyFromBridge(target.dataset.keyRemove); return;
     }
@@ -1044,7 +1092,7 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation(); send("test-provider", { providerId: target.dataset.testProvider }); return;
     }
     if (target.dataset.keyTest) {
-      event.preventDefault(); event.stopImmediatePropagation(); send("test-provider-key", { providerId: selectedProviderId(), keyId: target.dataset.keyTest, provider: serializeEditor() }); return;
+      event.preventDefault(); event.stopImmediatePropagation(); send("test-provider-key", { providerId: editingProviderId || "", keyId: target.dataset.keyTest, provider: serializeEditor() }); return;
     }
     if (target.dataset.secretToggle) {
       const input = document.getElementById(target.dataset.secretToggle);
@@ -1068,7 +1116,7 @@ const bridgeSource = String.raw`
     if (mockAction) {
       event.preventDefault(); event.stopImmediatePropagation();
       if (target.closest("#providerModels")) send("fetch-models", { provider: serializeEditor() });
-      else if (target.closest("#providerKeys")) send("test-provider-key-pool", { providerId: selectedProviderId() });
+      else if (target.closest("#providerKeys")) send("test-provider-key-pool", { providerId: editingProviderId || "" });
       else if (target.closest("#providerGeneral")) send("test-provider", { provider: serializeEditor() });
       else if (target.closest("#settingsProxy")) send("restart-main-proxy");
       else if (target.closest("#settingsData")) send("clear-cache");
@@ -1588,7 +1636,11 @@ function buildState(
     url: provider.base_url,
     channel: provider.channel_mode === "auto" ? "Auto" : channelLabel(provider.channel),
     mappings: provider.models.filter((model) => model.enabled).length,
-    keys: (provider.has_api_key ? 1 : 0) + (provider.key_pool?.available_keys ?? 0),
+    // An enabled pool is the routing boundary. Its connection-info Key is not
+    // eligible and must not be shown as usable capacity in the provider list.
+    keys: provider.key_pool?.enabled
+      ? provider.key_pool.available_keys
+      : (provider.has_api_key ? 1 : 0),
     active: false,
     latency: providerConnectionStatus[provider.id] ?? "未检测"
   }));
@@ -1628,6 +1680,7 @@ function buildState(
       id: key.id,
       alias: key.alias ?? "",
       has_saved_secret: key.has_saved_secret,
+      enabled: key.enabled,
       priority: key.priority,
       status: key.status
     }))

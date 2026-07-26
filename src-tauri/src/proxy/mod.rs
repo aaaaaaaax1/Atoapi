@@ -544,6 +544,8 @@ struct PrefixGuardWaitDiagnostics {
     state_age_ms: Option<u64>,
     skip_reason: Option<String>,
     budget_exhausted: bool,
+    exact_settle_window_elapsed: bool,
+    settled_exact_state_finished_at: Option<Instant>,
     cache_instability_score: Option<u64>,
     seen_bucket_tokens: Option<u64>,
     state_cache_read_tokens: Option<u64>,
@@ -1020,17 +1022,14 @@ async fn run_responses_compact_for_authorized_agent(
     let selected_provider_key =
         match select_provider_api_key(&state, &decision.provider.id, None, None).await {
             Ok(selected) => selected,
-            Err(err) if err.to_string().contains("not configured") => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    "provider API key is not configured",
-                )
-            }
             Err(err) => {
+                if let Some(message) = provider_key_configuration_error_message(&err) {
+                    return json_error(StatusCode::BAD_REQUEST, message);
+                }
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!("failed to select provider key: {err}"),
-                )
+                );
             }
         };
     let api_key = selected_provider_key.secret.clone();
@@ -2245,17 +2244,14 @@ async fn run_generation_for_authorized_agent(
     .await
     {
         Ok(selected) => selected,
-        Err(err) if err.to_string().contains("not configured") => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "provider API key is not configured",
-            )
-        }
         Err(err) => {
+            if let Some(message) = provider_key_configuration_error_message(&err) {
+                return json_error(StatusCode::BAD_REQUEST, message);
+            }
             return json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("failed to select provider key: {err}"),
-            )
+            );
         }
     };
     let api_key = selected_provider_key.secret.clone();
@@ -2461,26 +2457,6 @@ async fn run_generation_for_authorized_agent(
         .or(response_session_snapshot_lease);
     let session_anchor_diagnostics =
         response_session_anchor_diagnostics(response_session_lease.as_ref());
-    let local_prepare_ms = started.elapsed().as_millis() as u64;
-    let prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
-        wait_for_provider_prefix_settle(
-            &state,
-            &decision.upstream_channel,
-            provider_prefix_control_key.as_deref(),
-            provider_prefix_family_key.as_deref(),
-            &tail_input_diagnostics,
-            trusted_codex_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.compaction_requested),
-            prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
-        )
-        .await
-    } else {
-        PrefixGuardWaitDiagnostics {
-            skip_reason: prefix_guard_skip_reason.map(str::to_string),
-            ..PrefixGuardWaitDiagnostics::default()
-        }
-    };
     let response_session_cooldown_key =
         response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
     let mut response_session_delta_body_sizes = None;
@@ -2578,6 +2554,32 @@ async fn run_generation_for_authorized_agent(
         response_session_reuse_diagnostics.skip_reason = None;
     }
     let active_used_response_session = used_response_session;
+    let local_prepare_ms = started.elapsed().as_millis() as u64;
+    let prefix_guard_wait = if active_used_response_session {
+        PrefixGuardWaitDiagnostics {
+            // A verified upstream continuation sends only the exact delta, so
+            // a full-prefix cache settlement cannot improve this request and
+            // must not add foreground TTFT delay.
+            skip_reason: Some("verified_native_delta".to_string()),
+            ..PrefixGuardWaitDiagnostics::default()
+        }
+    } else if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
+        wait_for_provider_prefix_settle(
+            &state,
+            &decision.upstream_channel,
+            provider_prefix_control_key.as_deref(),
+            provider_prefix_family_key.as_deref(),
+            &tail_input_diagnostics,
+            response_session_starts_compaction_epoch,
+            prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
+        )
+        .await
+    } else {
+        PrefixGuardWaitDiagnostics {
+            skip_reason: prefix_guard_skip_reason.map(str::to_string),
+            ..PrefixGuardWaitDiagnostics::default()
+        }
+    };
     let response_session_parent = if !response_session_compaction_parent_matched
         || (client_supplied_previous_response_id.is_some()
             && !response_session_starts_compaction_epoch)
@@ -2737,6 +2739,11 @@ async fn run_generation_for_authorized_agent(
         .filter(|identity| session_identity_source_is_trusted(identity.source));
     let generated_prompt_cache_key_value = trusted_generated_cache_identity
         .map(|identity| generated_prompt_cache_key(identity, &decision, &selected_provider_key));
+    // Direct connection-info Keys used the v1.3.4 placement key. Keep that
+    // exact stable key for the normal recovery path so an upgrade does not
+    // cold-start a working upstream cache. Pool Keys remain realm-scoped.
+    let legacy_direct_prompt_cache_key_value =
+        trusted_generated_cache_identity.map(|identity| identity.provider_cache_key.clone());
     let generated_key_session_scope_id = generated_prompt_cache_key_value
         .as_deref()
         .map(generated_prompt_cache_key_session_scope_id);
@@ -2897,19 +2904,21 @@ async fn run_generation_for_authorized_agent(
     );
     let generated_prompt_cache_key_requested = candidate_cache_routing_requested
         && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
-    if (generated_prompt_cache_key_recovery_enabled
-        || generated_prompt_cache_key_requested
-        || generated_prompt_cache_key_promoted)
-        && generated_prompt_cache_key_eligible
-    {
-        if let Some(cache_key) = generated_prompt_cache_key_value.as_ref() {
-            cache_capability::apply_generated_prompt_cache_key(
-                &mut active_upstream_body,
-                cache_key,
-                &mut cache_control_application,
-            );
-            provider_prefix_key = Some(cache_key.clone());
-        }
+    if let Some(cache_key) = selected_prompt_cache_placement_key(
+        legacy_direct_prompt_cache_key_value.as_deref(),
+        generated_prompt_cache_key_value.as_deref(),
+        &selected_provider_key,
+        generated_prompt_cache_key_recovery_enabled,
+        generated_prompt_cache_key_requested,
+        generated_prompt_cache_key_promoted,
+        generated_prompt_cache_key_eligible,
+    ) {
+        cache_capability::apply_generated_prompt_cache_key(
+            &mut active_upstream_body,
+            cache_key,
+            &mut cache_control_application,
+        );
+        provider_prefix_key = Some(cache_key.to_string());
     }
     if agent_generation {
         let final_provider_prefix_key = openai_prompt_cache_key(active_upstream_body.body());
@@ -3899,6 +3908,9 @@ async fn run_generation_for_authorized_agent(
         active_used_response_session,
         retried_full_response,
         prefix_guard_wait.budget_exhausted,
+        prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
+        prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
+        prefix_guard_wait.settled_exact_state_finished_at,
         is_success_status && !sync_compact_diagnostic_only && !confirmed_compaction,
     )
     .await;
@@ -4277,6 +4289,7 @@ async fn wait_for_provider_prefix_settle(
     };
     if let Some((source, state)) = state_snapshot {
         let state_age = state.finished_at.elapsed();
+        let state_finished_at = state.finished_at;
         let state_age_ms = state_age.as_millis() as u64;
         let cache_instability_score = state.cache_instability_score as u64;
         let seen_bucket_tokens = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
@@ -4288,6 +4301,7 @@ async fn wait_for_provider_prefix_settle(
                 .max(state.avoidable_shortfall_tokens);
             let policy = PrefixController::before_request(PrefixControlInput {
                 source_is_exact: source == "exact",
+                recent_exact_high_hit: responses_exact_prefix_is_high_hit(&state),
                 avoidable_tokens,
                 fine_avoidable_tokens: state.avoidable_shortfall_tokens_128,
                 avoidable_shortfall_streak: state.avoidable_shortfall_streak,
@@ -4303,10 +4317,19 @@ async fn wait_for_provider_prefix_settle(
                 state_age,
                 request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
             });
+            let exact_settle_window_elapsed = prefix_exact_settle_window_elapsed(
+                &source,
+                state_age,
+                policy.wait,
+                policy.budget_exhausted,
+            );
+            let settled_exact_state_finished_at = (source == "exact").then_some(state_finished_at);
             if policy.wait.is_zero() {
                 return PrefixGuardWaitDiagnostics {
                     skip_reason: policy.skip_reason.map(str::to_string),
                     budget_exhausted: policy.budget_exhausted,
+                    exact_settle_window_elapsed,
+                    settled_exact_state_finished_at,
                     source: Some(source),
                     state_age_ms: Some(state_age_ms),
                     cache_instability_score: Some(cache_instability_score),
@@ -4323,6 +4346,8 @@ async fn wait_for_provider_prefix_settle(
                 state_age_ms: Some(state_age_ms),
                 skip_reason: None,
                 budget_exhausted: policy.budget_exhausted,
+                exact_settle_window_elapsed,
+                settled_exact_state_finished_at,
                 cache_instability_score: Some(cache_instability_score),
                 seen_bucket_tokens: Some(seen_bucket_tokens),
                 state_cache_read_tokens: Some(state_cache_read_tokens),
@@ -4364,6 +4389,8 @@ async fn wait_for_provider_prefix_settle(
                 state_age_ms: Some(state_age_ms),
                 skip_reason: None,
                 budget_exhausted,
+                exact_settle_window_elapsed: false,
+                settled_exact_state_finished_at: None,
                 cache_instability_score: Some(cache_instability_score),
                 seen_bucket_tokens: Some(seen_bucket_tokens),
                 state_cache_read_tokens: Some(state_cache_read_tokens),
@@ -5058,12 +5085,30 @@ fn responses_foreground_wait_cap() -> TokioDuration {
     TokioDuration::from_millis(500)
 }
 
+fn responses_exact_prefix_is_high_hit(state: &PrefixWarmState) -> bool {
+    state.input_tokens >= 32_000
+        && state.cache_read_tokens >= 32_000
+        && state.cache_read_tokens.saturating_mul(100) >= state.input_tokens.saturating_mul(98)
+}
+
+fn prefix_exact_settle_window_elapsed(
+    source: &str,
+    state_age: TokioDuration,
+    wait: TokioDuration,
+    budget_exhausted: bool,
+) -> bool {
+    source == "exact"
+        && !wait.is_zero()
+        && !budget_exhausted
+        && state_age.saturating_add(wait) >= responses_foreground_wait_cap()
+}
+
 fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
     _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
     // The guard is already fail-closed: it only waits on an exact, recent
-    // prefix state after the controller has found a concrete avoidable gap.
+    // high-hit prefix state or a concrete avoidable gap.
     // Keep the user's latency contract here as the final hard ceiling instead
     // of disabling that safe recovery path for every Responses request.
     matches!(channel, Channel::Responses).then_some(responses_foreground_wait_cap())
@@ -5786,6 +5831,9 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         used_response_session,
         retried_full_response,
         guard_budget_exhausted,
+        false,
+        false,
+        None,
         true,
     )
     .await;
@@ -5803,6 +5851,9 @@ async fn observe_provider_prefix_usage(
     used_response_session: bool,
     retried_full_response: bool,
     guard_budget_exhausted: bool,
+    guard_source_is_exact: bool,
+    exact_settle_window_elapsed: bool,
+    settled_exact_state_finished_at: Option<Instant>,
     learn_state: bool,
 ) -> ProviderPrefixUsageObservation {
     let Some(raw) = raw_usage else {
@@ -5810,12 +5861,47 @@ async fn observe_provider_prefix_usage(
         clear_recent_clean_tiny_gap_evidence(&mut states, provider_prefix_key);
         return ProviderPrefixUsageObservation::default();
     };
-    let (previous_exact, previous_best, previous_family, next, learn_family, static_wire_drift) = {
+    let (
+        previous_exact,
+        previous_best,
+        previous_family,
+        next,
+        learn_family,
+        static_wire_drift,
+        exact_settle_window_elapsed,
+    ) = {
         let mut states = state.prefix_states.lock().await;
         let key = provider_prefix_key;
         let previous_exact = key.and_then(|key| states.get(key).cloned());
         let previous_best = key.and_then(|key| lookup_provider_prefix_state(&states, key).cloned());
         let previous_family = provider_prefix_family_key.and_then(|key| states.get(key).cloned());
+        let completed_exact_settle = guard_source_is_exact && exact_settle_window_elapsed;
+        let exact_settle_window_elapsed = completed_exact_settle
+            && settled_exact_state_finished_at.is_some_and(|finished_at| {
+                previous_exact
+                    .as_ref()
+                    .is_some_and(|state| state.finished_at == finished_at)
+                    && previous_best
+                        .as_ref()
+                        .is_some_and(|state| state.finished_at == finished_at)
+            });
+        // A concurrent same-prefix completion may replace the snapshot while
+        // this request is spending its complete local settle window. The wait
+        // was still real; treating the following residual as locally
+        // avoidable would falsely inflate the gap metric. An older or foreign
+        // receipt never gets this exception.
+        let exact_settle_replaced_by_newer_state = completed_exact_settle
+            && !exact_settle_window_elapsed
+            && settled_exact_state_finished_at.is_some_and(|finished_at| {
+                previous_exact
+                    .as_ref()
+                    .is_some_and(|state| state.finished_at > finished_at)
+                    && previous_best
+                        .as_ref()
+                        .is_some_and(|state| state.finished_at > finished_at)
+            });
+        let exact_settle_window_elapsed =
+            exact_settle_window_elapsed || exact_settle_replaced_by_newer_state;
         let state_observation = if learn_state {
             effective_usage.map(|usage| {
                 PrefixController::observe(PrefixStateInput {
@@ -5825,6 +5911,7 @@ async fn observe_provider_prefix_usage(
                     used_response_session,
                     retried_full_response,
                     guard_budget_exhausted,
+                    exact_settle_window_elapsed,
                     final_responses_static_projection,
                 })
             })
@@ -5860,6 +5947,7 @@ async fn observe_provider_prefix_usage(
             next,
             learn_family,
             static_wire_drift,
+            exact_settle_window_elapsed,
         )
     };
     let gap = Some(PrefixController::classify_gap(PrefixGapInput {
@@ -5869,6 +5957,7 @@ async fn observe_provider_prefix_usage(
         usage: raw,
         tail,
         guard_budget_exhausted,
+        exact_settle_window_elapsed,
         static_wire_drift,
     }));
     if next.is_some() || learn_family {
@@ -6733,6 +6822,38 @@ async fn provider_cache_gap_breakdown_with_guard(
     } else {
         (None, None, None)
     };
+    let exact_settle_window_elapsed = prefix_guard_wait.is_some_and(|wait| {
+        wait.source.as_deref() == Some("exact")
+            && wait.wait_ms > 0
+            && wait.exact_settle_window_elapsed
+            && wait
+                .settled_exact_state_finished_at
+                .is_some_and(|finished_at| {
+                    previous_exact
+                        .as_ref()
+                        .is_some_and(|state| state.finished_at == finished_at)
+                        && previous_best
+                            .as_ref()
+                            .is_some_and(|state| state.finished_at == finished_at)
+                })
+    });
+    let exact_settle_replaced_by_newer_state = prefix_guard_wait.is_some_and(|wait| {
+        wait.source.as_deref() == Some("exact")
+            && wait.wait_ms > 0
+            && wait.exact_settle_window_elapsed
+            && wait
+                .settled_exact_state_finished_at
+                .is_some_and(|finished_at| {
+                    previous_exact
+                        .as_ref()
+                        .is_some_and(|state| state.finished_at > finished_at)
+                        && previous_best
+                            .as_ref()
+                            .is_some_and(|state| state.finished_at > finished_at)
+                })
+    });
+    let exact_settle_window_elapsed =
+        exact_settle_window_elapsed || exact_settle_replaced_by_newer_state;
     let default_tail = TailInputDiagnostics::default();
     Some(PrefixController::classify_gap(PrefixGapInput {
         previous_exact: previous_exact.as_ref(),
@@ -6743,6 +6864,7 @@ async fn provider_cache_gap_breakdown_with_guard(
         guard_budget_exhausted: prefix_guard_wait
             .map(|wait| wait.budget_exhausted)
             .unwrap_or(false),
+        exact_settle_window_elapsed,
         static_wire_drift: false,
     }))
 }
@@ -9502,6 +9624,21 @@ async fn select_provider_api_key(
             .insert(map_key, key_id.clone());
     }
     Ok(selected)
+}
+
+fn provider_key_configuration_error_message(error: &anyhow::Error) -> Option<&'static str> {
+    let contains = |needle: &str| {
+        error
+            .chain()
+            .any(|cause| cause.to_string().contains(needle))
+    };
+    if contains("provider key pool has no enabled usable key") {
+        Some("provider key pool has no enabled usable key")
+    } else if contains("provider API key is not configured") {
+        Some("provider API key is not configured")
+    } else {
+        None
+    }
 }
 
 fn provider_key_affinity_map_key(provider_id: &str, affinity_key: &str) -> String {
@@ -13050,6 +13187,32 @@ fn generated_prompt_cache_key_compatibility_allowed(
         key_id,
         ProviderCacheCapabilityField::PromptCacheKey,
     ) != ProviderCacheCapabilityStatus::Unsupported
+}
+
+/// Selects the final provider cache placement without weakening Key-realm
+/// isolation. A normal direct connection keeps the v1.3.4 key so a desktop
+/// upgrade can retain its warm upstream cache; pool selection, candidates and
+/// promoted routes always use the newer selected-Key-realm placement.
+fn selected_prompt_cache_placement_key<'a>(
+    legacy_direct_key: Option<&'a str>,
+    generated_key: Option<&'a str>,
+    selected_provider_key: &SelectedProviderKey,
+    recovery_enabled: bool,
+    candidate_requested: bool,
+    promoted: bool,
+    eligible: bool,
+) -> Option<&'a str> {
+    if !eligible || !(recovery_enabled || candidate_requested || promoted) {
+        return None;
+    }
+    if recovery_enabled
+        && !candidate_requested
+        && !promoted
+        && selected_provider_key.key_id.is_none()
+    {
+        return legacy_direct_key;
+    }
+    generated_key
 }
 
 /// The production placement key is fully Atoapi-owned. It combines a stable
@@ -20849,6 +21012,67 @@ mod tests {
     }
 
     #[test]
+    fn direct_key_keeps_legacy_placement_while_pool_and_validation_use_realm_key() {
+        let direct = SelectedProviderKey {
+            secret: "connection-key".to_string(),
+            key_id: None,
+        };
+        let pooled = SelectedProviderKey {
+            secret: "pool-key".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("v1-3-4-placement"),
+                Some("realm-placement"),
+                &direct,
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some("v1-3-4-placement")
+        );
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("v1-3-4-placement"),
+                Some("realm-placement"),
+                &pooled,
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some("realm-placement")
+        );
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("v1-3-4-placement"),
+                Some("realm-placement"),
+                &direct,
+                true,
+                true,
+                false,
+                true,
+            ),
+            Some("realm-placement")
+        );
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("v1-3-4-placement"),
+                Some("realm-placement"),
+                &direct,
+                false,
+                false,
+                false,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn upstream_headers_preserve_client_capabilities_and_replace_local_auth() {
         let mut inbound = HeaderMap::new();
         inbound.insert(
@@ -26290,6 +26514,156 @@ mod tests {
                 .unwrap();
         assert_eq!(recovered_gap.avoidable_tokens, 0);
         assert_eq!(recovered_gap.provider_unstable_tokens, 0);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn full_exact_settle_evidence_requires_the_same_prefix_state() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-exact-settle-state-match-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "main-prefix";
+        let settled_at = Instant::now();
+        let mut warm = prefix_state(100_000, 99_840, 160);
+        warm.finished_at = settled_at;
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), warm);
+        let residual = UsageRecord {
+            input_tokens: 100_512,
+            cache_read_tokens: 99_584,
+            ..UsageRecord::default()
+        };
+
+        let stale_receipt = PrefixGuardWaitDiagnostics {
+            wait_ms: 500,
+            source: Some("exact".to_string()),
+            exact_settle_window_elapsed: true,
+            settled_exact_state_finished_at: Some(Instant::now()),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let unproven = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            None,
+            Some(&stale_receipt),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unproven.avoidable_tokens, 256);
+        assert_eq!(unproven.provider_unstable_tokens, 0);
+
+        let matching_receipt = PrefixGuardWaitDiagnostics {
+            wait_ms: 500,
+            source: Some("exact".to_string()),
+            exact_settle_window_elapsed: true,
+            settled_exact_state_finished_at: Some(settled_at),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let proven = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            None,
+            Some(&matching_receipt),
+        )
+        .await
+        .unwrap();
+        assert_eq!(proven.avoidable_tokens, 0);
+        assert_eq!(proven.provider_unstable_tokens, 256);
+
+        let forged_sibling_receipt = PrefixGuardWaitDiagnostics {
+            wait_ms: 500,
+            source: Some("session-sibling".to_string()),
+            exact_settle_window_elapsed: true,
+            settled_exact_state_finished_at: Some(settled_at),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let sibling_gap = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            None,
+            Some(&forged_sibling_receipt),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sibling_gap.avoidable_tokens, 256);
+        assert_eq!(sibling_gap.provider_unstable_tokens, 0);
+
+        let mut newer = prefix_state(100_000, 99_840, 160);
+        newer.finished_at = settled_at + TokioDuration::from_millis(1);
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), newer);
+
+        let replaced = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            None,
+            Some(&matching_receipt),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replaced.avoidable_tokens, 0);
+        assert_eq!(replaced.provider_unstable_tokens, 256);
+
+        let partial = observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            Some(&residual),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::NotApplicable,
+            false,
+            false,
+            false,
+            true,
+            false,
+            Some(settled_at),
+            false,
+        )
+        .await;
+        let partial_gap = partial.gap.expect("partial settle must classify a gap");
+        assert_eq!(partial_gap.avoidable_tokens, 256);
+        assert_eq!(partial_gap.provider_unstable_tokens, 0);
+
+        let completed = observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&residual),
+            Some(&residual),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::NotApplicable,
+            false,
+            false,
+            false,
+            true,
+            true,
+            Some(settled_at),
+            false,
+        )
+        .await;
+        let completed_gap = completed.gap.expect("completed settle must classify a gap");
+        assert_eq!(completed_gap.avoidable_tokens, 0);
+        assert_eq!(completed_gap.provider_unstable_tokens, 256);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -31993,6 +32367,8 @@ mod tests {
                 state_age_ms: None,
                 skip_reason: None,
                 budget_exhausted: false,
+                exact_settle_window_elapsed: false,
+                settled_exact_state_finished_at: None,
                 cache_instability_score: Some(0),
                 seen_bucket_tokens: Some(59_392),
                 state_cache_read_tokens: Some(59_392),
@@ -32348,6 +32724,8 @@ mod tests {
             guarded.reason.as_deref(),
             Some("responses_exact_avoidable_gap")
         );
+        assert!(guarded.exact_settle_window_elapsed);
+        assert!(guarded.settled_exact_state_finished_at.is_some());
 
         {
             let mut states = state.prefix_states.lock().await;
@@ -32374,6 +32752,7 @@ mod tests {
             recovered.reason.as_deref(),
             Some("responses_exact_avoidable_gap")
         );
+        assert!(recovered.exact_settle_window_elapsed);
 
         let tool_tail = TailInputDiagnostics {
             tool_output_chars: 8_000,
@@ -32458,6 +32837,46 @@ mod tests {
         .await;
         assert_eq!(unguarded.wait_ms, 0);
         assert_eq!(unguarded.skip_reason.as_deref(), Some("no_avoidable_gap"));
+        assert!(!unguarded.exact_settle_window_elapsed);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn fresh_high_hit_exact_prefix_settles_before_first_visible_gap() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-fresh-high-hit-prefix-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0fresh-high-hit";
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), prefix_state(64_512, 63_872, 0));
+
+        let guard = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+
+        assert!(guard.wait_ms > 0);
+        assert!(guard.wait_ms <= 500);
+        assert_eq!(
+            guard.reason.as_deref(),
+            Some("responses_fresh_exact_prefix_settle")
+        );
+        assert!(guard.exact_settle_window_elapsed);
+        assert!(guard.settled_exact_state_finished_at.is_some());
 
         fs::remove_dir_all(dir).ok();
     }
@@ -33121,6 +33540,9 @@ mod tests {
             false,
             false,
             false,
+            false,
+            false,
+            None,
             false,
         )
         .await;
@@ -39279,10 +39701,15 @@ mod tests {
         let generated_key = captured
             .get("prompt_cache_key")
             .and_then(Value::as_str)
-            .expect("generated key must reach the one frozen upstream wire");
+            .expect("the selected placement key must reach the one frozen upstream wire");
         assert_eq!(generated_key.len(), 64);
         assert_ne!(generated_key, "codex-native-placement-key");
-        assert!(captured.get("prompt_cache_retention").is_none());
+        assert_eq!(
+            captured
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h")
+        );
         assert!(captured.get("prompt_cache_options").is_none());
         assert_eq!(
             captured_responses_accept.lock().await.as_deref(),
@@ -40607,7 +41034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_responses_key_failure_is_one_shot_then_next_inbound_rotates_key() {
+    async fn ordinary_responses_key_failure_is_one_shot_then_next_inbound_uses_backup_key() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let seen_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let upstream_hits_for_route = upstream_hits.clone();
@@ -40731,8 +41158,15 @@ mod tests {
                 .find(|pool| pool.provider_id == provider_id)
                 .and_then(|pool| pool.keys.iter().find(|key| key.id == "key-a"))
                 .expect("the rejected key must remain in the pool");
-            assert!(!key_a.enabled);
+            assert!(
+                key_a.enabled,
+                "a health failure must not change the user switch"
+            );
             assert_eq!(key_a.failures, 1);
+            assert!(
+                key_a.disabled_until.is_some(),
+                "the rejected key should be cooling down"
+            );
         }
 
         let second = handle_generation(

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -34,6 +35,7 @@ type CommandResult<T> = Result<T, String>;
 
 const ERROR_BODY_MAX_CHARS: usize = 512;
 const PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
+const KEY_POOL_HEALTH_CONCURRENCY: usize = 4;
 const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/api/claudecode",
     "/api/anthropic",
@@ -1003,25 +1005,22 @@ pub async fn test_provider_key(
     state: State<'_, Arc<AppState>>,
     input: ProviderKeyTestInput,
 ) -> CommandResult<ProviderKeyTestResult> {
-    let result = test_provider_key_inner(&state, &input).await;
+    let result = match test_provider_key_inner(state.inner(), &input).await {
+        Ok(result) => result,
+        Err(err) => failed_provider_key_test(&input, err),
+    };
     if let Some(provider_id) = input.provider_id.as_deref() {
         if let Some(key_id) = input.key_id.as_deref() {
             let version = {
                 let mut config = state.config.write().await;
                 match &result {
-                    Ok(result) if result.ok => {
+                    result if result.ok => {
                         config.mark_provider_key_success(provider_id, Some(key_id))
                     }
-                    Ok(result) => config.mark_provider_key_failure(
+                    result => config.mark_provider_key_failure(
                         provider_id,
                         Some(key_id),
                         &result.message,
-                        true,
-                    ),
-                    Err(err) => config.mark_provider_key_failure(
-                        provider_id,
-                        Some(key_id),
-                        &err.to_string(),
                         true,
                     ),
                 }
@@ -1035,7 +1034,7 @@ pub async fn test_provider_key(
                 .map_err(to_command_error)?;
         }
     }
-    result.map_err(to_command_error)
+    Ok(result)
 }
 
 /// Tests the editable connection over both direct and system-proxy paths.
@@ -1056,68 +1055,96 @@ pub async fn test_provider_key_pool(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
 ) -> CommandResult<Vec<ProviderKeyTestResult>> {
-    let provider = {
+    test_provider_key_pool_inner(state.inner(), &provider_id)
+        .await
+        .map_err(to_command_error)
+}
+
+async fn test_provider_key_pool_inner(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<Vec<ProviderKeyTestResult>> {
+    let (provider, key_ids) = {
         let config = state.config.read().await;
-        config
+        let provider = config
             .providers
             .iter()
             .find(|provider| provider.id == provider_id)
             .cloned()
-            .ok_or_else(|| format!("provider {provider_id} was not found"))?
-    };
-    let key_ids = {
-        let config = state.config.read().await;
-        config
+            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+        let key_ids = config
             .provider_key_pools
             .iter()
             .find(|pool| pool.provider_id == provider_id)
             .map(|pool| {
                 pool.keys
                     .iter()
+                    .filter(|key| key.enabled && key.key_encrypted.is_some())
                     .map(|key| key.id.clone())
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        (provider, key_ids)
     };
-    let mut results = Vec::new();
-    for key_id in key_ids {
-        let input = ProviderKeyTestInput {
-            provider_id: Some(provider_id.clone()),
-            key_id: Some(key_id),
-            api_key: None,
-            base_url: provider.base_url.clone(),
-            models_url: provider.models_url.clone(),
-            is_full_url: provider.is_full_url,
-            custom_user_agent: provider.custom_user_agent.clone(),
-            channel: provider.channel.clone(),
-            use_system_proxy: provider.use_system_proxy,
-        };
-        let result = test_provider_key_inner(&state, &input)
-            .await
-            .map_err(to_command_error)?;
-        let version = {
-            let mut config = state.config.write().await;
-            if result.ok {
-                config.mark_provider_key_success(&provider_id, input.key_id.as_deref());
-            } else {
-                config.mark_provider_key_failure(
-                    &provider_id,
-                    input.key_id.as_deref(),
-                    &result.message,
-                    true,
-                );
-            }
-            state
-                .publish_config_snapshot(&config)
-                .map_err(to_command_error)?
-        };
-        state
-            .wait_for_config_snapshot(version)
-            .await
-            .map_err(to_command_error)?;
-        results.push(result);
+    let inputs = key_ids
+        .into_iter()
+        .map(|key_id| {
+            let input = ProviderKeyTestInput {
+                provider_id: Some(provider_id.to_string()),
+                key_id: Some(key_id.clone()),
+                api_key: None,
+                base_url: provider.base_url.clone(),
+                models_url: provider.models_url.clone(),
+                is_full_url: provider.is_full_url,
+                custom_user_agent: provider.custom_user_agent.clone(),
+                channel: provider.channel.clone(),
+                use_system_proxy: provider.use_system_proxy,
+            };
+            (key_id, input)
+        })
+        .collect::<Vec<_>>();
+
+    let mut outcomes = stream::iter(inputs.into_iter().enumerate().map(
+        |(index, (key_id, input))| async move {
+            let result = match test_provider_key_inner(state, &input).await {
+                Ok(result) => result,
+                Err(err) => failed_provider_key_test(&input, err),
+            };
+            (index, key_id, result)
+        },
+    ))
+    .buffer_unordered(KEY_POOL_HEALTH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    outcomes.sort_by_key(|(index, _, _)| *index);
+    let outcomes = outcomes
+        .into_iter()
+        .map(|(_, key_id, result)| (key_id, result))
+        .collect::<Vec<_>>();
+
+    if outcomes.is_empty() {
+        return Err(anyhow!(
+            "provider key pool has no enabled saved key to test"
+        ));
     }
-    Ok(results)
+
+    // Health checks run independently, but their resulting state is one
+    // coherent config update. This avoids a disk write per key and prevents
+    // another request from observing a partially applied batch.
+    let version = {
+        let mut config = state.config.write().await;
+        for (key_id, result) in &outcomes {
+            if result.ok {
+                config.mark_provider_key_success(provider_id, Some(key_id));
+            } else {
+                config.mark_provider_key_failure(provider_id, Some(key_id), &result.message, true);
+            }
+        }
+        state.publish_config_snapshot(&config)?
+    };
+    state.wait_for_config_snapshot(version).await?;
+
+    Ok(outcomes.into_iter().map(|(_, result)| result).collect())
 }
 
 #[tauri::command]
@@ -1463,7 +1490,7 @@ async fn diagnose_model_endpoint(
 }
 
 async fn test_provider_key_inner(
-    state: &State<'_, Arc<AppState>>,
+    state: &AppState,
     input: &ProviderKeyTestInput,
 ) -> Result<ProviderKeyTestResult> {
     let mut upstream_secret = input
@@ -1515,6 +1542,19 @@ async fn test_provider_key_inner(
             message: err.to_string(),
             models_count: 0,
         }),
+    }
+}
+
+fn failed_provider_key_test(
+    input: &ProviderKeyTestInput,
+    error: anyhow::Error,
+) -> ProviderKeyTestResult {
+    ProviderKeyTestResult {
+        provider_id: input.provider_id.clone(),
+        key_id: input.key_id.clone(),
+        ok: false,
+        message: error.to_string(),
+        models_count: 0,
     }
 }
 

@@ -1,6 +1,6 @@
-#[cfg(test)]
-use crate::config::ProviderCacheCapabilityStatus;
-use crate::config::{AppConfig, Channel, ProviderCacheCapabilityField, ProviderConfig};
+use crate::config::{
+    AppConfig, Channel, ProviderCacheCapabilityField, ProviderCacheCapabilityStatus, ProviderConfig,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -118,19 +118,41 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
     };
     let probe_selected = |field| controlled_probe_fields.contains(&field) && probe_accepted(field);
     let allowed = |field| probe_selected(field) || promoted(field);
+    let enable_modern_options = allowed(ProviderCacheCapabilityField::PromptCacheOptions);
+    let retention_status = config.cache_capability_status_for_key(
+        &provider.id,
+        model,
+        channel,
+        key_id,
+        ProviderCacheCapabilityField::PromptCacheRetention,
+    );
+    let retention_has_capability_record = config
+        .cache_capability_for_key(
+            &provider.id,
+            model,
+            channel,
+            key_id,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        )
+        .is_some();
+    let legacy_retention_default =
+        !provider_uses_official_openai_api(provider) && !retention_has_capability_record;
 
     NativeCachePlan {
         // `prompt_cache_key` is never a normal routing rule. A schema probe
         // can accept the field without proving that it affects the upstream
         // cache, so retain it only for an administrator-started candidate.
         preserve_prompt_cache_key: probe_selected(ProviderCacheCapabilityField::PromptCacheKey),
-        // Retention remains an explicit provider compatibility choice, but
-        // ordinary traffic still requires measured, key-realm-scoped effect
-        // evidence. A controlled candidate may use an accepted field solely
-        // to collect that evidence.
+        // Retention is a user-selected legacy compatibility control. Keep it
+        // for a third-party upstream with no capability record, unless this
+        // exact provider/model/key rejected it or modern options supersede it.
+        // Once a capability record exists, preserve its measured scope rules.
         enable_prompt_cache_retention: provider.prompt_cache_retention_enabled
-            && allowed(ProviderCacheCapabilityField::PromptCacheRetention),
-        enable_modern_options: allowed(ProviderCacheCapabilityField::PromptCacheOptions),
+            && retention_status != ProviderCacheCapabilityStatus::Unsupported
+            && !enable_modern_options
+            && (legacy_retention_default
+                || allowed(ProviderCacheCapabilityField::PromptCacheRetention)),
+        enable_modern_options,
         // This control has repeatedly been rejected by the active upstream
         // class. Production keeps its schema probe and final-wire diagnostics
         // available, but does not inject it until a placement-proven promotion
@@ -139,6 +161,18 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
         enable_explicit_breakpoint: cfg!(test)
             && allowed(ProviderCacheCapabilityField::PromptCacheBreakpoint),
     }
+}
+
+fn provider_uses_official_openai_api(provider: &ProviderConfig) -> bool {
+    let endpoint = provider.base_url.trim().to_ascii_lowercase();
+    let authority = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .unwrap_or(&endpoint)
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    matches!(authority, "api.openai.com" | "api.openai.com:443")
 }
 
 #[cfg(test)]
@@ -979,7 +1013,7 @@ mod tests {
     }
 
     #[test]
-    fn third_party_unverified_plan_removes_unconfirmed_controls() {
+    fn unverified_provider_keeps_user_enabled_legacy_retention() {
         let config = AppConfig::default();
         let plan = plan(
             &config,
@@ -998,18 +1032,40 @@ mod tests {
             ]}]
         });
         let changed = apply(&mut body, &Channel::Responses, plan);
-        assert_eq!(
-            changed,
-            vec![
-                "prompt_cache_key",
-                "prompt_cache_retention",
-                "prompt_cache_options"
-            ]
-        );
+        assert_eq!(changed, vec!["prompt_cache_key", "prompt_cache_options"]);
         assert!(body.get("prompt_cache_key").is_none());
-        assert!(body.get("prompt_cache_retention").is_none());
+        assert_eq!(body["prompt_cache_retention"], PROMPT_CACHE_RETENTION_VALUE);
         assert!(body.get("prompt_cache_options").is_none());
         assert!(!contains_cache_breakpoint(&body));
+    }
+
+    #[test]
+    fn explicitly_unsupported_retention_is_not_forwarded() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("field rejected".to_string()),
+        );
+        let plan = plan(
+            &config,
+            &provider("https://third.example/v1"),
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+        );
+        let mut body = json!({
+            "prompt_cache_retention": "24h",
+            "input": []
+        });
+
+        let changed = apply(&mut body, &Channel::Responses, plan);
+
+        assert_eq!(changed, vec!["prompt_cache_retention"]);
+        assert!(body.get("prompt_cache_retention").is_none());
     }
 
     #[test]

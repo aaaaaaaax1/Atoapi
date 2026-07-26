@@ -43,6 +43,7 @@ const checks = [
   ["provider display regression", npm, ["run", "test:provider-display"]],
   ["metrics trend UI regression", npm, ["run", "test:metrics-trend-ui"]],
   ["secret-field UI regression", npm, ["run", "test:secret-field-ui"]],
+  ["key-pool UI regression", npm, ["run", "test:key-pool-ui"]],
   ["provider connection-path UI regression", npm, ["run", "test:provider-connection-path-ui"]],
   ["session reuse UI regression", npm, ["run", "test:session-reuse-ui"]],
   ["owned-dispatch acceptance", npm, ["run", "test:acceptance"]],

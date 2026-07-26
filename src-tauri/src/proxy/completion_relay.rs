@@ -665,6 +665,9 @@ pub(super) async fn stream_upstream(
             used_response_session,
             retried_full_response,
             prefix_guard_wait.budget_exhausted,
+            prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
+            prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
+            prefix_guard_wait.settled_exact_state_finished_at,
             stream_success_for_cache && !confirmed_compaction,
         )
         .await;

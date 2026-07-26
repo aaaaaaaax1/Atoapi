@@ -27,7 +27,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.3.8";
+const APP_VERSION = "v1.3.9";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -180,7 +180,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
             id: key.id,
             alias: cleanOptionalText(key.alias) ?? prior?.alias ?? null,
             key: cleanOptionalText(key.key) ?? null,
-            enabled: prior?.enabled ?? true,
+            enabled: key.enabled ?? prior?.enabled ?? true,
             priority: key.priority,
             status: prior?.status ?? "unknown",
             total_requests: prior?.total_requests ?? 0,
@@ -450,23 +450,28 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         : { error: result.message };
     }
     if (action === "test-provider-key") {
-      const provider = config?.providers.find((item) => item.id === text("providerId"));
+      const draft = providerPayload();
       const keyId = text("keyId");
+      const draftKey = draft.keys.find((item) => item.id === keyId);
+      const draftSecret = cleanOptionalText(draftKey?.key);
+      const provider = draft.id
+        ? config?.providers.find((item) => item.id === draft.id)
+        : undefined;
+      if (!keyId) throw new Error("未找到待测试的上游 Key");
+      if (!provider && !draftSecret) throw new Error("请先填写待测试的 Key");
+
+      const result = await command<ProviderKeyTestResult>("test_provider_key", {
+        input: draftProviderKeyTestInput(draft, keyId, draftSecret)
+      });
       if (!provider) {
-        const draft = providerPayload();
-        const key = draft.keys.find((item) => item.id === keyId)?.key;
-        if (!keyId || !cleanOptionalText(key)) throw new Error("请先填写待测试的 Key");
-        const result = await command<ProviderKeyTestResult>("test_provider_key", {
-          input: draftProviderTestInput(draft, key)
-        });
         return result.ok ? { notice: result.message } : { error: result.message };
       }
-      if (!provider || !keyId) throw new Error("未找到待测试的上游 Key");
-      const result = await command<ProviderKeyTestResult>("test_provider_key", {
-        input: providerTestInput(provider, keyId)
-      });
-      setConfig(await command<AppConfig>("get_config"));
-      return result.ok ? { notice: result.message } : { error: result.message };
+      const nextConfig = await command<AppConfig>("get_config");
+      setConfig(nextConfig);
+      const keyPoolHealth = graphiteKeyPoolHealth(nextConfig, provider.id);
+      return result.ok
+        ? { notice: result.message, payload: { keyPoolHealth } }
+        : { error: result.message, payload: { keyPoolHealth } };
     }
     if (action === "test-provider-key-pool") {
       const providerId = text("providerId");
@@ -475,11 +480,13 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         providerId,
         provider_id: providerId
       });
-      setConfig(await command<AppConfig>("get_config"));
+      const nextConfig = await command<AppConfig>("get_config");
+      setConfig(nextConfig);
+      const keyPoolHealth = graphiteKeyPoolHealth(nextConfig, providerId);
       const passed = results.filter((result) => result.ok).length;
       return passed === results.length
-        ? { notice: `${passed} 个 Key 测试通过` }
-        : { error: `${passed}/${results.length} 个 Key 测试通过；请在列表中查看状态` };
+        ? { notice: `${passed} 个 Key 测试通过`, payload: { keyPoolHealth } }
+        : { error: `${passed}/${results.length} 个 Key 测试通过；请在列表中查看状态`, payload: { keyPoolHealth } };
     }
     if (action === "diagnose-network-paths") {
       const providerId = text("providerId");
@@ -717,6 +724,18 @@ function cleanOptionalText(value?: string | null): string | null {
   return text || null;
 }
 
+function graphiteKeyPoolHealth(config: AppConfig, providerId: string) {
+  const keys = config.providers.find((provider) => provider.id === providerId)?.key_pool?.keys ?? [];
+  return {
+    providerId,
+    keys: keys.map((key) => ({
+      id: key.id,
+      enabled: key.enabled,
+      status: key.status
+    }))
+  };
+}
+
 function normalizeGraphiteModels(models: GraphiteProviderPayload["models"]) {
   const byId = new Map<string, GraphiteProviderPayload["models"][number]>();
   for (const source of models) {
@@ -767,5 +786,16 @@ function draftProviderTestInput(provider: GraphiteProviderPayload, key: string |
     custom_user_agent: cleanOptionalText(provider.custom_user_agent),
     channel: provider.channel || "responses",
     use_system_proxy: provider.use_system_proxy ?? true
+  };
+}
+
+function draftProviderKeyTestInput(
+  provider: GraphiteProviderPayload,
+  keyId: string,
+  key: string | null
+) {
+  return {
+    ...draftProviderTestInput(provider, key),
+    key_id: provider.id ? keyId : null
   };
 }
