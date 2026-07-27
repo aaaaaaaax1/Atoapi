@@ -232,6 +232,16 @@ assert.match(
 );
 assert.match(
   html,
+  /\.cache-trend-chart\s+svg:focus\s*,\s*\.cache-trend-chart\s+svg:focus-visible\s*\{[\s\S]{0,240}outline\s*:\s*none[\s\S]{0,120}box-shadow\s*:\s*none/i,
+  "pointer and keyboard focus must not draw a white frame around the trend chart"
+);
+assert.match(
+  html,
+  /id=["']cacheTrendSvg["'][^>]*tabindex=["']0["']/,
+  "removing the trend focus frame must retain keyboard chart navigation"
+);
+assert.match(
+  html,
   /function\s+openDatePicker\(input\)[\s\S]{0,300}input\.showPicker\(\)/,
   "clicking any part of a custom range date field must request the native date picker"
 );

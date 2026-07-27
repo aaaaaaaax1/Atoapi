@@ -32,6 +32,7 @@ pub(super) struct StreamSummary {
     pub error_event_seen: bool,
     pub error_summary: Option<String>,
     pub canonical_responses_failure_seen: bool,
+    pub provider_health_failure_event_seen: bool,
     pub cache_capability_rejection_fields: HashSet<ProviderCacheCapabilityField>,
     pub compaction_output_seen: bool,
     pub model_output_seen: bool,
@@ -344,6 +345,14 @@ impl ResponsesStreamState {
         }
     }
 
+    /// Returns the most recent upstream Responses id observed before the
+    /// stream's terminal event. A generic provider-side `event: error` does
+    /// not normally repeat this id, but a synthetic native failure must keep
+    /// the same response identity for the downstream client.
+    pub(super) fn response_id(&self) -> Option<String> {
+        self.summary.response_id.clone()
+    }
+
     pub fn finish(mut self) -> StreamSummary {
         for frame in self.decoder.finish() {
             let sequence = self.next_event_sequence();
@@ -371,6 +380,7 @@ impl ResponsesStreamState {
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             if frame.event.as_deref().is_some_and(is_error_event_type) {
                 self.summary.error_event_seen = true;
+                self.summary.provider_health_failure_event_seen = true;
                 self.summary.error_event_sequence.get_or_insert(sequence);
                 if self.summary.error_summary.is_none() {
                     let summary = super::truncate_log_message(payload);
@@ -402,6 +412,9 @@ impl ResponsesStreamState {
         let frame_has_error = value.get("error").is_some_and(|error| !error.is_null())
             || frame.event.as_deref().is_some_and(is_error_event_type)
             || payload_event_type.is_some_and(is_error_event_type);
+        if frame_has_error && provider_health_failure_event(&value, effective_event_type) {
+            self.summary.provider_health_failure_event_seen = true;
+        }
         self.capture_output_items(&value, effective_event_type);
         self.summary.model_output_seen |= value_has_model_output(&value);
         self.summary.compaction_output_seen |= value_has_compaction_output(&value);
@@ -502,6 +515,45 @@ fn is_error_event_type(kind: &str) -> bool {
     ) || kind.ends_with(".failed")
         || kind.ends_with(".incomplete")
         || kind.ends_with(".error")
+}
+
+pub(super) fn provider_health_failure_event(value: &Value, event_type: Option<&str>) -> bool {
+    if event_type.is_some_and(|kind| {
+        kind == "error" || kind == "message_delta_error" || kind.ends_with(".error")
+    }) {
+        return true;
+    }
+
+    let server_failure_marker = value
+        .get("error")
+        .filter(|error| !error.is_null())
+        .or_else(|| value.pointer("/response/error"))
+        .or_else(|| value.pointer("/incomplete_details/error"))
+        .and_then(|error| serde_json::to_string(error).ok())
+        .is_some_and(|error| {
+            let error = error.to_ascii_lowercase();
+            [
+                "server_error",
+                "internal_error",
+                "upstream_error",
+                "service_unavailable",
+                "temporarily_unavailable",
+                "overloaded",
+                "bad_gateway",
+                "gateway_timeout",
+                "processing your request",
+            ]
+            .iter()
+            .any(|marker| error.contains(marker))
+        });
+
+    server_failure_marker
+        && event_type.is_none_or(|kind| {
+            kind.ends_with(".failed")
+                || kind.ends_with(".incomplete")
+                || kind == "response.failed"
+                || kind == "response.incomplete"
+        })
 }
 
 pub(super) fn value_has_model_output(value: &Value) -> bool {
@@ -845,6 +897,7 @@ data: {"id":"resp-top-level","object":"response","output":[{"type":"function_cal
             Some("upstream overloaded")
         );
         assert!(!summary.canonical_responses_failure_seen);
+        assert!(summary.provider_health_failure_event_seen);
     }
 
     #[test]
@@ -857,6 +910,52 @@ data: {"id":"resp-top-level","object":"response","output":[{"type":"function_cal
         let summary = state.finish();
         assert!(summary.error_event_seen);
         assert!(summary.canonical_responses_failure_seen);
+    }
+
+    #[test]
+    fn native_parameter_failure_does_not_poison_provider_health() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_invalid\",\"status\":\"failed\",\"error\":{\"code\":\"invalid_parameter\",\"message\":\"prompt_cache_key is not supported\"}}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.canonical_responses_failure_seen);
+        assert!(!summary.provider_health_failure_event_seen);
+    }
+
+    #[test]
+    fn native_server_failure_marks_provider_health() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_server\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"message\":\"An error occurred while processing your request\"}}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.canonical_responses_failure_seen);
+        assert!(summary.provider_health_failure_event_seen);
+    }
+
+    #[test]
+    fn buffered_server_error_without_an_event_type_marks_provider_health() {
+        assert!(provider_health_failure_event(
+            &serde_json::json!({
+                "error": {
+                    "type": "server_error",
+                    "message": "An error occurred while processing your request"
+                }
+            }),
+            None,
+        ));
+        assert!(!provider_health_failure_event(
+            &serde_json::json!({
+                "error": {
+                    "code": "invalid_parameter",
+                    "message": "prompt_cache_key is not supported"
+                }
+            }),
+            None,
+        ));
     }
 
     #[test]

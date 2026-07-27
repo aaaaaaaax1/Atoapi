@@ -1463,7 +1463,6 @@ async fn run_responses_compact_for_authorized_agent(
         key_error_summary.as_deref(),
     )
     .await;
-
     let provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
     let provider_prefix_fingerprint = Some(provider_prefix_fingerprint(
         &active_upstream_body,
@@ -3176,6 +3175,12 @@ async fn run_generation_for_authorized_agent(
     let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
+            clear_provider_route_affinity(
+                &state,
+                route_affinity_key.as_deref(),
+                &decision.provider.id,
+            )
+            .await;
             upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                 .take()
                 .and_then(|guard| guard.finish(None, false, false, None));
@@ -3416,15 +3421,6 @@ async fn run_generation_for_authorized_agent(
     );
 
     if is_stream {
-        let selected_provider_id = decision.provider.id.clone();
-        // This only schedules bookkeeping. Start it before the owned relay can
-        // wait through a long stream so concurrent key selection sees success
-        // promptly without blocking the response handoff.
-        let _ = spawn_selected_provider_key_success(
-            state.clone(),
-            selected_provider_id,
-            &selected_provider_key,
-        );
         let mut relay_decision = decision;
         relay_decision.upstream_channel = active_request_channel.clone();
         let response = stream_upstream(
@@ -3495,6 +3491,12 @@ async fn run_generation_for_authorized_agent(
         {
             Ok(outcome) => outcome,
             Err(err) => {
+                clear_provider_route_affinity(
+                    &state,
+                    route_affinity_key.as_deref(),
+                    &decision.provider.id,
+                )
+                .await;
                 upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                     .take()
                     .and_then(|guard| guard.finish(None, false, false, None));
@@ -4507,6 +4509,17 @@ async fn clear_prefix_error_cooldown(state: &AppState, provider_prefix_key: Opti
         return;
     };
     state.prefix_error_cooldowns.lock().await.remove(key);
+}
+
+fn is_provider_health_failure_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::FORBIDDEN
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// Never wait behind local bookkeeping just to decide whether a caller-owned
@@ -9744,20 +9757,20 @@ async fn note_selected_provider_key_status(
     let Ok(status_code) = StatusCode::from_u16(status) else {
         return;
     };
-    if status_code.is_success() {
+    let key_failure = is_provider_key_failure_status(status_code)
+        || error_summary
+            .map(is_provider_key_failure_message)
+            .unwrap_or(false);
+    if status_code.is_success() && error_summary.is_none() {
         mark_selected_provider_key_success(state, provider_id, key_id).await;
         return;
     }
-    let mut config = state.config.write().await;
-    if is_provider_key_failure_status(status_code)
-        || error_summary
-            .map(is_provider_key_failure_message)
-            .unwrap_or(false)
-    {
+    if key_failure {
         let message = error_summary
             .filter(|message| !message.trim().is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("upstream returned HTTP {status_code}"));
+        let mut config = state.config.write().await;
         config.mark_provider_key_failure(provider_id, selected.key_id.as_deref(), &message, true);
         state.journal_config(&config);
     }
@@ -9769,18 +9782,29 @@ async fn mark_selected_provider_key_success(state: &AppState, provider_id: &str,
     state.journal_config(&config);
 }
 
-fn spawn_selected_provider_key_success(
-    state: Arc<AppState>,
-    provider_id: String,
-    selected: &SelectedProviderKey,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let key_id = selected.key_id.clone()?;
-    let tracker = state.relay_tasks.clone();
-    tracker
-        .spawn(async move {
-            mark_selected_provider_key_success(&state, &provider_id, &key_id).await;
-        })
-        .ok()
+async fn note_selected_provider_key_stream_terminal(
+    state: &AppState,
+    provider_id: &str,
+    key_id: Option<&str>,
+    terminal_success: bool,
+    error_summary: Option<&str>,
+) {
+    let Some(key_id) = key_id else {
+        return;
+    };
+    if terminal_success {
+        mark_selected_provider_key_success(state, provider_id, key_id).await;
+        return;
+    }
+    let Some(message) = error_summary
+        .filter(|message| is_provider_key_failure_message(message))
+        .filter(|message| !message.trim().is_empty())
+    else {
+        return;
+    };
+    let mut config = state.config.write().await;
+    config.mark_provider_key_failure(provider_id, Some(key_id), message, true);
+    state.journal_config(&config);
 }
 
 fn is_provider_key_failure_status(status: StatusCode) -> bool {
@@ -12389,7 +12413,8 @@ async fn maybe_clear_provider_route_affinity_after_status(
     let Ok(status_code) = StatusCode::from_u16(status) else {
         return;
     };
-    if is_provider_key_failure_status(status_code)
+    if is_provider_health_failure_status(status_code)
+        || is_provider_key_failure_status(status_code)
         || error_summary
             .map(is_provider_key_failure_message)
             .unwrap_or(false)
@@ -27732,6 +27757,603 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_upstream_replaces_a_generic_responses_error_frame_with_one_native_failure() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-generic-responses-error-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_generic_upstream\",\"object\":\"response\"}}\n\n",
+                        ));
+                        for index in 0..94 {
+                            yield Ok::<Bytes, Infallible>(Bytes::from(format!(
+                                "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"chunk-{index}\"}}\n\n"
+                            )));
+                        }
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"provider stream failed\",\"type\":\"server_error\"}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response =
+            stream_test_response(state.clone(), upstream, "generic-error-trace", None, false).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(
+            text.matches("event: response.output_text.delta").count(),
+            94
+        );
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(!text.contains("event: error"));
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("\"code\":\"upstream_sse_error\""));
+        assert!(text.contains("provider stream failed"));
+        assert!(text.contains("atoapi_trace_id=generic-error-trace"));
+        let failure = text
+            .split("event: response.failed")
+            .nth(1)
+            .expect("native terminal failure must be present");
+        assert!(
+            failure.contains("\"id\":\"resp_generic_upstream\""),
+            "failure frame used the wrong response id: {failure}"
+        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generic SSE error settlement must complete");
+        assert_eq!(metrics.upstream_requests, 1);
+        let log = &metrics.recent_failed_requests[0];
+        assert_eq!(log.sse_end_reason.as_deref(), Some("upstream_sse_error"));
+        assert_eq!(log.sse_completed_event_seen, Some(false));
+        assert_eq!(log.sse_done_marker_seen, Some(false));
+        assert_eq!(log.downstream_disconnected, Some(false));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_replaces_a_data_only_responses_error_with_one_native_failure() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-data-only-responses-error-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_data_only_upstream\",\"object\":\"response\"}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"before-error\"}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: {\"type\":\"error\",\"error\":{\"message\":\"data-only provider failure\",\"type\":\"server_error\"}}\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "data-only-error-trace",
+            None,
+            false,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(text.matches("event: response.output_text.delta").count(), 1);
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(!text.contains("data: {\"type\":\"error\""));
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("data-only provider failure"));
+        assert!(text.contains("atoapi_trace_id=data-only-error-trace"));
+        let failure = text
+            .split("event: response.failed")
+            .nth(1)
+            .expect("native terminal failure must be present");
+        assert!(failure.contains("\"id\":\"resp_data_only_upstream\""));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("data-only SSE error settlement must complete");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(
+            metrics.recent_failed_requests[0].sse_end_reason.as_deref(),
+            Some("upstream_sse_error")
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_emits_native_failure_after_transport_error() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-transport-error-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_transport_upstream\",\"object\":\"response\"}}\n\n",
+                        ));
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"before-transport-error\"}\n\n",
+                        ));
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        yield Err::<Bytes, std::io::Error>(std::io::Error::other(
+                            "simulated upstream transport failure",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let response = stream_test_response(
+            state.clone(),
+            upstream,
+            "transport-error-trace",
+            None,
+            false,
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(text.matches("event: response.output_text.delta").count(), 1);
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(text.contains("\"code\":\"upstream_stream_error\""));
+        assert!(text.contains("atoapi_trace_id=transport-error-trace"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport error stream settlement must complete");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(
+            metrics.recent_failed_requests[0].sse_end_reason.as_deref(),
+            Some("upstream_stream_error")
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn incomplete_stream_does_not_block_the_next_inbound() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = upstream_hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_incomplete_health\",\"object\":\"response\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "incomplete-health-provider";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-incomplete-provider-health-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": [{"type": "message", "role": "user", "content": "continue"}]
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_text = String::from_utf8_lossy(&first_body);
+        assert_eq!(first_text.matches("event: response.failed").count(), 1);
+        assert!(first_text.contains("\"code\":\"upstream_incomplete_eof\""));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_text = String::from_utf8_lossy(&second_body);
+        assert_eq!(second_text.matches("event: response.failed").count(), 1);
+        assert!(second_text.contains("\"code\":\"upstream_incomplete_eof\""));
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            2,
+            "each inbound must receive its own single upstream request"
+        );
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 2);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        assert_eq!(metrics.recent_agent_inbound_outcomes.len(), 2);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn forbidden_response_isolates_only_the_failed_key_and_uses_the_next_key() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = upstream_hits_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    raw_response(
+                        StatusCode::FORBIDDEN.as_u16(),
+                        "application/json",
+                        br#"{"error":{"type":"forbidden","message":"forbidden by upstream"}}"#
+                            .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "forbidden-health-provider";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.to_string(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: vec![
+                crate::config::ProviderKeyConfig {
+                    id: "forbidden-key".to_string(),
+                    alias: None,
+                    key_encrypted: Some("forbidden-key-secret".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                crate::config::ProviderKeyConfig {
+                    id: "fallback-key".to_string(),
+                    alias: None,
+                    key_encrypted: Some("fallback-key-secret".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            ],
+            updated_at: now,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-forbidden-provider-health-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": [{"type": "message", "role": "user", "content": "continue"}]
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        {
+            let config = state.config.read().await;
+            let key = &config.provider_key_pools[0].keys[0];
+            assert_eq!(key.status, crate::config::ProviderKeyStatus::Unhealthy);
+            assert_eq!(key.failures, 1);
+            assert!(key.disabled_until.is_some());
+        }
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::FORBIDDEN);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 2);
+        {
+            let config = state.config.read().await;
+            assert_eq!(
+                config.provider_key_pools[0]
+                    .keys
+                    .iter()
+                    .filter(|key| key.status == crate::config::ProviderKeyStatus::Unhealthy)
+                    .count(),
+                2
+            );
+        }
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 2);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
     async fn codex_route_switch_drops_a_managed_previous_response_from_the_old_scope() {
         let old_hits = Arc::new(AtomicUsize::new(0));
         let new_hits = Arc::new(AtomicUsize::new(0));
@@ -30296,43 +30918,107 @@ mod tests {
         fs::remove_dir_all(config_dir).ok();
     }
 
+    #[test]
+    fn provider_route_failure_status_stays_limited_to_route_level_failures() {
+        assert!(is_provider_health_failure_status(StatusCode::FORBIDDEN));
+        assert!(is_provider_health_failure_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_provider_health_failure_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_provider_health_failure_status(StatusCode::BAD_REQUEST));
+    }
+
     #[tokio::test]
-    async fn selected_provider_key_success_update_does_not_block_stream_handoff() {
+    async fn selected_provider_key_stream_health_waits_for_a_real_terminal() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-stream-key-status-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
+        let provider_id = "stream-key-provider".to_string();
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("http://127.0.0.1:1/v1".to_string());
+        provider.id = provider_id.clone();
+        config.providers = vec![provider];
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.clone(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: vec![crate::config::ProviderKeyConfig {
+                id: "key-id".to_string(),
+                alias: None,
+                key_encrypted: None,
+                enabled: true,
+                priority: 5,
+                status: crate::config::ProviderKeyStatus::Unknown,
+                total_requests: 0,
+                successes: 0,
+                failures: 0,
+                last_checked_at: None,
+                last_error: None,
+                disabled_until: None,
+                created_at: now,
+                updated_at: now,
+            }],
+            updated_at: now,
+        }];
         let state = Arc::new(
             AppState::for_test(
-                AppConfig::default(),
+                config,
                 config_dir.join("config.toml"),
                 CacheStore::load(cache_path(&config_dir)).unwrap(),
             )
             .unwrap(),
         );
 
-        let config_write_guard = state.config.write().await;
-        let mut status_update = spawn_selected_provider_key_success(
-            state.clone(),
-            "provider".to_string(),
-            &SelectedProviderKey {
-                secret: "unused".to_string(),
-                key_id: Some("key-id".to_string()),
-            },
+        note_selected_provider_key_stream_terminal(
+            &state,
+            &provider_id,
+            Some("key-id"),
+            false,
+            Some("provider stream failed"),
         )
-        .expect("a pooled key should schedule a background success update");
+        .await;
+        {
+            let config = state.config.read().await;
+            let key = &config.provider_key_pools[0].keys[0];
+            assert_eq!(key.status, crate::config::ProviderKeyStatus::Unknown);
+            assert_eq!(key.successes, 0);
+            assert_eq!(key.failures, 0);
+            assert!(key.disabled_until.is_none());
+        }
 
-        assert!(
-            tokio::time::timeout(TokioDuration::from_millis(25), &mut status_update)
-                .await
-                .is_err(),
-            "the queued status update should wait behind the config lock without blocking the stream handoff"
-        );
-        drop(config_write_guard);
-        tokio::time::timeout(TokioDuration::from_millis(250), status_update)
-            .await
-            .expect("the queued status update should finish after the config lock is released")
-            .expect("background status update task should not panic");
+        note_selected_provider_key_stream_terminal(
+            &state,
+            &provider_id,
+            Some("key-id"),
+            true,
+            None,
+        )
+        .await;
+        {
+            let config = state.config.read().await;
+            let key = &config.provider_key_pools[0].keys[0];
+            assert_eq!(key.status, crate::config::ProviderKeyStatus::Healthy);
+            assert_eq!(key.successes, 1);
+        }
+
+        note_selected_provider_key_stream_terminal(
+            &state,
+            &provider_id,
+            Some("key-id"),
+            false,
+            Some("Insufficient account balance"),
+        )
+        .await;
+        {
+            let config = state.config.read().await;
+            let key = &config.provider_key_pools[0].keys[0];
+            assert_eq!(key.status, crate::config::ProviderKeyStatus::Unhealthy);
+            assert_eq!(key.failures, 1);
+            assert!(key.disabled_until.is_some());
+        }
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -39327,7 +40013,7 @@ mod tests {
         let response = handle_responses_compact_for_agent(
             state.clone(),
             test_local_auth_headers(),
-            body,
+            body.clone(),
             None,
             Some("codex"),
         )
@@ -39350,6 +40036,33 @@ mod tests {
         assert_eq!(metrics.recent_agent_inbound_outcomes.len(), 1);
         assert!(metrics.recent_requests.is_empty());
         assert_eq!(metrics.recent_failed_requests.len(), 1);
+
+        let second = handle_responses_compact_for_agent(
+            state.clone(),
+            test_local_auth_headers(),
+            body,
+            None,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&second_body).contains("upstream compact request failed"));
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.total_requests, 2);
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 2);
+        assert_eq!(metrics.agent_generation.active_inbounds, 0);
+        assert_eq!(metrics.agent_generation.active_attempts, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        assert!(metrics
+            .recent_agent_upstream_attempts
+            .iter()
+            .all(|attempt| attempt.outcome == AgentAttemptOutcome::TransportError));
 
         fs::remove_dir_all(dir).ok();
     }
@@ -40519,8 +41232,9 @@ mod tests {
             Some("shared-client:pool-enabled-hit-not-exposed")
         );
 
-        // A generic 5xx is not a field rejection. The next trusted request
-        // must keep the same generated placement key and still use one POST.
+        // A generic 5xx is not a cache-field rejection and must not block the
+        // next independent inbound. That next request still gets exactly one
+        // upstream POST with the unchanged generated placement key.
         let after_502_body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",

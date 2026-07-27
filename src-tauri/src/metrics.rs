@@ -1695,7 +1695,6 @@ fn commit_metrics_transaction(
             return MetricsCommitOutcome::without_history(MetricsCommitResult::Duplicate);
         }
     }
-
     let cache_creation_tokens = usage
         .as_ref()
         .map(|usage| usage.record.cache_creation_tokens)

@@ -5984,10 +5984,12 @@
       touch-action: none;
     }
 
+    .cache-trend-chart svg:focus,
     .cache-trend-chart svg:focus-visible {
       /* The active point, guide line and tooltip already communicate focus.
          Avoid a browser-like white frame around the entire chart. */
       outline: none;
+      box-shadow: none;
     }
 
     .cache-trend-tooltip {

@@ -41,7 +41,10 @@ impl BoundedCacheCapture {
 
 #[cfg(test)]
 mod tests {
-    use super::{canonical_responses_failure_frame, terminal_failure_message, TerminalFailure};
+    use super::{
+        canonical_responses_failure_frame, GenericResponsesErrorFrameGate,
+        GenericResponsesErrorFrameGateEvent, TerminalFailure,
+    };
 
     #[test]
     fn canonical_failure_frame_keeps_the_upstream_summary_and_native_shape() {
@@ -66,11 +69,36 @@ mod tests {
     }
 
     #[test]
-    fn terminal_failure_message_uses_a_stable_local_explanation_when_missing() {
-        assert_eq!(
-            terminal_failure_message(TerminalFailure::IncompleteEof, None),
-            "upstream stream ended before a completion event"
+    fn generic_error_gate_holds_only_a_generic_error_event() {
+        let mut gate = GenericResponsesErrorFrameGate::default();
+        let first = gate.push(b"event: error\ndata: {\"type\":");
+        assert!(first.is_empty());
+        let second = gate.push(b"\"error\",\"error\":{\"message\":\"busy\"}}\n\n");
+        assert_eq!(second.len(), 1);
+        assert!(matches!(
+            second.first(),
+            Some(GenericResponsesErrorFrameGateEvent::ErrorFrame(frame))
+                if frame.starts_with(b"event: error")
+        ));
+
+        let ordinary = gate.push(
+            b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
         );
+        assert_eq!(ordinary.len(), 1);
+        assert!(matches!(
+            ordinary.first(),
+            Some(GenericResponsesErrorFrameGateEvent::Passthrough(frame))
+                if frame.starts_with(b"event: response.output_text.delta")
+        ));
+
+        let mut data_only_gate = GenericResponsesErrorFrameGate::default();
+        let data_only =
+            data_only_gate.push(b"data: {\"type\":\"error\",\"error\":{\"message\":\"busy\"}}\n\n");
+        assert!(matches!(
+            data_only.first(),
+            Some(GenericResponsesErrorFrameGateEvent::ErrorFrame(frame))
+                if frame.starts_with(b"data: {\"type\":\"error\"")
+        ));
     }
 }
 
@@ -83,6 +111,193 @@ pub(super) fn relay_chunk_parts(chunk: &Bytes) -> impl Iterator<Item = Bytes> + 
                 .min(chunk.len());
             chunk.slice(start..end)
         })
+}
+
+const GENERIC_RESPONSES_ERROR_FRAME_LIMIT: usize = 64 * 1024;
+
+/// Retains only a candidate generic `event: error` frame. Normal Responses
+/// bytes (including comments, SSE ids, and original chunk grouping) remain on
+/// the byte-for-byte passthrough path.
+#[derive(Default)]
+struct GenericResponsesErrorFrameGate {
+    mode: GenericResponsesErrorFrameGateMode,
+    frame: Vec<u8>,
+    line: Vec<u8>,
+    line_has_bytes: bool,
+    pending_cr: bool,
+}
+
+#[derive(Default, PartialEq, Eq)]
+enum GenericResponsesErrorFrameGateMode {
+    #[default]
+    Undecided,
+    Passthrough,
+    Candidate,
+}
+
+enum GenericResponsesErrorFrameGateEvent {
+    Passthrough(Bytes),
+    ErrorFrame(Bytes),
+}
+
+enum RelayStreamChunk {
+    Raw(Bytes),
+    GenericErrorFrame(Bytes),
+}
+
+impl GenericResponsesErrorFrameGate {
+    fn push(&mut self, chunk: &[u8]) -> Vec<GenericResponsesErrorFrameGateEvent> {
+        let mut events = Vec::new();
+        let mut passthrough = Vec::new();
+        for &byte in chunk {
+            self.push_byte(byte, &mut passthrough, &mut events);
+        }
+        if !passthrough.is_empty() {
+            events.push(GenericResponsesErrorFrameGateEvent::Passthrough(
+                Bytes::from(passthrough),
+            ));
+        }
+        events
+    }
+
+    fn push_byte(
+        &mut self,
+        byte: u8,
+        passthrough: &mut Vec<u8>,
+        events: &mut Vec<GenericResponsesErrorFrameGateEvent>,
+    ) {
+        if self.pending_cr {
+            self.pending_cr = false;
+            if byte == b'\n' {
+                self.append_byte(byte, passthrough);
+                self.finish_line(passthrough, events);
+                return;
+            }
+            self.finish_line(passthrough, events);
+        }
+
+        self.append_byte(byte, passthrough);
+        match byte {
+            b'\r' => self.pending_cr = true,
+            b'\n' => self.finish_line(passthrough, events),
+            _ => {
+                self.line_has_bytes = true;
+                self.line.push(byte);
+            }
+        }
+    }
+
+    fn append_byte(&mut self, byte: u8, passthrough: &mut Vec<u8>) {
+        match self.mode {
+            GenericResponsesErrorFrameGateMode::Passthrough => passthrough.push(byte),
+            GenericResponsesErrorFrameGateMode::Undecided
+            | GenericResponsesErrorFrameGateMode::Candidate => {
+                self.frame.push(byte);
+                if self.mode == GenericResponsesErrorFrameGateMode::Candidate
+                    && self.frame.len() > GENERIC_RESPONSES_ERROR_FRAME_LIMIT
+                {
+                    passthrough.extend(std::mem::take(&mut self.frame));
+                    self.mode = GenericResponsesErrorFrameGateMode::Passthrough;
+                }
+            }
+        }
+    }
+
+    fn finish_line(
+        &mut self,
+        passthrough: &mut Vec<u8>,
+        events: &mut Vec<GenericResponsesErrorFrameGateEvent>,
+    ) {
+        let line_has_bytes = std::mem::replace(&mut self.line_has_bytes, false);
+        let line = std::mem::take(&mut self.line);
+        match self.mode {
+            GenericResponsesErrorFrameGateMode::Undecided => {
+                if !line_has_bytes {
+                    passthrough.extend(std::mem::take(&mut self.frame));
+                    self.reset_frame();
+                    return;
+                }
+                let line = String::from_utf8_lossy(&line);
+                let (field, value) = line.split_once(':').unwrap_or((&line, ""));
+                let value = value.strip_prefix(' ').unwrap_or(value).trim();
+                if field == "event" {
+                    if is_generic_responses_error_event(value) {
+                        self.mode = GenericResponsesErrorFrameGateMode::Candidate;
+                    } else {
+                        passthrough.extend(std::mem::take(&mut self.frame));
+                        self.mode = GenericResponsesErrorFrameGateMode::Passthrough;
+                    }
+                } else if field == "data" {
+                    if is_generic_responses_error_data(value) {
+                        self.mode = GenericResponsesErrorFrameGateMode::Candidate;
+                    } else {
+                        passthrough.extend(std::mem::take(&mut self.frame));
+                        self.mode = GenericResponsesErrorFrameGateMode::Passthrough;
+                    }
+                }
+            }
+            GenericResponsesErrorFrameGateMode::Candidate if !line_has_bytes => {
+                if !passthrough.is_empty() {
+                    events.push(GenericResponsesErrorFrameGateEvent::Passthrough(
+                        Bytes::from(std::mem::take(passthrough)),
+                    ));
+                }
+                let frame = Bytes::from(std::mem::take(&mut self.frame));
+                self.reset_frame();
+                events.push(GenericResponsesErrorFrameGateEvent::ErrorFrame(frame));
+            }
+            GenericResponsesErrorFrameGateMode::Candidate => {}
+            GenericResponsesErrorFrameGateMode::Passthrough if !line_has_bytes => {
+                self.reset_frame();
+            }
+            GenericResponsesErrorFrameGateMode::Passthrough => {}
+        }
+    }
+
+    fn reset_frame(&mut self) {
+        self.mode = GenericResponsesErrorFrameGateMode::Undecided;
+        self.frame.clear();
+        self.line.clear();
+        self.line_has_bytes = false;
+        self.pending_cr = false;
+    }
+}
+
+fn is_generic_responses_error_event(event: &str) -> bool {
+    let event = event.trim();
+    event == "error" || event == "message_delta_error" || event.ends_with(".error")
+}
+
+/// A number of proxy implementations omit the SSE `event:` field and put the
+/// generic error type only in a normal `data:` line. Treat that as the same
+/// compatibility failure; otherwise the client may act on the raw error and
+/// close before the relay can publish its native `response.failed` at EOF.
+fn is_generic_responses_error_data(data: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .map(is_generic_responses_error_event)
+        })
+        .unwrap_or(false)
+}
+
+fn generic_responses_error_frame_summary(
+    frame: &[u8],
+    client_prompt_cache_key_for_redaction: Option<&str>,
+) -> String {
+    let mut decoder = sse::SseFrameDecoder::default();
+    for event in decoder.push_ordered(frame) {
+        if let sse::SseDecodeEvent::Frame(frame) = event {
+            return upstream_error_summary_redacting(
+                frame.data.as_bytes(),
+                client_prompt_cache_key_for_redaction,
+            );
+        }
+    }
+    upstream_error_summary_redacting(frame, client_prompt_cache_key_for_redaction)
 }
 
 fn terminal_failure_message(failure: TerminalFailure, upstream_summary: Option<&str>) -> String {
@@ -398,6 +613,13 @@ pub(super) async fn stream_upstream(
         let mut cache_capture = BoundedCacheCapture::new(eligible);
         let mut session_error_body = Vec::new();
         let mut stream_state = ResponsesStreamState::default();
+        let use_generic_responses_error_gate = matches!(client_channel, Channel::Responses)
+            && matches!(decision.upstream_channel, Channel::Responses)
+            && is_text_event_stream(&content_type);
+        let mut generic_responses_error_gate =
+            use_generic_responses_error_gate.then(GenericResponsesErrorFrameGate::default);
+        let mut responses_completion_seen = false;
+        let mut native_failure_relayed = false;
         let mut sse_chunks = 0u64;
         let mut sse_end_reason = "upstream_eof".to_string();
         let mut stream_upstream_wait_ms = 0u64;
@@ -435,7 +657,59 @@ pub(super) async fn stream_upstream(
                 first_chunk_at = Some(chunk_received_at);
             }
             sse_chunks += 1;
-            for relay_chunk in relay_chunk_parts(&chunk) {
+            let relay_chunks = if let Some(gate) = generic_responses_error_gate.as_mut() {
+                gate.push(&chunk)
+                    .into_iter()
+                    .map(|event| match event {
+                        GenericResponsesErrorFrameGateEvent::Passthrough(chunk) => {
+                            RelayStreamChunk::Raw(chunk)
+                        }
+                        GenericResponsesErrorFrameGateEvent::ErrorFrame(chunk) => {
+                            RelayStreamChunk::GenericErrorFrame(chunk)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                relay_chunk_parts(&chunk)
+                    .map(RelayStreamChunk::Raw)
+                    .collect::<Vec<_>>()
+            };
+            for relay in relay_chunks {
+                if native_failure_relayed && use_generic_responses_error_gate {
+                    // A native terminal failure was already published for this
+                    // stream. Keep draining the one upstream request for clean
+                    // accounting, but never append contradictory events.
+                    continue;
+                }
+                let (state_chunk, relay_chunk, replaces_upstream_error) = match relay {
+                    RelayStreamChunk::Raw(chunk) => (chunk.clone(), chunk, false),
+                    RelayStreamChunk::GenericErrorFrame(chunk) if !responses_completion_seen => {
+                        let summary = generic_responses_error_frame_summary(
+                            &chunk,
+                            client_prompt_cache_key_for_redaction.as_deref(),
+                        );
+                        // Generic SSE errors usually carry only an `error`
+                        // object, not the response id published earlier by
+                        // `response.created`. Preserve that known identity so
+                        // the downstream terminal belongs to the same
+                        // response rather than a locally generated one.
+                        let response_id =
+                            response_id_from_bytes(&chunk).or_else(|| stream_state.response_id());
+                        let failure = canonical_responses_failure_frame(
+                            &decision.model,
+                            response_id.as_deref(),
+                            TerminalFailure::ErrorEvent,
+                            (!summary.trim().is_empty()).then_some(summary.as_str()),
+                            &request_id,
+                            upstream_request_diagnostics
+                                .upstream_trace_source
+                                .as_deref(),
+                            upstream_request_diagnostics.upstream_trace_id.as_deref(),
+                        );
+                        (chunk, failure, true)
+                    }
+                    RelayStreamChunk::GenericErrorFrame(chunk) => (chunk.clone(), chunk, false),
+                };
                 // Keep complete SSE/JSON parsing behind downstream enqueue.
                 // A zero-allocation marker scan only installs a provisional
                 // publication guard for the rare chunk that may contain a
@@ -484,7 +758,16 @@ pub(super) async fn stream_upstream(
                     stream_client_backpressure_ms = stream_client_backpressure_ms
                         .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
                 }
-                let observation = stream_state.ingest(&relay_chunk);
+                let observation = stream_state.ingest(&state_chunk);
+                if replaces_upstream_error {
+                    // The upstream failure frame is intentionally withheld from
+                    // the client, but still observed for diagnostics. Ingesting
+                    // the replacement makes the downstream terminal explicit
+                    // and prevents a second synthetic response.failed at EOF.
+                    stream_state.ingest(&relay_chunk);
+                    native_failure_relayed = true;
+                }
+                responses_completion_seen |= observation.responses_completed_event_seen;
                 if first_model_output_at.is_none() && observation.model_output_started {
                     first_model_output_at = Some(chunk_received_at);
                 }
@@ -516,7 +799,7 @@ pub(super) async fn stream_upstream(
                 if used_response_session && session_error_body.len() < 65_536 {
                     let remaining = 65_536usize.saturating_sub(session_error_body.len());
                     session_error_body
-                        .extend_from_slice(&relay_chunk[..relay_chunk.len().min(remaining)]);
+                        .extend_from_slice(&state_chunk[..state_chunk.len().min(remaining)]);
                 }
             }
         }
@@ -677,6 +960,24 @@ pub(super) async fn stream_upstream(
         // usage, cache, metrics, and persistence settlement continue.
         let client_completed_ms = started.elapsed().as_millis() as u64;
         drop(downstream_sender);
+        note_selected_provider_key_stream_terminal(
+            &state_for_stream,
+            &decision.provider.id,
+            upstream_request_diagnostics
+                .cache_capability_key_id
+                .as_deref(),
+            stream_success_for_cache,
+            stream_metadata.error_summary.as_deref(),
+        )
+        .await;
+        if !stream_success_for_cache {
+            clear_provider_route_affinity(
+                &state_for_stream,
+                route_affinity_key.as_deref(),
+                &decision.provider.id,
+            )
+            .await;
+        }
         // The terminal event is already visible, so publish the minimal
         // in-memory lineage and waterline control state before releasing its
         // per-lineage publication fence. Slow metrics/persistence remain below.
