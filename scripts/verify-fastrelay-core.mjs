@@ -46,6 +46,7 @@ const checks = [
   ["key-pool UI regression", npm, ["run", "test:key-pool-ui"]],
   ["provider connection-path UI regression", npm, ["run", "test:provider-connection-path-ui"]],
   ["owned-dispatch acceptance", npm, ["run", "test:acceptance"]],
+  ["release champion verifier self-test", npm, ["run", "test:release-champion"]],
   ["diff whitespace", "git", ["diff", "--check"]]
 ];
 
@@ -60,7 +61,8 @@ if (includeWireCompat) {
     ],
     ["isolated retained-baseline wire compatibility", npm, ["run", "test:isolated-wire-compat"]],
     ["isolated same-prefix dispatch stress", npm, ["run", "test:isolated-wire-stress"]],
-    ["isolated same-prefix header-gate concurrency", npm, ["run", "test:isolated-wire-header-concurrency"]]
+    ["isolated same-prefix header-gate concurrency", npm, ["run", "test:isolated-wire-header-concurrency"]],
+    ["isolated terminal publication handoff", npm, ["run", "test:terminal-handoff"]]
   );
 }
 if (includeCacheReplay) {

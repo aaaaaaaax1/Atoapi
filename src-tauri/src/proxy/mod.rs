@@ -359,6 +359,7 @@ impl FinalScopeDispatchGuard {
         upstream_succeeded: bool,
         confirmed_compaction: bool,
         committed_head: Option<WaterlineControlHead>,
+        rebased_from_head: Option<WaterlineControlHead>,
     ) -> Option<FinalScopeWaterlineLog> {
         let ticket = self.ticket.take()?;
         settle_final_scope_waterline_and_record(
@@ -368,6 +369,7 @@ impl FinalScopeDispatchGuard {
             upstream_succeeded,
             confirmed_compaction,
             committed_head,
+            rebased_from_head,
         )
     }
 }
@@ -377,8 +379,15 @@ impl Drop for FinalScopeDispatchGuard {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        let _ =
-            settle_final_scope_waterline_and_record(&self.state, &ticket, None, false, false, None);
+        let _ = settle_final_scope_waterline_and_record(
+            &self.state,
+            &ticket,
+            None,
+            false,
+            false,
+            None,
+            None,
+        );
     }
 }
 struct UpstreamSendOutcome {
@@ -3178,7 +3187,7 @@ async fn run_generation_for_authorized_agent(
             .await;
             upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                 .take()
-                .and_then(|guard| guard.finish(None, false, false, None));
+                .and_then(|guard| guard.finish(None, false, false, None, None));
             if agent_generation {
                 let mut log = upstream_transport_failure_log(
                     &request_id,
@@ -3306,7 +3315,7 @@ async fn run_generation_for_authorized_agent(
                 Err(err) => {
                     upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                         .take()
-                        .and_then(|guard| guard.finish(None, false, false, None));
+                        .and_then(|guard| guard.finish(None, false, false, None, None));
                     let mut log = upstream_transport_failure_log(
                         &request_id,
                         &started,
@@ -3493,7 +3502,7 @@ async fn run_generation_for_authorized_agent(
                 .await;
                 upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                     .take()
-                    .and_then(|guard| guard.finish(None, false, false, None));
+                    .and_then(|guard| guard.finish(None, false, false, None, None));
                 if agent_generation {
                     let mut terminal_errors = request_metric_errors.clone();
                     terminal_errors.push(("upstream_body".to_string(), err.to_string()));
@@ -3849,6 +3858,10 @@ async fn run_generation_for_authorized_agent(
         response_session_update.as_ref(),
         response_session_response_id.as_deref(),
     );
+    let rebased_from_head = rebased_waterline_control_head(
+        response_session_lease.as_ref(),
+        response_session_update.as_ref(),
+    );
     upstream_request_diagnostics.final_scope_waterline =
         final_scope_dispatch.take().and_then(|guard| {
             guard.finish(
@@ -3856,6 +3869,7 @@ async fn run_generation_for_authorized_agent(
                 is_success_status,
                 confirmed_compaction,
                 committed_head,
+                rebased_from_head,
             )
         });
     let final_responses_static_projection = if matches!(active_request_channel, Channel::Responses)
@@ -5491,6 +5505,7 @@ fn settle_final_scope_waterline(
     upstream_succeeded: bool,
     confirmed_compaction: bool,
     committed_head: Option<WaterlineControlHead>,
+    rebased_from_head: Option<WaterlineControlHead>,
 ) -> WaterlineSettlementOutcome {
     let Ok(mut ledger) = state.final_scope_waterlines.try_lock() else {
         state
@@ -5505,6 +5520,7 @@ fn settle_final_scope_waterline(
             compaction: confirmed_compaction,
             raw_usage,
             committed_head,
+            rebased_from_head,
         },
     );
     state
@@ -5520,6 +5536,7 @@ fn settle_final_scope_waterline_and_record(
     upstream_succeeded: bool,
     confirmed_compaction: bool,
     committed_head: Option<WaterlineControlHead>,
+    rebased_from_head: Option<WaterlineControlHead>,
 ) -> Option<FinalScopeWaterlineLog> {
     let outcome = settle_final_scope_waterline(
         state,
@@ -5528,6 +5545,7 @@ fn settle_final_scope_waterline_and_record(
         upstream_succeeded,
         confirmed_compaction,
         committed_head,
+        rebased_from_head,
     );
     let log = final_scope_waterline_log(ticket, &outcome);
     state.final_scope_observations.try_record(log.clone());
@@ -6726,10 +6744,28 @@ fn committed_waterline_control_head(
     response_id: Option<&str>,
 ) -> Option<WaterlineControlHead> {
     let lease = lease?;
-    let LineageCommitOutcome::Applied { generation } = outcome? else {
-        return None;
+    let generation = match outcome? {
+        LineageCommitOutcome::Applied { generation }
+        | LineageCommitOutcome::Rebased { generation, .. } => generation,
+        _ => return None,
     };
     WaterlineControlHead::derive(lease.epoch(), *generation, response_id?)
+}
+
+fn rebased_waterline_control_head(
+    lease: Option<&LineageLease>,
+    outcome: Option<&LineageCommitOutcome>,
+) -> Option<WaterlineControlHead> {
+    let lease = lease?;
+    let LineageCommitOutcome::Rebased {
+        parent_generation,
+        parent_response_id,
+        ..
+    } = outcome?
+    else {
+        return None;
+    };
+    WaterlineControlHead::derive(lease.epoch(), *parent_generation, parent_response_id)
 }
 
 fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionAnchorDiagnostics) {
@@ -6937,10 +6973,10 @@ fn response_session_breakpoint_placement_matches(
     let Some(lease) = session_lease else {
         return true;
     };
-    if lease.head().is_none() {
+    if lease.control_head().is_none() {
         return true;
     }
-    lease.breakpoint_placement_digest() == final_breakpoint_placement
+    lease.control_breakpoint_placement_digest() == final_breakpoint_placement
 }
 
 async fn update_response_session_with_id(
@@ -7930,7 +7966,13 @@ fn analyze_tail_input_for_session(
             ),
         };
     };
-    let Some(previous_session) = lease.head() else {
+    // A terminal-publication fence may deliberately hide the semantic head to
+    // prevent unsafe local response-id recovery. The previously committed
+    // FullReplay input remains a truthful control predecessor, however: the
+    // exact canonical-prefix comparison below still rejects every real branch
+    // or field drift. Using it avoids turning concurrent terminal handoff into
+    // a synthetic root and losing the next cache waterline.
+    let Some(previous_session) = lease.control_head() else {
         return TailInputAnalysis {
             diagnostics: summarize_tail_input_items(current_items),
             predecessor: PredecessorProofReceipt::root(lease.epoch(), current_input_items),
@@ -23902,6 +23944,7 @@ mod tests {
                 compaction: false,
                 raw_usage: Some(&first_usage),
                 committed_head: Some(first_head.clone()),
+                rebased_from_head: None,
             },
         );
         let first_log = final_scope_waterline_log(&first, &first_outcome);
@@ -23923,6 +23966,7 @@ mod tests {
                 compaction: false,
                 raw_usage: None,
                 committed_head: None,
+                rebased_from_head: None,
             },
         );
         let failed_log = final_scope_waterline_log(&second, &failed_outcome);
@@ -23963,6 +24007,7 @@ mod tests {
                 true,
                 false,
                 WaterlineControlHead::derive(23, 1, "resp-settled"),
+                None,
             )
             .unwrap();
         assert_eq!(settled_log.outcome, "settled");
@@ -24047,6 +24092,7 @@ mod tests {
             true,
             false,
             Some(first_head.clone()),
+            None,
         );
         assert_eq!(first_outcome.status, "settled");
 
@@ -24058,7 +24104,8 @@ mod tests {
         )
         .unwrap();
         let ledger_guard = state.final_scope_waterlines.lock().unwrap();
-        let lock_busy = settle_final_scope_waterline(&state, &second, None, false, false, None);
+        let lock_busy =
+            settle_final_scope_waterline(&state, &second, None, false, false, None, None);
         drop(ledger_guard);
         assert_eq!(lock_busy.status, "settle_lock_busy");
         let lock_busy_log = final_scope_waterline_log(&second, &lock_busy);
@@ -30231,6 +30278,63 @@ mod tests {
         );
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_timeout_keeps_a_control_prefix_without_exposing_a_semantic_head()
+    {
+        let lineage = crate::continuation_lineage::ContinuationLineageIndex::default();
+        let previous_input = json!([
+            { "type": "message", "role": "user", "content": "stable prefix" },
+            {
+                "type": "function_call_output",
+                "call_id": "call-stable",
+                "output": { "stdout": "ok", "stderr": "", "exit_code": 0 }
+            }
+        ]);
+        lineage
+            .seed_for_test(
+                "terminal-fence-prefix",
+                ResponseSessionState {
+                    generation: 7,
+                    parent_generation: Some(6),
+                    response_id: "resp-stable".to_string(),
+                    input: previous_input.clone(),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let publication = lineage.register_terminal_publication("terminal-fence-prefix");
+
+        let lease = lineage.begin("terminal-fence-prefix").await;
+        assert!(
+            lease.head().is_none(),
+            "a timed-out terminal fence must still withhold semantic response-id recovery"
+        );
+        assert_eq!(
+            lease.control_head().map(|head| head.response_id.as_str()),
+            Some("resp-stable")
+        );
+
+        let mut current_items = previous_input.as_array().unwrap().clone();
+        current_items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "next turn"
+        }));
+        let analysis = analyze_tail_input_for_session(
+            &Channel::Responses,
+            Some(&lease),
+            Some(&Value::Array(current_items)),
+        );
+        assert_eq!(analysis.predecessor.status, PredecessorProofStatus::Exact);
+        assert!(analysis.predecessor.is_exact());
+        assert_eq!(analysis.predecessor.predecessor_input_items, 2);
+        assert_eq!(analysis.predecessor.current_input_items, 3);
+        assert!(analysis.diagnostics.delta_from_session);
+
+        drop(publication);
     }
 
     #[tokio::test]

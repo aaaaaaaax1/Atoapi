@@ -46,8 +46,22 @@ pub struct LineageLease {
     key: String,
     epoch: u64,
     expected_generation: u64,
+    /// `true` only when the bounded terminal-publication fence elapsed before
+    /// a semantic head could be safely exposed. This is intentionally carried
+    /// into settlement so the narrowly safe rebase path cannot apply to an
+    /// ordinary concurrent sibling.
+    publication_timed_out: bool,
+    /// Semantic response state is intentionally withheld while a terminal
+    /// publication fence is still active.  It must never authorize local
+    /// `previous_response_id` recovery from a response that has not finished
+    /// settling yet.
     head: Option<Arc<ResponseSessionState>>,
-    breakpoint_placement_digest: Option<String>,
+    /// The last fully committed input is still a truthful FullReplay prefix
+    /// even while a newer sibling is publishing its terminal state.  Keep it
+    /// separate from `head`: it is control-only evidence for canonical-prefix
+    /// proof and cache waterlines, never a semantic continuation authority.
+    control_head: Option<Arc<ResponseSessionState>>,
+    control_breakpoint_placement_digest: Option<String>,
 }
 
 impl LineageLease {
@@ -68,14 +82,27 @@ impl LineageLease {
         self.epoch
     }
 
+    pub fn publication_timed_out(&self) -> bool {
+        self.publication_timed_out
+    }
+
     pub fn head(&self) -> Option<&Arc<ResponseSessionState>> {
         self.head.as_ref()
     }
 
-    /// The exact final-wire cache-control position associated with this head.
-    /// `None` is a real value and must match the next FullReplay exactly.
-    pub fn breakpoint_placement_digest(&self) -> Option<&str> {
-        self.breakpoint_placement_digest.as_deref()
+    /// Returns the last committed FullReplay input that may be used only to
+    /// prove an unchanged canonical prefix.  This deliberately remains
+    /// available when `head()` is hidden by the terminal publication fence so
+    /// concurrent siblings do not repeatedly reset cache-control continuity.
+    pub fn control_head(&self) -> Option<&Arc<ResponseSessionState>> {
+        self.control_head.as_ref()
+    }
+
+    /// Cache-control placement associated with `control_head()`.  A `None`
+    /// value is meaningful when a control head exists, so callers must first
+    /// test `control_head()` rather than treating this as absence of evidence.
+    pub fn control_breakpoint_placement_digest(&self) -> Option<&str> {
+        self.control_breakpoint_placement_digest.as_deref()
     }
 }
 
@@ -108,10 +135,28 @@ pub enum LineageParent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineageCommitOutcome {
-    Applied { generation: u64 },
-    Tombstoned { generation: u64 },
-    Stale { expected: u64, actual: u64 },
-    EpochChanged { expected: u64, actual: u64 },
+    Applied {
+        generation: u64,
+    },
+    /// A terminal-fence-timed-out FullReplay was proven to be a strict
+    /// extension of the head that won while it was in flight. This preserves
+    /// continuity without ever accepting an ordinary sibling branch.
+    Rebased {
+        generation: u64,
+        parent_generation: u64,
+        parent_response_id: String,
+    },
+    Tombstoned {
+        generation: u64,
+    },
+    Stale {
+        expected: u64,
+        actual: u64,
+    },
+    EpochChanged {
+        expected: u64,
+        actual: u64,
+    },
     ParentMismatch,
     Regressive,
     ExternalContinuation,
@@ -280,14 +325,18 @@ impl ContinuationLineageIndex {
             key: key.to_string(),
             epoch: slot.epoch,
             expected_generation: slot.generation,
+            publication_timed_out: !publication_completed,
             // A timed-out publication may still expose the previous head.
             // Force a safe FullReplay lease instead of attempting delta from
             // stale lineage; the generation/epoch CAS still prevents a late
             // sibling from overwriting newer state.
             head: publication_completed.then(|| slot.head.clone()).flatten(),
-            breakpoint_placement_digest: publication_completed
-                .then(|| slot.breakpoint_placement_digest.clone())
-                .flatten(),
+            // A timeout must not turn a previously committed FullReplay input
+            // into a synthetic root. The input remains a truthful predecessor
+            // for canonical-prefix proof, but stays separate from `head` so it
+            // cannot authorize semantic response-id recovery.
+            control_head: slot.head.clone(),
+            control_breakpoint_placement_digest: slot.breakpoint_placement_digest.clone(),
         };
         let slot_count = slots.len();
         drop(slots);
@@ -319,8 +368,10 @@ impl ContinuationLineageIndex {
             key: key.to_string(),
             epoch: slot.epoch,
             expected_generation: slot.generation,
+            publication_timed_out: false,
             head: None,
-            breakpoint_placement_digest: None,
+            control_head: None,
+            control_breakpoint_placement_digest: None,
         };
         slots.insert(key.to_string(), slot);
         let slot_count = slots.len();
@@ -347,8 +398,10 @@ impl ContinuationLineageIndex {
             key: lease.key.clone(),
             epoch: slot.epoch,
             expected_generation: slot.generation,
+            publication_timed_out: false,
             head: None,
-            breakpoint_placement_digest: None,
+            control_head: None,
+            control_breakpoint_placement_digest: None,
         };
         slots.insert(lease.key.clone(), slot);
         let slot_count = slots.len();
@@ -371,7 +424,10 @@ impl ContinuationLineageIndex {
         let outcome = apply_commit(&mut slots, lease, parent, candidate, replacement_allowed);
         let slot_count = slots.len();
         drop(slots);
-        if matches!(outcome, LineageCommitOutcome::Applied { .. }) {
+        if matches!(
+            outcome,
+            LineageCommitOutcome::Applied { .. } | LineageCommitOutcome::Rebased { .. }
+        ) {
             self.maybe_schedule_gc(slot_count);
         }
         outcome
@@ -396,7 +452,10 @@ impl ContinuationLineageIndex {
                     apply_commit(&mut slots, lease, parent, candidate, replacement_allowed);
                 let slot_count = slots.len();
                 drop(slots);
-                if matches!(outcome, LineageCommitOutcome::Applied { .. }) {
+                if matches!(
+                    outcome,
+                    LineageCommitOutcome::Applied { .. } | LineageCommitOutcome::Rebased { .. }
+                ) {
                     self.maybe_schedule_gc(slot_count);
                 }
                 outcome
@@ -602,16 +661,30 @@ fn apply_commit(
             actual: slot.epoch,
         };
     }
+    if !replacement_allowed {
+        return LineageCommitOutcome::Regressive;
+    }
     let current_generation = slot.generation;
-    if current_generation != lease.expected_generation {
+    let rebased = current_generation != lease.expected_generation
+        && lease.publication_timed_out()
+        && matches!(parent, LineageParent::FullReplay)
+        && slot.head.as_ref().is_some_and(|current| {
+            full_replay_input_strictly_extends(&current.input, &candidate.input)
+                && slot.breakpoint_placement_digest == candidate.breakpoint_placement_digest
+        });
+    if current_generation != lease.expected_generation && !rebased {
         return LineageCommitOutcome::Stale {
             expected: lease.expected_generation,
             actual: current_generation,
         };
     }
-    if !replacement_allowed {
-        return LineageCommitOutcome::Regressive;
-    }
+    let rebased_parent = rebased.then(|| {
+        let parent = slot
+            .head
+            .as_ref()
+            .expect("a rebased commit must have an already committed parent");
+        (parent.generation, parent.response_id.clone())
+    });
     let generation = current_generation
         .checked_add(1)
         .expect("continuation lineage generation overflow");
@@ -631,7 +704,35 @@ fn apply_commit(
     slot.head = Some(head);
     slot.breakpoint_placement_digest = candidate.breakpoint_placement_digest;
     slot.updated_at = Instant::now();
-    LineageCommitOutcome::Applied { generation }
+    if let Some((parent_generation, parent_response_id)) = rebased_parent {
+        // This was captured before replacing the slot. It is used only by the
+        // final-scope ledger to prove that the winning head is exactly the
+        // parent observed during the strict rebase, never exposed in metrics.
+        LineageCommitOutcome::Rebased {
+            generation,
+            parent_generation,
+            parent_response_id,
+        }
+    } else {
+        LineageCommitOutcome::Applied { generation }
+    }
+}
+
+/// A late terminal-fence request may join the lineage only when its complete
+/// FullReplay request literally preserves every item of the newly committed
+/// head and appends at least one item. This is intentionally stricter than a
+/// generic response replacement: sibling branches, compaction, and external
+/// continuations cannot satisfy it.
+fn full_replay_input_strictly_extends(previous: &Value, current: &Value) -> bool {
+    let (Some(previous_items), Some(current_items)) = (previous.as_array(), current.as_array())
+    else {
+        return false;
+    };
+    previous_items.len() < current_items.len()
+        && previous_items
+            .iter()
+            .zip(current_items.iter())
+            .all(|(previous, current)| previous == current)
 }
 
 fn apply_invalidation(
@@ -683,6 +784,20 @@ mod tests {
             response_id: response_id.to_string(),
             breakpoint_placement_digest: None,
             input: json!([{"type":"message","role":"user","content":input}]),
+            output_items: Vec::new(),
+            finished_at: Instant::now(),
+        }
+    }
+
+    fn candidate_with_input(
+        response_id: &str,
+        input: Value,
+        breakpoint_placement_digest: Option<&str>,
+    ) -> ResponseSessionCandidate {
+        ResponseSessionCandidate {
+            response_id: response_id.to_string(),
+            breakpoint_placement_digest: breakpoint_placement_digest.map(ToOwned::to_owned),
+            input,
             output_items: Vec::new(),
             finished_at: Instant::now(),
         }
@@ -750,6 +865,11 @@ mod tests {
             lease.head().is_none(),
             "a timed-out fence must force FullReplay instead of exposing the stale head"
         );
+        assert_eq!(
+            lease.control_head().map(|head| head.response_id.as_str()),
+            Some("resp-old"),
+            "the last committed input remains valid control evidence even though it cannot authorize semantic response-id recovery"
+        );
         drop(publication);
     }
 
@@ -792,6 +912,136 @@ mod tests {
         let head = index.head("thread").await.unwrap();
         assert_eq!(head.response_id, "resp-right");
         assert_eq!(head.parent_generation, None);
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_timeout_rebases_only_a_strict_full_replay_extension() {
+        let index = ContinuationLineageIndex::default();
+        let base = json!([{"type":"message","role":"user","content":"base"}]);
+        index
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-base".to_string(),
+                    input: base.clone(),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let terminal_owner = index.register_terminal_publication("thread");
+        let parent = index.begin("thread").await;
+        let timed_out_child = index.begin("thread").await;
+        assert!(timed_out_child.publication_timed_out());
+        assert!(timed_out_child.head().is_none());
+
+        let parent_input = json!([
+            {"type":"message","role":"user","content":"base"},
+            {"type":"message","role":"assistant","content":"terminal"}
+        ]);
+        assert_eq!(
+            index
+                .commit(
+                    &parent,
+                    &LineageParent::FullReplay,
+                    candidate_with_input("resp-parent", parent_input.clone(), Some("placement-a")),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { generation: 2 }
+        );
+
+        let child_input = json!([
+            {"type":"message","role":"user","content":"base"},
+            {"type":"message","role":"assistant","content":"terminal"},
+            {"type":"message","role":"user","content":"next"}
+        ]);
+        assert_eq!(
+            index
+                .commit(
+                    &timed_out_child,
+                    &LineageParent::FullReplay,
+                    candidate_with_input("resp-child", child_input.clone(), Some("placement-a")),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Rebased {
+                generation: 3,
+                parent_generation: 2,
+                parent_response_id: "resp-parent".to_string(),
+            }
+        );
+        let head = index.head("thread").await.unwrap();
+        assert_eq!(head.response_id, "resp-child");
+        assert_eq!(head.input, child_input);
+
+        drop(terminal_owner);
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_timeout_does_not_rebase_a_sibling_branch_or_placement_change() {
+        let index = ContinuationLineageIndex::default();
+        let base = json!([{"type":"message","role":"user","content":"base"}]);
+        index
+            .seed_for_test(
+                "thread",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-base".to_string(),
+                    input: base,
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let terminal_owner = index.register_terminal_publication("thread");
+        let parent = index.begin("thread").await;
+        let timed_out_child = index.begin("thread").await;
+        assert!(timed_out_child.publication_timed_out());
+
+        let parent_input = json!([
+            {"type":"message","role":"user","content":"base"},
+            {"type":"message","role":"assistant","content":"right"}
+        ]);
+        assert_eq!(
+            index
+                .commit(
+                    &parent,
+                    &LineageParent::FullReplay,
+                    candidate_with_input("resp-right", parent_input, Some("placement-a")),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { generation: 2 }
+        );
+
+        let sibling_branch = json!([
+            {"type":"message","role":"user","content":"base"},
+            {"type":"message","role":"assistant","content":"left"}
+        ]);
+        assert_eq!(
+            index
+                .commit(
+                    &timed_out_child,
+                    &LineageParent::FullReplay,
+                    candidate_with_input("resp-left", sibling_branch, Some("placement-a")),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Stale {
+                expected: 1,
+                actual: 2,
+            }
+        );
+        assert_eq!(
+            index.head("thread").await.unwrap().response_id,
+            "resp-right"
+        );
+
+        drop(terminal_owner);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

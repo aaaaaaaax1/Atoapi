@@ -315,6 +315,11 @@ pub(super) struct WaterlineSettlement<'a> {
     /// Present only when this exact request won the lineage CAS and created
     /// the supplied head. Losing siblings cannot advance control evidence.
     pub(super) committed_head: Option<WaterlineControlHead>,
+    /// Present only for the terminal-publication timeout rebase. It is the
+    /// exact head that won while this FullReplay was in flight, allowing a
+    /// proven strict extension to bind to that head without accepting a
+    /// generic concurrent sibling branch.
+    pub(super) rebased_from_head: Option<WaterlineControlHead>,
 }
 
 impl<'a> WaterlineSettlement<'a> {
@@ -325,6 +330,7 @@ impl<'a> WaterlineSettlement<'a> {
             compaction: false,
             raw_usage: Some(raw_usage),
             committed_head: WaterlineControlHead::derive(1, 1, "test-response"),
+            rebased_from_head: None,
         }
     }
 }
@@ -644,14 +650,19 @@ impl FinalScopeWaterlineLedger {
         if ticket.dispatch_seq <= entry.last_settled_seq {
             return WaterlineSettlementOutcome::ignored("out_of_order");
         }
-        if ticket.captured_control_head != entry.control_head {
+        let rebased_predecessor_bound = settlement
+            .rebased_from_head
+            .as_ref()
+            .is_some_and(|head| entry.control_head.as_ref() == Some(head));
+        if ticket.captured_control_head != entry.control_head && !rebased_predecessor_bound {
             return WaterlineSettlementOutcome::ignored("ambiguous_branch");
         }
 
         let prior = entry.waterlines;
-        let predecessor_bound = entry.control_head.as_ref().is_some_and(|head| {
-            ticket.predecessor.is_exact() && ticket.predecessor.head.as_ref() == Some(head)
-        });
+        let predecessor_bound = rebased_predecessor_bound
+            || entry.control_head.as_ref().is_some_and(|head| {
+                ticket.predecessor.is_exact() && ticket.predecessor.head.as_ref() == Some(head)
+            });
         let continuity_reset =
             ticket.sent_prediction_eligible && entry.control_head.is_some() && !predecessor_bound;
         if continuity_reset {
@@ -850,6 +861,7 @@ mod tests {
             compaction: false,
             raw_usage: Some(raw_usage),
             committed_head: Some(head),
+            rebased_from_head: None,
         }
     }
 
@@ -921,6 +933,7 @@ mod tests {
                 compaction: false,
                 raw_usage: Some(&raw),
                 committed_head: None,
+                rebased_from_head: None,
             },
         );
         assert_eq!(outcome.status, "observe_only");
@@ -947,6 +960,7 @@ mod tests {
                     compaction: false,
                     raw_usage: Some(&raw),
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             );
             assert_eq!(outcome.status, "observe_only");
@@ -974,6 +988,7 @@ mod tests {
                     compaction: false,
                     raw_usage: Some(&usage(13_396, 13_396)),
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1000,6 +1015,7 @@ mod tests {
                     compaction: false,
                     raw_usage: None,
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1013,6 +1029,7 @@ mod tests {
                     compaction: true,
                     raw_usage: Some(&usage(13_396, 13_396)),
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1063,6 +1080,7 @@ mod tests {
                     compaction: false,
                     raw_usage: None,
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1091,6 +1109,7 @@ mod tests {
                     compaction: false,
                     raw_usage: None,
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1111,6 +1130,7 @@ mod tests {
                     compaction: true,
                     raw_usage: Some(&usage(13_396, 13_396)),
                     committed_head: None,
+                    rebased_from_head: None,
                 },
             )
             .is_none());
@@ -1181,6 +1201,7 @@ mod tests {
                         compaction: false,
                         raw_usage: None,
                         committed_head: None,
+                        rebased_from_head: None,
                     },
                     now + Duration::from_secs(index + 1),
                 )
@@ -1447,10 +1468,257 @@ mod tests {
             successful_with_head(&right_usage, control_head(5, 2, "resp-right")),
         );
         assert_eq!(right_outcome.status, "ambiguous_branch");
+        assert!(!right_outcome.predecessor_bound);
+        assert!(!right_outcome.continuity_reset);
         assert!(right_outcome.waterlines.is_none());
         assert_eq!(
             ledger.snapshot("scope-a").unwrap(),
             left_outcome.waterlines.unwrap()
+        );
+    }
+
+    #[test]
+    fn terminal_timeout_rebase_binds_only_to_the_head_that_won_in_flight() {
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let root_head = control_head(19, 1, "resp-root");
+        let root = ledger
+            .try_begin_with_proof("scope-a", true, true, PredecessorProofReceipt::root(19, 1))
+            .unwrap();
+        let root_usage = usage(50_000, 49_920);
+        let root_outcome =
+            ledger.settle_with_outcome(&root, successful_with_head(&root_usage, root_head.clone()));
+        assert_eq!(root_outcome.status, "settled");
+        let initial_continuity_generation = ledger
+            .snapshot("scope-a")
+            .expect("root settlement should create the scope")
+            .continuity_generation;
+
+        // Both requests left while H1 was the last settled control head. The
+        // parent H2 finishes first; the timed-out child is only allowed to
+        // settle when its lineage layer proves that it strictly extended H2.
+        let parent = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head.clone())),
+            )
+            .unwrap();
+        let rebased_child = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head)),
+            )
+            .unwrap();
+
+        let parent_head = control_head(19, 2, "resp-parent");
+        let parent_usage = usage(50_128, 49_920);
+        let parent_outcome = ledger.settle_with_outcome(
+            &parent,
+            successful_with_head(&parent_usage, parent_head.clone()),
+        );
+        assert_eq!(parent_outcome.status, "settled");
+
+        let child_head = control_head(19, 3, "resp-child");
+        let child_usage = usage(50_256, 50_048);
+        let child_outcome = ledger.settle_with_outcome(
+            &rebased_child,
+            WaterlineSettlement {
+                upstream_succeeded: true,
+                compaction: false,
+                raw_usage: Some(&child_usage),
+                committed_head: Some(child_head.clone()),
+                rebased_from_head: Some(parent_head),
+            },
+        );
+
+        assert_eq!(child_outcome.status, "settled");
+        assert!(child_outcome.predecessor_bound);
+        assert!(!child_outcome.continuity_reset);
+        let final_state = ledger.snapshot("scope-a").unwrap();
+        assert_eq!(
+            final_state.continuity_generation,
+            initial_continuity_generation
+        );
+        assert_eq!(
+            ledger
+                .entries
+                .get("scope-a")
+                .and_then(|entry| entry.control_head.as_ref()),
+            Some(&child_head)
+        );
+    }
+
+    #[test]
+    fn terminal_timeout_rebase_rejects_a_parent_head_that_did_not_win() {
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let root_head = control_head(29, 1, "resp-root");
+        let root = ledger
+            .try_begin_with_proof("scope-a", true, true, PredecessorProofReceipt::root(29, 1))
+            .unwrap();
+        ledger.settle_with_outcome(
+            &root,
+            successful_with_head(&usage(40_000, 39_936), root_head.clone()),
+        );
+
+        let parent = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head.clone())),
+            )
+            .unwrap();
+        let stale_child = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head.clone())),
+            )
+            .unwrap();
+        let parent_head = control_head(29, 2, "resp-parent");
+        let parent_usage = usage(40_128, 39_936);
+        let parent_outcome = ledger.settle_with_outcome(
+            &parent,
+            successful_with_head(&parent_usage, parent_head.clone()),
+        );
+        let before_rejected = parent_outcome.waterlines.unwrap();
+
+        let rejected_usage = usage(40_256, 40_064);
+        let rejected = ledger.settle_with_outcome(
+            &stale_child,
+            WaterlineSettlement {
+                upstream_succeeded: true,
+                compaction: false,
+                raw_usage: Some(&rejected_usage),
+                committed_head: Some(control_head(29, 3, "resp-child")),
+                // The child must bind to the head that actually won while it
+                // was in flight, never an older captured predecessor.
+                rebased_from_head: Some(root_head),
+            },
+        );
+
+        assert_eq!(rejected.status, "ambiguous_branch");
+        assert!(rejected.waterlines.is_none());
+        assert_eq!(ledger.snapshot("scope-a"), Some(before_rejected));
+        assert_eq!(
+            ledger
+                .entries
+                .get("scope-a")
+                .and_then(|entry| entry.control_head.as_ref()),
+            Some(&parent_head)
+        );
+    }
+
+    #[test]
+    fn terminal_timeout_rebase_never_settles_without_a_committed_child_head() {
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let root_head = control_head(31, 1, "resp-root");
+        let root = ledger
+            .try_begin_with_proof("scope-a", true, true, PredecessorProofReceipt::root(31, 1))
+            .unwrap();
+        ledger.settle_with_outcome(
+            &root,
+            successful_with_head(&usage(42_000, 41_984), root_head.clone()),
+        );
+
+        let no_commit = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head.clone())),
+            )
+            .unwrap();
+        let baseline = ledger.snapshot("scope-a").unwrap();
+        let rejected_usage = usage(42_128, 42_112);
+        let rejected = ledger.settle_with_outcome(
+            &no_commit,
+            WaterlineSettlement {
+                upstream_succeeded: true,
+                compaction: false,
+                raw_usage: Some(&rejected_usage),
+                committed_head: None,
+                rebased_from_head: Some(root_head),
+            },
+        );
+
+        assert_eq!(rejected.status, "lineage_rejected");
+        assert!(rejected.waterlines.is_none());
+        assert_eq!(ledger.snapshot("scope-a"), Some(baseline));
+    }
+
+    #[test]
+    fn terminal_timeout_rebase_still_respects_dispatch_order() {
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let root_head = control_head(37, 1, "resp-root");
+        let root = ledger
+            .try_begin_with_proof("scope-a", true, true, PredecessorProofReceipt::root(37, 1))
+            .unwrap();
+        ledger.settle_with_outcome(
+            &root,
+            successful_with_head(&usage(60_000, 59_904), root_head.clone()),
+        );
+
+        let parent = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head.clone())),
+            )
+            .unwrap();
+        let stale_rebase = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(root_head)),
+            )
+            .unwrap();
+        let parent_head = control_head(37, 2, "resp-parent");
+        ledger.settle_with_outcome(
+            &parent,
+            successful_with_head(&usage(60_128, 59_904), parent_head.clone()),
+        );
+
+        let newer = ledger
+            .try_begin_with_proof(
+                "scope-a",
+                true,
+                true,
+                proof(PredecessorProofStatus::Exact, Some(parent_head.clone())),
+            )
+            .unwrap();
+        let newer_head = control_head(37, 3, "resp-newer");
+        let newer_outcome = ledger.settle_with_outcome(
+            &newer,
+            successful_with_head(&usage(60_256, 60_032), newer_head.clone()),
+        );
+        assert_eq!(newer_outcome.status, "settled");
+
+        let stale_outcome = ledger.settle_with_outcome(
+            &stale_rebase,
+            WaterlineSettlement {
+                upstream_succeeded: true,
+                compaction: false,
+                raw_usage: Some(&usage(60_384, 60_160)),
+                committed_head: Some(control_head(37, 4, "resp-stale")),
+                rebased_from_head: Some(parent_head),
+            },
+        );
+
+        assert_eq!(stale_outcome.status, "out_of_order");
+        assert!(stale_outcome.waterlines.is_none());
+        assert_eq!(
+            ledger
+                .entries
+                .get("scope-a")
+                .and_then(|entry| entry.control_head.as_ref()),
+            Some(&newer_head)
         );
     }
 
@@ -1479,6 +1747,7 @@ mod tests {
                         compaction: false,
                         raw_usage: None,
                         committed_head: None,
+                        rebased_from_head: None,
                     },
                     now + Duration::from_secs(seconds),
                 )

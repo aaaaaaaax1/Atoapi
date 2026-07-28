@@ -1504,6 +1504,61 @@ function formatTokenCount(value?: number | null): string {
   return (value ?? 0).toLocaleString("en-US");
 }
 
+const CACHE_DISPLAY_BUCKET_TOKENS = 128;
+
+type RequestCacheTailDisplay = {
+  shortfallTokens: number;
+  newTailTokens: number;
+  avoidableTokens: number;
+};
+
+function wholeTokenCount(value?: number | null): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0;
+}
+
+/**
+ * The request-row hint is deliberately computed in the UI from the raw
+ * provider usage that is already persisted. This makes the 128-token bucket
+ * visible without changing historical records or pretending that the old
+ * aggregate 512-token diagnostic was rewritten.
+ */
+function cacheTailDisplayForRequest(
+  request: Pick<
+    MetricsSnapshot["recent_requests"][number],
+    | "input_tokens"
+    | "cache_read_tokens"
+    | "cache_avoidable_gap_tokens"
+    | "cache_provider_unstable_gap_tokens"
+  >
+): RequestCacheTailDisplay {
+  const inputTokens = wholeTokenCount(request.input_tokens);
+  const cacheReadTokens = Math.min(wholeTokenCount(request.cache_read_tokens), inputTokens);
+  const cacheableInputTokens = Math.floor(inputTokens / CACHE_DISPLAY_BUCKET_TOKENS)
+    * CACHE_DISPLAY_BUCKET_TOKENS;
+  const shortfallTokens = Math.max(
+    0,
+    cacheableInputTokens - Math.min(cacheReadTokens, cacheableInputTokens)
+  );
+  const avoidableTokens = Math.min(
+    wholeTokenCount(request.cache_avoidable_gap_tokens),
+    shortfallTokens
+  );
+  const providerUnstableTokens = Math.min(
+    wholeTokenCount(request.cache_provider_unstable_gap_tokens),
+    shortfallTokens - avoidableTokens
+  );
+
+  return {
+    shortfallTokens,
+    // Provider instability is intentionally not presented as a new user tail.
+    // The remaining 128-aligned shortfall is the only safe "new" display.
+    newTailTokens: shortfallTokens - avoidableTokens - providerUnstableTokens,
+    avoidableTokens
+  };
+}
+
 function cacheGapDetail(shortfall: number, avoidable: number, newTail: number): string {
   const segments: string[] = [];
   const append = (label: string, value: number) => {
@@ -1804,6 +1859,7 @@ function buildState(
       cacheReadTokens: cached,
       coldStart: request.cold_start
     });
+    const cacheTailDisplay = cacheTailDisplayForRequest(request);
     return {
       id: request.id,
       recordedAt: request.at,
@@ -1827,9 +1883,9 @@ function buildState(
       inputTokens: input,
       outputTokens: request.output_tokens ?? 0,
       cachedTokens: cached,
-      cacheShortfallTokens: request.cache_shortfall_tokens ?? 0,
-      cacheAvoidableGapTokens: request.cache_avoidable_gap_tokens ?? 0,
-      cacheNewTailGapTokens: request.cache_new_tail_gap_tokens ?? 0,
+      cacheShortfallTokens: cacheTailDisplay.shortfallTokens,
+      cacheAvoidableGapTokens: cacheTailDisplay.avoidableTokens,
+      cacheNewTailGapTokens: cacheTailDisplay.newTailTokens,
       reasoning: request.effective_reasoning_effort ?? request.configured_reasoning_effort ?? request.agent_reasoning_effort ?? "—",
       ratio,
       detail: cacheGapDetail(

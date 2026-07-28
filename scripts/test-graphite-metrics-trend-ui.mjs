@@ -265,6 +265,31 @@ assert.match(
   /const cacheTailDetail = "新 " \+ requestTokens\(request\.cacheNewTailGapTokens\)[\s\S]{0,220}Number\(request\.cacheAvoidableGapTokens \|\| 0\) > 0/,
   "the request hit cell must always show the new tail and conditionally include a nonzero avoidable gap"
 );
+assert.match(
+  host,
+  /const CACHE_DISPLAY_BUCKET_TOKENS = 128;/,
+  "the request-row cache hint must use the provider's 128-token cache bucket"
+);
+assert.match(
+  host,
+  /function cacheTailDisplayForRequest\([\s\S]{0,220}cache_provider_unstable_gap_tokens/,
+  "the request-row display must classify the 128-aligned gap without labeling provider instability as a new tail"
+);
+assert.match(
+  host,
+  /const cacheTailDisplay = cacheTailDisplayForRequest\(request\);/,
+  "the request-row projection must derive its display values from existing raw usage"
+);
+assert.match(
+  host,
+  /cacheShortfallTokens: cacheTailDisplay\.shortfallTokens,/,
+  "the request-row shortfall must use the 128-token projection"
+);
+assert.match(
+  host,
+  /cacheNewTailGapTokens: cacheTailDisplay\.newTailTokens,/,
+  "only the request-row projection may derive 128-token values from existing raw usage; no backend history rewrite is required"
+);
 assert.doesNotMatch(
   host,
   /cacheGapBucket|· 桶 /,

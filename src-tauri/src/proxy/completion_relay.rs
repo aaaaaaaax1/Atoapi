@@ -492,7 +492,7 @@ pub(super) async fn stream_upstream(
                 // the failed inbound before returning a local 503.
                 upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                     .take()
-                    .and_then(|guard| guard.finish(None, false, false, None));
+                    .and_then(|guard| guard.finish(None, false, false, None, None));
                 let admission_body = json!({ "stream": true });
                 record_upstream_transport_failure(
                     &state,
@@ -1002,6 +1002,10 @@ pub(super) async fn stream_upstream(
             response_session_update.as_ref(),
             response_session_response_id.as_deref(),
         );
+        let rebased_from_head = rebased_waterline_control_head(
+            response_session_lease.as_ref(),
+            response_session_update.as_ref(),
+        );
         let raw_final_scope_usage = (stream_success_for_cache && stream_metadata.usage.has_usage())
             .then_some(&stream_metadata.usage);
         upstream_request_diagnostics.final_scope_waterline =
@@ -1011,6 +1015,7 @@ pub(super) async fn stream_upstream(
                     stream_success_for_cache,
                     confirmed_compaction,
                     committed_head,
+                    rebased_from_head,
                 )
             });
         if let Some(publication) = terminal_publication.take() {
