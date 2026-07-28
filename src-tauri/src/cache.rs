@@ -8,8 +8,12 @@ use std::{
     fs,
     fs::OpenOptions,
     io::Write,
+    mem::size_of,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard,
+    },
 };
 use tokio::sync::RwLock;
 
@@ -19,6 +23,24 @@ use crate::{
     metrics::MetricsStore,
     persistence::{WriteBehindCoordinator, WriteOperation},
 };
+
+// The response cache is a best-effort acceleration layer.  It must never let
+// a long-lived local process retain an unbounded amount of provider output.
+// These limits cover the complete in-memory entry estimate, not just its body:
+// semantic text and embeddings may otherwise be just as large as a response.
+// They intentionally do not affect relaying; an entry that cannot fit simply
+// is not cached after its normal single upstream response has already finished.
+const MAX_RESPONSE_CACHE_ENTRY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RESPONSE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+// Evict in batches rather than sorting the full map for every small write once
+// the cache reaches its ceiling. This keeps normal cache inserts inexpensive.
+const RESPONSE_CACHE_BYTES_RECLAIM_TARGET: usize = 48 * 1024 * 1024;
+// Cache snapshots are JSON-encoded before optional encryption, so their disk
+// representation can be several times larger than retained response bytes.
+// Refuse an oversized legacy snapshot before `fs::read` allocates it into the
+// process. The file is deliberately preserved for inspection; it is merely
+// not loaded into the live acceleration cache.
+const MAX_RESPONSE_CACHE_SNAPSHOT_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -55,6 +77,9 @@ pub enum CacheLookupStatus {
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     entries: Arc<RwLock<HashMap<String, Arc<CacheEntry>>>>,
+    // Maintained under the entries write lock. Keeping the total incrementally
+    // avoids rescanning a large cache for every ordinary insert.
+    retained_bytes: Arc<AtomicUsize>,
     path: PathBuf,
     persistence: CacheWriteCoordinator,
     #[cfg(test)]
@@ -211,6 +236,7 @@ impl CacheStore {
         let store = Self {
             persistence: CacheWriteCoordinator::new(path.clone()),
             entries,
+            retained_bytes: Arc::new(AtomicUsize::new(0)),
             path,
             #[cfg(test)]
             publication_hook: None,
@@ -235,6 +261,7 @@ impl CacheStore {
     ) -> Result<Self> {
         Ok(Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
+            retained_bytes: Arc::new(AtomicUsize::new(0)),
             path,
             persistence: CacheWriteCoordinator::new_with_job(write_job),
             publication_hook: None,
@@ -268,16 +295,36 @@ impl CacheStore {
         if !self.path.exists() {
             return Ok(());
         }
+        let snapshot_bytes = fs::metadata(&self.path)?.len();
+        if !cache_snapshot_is_loadable(snapshot_bytes) {
+            eprintln!(
+                "response cache snapshot skipped because it exceeds the {} MiB safety limit",
+                MAX_RESPONSE_CACHE_SNAPSHOT_BYTES / (1024 * 1024)
+            );
+            return Ok(());
+        }
         let raw = fs::read(&self.path)?;
         let plain = crypto::decrypt_cache_bytes(&raw)?;
         let entries: Vec<CacheEntry> = serde_json::from_slice(&plain)?;
         let now = Utc::now();
-        let mut guard = self.entries.write().await;
-        guard.clear();
+        let mut loaded = HashMap::new();
         for mut entry in entries.into_iter().filter(|entry| entry.expires_at > now) {
             ensure_semantic_vector(&mut entry);
-            guard.insert(entry.key.clone(), Arc::new(entry));
+            if cache_entry_fits_budget(&entry) {
+                loaded.insert(entry.key.clone(), Arc::new(entry));
+            }
         }
+        let retained_bytes = cache_entries_retained_bytes(&loaded);
+        let retained_bytes = trim_cache_entries(
+            &mut loaded,
+            usize::MAX,
+            MAX_RESPONSE_CACHE_BYTES,
+            RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
+            retained_bytes,
+        );
+        let mut guard = self.entries.write().await;
+        *guard = loaded;
+        self.retained_bytes.store(retained_bytes, Ordering::Release);
         // A previous file only survives when the process stopped after the new
         // snapshot was promoted but before cleanup. Remove it only after the
         // promoted snapshot has been decrypted and parsed successfully.
@@ -379,19 +426,23 @@ impl CacheStore {
         }
         let mut guard = self.entries.write().await;
         let mut persistence_gate = self.persistence.begin_mutation()?;
-        for entry in entries {
-            guard.insert(entry.key.clone(), Arc::new(entry));
-        }
-        if guard.len() > config.max_entries {
-            let mut by_age = guard
-                .values()
-                .map(|entry| (entry.created_at, entry.key.clone()))
-                .collect::<Vec<_>>();
-            by_age.sort_by_key(|(created_at, _)| *created_at);
-            for (_, key) in by_age.into_iter().take(guard.len() - config.max_entries) {
-                guard.remove(&key);
+        let mut retained_bytes = self.retained_bytes.load(Ordering::Acquire);
+        for entry in entries.into_iter().filter(cache_entry_fits_budget) {
+            let entry_bytes = cache_entry_retained_bytes(&entry);
+            if let Some(previous) = guard.insert(entry.key.clone(), Arc::new(entry)) {
+                retained_bytes =
+                    retained_bytes.saturating_sub(cache_entry_retained_bytes(&previous));
             }
+            retained_bytes = retained_bytes.saturating_add(entry_bytes);
         }
+        retained_bytes = trim_cache_entries(
+            &mut guard,
+            config.max_entries,
+            MAX_RESPONSE_CACHE_BYTES,
+            RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
+            retained_bytes,
+        );
+        self.retained_bytes.store(retained_bytes, Ordering::Release);
         if config.persist_encrypted {
             let snapshot = guard.values().cloned().collect::<Vec<_>>();
             // Publish the matching immutable snapshot while both the entry map
@@ -410,6 +461,7 @@ impl CacheStore {
             let mut entries = self.entries.write().await;
             let mut persistence_gate = self.persistence.begin_mutation()?;
             entries.clear();
+            self.retained_bytes.store(0, Ordering::Release);
             #[cfg(test)]
             self.before_publication(WriteOperation::Delete);
             persistence_gate.publish_delete()
@@ -428,6 +480,98 @@ impl CacheStore {
     pub async fn close_and_flush(&self) -> Result<()> {
         self.persistence.close_and_flush().await
     }
+}
+
+fn cache_entry_retained_bytes(entry: &CacheEntry) -> usize {
+    let string_bytes = entry
+        .key
+        .len()
+        .saturating_add(entry.semantic_text.as_deref().map_or(0, str::len))
+        .saturating_add(entry.semantic_shape.as_deref().map_or(0, str::len))
+        .saturating_add(entry.content_type.len())
+        .saturating_add(entry.provider_id.len())
+        .saturating_add(entry.model.len())
+        .saturating_add(entry.workspace_fingerprint.as_deref().map_or(0, str::len));
+    entry
+        .body
+        .len()
+        .saturating_add(string_bytes)
+        .saturating_add(
+            entry
+                .semantic_vector
+                .len()
+                .saturating_mul(size_of::<(u64, f32)>()),
+        )
+}
+
+fn cache_snapshot_is_loadable(snapshot_bytes: u64) -> bool {
+    snapshot_bytes <= MAX_RESPONSE_CACHE_SNAPSHOT_BYTES
+}
+
+fn cache_entry_fits_budget(entry: &CacheEntry) -> bool {
+    cache_entry_retained_bytes(entry) <= MAX_RESPONSE_CACHE_ENTRY_BYTES
+}
+
+fn cache_entries_retained_bytes(entries: &HashMap<String, Arc<CacheEntry>>) -> usize {
+    entries.values().fold(0usize, |total, entry| {
+        total.saturating_add(cache_entry_retained_bytes(entry))
+    })
+}
+
+fn trim_cache_entries(
+    entries: &mut HashMap<String, Arc<CacheEntry>>,
+    max_entries: usize,
+    max_bytes: usize,
+    reclaim_target_bytes: usize,
+    mut retained_bytes: usize,
+) -> usize {
+    if entries.len() <= max_entries && retained_bytes <= max_bytes {
+        return retained_bytes;
+    }
+
+    // Expired values are not part of the useful cache. Reclaim them only on a
+    // real capacity boundary, rather than doing a full-map sweep on every
+    // write; the latter turns normal 300k replay warming into O(n^2) work.
+    let now = Utc::now();
+    let expired = entries
+        .iter()
+        .filter(|(_, entry)| entry.expires_at <= now)
+        .map(|(key, entry)| (key.clone(), cache_entry_retained_bytes(entry)))
+        .collect::<Vec<_>>();
+    for (key, entry_bytes) in expired {
+        if entries.remove(&key).is_some() {
+            retained_bytes = retained_bytes.saturating_sub(entry_bytes);
+        }
+    }
+    if entries.len() <= max_entries && retained_bytes <= max_bytes {
+        return retained_bytes;
+    }
+
+    let target_bytes = if retained_bytes > max_bytes {
+        reclaim_target_bytes.min(max_bytes)
+    } else {
+        max_bytes
+    };
+    let mut by_age = entries
+        .values()
+        .map(|entry| {
+            (
+                entry.created_at,
+                entry.key.clone(),
+                cache_entry_retained_bytes(entry),
+            )
+        })
+        .collect::<Vec<_>>();
+    by_age.sort_by_key(|(created_at, _, _)| *created_at);
+    for (_, key, entry_bytes) in by_age {
+        if entries.len() <= max_entries && retained_bytes <= target_bytes {
+            break;
+        }
+        if entries.remove(&key).is_some() {
+            retained_bytes = retained_bytes.saturating_sub(entry_bytes);
+        }
+    }
+    retained_bytes
 }
 
 fn write_cache_snapshot(path: &Path, entries: Vec<Arc<CacheEntry>>) -> Result<()> {
@@ -1145,6 +1289,118 @@ mod tests {
         Barrier, Mutex as StdMutex,
     };
     use uuid::Uuid;
+
+    fn cache_budget_entry(key: &str, created_at: DateTime<Utc>, body_len: usize) -> CacheEntry {
+        CacheEntry {
+            key: key.to_string(),
+            semantic_text: None,
+            semantic_shape: None,
+            semantic_vector: Vec::new(),
+            content_type: "application/json".to_string(),
+            status: 200,
+            body: vec![b'x'; body_len],
+            created_at,
+            expires_at: created_at + chrono::Duration::hours(1),
+            provider_id: "provider".to_string(),
+            model: "model".to_string(),
+            workspace_fingerprint: Some("workspace".to_string()),
+        }
+    }
+
+    fn exact_cache_config() -> CacheConfig {
+        CacheConfig {
+            mode: CacheMode::PassiveWarm,
+            enabled: true,
+            exact_enabled: true,
+            semantic_enabled: false,
+            semantic_threshold: 0.985,
+            max_age_seconds: 3600,
+            max_entries: 10,
+            persist_encrypted: false,
+            prewarm_enabled: false,
+            background_prewarm_enabled: false,
+        }
+    }
+
+    #[test]
+    fn cache_byte_budget_evicts_oldest_entries_in_a_batch() {
+        let now = Utc::now();
+        let oldest = Arc::new(cache_budget_entry("oldest", now, 7));
+        let middle = Arc::new(cache_budget_entry(
+            "middle",
+            now + chrono::Duration::seconds(1),
+            7,
+        ));
+        let newest = Arc::new(cache_budget_entry(
+            "newest",
+            now + chrono::Duration::seconds(2),
+            7,
+        ));
+        let oldest_bytes = cache_entry_retained_bytes(&oldest);
+        let middle_bytes = cache_entry_retained_bytes(&middle);
+        let newest_bytes = cache_entry_retained_bytes(&newest);
+        let mut entries = HashMap::from([
+            (oldest.key.clone(), oldest),
+            (middle.key.clone(), middle),
+            (newest.key.clone(), newest),
+        ]);
+
+        let total_bytes = cache_entries_retained_bytes(&entries);
+        let retained_bytes = trim_cache_entries(
+            &mut entries,
+            usize::MAX,
+            oldest_bytes + middle_bytes + newest_bytes - 1,
+            newest_bytes,
+            total_bytes,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("newest"));
+        assert_eq!(retained_bytes, cache_entries_retained_bytes(&entries));
+        assert!(cache_entries_retained_bytes(&entries) <= newest_bytes);
+    }
+
+    #[test]
+    fn oversized_legacy_snapshot_is_rejected_before_reading_it_into_memory() {
+        assert!(cache_snapshot_is_loadable(
+            MAX_RESPONSE_CACHE_SNAPSHOT_BYTES
+        ));
+        assert!(!cache_snapshot_is_loadable(
+            MAX_RESPONSE_CACHE_SNAPSHOT_BYTES.saturating_add(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_entry_is_skipped_without_displacing_a_normal_exact_hit() {
+        let path = std::env::temp_dir().join(format!(
+            "atoapi-cache-size-budget-{}.bin",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let store = CacheStore::load(path).unwrap();
+        let config = exact_cache_config();
+        let now = Utc::now();
+        store
+            .insert(cache_budget_entry("same-key", now, 16), &config)
+            .await
+            .unwrap();
+
+        let oversized = cache_budget_entry(
+            "same-key",
+            now + chrono::Duration::seconds(1),
+            MAX_RESPONSE_CACHE_ENTRY_BYTES,
+        );
+        assert!(
+            !cache_entry_fits_budget(&oversized),
+            "entry metadata must count toward the hard retention ceiling"
+        );
+        store.insert(oversized, &config).await.unwrap();
+
+        let cached = store
+            .lookup_exact("same-key", &config)
+            .await
+            .expect("the normal cache value remains usable");
+        assert_eq!(cached.entry.body.len(), 16);
+    }
 
     #[test]
     fn windows_style_cache_replace_promotes_temp_and_removes_backup() {

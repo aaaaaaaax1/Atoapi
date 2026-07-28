@@ -12,6 +12,11 @@ use tokio::sync::{Notify, RwLock};
 
 const RECENT_USAGE_WINDOW_MINUTES: i64 = 30;
 const RECENT_USAGE_WINDOW_SECONDS: u64 = 30 * 60;
+// Time expiry alone is not a memory bound: a very high request rate can still
+// accumulate an arbitrarily large 30-minute deque. This is telemetry only, so
+// retain a generous hard ceiling without affecting request forwarding or the
+// persisted historical aggregates.
+const RECENT_USAGE_RECORD_LIMIT: usize = 50_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
@@ -2747,11 +2752,18 @@ fn sorted_background_prewarm(
 fn push_recent_usage(items: &mut VecDeque<TimedUsageRecord>, item: TimedUsageRecord) {
     items.push_front(item);
     prune_recent_usage(items);
+    trim_recent_usage_to_capacity(items, RECENT_USAGE_RECORD_LIMIT);
 }
 
 fn prune_recent_usage(items: &mut VecDeque<TimedUsageRecord>) {
     let cutoff = Utc::now() - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES);
     while items.back().is_some_and(|item| item.at < cutoff) {
+        items.pop_back();
+    }
+}
+
+fn trim_recent_usage_to_capacity(items: &mut VecDeque<TimedUsageRecord>, limit: usize) {
+    while items.len() > limit {
         items.pop_back();
     }
 }
@@ -3011,6 +3023,38 @@ mod tests {
             sse_done_marker_seen: None,
             sse_chunks: None,
         }
+    }
+
+    #[test]
+    fn recent_usage_capacity_discards_only_the_oldest_window_records() {
+        let now = Utc::now();
+        let mut records = VecDeque::new();
+        for index in 0..4 {
+            records.push_front(TimedUsageRecord {
+                at: now,
+                record: UsageRecord {
+                    provider: "provider".to_string(),
+                    model: format!("model-{index}"),
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                },
+                cold_start_counted: false,
+            });
+        }
+
+        trim_recent_usage_to_capacity(&mut records, 3);
+
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records.front().map(|record| record.record.model.as_str()),
+            Some("model-3")
+        );
+        assert_eq!(
+            records.back().map(|record| record.record.model.as_str()),
+            Some("model-1")
+        );
     }
 
     #[test]

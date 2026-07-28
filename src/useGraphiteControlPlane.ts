@@ -26,7 +26,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.8";
+const APP_VERSION = "v1.4.9";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -593,6 +593,12 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         input: { ...config.cache, enabled: payload.enabled === true }
       }));
       return { notice: payload.enabled === true ? "智能缓存已开启" : "智能缓存已关闭" };
+    }
+    if (action === "set-include-special-requests") {
+      const enabled = payload.enabled === true;
+      setIncludeColdStarts(enabled);
+      setIncludeCompactions(enabled);
+      return { notice: enabled ? "统计已计入冷启动和压缩" : "统计已排除冷启动和压缩" };
     }
     if (action === "set-include-cold-starts") {
       const enabled = payload.enabled === true;

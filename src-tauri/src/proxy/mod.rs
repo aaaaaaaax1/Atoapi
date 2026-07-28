@@ -11,8 +11,8 @@ use crate::{
         ProviderConfig, SelectedProviderKey, REASONING_EFFORT_VALUES,
     },
     continuation_lineage::{
-        LineageCommitOutcome, LineageInvalidateOutcome, LineageLease, LineageParent,
-        ResponseSessionCandidate, ResponseSessionState,
+        ControlOnlyReplayCandidate, LineageCommitOutcome, LineageInvalidateOutcome, LineageLease,
+        LineageParent, ResponseSessionCandidate, ResponseSessionState,
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
@@ -138,6 +138,10 @@ const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
+// These maps are local compatibility hints, not durable routing state. Bound
+// their cardinality so a long-running process cannot retain a key for every
+// transient URL/model configuration it has ever seen.
+const TRANSIENT_SCOPE_COOLDOWN_LIMIT: usize = 512;
 const LOG_MESSAGE_MAX_CHARS: usize = 700;
 const CLIENT_PROMPT_CACHE_KEY_MAX_CHARS: usize = 64;
 // Keep enough pre-redaction context to replace a valid client key that begins
@@ -4472,6 +4476,25 @@ async fn note_client_prompt_cache_key_rejection_cooldown(state: &AppState, local
     );
 }
 
+fn remember_bounded_scope_cooldown(
+    cooldowns: &mut HashMap<String, Instant>,
+    key: &str,
+    duration: TokioDuration,
+) {
+    let now = Instant::now();
+    cooldowns.retain(|_, until| *until > now);
+    if !cooldowns.contains_key(key) && cooldowns.len() >= TRANSIENT_SCOPE_COOLDOWN_LIMIT {
+        if let Some(oldest) = cooldowns
+            .iter()
+            .min_by_key(|(_, until)| *until)
+            .map(|(key, _)| key.clone())
+        {
+            cooldowns.remove(&oldest);
+        }
+    }
+    cooldowns.insert(key.to_string(), now + duration);
+}
+
 fn compact_chat_compat_cooldown_key(decision: &RouteDecision) -> String {
     format!(
         "{}:{}:{}",
@@ -4494,9 +4517,11 @@ async fn compact_chat_compat_cooldown_active(state: &AppState, key: &str) -> boo
 }
 
 async fn note_compact_chat_compat_cooldown(state: &AppState, key: &str) {
-    state.compact_chat_compat_cooldowns.lock().await.insert(
-        key.to_string(),
-        Instant::now() + std::time::Duration::from_secs(COMPACT_CHAT_COMPAT_COOLDOWN_SECS),
+    let mut cooldowns = state.compact_chat_compat_cooldowns.lock().await;
+    remember_bounded_scope_cooldown(
+        &mut cooldowns,
+        key,
+        TokioDuration::from_secs(COMPACT_CHAT_COMPAT_COOLDOWN_SECS),
     );
 }
 
@@ -4513,9 +4538,11 @@ async fn compact_endpoint_cooldown_active(state: &AppState, key: &str) -> bool {
 }
 
 async fn note_compact_endpoint_cooldown(state: &AppState, key: &str) {
-    state.compact_endpoint_cooldowns.lock().await.insert(
-        key.to_string(),
-        Instant::now() + std::time::Duration::from_secs(COMPACT_ENDPOINT_COOLDOWN_SECS),
+    let mut cooldowns = state.compact_endpoint_cooldowns.lock().await;
+    remember_bounded_scope_cooldown(
+        &mut cooldowns,
+        key,
+        TokioDuration::from_secs(COMPACT_ENDPOINT_COOLDOWN_SECS),
     );
 }
 
@@ -5177,9 +5204,11 @@ async fn request_body_gzip_cooldown_active(state: &AppState, key: &str) -> bool 
 }
 
 async fn note_request_body_gzip_fallback(state: &AppState, key: &str) {
-    state.request_body_gzip_cooldowns.lock().await.insert(
-        key.to_string(),
-        Instant::now() + TokioDuration::from_secs(REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS),
+    let mut cooldowns = state.request_body_gzip_cooldowns.lock().await;
+    remember_bounded_scope_cooldown(
+        &mut cooldowns,
+        key,
+        TokioDuration::from_secs(REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS),
     );
 }
 
@@ -6724,8 +6753,16 @@ fn response_session_anchor_diagnostics(lease: Option<&LineageLease>) -> SessionA
     let Some(lease) = lease else {
         return SessionAnchorDiagnostics::default();
     };
-    let exact = lease.head().is_some();
-    let source = if exact { "exact" } else { "new-anchor" };
+    let source = if lease.head().is_some() {
+        "exact"
+    } else if lease.control_head().is_some() {
+        // The last successful response had no upstream id, so this cannot
+        // authorize semantic reuse. It is nevertheless an exact frozen
+        // FullReplay predecessor and must not be reported as a synthetic root.
+        "control-prefix"
+    } else {
+        "new-anchor"
+    };
     SessionAnchorDiagnostics {
         hash: Some(lease.key().to_string()),
         source: Some(source.to_string()),
@@ -6744,12 +6781,16 @@ fn committed_waterline_control_head(
     response_id: Option<&str>,
 ) -> Option<WaterlineControlHead> {
     let lease = lease?;
-    let generation = match outcome? {
+    let (generation, control_identity) = match outcome? {
         LineageCommitOutcome::Applied { generation }
-        | LineageCommitOutcome::Rebased { generation, .. } => generation,
+        | LineageCommitOutcome::Rebased { generation, .. } => (*generation, response_id?),
+        LineageCommitOutcome::TombstonedWithControl {
+            generation,
+            control_identity,
+        } => (*generation, control_identity.as_str()),
         _ => return None,
     };
-    WaterlineControlHead::derive(lease.epoch(), *generation, response_id?)
+    WaterlineControlHead::derive(lease.epoch(), generation, control_identity)
 }
 
 fn rebased_waterline_control_head(
@@ -7015,24 +7056,29 @@ async fn update_response_session_with_owned_input(
     if matches!(parent, LineageParent::ExternalContinuation) {
         return Some(LineageCommitOutcome::ExternalContinuation);
     }
-    let (Some(input), Some(response_id)) = (full_response_input, response_id) else {
+    let Some(input) = full_response_input else {
         let expected_response_id = lease.head().map(|head| head.response_id.as_str());
         let outcome = state
             .continuation_lineage
             .invalidate_fast(lease, expected_response_id)
             .await;
-        return Some(match outcome {
-            LineageInvalidateOutcome::Applied { generation } => {
-                LineageCommitOutcome::Tombstoned { generation }
-            }
-            LineageInvalidateOutcome::Stale { expected, actual } => {
-                LineageCommitOutcome::Stale { expected, actual }
-            }
-            LineageInvalidateOutcome::EpochChanged { expected, actual } => {
-                LineageCommitOutcome::EpochChanged { expected, actual }
-            }
-            LineageInvalidateOutcome::ParentMismatch => LineageCommitOutcome::ParentMismatch,
-        });
+        return Some(response_session_invalidation_outcome(outcome));
+    };
+    let Some(response_id) = response_id else {
+        let expected_response_id = lease.head().map(|head| head.response_id.as_str());
+        let outcome = state
+            .continuation_lineage
+            .tombstone_with_control_prefix_fast(
+                lease,
+                expected_response_id,
+                ControlOnlyReplayCandidate {
+                    breakpoint_placement_digest,
+                    input,
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        return Some(response_session_invalidation_outcome(outcome));
     };
     let replacement_allowed = lease
         .head()
@@ -7051,6 +7097,30 @@ async fn update_response_session_with_owned_input(
             .commit_fast(lease, parent, candidate, replacement_allowed)
             .await,
     )
+}
+
+fn response_session_invalidation_outcome(
+    outcome: LineageInvalidateOutcome,
+) -> LineageCommitOutcome {
+    match outcome {
+        LineageInvalidateOutcome::Applied { generation } => {
+            LineageCommitOutcome::Tombstoned { generation }
+        }
+        LineageInvalidateOutcome::AppliedWithControl {
+            generation,
+            control_identity,
+        } => LineageCommitOutcome::TombstonedWithControl {
+            generation,
+            control_identity,
+        },
+        LineageInvalidateOutcome::Stale { expected, actual } => {
+            LineageCommitOutcome::Stale { expected, actual }
+        }
+        LineageInvalidateOutcome::EpochChanged { expected, actual } => {
+            LineageCommitOutcome::EpochChanged { expected, actual }
+        }
+        LineageInvalidateOutcome::ParentMismatch => LineageCommitOutcome::ParentMismatch,
+    }
 }
 
 async fn finalize_confirmed_responses_compaction(
@@ -7980,8 +8050,8 @@ fn analyze_tail_input_for_session(
     };
     let Some(control_head) = WaterlineControlHead::derive(
         lease.epoch(),
-        previous_session.generation,
-        &previous_session.response_id,
+        previous_session.generation(),
+        previous_session.control_identity(),
     ) else {
         return TailInputAnalysis {
             diagnostics: summarize_tail_input_items(current_items),
@@ -7993,7 +8063,7 @@ fn analyze_tail_input_for_session(
             ),
         };
     };
-    let Some(previous_items) = previous_session.input.as_array() else {
+    let Some(previous_items) = previous_session.input().as_array() else {
         return TailInputAnalysis {
             diagnostics: summarize_tail_input_items(current_items),
             predecessor: PredecessorProofReceipt::new(
@@ -15808,6 +15878,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn transient_scope_cooldowns_prune_expiry_and_have_a_hard_cardinality_bound() {
+        let mut cooldowns = HashMap::new();
+        cooldowns.insert(
+            "expired".to_string(),
+            Instant::now() - TokioDuration::from_secs(1),
+        );
+        for index in 0..=TRANSIENT_SCOPE_COOLDOWN_LIMIT {
+            remember_bounded_scope_cooldown(
+                &mut cooldowns,
+                &format!("scope-{index}"),
+                TokioDuration::from_secs(60),
+            );
+        }
+
+        assert_eq!(cooldowns.len(), TRANSIENT_SCOPE_COOLDOWN_LIMIT);
+        assert!(!cooldowns.contains_key("expired"));
+        assert!(!cooldowns.contains_key("scope-0"));
+        assert!(cooldowns.contains_key(&format!("scope-{}", TRANSIENT_SCOPE_COOLDOWN_LIMIT)));
+    }
+
     fn eligible_final_scope_receipt(digest: &str) -> FinalScopeShadowReceipt {
         FinalScopeShadowReceipt {
             version: 5,
@@ -20889,7 +20980,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_native_response_without_id_tombstones_old_head() {
+    async fn successful_native_response_without_id_tombstones_semantic_head_but_keeps_full_replay_control_prefix(
+    ) {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-missing-response-id-lineage-{}",
             Uuid::new_v4().simple()
@@ -20915,22 +21007,78 @@ mod tests {
             )
             .await;
         let lease = state.continuation_lineage.begin("thread").await;
-        let next_input = json!([{"type":"message","role":"user","content":"next"}]);
+        // This is the exact FullReplay payload that reached the upstream. A
+        // provider may omit its response id even though the request itself
+        // completed successfully, so the following turn must still be able to
+        // prove this frozen prefix without ever reviving `resp-old` for local
+        // semantic continuation.
+        let prior_tool_output = "x".repeat(32 * 1024);
+        let next_input = json!([
+            {"type":"message","role":"user","content":"old"},
+            {
+                "type":"function_call_output",
+                "call_id":"call-large-history",
+                "output": prior_tool_output
+            }
+        ]);
 
-        assert_eq!(
-            update_response_session_with_id(
-                &state,
-                Some(&lease),
-                &LineageParent::FullReplay,
-                Some(&next_input),
-                None,
-                None,
-                Vec::new(),
-            )
-            .await,
-            Some(LineageCommitOutcome::Tombstoned { generation: 2 })
-        );
+        let outcome = update_response_session_with_id(
+            &state,
+            Some(&lease),
+            &LineageParent::FullReplay,
+            Some(&next_input),
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert!(matches!(
+            &outcome,
+            Some(LineageCommitOutcome::TombstonedWithControl { generation: 2, .. })
+        ));
+        let committed_control_head =
+            committed_waterline_control_head(Some(&lease), outcome.as_ref(), None).expect(
+                "an id-less successful FullReplay must still advance its control waterline",
+            );
         assert!(!state.continuation_lineage.contains_head("thread").await);
+        let mut follow_up = next_input
+            .as_array()
+            .expect("the test FullReplay input is an array")
+            .clone();
+        follow_up.push(json!({
+            "type":"message",
+            "role":"user",
+            "content":"follow up"
+        }));
+        let follow_up = Value::Array(follow_up);
+        let next_lease = state.continuation_lineage.begin("thread").await;
+        assert!(
+            next_lease.head().is_none(),
+            "a missing upstream response id must never be promoted back into semantic continuation"
+        );
+        assert_eq!(
+            next_lease.control_head().map(|head| head.input()),
+            Some(&next_input),
+            "the successful FullReplay request remains control-only prefix evidence"
+        );
+        assert_eq!(
+            response_session_anchor_diagnostics(Some(&next_lease))
+                .source
+                .as_deref(),
+            Some("control-prefix")
+        );
+        let analysis = analyze_tail_input_for_session(
+            &Channel::Responses,
+            Some(&next_lease),
+            Some(&follow_up),
+        );
+        assert_eq!(analysis.predecessor.status, PredecessorProofStatus::Exact);
+        assert_eq!(analysis.predecessor.head, Some(committed_control_head));
+        assert_eq!(analysis.predecessor.predecessor_input_items, 2);
+        assert_eq!(analysis.predecessor.current_input_items, 3);
+        assert!(analysis.diagnostics.delta_from_session);
+        assert_eq!(analysis.diagnostics.tool_output_chars, 0);
+        assert_eq!(analysis.diagnostics.largest_tool_output_chars, 0);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -30313,7 +30461,9 @@ mod tests {
             "a timed-out terminal fence must still withhold semantic response-id recovery"
         );
         assert_eq!(
-            lease.control_head().map(|head| head.response_id.as_str()),
+            lease
+                .control_head()
+                .and_then(|head| head.semantic_response_id()),
             Some("resp-stable")
         );
 

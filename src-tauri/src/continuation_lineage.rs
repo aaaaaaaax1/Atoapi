@@ -13,6 +13,9 @@ const LINEAGE_HEAD_TTL: Duration = Duration::from_secs(30 * 60);
 const LINEAGE_TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
 const LINEAGE_GC_INTERVAL: u64 = 256;
 const LINEAGE_GC_MIN_SLOTS: usize = 128;
+/// A small index must still reclaim expired FullReplay bodies. Scanning fewer
+/// than 128 slots is cheap; deferring it indefinitely is not.
+const LINEAGE_SMALL_INDEX_GC_INTERVAL: u64 = 8;
 /// A terminal frame normally reaches EOF in the same network turn. Never let
 /// a provider that keeps the tail open turn this small publication fence into
 /// an unbounded pre-dispatch wait. Timing out is safe: the next request stays
@@ -30,6 +33,62 @@ pub struct ResponseSessionState {
     pub finished_at: Instant,
 }
 
+/// A successful FullReplay request whose upstream response omitted an id.
+///
+/// It deliberately contains no semantic continuation id and must never be
+/// considered by `head()` or `managed_response_in_other_scope()`. Its only
+/// purpose is to prove that a later FullReplay request preserved the exact
+/// sent prefix, so cache waterlines do not regress to a synthetic root.
+#[derive(Debug, Clone)]
+pub struct ControlOnlyReplayState {
+    generation: u64,
+    control_identity: String,
+    input: Value,
+    finished_at: Instant,
+}
+
+/// A lineage predecessor that is admissible for FullReplay/cache control but
+/// not necessarily for semantic response-id continuation.
+#[derive(Debug, Clone)]
+pub enum LineageControlHead {
+    Semantic(Arc<ResponseSessionState>),
+    FullReplayOnly(Arc<ControlOnlyReplayState>),
+}
+
+impl LineageControlHead {
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::Semantic(state) => state.generation,
+            Self::FullReplayOnly(state) => state.generation,
+        }
+    }
+
+    pub fn input(&self) -> &Value {
+        match self {
+            Self::Semantic(state) => &state.input,
+            Self::FullReplayOnly(state) => &state.input,
+        }
+    }
+
+    /// An opaque local identity used exclusively by final-scope waterline
+    /// CAS. For semantic heads this is the upstream id; for id-less successful
+    /// FullReplay it is a local, non-routable control identity.
+    pub fn control_identity(&self) -> &str {
+        match self {
+            Self::Semantic(state) => &state.response_id,
+            Self::FullReplayOnly(state) => &state.control_identity,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn semantic_response_id(&self) -> Option<&str> {
+        match self {
+            Self::Semantic(state) => Some(&state.response_id),
+            Self::FullReplayOnly(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResponseSessionCandidate {
     pub response_id: String,
@@ -38,6 +97,15 @@ pub struct ResponseSessionCandidate {
     pub breakpoint_placement_digest: Option<String>,
     pub input: Value,
     pub output_items: Vec<Value>,
+    pub finished_at: Instant,
+}
+
+/// Candidate retained only as canonical FullReplay prefix evidence after a
+/// successful Responses result lacked a response id.
+#[derive(Debug, Clone)]
+pub struct ControlOnlyReplayCandidate {
+    pub breakpoint_placement_digest: Option<String>,
+    pub input: Value,
     pub finished_at: Instant,
 }
 
@@ -60,7 +128,7 @@ pub struct LineageLease {
     /// even while a newer sibling is publishing its terminal state.  Keep it
     /// separate from `head`: it is control-only evidence for canonical-prefix
     /// proof and cache waterlines, never a semantic continuation authority.
-    control_head: Option<Arc<ResponseSessionState>>,
+    control_head: Option<Arc<LineageControlHead>>,
     control_breakpoint_placement_digest: Option<String>,
 }
 
@@ -94,7 +162,7 @@ impl LineageLease {
     /// prove an unchanged canonical prefix.  This deliberately remains
     /// available when `head()` is hidden by the terminal publication fence so
     /// concurrent siblings do not repeatedly reset cache-control continuity.
-    pub fn control_head(&self) -> Option<&Arc<ResponseSessionState>> {
+    pub fn control_head(&self) -> Option<&Arc<LineageControlHead>> {
         self.control_head.as_ref()
     }
 
@@ -149,6 +217,12 @@ pub enum LineageCommitOutcome {
     Tombstoned {
         generation: u64,
     },
+    /// The semantic response id is intentionally absent, but the successful
+    /// FullReplay input was retained as a control-only predecessor.
+    TombstonedWithControl {
+        generation: u64,
+        control_identity: String,
+    },
     Stale {
         expected: u64,
         actual: u64,
@@ -164,9 +238,21 @@ pub enum LineageCommitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineageInvalidateOutcome {
-    Applied { generation: u64 },
-    Stale { expected: u64, actual: u64 },
-    EpochChanged { expected: u64, actual: u64 },
+    Applied {
+        generation: u64,
+    },
+    AppliedWithControl {
+        generation: u64,
+        control_identity: String,
+    },
+    Stale {
+        expected: u64,
+        actual: u64,
+    },
+    EpochChanged {
+        expected: u64,
+        actual: u64,
+    },
     ParentMismatch,
 }
 
@@ -196,6 +282,7 @@ pub(crate) struct LineageSlot {
     epoch: u64,
     generation: u64,
     head: Option<Arc<ResponseSessionState>>,
+    control_only: Option<Arc<ControlOnlyReplayState>>,
     breakpoint_placement_digest: Option<String>,
     updated_at: Instant,
 }
@@ -335,7 +422,16 @@ impl ContinuationLineageIndex {
             // into a synthetic root. The input remains a truthful predecessor
             // for canonical-prefix proof, but stays separate from `head` so it
             // cannot authorize semantic response-id recovery.
-            control_head: slot.head.clone(),
+            control_head: slot
+                .head
+                .clone()
+                .map(LineageControlHead::Semantic)
+                .or_else(|| {
+                    slot.control_only
+                        .clone()
+                        .map(LineageControlHead::FullReplayOnly)
+                })
+                .map(Arc::new),
             control_breakpoint_placement_digest: slot.breakpoint_placement_digest.clone(),
         };
         let slot_count = slots.len();
@@ -473,10 +569,14 @@ impl ContinuationLineageIndex {
         expected_response_id: Option<&str>,
     ) -> LineageInvalidateOutcome {
         let mut slots = self.slots.lock().await;
-        let outcome = apply_invalidation(&mut slots, lease, expected_response_id);
+        let outcome = apply_invalidation(&mut slots, lease, expected_response_id, None);
         let slot_count = slots.len();
         drop(slots);
-        if matches!(outcome, LineageInvalidateOutcome::Applied { .. }) {
+        if matches!(
+            outcome,
+            LineageInvalidateOutcome::Applied { .. }
+                | LineageInvalidateOutcome::AppliedWithControl { .. }
+        ) {
             self.maybe_schedule_gc(slot_count);
         }
         outcome
@@ -489,15 +589,64 @@ impl ContinuationLineageIndex {
     ) -> LineageInvalidateOutcome {
         match self.slots.try_lock() {
             Ok(mut slots) => {
-                let outcome = apply_invalidation(&mut slots, lease, expected_response_id);
+                let outcome = apply_invalidation(&mut slots, lease, expected_response_id, None);
                 let slot_count = slots.len();
                 drop(slots);
-                if matches!(outcome, LineageInvalidateOutcome::Applied { .. }) {
+                if matches!(
+                    outcome,
+                    LineageInvalidateOutcome::Applied { .. }
+                        | LineageInvalidateOutcome::AppliedWithControl { .. }
+                ) {
                     self.maybe_schedule_gc(slot_count);
                 }
                 outcome
             }
             Err(_) => self.invalidate(lease, expected_response_id).await,
+        }
+    }
+
+    /// Hides the semantic response head while retaining only the exact
+    /// successful FullReplay input for cache-control proof. This is never a
+    /// substitute for `previous_response_id` recovery.
+    pub async fn tombstone_with_control_prefix(
+        &self,
+        lease: &LineageLease,
+        expected_response_id: Option<&str>,
+        candidate: ControlOnlyReplayCandidate,
+    ) -> LineageInvalidateOutcome {
+        let mut slots = self.slots.lock().await;
+        let outcome = apply_invalidation(&mut slots, lease, expected_response_id, Some(candidate));
+        let slot_count = slots.len();
+        drop(slots);
+        if matches!(outcome, LineageInvalidateOutcome::AppliedWithControl { .. }) {
+            self.maybe_schedule_gc(slot_count);
+        }
+        outcome
+    }
+
+    /// Fast-path counterpart to `tombstone_with_control_prefix`; contention
+    /// uses the same async CAS and never creates a second state transition.
+    pub async fn tombstone_with_control_prefix_fast(
+        &self,
+        lease: &LineageLease,
+        expected_response_id: Option<&str>,
+        candidate: ControlOnlyReplayCandidate,
+    ) -> LineageInvalidateOutcome {
+        match self.slots.try_lock() {
+            Ok(mut slots) => {
+                let outcome =
+                    apply_invalidation(&mut slots, lease, expected_response_id, Some(candidate));
+                let slot_count = slots.len();
+                drop(slots);
+                if matches!(outcome, LineageInvalidateOutcome::AppliedWithControl { .. }) {
+                    self.maybe_schedule_gc(slot_count);
+                }
+                outcome
+            }
+            Err(_) => {
+                self.tombstone_with_control_prefix(lease, expected_response_id, candidate)
+                    .await
+            }
         }
     }
 
@@ -580,6 +729,7 @@ impl ContinuationLineageIndex {
                 epoch: self.allocate_epoch(),
                 generation,
                 head: Some(Arc::new(state)),
+                control_only: None,
                 breakpoint_placement_digest: None,
                 updated_at: Instant::now(),
             },
@@ -602,6 +752,7 @@ impl ContinuationLineageIndex {
             epoch: self.allocate_epoch(),
             generation,
             head,
+            control_only: None,
             breakpoint_placement_digest: None,
             updated_at: Instant::now(),
         }
@@ -609,8 +760,12 @@ impl ContinuationLineageIndex {
 
     fn maybe_schedule_gc(&self, slot_count: usize) {
         let operation = self.operations.fetch_add(1, Ordering::Relaxed) + 1;
-        if slot_count < LINEAGE_GC_MIN_SLOTS
-            || operation % LINEAGE_GC_INTERVAL != 0
+        let interval = if slot_count < LINEAGE_GC_MIN_SLOTS {
+            LINEAGE_SMALL_INDEX_GC_INTERVAL
+        } else {
+            LINEAGE_GC_INTERVAL
+        };
+        if operation % interval != 0
             || self
                 .gc_running
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -632,6 +787,11 @@ impl ContinuationLineageIndex {
             slot.head
                 .as_ref()
                 .map(|head| head.finished_at.elapsed() <= head_ttl)
+                .or_else(|| {
+                    slot.control_only
+                        .as_ref()
+                        .map(|head| head.finished_at.elapsed() <= head_ttl)
+                })
                 .unwrap_or_else(|| slot.updated_at.elapsed() <= tombstone_ttl)
         });
     }
@@ -702,6 +862,7 @@ fn apply_commit(
     });
     slot.generation = generation;
     slot.head = Some(head);
+    slot.control_only = None;
     slot.breakpoint_placement_digest = candidate.breakpoint_placement_digest;
     slot.updated_at = Instant::now();
     if let Some((parent_generation, parent_response_id)) = rebased_parent {
@@ -739,6 +900,7 @@ fn apply_invalidation(
     slots: &mut HashMap<String, LineageSlot>,
     lease: &LineageLease,
     expected_response_id: Option<&str>,
+    control_candidate: Option<ControlOnlyReplayCandidate>,
 ) -> LineageInvalidateOutcome {
     let Some(slot) = slots.get_mut(lease.key()) else {
         return LineageInvalidateOutcome::EpochChanged {
@@ -768,10 +930,34 @@ fn apply_invalidation(
     let generation = current_generation
         .checked_add(1)
         .expect("continuation lineage generation overflow");
+    let (control_only, breakpoint_placement_digest, outcome) =
+        if let Some(candidate) = control_candidate {
+            let control_identity = format!(
+                "atoapi-full-replay-control-v1:{}:{}",
+                slot.epoch, generation
+            );
+            (
+                Some(Arc::new(ControlOnlyReplayState {
+                    generation,
+                    control_identity: control_identity.clone(),
+                    input: candidate.input,
+                    finished_at: candidate.finished_at,
+                })),
+                candidate.breakpoint_placement_digest,
+                LineageInvalidateOutcome::AppliedWithControl {
+                    generation,
+                    control_identity,
+                },
+            )
+        } else {
+            (None, None, LineageInvalidateOutcome::Applied { generation })
+        };
     slot.generation = generation;
     slot.head = None;
+    slot.control_only = control_only;
+    slot.breakpoint_placement_digest = breakpoint_placement_digest;
     slot.updated_at = Instant::now();
-    LineageInvalidateOutcome::Applied { generation }
+    outcome
 }
 
 #[cfg(test)]
@@ -866,7 +1052,9 @@ mod tests {
             "a timed-out fence must force FullReplay instead of exposing the stale head"
         );
         assert_eq!(
-            lease.control_head().map(|head| head.response_id.as_str()),
+            lease
+                .control_head()
+                .and_then(|head| head.semantic_response_id()),
             Some("resp-old"),
             "the last committed input remains valid control evidence even though it cannot authorize semantic response-id recovery"
         );
@@ -1214,6 +1402,38 @@ mod tests {
         assert!(index.confirm_compaction(&old_request).await.is_none());
         assert_eq!(index.head("thread").await.unwrap().response_id, "resp-new");
         assert_ne!(old_request.epoch(), newer_compaction.lease().epoch());
+    }
+
+    #[tokio::test]
+    async fn small_index_gc_reclaims_expired_full_replay_heads_without_waiting_for_128_slots() {
+        let index = ContinuationLineageIndex::default();
+        index
+            .seed_for_test(
+                "expired",
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp-expired".to_string(),
+                    input: json!([{"type":"message","role":"user","content":"expired"}]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now()
+                        .checked_sub(LINEAGE_HEAD_TTL + Duration::from_secs(1))
+                        .expect("the test clock supports a 30 minute offset"),
+                },
+            )
+            .await;
+
+        for _ in 0..LINEAGE_SMALL_INDEX_GC_INTERVAL {
+            let _ = index.begin("active").await;
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while index.contains_head("expired").await {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a small index must schedule expiration cleanup before 128 slots exist");
     }
 
     #[tokio::test]

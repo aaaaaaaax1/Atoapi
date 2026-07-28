@@ -192,18 +192,6 @@ const bridgeSource = String.raw`
     result.querySelector("b")?.replaceChildren(document.createTextNode("尚未测试"));
     result.querySelector("small")?.replaceChildren(document.createTextNode("测试会获取模型，并仅给出直连或系统代理建议。"));
   }
-  const ensureCompactionPolicySwitch = () => {
-    const existing = $bridge('[aria-label="计入压缩"]');
-    if (existing) return existing;
-    const coldStartSwitch = $bridge('[aria-label="计入冷启动"]');
-    const coldStartRow = coldStartSwitch?.closest(".policy-row");
-    if (!coldStartRow?.parentElement) return null;
-    const row = document.createElement("div");
-    row.className = "policy-row";
-    row.innerHTML = '<div><b>计入压缩</b><small>仅影响当前统计视图；压缩后冷读单独标记</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="计入压缩"></button>';
-    coldStartRow.insertAdjacentElement("afterend", row);
-    return row.querySelector('[aria-label="计入压缩"]');
-  };
   const strategyToUi = (value) => ({ "round-robin": "轮询", priority: "优先级", "least-used": "最低使用", random: "随机", sequential: "顺序" }[value] || "顺序");
   const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "sequential");
   const selectedProviderId = () => editingProviderId || currentAgent()?.provider || "";
@@ -711,11 +699,14 @@ const bridgeSource = String.raw`
     if (labels[1]) labels[1].textContent = "累计输入";
     if (labels[2]) labels[2].textContent = "累计命中";
     if (labels[3]) labels[3].textContent = hasErrors ? "成功 / error" : "成功请求";
+    const includeSpecialRequests = metricState.includeColdStarts !== false &&
+      metricState.includeCompactions !== false;
     const successDetails = $bridge("#successMetricDetails");
     if (successDetails) {
-      const compactionSuffix = metric.compactionExclusion || "";
-      const coldStartSuffix = metric.coldStartExclusion || "";
-      successDetails.textContent = "压缩 " + (metric.compactionRequests ?? "—") + compactionSuffix + " · 冷启动 " + (metric.coldStartRequests ?? "—") + coldStartSuffix;
+      successDetails.hidden = !includeSpecialRequests;
+      successDetails.textContent = includeSpecialRequests
+        ? "压缩 " + (metric.compactionRequests ?? "—") + " · 冷启动 " + (metric.coldStartRequests ?? "—")
+        : "";
     }
     const rate = metric.cacheRate || "—";
     const overview = $bridge("#overviewPanel");
@@ -734,9 +725,7 @@ const bridgeSource = String.raw`
         stats[2].textContent = metric.cacheNewTail || "0";
       }
       setSwitch("智能缓存", metricState.cacheEnabled !== false);
-      setSwitch("计入冷启动", metricState.includeColdStarts !== false);
-      ensureCompactionPolicySwitch();
-      setSwitch("计入压缩", metricState.includeCompactions !== false);
+      setSwitch("计入冷启动和压缩", includeSpecialRequests);
       setSwitch("提示详细错误", metricState.showDetailedErrors === true);
     }
     const dock = $bridge("#cacheButton");
@@ -1063,13 +1052,9 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation();
       send("save-cache-enabled", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
     }
-    if (target.getAttribute("aria-label") === "计入冷启动") {
+    if (target.getAttribute("aria-label") === "计入冷启动和压缩") {
       event.preventDefault(); event.stopImmediatePropagation();
-      send("set-include-cold-starts", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
-    }
-    if (target.getAttribute("aria-label") === "计入压缩") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      send("set-include-compactions", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
+      send("set-include-special-requests", { enabled: target.getAttribute("aria-checked") !== "true" }); return;
     }
     if (target.getAttribute("aria-label") === "提示详细错误") {
       event.preventDefault(); event.stopImmediatePropagation();
@@ -2030,16 +2015,6 @@ function buildState(
       errors: aggregate?.errors ?? "—",
       compactionRequests: aggregate?.compactionRequests ?? "—",
       coldStartRequests: aggregate?.coldStartRequests ?? "—",
-      compactionExclusion: !includeCompactions
-        ? "（已排除）"
-        : !includeColdStarts && compaction.coldStartRequests > 0
-          ? "（部分已排除）"
-          : "",
-      coldStartExclusion: !includeColdStarts
-        ? "（已排除）"
-        : !includeCompactions && compaction.coldStartRequests > 0
-          ? "（部分已排除）"
-          : "",
       cacheShortfall: aggregate ? formatTokens(cacheShortfall) : "—",
       cacheAvoidable: aggregate ? formatTokens(cacheAvoidable) : "—",
       cacheNewTail: aggregate ? formatTokens(cacheNewTail) : "—"

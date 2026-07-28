@@ -9,6 +9,10 @@ const host = await readFile(
   new URL("../src/GraphitePrototypeHost.tsx", import.meta.url),
   "utf8"
 );
+const controlPlane = await readFile(
+  new URL("../src/useGraphiteControlPlane.ts", import.meta.url),
+  "utf8"
+);
 const api = await readFile(new URL("../src/lib/api.ts", import.meta.url), "utf8");
 const combined = `${html}\n${host}\n${api}`;
 
@@ -226,8 +230,54 @@ assert.match(
 );
 assert.match(
   host,
-  /compactionExclusion:[\s\S]{0,220}coldStartExclusion:/,
-  "combined cold-start and compaction filters must label partial overlap exclusions"
+  /function filteredMetricValue\([\s\S]{0,520}includeColdStarts[\s\S]{0,180}includeCompactions/,
+  "the metrics layer must retain exact cold-start and compaction filtering before the combined UI control applies both"
+);
+
+assert.match(
+  html,
+  /aria-label=["']计入冷启动和压缩["']/,
+  "the policy panel must expose one combined special-request inclusion switch"
+);
+assert.doesNotMatch(
+  html,
+  /aria-label=["'](?:计入冷启动|计入压缩)["']/,
+  "the old separate cold-start and compaction switches must not remain in the policy panel"
+);
+assert.doesNotMatch(
+  host,
+  /ensureCompactionPolicySwitch/,
+  "the bridge must not dynamically reinsert a second compaction switch"
+);
+assert.match(
+  host,
+  /const includeSpecialRequests = metricState\.includeColdStarts !== false &&[\s\S]{0,120}metricState\.includeCompactions !== false/,
+  "the combined switch must reflect both filter dimensions"
+);
+assert.match(
+  host,
+  /setSwitch\("计入冷启动和压缩", includeSpecialRequests\)/,
+  "the combined switch must render one coherent on/off state"
+);
+assert.match(
+  host,
+  /send\("set-include-special-requests", \{ enabled: target\.getAttribute\("aria-checked"\) !== "true" \}\)/,
+  "the policy click must toggle both filter dimensions through one bridge action"
+);
+assert.doesNotMatch(
+  host,
+  /send\("set-include-(?:cold-starts|compactions)"/,
+  "the visible policy UI must not send one-sided legacy filter actions"
+);
+assert.match(
+  controlPlane,
+  /action === "set-include-special-requests"[\s\S]{0,240}setIncludeColdStarts\(enabled\);[\s\S]{0,120}setIncludeCompactions\(enabled\);/,
+  "the control plane must update cold-start and compaction filters atomically from the one UI switch"
+);
+assert.match(
+  host,
+  /successDetails\.hidden = !includeSpecialRequests;[\s\S]{0,260}: "";/,
+  "when the combined filter is off, the success-card detail node must be hidden instead of wrapping into a second line"
 );
 
 assert.match(

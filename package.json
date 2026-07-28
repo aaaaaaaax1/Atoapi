@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.4.8",
+  "version": "1.4.9",
   "private": true,
   "type": "module",
   "scripts": {
@@ -19,6 +19,7 @@
     "test:isolated-wire-stress": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12",
     "test:isolated-wire-header-concurrency": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12 --gate-headers",
     "test:terminal-handoff": "node scripts/verify-terminal-publication-handoff.mjs",
+    "verify:idless-control-prefix": "node scripts/verify-missing-response-id-control-prefix.mjs",
     "test:release-champion": "node scripts/verify-release-champion.mjs --self-test",
     "verify:fastrelay": "node scripts/verify-fastrelay-core.mjs",
     "verify:fastrelay:release": "node scripts/verify-fastrelay-core.mjs --wire-compat --cache-replay",
