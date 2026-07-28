@@ -16,7 +16,6 @@ pub(super) struct CacheControlCore;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CacheContextMode {
     FullReplay,
-    VerifiedNativeDelta,
     ExternalContinuation,
 }
 
@@ -24,7 +23,6 @@ impl CacheContextMode {
     const fn label(self) -> &'static str {
         match self {
             Self::FullReplay => "full_replay",
-            Self::VerifiedNativeDelta => "verified_native_delta",
             Self::ExternalContinuation => "external_continuation",
         }
     }
@@ -439,15 +437,15 @@ mod tests {
             lineage_epoch: Some(1),
         })
         .seal(&envelope);
-        let delta = CacheControlCore::plan(CacheControlPlanInput {
+        let external_continuation = CacheControlCore::plan(CacheControlPlanInput {
             action_scope: Some(&action_scope()),
             active_channel: &Channel::Responses,
-            context_mode: CacheContextMode::VerifiedNativeDelta,
+            context_mode: CacheContextMode::ExternalContinuation,
             lineage_epoch: Some(1),
         })
         .seal(&envelope);
 
-        assert_eq!(full_replay.wire, delta.wire);
-        assert_ne!(full_replay.semantic, delta.semantic);
+        assert_eq!(full_replay.wire, external_continuation.wire);
+        assert_ne!(full_replay.semantic, external_continuation.semantic);
     }
 }

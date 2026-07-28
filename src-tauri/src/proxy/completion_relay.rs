@@ -421,7 +421,6 @@ pub(super) async fn stream_upstream(
     provider_prefix_family_key: Option<String>,
     route_affinity_key: Option<String>,
     config: AppConfig,
-    session_reuse_capability: Option<ProviderResponseSessionReuseCapability>,
     _prefix_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     prefix_state_key: Option<String>,
     response_session_key: Option<String>,
@@ -611,7 +610,6 @@ pub(super) async fn stream_upstream(
         let mut first_chunk_at: Option<u64> = None;
         let mut first_model_output_at: Option<u64> = None;
         let mut cache_capture = BoundedCacheCapture::new(eligible);
-        let mut session_error_body = Vec::new();
         let mut stream_state = ResponsesStreamState::default();
         let use_generic_responses_error_gate = matches!(client_channel, Channel::Responses)
             && matches!(decision.upstream_channel, Channel::Responses)
@@ -796,11 +794,6 @@ pub(super) async fn stream_upstream(
                     terminal_accepted_by_relay = true;
                 }
                 cache_capture.push(&relay_chunk);
-                if used_response_session && session_error_body.len() < 65_536 {
-                    let remaining = 65_536usize.saturating_sub(session_error_body.len());
-                    session_error_body
-                        .extend_from_slice(&state_chunk[..state_chunk.len().min(remaining)]);
-                }
             }
         }
         let cache_body = cache_capture.finish();
@@ -1037,60 +1030,6 @@ pub(super) async fn stream_upstream(
                 .await;
             }
         }
-        if used_response_session
-            && supports_main_response_session_delta(
-                &config,
-                &decision,
-                session_reuse_capability.as_ref(),
-            )
-            && stream_metadata.error_event_seen
-        {
-            let error_summary = upstream_error_summary_redacting(
-                &session_error_body,
-                client_prompt_cache_key_for_redaction.as_deref(),
-            );
-            let rejection = response_session_rejection_classification(status, &error_summary);
-            if !error_summary.is_empty() {
-                stream_metric_errors.push((
-                    "verified_response_session_delta_rejected".to_string(),
-                    error_summary.clone(),
-                ));
-            }
-            let cooldown_key =
-                response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
-            note_response_session_error_cooldown_for_rejection(
-                &state_for_stream,
-                cooldown_key.as_deref(),
-                status,
-                &error_summary,
-            )
-            .await;
-            if matches!(
-                rejection,
-                ResponseSessionRejectionClass::StaleReference
-                    | ResponseSessionRejectionClass::Unsupported
-            ) {
-                clear_response_session_reference(
-                    &state_for_stream,
-                    response_session_lease.as_ref(),
-                    response_session_lease
-                        .as_ref()
-                        .and_then(LineageLease::head)
-                        .map(|head| head.response_id.as_str()),
-                )
-                .await;
-            }
-            if rejection == ResponseSessionRejectionClass::Unsupported {
-                invalidate_verified_response_session_reuse(
-                    &state_for_stream,
-                    &decision.provider.id,
-                    &decision.model,
-                    session_reuse_capability.as_ref(),
-                    &error_summary,
-                )
-                .await;
-            }
-        }
         let terminal_error_scope = match terminal_verdict.failure {
             Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof) => {
                 Some("upstream_sse_error")
@@ -1158,6 +1097,8 @@ pub(super) async fn stream_upstream(
             used_response_session,
             retried_full_response,
             prefix_guard_wait.budget_exhausted,
+            prefix_guard_wait.pre_request_avoidable_tokens,
+            prefix_guard_wait.recovery_applicable,
             prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
             prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
             prefix_guard_wait.settled_exact_state_finished_at,
@@ -1200,7 +1141,6 @@ pub(super) async fn stream_upstream(
                 &decision.provider.id,
             )
             .await;
-            clear_prefix_error_cooldown(&state_for_stream, prefix_state_key.as_deref()).await;
         }
         let ttft_ms = first_model_output_at.or(first_chunk_at).unwrap_or(total_ms);
         let upstream_first_chunk_ms = first_chunk_at

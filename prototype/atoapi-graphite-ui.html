@@ -4763,6 +4763,9 @@
     .key-drag-handle {
       align-self: center;
       cursor: grab;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
     }
 
     .key-drag-handle:active {
@@ -6624,7 +6627,6 @@
             <button class="editor-tab" type="button" role="tab" aria-selected="false" data-panel="providerModels">模型映射</button>
             <button class="editor-tab" type="button" role="tab" aria-selected="false" data-panel="providerKeys">多 Key</button>
             <button class="editor-tab" type="button" role="tab" aria-selected="false" data-panel="providerTransport">传输与缓存</button>
-            <button class="editor-tab" type="button" role="tab" aria-selected="false" data-panel="providerCompatibility">兼容性</button>
           </nav>
 
           <div class="editor-panel">
@@ -6663,7 +6665,7 @@
                 <div class="form-section-head"><div><h3>多 Key 池</h3><p>开启后只使用此页 Key，并按负载均衡策略转发。</p></div><button class="switch" id="providerKeyPoolEnabled" type="button" role="switch" aria-checked="false" aria-label="启用多 Key 池"></button></div>
                 <div class="key-pool-actions"><button class="secondary-button" type="button" data-mock-action="全部 Key 测试通过"><i class="icon" data-lucide="flask-conical"></i>全部测试</button><button class="secondary-button" id="addKeyButton" type="button"><i class="icon" data-lucide="plus"></i>添加 Key</button></div>
                 <div class="form-grid">
-                  <label class="field"><span>负载均衡</span><select><option selected>轮询</option><option>优先级</option><option>最低使用</option><option>顺序</option></select></label>
+                  <label class="field"><span>负载均衡</span><select><option>轮询</option><option>优先级</option><option>最低使用</option><option selected>顺序</option></select></label>
                   <label class="field"><span>失败阈值</span><input value="3" inputmode="numeric" autocomplete="off" /></label>
                 </div>
                 <div class="bulk-key-add"><label class="field wide"><span>批量添加 Key</span><span class="bulk-key-input"><textarea id="bulkKeyInput" autocomplete="off" spellcheck="false" aria-label="批量添加 Key"></textarea><button class="secondary-button" id="bulkAddKeysButton" type="button"><i class="icon" data-lucide="plus"></i>添加</button></span><small>逗号、分号、空格、回车或换行均可分隔；Shift+Enter 保留换行。</small></label></div>
@@ -6681,23 +6683,6 @@
               </div>
             </section>
 
-            <section class="panel" id="providerCompatibility" hidden>
-              <div class="form-section">
-                <div class="form-section-head"><div><h3>Responses 会话复用</h3><p>验证通过后才可启用增量请求。</p></div></div>
-                <div class="compatibility-model-control">
-                  <div class="field wide compatibility-model-field">
-                    <label for="providerSessionReuseModelInput">实际模型 ID</label>
-                    <span class="compatibility-model-input-row">
-                      <input id="providerSessionReuseModelInput" list="providerModelCandidates" placeholder="选择已获取模型或直接输入，例如 gpt-5.6-sol" autocomplete="off" spellcheck="false" />
-                      <button class="secondary-button" id="fetchCompatibilityModelsButton" type="button" data-mock-action="已模拟获取模型"><i class="icon" data-lucide="refresh-cw"></i>获取模型</button>
-                    </span>
-                    <small class="compatibility-model-hint">使用实际上游模型进行资格验证；不要求先添加模型映射。</small>
-                  </div>
-                </div>
-                <div class="status-band"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>尚未验证</b><small>选择或输入实际模型后再验证</small></div><button class="secondary-button" id="probeSessionReuseButton" type="button" data-mock-action="模拟验证完成：当前上游不支持">重新验证</button></div>
-                <div class="option-row"><div><b>启用会话复用</b><small>当前由能力验证门控</small></div><button class="switch" type="button" role="switch" aria-checked="false" aria-label="启用会话复用" disabled></button></div>
-              </div>
-            </section>
           </div>
         </div>
       </form>
@@ -6753,7 +6738,7 @@
     ];
 
     let keyPool = [
-      { id: "key-primary", name: "主 Key", secret: "sk-demo-yunzhou-8J2A", enabled: true, priority: 10, status: "正常" },
+      { id: "key-primary", name: "主 Key", secret: "sk-demo-yunzhou-8J2A", enabled: true, priority: 5, status: "正常" },
       { id: "key-backup", name: "备用 Key", secret: "sk-demo-yunzhou-Q9LM", enabled: true, priority: 5, status: "正常" }
     ];
 
@@ -7646,7 +7631,7 @@
           name: `Key ${keyPool.length + 1}`,
           secret,
           enabled: true,
-          priority: 0,
+          priority: 5,
           status: "未测试"
         });
       });
@@ -7832,7 +7817,7 @@
 
     $("#addKeyButton").addEventListener("click", () => {
       const id = `key-${Date.now()}`;
-      keyPool.push({ id, name: "新 Key", secret: "sk-demo-new-key", enabled: true, priority: 0, status: "未测试" });
+      keyPool.push({ id, name: "新 Key", secret: "sk-demo-new-key", enabled: true, priority: 5, status: "未测试" });
       renderKeyPool();
       hydrateIcons();
       showToast("已添加新的模拟 Key");

@@ -177,15 +177,25 @@ assert.doesNotMatch(
   "the Graphite trend UI must not poll get_metrics every second"
 );
 
-assert.match(
+assert.doesNotMatch(
   html,
-  /id=["']providerSessionReuseModelInput["'][^>]*list=["']providerModelCandidates["']/,
-  "the session-reuse model selector must remain present after adding the trend card"
+  /providerCompatibility|providerSessionReuseModelInput|probeSessionReuseButton/,
+  "the retired session-reuse qualification panel must not remain in the provider editor"
+);
+assert.doesNotMatch(
+  host,
+  /probe-session-reuse|set-session-reuse|compatibilityModelId/,
+  "the Graphite bridge must not retain automatic or manual session-reuse qualification actions"
 );
 assert.match(
   host,
-  /#providerSessionReuseModelInput/,
-  "the Graphite bridge must retain providerSessionReuseModelInput behavior"
+  /const transport = \$bridge\("#providerTransport"\)/,
+  "cache validation must target the transport-and-cache panel after removing session reuse"
+);
+assert.match(
+  host,
+  /transport\.append\(section\)/,
+  "cache validation must remain available after removing session reuse"
 );
 
 assert.match(
@@ -249,6 +259,16 @@ assert.match(
   html,
   /命中率（右轴）/,
   "the dashed hit-rate series must explicitly identify its right-side percentage axis"
+);
+assert.match(
+  host,
+  /const cacheTailDetail = "新 " \+ requestTokens\(request\.cacheNewTailGapTokens\)[\s\S]{0,220}Number\(request\.cacheAvoidableGapTokens \|\| 0\) > 0/,
+  "the request hit cell must always show the new tail and conditionally include a nonzero avoidable gap"
+);
+assert.doesNotMatch(
+  host,
+  /cacheGapBucket|· 桶 /,
+  "the request hit cell must not crowd the compact view with shortfall or bucket diagnostics"
 );
 const trendControllerSource = html.slice(
   html.indexOf("function createCacheTrendController()"),

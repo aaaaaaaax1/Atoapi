@@ -45,7 +45,6 @@ const checks = [
   ["secret-field UI regression", npm, ["run", "test:secret-field-ui"]],
   ["key-pool UI regression", npm, ["run", "test:key-pool-ui"]],
   ["provider connection-path UI regression", npm, ["run", "test:provider-connection-path-ui"]],
-  ["session reuse UI regression", npm, ["run", "test:session-reuse-ui"]],
   ["owned-dispatch acceptance", npm, ["run", "test:acceptance"]],
   ["diff whitespace", "git", ["diff", "--check"]]
 ];
@@ -54,7 +53,7 @@ if (includeWireCompat) {
   checks.splice(
     -1,
     0,
-    ["isolated v1.3.4 wire compatibility", npm, ["run", "test:isolated-wire-compat"]],
+    ["isolated retained-baseline wire compatibility", npm, ["run", "test:isolated-wire-compat"]],
     ["isolated same-prefix dispatch stress", npm, ["run", "test:isolated-wire-stress"]],
     ["isolated same-prefix header-gate concurrency", npm, ["run", "test:isolated-wire-header-concurrency"]]
   );

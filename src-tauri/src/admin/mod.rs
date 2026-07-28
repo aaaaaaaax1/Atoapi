@@ -18,7 +18,7 @@ use crate::{
     config::{
         normalize_upstream_proxy_url, AgentInjectionConfig, AppConfig, CacheConfig, Channel,
         ModelConfig, ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
-        ProviderInput, ProviderResponseSessionReuseProbeResult, PublicConfig,
+        ProviderInput, PublicConfig,
     },
     metrics::MetricsSnapshot,
     metrics_history::{MetricsTrendQueryInput, MetricsTrendSnapshot},
@@ -146,12 +146,6 @@ struct ProviderNetworkPathAttempt {
     result: ProviderNetworkPathResult,
     has_valid_model_list: bool,
     models_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderResponseSessionReuseProbeInput {
-    pub provider_id: String,
-    pub model_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -405,20 +399,6 @@ fn clone_provider_for_agent_config(
                 channel_mode.updated_at = now;
                 config.provider_channel_modes.push(channel_mode);
             }
-            let response_session_reuse = config
-                .provider_response_session_reuse
-                .iter()
-                .filter(|item| item.provider_id == source_provider.id)
-                .cloned()
-                .map(|mut item| {
-                    item.provider_id = cloned_id.clone();
-                    item.updated_at = now;
-                    item
-                })
-                .collect::<Vec<_>>();
-            config
-                .provider_response_session_reuse
-                .extend(response_session_reuse);
             let cache_capabilities = config
                 .provider_cache_capabilities
                 .iter()
@@ -811,20 +791,6 @@ fn bound_provider_ids_for_agent(config: &AppConfig, agent_id: &str) -> Vec<Strin
 }
 
 #[tauri::command]
-pub async fn probe_provider_response_session_reuse(
-    state: State<'_, Arc<AppState>>,
-    input: ProviderResponseSessionReuseProbeInput,
-) -> CommandResult<ProviderResponseSessionReuseProbeResult> {
-    proxy::probe_and_record_provider_response_session_reuse(
-        &state,
-        input.provider_id.trim(),
-        input.model_id.trim(),
-    )
-    .await
-    .map_err(to_command_error)
-}
-
-#[tauri::command]
 pub async fn probe_provider_cache_capabilities(
     state: State<'_, Arc<AppState>>,
     input: ProviderCacheCapabilityProbeInput,
@@ -837,29 +803,6 @@ pub async fn probe_provider_cache_capabilities(
     )
     .await
     .map_err(to_command_error)
-}
-
-#[tauri::command]
-pub async fn set_provider_response_session_reuse_enabled(
-    state: State<'_, Arc<AppState>>,
-    provider_id: String,
-    model_id: String,
-    enabled: bool,
-) -> CommandResult<PublicConfig> {
-    let version = {
-        let mut config = state.config.write().await;
-        config
-            .set_response_session_reuse_enabled(provider_id.trim(), model_id.trim(), enabled)
-            .map_err(to_command_error)?;
-        state
-            .publish_config_snapshot(&config)
-            .map_err(to_command_error)?
-    };
-    state
-        .wait_for_config_snapshot(version)
-        .await
-        .map_err(to_command_error)?;
-    Ok(state.public_config().await)
 }
 
 #[tauri::command]
@@ -1003,9 +946,6 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
         .provider_channel_modes
         .retain(|item| item.provider_id != provider_id);
     config
-        .provider_response_session_reuse
-        .retain(|item| item.provider_id != provider_id);
-    config
         .provider_cache_capabilities
         .retain(|item| item.provider_id != provider_id);
     for agent in &mut config.agent_injections {
@@ -1040,32 +980,102 @@ pub async fn test_provider_key(
         Ok(result) => result,
         Err(err) => failed_provider_key_test(&input, err),
     };
-    if let Some(provider_id) = input.provider_id.as_deref() {
-        if let Some(key_id) = input.key_id.as_deref() {
-            let version = {
-                let mut config = state.config.write().await;
-                match &result {
-                    result if result.ok => {
-                        config.mark_provider_key_success(provider_id, Some(key_id))
-                    }
-                    result => config.mark_provider_key_failure(
-                        provider_id,
-                        Some(key_id),
-                        &result.message,
-                        true,
-                    ),
-                }
-                state
-                    .publish_config_snapshot(&config)
-                    .map_err(to_command_error)?
-            };
-            state
-                .wait_for_config_snapshot(version)
-                .await
-                .map_err(to_command_error)?;
-        }
-    }
+    persist_provider_key_test_result(state.inner(), &input, &result)
+        .await
+        .map_err(to_command_error)?;
     Ok(result)
+}
+
+/// Tests the exact Key that the next ordinary inbound for this provider would
+/// use. An enabled key pool is authoritative: this command never falls back
+/// to the legacy connection-info Key when the pool has no usable Key.
+#[tauri::command]
+pub async fn test_active_provider_key(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<ProviderKeyTestResult> {
+    let input = active_provider_key_test_input(state.inner(), provider_id.trim())
+        .await
+        .map_err(to_command_error)?;
+    let result = match test_provider_key_inner(state.inner(), &input).await {
+        Ok(result) => result,
+        Err(err) => failed_provider_key_test(&input, err),
+    };
+    persist_provider_key_test_result(state.inner(), &input, &result)
+        .await
+        .map_err(to_command_error)?;
+    Ok(result)
+}
+
+async fn persist_provider_key_test_result(
+    state: &AppState,
+    input: &ProviderKeyTestInput,
+    result: &ProviderKeyTestResult,
+) -> Result<()> {
+    let (Some(provider_id), Some(key_id)) = (input.provider_id.as_deref(), input.key_id.as_deref())
+    else {
+        return Ok(());
+    };
+    let version = {
+        let mut config = state.config.write().await;
+        if result.ok {
+            config.mark_provider_key_success(provider_id, Some(key_id));
+        } else {
+            config.mark_provider_key_failure(provider_id, Some(key_id), &result.message, true);
+        }
+        state.publish_config_snapshot(&config)?
+    };
+    state.wait_for_config_snapshot(version).await?;
+    Ok(())
+}
+
+async fn active_provider_key_test_input(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<ProviderKeyTestInput> {
+    let (input, version) = {
+        let mut config = state.config.write().await;
+        let input = active_provider_key_test_input_from_config(&mut config, provider_id)?;
+        let version = state.publish_config_snapshot(&config)?;
+        (input, version)
+    };
+    state.wait_for_config_snapshot(version).await?;
+    Ok(input)
+}
+
+fn active_provider_key_test_input_from_config(
+    config: &mut AppConfig,
+    provider_id: &str,
+) -> Result<ProviderKeyTestInput> {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(anyhow!("provider id is required"));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    let selected = config
+        .select_provider_key_for_request(provider_id, None, None)?
+        .ok_or_else(|| anyhow!("provider API key is not configured"))?;
+    Ok(ProviderKeyTestInput {
+        provider_id: Some(provider_id.to_string()),
+        key_id: selected.key_id,
+        // Pass the freshly selected secret directly, so the test cannot
+        // resolve a stale connection-info Key after the pool has advanced.
+        api_key: Some(selected.secret),
+        base_url: provider.base_url,
+        models_url: provider.models_url,
+        is_full_url: provider.is_full_url,
+        custom_user_agent: provider.custom_user_agent,
+        channel: provider.channel,
+        use_system_proxy: provider.use_system_proxy,
+    })
 }
 
 /// Tests the editable connection over both direct and system-proxy paths.
@@ -1815,7 +1825,6 @@ pub async fn delete_model(
             provider.models.retain(|model| model.id != model_id);
             provider.updated_at = Utc::now();
         }
-        config.clear_response_session_reuse_for_model(&provider_id, &model_id);
         config.clear_cache_capabilities_for_model(&provider_id, &model_id);
         for agent in config
             .agent_injections
@@ -2676,6 +2685,81 @@ mod tests {
     }
 
     #[test]
+    fn active_provider_test_uses_the_next_eligible_pool_key_and_never_the_connection_key() {
+        use crate::config::{
+            KeyLoadBalanceStrategy, ProviderKeyInput, ProviderKeyPoolInput, ProviderKeyStatus,
+        };
+
+        let provider_id = "active-pool-key-test";
+        let mut config = AppConfig::default();
+        let mut provider = test_provider(provider_id);
+        provider.api_key_encrypted = Some("legacy-connection-key".to_string());
+        config.providers.push(provider);
+        config
+            .upsert_provider_key_pool(
+                provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 1,
+                    recovery_minutes: 30,
+                    keys: vec![
+                        ProviderKeyInput {
+                            id: Some("disabled-old-key".to_string()),
+                            alias: None,
+                            key: Some("disabled-secret".to_string()),
+                            enabled: false,
+                            priority: 5,
+                            status: ProviderKeyStatus::Unhealthy,
+                            total_requests: 0,
+                            successes: 0,
+                            failures: 1,
+                            last_checked_at: Some(Utc::now()),
+                            last_error: Some("quota exhausted".to_string()),
+                            disabled_until: None,
+                        },
+                        ProviderKeyInput {
+                            id: Some("current-key".to_string()),
+                            alias: None,
+                            key: Some("current-secret".to_string()),
+                            enabled: true,
+                            priority: 5,
+                            status: ProviderKeyStatus::Healthy,
+                            total_requests: 0,
+                            successes: 0,
+                            failures: 0,
+                            last_checked_at: Some(Utc::now()),
+                            last_error: None,
+                            disabled_until: None,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        let input = active_provider_key_test_input_from_config(&mut config, provider_id).unwrap();
+        assert_eq!(input.key_id.as_deref(), Some("current-key"));
+        assert_eq!(input.api_key.as_deref(), Some("current-secret"));
+        assert_ne!(input.api_key.as_deref(), Some("legacy-connection-key"));
+
+        let pool = config
+            .provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id)
+            .unwrap();
+        pool.keys
+            .iter_mut()
+            .find(|key| key.id == "current-key")
+            .unwrap()
+            .disabled_until = Some(Utc::now() + chrono::Duration::minutes(30));
+        let error = active_provider_key_test_input_from_config(&mut config, provider_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key pool has no enabled usable key"));
+        assert!(!error.contains("legacy-connection-key"));
+    }
+
+    #[test]
     fn codex_ui_patch_failure_becomes_a_non_blocking_notice() {
         let notice = codex_ui_patch_notice(true, Err(anyhow!("node unavailable")));
 
@@ -3208,7 +3292,6 @@ mod tests {
         assert!(config.provider_key_pools.is_empty());
         assert!(config.provider_compact_modes.is_empty());
         assert!(config.provider_channel_modes.is_empty());
-        assert!(config.provider_response_session_reuse.is_empty());
         assert!(config.provider_cache_capabilities.is_empty());
         assert!(config.agent_provider_orders.is_empty());
     }

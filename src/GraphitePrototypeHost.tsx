@@ -139,7 +139,7 @@ const bridgeSource = String.raw`
     syncKeyPoolSecretInputs();
   };
   const pendingActions = new Map();
-  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-session-reuse", "set-session-reuse", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
+  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
     const requestId = "graphite-" + Date.now() + "-" + Math.random().toString(16).slice(2);
     const source = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
@@ -181,16 +181,18 @@ const bridgeSource = String.raw`
     coldStartRow.insertAdjacentElement("afterend", row);
     return row.querySelector('[aria-label="计入压缩"]');
   };
-  const strategyToUi = (value) => ({ "round-robin": "轮询", priority: "优先级", "least-used": "最低使用", random: "随机", sequential: "顺序" }[value] || "轮询");
-  const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "round-robin");
+  const strategyToUi = (value) => ({ "round-robin": "轮询", priority: "优先级", "least-used": "最低使用", random: "随机", sequential: "顺序" }[value] || "顺序");
+  const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "sequential");
   const selectedProviderId = () => editingProviderId || currentAgent()?.provider || "";
   const REQUESTS_PER_PAGE = 20;
   const REQUEST_PAGE_LIMIT = 10;
+  const DEFAULT_KEY_PRIORITY = 5;
   let fetchedModelIds = [];
   let requestScopeId = "";
   let requestPage = 1;
   let lastTrendContextKey = "";
   let draggingProviderId = "";
+  let keyPointerDrag = null;
 
   const trendController = () => window.__atoapiTrend;
 
@@ -307,8 +309,6 @@ const bridgeSource = String.raw`
       reasoning: model.reasoning_effort_override_enabled ? (model.reasoning_effort || "") : "",
       supportedReasoningEfforts: model.supported_reasoning_efforts || []
     })));
-    const compatibilityModel = $bridge("#providerSessionReuseModelInput");
-    if (compatibilityModel) compatibilityModel.value = preferredCompatibilityModelId(detail);
     replace(keyPool, (detail?.keys || []).map((item, index) => ({
       id: item.id || "key-" + index,
       name: item.alias || "Key " + (index + 1),
@@ -334,13 +334,13 @@ const bridgeSource = String.raw`
       }
       keyStrategy.value = strategyLabel;
     }
+    normalizeKeyPriorities();
     if (failureThreshold) failureThreshold.value = String(detail?.key_pool?.failure_threshold ?? 3);
     setSwitch("使用系统代理", detail?.use_system_proxy ?? true);
     setSwitch("prompt cache retention", detail?.prompt_cache_retention_enabled ?? true);
     setSwitch("大请求体 gzip", detail?.request_body_gzip_enabled ?? true);
     setSwitch("非 SSE compact 兼容", detail?.non_sse_compact_compat_enabled || false);
     setKeyPoolEnabled(detail?.key_pool?.enabled === true);
-    applyCompatibility(detail);
     applyCacheValidation(detail);
     applyNetworkDiagnostic(detail?.network_diagnostic);
     renderModelCandidates();
@@ -350,8 +350,12 @@ const bridgeSource = String.raw`
   }
 
   function normalizeKeyPriorities() {
-    keyPool.forEach((key, index) => {
-      key.priority = keyPool.length - index;
+    const strategy = strategyFromUi($bridge("#providerKeys .form-grid select")?.value || "顺序");
+    keyPool.forEach((key) => {
+      const priority = Number(key.priority);
+      if (strategy === "sequential" || !Number.isFinite(priority) || priority < 0) {
+        key.priority = DEFAULT_KEY_PRIORITY;
+      }
     });
   }
 
@@ -397,7 +401,7 @@ const bridgeSource = String.raw`
       name: "新 Key " + (keyPool.length + 1),
       secret: "",
       enabled: true,
-      priority: 0,
+      priority: DEFAULT_KEY_PRIORITY,
       status: "待填写",
       isNew: true
     });
@@ -428,7 +432,7 @@ const bridgeSource = String.raw`
         name: "Key " + (keyPool.length + 1),
         secret,
         enabled: true,
-        priority: 0,
+        priority: DEFAULT_KEY_PRIORITY,
         status: "未测试",
         isNew: true
       });
@@ -507,21 +511,21 @@ const bridgeSource = String.raw`
         reasoning_effort: reasoning || null
       };
     }).filter((mapping) => mapping.id);
-    const strategy = strategyFromUi($bridge("#providerKeys .form-grid select")?.value || "轮询");
+    const strategy = strategyFromUi($bridge("#providerKeys .form-grid select")?.value || "顺序");
     const failureThreshold = Number($bridge("#providerKeys .form-grid input")?.value) || 3;
     const orderedKeys = keyPool.filter((key) => !key.isNew || String(key.secret || "").trim());
-    const keys = orderedKeys.map((key, index) => {
+    const keys = orderedKeys.map((key) => {
       const priority = Number(key.priority);
       return {
         id: key.id,
         alias: key.name,
         key: key.secret || undefined,
         enabled: key.enabled !== false,
-        // Keep the draft array order for sequential/round-robin strategies and
-        // use a stable rank only when a manually entered priority is invalid.
+        // List order is authoritative for the default sequential strategy.
+        // Preserve a manually chosen priority without rewriting it on reorder.
         priority: Number.isFinite(priority) && priority >= 0
           ? Math.trunc(priority)
-          : orderedKeys.length - index
+          : DEFAULT_KEY_PRIORITY
       };
     });
     return {
@@ -549,47 +553,16 @@ const bridgeSource = String.raw`
     };
   }
 
-  function compatibilityModelId() {
-    return $bridge("#providerSessionReuseModelInput")?.value.trim() || "";
-  }
-
-  function preferredCompatibilityModelId(detail) {
-    const records = detail?.response_session_reuse_models || [];
-    return records.find((item) => item.enabled)?.model_id
-      || records[0]?.model_id
-      || mappings[0]?.actual
-      || detail?.models?.[0]?.id
-      || "";
-  }
-
-  function applyCompatibility(detail) {
-    const modelId = compatibilityModelId();
-    const reuse = (detail?.response_session_reuse_models || []).find((item) => item.model_id === modelId) || null;
-    const band = $bridge("#providerCompatibility .status-band");
-    const enableSwitch = $bridge('[aria-label="启用会话复用"]');
-    if (!band) return;
-    const title = reuse?.status === "verified" ? "已验证" : reuse?.status === "error" ? "验证失败" : reuse?.status === "unsupported" ? "上游不支持" : "尚未验证";
-    const detailText = !modelId
-      ? "选择或输入实际模型后再验证"
-      : reuse?.last_error || (reuse?.status === "verified" ? modelId + " · 已验证后才允许增量请求" : modelId + " · 点击重新验证，不会影响正常转发");
-    band.querySelector("b").textContent = title;
-    band.querySelector("small").textContent = detailText;
-    if (enableSwitch) {
-      enableSwitch.disabled = reuse?.status !== "verified";
-      enableSwitch.setAttribute("aria-checked", String(Boolean(reuse?.enabled)));
-    }
-  }
-
   function cacheValidationModelId() {
     const input = $bridge("#providerCacheValidationModelInput");
-    return String(input?.value || compatibilityModelId() || "").trim();
+    return String(input?.value || mappings[0]?.actual || "").trim();
   }
 
   function ensureCacheValidationPanel() {
     const existing = $bridge("#providerCacheValidationSection");
     if (existing) return existing;
-    const compatibility = $bridge("#providerCompatibility");
-    if (!compatibility) return null;
+    const transport = $bridge("#providerTransport");
+    if (!transport) return null;
     const section = document.createElement("div");
     section.className = "form-section";
     section.id = "providerCacheValidationSection";
@@ -597,7 +570,7 @@ const bridgeSource = String.raw`
       + '<div class="compatibility-model-control"><div class="field wide compatibility-model-field"><label for="providerCacheValidationModelInput">实际模型 ID</label><span class="compatibility-model-input-row"><input id="providerCacheValidationModelInput" list="providerModelCandidates" placeholder="选择已获取模型或直接输入" autocomplete="off" spellcheck="false" /><button class="secondary-button" id="fetchCacheValidationModelsButton" type="button"><i class="icon" data-lucide="refresh-cw"></i>获取模型</button></span><small>先探测字段支持，再依次运行基线与候选；候选每次只验证一个字段。</small></div></div>'
       + '<div class="status-band" id="providerCacheValidationStatus"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>尚未验证</b><small>选择实际模型后手动探测缓存字段。</small></div><button class="secondary-button" id="probeCacheCapabilitiesButton" type="button"><i class="icon" data-lucide="scan-search"></i>探测字段</button></div>'
       + '<div class="key-pool-actions"><button class="secondary-button" id="startCacheBaselineButton" type="button">基线</button><button class="secondary-button" id="startCacheCandidateButton" type="button">候选</button><button class="secondary-button" id="stopCacheValidationButton" type="button">停止</button></div>';
-    compatibility.append(section);
+    transport.append(section);
     return section;
   }
 
@@ -605,7 +578,7 @@ const bridgeSource = String.raw`
     const section = ensureCacheValidationPanel();
     if (!section) return;
     const modelInput = $bridge("#providerCacheValidationModelInput", section);
-    if (modelInput && !modelInput.value) modelInput.value = preferredCompatibilityModelId(detail);
+    if (modelInput && !modelInput.value) modelInput.value = mappings[0]?.actual || detail?.models?.[0]?.id || "";
     const modelId = cacheValidationModelId();
     const validation = host.state?.cacheValidation || {};
     const providerId = selectedProviderId();
@@ -904,7 +877,6 @@ const bridgeSource = String.raw`
         }
       }
       if (message.payload?.keyPoolHealth) mergeKeyPoolHealth(message.payload.keyPoolHealth);
-      if (message.payload?.compatibility) applyCompatibility(message.payload.compatibility);
       if (message.payload?.networkDiagnostic) applyNetworkDiagnostic(message.payload.networkDiagnostic);
       if (message.payload?.connectionTest) applyConnectionPathTest(message.payload.connectionTest);
       if (message.payload?.metricsTrend) {
@@ -923,6 +895,57 @@ const bridgeSource = String.raw`
     event.preventDefault();
     event.stopImmediatePropagation();
     addBulkKeysFromBridge();
+  }, true);
+
+  function clearKeyPointerDrag() {
+    keyPointerDrag = null;
+    document.querySelectorAll(".key-editor-row.dragging, .key-editor-row.drop-target").forEach((row) => {
+      row.classList.remove("dragging", "drop-target");
+    });
+  }
+
+  document.addEventListener("pointerdown", (event) => {
+    const handle = event.target instanceof Element ? event.target.closest("[data-key-drag]") : null;
+    const keyId = handle?.getAttribute("data-key-drag") || "";
+    if (!keyId || event.button !== 0) return;
+    keyPointerDrag = { pointerId: event.pointerId, keyId };
+    handle.closest(".key-editor-row")?.classList.add("dragging");
+    try { handle.setPointerCapture?.(event.pointerId); } catch (_) {}
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("pointermove", (event) => {
+    if (!keyPointerDrag || event.pointerId !== keyPointerDrag.pointerId) return;
+    const node = document.elementFromPoint(event.clientX, event.clientY);
+    const row = node instanceof Element ? node.closest(".key-editor-row[data-key-id]") : null;
+    const targetId = row?.getAttribute("data-key-id") || "";
+    document.querySelectorAll(".key-editor-row.drop-target").forEach((item) => item.classList.remove("drop-target"));
+    if (targetId && targetId !== keyPointerDrag.keyId) row?.classList.add("drop-target");
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("pointerup", (event) => {
+    if (!keyPointerDrag || event.pointerId !== keyPointerDrag.pointerId) return;
+    const draggedId = keyPointerDrag.keyId;
+    const node = document.elementFromPoint(event.clientX, event.clientY);
+    const row = node instanceof Element ? node.closest(".key-editor-row[data-key-id]") : null;
+    const targetId = row?.getAttribute("data-key-id") || "";
+    clearKeyPointerDrag();
+    if (!targetId || targetId === draggedId) return;
+    event.preventDefault();
+    reorderKeyFromBridge(draggedId, targetId);
+    showToast("Key 顺序已调整，保存上游后生效");
+  }, true);
+
+  document.addEventListener("pointercancel", clearKeyPointerDrag, true);
+
+  // The browser's HTML drag path is unreliable in the embedded WebView and
+  // can otherwise emit a second drop after the pointer reorder has completed.
+  document.addEventListener("dragstart", (event) => {
+    const handle = event.target instanceof Element ? event.target.closest("[data-key-drag]") : null;
+    if (!handle || !keyPointerDrag) return;
+    event.preventDefault();
+    event.stopPropagation();
   }, true);
 
   document.addEventListener("dragstart", (event) => {
@@ -1040,13 +1063,6 @@ const bridgeSource = String.raw`
     if (target.id === "saveProviderButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("save-provider", serializeEditor()); return;
     }
-    if (target.id === "fetchCompatibilityModelsButton") {
-      event.preventDefault(); event.stopImmediatePropagation(); send("fetch-models", { provider: serializeEditor() }); return;
-    }
-    if (target.id === "probeSessionReuseButton") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      send("probe-session-reuse", { providerId: selectedProviderId(), modelId: compatibilityModelId() }); return;
-    }
     if (target.id === "fetchCacheValidationModelsButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("fetch-models", { provider: serializeEditor() }); return;
     }
@@ -1122,11 +1138,6 @@ const bridgeSource = String.raw`
       else if (target.closest("#settingsData")) send("clear-cache");
       return;
     }
-    if (target.getAttribute("aria-label") === "启用会话复用") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      const providerId = selectedProviderId();
-      send("set-session-reuse", { providerId, modelId: compatibilityModelId(), enabled: target.getAttribute("aria-checked") !== "true" }); return;
-    }
   }, true);
 
   document.addEventListener("input", (event) => {
@@ -1137,9 +1148,6 @@ const bridgeSource = String.raw`
       target.removeAttribute("data-saved-secret");
       const key = keyPool.find((item) => item.id === target.dataset.keySecret);
       if (key) key.hasSavedSecret = false;
-    }
-    if (target.id === "providerSessionReuseModelInput") {
-      applyCompatibility(host.state?.providerDetails?.[selectedProviderId()] || {});
     }
     if (target.id === "providerCacheValidationModelInput") {
       applyCacheValidation(host.state?.providerDetails?.[selectedProviderId()] || {});
@@ -1249,13 +1257,17 @@ const bridgeSource = String.raw`
       const statusDetail = request.statusDetail
         ? '<small>' + escape(request.statusDetail) + '</small>'
         : '';
+      const cacheTailDetail = "新 " + requestTokens(request.cacheNewTailGapTokens) +
+        (Number(request.cacheAvoidableGapTokens || 0) > 0
+          ? " · 可 " + requestTokens(request.cacheAvoidableGapTokens)
+          : "");
       return '<article class="request-row status-' + escape(rowTone) + (request.failed ? ' failed' : '') + '" tabindex="0" data-request-id="' + escape(request.id) + '">' +
         '<div class="request-identity" title="' + escape(request.provider + " · " + request.agentLabel) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span>' + escape(request.time) + '</span></div>' +
         '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><div class="request-model-stack"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div></div>' +
         '<div class="request-stream transport-' + escape(request.transportTone || "stream") + '"><b>' + escape(request.transport) + '</b><small>' + (outputRate ? outputRate + ' t/s' : '—') + '</small></div>' +
         '<div class="request-tokens"><b>' + escape(requestTokens(request.inputTokens)) + ' / ' + escape(requestTokens(request.outputTokens)) + '</b><small>缓存 ' + escape(requestTokens(request.cachedTokens)) + ' (' + escape(cachePercent) + ')</small></div>' +
         '<div class="request-time"><span class="request-time-line ' + requestTimingTone(ttftMs, "ttft") + '"><span>首字</span><b class="value">' + escape(requestDuration(ttftMs)) + '</b></span><span class="request-time-line ' + requestTimingTone(totalMs, "total") + '"><span>耗时</span><b class="value">' + escape(requestDuration(totalMs)) + '</b></span></div>' +
-        '<div class="request-cache"><b>' + escape(cachePercent) + '</b><small>缺 ' + escape(requestTokens(request.cacheShortfallTokens)) + ' · 可 ' + escape(requestTokens(request.cacheAvoidableGapTokens)) + ' · 新 ' + escape(requestTokens(request.cacheNewTailGapTokens)) + '</small></div>' +
+        '<div class="request-cache"><b>' + escape(cachePercent) + '</b><small>' + escape(cacheTailDetail) + '</small></div>' +
         '<div class="request-status request-state ' + escape(rowTone) + '"><b>' + escape(request.statusLabel || "OK") + '</b>' + statusDetail + '</div></article>';
     }).join("") : '<div class="empty-row">当前筛选下暂无请求记录</div>';
     const pageButtons = Array.from({ length: totalPages }, (_, index) => {
@@ -1665,7 +1677,6 @@ function buildState(
           recovery_minutes: provider.key_pool.recovery_minutes
         }
       : null,
-    response_session_reuse_models: provider.response_session_reuse_models ?? [],
     cache_capabilities: provider.cache_capabilities ?? [],
     network_diagnostic: networkPathDiagnostic?.provider_id === provider.id ? networkPathDiagnostic : null,
     models: provider.models.map((model) => ({

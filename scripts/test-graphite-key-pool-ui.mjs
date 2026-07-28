@@ -83,4 +83,61 @@ assert.match(
   "the control plane must retain a saved key ID while testing an edited draft endpoint"
 );
 
+const providerListTestStart = controlPlane.indexOf('if (action === "test-provider")');
+const providerListTestEnd = controlPlane.indexOf('if (action === "test-provider-key")', providerListTestStart);
+assert.ok(providerListTestStart >= 0 && providerListTestEnd > providerListTestStart, "the saved-provider test action must remain bounded");
+const providerListTest = controlPlane.slice(providerListTestStart, providerListTestEnd);
+assert.match(
+  providerListTest,
+  /command<ProviderKeyTestResult>\("test_active_provider_key",\s*\{\s*providerId:\s*provider\.id,\s*provider_id:\s*provider\.id\s*\}\)/,
+  "the provider-list health button must use the Key the next ordinary inbound would select"
+);
+const savedProviderKeyTest = providerListTest.slice(providerListTest.indexOf("const activeKeyResult"));
+assert.doesNotMatch(
+  savedProviderKeyTest,
+  /test_provider_connection_paths/,
+  "the provider-list health button must not dispatch through the editor connection-key path"
+);
+
+assert.match(
+  html,
+  /<select><option>轮询<\/option><option>优先级<\/option><option>最低使用<\/option><option selected>顺序<\/option><\/select>/,
+  "new Graphite key pools must default to top-to-bottom sequential selection"
+);
+assert.match(
+  bridgeSource,
+  /const DEFAULT_KEY_PRIORITY = 5;/,
+  "new key rows must share one stable default priority instead of receiving a positional rank"
+);
+assert.doesNotMatch(
+  bridgeSource,
+  /key\.priority = keyPool\.length - index/,
+  "reordering or adding a key must not silently rewrite every key priority"
+);
+assert.match(
+  bridgeSource,
+  /strategyFromUi[\s\S]{0,360}\|\| "sequential"/,
+  "an untouched editor must serialize its default strategy as sequential"
+);
+assert.match(
+  controlPlane,
+  /editablePayload\.key_pool\?\.strategy \?\? existing\?\.key_pool\?\.strategy \?\? "sequential"/,
+  "new saved providers must retain the UI's sequential default"
+);
+assert.match(
+  bridgeSource,
+  /document\.addEventListener\("pointerdown",[\s\S]{0,640}\[data-key-drag\]/,
+  "the Key handle must begin a pointer-driven drag path in the embedded WebView"
+);
+assert.match(
+  bridgeSource,
+  /document\.addEventListener\("pointermove",[\s\S]{0,640}elementFromPoint/,
+  "pointer drag must identify the row beneath the pointer rather than rely on native HTML drop delivery"
+);
+assert.match(
+  bridgeSource,
+  /document\.addEventListener\("pointerup",[\s\S]{0,640}reorderKeyFromBridge/,
+  "releasing a Key drag over another row must apply the draft reorder immediately"
+);
+
 console.log("graphite key-pool UI regression tests passed");

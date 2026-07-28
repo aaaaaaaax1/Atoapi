@@ -8,9 +8,7 @@ use crate::{
         ProviderCacheCapabilityField, ProviderCacheCapabilityProbeFieldResult,
         ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
         ProviderCacheCapabilityStatus, ProviderCacheEffectStatus, ProviderChannelMode,
-        ProviderConfig, ProviderResponseSessionReuseCapability,
-        ProviderResponseSessionReuseProbeResult, ProviderResponseSessionReuseStatus,
-        ResponseSessionReuseStreamShape, SelectedProviderKey, REASONING_EFFORT_VALUES,
+        ProviderConfig, SelectedProviderKey, REASONING_EFFORT_VALUES,
     },
     continuation_lineage::{
         LineageCommitOutcome, LineageInvalidateOutcome, LineageLease, LineageParent,
@@ -22,7 +20,7 @@ use crate::{
         FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
         ResponsesWirePrefixFingerprints, UsageRecord,
     },
-    state::{AppState, PrefixWarmState, ResponseSessionCooldownState},
+    state::{AppState, PrefixWarmState},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -37,7 +35,7 @@ use bytes::Bytes;
 use chrono::{Duration, Utc};
 use flate2::{write::GzEncoder, Compression};
 use futures_util::{Stream, StreamExt};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
@@ -73,7 +71,6 @@ mod prefix_control;
 mod prepared_wire_request;
 mod request_plan;
 mod responses_stream;
-mod responses_websocket_probe;
 mod session_identity;
 mod settlement_pipeline;
 mod sse;
@@ -100,9 +97,7 @@ use completion_relay::{
     relay_chunk_parts, BoundedCacheCapture, STREAM_CACHE_CAPTURE_BYTE_LIMIT,
     STREAM_RELAY_BYTE_BUDGET, STREAM_RELAY_CHANNEL_CAPACITY,
 };
-use continuation_scope::{
-    native_responses_verified_delta_schema_is_known, response_session_capability, ContinuationScope,
-};
+use continuation_scope::ContinuationScope;
 use final_scope_shadow::{FinalScopeShadow, FinalScopeShadowInput, FinalScopeShadowReceipt};
 use final_scope_waterline::{
     PredecessorProofReceipt, PredecessorProofStatus, WaterlineControlHead, WaterlineSettlement,
@@ -136,12 +131,6 @@ pub(crate) use transport::TransportClients;
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
 #[cfg(test)]
 const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
-const PREFIX_ERROR_COOLDOWN_SECS: u64 = 45;
-const RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS: u64 = 30;
-const RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS: u64 = 2 * 60;
-const RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS: u64 = 5 * 60;
-const RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS: u64 = 5 * 60;
-const RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES: u64 = 32 * 1024;
 #[cfg(test)]
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
@@ -163,8 +152,6 @@ const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
-const RESPONSE_SESSION_PROBE_REQUEST_KIND: &str = "response-session-probe";
-const PROVIDER_CACHE_MIN_BUCKET_TOKENS: u64 = 128;
 const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
 const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
 /// Cache-affinity state is an optional routing/measurement optimization, not
@@ -201,20 +188,12 @@ fn try_compute_shadow_affinity_without_wait(
     decision.policy_compute_ms = decision.policy_compute_ms.saturating_add(policy_compute_ms);
     (decision, false)
 }
-
-#[derive(Debug, Deserialize)]
-struct ResponseSessionReuseProbeHttpInput {
-    provider_id: String,
-    model_id: String,
-}
-
 #[derive(Debug, Clone)]
 struct RouteDecision {
     provider: ProviderConfig,
     upstream_channel: Channel,
     model: String,
 }
-
 #[derive(Debug, Clone, Default)]
 struct BodyDiagnostics {
     inbound_body_bytes: u64,
@@ -235,7 +214,6 @@ struct ReasoningEffortDiagnostics {
     effective: Option<String>,
     source: Option<String>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TrustedCodexRequestMetadata {
     thread_id: Option<String>,
@@ -245,14 +223,12 @@ struct TrustedCodexRequestMetadata {
     compaction_requested: bool,
     source: TrustedCodexMetadataSource,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum TrustedCodexMetadataSource {
     AdapterHeader,
     #[default]
     AgentClientMetadata,
 }
-
 impl TrustedCodexMetadataSource {
     const fn action_scope_attested(self) -> bool {
         matches!(self, Self::AdapterHeader)
@@ -544,6 +520,8 @@ struct PrefixGuardWaitDiagnostics {
     state_age_ms: Option<u64>,
     skip_reason: Option<String>,
     budget_exhausted: bool,
+    pre_request_avoidable_tokens: u64,
+    recovery_applicable: bool,
     exact_settle_window_elapsed: bool,
     settled_exact_state_finished_at: Option<Instant>,
     cache_instability_score: Option<u64>,
@@ -569,14 +547,6 @@ struct SessionAnchorDiagnostics {
     source: Option<String>,
     changed: Option<bool>,
     peer_count: Option<u64>,
-}
-#[derive(Debug, Clone)]
-struct ResponseSessionReuseOutcome {
-    /// Present only when an exact native continuation delta was built.
-    /// Full-replay fallbacks borrow the original prepared body instead of
-    /// cloning a potentially very large Agent input merely to report a skip.
-    delta_body: Option<Value>,
-    diagnostics: ResponseSessionReuseDiagnostics,
 }
 #[derive(Debug, Clone, Default)]
 struct ResponseSessionReuseDiagnostics {
@@ -604,14 +574,6 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/cache-capabilities/probe",
             post(admin_probe_cache_capabilities),
-        )
-        .route(
-            "/admin/response-session-reuse/probe",
-            post(admin_probe_response_session_reuse),
-        )
-        .route(
-            "/admin/responses-websocket/probe",
-            post(admin_probe_responses_websocket),
         )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
@@ -685,48 +647,6 @@ async fn admin_probe_cache_capabilities(
         input.provider_id.trim(),
         input.model_id.trim(),
         input.channel,
-    )
-    .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
-    }
-}
-
-async fn admin_probe_response_session_reuse(
-    AxumState(state): AxumState<Arc<AppState>>,
-    request: Request,
-) -> Response {
-    let input: ResponseSessionReuseProbeHttpInput =
-        match authorize_and_parse_admin_json(&state, request).await {
-            Ok(input) => input,
-            Err(response) => return response,
-        };
-    match probe_and_record_provider_response_session_reuse(
-        &state,
-        input.provider_id.trim(),
-        input.model_id.trim(),
-    )
-    .await
-    {
-        Ok(result) => Json(result).into_response(),
-        Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
-    }
-}
-
-async fn admin_probe_responses_websocket(
-    AxumState(state): AxumState<Arc<AppState>>,
-    request: Request,
-) -> Response {
-    let input: ResponseSessionReuseProbeHttpInput =
-        match authorize_and_parse_admin_json(&state, request).await {
-            Ok(input) => input,
-            Err(response) => return response,
-        };
-    match probe_provider_responses_websocket(
-        &state,
-        input.provider_id.trim(),
-        input.model_id.trim(),
     )
     .await
     {
@@ -1092,13 +1012,9 @@ async fn run_responses_compact_for_authorized_agent(
     let continuation_scope = compaction_action_scope
         .as_ref()
         .map(ContinuationScope::from_action_scope);
-    let response_session_key = if responses_session_reuse_enabled(&config) {
-        continuation_scope
-            .as_ref()
-            .map(|scope| scope.anchor_key.clone())
-    } else {
-        None
-    };
+    let response_session_key = continuation_scope
+        .as_ref()
+        .map(|scope| scope.anchor_key.clone());
     let full_response_input = upstream_body.get("input").cloned();
     let response_session_snapshot_lease = match response_session_key.as_deref() {
         Some(key) => Some(state.continuation_lineage.begin(key).await),
@@ -2009,15 +1925,10 @@ async fn run_generation_for_authorized_agent(
     let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
     set_request_model(&mut client_request, &decision.model);
 
-    let request_had_stream_field = client_request.get("stream").is_some();
     let client_requested_stream =
         infer_client_requested_stream(&mut client_request, &client_channel, forced_agent_id);
     let chat_stream_include_usage =
         chat_stream_include_usage_requested(&client_request, &client_channel);
-    let codex_defaulted_responses_stream = forced_agent_id == Some("codex")
-        && matches!(client_channel, Channel::Responses)
-        && !request_had_stream_field
-        && client_requested_stream;
     let native_responses_passthrough = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
         && !codex_responses_chat_compat;
@@ -2333,29 +2244,23 @@ async fn run_generation_for_authorized_agent(
             identity_source: metadata.source.label(),
         })
     });
-    let session_reuse_capability =
-        (native_responses_passthrough && client_requested_stream).then(|| {
-            response_session_capability(
-                &decision,
-                &selected_provider_key,
-                ResponseSessionReuseStreamShape::StreamSse,
-            )
-        });
     let continuation_scope = action_scope
         .as_ref()
         .map(ContinuationScope::from_action_scope);
-    let response_session_key = if responses_session_reuse_enabled(&config) {
-        continuation_scope
-            .as_ref()
-            .map(|scope| scope.anchor_key.clone())
-    } else {
-        None
-    };
+    // Lineage is local control state for FullReplay only: it protects a
+    // manually hot-switched route, makes compaction an explicit epoch
+    // boundary, and proves the stable prefix. It must never authorize an
+    // upstream `previous_response_id` delta.
+    let response_session_key = continuation_scope
+        .as_ref()
+        .map(|scope| scope.anchor_key.clone());
+    let incoming_previous_response_id = upstream_body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let stale_external_continuation = match (
         continuation_scope.as_ref(),
-        upstream_body
-            .get("previous_response_id")
-            .and_then(Value::as_str),
+        incoming_previous_response_id.as_deref(),
     ) {
         (Some(scope), Some(response_id)) => {
             state
@@ -2386,58 +2291,6 @@ async fn run_generation_for_authorized_agent(
         &decision.upstream_channel,
         client_requested_stream,
     );
-    let responses_main_retry_guard =
-        skip_prefix_guard_for_sync_responses || codex_defaulted_responses_stream;
-    if responses_sync_main_prefix_error_cooled_down(
-        &state,
-        responses_main_retry_guard,
-        provider_prefix_control_key.as_deref(),
-    )
-    .await
-    {
-        let mut local_diagnostics = body_diagnostics(
-            &decision.upstream_channel,
-            &upstream_body,
-            &upstream_body,
-            false,
-        );
-        local_diagnostics.reasoning = reasoning_diagnostics.clone();
-        let mut request_log = upstream_transport_failure_log(
-            &request_id,
-            &started,
-            &client_channel,
-            &decision.upstream_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &PrefixGuardWaitDiagnostics::default(),
-            started.elapsed().as_millis() as u64,
-            &local_diagnostics,
-            &upstream_body,
-            false,
-            &ResponseSessionReuseDiagnostics::default(),
-            requested_model_for_log.clone(),
-            "responses-sync-main-prefix-error-cooldown",
-        );
-        request_log.status = StatusCode::SERVICE_UNAVAILABLE.as_u16();
-        request_log.agent_id = authorized_agent.clone();
-        request_log.agent_label = authorized_agent.clone();
-        request_log.upstream_request_id = None;
-        request_log.upstream_attempt_index = None;
-        request_log.upstream_attempt_total = None;
-        request_log.upstream_attempts = None;
-        let mut transaction = MetricsTransaction::local_rejection(request_log);
-        transaction.observe_error(
-            "responses_sync_main_prefix_error_cooldown",
-            "skip sync main request after recent upstream sync failure for same prefix",
-        );
-        state.metrics.commit(transaction).await;
-        return json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "upstream is cooling down after recent sync failure; retry shortly",
-        );
-    }
     let prefix_guard_skip_reason = provider_prefix_guard_skip_reason(
         &config,
         skip_prefix_guard_for_sync_responses,
@@ -2461,11 +2314,6 @@ async fn run_generation_for_authorized_agent(
         )
         .await
     };
-    let full_response_input = upstream_body.get("input").cloned();
-    let client_supplied_previous_response_id = upstream_body
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
     let response_session_starts_compaction_epoch =
         matches!(decision.upstream_channel, Channel::Responses)
             && (client_request_starts_compaction_epoch
@@ -2477,6 +2325,31 @@ async fn run_generation_for_authorized_agent(
         Some(key) => Some(state.continuation_lineage.begin(key).await),
         None => None,
     };
+    let mut full_replay_after_local_lineage = false;
+    if !response_session_starts_compaction_epoch {
+        if let (Some(response_id), Some(lease), Some(request)) = (
+            incoming_previous_response_id.as_deref(),
+            response_session_snapshot_lease.as_ref(),
+            upstream_body.as_object_mut(),
+        ) {
+            if let Some(local_head) = lease.head().filter(|head| head.response_id == response_id) {
+                if let Some(input) =
+                    full_replay_input_after_route_switch(local_head, request.get("input"))
+                {
+                    request.insert("input".to_string(), input);
+                    request.remove("previous_response_id");
+                    full_replay_after_local_lineage = true;
+                }
+            }
+        }
+    }
+    // Only an unreconstructable external continuation remains after the local
+    // full-replay recovery above. It must not affect local lineage state.
+    let client_supplied_previous_response_id = upstream_body
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let full_response_input = upstream_body.get("input").cloned();
     let tail_input_analysis = analyze_tail_input_for_session(
         &decision.upstream_channel,
         response_session_snapshot_lease.as_ref(),
@@ -2489,7 +2362,7 @@ async fn run_generation_for_authorized_agent(
             Some(key) => Some(
                 state
                     .continuation_lineage
-                    .begin_compaction(key, client_supplied_previous_response_id.as_deref())
+                    .begin_compaction(key, incoming_previous_response_id.as_deref())
                     .await,
             ),
             None => None,
@@ -2505,115 +2378,43 @@ async fn run_generation_for_authorized_agent(
         .or(response_session_snapshot_lease);
     let session_anchor_diagnostics =
         response_session_anchor_diagnostics(response_session_lease.as_ref());
-    let response_session_cooldown_key =
-        response_session_error_cooldown_key(&decision, session_reuse_capability.as_ref());
-    let mut response_session_delta_body_sizes = None;
-    let mut selected_prepared_delta = None;
-    let (original_prepared_body, mut response_session_reuse_diagnostics) =
-        if matches!(client_channel, Channel::Responses)
-            && matches!(decision.upstream_channel, Channel::Responses)
-        {
-            let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-            let MainResponseSessionDeltaEvaluation {
-                skip_reason: main_delta_skip_reason,
-                original_body,
-            } = evaluate_main_response_session_delta(
-                &config,
-                &decision,
-                session_reuse_capability.as_ref(),
-                client_requested_stream,
-                upstream_body,
-                &tail_input_diagnostics,
-                &session_anchor_diagnostics,
-            );
-            if let Some(cooldown_skip_reason) = response_session_cooldown_skip_reason(
-                &state,
-                response_session_cooldown_key.as_deref(),
-            )
-            .await
-            {
-                diagnostics.cooldown_active = true;
-                diagnostics.skip_reason = Some(cooldown_skip_reason);
-                (original_body, diagnostics)
-            } else if !main_response_session_delta_enabled_for_agent(forced_agent_id) {
-                diagnostics.skip_reason = Some("codex_main_session_delta_disabled".to_string());
-                (original_body, diagnostics)
-            } else if main_delta_skip_reason.is_none() {
-                let ResponseSessionReuseOutcome {
-                    delta_body,
-                    diagnostics: outcome_diagnostics,
-                } = maybe_reuse_response_session(
-                    original_body.body(),
-                    response_session_lease.as_ref(),
-                    &decision,
-                    true,
-                );
-                let original_body_bytes = original_body
-                    .initial_wire_len()
-                    .map(|len| len as u64)
-                    .expect("an eligible session delta must retain its measured full-body wire");
-                let prepared_delta = delta_body.and_then(|delta_body| {
-                    response_session_delta_benefit(
-                        original_body.body(),
-                        delta_body,
-                        original_body_bytes,
-                        &tail_input_diagnostics,
-                    )
-                });
-                diagnostics = outcome_diagnostics;
-                if let Some(prepared_delta) = prepared_delta {
-                    response_session_delta_body_sizes = Some(prepared_delta.body_sizes);
-                    selected_prepared_delta = Some(prepared_delta.body);
-                    diagnostics.wire_saved_bytes = prepared_delta.body_sizes.saved_bytes();
-                    diagnostics.wire_saved_ratio = prepared_delta.body_sizes.saved_ratio();
-                    (original_body, diagnostics)
-                } else {
-                    diagnostics.skip_reason = Some("main_session_delta_not_beneficial".to_string());
-                    (original_body, diagnostics)
-                }
-            } else {
-                diagnostics.skip_reason = main_delta_skip_reason.map(str::to_string);
-                (original_body, diagnostics)
-            }
-        } else {
-            (
-                PreparedResponseBody::plain(upstream_body),
-                ResponseSessionReuseDiagnostics::default(),
-            )
-        };
-    let used_response_session = selected_prepared_delta.is_some();
+    let original_prepared_body = if matches!(client_channel, Channel::Responses)
+        && matches!(decision.upstream_channel, Channel::Responses)
+    {
+        PreparedResponseBody::responses(upstream_body)
+    } else {
+        PreparedResponseBody::plain(upstream_body)
+    };
+    // Third-party Responses upstreams are treated as FullReplay-only. Keep
+    // the legacy metric fields populated with an explicit explanation so old
+    // metric readers do not mistake the removed delta route for a failure.
+    let mut response_session_reuse_diagnostics = ResponseSessionReuseDiagnostics {
+        skip_reason: (matches!(client_channel, Channel::Responses)
+            && matches!(decision.upstream_channel, Channel::Responses))
+        .then_some("full_replay_required".to_string()),
+        ..ResponseSessionReuseDiagnostics::default()
+    };
+    let active_used_response_session = false;
     if matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
     {
         response_session_reuse_diagnostics.context_plan = Some(
             if stale_external_continuation_after_route_switch {
                 "full_replay_after_route_switch"
+            } else if full_replay_after_local_lineage {
+                "full_replay_after_local_lineage"
             } else if client_supplied_previous_response_id.is_some()
                 && !response_session_starts_compaction_epoch
             {
                 "external_continuation"
-            } else if used_response_session {
-                "verified_native_delta"
             } else {
                 "full_replay"
             }
             .to_string(),
         );
     }
-    if used_response_session {
-        response_session_reuse_diagnostics.skip_reason = None;
-    }
-    let active_used_response_session = used_response_session;
     let local_prepare_ms = started.elapsed().as_millis() as u64;
-    let prefix_guard_wait = if active_used_response_session {
-        PrefixGuardWaitDiagnostics {
-            // A verified upstream continuation sends only the exact delta, so
-            // a full-prefix cache settlement cannot improve this request and
-            // must not add foreground TTFT delay.
-            skip_reason: Some("verified_native_delta".to_string()),
-            ..PrefixGuardWaitDiagnostics::default()
-        }
-    } else if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
+    let prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
         wait_for_provider_prefix_settle(
             &state,
             &decision.upstream_channel,
@@ -2635,15 +2436,6 @@ async fn run_generation_for_authorized_agent(
             && !response_session_starts_compaction_epoch)
     {
         LineageParent::ExternalContinuation
-    } else if active_used_response_session {
-        response_session_lease
-            .as_ref()
-            .and_then(LineageLease::head)
-            .map(|head| LineageParent::Managed {
-                generation: head.generation,
-                response_id: head.response_id.clone(),
-            })
-            .unwrap_or(LineageParent::FullReplay)
     } else {
         LineageParent::FullReplay
     };
@@ -2662,10 +2454,6 @@ async fn run_generation_for_authorized_agent(
             active_used_response_session,
         )
     };
-    if let Some(body_sizes) = response_session_delta_body_sizes {
-        diagnostics.original_body_bytes = body_sizes.original_body_bytes;
-        diagnostics.send_body_bytes = body_sizes.delta_body_bytes;
-    }
     diagnostics.trusted_codex_compaction_requested = trusted_codex_metadata
         .as_ref()
         .is_some_and(|metadata| metadata.compaction_requested);
@@ -2713,8 +2501,6 @@ async fn run_generation_for_authorized_agent(
             && !response_session_starts_compaction_epoch
         {
             CacheContextMode::ExternalContinuation
-        } else if active_used_response_session {
-            CacheContextMode::VerifiedNativeDelta
         } else {
             CacheContextMode::FullReplay
         },
@@ -2734,14 +2520,11 @@ async fn run_generation_for_authorized_agent(
         (identity, identity_started.elapsed())
     });
     let mut active_upstream_body = if matches!(active_request_channel, Channel::Responses) {
-        selected_prepared_delta.unwrap_or(original_prepared_body)
+        original_prepared_body
     } else {
-        let selected_body = selected_prepared_delta
-            .as_ref()
-            .unwrap_or(&original_prepared_body);
         PreparedResponseBody::plain(build_active_upstream_body_for_compat(
             original_prepared_body.body(),
-            selected_body.body(),
+            original_prepared_body.body(),
             &config,
             &decision,
             &active_request_channel,
@@ -2789,11 +2572,6 @@ async fn run_generation_for_authorized_agent(
         .filter(|identity| session_identity_source_is_trusted(identity.source));
     let generated_prompt_cache_key_value = trusted_generated_cache_identity
         .map(|identity| generated_prompt_cache_key(identity, &decision, &selected_provider_key));
-    // Direct connection-info Keys used the v1.3.4 placement key. Keep that
-    // exact stable key for the normal recovery path so an upgrade does not
-    // cold-start a working upstream cache. Pool Keys remain realm-scoped.
-    let legacy_direct_prompt_cache_key_value =
-        trusted_generated_cache_identity.map(|identity| identity.provider_cache_key.clone());
     let generated_key_session_scope_id = generated_prompt_cache_key_value
         .as_deref()
         .map(generated_prompt_cache_key_session_scope_id);
@@ -2880,22 +2658,6 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
-    // Restore the v1.3.6 placement behavior only for an Atoapi-generated key
-    // in a trusted, selected-Key realm. An explicit field rejection records
-    // `Unsupported` for this exact scope and turns this path off without a
-    // retry. Manual key validation still gets a clean no-key baseline.
-    let generated_prompt_cache_key_recovery_enabled = generated_prompt_cache_key_eligible
-        && smart_hit_enabled(&config)
-        && generated_prompt_cache_key_compatibility_allowed(
-            &config,
-            &decision,
-            &active_request_channel,
-            selected_provider_key.key_id.as_deref(),
-        )
-        && !validation_selection.as_ref().is_some_and(|selection| {
-            selection.mode == cache_validation::CacheValidationMode::Baseline
-                && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey)
-        });
     // A generated placement key may also be measured in an explicit candidate
     // run. Promotion certificates remain exact-session scoped, so they cannot
     // make a different conversation eligible.
@@ -2955,10 +2717,7 @@ async fn run_generation_for_authorized_agent(
     let generated_prompt_cache_key_requested = candidate_cache_routing_requested
         && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
     if let Some(cache_key) = selected_prompt_cache_placement_key(
-        legacy_direct_prompt_cache_key_value.as_deref(),
         generated_prompt_cache_key_value.as_deref(),
-        &selected_provider_key,
-        generated_prompt_cache_key_recovery_enabled,
         generated_prompt_cache_key_requested,
         generated_prompt_cache_key_promoted,
         generated_prompt_cache_key_eligible,
@@ -3444,7 +3203,6 @@ async fn run_generation_for_authorized_agent(
             provider_prefix_family_key.clone(),
             route_affinity_key.clone(),
             config.clone(),
-            session_reuse_capability.clone(),
             None,
             prefix_state_update_key.clone(),
             response_session_key.clone(),
@@ -3579,81 +3337,6 @@ async fn run_generation_for_authorized_agent(
         },
     };
     let bytes = body_read.bytes;
-    let automatic_response_session_delta = active_used_response_session;
-    let automatic_verified_native_delta = automatic_response_session_delta
-        && supports_main_response_session_delta(
-            &config,
-            &decision,
-            session_reuse_capability.as_ref(),
-        );
-    if !is_success_status
-        && matches!(active_request_channel, Channel::Responses)
-        && active_upstream_body.get("previous_response_id").is_some()
-    {
-        let error_summary = upstream_error_summary_redacting(
-            &bytes,
-            client_prompt_cache_key_for_error_redaction.as_deref(),
-        );
-        let rejection = response_session_rejection_classification(status, &error_summary);
-        if automatic_verified_native_delta {
-            response_session_reuse_diagnostics.rejected_status = Some(status);
-            if !error_summary.is_empty() {
-                request_metric_errors.push((
-                    "verified_response_session_delta_rejected".to_string(),
-                    error_summary.clone(),
-                ));
-            }
-            note_response_session_error_cooldown_for_rejection(
-                &state,
-                response_session_cooldown_key.as_deref(),
-                status,
-                &error_summary,
-            )
-            .await;
-            if matches!(
-                rejection,
-                ResponseSessionRejectionClass::StaleReference
-                    | ResponseSessionRejectionClass::Unsupported
-            ) {
-                let stale_response_id = previous_response_id_from_request(&active_upstream_body);
-                clear_response_session_reference(
-                    &state,
-                    response_session_lease.as_ref(),
-                    stale_response_id.as_deref(),
-                )
-                .await;
-            }
-            if rejection == ResponseSessionRejectionClass::Unsupported {
-                invalidate_verified_response_session_reuse(
-                    &state,
-                    &decision.provider.id,
-                    &decision.model,
-                    session_reuse_capability.as_ref(),
-                    &error_summary,
-                )
-                .await;
-            }
-        } else if !automatic_response_session_delta
-            && rejection == ResponseSessionRejectionClass::Unsupported
-        {
-            note_response_session_error_cooldown_for_rejection(
-                &state,
-                response_session_cooldown_key.as_deref(),
-                status,
-                &error_summary,
-            )
-            .await;
-            if !error_summary.is_empty() {
-                request_metric_errors.push((
-                    "client_previous_response_id_unsupported".to_string(),
-                    error_summary,
-                ));
-            }
-            response_session_reuse_diagnostics.rejected_status = Some(status);
-            response_session_reuse_diagnostics.skip_reason =
-                Some("client_previous_response_id_unsupported_next_inbound".to_string());
-        }
-    }
 
     // Buffered Responses -> Anthropic fallbacks can still receive an SSE body
     // from a non-streaming upstream.  Settle from the canonical Responses JSON,
@@ -3961,6 +3644,8 @@ async fn run_generation_for_authorized_agent(
         active_used_response_session,
         retried_full_response,
         prefix_guard_wait.budget_exhausted,
+        prefix_guard_wait.pre_request_avoidable_tokens,
+        prefix_guard_wait.recovery_applicable,
         prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
         prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
         prefix_guard_wait.settled_exact_state_finished_at,
@@ -4000,18 +3685,10 @@ async fn run_generation_for_authorized_agent(
             settlement_bytes,
             client_prompt_cache_key_for_error_redaction.as_deref(),
         );
-        if should_cooldown_prefix_after_status(status)
-            || (responses_main_retry_guard
-                && should_cooldown_responses_sync_main_after_status(status))
-        {
-            note_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
-        }
         request_metric_errors.push((
             upstream_error_scope(status, &error_summary).to_string(),
             error_summary,
         ));
-    } else if !active_responses_non_stream_chat_compat {
-        clear_prefix_error_cooldown(&state, prefix_state_update_key.as_deref()).await;
     }
     if !is_success_status {
         if owned_response_handoff {
@@ -4327,12 +4004,10 @@ async fn wait_for_provider_prefix_settle(
         };
     }
     let state_snapshot = {
-        let Ok(states) = state.prefix_states.try_lock() else {
-            return PrefixGuardWaitDiagnostics {
-                skip_reason: Some("runtime_snapshot_lock_busy".to_string()),
-                ..PrefixGuardWaitDiagnostics::default()
-            };
-        };
+        // Writes hold this mutex only while updating a small in-memory map.
+        // Wait for that short critical section so ordinary contention cannot
+        // erase exact pre-request evidence.
+        let states = state.prefix_states.lock().await;
         lookup_provider_prefix_state_with_source(
             &states,
             provider_prefix_key,
@@ -4381,6 +4056,8 @@ async fn wait_for_provider_prefix_settle(
                 return PrefixGuardWaitDiagnostics {
                     skip_reason: policy.skip_reason.map(str::to_string),
                     budget_exhausted: policy.budget_exhausted,
+                    pre_request_avoidable_tokens: avoidable_tokens,
+                    recovery_applicable: policy.recovery_applicable,
                     exact_settle_window_elapsed,
                     settled_exact_state_finished_at,
                     source: Some(source),
@@ -4399,6 +4076,8 @@ async fn wait_for_provider_prefix_settle(
                 state_age_ms: Some(state_age_ms),
                 skip_reason: None,
                 budget_exhausted: policy.budget_exhausted,
+                pre_request_avoidable_tokens: avoidable_tokens,
+                recovery_applicable: policy.recovery_applicable,
                 exact_settle_window_elapsed,
                 settled_exact_state_finished_at,
                 cache_instability_score: Some(cache_instability_score),
@@ -4442,6 +4121,8 @@ async fn wait_for_provider_prefix_settle(
                 state_age_ms: Some(state_age_ms),
                 skip_reason: None,
                 budget_exhausted,
+                pre_request_avoidable_tokens: 0,
+                recovery_applicable: false,
                 exact_settle_window_elapsed: false,
                 settled_exact_state_finished_at: None,
                 cache_instability_score: Some(cache_instability_score),
@@ -4464,51 +4145,6 @@ async fn wait_for_provider_prefix_settle(
         skip_reason: Some("no_prefix_state".to_string()),
         ..PrefixGuardWaitDiagnostics::default()
     }
-}
-
-async fn is_prefix_error_cooled_down(state: &AppState, provider_prefix_key: &str) -> bool {
-    let mut cooldowns = state.prefix_error_cooldowns.lock().await;
-    match cooldowns.get(provider_prefix_key).copied() {
-        Some(until) if until > Instant::now() => true,
-        Some(_) => {
-            cooldowns.remove(provider_prefix_key);
-            false
-        }
-        None => false,
-    }
-}
-
-async fn note_prefix_error_cooldown(state: &AppState, provider_prefix_key: Option<&str>) {
-    let Some(key) = provider_prefix_key else {
-        return;
-    };
-    let until = Instant::now() + std::time::Duration::from_secs(PREFIX_ERROR_COOLDOWN_SECS);
-    state
-        .prefix_error_cooldowns
-        .lock()
-        .await
-        .insert(key.to_string(), until);
-}
-
-async fn responses_sync_main_prefix_error_cooled_down(
-    state: &AppState,
-    skip_prefix_guard_for_sync_responses: bool,
-    provider_prefix_control_key: Option<&str>,
-) -> bool {
-    if !skip_prefix_guard_for_sync_responses {
-        return false;
-    }
-    let Some(prefix_key) = provider_prefix_state_update_key(provider_prefix_control_key) else {
-        return false;
-    };
-    is_prefix_error_cooled_down(state, &prefix_key).await
-}
-
-async fn clear_prefix_error_cooldown(state: &AppState, provider_prefix_key: Option<&str>) {
-    let Some(key) = provider_prefix_key else {
-        return;
-    };
-    state.prefix_error_cooldowns.lock().await.remove(key);
 }
 
 fn is_provider_health_failure_status(status: StatusCode) -> bool {
@@ -4627,180 +4263,6 @@ async fn note_compact_endpoint_cooldown(state: &AppState, key: &str) {
     );
 }
 
-fn response_session_error_cooldown_key(
-    decision: &RouteDecision,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-) -> Option<String> {
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return None;
-    }
-    let capability = capability?;
-    let encoded = serde_json::to_vec(capability).ok()?;
-    let digest = format!("{:x}", Sha256::digest(encoded));
-    Some(format!(
-        "{}:{}:{}:{}",
-        decision.upstream_channel.label(),
-        decision.provider.id,
-        decision.model,
-        digest
-    ))
-}
-
-#[cfg(test)]
-async fn response_session_cooldown_active(state: &AppState, key: Option<&str>) -> bool {
-    response_session_cooldown_skip_reason(state, key)
-        .await
-        .is_some()
-}
-
-async fn response_session_cooldown_skip_reason(
-    state: &AppState,
-    key: Option<&str>,
-) -> Option<String> {
-    let Some(key) = key else {
-        return None;
-    };
-    let cooldowns = state.response_session_error_cooldowns.lock().await;
-    match cooldowns.get(key).cloned() {
-        Some(cooldown) if cooldown.until > Instant::now() => {
-            if cooldown.unsupported {
-                Some("provider_session_delta_unsupported".to_string())
-            } else {
-                Some("provider_session_delta_cooldown".to_string())
-            }
-        }
-        Some(_) => None,
-        None => None,
-    }
-}
-
-#[cfg(test)]
-async fn note_response_session_error_cooldown(state: &AppState, key: Option<&str>) {
-    note_response_session_error_cooldown_internal(state, key, false).await;
-}
-
-async fn note_response_session_error_cooldown_for_rejection(
-    state: &AppState,
-    key: Option<&str>,
-    status: u16,
-    summary: &str,
-) {
-    match response_session_rejection_classification(status, summary) {
-        ResponseSessionRejectionClass::StaleReference => return,
-        ResponseSessionRejectionClass::Unsupported => {
-            note_response_session_error_cooldown_internal(state, key, true).await
-        }
-        ResponseSessionRejectionClass::TransientInvalid => {
-            note_response_session_error_cooldown_internal(state, key, false).await
-        }
-    }
-}
-
-async fn invalidate_verified_response_session_reuse(
-    state: &AppState,
-    provider_id: &str,
-    model_id: &str,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-    summary: &str,
-) {
-    let Some(capability) = capability else {
-        return;
-    };
-    let message = if summary.trim().is_empty() {
-        "upstream rejected previous_response_id".to_string()
-    } else {
-        truncate_log_message(summary)
-    };
-    let mut config = state.config.write().await;
-    if !config.response_session_reuse_verified_for_scope(provider_id, model_id, capability) {
-        return;
-    }
-    config.record_response_session_reuse_probe(
-        provider_id,
-        model_id,
-        Some(capability.clone()),
-        ProviderResponseSessionReuseStatus::Unsupported,
-        false,
-        Some(message),
-    );
-    state.journal_config(&config);
-}
-
-async fn note_response_session_error_cooldown_internal(
-    state: &AppState,
-    key: Option<&str>,
-    unsupported: bool,
-) {
-    let Some(key) = key else {
-        return;
-    };
-    let mut cooldowns = state.response_session_error_cooldowns.lock().await;
-    let failures = cooldowns
-        .get(key)
-        .map(|cooldown| cooldown.failures.saturating_add(1))
-        .unwrap_or(1);
-    let seconds = response_session_error_cooldown_secs(failures, unsupported);
-    cooldowns.insert(
-        key.to_string(),
-        ResponseSessionCooldownState {
-            until: Instant::now() + std::time::Duration::from_secs(seconds),
-            failures,
-            unsupported,
-        },
-    );
-    drop(cooldowns);
-    state.journal_runtime_state();
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResponseSessionRejectionClass {
-    StaleReference,
-    Unsupported,
-    TransientInvalid,
-}
-
-fn response_session_rejection_classification(
-    _status: u16,
-    summary: &str,
-) -> ResponseSessionRejectionClass {
-    let summary = summary.to_ascii_lowercase();
-    let names_previous_response = summary.contains("previous_response_id")
-        || summary.contains("previous_response_not_found")
-        || summary.contains("previous response")
-        || summary.contains("response id");
-    if names_previous_response
-        && (summary.contains("not found")
-            || summary.contains("expired")
-            || summary.contains("stale")
-            || summary.contains("does not exist"))
-    {
-        return ResponseSessionRejectionClass::StaleReference;
-    }
-    if names_previous_response
-        && (summary.contains("unsupported")
-            || summary.contains("not supported")
-            || summary.contains("only supported")
-            || summary.contains("unknown parameter")
-            || summary.contains("unrecognized parameter")
-            || summary.contains("websocket")
-            || summary.contains("invalid parameter"))
-    {
-        return ResponseSessionRejectionClass::Unsupported;
-    }
-    ResponseSessionRejectionClass::TransientInvalid
-}
-
-fn response_session_error_cooldown_secs(failures: u32, unsupported: bool) -> u64 {
-    if unsupported {
-        return RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS;
-    }
-    match failures {
-        0 | 1 => RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS,
-        2 => RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS,
-        _ => RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS,
-    }
-}
-
 #[cfg(test)]
 async fn is_prefix_prewarm_cooled_down(state: &AppState, provider_prefix_key: &str) -> bool {
     let mut cooldowns = state.prefix_prewarm_cooldowns.lock().await;
@@ -4826,15 +4288,6 @@ async fn note_prefix_prewarm_cooldown(
         .lock()
         .await
         .insert(provider_prefix_key.to_string(), until);
-}
-
-fn should_cooldown_prefix_after_status(status: u16) -> bool {
-    let _ = status;
-    false
-}
-
-fn should_cooldown_responses_sync_main_after_status(status: u16) -> bool {
-    matches!(status, 400 | 408 | 413 | 429 | 500..=599)
 }
 
 #[cfg(test)]
@@ -5895,6 +5348,8 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         used_response_session,
         retried_full_response,
         guard_budget_exhausted,
+        0,
+        false,
         false,
         false,
         None,
@@ -5915,6 +5370,8 @@ async fn observe_provider_prefix_usage(
     used_response_session: bool,
     retried_full_response: bool,
     guard_budget_exhausted: bool,
+    pre_request_avoidable_tokens: u64,
+    recovery_applicable: bool,
     guard_source_is_exact: bool,
     exact_settle_window_elapsed: bool,
     settled_exact_state_finished_at: Option<Instant>,
@@ -6021,6 +5478,8 @@ async fn observe_provider_prefix_usage(
         usage: raw,
         tail,
         guard_budget_exhausted,
+        pre_request_avoidable_tokens,
+        recovery_applicable,
         exact_settle_window_elapsed,
         static_wire_drift,
     }));
@@ -6928,6 +6387,12 @@ async fn provider_cache_gap_breakdown_with_guard(
         guard_budget_exhausted: prefix_guard_wait
             .map(|wait| wait.budget_exhausted)
             .unwrap_or(false),
+        pre_request_avoidable_tokens: prefix_guard_wait
+            .map(|wait| wait.pre_request_avoidable_tokens)
+            .unwrap_or_default(),
+        recovery_applicable: prefix_guard_wait
+            .map(|wait| wait.recovery_applicable)
+            .unwrap_or(false),
         exact_settle_window_elapsed,
         static_wire_drift: false,
     }))
@@ -6960,357 +6425,6 @@ fn responses_tail_has_tool_activity(current_tail: &TailInputDiagnostics) -> bool
             current_tail.source.as_deref(),
             Some("tool_call") | Some("tool_output") | Some("mixed")
         )
-}
-
-fn maybe_reuse_response_session(
-    request: &Value,
-    lease: Option<&LineageLease>,
-    decision: &RouteDecision,
-    allow_stream_delta: bool,
-) -> ResponseSessionReuseOutcome {
-    let mut diagnostics = ResponseSessionReuseDiagnostics::default();
-    let Some(lease) = lease else {
-        diagnostics.skip_reason = Some("no_session_key".to_string());
-        return ResponseSessionReuseOutcome {
-            delta_body: None,
-            diagnostics,
-        };
-    };
-    let Some(current_input) = request.get("input") else {
-        diagnostics.skip_reason = Some("no_input".to_string());
-        return ResponseSessionReuseOutcome {
-            delta_body: None,
-            diagnostics,
-        };
-    };
-    if request.get("previous_response_id").is_some() {
-        diagnostics.skip_reason = Some("already_has_previous_response_id".to_string());
-        return ResponseSessionReuseOutcome {
-            delta_body: None,
-            diagnostics,
-        };
-    }
-    if !allow_stream_delta
-        && request
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        diagnostics.skip_reason = Some("stream_delta_disabled".to_string());
-        return ResponseSessionReuseOutcome {
-            delta_body: None,
-            diagnostics,
-        };
-    }
-    let mut sessions = Vec::new();
-    if let Some(exact) = lease.head() {
-        diagnostics.exact_key_hit = true;
-        sessions.push(exact.clone());
-    }
-    diagnostics.scope_match_count = 0;
-    diagnostics.candidate_count = sessions.len() as u64;
-    if sessions.is_empty() {
-        diagnostics.skip_reason = Some("no_candidate".to_string());
-        return ResponseSessionReuseOutcome {
-            delta_body: None,
-            diagnostics,
-        };
-    }
-    let mut saw_unexpired = false;
-    let mut saw_delta_rejected = false;
-    for session in sessions {
-        if session.finished_at.elapsed() > std::time::Duration::from_secs(1800) {
-            continue;
-        }
-        saw_unexpired = true;
-        // A protocol cache breakpoint lives in the final upstream input but
-        // is not part of the Agent's next raw replay.  Keep native delta
-        // disabled for that lineage until an upstream-specific proof covers
-        // the complete final wire, rather than treating this control-only
-        // difference as evidence that a delta is safe.
-        if cache_capability::responses_input_contains_protocol_cache_breakpoint(&session.input) {
-            saw_delta_rejected = true;
-            continue;
-        }
-        let Some(delta_input) = appended_response_input_delta_for_session(&session, current_input)
-        else {
-            saw_delta_rejected = true;
-            continue;
-        };
-        diagnostics.append_delta_match = true;
-        diagnostics.delta_items = response_input_item_count(&delta_input) as u64;
-        diagnostics.semantic_reuse_items = response_input_item_count(&session.input)
-            .saturating_add(session.output_items.len())
-            as u64;
-
-        let Some(optimized) = build_response_session_delta_body(
-            request,
-            delta_input,
-            &session.response_id,
-            &decision.model,
-        ) else {
-            diagnostics.skip_reason = Some("request_not_object".to_string());
-            return ResponseSessionReuseOutcome {
-                delta_body: None,
-                diagnostics,
-            };
-        };
-        diagnostics.skip_reason = None;
-        return ResponseSessionReuseOutcome {
-            delta_body: Some(optimized),
-            diagnostics,
-        };
-    }
-    diagnostics.skip_reason = if !saw_unexpired {
-        Some("expired".to_string())
-    } else if saw_delta_rejected {
-        Some("append_delta_rejected".to_string())
-    } else {
-        Some("no_delta".to_string())
-    };
-    ResponseSessionReuseOutcome {
-        delta_body: None,
-        diagnostics,
-    }
-}
-
-fn build_response_session_delta_body(
-    request: &Value,
-    delta_input: Value,
-    response_id: &str,
-    model: &str,
-) -> Option<Value> {
-    let source = request.as_object()?;
-    let mut optimized = Map::new();
-    for (key, value) in source {
-        if matches!(key.as_str(), "input" | "previous_response_id" | "model") {
-            continue;
-        }
-        optimized.insert(key.clone(), value.clone());
-    }
-    optimized.insert("model".to_string(), Value::String(model.to_string()));
-    optimized.insert(
-        "previous_response_id".to_string(),
-        Value::String(response_id.to_string()),
-    );
-    optimized.insert("input".to_string(), delta_input);
-    Some(Value::Object(optimized))
-}
-
-#[cfg(test)]
-fn should_attempt_main_response_session_delta(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-    client_requested_stream: bool,
-    request: &Value,
-    current_tail: &TailInputDiagnostics,
-    session_anchor: &SessionAnchorDiagnostics,
-) -> bool {
-    evaluate_main_response_session_delta(
-        config,
-        decision,
-        capability,
-        client_requested_stream,
-        request.clone(),
-        current_tail,
-        session_anchor,
-    )
-    .skip_reason
-    .is_none()
-}
-
-#[derive(Debug)]
-struct MainResponseSessionDeltaEvaluation {
-    skip_reason: Option<&'static str>,
-    original_body: PreparedResponseBody,
-}
-
-impl MainResponseSessionDeltaEvaluation {
-    fn skipped(skip_reason: &'static str, original_body: Value) -> Self {
-        Self {
-            skip_reason: Some(skip_reason),
-            original_body: PreparedResponseBody::plain(original_body),
-        }
-    }
-
-    fn measured(skip_reason: Option<&'static str>, original_body: PreparedResponseBody) -> Self {
-        Self {
-            skip_reason,
-            original_body,
-        }
-    }
-}
-
-/// Return the first reason a main Responses request cannot use a session delta.
-///
-/// Keeping this decision explainable matters for latency work: a generic
-/// "guard not eligible" label hides whether the request is paying the full
-/// history upload because the provider is unverified, the session anchor is
-/// missing, or the tail is simply too small to benefit.
-fn evaluate_main_response_session_delta(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-    client_requested_stream: bool,
-    request: Value,
-    _current_tail: &TailInputDiagnostics,
-    session_anchor: &SessionAnchorDiagnostics,
-) -> MainResponseSessionDeltaEvaluation {
-    if !responses_session_reuse_enabled(config) {
-        return MainResponseSessionDeltaEvaluation::skipped("session_reuse_disabled", request);
-    }
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return MainResponseSessionDeltaEvaluation::skipped(
-            "upstream_channel_not_responses",
-            request,
-        );
-    }
-    if !client_requested_stream {
-        return MainResponseSessionDeltaEvaluation::skipped("client_stream_disabled", request);
-    }
-    if !supports_main_response_session_delta(config, decision, capability) {
-        return MainResponseSessionDeltaEvaluation::skipped(
-            "provider_session_delta_unverified",
-            request,
-        );
-    }
-    if session_anchor.source.as_deref() != Some("exact") {
-        return MainResponseSessionDeltaEvaluation::skipped(
-            match session_anchor.source.as_deref() {
-                Some("new-anchor") => "session_anchor_missing",
-                _ => "session_anchor_not_exact",
-            },
-            request,
-        );
-    }
-    if request.get("previous_response_id").is_some() {
-        return MainResponseSessionDeltaEvaluation::skipped(
-            "client_previous_response_id_present",
-            request,
-        );
-    }
-    if request.get("store").and_then(Value::as_bool) == Some(false) {
-        return MainResponseSessionDeltaEvaluation::skipped("client_store_disabled", request);
-    }
-    if !native_responses_verified_delta_schema_is_known(&request) {
-        return MainResponseSessionDeltaEvaluation::skipped(
-            "unknown_response_request_field",
-            request,
-        );
-    }
-
-    let original_body = PreparedResponseBody::responses(request);
-    let body_bytes = original_body
-        .initial_wire_len()
-        .expect("an eligible Responses request must be a JSON object") as u64;
-    let skip_reason = (body_bytes <= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES)
-        .then_some("session_delta_full_body_below_minimum_savings");
-    MainResponseSessionDeltaEvaluation::measured(skip_reason, original_body)
-}
-
-#[cfg(test)]
-fn main_response_session_delta_skip_reason(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-    client_requested_stream: bool,
-    request: &Value,
-    current_tail: &TailInputDiagnostics,
-    session_anchor: &SessionAnchorDiagnostics,
-) -> Option<&'static str> {
-    evaluate_main_response_session_delta(
-        config,
-        decision,
-        capability,
-        client_requested_stream,
-        request.clone(),
-        current_tail,
-        session_anchor,
-    )
-    .skip_reason
-}
-
-fn supports_main_response_session_delta(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    capability: Option<&ProviderResponseSessionReuseCapability>,
-) -> bool {
-    if !matches!(decision.upstream_channel, Channel::Responses) {
-        return false;
-    }
-
-    capability.is_some_and(|capability| {
-        config.response_session_reuse_verified_for_scope(
-            &decision.provider.id,
-            &decision.model,
-            capability,
-        )
-    })
-}
-
-fn main_response_session_delta_enabled_for_agent(_forced_agent_id: Option<&str>) -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResponseSessionDeltaBodySizes {
-    original_body_bytes: u64,
-    delta_body_bytes: u64,
-}
-
-impl ResponseSessionDeltaBodySizes {
-    fn saved_bytes(self) -> u64 {
-        self.original_body_bytes
-            .saturating_sub(self.delta_body_bytes)
-    }
-
-    fn saved_ratio(self) -> Option<f64> {
-        (self.original_body_bytes > 0)
-            .then(|| self.saved_bytes() as f64 / self.original_body_bytes as f64)
-    }
-}
-
-#[derive(Debug)]
-struct PreparedResponseSessionDelta {
-    body_sizes: ResponseSessionDeltaBodySizes,
-    body: PreparedResponseBody,
-}
-
-fn response_session_delta_benefit(
-    original: &Value,
-    delta: Value,
-    original_bytes: u64,
-    _current_tail: &TailInputDiagnostics,
-) -> Option<PreparedResponseSessionDelta> {
-    if !response_session_delta_request(&delta, original) {
-        return None;
-    }
-    let body = PreparedResponseBody::responses(delta);
-    let delta_bytes = body.initial_wire_len()? as u64;
-    if delta_bytes >= original_bytes {
-        return None;
-    }
-    let saved_bytes = original_bytes.saturating_sub(delta_bytes);
-    let beneficial = saved_bytes >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES
-        && delta_bytes.saturating_mul(5) <= original_bytes.saturating_mul(4);
-    beneficial.then_some(PreparedResponseSessionDelta {
-        body_sizes: ResponseSessionDeltaBodySizes {
-            original_body_bytes: original_bytes,
-            delta_body_bytes: delta_bytes,
-        },
-        body,
-    })
-}
-
-#[cfg(test)]
-fn response_session_delta_is_beneficial(
-    original: &Value,
-    delta: &Value,
-    current_tail: &TailInputDiagnostics,
-) -> bool {
-    let original_bytes = serialized_body_len(&Channel::Responses, original);
-    response_session_delta_benefit(original, delta.clone(), original_bytes, current_tail).is_some()
 }
 
 fn response_session_anchor_diagnostics(lease: Option<&LineageLease>) -> SessionAnchorDiagnostics {
@@ -7350,37 +6464,6 @@ fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionA
     log.session_anchor_peer_count = diagnostics.peer_count;
 }
 
-fn response_input_item_count(input: &Value) -> usize {
-    input.as_array().map(Vec::len).unwrap_or_default()
-}
-
-fn response_session_delta_request(candidate: &Value, original: &Value) -> bool {
-    candidate.get("previous_response_id").is_some()
-        && original.get("previous_response_id").is_none()
-        && candidate.get("input") != original.get("input")
-}
-
-async fn clear_response_session_reference(
-    state: &AppState,
-    lease: Option<&LineageLease>,
-    response_id: Option<&str>,
-) -> Option<LineageInvalidateOutcome> {
-    let lease = lease?;
-    Some(
-        state
-            .continuation_lineage
-            .invalidate(lease, response_id)
-            .await,
-    )
-}
-
-fn previous_response_id_from_request(request: &Value) -> Option<String> {
-    request
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
 fn full_replay_input_after_route_switch(
     session: &ResponseSessionState,
     current: Option<&Value>,
@@ -7413,6 +6496,7 @@ fn response_input_starts_with(current: &[Value], prefix: &[Value]) -> bool {
             .all(|(expected, current)| expected == current)
 }
 
+#[cfg(any())]
 fn appended_response_input_delta_for_session(
     session: &ResponseSessionState,
     current: &Value,
@@ -7447,12 +6531,14 @@ fn appended_response_input_delta_for_session(
     Some(Value::Array(delta.to_vec()))
 }
 
+#[cfg(any())]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedResponseCallOutput {
     call_id: String,
     item_type: String,
 }
 
+#[cfg(any())]
 fn expected_response_call_outputs(
     output_items: &[Value],
 ) -> Option<Vec<ExpectedResponseCallOutput>> {
@@ -7483,6 +6569,7 @@ fn expected_response_call_outputs(
     Some(expected)
 }
 
+#[cfg(any())]
 fn response_session_delta_input_is_safe(
     delta: &[Value],
     expected_call_outputs: &[ExpectedResponseCallOutput],
@@ -7539,6 +6626,7 @@ fn response_input_delta_start_index(
         .then_some(previous_items.len())
 }
 
+#[cfg(test)]
 fn response_input_raw_prefix_delta_start_index(
     previous_items: &[Value],
     current_items: &[Value],
@@ -7689,18 +6777,6 @@ async fn finalize_confirmed_responses_compaction(
         if clear_family_state {
             if let Some(key) = provider_prefix_family_key {
                 states.remove(key);
-            }
-        }
-    }
-
-    {
-        let mut cooldowns = state.prefix_error_cooldowns.lock().await;
-        if let Some(key) = prefix_state_key {
-            cooldowns.remove(key);
-        }
-        if clear_family_state {
-            if let Some(key) = provider_prefix_family_key {
-                cooldowns.remove(key);
             }
         }
     }
@@ -8067,10 +7143,6 @@ fn local_session_keys_enabled(config: &AppConfig) -> bool {
     smart_hit_enabled(config)
 }
 
-fn responses_session_reuse_enabled(config: &AppConfig) -> bool {
-    smart_hit_enabled(config)
-}
-
 fn smart_hit_enabled(config: &AppConfig) -> bool {
     config.cache.enabled
         && matches!(
@@ -8117,25 +7189,7 @@ fn metrics_cache_key(cache_keys: &[String]) -> String {
     }
 }
 
-#[cfg(test)]
-std::thread_local! {
-    static SERIALIZED_BODY_LEN_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn reset_serialized_body_len_calls() {
-    SERIALIZED_BODY_LEN_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(test)]
-fn serialized_body_len_calls() -> u64 {
-    SERIALIZED_BODY_LEN_CALLS.with(std::cell::Cell::get)
-}
-
 fn serialized_body_len(channel: &Channel, body: &Value) -> u64 {
-    #[cfg(test)]
-    SERIALIZED_BODY_LEN_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
-
     if matches!(channel, Channel::Responses) {
         serialize_responses_body_bytes_for_provider_prefix(body).len() as u64
     } else {
@@ -9866,17 +8920,10 @@ async fn send_agent_upstream_request(
 }
 
 #[derive(Debug)]
-struct ResponseSessionReuseProbeResponse {
+struct ProviderManagementProbeResponse {
     status: u16,
     content_type: String,
     bytes: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct ParsedResponseSessionSseProbe {
-    usage: UsageRecord,
-    response_id: String,
-    output_items: Vec<Value>,
 }
 
 pub(crate) async fn probe_and_record_provider_cache_capabilities(
@@ -10263,1228 +9310,6 @@ async fn note_runtime_cache_capability_rejection(
     }
 }
 
-pub(crate) async fn probe_provider_response_session_reuse(
-    state: &AppState,
-    provider_id: &str,
-    model_id: &str,
-) -> Result<ProviderResponseSessionReuseProbeResult> {
-    let model_id = model_id.trim();
-    if model_id.is_empty() {
-        return Err(anyhow!(
-            "an actual upstream model id is required for verification"
-        ));
-    }
-    let provider = {
-        let config = state.config.read().await;
-        config
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?
-    };
-    if !provider.enabled {
-        return Err(anyhow!("provider {} is disabled", provider.name));
-    }
-    let selected_key = select_provider_api_key(state, provider_id, None, None).await?;
-    if selected_key.secret.trim().is_empty() {
-        return Err(anyhow!("provider API key is not configured"));
-    }
-    let probe_decision = RouteDecision {
-        provider: provider.clone(),
-        upstream_channel: Channel::Responses,
-        model: model_id.to_string(),
-    };
-    let capability = response_session_capability(
-        &probe_decision,
-        &selected_key,
-        ResponseSessionReuseStreamShape::StreamSse,
-    );
-
-    let fidelity_nonce = Uuid::new_v4().simple().to_string();
-    let fidelity = build_response_session_fidelity_payload(&fidelity_nonce);
-    let tool_name = "atoapi_fidelity_probe";
-    let stable_prefix = "Atoapi response-session cache verification stable context. ".repeat(192);
-    let anchor_input = json!([{
-        "type": "message",
-        "role": "user",
-        "content": [{
-            "type": "input_text",
-            "text": format!(
-                "{stable_prefix}\nGenerate a fresh unpredictable 64-character lowercase hexadecimal token. Return exactly that token as the only assistant output text."
-            ),
-        }],
-    }]);
-    let anchor_body = json!({
-        "model": model_id,
-        "instructions": "This is an explicit compatibility verification. Return exactly one freshly generated 64-character lowercase hexadecimal token and no other visible text.",
-        "input": anchor_input.clone(),
-        "store": true,
-        "stream": true,
-        "max_output_tokens": 128,
-    });
-    let anchor = send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &anchor_body,
-    )
-    .await?;
-    let Some(anchor_probe) = parse_successful_response_session_sse_probe(&anchor) else {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            probe_status_for_failure(anchor.status, &anchor.bytes),
-            format!(
-                "anchor request returned HTTP {}: {}",
-                anchor.status,
-                upstream_error_summary(&anchor.bytes)
-            ),
-            Some(anchor.status),
-            None,
-        ));
-    };
-    let anchor_usage = anchor_probe.usage;
-    let anchor_response_id = anchor_probe.response_id;
-    let anchor_output_items = anchor_probe.output_items;
-    let anchor_challenge = match response_session_probe_text_challenge(&anchor_output_items) {
-        Ok(challenge) => challenge,
-        Err(message) => {
-            return Ok(response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability.clone()),
-                ProviderResponseSessionReuseStatus::Unsupported,
-                format!("anchor response failed: {message}"),
-                Some(anchor.status),
-                None,
-            ));
-        }
-    };
-    if serde_json::to_string(&anchor_body)
-        .unwrap_or_default()
-        .contains(&anchor_challenge)
-    {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "anchor challenge was present in the request wire instead of being generated only by the assistant"
-                .to_string(),
-            Some(anchor.status),
-            None,
-        ));
-    }
-
-    let freshness_decoy = send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &anchor_body,
-    )
-    .await?;
-    let Some(freshness_decoy_probe) = parse_successful_response_session_sse_probe(&freshness_decoy)
-    else {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            probe_status_for_failure(freshness_decoy.status, &freshness_decoy.bytes),
-            format!(
-                "freshness decoy returned HTTP {}: {}",
-                freshness_decoy.status,
-                upstream_error_summary(&freshness_decoy.bytes)
-            ),
-            Some(freshness_decoy.status),
-            None,
-        ));
-    };
-    let freshness_challenge =
-        match response_session_probe_text_challenge(&freshness_decoy_probe.output_items) {
-            Ok(challenge) => challenge,
-            Err(message) => {
-                return Ok(response_session_reuse_probe_result(
-                    provider_id,
-                    model_id,
-                    Some(capability.clone()),
-                    ProviderResponseSessionReuseStatus::Unsupported,
-                    format!("freshness decoy failed: {message}"),
-                    Some(freshness_decoy.status),
-                    None,
-                ));
-            }
-        };
-    if freshness_challenge == anchor_challenge {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "two independent anchor responses reused the same challenge; freshness and unpredictability were not verified"
-                .to_string(),
-            Some(freshness_decoy.status),
-            None,
-        ));
-    }
-
-    let probe_tools = json!([{
-        "type": "function",
-        "name": tool_name,
-        "description": "Returns a private protocol-fidelity fixture that must be preserved exactly.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "challenge": {
-                    "type": "string",
-                    "description": "The exact hidden 64-character lowercase hexadecimal token from the earlier assistant response selected by previous_response_id.",
-                    "minLength": 64,
-                    "maxLength": 64,
-                    "pattern": "^[0-9a-f]{64}$",
-                },
-            },
-            "required": ["challenge"],
-            "additionalProperties": false,
-        },
-    }]);
-    let seed_input = json!([response_session_probe_user_message(
-        "Use the exact hidden token from the selected earlier assistant response as challenge. Call the required fidelity tool exactly once and emit no assistant text."
-    )]);
-    let seed_body = json!({
-        "model": model_id,
-        "previous_response_id": anchor_response_id,
-        "instructions": "This is an explicit compatibility verification. Retrieve the exact token from the selected earlier assistant response, call the required function exactly once with it, and emit no assistant text.",
-        "input": seed_input.clone(),
-        "tools": probe_tools.clone(),
-        "tool_choice": { "type": "function", "name": tool_name },
-        "parallel_tool_calls": false,
-        "store": true,
-        "stream": true,
-        "max_output_tokens": 512,
-    });
-    let seed_wire = serde_json::to_string(&seed_body).unwrap_or_default();
-    if seed_wire.contains(&anchor_challenge) || seed_wire.contains("\"call_id\"") {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "anchor continuation wire exposed the hidden token or a prior call_id".to_string(),
-            Some(anchor.status),
-            None,
-        ));
-    }
-    let first = send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &seed_body,
-    )
-    .await?;
-    let Some(first_probe) = parse_successful_response_session_sse_probe(&first) else {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            probe_status_for_failure(first.status, &first.bytes),
-            format!(
-                "anchor continuation returned HTTP {}: {}",
-                first.status,
-                upstream_error_summary(&first.bytes)
-            ),
-            Some(first.status),
-            None,
-        ));
-    };
-    let first_usage = first_probe.usage;
-    let previous_response_id = first_probe.response_id;
-    let first_output_items = first_probe.output_items;
-    let seed_call = match response_session_probe_function_call(&first_output_items, tool_name) {
-        Ok(seed_call) => seed_call,
-        Err(message) => {
-            return Ok(response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability.clone()),
-                ProviderResponseSessionReuseStatus::Unsupported,
-                message,
-                Some(first.status),
-                None,
-            ));
-        }
-    };
-    if seed_call.challenge != anchor_challenge {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "anchor continuation did not recover the exact hidden token selected by previous_response_id"
-                .to_string(),
-            Some(first.status),
-            None,
-        ));
-    }
-    let call_id = seed_call.call_id.clone();
-    let challenge_nonce = seed_call.challenge.clone();
-
-    let lineage_decoy = send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &anchor_body,
-    )
-    .await?;
-    let Some(lineage_decoy_probe) = parse_successful_response_session_sse_probe(&lineage_decoy)
-    else {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            probe_status_for_failure(lineage_decoy.status, &lineage_decoy.bytes),
-            format!(
-                "lineage decoy returned HTTP {}: {}",
-                lineage_decoy.status,
-                upstream_error_summary(&lineage_decoy.bytes)
-            ),
-            Some(first.status),
-            None,
-        ));
-    };
-    let lineage_decoy_challenge =
-        match response_session_probe_text_challenge(&lineage_decoy_probe.output_items) {
-            Ok(challenge) => challenge,
-            Err(message) => {
-                return Ok(response_session_reuse_probe_result(
-                    provider_id,
-                    model_id,
-                    Some(capability.clone()),
-                    ProviderResponseSessionReuseStatus::Unsupported,
-                    format!("lineage decoy failed: {message}"),
-                    Some(first.status),
-                    None,
-                ));
-            }
-        };
-    if lineage_decoy_challenge == anchor_challenge || lineage_decoy_challenge == freshness_challenge
-    {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            "lineage decoy reused an earlier challenge; non-latest response selection was not verified"
-                .to_string(),
-            Some(first.status),
-            None,
-        ));
-    }
-
-    let function_call_output = json!({
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": fidelity.output.clone(),
-    });
-    let verifier_tool = response_session_fidelity_verifier_tool();
-    let expected_fidelity_arguments =
-        response_session_fidelity_expected_arguments(&seed_call, &fidelity);
-    let continuation_body = json!({
-        "model": model_id,
-        "previous_response_id": previous_response_id,
-        "instructions": response_session_fidelity_render_instructions(),
-        "input": [function_call_output.clone()],
-        "tools": [verifier_tool.clone()],
-        "tool_choice": { "type": "function", "name": "atoapi_fidelity_verify" },
-        "parallel_tool_calls": false,
-        "store": true,
-        "stream": true,
-        "max_output_tokens": 4_096,
-    });
-    debug_assert!(
-        !serde_json::to_string(&continuation_body)
-            .unwrap_or_default()
-            .contains(&challenge_nonce),
-        "the continuation wire must not reveal the seed challenge"
-    );
-    let continuation = send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &continuation_body,
-    )
-    .await?;
-    let Some(continuation_probe) = parse_successful_response_session_sse_probe(&continuation)
-    else {
-        return Ok(response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            Some(capability.clone()),
-            probe_status_for_failure(continuation.status, &continuation.bytes),
-            format!(
-                "continuation returned HTTP {}: {}",
-                continuation.status,
-                upstream_error_summary(&continuation.bytes)
-            ),
-            Some(first.status),
-            Some(continuation.status),
-        ));
-    };
-    let continuation_usage = continuation_probe.usage;
-    if !response_session_probe_verifier_matches(
-        &continuation_probe.output_items,
-        &expected_fidelity_arguments,
-    ) {
-        return Ok(with_response_session_probe_usage(
-            response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability.clone()),
-                ProviderResponseSessionReuseStatus::Unsupported,
-                "continuation succeeded but did not reproduce the exact typed tool manifest"
-                    .to_string(),
-                Some(first.status),
-                Some(continuation.status),
-            ),
-            &first_usage,
-            &continuation_usage,
-            false,
-        ));
-    }
-
-    if let Some(message) =
-        response_session_probe_plain_delta_usage_error(&anchor_usage, &first_usage)
-    {
-        return Ok(with_response_session_probe_usage(
-            response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability.clone()),
-                ProviderResponseSessionReuseStatus::Unverified,
-                message.to_string(),
-                Some(first.status),
-                Some(continuation.status),
-            ),
-            &first_usage,
-            &continuation_usage,
-            false,
-        ));
-    }
-
-    if let Some(message) = response_session_probe_usage_error(&first_usage, &continuation_usage) {
-        return Ok(with_response_session_probe_usage(
-            response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability.clone()),
-                ProviderResponseSessionReuseStatus::Unverified,
-                message.to_string(),
-                Some(first.status),
-                Some(continuation.status),
-            ),
-            &first_usage,
-            &continuation_usage,
-            false,
-        ));
-    }
-
-    let mut compact_input = anchor_input.as_array().cloned().unwrap_or_default();
-    compact_input.extend(anchor_output_items);
-    compact_input.extend(seed_input.as_array().cloned().unwrap_or_default());
-    compact_input.extend(first_output_items);
-    compact_input.push(function_call_output);
-    let compact_body = json!({
-        "model": model_id,
-        "instructions": "Preserve the complete tool-call chain and every byte of its function output. Do not summarize, omit, reorder, or replace tool data with references.",
-        "input": compact_input,
-    });
-    let compact = match send_response_session_compaction_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &compact_body,
-    )
-    .await
-    {
-        Ok(compact) => compact,
-        Err(error) => {
-            return Ok(response_session_direct_verified_result(
-                provider_id,
-                model_id,
-                capability.clone(),
-                format!(
-                    "direct fidelity v3 passed; compaction transport failed and remains FullReplay-only: {error}"
-                ),
-                first.status,
-                continuation.status,
-                &first_usage,
-                &continuation_usage,
-                None,
-                None,
-                false,
-            ));
-        }
-    };
-    if !is_successful_probe_response(&compact) {
-        return Ok(response_session_direct_verified_result(
-            provider_id,
-            model_id,
-            capability.clone(),
-            format!(
-                "direct fidelity v3 passed; compaction returned HTTP {} and remains FullReplay-only: {}",
-                compact.status,
-                upstream_error_summary(&compact.bytes)
-            ),
-            first.status,
-            continuation.status,
-            &first_usage,
-            &continuation_usage,
-            Some(compact.status),
-            None,
-            false,
-        ));
-    }
-    let Some(mut compacted_input) = response_session_compaction_output(&compact.bytes) else {
-        return Ok(response_session_direct_verified_result(
-            provider_id,
-            model_id,
-            capability.clone(),
-            "direct fidelity v3 passed; compaction did not return canonical output and remains FullReplay-only".to_string(),
-            first.status,
-            continuation.status,
-            &first_usage,
-            &continuation_usage,
-            Some(compact.status),
-            None,
-            false,
-        ));
-    };
-    compacted_input.push(response_session_probe_user_message(
-        "Read the compacted context and reproduce the private fidelity markers exactly as previously required.",
-    ));
-    let compact_continuation_body = json!({
-        "model": model_id,
-        "instructions": response_session_fidelity_render_instructions(),
-        "input": compacted_input,
-        "tools": [verifier_tool],
-        "tool_choice": { "type": "function", "name": "atoapi_fidelity_verify" },
-        "parallel_tool_calls": false,
-        "store": true,
-        "stream": true,
-        "max_output_tokens": 4_096,
-    });
-    let compact_continuation = match send_response_session_reuse_probe_request(
-        state,
-        &provider,
-        &selected_key.secret,
-        &compact_continuation_body,
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            return Ok(response_session_direct_verified_result(
-                provider_id,
-                model_id,
-                capability.clone(),
-                format!(
-                    "direct fidelity v3 passed; post-compaction continuation failed and remains FullReplay-only: {error}"
-                ),
-                first.status,
-                continuation.status,
-                &first_usage,
-                &continuation_usage,
-                Some(compact.status),
-                None,
-                false,
-            ));
-        }
-    };
-    let Some(compact_continuation_probe) =
-        parse_successful_response_session_sse_probe(&compact_continuation)
-    else {
-        return Ok(response_session_direct_verified_result(
-            provider_id,
-            model_id,
-            capability.clone(),
-            format!(
-                "direct fidelity v3 passed; post-compaction continuation returned HTTP {} and remains FullReplay-only: {}",
-                compact_continuation.status,
-                upstream_error_summary(&compact_continuation.bytes)
-            ),
-            first.status,
-            continuation.status,
-            &first_usage,
-            &continuation_usage,
-            Some(compact.status),
-            Some(compact_continuation.status),
-            false,
-        ));
-    };
-    if !response_session_probe_verifier_matches(
-        &compact_continuation_probe.output_items,
-        &expected_fidelity_arguments,
-    ) {
-        return Ok(response_session_direct_verified_result(
-            provider_id,
-            model_id,
-            capability.clone(),
-            "direct fidelity v3 passed; post-compaction typed fidelity failed and remains FullReplay-only"
-                .to_string(),
-            first.status,
-            continuation.status,
-            &first_usage,
-            &continuation_usage,
-            Some(compact.status),
-            Some(compact_continuation.status),
-            false,
-        ));
-    }
-
-    Ok(response_session_direct_verified_result(
-        provider_id,
-        model_id,
-        capability,
-        format!(
-            "fidelity v3 verification passed; direct typed continuation, compaction continuation, and cached-token usage were preserved (seed input {}, continuation input {}, cached {})",
-            first_usage.input_tokens,
-            continuation_usage.input_tokens,
-            continuation_usage.cache_read_tokens
-        ),
-        first.status,
-        continuation.status,
-        &first_usage,
-        &continuation_usage,
-        Some(compact.status),
-        Some(compact_continuation.status),
-        true,
-    ))
-}
-
-#[derive(Debug)]
-struct ResponseSessionFidelityPayload {
-    output: String,
-    manifest: Value,
-}
-
-fn build_response_session_fidelity_payload(nonce: &str) -> ResponseSessionFidelityPayload {
-    let marker = |suffix: &str| format!("ATO_FID_{nonce}_{suffix}");
-    let file_path = format!("G:/atoapi/probe/{}.rs", marker("FILE_PATH"));
-    let file_content = format!(
-        "fn fidelity_probe() {{\n    println!(\"{}\");\n}}\n",
-        marker("FILE_CONTENT")
-    );
-    let stdout = format!(
-        "compile succeeded {}\nsecond stdout line retained\n",
-        marker("STDOUT")
-    );
-    let stderr = format!("warning stream {} retained\n", marker("STDERR"));
-    let error_code = marker("ERROR_CODE");
-    let error_message = format!("structured failure {}", marker("ERROR_MESSAGE"));
-    let unicode = format!("{}_汉字_Δ_🙂_换行\n保留", marker("UNICODE"));
-    let long_start = marker("LONG_START");
-    let long_middle = marker("LONG_MIDDLE");
-    let long_end = marker("LONG_END");
-    let repeated = marker("REPEATED");
-    let ordered = marker("ORDERED_BETWEEN_REPEATS");
-    let long_value = format!(
-        " {long_start} {} {long_middle} {} {long_end} ",
-        "0123456789abcdef".repeat(256),
-        "fedcba9876543210".repeat(256),
-    );
-    let manifest = json!({
-        "file": {
-            "path": file_path,
-            "content": file_content,
-        },
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": 37,
-        "error": {
-            "code": error_code,
-            "message": error_message,
-            "retryable": false,
-        },
-        "unicode": unicode,
-        "long_content": long_value,
-        "ordered_repeated": [repeated, ordered, repeated],
-    });
-    ResponseSessionFidelityPayload {
-        output: serde_json::to_string(&manifest).expect("a fixed fidelity fixture must serialize"),
-        manifest,
-    }
-}
-
-fn response_session_fidelity_render_instructions() -> &'static str {
-    "Call the required verifier function exactly once. Copy the complete prior function-call envelope into seed_function_call, including id, status, call_id, name, and the original arguments JSON string. Set challenge to the exact value from those prior arguments. Decode the function result JSON and copy every other field into the verifier arguments without changing types, nesting, bytes, Unicode, newlines, long content, duplicates, or order. Emit no assistant text."
-}
-
-fn response_session_fidelity_verifier_tool() -> Value {
-    json!({
-        "type": "function",
-        "name": "atoapi_fidelity_verify",
-        "description": "Returns the exact typed fidelity manifest received from the prior tool result.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "challenge": { "type": "string" },
-                "seed_function_call": {
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "status": { "type": "string" },
-                        "call_id": { "type": "string" },
-                        "name": { "type": "string" },
-                        "arguments": { "type": "string" }
-                    },
-                    "required": ["id", "status", "call_id", "name", "arguments"],
-                    "additionalProperties": false
-                },
-                "file": {
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["path", "content"],
-                    "additionalProperties": false
-                },
-                "stdout": { "type": "string" },
-                "stderr": { "type": "string" },
-                "exit_code": { "type": "integer" },
-                "error": {
-                    "type": "object",
-                    "properties": {
-                        "code": { "type": "string" },
-                        "message": { "type": "string" },
-                        "retryable": { "type": "boolean" }
-                    },
-                    "required": ["code", "message", "retryable"],
-                    "additionalProperties": false
-                },
-                "unicode": { "type": "string" },
-                "long_content": { "type": "string" },
-                "ordered_repeated": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "minItems": 3,
-                    "maxItems": 3
-                }
-            },
-            "required": [
-                "challenge",
-                "seed_function_call",
-                "file",
-                "stdout",
-                "stderr",
-                "exit_code",
-                "error",
-                "unicode",
-                "long_content",
-                "ordered_repeated"
-            ],
-            "additionalProperties": false
-        }
-    })
-}
-
-fn response_session_fidelity_expected_arguments(
-    seed_call: &ResponseSessionProbeFunctionCall,
-    payload: &ResponseSessionFidelityPayload,
-) -> Value {
-    let mut expected = payload
-        .manifest
-        .as_object()
-        .cloned()
-        .expect("the fixed fidelity manifest must be an object");
-    expected.insert(
-        "challenge".to_string(),
-        Value::String(seed_call.challenge.clone()),
-    );
-    expected.insert(
-        "seed_function_call".to_string(),
-        json!({
-            "id": seed_call.item_id.clone(),
-            "status": seed_call.status.clone(),
-            "call_id": seed_call.call_id.clone(),
-            "name": seed_call.name.clone(),
-            "arguments": seed_call.arguments.clone(),
-        }),
-    );
-    Value::Object(expected)
-}
-
-fn response_session_probe_user_message(text: &str) -> Value {
-    json!({
-        "type": "message",
-        "role": "user",
-        "content": [{ "type": "input_text", "text": text }],
-    })
-}
-
-fn response_session_probe_text_challenge(
-    output_items: &[Value],
-) -> std::result::Result<String, String> {
-    if output_items.iter().any(|item| {
-        !matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("reasoning" | "message")
-        )
-    }) {
-        return Err(
-            "anchor response included output beside reasoning and one assistant message"
-                .to_string(),
-        );
-    }
-    let messages = output_items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
-        .collect::<Vec<_>>();
-    let [message] = messages.as_slice() else {
-        return Err("anchor response did not contain exactly one assistant message".to_string());
-    };
-    if message.get("role").and_then(Value::as_str) != Some("assistant")
-        || message.get("status").and_then(Value::as_str) != Some("completed")
-    {
-        return Err("anchor assistant message was not completed".to_string());
-    }
-    let content = message
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "anchor assistant message did not contain output text".to_string())?;
-    let [content] = content.as_slice() else {
-        return Err("anchor assistant message did not contain exactly one output item".to_string());
-    };
-    if content.get("type").and_then(Value::as_str) != Some("output_text") {
-        return Err("anchor assistant message did not contain output_text".to_string());
-    }
-    let challenge = content
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "anchor output_text did not contain a token".to_string())?;
-    let distinct = challenge.as_bytes().iter().copied().collect::<HashSet<_>>();
-    if challenge.len() != 64
-        || !challenge
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || distinct.len() < 8
-    {
-        return Err(
-            "anchor response did not generate a valid unpredictable hexadecimal token".to_string(),
-        );
-    }
-    if output_items.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("reasoning")
-            && serde_json::to_string(item)
-                .unwrap_or_default()
-                .contains(challenge)
-    }) {
-        return Err("anchor token leaked into visible reasoning output".to_string());
-    }
-    Ok(challenge.to_string())
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ResponseSessionProbeFunctionCall {
-    item_id: String,
-    status: String,
-    call_id: String,
-    name: String,
-    arguments: String,
-    challenge: String,
-}
-
-fn response_session_probe_function_call(
-    output_items: &[Value],
-    expected_name: &str,
-) -> std::result::Result<ResponseSessionProbeFunctionCall, String> {
-    let call = response_session_probe_single_function_call(output_items, expected_name)?;
-    let item_id = call
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "seed function call did not include a valid item id".to_string())?;
-    let status = call
-        .get("status")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "seed function call did not include a valid status".to_string())?;
-    let call_id = call
-        .get("call_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "seed function call did not include a valid call_id".to_string())?;
-    let name = call
-        .get("name")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "seed function call did not include a valid name".to_string())?;
-    let arguments_raw = call
-        .get("arguments")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "seed function call arguments were not an exact JSON string".to_string())?;
-    let arguments = serde_json::from_str::<Value>(arguments_raw)
-        .map_err(|_| "seed function call arguments were not valid JSON".to_string())?;
-    let Some(arguments) = arguments.as_object() else {
-        return Err("seed function call arguments were not a JSON object".to_string());
-    };
-    let Some(challenge) = arguments.get("challenge").and_then(Value::as_str) else {
-        return Err("seed function call did not generate a challenge".to_string());
-    };
-    let distinct = challenge.as_bytes().iter().copied().collect::<HashSet<_>>();
-    let lowercase_hex = challenge
-        .bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-    if arguments.len() != 1 || challenge.len() != 64 || !lowercase_hex || distinct.len() < 8 {
-        return Err(format!(
-            "seed function call did not generate a valid unpredictable hexadecimal challenge (fields={}, length={}, lowercase_hex={}, distinct={})",
-            arguments.len(),
-            challenge.len(),
-            lowercase_hex,
-            distinct.len()
-        ));
-    }
-    if output_items.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("reasoning")
-            && serde_json::to_string(item)
-                .unwrap_or_default()
-                .contains(challenge)
-    }) {
-        return Err(
-            "seed challenge leaked outside the structured function-call arguments".to_string(),
-        );
-    }
-    Ok(ResponseSessionProbeFunctionCall {
-        item_id: item_id.to_string(),
-        status: status.to_string(),
-        call_id: call_id.to_string(),
-        name: name.to_string(),
-        arguments: arguments_raw.to_string(),
-        challenge: challenge.to_string(),
-    })
-}
-
-fn response_session_probe_single_function_call<'a>(
-    output_items: &'a [Value],
-    expected_name: &str,
-) -> std::result::Result<&'a Value, String> {
-    if output_items.iter().any(|item| {
-        !matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("reasoning" | "function_call")
-        )
-    }) {
-        return Err("seed response included unexpected output beside reasoning and the required function call".to_string());
-    }
-    let calls = output_items
-        .iter()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
-        .collect::<Vec<_>>();
-    let [call] = calls.as_slice() else {
-        return Err("response did not produce exactly one required function call".to_string());
-    };
-    if call.get("name").and_then(Value::as_str) != Some(expected_name) {
-        return Err("seed response called a different function".to_string());
-    }
-    call.get("id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "seed function call did not include a valid item id".to_string())?;
-    if call.get("status").and_then(Value::as_str) != Some("completed") {
-        return Err("seed function call did not finish with completed status".to_string());
-    }
-    call.get("call_id")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "function call did not include a valid call_id".to_string())?;
-    Ok(call)
-}
-
-fn response_session_probe_verifier_matches(
-    output_items: &[Value],
-    expected_arguments: &Value,
-) -> bool {
-    let Ok(call) =
-        response_session_probe_single_function_call(output_items, "atoapi_fidelity_verify")
-    else {
-        return false;
-    };
-    let Some(arguments) = call.get("arguments").and_then(Value::as_str) else {
-        return false;
-    };
-    serde_json::from_str::<Value>(arguments).is_ok_and(|arguments| arguments == *expected_arguments)
-}
-
-fn response_session_compaction_output(bytes: &[u8]) -> Option<Vec<Value>> {
-    let value = serde_json::from_slice::<Value>(bytes).ok()?;
-    let output = value.get("output").and_then(Value::as_array)?.clone();
-    if !output
-        .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction"))
-    {
-        return None;
-    }
-    (!output.is_empty()).then_some(output)
-}
-
-fn response_session_probe_usage_error(
-    first: &UsageRecord,
-    continuation: &UsageRecord,
-) -> Option<&'static str> {
-    if first.input_tokens == 0 {
-        return Some("semantic continuation succeeded but the seed response did not report input usage; session reuse remains disabled");
-    }
-    if continuation.input_tokens == 0 {
-        return Some("semantic continuation succeeded but the continuation did not report input usage; session reuse remains disabled");
-    }
-    if continuation.input_tokens < first.input_tokens {
-        return Some("semantic continuation succeeded but continuation usage did not include the seed context; session reuse remains disabled");
-    }
-    if continuation.cache_read_tokens < PROVIDER_CACHE_MIN_BUCKET_TOKENS {
-        return Some("semantic continuation succeeded but the continuation did not report one full 128-token cache bucket; no cache benefit was verified");
-    }
-    None
-}
-
-fn response_session_probe_plain_delta_usage_error(
-    anchor: &UsageRecord,
-    plain_delta: &UsageRecord,
-) -> Option<&'static str> {
-    if anchor.input_tokens == 0 {
-        return Some("plain previous_response_id continuation succeeded but the anchor response did not report input usage; session reuse remains disabled");
-    }
-    if plain_delta.input_tokens == 0 {
-        return Some("plain previous_response_id continuation succeeded but did not report input usage; session reuse remains disabled");
-    }
-    if plain_delta.input_tokens < anchor.input_tokens {
-        return Some("plain previous_response_id continuation usage did not include the selected anchor context; session reuse remains disabled");
-    }
-    if plain_delta.cache_read_tokens < PROVIDER_CACHE_MIN_BUCKET_TOKENS {
-        return Some("plain previous_response_id continuation did not report one full 128-token cache bucket; no cache benefit was verified");
-    }
-    None
-}
-
-fn with_response_session_probe_usage(
-    mut result: ProviderResponseSessionReuseProbeResult,
-    first: &UsageRecord,
-    continuation: &UsageRecord,
-    usage_verified: bool,
-) -> ProviderResponseSessionReuseProbeResult {
-    result.first_input_tokens = (first.input_tokens > 0).then_some(first.input_tokens);
-    result.first_cached_tokens = (first.input_tokens > 0).then_some(first.cache_read_tokens);
-    result.continuation_input_tokens =
-        (continuation.input_tokens > 0).then_some(continuation.input_tokens);
-    result.continuation_cached_tokens =
-        (continuation.input_tokens > 0).then_some(continuation.cache_read_tokens);
-    result.usage_verified = usage_verified;
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn response_session_direct_verified_result(
-    provider_id: &str,
-    model_id: &str,
-    capability: ProviderResponseSessionReuseCapability,
-    message: String,
-    first_status: u16,
-    continuation_status: u16,
-    first_usage: &UsageRecord,
-    continuation_usage: &UsageRecord,
-    compact_status: Option<u16>,
-    compact_continuation_status: Option<u16>,
-    compact_fidelity_verified: bool,
-) -> ProviderResponseSessionReuseProbeResult {
-    with_response_session_probe_compaction_statuses(
-        with_response_session_probe_usage(
-            response_session_reuse_probe_result(
-                provider_id,
-                model_id,
-                Some(capability),
-                ProviderResponseSessionReuseStatus::Verified,
-                message,
-                Some(first_status),
-                Some(continuation_status),
-            ),
-            first_usage,
-            continuation_usage,
-            true,
-        ),
-        compact_status,
-        compact_continuation_status,
-        compact_fidelity_verified,
-    )
-}
-
-fn with_response_session_probe_compaction_statuses(
-    mut result: ProviderResponseSessionReuseProbeResult,
-    compact_status: Option<u16>,
-    compact_continuation_status: Option<u16>,
-    compact_fidelity_verified: bool,
-) -> ProviderResponseSessionReuseProbeResult {
-    result.compact_status = compact_status;
-    result.compact_continuation_status = compact_continuation_status;
-    result.compact_fidelity_verified = compact_fidelity_verified;
-    result
-}
-
-pub(crate) async fn probe_provider_responses_websocket(
-    state: &AppState,
-    provider_id: &str,
-    model_id: &str,
-) -> Result<responses_websocket_probe::ResponsesWebSocketProbeResult> {
-    let provider_id = provider_id.trim();
-    let model_id = model_id.trim();
-    if provider_id.is_empty() || model_id.is_empty() {
-        return Err(anyhow!(
-            "provider and actual upstream model are required for WebSocket verification"
-        ));
-    }
-    let (provider, explicit_proxy_url) = {
-        let config = state.config.read().await;
-        let provider = config
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
-        let explicit_proxy_url = config
-            .upstream_proxy_url_for(provider.use_system_proxy)
-            .map(str::to_owned);
-        (provider, explicit_proxy_url)
-    };
-    if !provider.enabled {
-        return Err(anyhow!("provider {} is disabled", provider.name));
-    }
-    let selected_key = select_provider_api_key(state, provider_id, None, None).await?;
-    if selected_key.secret.trim().is_empty() {
-        return Err(anyhow!("provider API key is not configured"));
-    }
-
-    Ok(responses_websocket_probe::probe_responses_websocket(
-        responses_websocket_probe::ResponsesWebSocketProbeTarget {
-            provider_id: provider.id.clone(),
-            model_id: model_id.to_string(),
-            responses_url: upstream_url(&provider.base_url, &Channel::Responses),
-            api_key: selected_key.secret,
-            use_system_proxy: provider.use_system_proxy,
-            explicit_proxy_url,
-            custom_user_agent: provider.custom_user_agent.clone(),
-        },
-    )
-    .await)
-}
-
-pub(crate) async fn probe_and_record_provider_response_session_reuse(
-    state: &AppState,
-    provider_id: &str,
-    model_id: &str,
-) -> Result<ProviderResponseSessionReuseProbeResult> {
-    let provider_id = provider_id.trim();
-    let model_id = model_id.trim();
-    if provider_id.is_empty() || model_id.is_empty() {
-        return Err(anyhow!(
-            "provider and actual upstream model are required for verification"
-        ));
-    }
-    let (probe_target, probe_record_snapshot) = {
-        let config = state.config.read().await;
-        (
-            config
-                .response_session_reuse_probe_target(provider_id)
-                .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?,
-            config.response_session_reuse_record_snapshot(provider_id, model_id),
-        )
-    };
-
-    let mut result = match probe_provider_response_session_reuse(state, provider_id, model_id).await
-    {
-        Ok(result) => result,
-        Err(err) => response_session_reuse_probe_result(
-            provider_id,
-            model_id,
-            None,
-            ProviderResponseSessionReuseStatus::Error,
-            err.to_string(),
-            None,
-            None,
-        ),
-    };
-
-    let persist_version = {
-        let mut config = state.config.write().await;
-        if config
-            .response_session_reuse_probe_target(provider_id)
-            .as_ref()
-            != Some(&probe_target)
-            || config.response_session_reuse_record_snapshot(provider_id, model_id)
-                != probe_record_snapshot
-        {
-            result.status = ProviderResponseSessionReuseStatus::Error;
-            result.enabled = false;
-            result.usage_verified = false;
-            result.message = "Provider settings or session-reuse preference changed while compatibility verification was running; verify again."
-                .to_string();
-            result.checked_at = Some(Utc::now());
-            return Ok(result);
-        }
-        config.record_response_session_reuse_probe(
-            provider_id,
-            model_id,
-            result.capability.clone(),
-            result.status.clone(),
-            result.usage_verified,
-            (!matches!(&result.status, ProviderResponseSessionReuseStatus::Verified))
-                .then(|| result.message.clone()),
-        );
-        config.set_response_session_reuse_compact_fidelity(
-            provider_id,
-            model_id,
-            result.capability.as_ref(),
-            result.compact_fidelity_verified,
-        );
-        state.publish_config_snapshot(&config)?
-    };
-    state.wait_for_config_snapshot(persist_version).await?;
-    result.checked_at = Some(Utc::now());
-    Ok(result)
-}
-
-async fn send_response_session_reuse_probe_request(
-    state: &AppState,
-    provider: &ProviderConfig,
-    api_key: &str,
-    body: &Value,
-) -> Result<ResponseSessionReuseProbeResponse> {
-    send_provider_management_probe_request(
-        state,
-        provider,
-        api_key,
-        &Channel::Responses,
-        body,
-        RESPONSE_SESSION_PROBE_REQUEST_KIND,
-    )
-    .await
-}
-
-async fn send_response_session_compaction_probe_request(
-    state: &AppState,
-    provider: &ProviderConfig,
-    api_key: &str,
-    body: &Value,
-) -> Result<ResponseSessionReuseProbeResponse> {
-    send_provider_management_probe_request_to_url(
-        state,
-        provider,
-        api_key,
-        &Channel::Responses,
-        responses_compact_collection_url(&provider.base_url),
-        body,
-        RESPONSE_SESSION_PROBE_REQUEST_KIND,
-    )
-    .await
-}
-
 async fn send_provider_management_probe_request(
     state: &AppState,
     provider: &ProviderConfig,
@@ -11492,7 +9317,7 @@ async fn send_provider_management_probe_request(
     channel: &Channel,
     body: &Value,
     request_kind: &'static str,
-) -> Result<ResponseSessionReuseProbeResponse> {
+) -> Result<ProviderManagementProbeResponse> {
     send_provider_management_probe_request_to_url(
         state,
         provider,
@@ -11513,7 +9338,7 @@ async fn send_provider_management_probe_request_to_url(
     url: String,
     body: &Value,
     request_kind: &'static str,
-) -> Result<ResponseSessionReuseProbeResponse> {
+) -> Result<ProviderManagementProbeResponse> {
     let started = Instant::now();
     let mut management_headers = HeaderMap::new();
     management_headers.insert(
@@ -11548,92 +9373,16 @@ async fn send_provider_management_probe_request_to_url(
         headers_at_ms,
     )
     .await?;
-    Ok(ResponseSessionReuseProbeResponse {
+    Ok(ProviderManagementProbeResponse {
         status,
         content_type,
         bytes: body.bytes,
     })
 }
 
-fn is_successful_probe_response(response: &ResponseSessionReuseProbeResponse) -> bool {
+fn is_successful_probe_response(response: &ProviderManagementProbeResponse) -> bool {
     (200..300).contains(&response.status)
         && !upstream_body_has_error(&response.bytes, &response.content_type)
-}
-
-#[cfg(test)]
-fn is_successful_response_session_sse_probe(response: &ResponseSessionReuseProbeResponse) -> bool {
-    parse_successful_response_session_sse_probe(response).is_some()
-}
-
-fn parse_successful_response_session_sse_probe(
-    response: &ResponseSessionReuseProbeResponse,
-) -> Option<ParsedResponseSessionSseProbe> {
-    if !is_successful_probe_response(response)
-        || !response
-            .content_type
-            .to_ascii_lowercase()
-            .contains("text/event-stream")
-    {
-        return None;
-    }
-    let mut stream = ResponsesStreamState::default();
-    stream.ingest(&response.bytes);
-    let summary = stream.finish();
-    if !evaluate_terminal(
-        &Channel::Responses,
-        TerminalCompatibility::Strict,
-        &summary,
-        StreamEnd::CleanEof,
-    )
-    .success
-    {
-        return None;
-    }
-    Some(ParsedResponseSessionSseProbe {
-        response_id: summary.response_id?,
-        usage: summary.usage,
-        output_items: summary.output_items,
-    })
-}
-
-fn probe_status_for_failure(status: u16, bytes: &[u8]) -> ProviderResponseSessionReuseStatus {
-    if response_session_rejection_classification(status, &upstream_error_summary(bytes))
-        == ResponseSessionRejectionClass::Unsupported
-    {
-        ProviderResponseSessionReuseStatus::Unsupported
-    } else {
-        ProviderResponseSessionReuseStatus::Error
-    }
-}
-
-fn response_session_reuse_probe_result(
-    provider_id: &str,
-    model_id: &str,
-    capability: Option<ProviderResponseSessionReuseCapability>,
-    status: ProviderResponseSessionReuseStatus,
-    message: String,
-    first_status: Option<u16>,
-    continuation_status: Option<u16>,
-) -> ProviderResponseSessionReuseProbeResult {
-    ProviderResponseSessionReuseProbeResult {
-        provider_id: provider_id.to_string(),
-        model_id: model_id.to_string(),
-        capability,
-        enabled: status == ProviderResponseSessionReuseStatus::Verified,
-        status,
-        message,
-        checked_at: Some(Utc::now()),
-        first_status,
-        continuation_status,
-        compact_status: None,
-        compact_continuation_status: None,
-        first_input_tokens: None,
-        first_cached_tokens: None,
-        continuation_input_tokens: None,
-        continuation_cached_tokens: None,
-        usage_verified: false,
-        compact_fidelity_verified: false,
-    }
 }
 
 fn build_upstream_request_headers(
@@ -13422,49 +11171,18 @@ fn apply_candidate_prompt_cache_routing(
     }
 }
 
-/// The compatibility recovery path is opt-out only after the exact upstream
-/// realm explicitly rejects the field. Unknown and transient probe failures
-/// must not be treated as schema rejection, otherwise a 5xx would silently
-/// erase the v1.3.6 cache-affinity behavior.
-fn generated_prompt_cache_key_compatibility_allowed(
-    config: &AppConfig,
-    decision: &RouteDecision,
-    channel: &Channel,
-    key_id: Option<&str>,
-) -> bool {
-    config.cache_capability_status_for_key(
-        &decision.provider.id,
-        &decision.model,
-        channel,
-        key_id,
-        ProviderCacheCapabilityField::PromptCacheKey,
-    ) != ProviderCacheCapabilityStatus::Unsupported
-}
-
-/// Selects the final provider cache placement without weakening Key-realm
-/// isolation. A normal direct connection keeps the v1.3.4 key so a desktop
-/// upgrade can retain its warm upstream cache; pool selection, candidates and
-/// promoted routes always use the newer selected-Key-realm placement.
+/// Selects an Atoapi-generated placement only for a controlled candidate or
+/// a positive, exact-session effect certificate. Unknown third-party cache
+/// schemas never receive a speculative `prompt_cache_key` on ordinary traffic.
 fn selected_prompt_cache_placement_key<'a>(
-    legacy_direct_key: Option<&'a str>,
     generated_key: Option<&'a str>,
-    selected_provider_key: &SelectedProviderKey,
-    recovery_enabled: bool,
     candidate_requested: bool,
     promoted: bool,
     eligible: bool,
 ) -> Option<&'a str> {
-    if !eligible || !(recovery_enabled || candidate_requested || promoted) {
-        return None;
-    }
-    if recovery_enabled
-        && !candidate_requested
-        && !promoted
-        && selected_provider_key.key_id.is_none()
-    {
-        return legacy_direct_key;
-    }
-    generated_key
+    (eligible && (candidate_requested || promoted))
+        .then_some(generated_key)
+        .flatten()
 }
 
 /// The production placement key is fully Atoapi-owned. It combines a stable
@@ -17298,17 +15016,6 @@ fn responses_compact_url(base_url: &str, response_id: &str) -> String {
     }
 }
 
-fn responses_compact_collection_url(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if trimmed.ends_with("/responses") {
-        format!("{trimmed}/compact")
-    } else if trimmed.ends_with("/v1") {
-        format!("{trimmed}/responses/compact")
-    } else {
-        format!("{trimmed}/v1/responses/compact")
-    }
-}
-
 fn compact_request_set_response_id(request: &mut Value, response_id: &str) {
     if let Value::Object(object) = request {
         object.insert(
@@ -17741,21 +15448,6 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for final-scope {outcome} >= {target}"));
     }
 
-    fn test_session_reuse_capability(
-        decision: &RouteDecision,
-        secret: &str,
-        key_id: Option<&str>,
-    ) -> ProviderResponseSessionReuseCapability {
-        response_session_capability(
-            decision,
-            &SelectedProviderKey {
-                secret: secret.to_string(),
-                key_id: key_id.map(ToOwned::to_owned),
-            },
-            ResponseSessionReuseStreamShape::StreamSse,
-        )
-    }
-
     fn configure_test_codex_agent(config: &mut AppConfig, provider_id: &str) {
         config.agent_injections = vec![AgentInjectionConfig {
             id: "codex".to_string(),
@@ -17959,13 +15651,6 @@ mod tests {
         assert!(snapshot.recent_upstream_calls.is_empty());
     }
 
-    fn admin_probe_request(provider_id: &str, model_id: &str, local_key: Option<&str>) -> Request {
-        admin_request_with_body(
-            json!({ "provider_id": provider_id, "model_id": model_id }).to_string(),
-            local_key,
-        )
-    }
-
     fn admin_request_with_body(body: String, local_key: Option<&str>) -> Request {
         let mut request = Request::new(Body::from(body));
         request.headers_mut().insert(
@@ -18040,7 +15725,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             LineageParent::FullReplay,
             false,
             false,
@@ -18096,7 +15780,6 @@ mod tests {
             None,
             None,
             AppConfig::default(),
-            None,
             None,
             None,
             None,
@@ -20436,7 +18119,6 @@ mod tests {
 
         assert!(request.get("prompt_cache_key").is_none());
         assert!(request.get("prompt_cache_retention").is_none());
-        assert!(!responses_session_reuse_enabled(&config));
         assert!(!local_session_keys_enabled(&config));
     }
 
@@ -20456,7 +18138,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_cache_controls_and_verified_session_reuse_are_independent_of_prewarm() {
+    fn stable_cache_controls_do_not_depend_on_prewarm() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
         config.cache.prewarm_enabled = false;
@@ -20499,7 +18181,6 @@ mod tests {
         assert!(!changed.iter().any(|field| field == "prompt_cache_options"));
         assert!(native_request.body().get("prompt_cache_options").is_none());
         assert!(smart_hit_enabled(&config));
-        assert!(responses_session_reuse_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
             Some(TokioDuration::from_millis(500))
@@ -20556,7 +18237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_lock_busy_skips_prefix_guard_without_delaying_the_inbound_plan() {
+    async fn prefix_snapshot_waits_for_the_short_state_lock_instead_of_dropping_evidence() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-snapshot-lock-{}",
             Uuid::new_v4().simple()
@@ -20567,10 +18248,19 @@ mod tests {
             CacheStore::load(cache_path(&dir)).unwrap(),
         )
         .unwrap();
-        let held = state.prefix_states.lock().await;
+        let mut held = state.prefix_states.clone().lock_owned().await;
+        held.insert(
+            "snapshot-prefix".to_string(),
+            prefix_state(64_512, 63_872, 0),
+        );
+        let release = tokio::spawn(async move {
+            sleep(TokioDuration::from_millis(20)).await;
+            drop(held);
+        });
 
+        let started = Instant::now();
         let wait = tokio::time::timeout(
-            TokioDuration::from_millis(5),
+            TokioDuration::from_millis(100),
             wait_for_provider_prefix_settle(
                 &state,
                 &Channel::Responses,
@@ -20582,13 +18272,16 @@ mod tests {
             ),
         )
         .await
-        .expect("a runtime snapshot lock must not delay a Responses request");
+        .expect("the short runtime snapshot lock must settle promptly");
 
+        release.await.unwrap();
+        assert!(started.elapsed() >= TokioDuration::from_millis(15));
+        assert_eq!(wait.source.as_deref(), Some("exact"));
         assert_eq!(
             wait.skip_reason.as_deref(),
-            Some("runtime_snapshot_lock_busy")
+            Some("local_guard_budget_exhausted")
         );
-        drop(held);
+        assert!(wait.recovery_applicable);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -20947,6 +18640,179 @@ mod tests {
     }
 
     #[test]
+    fn frozen_cache_controls_require_exact_provider_model_key_and_effect_scope() {
+        let mut config = AppConfig::default();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let provider = ProviderConfig {
+            id: "scoped-provider".to_string(),
+            name: "scoped-provider".to_string(),
+            base_url: "https://provider.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: Some("key-a-secret".to_string()),
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let decision = RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let selected_key = SelectedProviderKey {
+            secret: "key-a-secret".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let exact_scope = cache_validation::CacheValidationScope {
+            channel: Channel::Responses,
+            key_id: selected_key.key_id.clone(),
+            realm_id: affinity_identity::realm_id(&decision, &selected_key),
+            stream: Some(true),
+            store: None,
+            generated_key_session_scope_id: None,
+        }
+        .effect_scope_id(None);
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            selected_key.key_id.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            &decision.provider.id,
+            &decision.model,
+            &Channel::Responses,
+            selected_key.key_id.as_deref(),
+            Some(&exact_scope),
+            &[ProviderCacheCapabilityField::PromptCacheRetention],
+            ProviderCacheEffectStatus::Promoted,
+            Some("exact selected-key effect certificate".to_string()),
+            Some(0),
+            Some(128),
+            Some(100),
+            Some(100),
+        );
+        let fresh_body = || {
+            PreparedResponseBody::responses(json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "prompt_cache_retention": "24h",
+                "input": [{ "type": "message", "role": "user", "content": "stable" }]
+            }))
+        };
+
+        let mut exact = fresh_body();
+        apply_native_cache_controls_with_probe_fields(
+            &mut exact,
+            &config,
+            &decision,
+            &Channel::Responses,
+            selected_key.key_id.as_deref(),
+            Some(&exact_scope),
+            &[],
+        );
+        let exact_envelope = GenerationEnvelope::freeze(
+            &decision.provider,
+            "https://provider.example/v1/responses",
+            Channel::Responses,
+            exact,
+        );
+        let exact_receipt = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        })
+        .seal(&exact_envelope);
+        assert_eq!(
+            exact_envelope
+                .body()
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h")
+        );
+        assert!(exact_receipt
+            .cache_controls
+            .present_fields()
+            .contains(&ProviderCacheCapabilityField::PromptCacheRetention));
+
+        let mut wrong_key = fresh_body();
+        apply_native_cache_controls_with_probe_fields(
+            &mut wrong_key,
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-b"),
+            Some(&exact_scope),
+            &[],
+        );
+        assert!(wrong_key.body().get("prompt_cache_retention").is_none());
+
+        let mut wrong_scope = fresh_body();
+        apply_native_cache_controls_with_probe_fields(
+            &mut wrong_scope,
+            &config,
+            &decision,
+            &Channel::Responses,
+            selected_key.key_id.as_deref(),
+            Some("v2:wrong-scope"),
+            &[],
+        );
+        assert!(wrong_scope.body().get("prompt_cache_retention").is_none());
+
+        let wrong_model = RouteDecision {
+            model: "gpt-5.6".to_string(),
+            ..decision.clone()
+        };
+        let mut wrong_model_body = fresh_body();
+        apply_native_cache_controls_with_probe_fields(
+            &mut wrong_model_body,
+            &config,
+            &wrong_model,
+            &Channel::Responses,
+            selected_key.key_id.as_deref(),
+            Some(&exact_scope),
+            &[],
+        );
+        assert!(wrong_model_body
+            .body()
+            .get("prompt_cache_retention")
+            .is_none());
+
+        let wrong_provider = RouteDecision {
+            provider: ProviderConfig {
+                id: "other-provider".to_string(),
+                ..provider
+            },
+            ..decision
+        };
+        let mut wrong_provider_body = fresh_body();
+        apply_native_cache_controls_with_probe_fields(
+            &mut wrong_provider_body,
+            &config,
+            &wrong_provider,
+            &Channel::Responses,
+            selected_key.key_id.as_deref(),
+            Some(&exact_scope),
+            &[],
+        );
+        assert!(wrong_provider_body
+            .body()
+            .get("prompt_cache_retention")
+            .is_none());
+    }
+
+    #[test]
     fn official_openai_responses_provider_does_not_assume_prompt_cache_retention() {
         let mut config = AppConfig::default();
         config.cache.enabled = true;
@@ -21264,62 +19130,21 @@ mod tests {
     }
 
     #[test]
-    fn direct_key_keeps_legacy_placement_while_pool_and_validation_use_realm_key() {
-        let direct = SelectedProviderKey {
-            secret: "connection-key".to_string(),
-            key_id: None,
-        };
-        let pooled = SelectedProviderKey {
-            secret: "pool-key".to_string(),
-            key_id: Some("key-a".to_string()),
-        };
-
+    fn generated_prompt_cache_key_requires_candidate_or_proven_scope() {
         assert_eq!(
-            selected_prompt_cache_placement_key(
-                Some("v1-3-4-placement"),
-                Some("realm-placement"),
-                &direct,
-                true,
-                false,
-                false,
-                true,
-            ),
-            Some("v1-3-4-placement")
+            selected_prompt_cache_placement_key(Some("realm-placement"), false, false, true,),
+            None
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(
-                Some("v1-3-4-placement"),
-                Some("realm-placement"),
-                &pooled,
-                true,
-                false,
-                false,
-                true,
-            ),
+            selected_prompt_cache_placement_key(Some("realm-placement"), true, false, true,),
             Some("realm-placement")
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(
-                Some("v1-3-4-placement"),
-                Some("realm-placement"),
-                &direct,
-                true,
-                true,
-                false,
-                true,
-            ),
+            selected_prompt_cache_placement_key(Some("realm-placement"), false, true, true,),
             Some("realm-placement")
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(
-                Some("v1-3-4-placement"),
-                Some("realm-placement"),
-                &direct,
-                false,
-                false,
-                false,
-                true,
-            ),
+            selected_prompt_cache_placement_key(Some("realm-placement"), false, false, false,),
             None
         );
     }
@@ -21844,56 +19669,6 @@ mod tests {
     }
 
     #[test]
-    fn response_session_delta_body_rebuilds_non_input_fields_exactly() {
-        let request = json!({
-            "model": "client-model",
-            "stream": true,
-            "store": false,
-            "instructions": "stable instructions",
-            "tools": [{"type": "function", "name": "read_file"}],
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "large history ".repeat(10_000)
-            }],
-            "metadata": {"conversation": "stable"},
-            "vendor_extension": {"enabled": true}
-        });
-        let delta_input = json!([{
-            "type": "message",
-            "role": "user",
-            "content": "new tail"
-        }]);
-
-        let mut legacy = request.clone();
-        let legacy_object = legacy.as_object_mut().unwrap();
-        legacy_object.insert(
-            "previous_response_id".to_string(),
-            Value::String("resp_previous".to_string()),
-        );
-        legacy_object.insert("input".to_string(), delta_input.clone());
-        legacy_object.insert(
-            "model".to_string(),
-            Value::String("resolved-model".to_string()),
-        );
-
-        let optimized = build_response_session_delta_body(
-            &request,
-            delta_input,
-            "resp_previous",
-            "resolved-model",
-        )
-        .expect("an object request must produce a delta body");
-
-        assert_eq!(optimized, legacy);
-        assert_eq!(optimized["store"], false);
-        assert_eq!(
-            serialize_responses_body_for_provider_prefix(&optimized),
-            serialize_responses_body_for_provider_prefix(&legacy)
-        );
-    }
-
-    #[test]
     fn large_exact_session_append_uses_raw_prefix_delta() {
         let previous = (0..800)
             .map(|index| {
@@ -21965,317 +19740,6 @@ mod tests {
             Some(&next),
             Some("v1:moved-to-tail")
         ));
-    }
-
-    #[test]
-    fn managed_response_session_delta_requires_exact_output_lineage() {
-        let session = ResponseSessionState {
-            generation: 1,
-            parent_generation: None,
-            response_id: "resp-parent".to_string(),
-            input: json!([{
-                "type": "message",
-                "role": "user",
-                "content": "inspect the project"
-            }]),
-            output_items: vec![json!({
-                "type": "function_call",
-                "id": "fc-1",
-                "status": "completed",
-                "call_id": "call-1",
-                "name": "shell",
-                "arguments": "{\"command\":\"build\"}",
-                "vendor": {"kept": true}
-            })],
-            finished_at: Instant::now(),
-        };
-        let current = json!([{
-            "type": "message",
-            "role": "user",
-            "content": "inspect the project"
-        }, {
-            "type": "function_call",
-            "id": "fc-1",
-            "status": "completed",
-            "call_id": "call-1",
-            "name": "shell",
-            "arguments": "{\"command\":\"build\"}",
-            "vendor": {"kept": true}
-        }, {
-            "type": "function_call_output",
-            "call_id": "call-1",
-            "output": {
-                "stdout": "compiled",
-                "stderr": "warning",
-                "exit_code": 0,
-                "file": "fn main() {}"
-            },
-            "vendor_output": {"unknown": null}
-        }, {
-            "type": "message",
-            "role": "user",
-            "content": "continue"
-        }]);
-
-        assert_eq!(
-            appended_response_input_delta_for_session(&session, &current),
-            Some(json!([{
-                "type": "function_call_output",
-                "call_id": "call-1",
-                "output": {
-                    "stdout": "compiled",
-                    "stderr": "warning",
-                    "exit_code": 0,
-                    "file": "fn main() {}"
-                },
-                "vendor_output": {"unknown": null}
-            }, {
-                "type": "message",
-                "role": "user",
-                "content": "continue"
-            }]))
-        );
-    }
-
-    #[test]
-    fn managed_response_session_delta_rejects_changed_or_missing_lineage() {
-        let session = ResponseSessionState {
-            generation: 1,
-            parent_generation: None,
-            response_id: "resp-parent".to_string(),
-            input: json!([{"type":"message","role":"user","content":"anchor"}]),
-            output_items: vec![json!({
-                "type": "function_call",
-                "id": "fc-1",
-                "status": "completed",
-                "call_id": "call-1",
-                "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            })],
-            finished_at: Instant::now(),
-        };
-        let changed_call = json!([
-            {"type":"message","role":"user","content":"anchor"},
-            {
-                "type":"function_call",
-                "id":"fc-1",
-                "status":"completed",
-                "call_id":"call-changed",
-                "name":"read_file",
-                "arguments":"{\"path\":\"README.md\"}"
-            },
-            {"type":"function_call_output","call_id":"call-changed","output":"secret file"}
-        ]);
-        assert_eq!(
-            appended_response_input_delta_for_session(&session, &changed_call),
-            None
-        );
-
-        let missing_output_lineage = ResponseSessionState {
-            output_items: Vec::new(),
-            ..session
-        };
-        let plain_append = json!([
-            {"type":"message","role":"user","content":"anchor"},
-            {"type":"message","role":"user","content":"continue"}
-        ]);
-        assert_eq!(
-            appended_response_input_delta_for_session(&missing_output_lineage, &plain_append),
-            None
-        );
-    }
-
-    #[test]
-    fn managed_response_session_delta_requires_ordered_single_use_call_outputs() {
-        let input = json!([{"type":"message","role":"user","content":"anchor"}]);
-        let output_items = vec![
-            json!({
-                "type": "function_call",
-                "id": "fc-1",
-                "status": "completed",
-                "call_id": "call-1",
-                "name": "first",
-                "arguments": "{}"
-            }),
-            json!({
-                "type": "function_call",
-                "id": "fc-2",
-                "status": "completed",
-                "call_id": "call-2",
-                "name": "second",
-                "arguments": "{}"
-            }),
-        ];
-        let session = ResponseSessionState {
-            generation: 1,
-            parent_generation: None,
-            response_id: "resp-parent".to_string(),
-            input: input.clone(),
-            output_items: output_items.clone(),
-            finished_at: Instant::now(),
-        };
-        let current = |delta: Vec<Value>| {
-            let mut items = input.as_array().unwrap().clone();
-            items.extend(output_items.clone());
-            items.extend(delta);
-            Value::Array(items)
-        };
-        let output_1 = json!({
-            "type": "function_call_output",
-            "call_id": "call-1",
-            "output": "one"
-        });
-        let output_2 = json!({
-            "type": "function_call_output",
-            "call_id": "call-2",
-            "output": "two"
-        });
-        let user = json!({"type":"message","role":"user","content":"continue"});
-
-        assert!(appended_response_input_delta_for_session(
-            &session,
-            &current(vec![output_1.clone(), output_2.clone(), user.clone()])
-        )
-        .is_some());
-        assert!(appended_response_input_delta_for_session(
-            &session,
-            &current(vec![output_2.clone(), output_1.clone(), user.clone()])
-        )
-        .is_none());
-        assert!(appended_response_input_delta_for_session(
-            &session,
-            &current(vec![output_1.clone(), user.clone()])
-        )
-        .is_none());
-        assert!(appended_response_input_delta_for_session(
-            &session,
-            &current(vec![
-                output_1.clone(),
-                output_1.clone(),
-                output_2.clone(),
-                user.clone()
-            ])
-        )
-        .is_none());
-        assert!(appended_response_input_delta_for_session(
-            &session,
-            &current(vec![user, output_1, output_2])
-        )
-        .is_none());
-
-        let missing_call_id = ResponseSessionState {
-            output_items: vec![json!({
-                "type": "function_call",
-                "id": "fc-only-id",
-                "status": "completed",
-                "name": "unsafe",
-                "arguments": "{}"
-            })],
-            ..session
-        };
-        let mut unsafe_current = input.as_array().unwrap().clone();
-        unsafe_current.extend(missing_call_id.output_items.clone());
-        unsafe_current.push(json!({"type":"message","role":"user","content":"continue"}));
-        assert!(appended_response_input_delta_for_session(
-            &missing_call_id,
-            &Value::Array(unsafe_current)
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn verified_native_delta_matches_full_replay_for_fifty_paired_fixtures() {
-        for index in 0..50 {
-            let call_id = format!("call-{index}");
-            let previous_input = json!([{
-                "type": "message",
-                "role": "developer",
-                "content": format!("stable-{index}-").repeat(6_000)
-            }, {
-                "type": "message",
-                "role": "user",
-                "content": format!("inspect fixture {index}")
-            }]);
-            let output_items = vec![
-                json!({
-                    "type": "reasoning",
-                    "id": format!("rs-{index}"),
-                    "summary": []
-                }),
-                json!({
-                    "type": "function_call",
-                    "id": format!("fc-{index}"),
-                    "status": "completed",
-                    "call_id": call_id,
-                    "name": "read_fixture",
-                    "arguments": serde_json::to_string(&json!({"index": index})).unwrap()
-                }),
-            ];
-            let new_items = vec![
-                json!({
-                    "type": "function_call_output",
-                    "call_id": format!("call-{index}"),
-                    "output": {
-                        "stdout": format!("ok-{index}"),
-                        "stderr": "",
-                        "exit_code": 0,
-                        "unicode": "完整🙂"
-                    }
-                }),
-                json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": format!("continue fixture {index}")
-                }),
-            ];
-            let session = ResponseSessionState {
-                generation: index + 1,
-                parent_generation: None,
-                response_id: format!("resp-{index}"),
-                input: previous_input.clone(),
-                output_items: output_items.clone(),
-                finished_at: Instant::now(),
-            };
-            let mut full_input = previous_input.as_array().unwrap().clone();
-            full_input.extend(output_items);
-            full_input.extend(new_items.clone());
-            let full_input = Value::Array(full_input);
-            let delta_input = appended_response_input_delta_for_session(&session, &full_input)
-                .expect("the exact paired fixture must produce a safe delta");
-            assert_eq!(delta_input, Value::Array(new_items));
-
-            let mut reconstructed = session.input.as_array().unwrap().clone();
-            reconstructed.extend(session.output_items.clone());
-            reconstructed.extend(delta_input.as_array().unwrap().clone());
-            assert_eq!(Value::Array(reconstructed), full_input);
-
-            let full_request = json!({
-                "model": "gpt-5.5",
-                "stream": true,
-                "store": true,
-                "input": full_input
-            });
-            let delta_request = build_response_session_delta_body(
-                &full_request,
-                delta_input,
-                &session.response_id,
-                "gpt-5.5",
-            )
-            .unwrap();
-            let full_bytes = serialized_body_len(&Channel::Responses, &full_request);
-            let prepared = response_session_delta_benefit(
-                &full_request,
-                delta_request,
-                full_bytes,
-                &TailInputDiagnostics::default(),
-            )
-            .expect("each paired fixture must clear the 20% and 32 KiB wire gate");
-            assert!(prepared.body_sizes.saved_bytes() >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES);
-            assert!(prepared
-                .body_sizes
-                .saved_ratio()
-                .is_some_and(|ratio| ratio >= 0.20));
-        }
     }
 
     #[test]
@@ -22434,442 +19898,6 @@ mod tests {
             response_session_lineage_epoch(Some(&compact_a)),
             response_session_lineage_epoch(Some(&compact_b))
         );
-    }
-
-    #[tokio::test]
-    async fn response_session_reuse_allows_safe_streaming_main_delta() {
-        let config = AppConfig::default();
-        let decision = RouteDecision {
-            provider: ProviderConfig {
-                id: "share".to_string(),
-                name: "Share".to_string(),
-                base_url: "https://share.example/v1".to_string(),
-                models_url: None,
-                is_full_url: false,
-                custom_user_agent: None,
-                channel: Channel::Responses,
-                prompt_cache_retention_enabled: false,
-                request_body_gzip_enabled: false,
-                use_system_proxy: false,
-                api_key_encrypted: None,
-                models: Vec::new(),
-                enabled: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-stream-session-skip-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state
-            .continuation_lineage
-            .seed_for_test(
-                "session-a",
-                ResponseSessionState {
-                    generation: 1,
-                    parent_generation: None,
-                    response_id: "resp_old".to_string(),
-                    input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
-                    output_items: vec![json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": "covered"
-                    })],
-                    finished_at: Instant::now(),
-                },
-            )
-            .await;
-        let request = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor" },
-                { "type": "message", "role": "assistant", "content": "covered" },
-                { "type": "message", "role": "user", "content": "continue" }
-            ]
-        });
-
-        let lease = state.continuation_lineage.begin("session-a").await;
-        let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
-        let optimized = outcome
-            .delta_body
-            .expect("an exact appended request must build a delta body");
-
-        assert_eq!(optimized["previous_response_id"], "resp_old");
-        assert_eq!(
-            optimized["input"],
-            json!([{ "type": "message", "role": "user", "content": "continue" }])
-        );
-        assert_eq!(optimized["stream"], true);
-        assert_eq!(outcome.diagnostics.candidate_count, 1);
-        assert!(outcome.diagnostics.append_delta_match);
-        assert_eq!(outcome.diagnostics.delta_items, 1);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
-    async fn main_response_session_delta_does_not_use_scope_sibling() {
-        let config = AppConfig::default();
-        let decision = RouteDecision {
-            provider: ProviderConfig {
-                id: "share".to_string(),
-                name: "Share".to_string(),
-                base_url: "https://share.example/v1".to_string(),
-                models_url: None,
-                is_full_url: false,
-                custom_user_agent: None,
-                channel: Channel::Responses,
-                prompt_cache_retention_enabled: false,
-                request_body_gzip_enabled: false,
-                use_system_proxy: false,
-                api_key_encrypted: None,
-                models: Vec::new(),
-                enabled: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-main-session-no-scope-fallback-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        state
-            .continuation_lineage
-            .seed_for_test(
-                "sibling-key",
-                ResponseSessionState {
-                    generation: 1,
-                    parent_generation: None,
-                    response_id: "resp_sibling".to_string(),
-                    input: json!([{ "type": "message", "role": "user", "content": "anchor" }]),
-                    output_items: Vec::new(),
-                    finished_at: Instant::now(),
-                },
-            )
-            .await;
-        let request = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor" },
-                { "type": "message", "role": "user", "content": "continue" }
-            ]
-        });
-
-        let lease = state.continuation_lineage.begin("current-key").await;
-        let outcome = maybe_reuse_response_session(&request, Some(&lease), &decision, true);
-
-        assert!(outcome.delta_body.is_none());
-        assert_eq!(request["input"].as_array().unwrap().len(), 2);
-        assert_eq!(outcome.diagnostics.candidate_count, 0);
-        assert_eq!(outcome.diagnostics.scope_match_count, 0);
-        assert_eq!(
-            outcome.diagnostics.skip_reason.as_deref(),
-            Some("no_candidate")
-        );
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn main_response_session_delta_requires_real_size_win() {
-        let original = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor" },
-                { "type": "message", "role": "user", "content": "tiny" }
-            ]
-        });
-        let delta = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "previous_response_id": "resp_old",
-            "store": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "tiny" }
-            ]
-        });
-        let beneficial_original = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor ".repeat(20_000) },
-                { "type": "message", "role": "user", "content": "tiny" }
-            ]
-        });
-
-        assert!(!response_session_delta_is_beneficial(
-            &original,
-            &delta,
-            &TailInputDiagnostics::default()
-        ));
-        assert!(response_session_delta_is_beneficial(
-            &beneficial_original,
-            &delta,
-            &TailInputDiagnostics::default()
-        ));
-        reset_serialized_body_len_calls();
-        let beneficial_original_bytes =
-            serialized_body_len(&Channel::Responses, &beneficial_original);
-        let prepared_delta = response_session_delta_benefit(
-            &beneficial_original,
-            delta.clone(),
-            beneficial_original_bytes,
-            &TailInputDiagnostics::default(),
-        )
-        .expect("beneficial delta should retain its measured wire sizes");
-        assert_eq!(
-            serialized_body_len_calls(),
-            1,
-            "the optimized decision path must not route the delta through a discarded length-only serialization"
-        );
-        assert_eq!(
-            prepared_delta.body_sizes.original_body_bytes,
-            beneficial_original_bytes
-        );
-        assert_eq!(
-            prepared_delta.body_sizes.delta_body_bytes,
-            prepared_delta.body.initial_wire_len().unwrap() as u64
-        );
-        assert!(
-            prepared_delta
-                .body_sizes
-                .original_body_bytes
-                .saturating_sub(prepared_delta.body_sizes.delta_body_bytes)
-                >= RESPONSE_SESSION_DELTA_MIN_SAVED_BYTES
-        );
-        assert!(
-            prepared_delta.body_sizes.delta_body_bytes.saturating_mul(5)
-                <= prepared_delta
-                    .body_sizes
-                    .original_body_bytes
-                    .saturating_mul(4)
-        );
-
-        let relative_only_original = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "x".repeat(220_000)
-            }]
-        });
-        let relative_only_delta = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "previous_response_id": "resp_old",
-            "input": [{
-                "type": "message",
-                "role": "user",
-                "content": "y".repeat(185_000)
-            }]
-        });
-        assert!(!response_session_delta_is_beneficial(
-            &relative_only_original,
-            &relative_only_delta,
-            &TailInputDiagnostics::default()
-        ));
-    }
-
-    #[test]
-    fn main_response_session_delta_gate_is_strict() {
-        let mut config = AppConfig::default();
-        config.cache.enabled = true;
-        config.cache.prewarm_enabled = true;
-        config.cache.mode = CacheMode::PrefixPrewarm;
-        let decision = RouteDecision {
-            provider: ProviderConfig {
-                id: "share".to_string(),
-                name: "Share".to_string(),
-                base_url: "https://api.openai.com/v1".to_string(),
-                models_url: None,
-                is_full_url: false,
-                custom_user_agent: None,
-                channel: Channel::Responses,
-                prompt_cache_retention_enabled: false,
-                request_body_gzip_enabled: false,
-                use_system_proxy: false,
-                api_key_encrypted: None,
-                models: Vec::new(),
-                enabled: true,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            },
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let request = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": [
-                { "type": "message", "role": "user", "content": "anchor ".repeat(20_000) }
-            ]
-        });
-        let exact_anchor = SessionAnchorDiagnostics {
-            source: Some("exact".to_string()),
-            ..SessionAnchorDiagnostics::default()
-        };
-        let sibling_anchor = SessionAnchorDiagnostics {
-            source: Some("scope-sibling".to_string()),
-            ..SessionAnchorDiagnostics::default()
-        };
-        let capability = test_session_reuse_capability(&decision, "key", None);
-
-        assert!(!should_attempt_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability),
-            true,
-            &request,
-            &TailInputDiagnostics::default(),
-            &exact_anchor,
-        ));
-        config.record_response_session_reuse_probe(
-            &decision.provider.id,
-            &decision.model,
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-
-        assert!(should_attempt_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability),
-            true,
-            &request,
-            &TailInputDiagnostics::default(),
-            &exact_anchor,
-        ));
-        assert!(!should_attempt_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability),
-            true,
-            &request,
-            &TailInputDiagnostics::default(),
-            &sibling_anchor,
-        ));
-        assert!(!should_attempt_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability),
-            false,
-            &request,
-            &TailInputDiagnostics::default(),
-            &exact_anchor,
-        ));
-        let third_party_decision = RouteDecision {
-            provider: ProviderConfig {
-                base_url: "https://hubway.cc/v1".to_string(),
-                ..decision.provider.clone()
-            },
-            ..decision.clone()
-        };
-        let third_party_capability =
-            test_session_reuse_capability(&third_party_decision, "key", None);
-        assert!(!should_attempt_main_response_session_delta(
-            &config,
-            &third_party_decision,
-            Some(&third_party_capability),
-            true,
-            &request,
-            &TailInputDiagnostics::default(),
-            &exact_anchor,
-        ));
-        assert_eq!(
-            main_response_session_delta_skip_reason(
-                &config,
-                &third_party_decision,
-                Some(&third_party_capability),
-                true,
-                &request,
-                &TailInputDiagnostics::default(),
-                &exact_anchor,
-            ),
-            Some("provider_session_delta_unverified")
-        );
-        assert_eq!(
-            main_response_session_delta_skip_reason(
-                &config,
-                &decision,
-                Some(&capability),
-                true,
-                &request,
-                &TailInputDiagnostics::default(),
-                &sibling_anchor,
-            ),
-            Some("session_anchor_not_exact")
-        );
-        let evaluation = evaluate_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability),
-            true,
-            request.clone(),
-            &TailInputDiagnostics::default(),
-            &exact_anchor,
-        );
-        assert_eq!(evaluation.skip_reason, None);
-        assert_eq!(
-            evaluation
-                .original_body
-                .initial_wire_len()
-                .map(|len| len as u64),
-            Some(serialized_body_len(&Channel::Responses, &request))
-        );
-
-        let mut unknown_field_request = request.clone();
-        unknown_field_request["vendor_extension"] = json!({"requires_full_history": true});
-        assert_eq!(
-            main_response_session_delta_skip_reason(
-                &config,
-                &decision,
-                Some(&capability),
-                true,
-                &unknown_field_request,
-                &TailInputDiagnostics::default(),
-                &exact_anchor,
-            ),
-            Some("unknown_response_request_field")
-        );
-    }
-
-    #[test]
-    fn codex_allows_main_response_session_delta() {
-        assert!(main_response_session_delta_enabled_for_agent(None));
-        assert!(main_response_session_delta_enabled_for_agent(Some("zcode")));
-        assert!(main_response_session_delta_enabled_for_agent(Some("codex")));
-    }
-
-    #[test]
-    fn body_diagnostics_reports_delta_send_body() {
-        let original = json!({
-            "model": "gpt-5.5",
-            "input": [
-                { "type": "message", "role": "user", "content": "stable context ".repeat(100) },
-                { "type": "message", "role": "user", "content": "fresh" }
-            ]
-        });
-        let delta = json!({
-            "model": "gpt-5.5",
-            "previous_response_id": "resp_abc",
-            "input": [{ "type": "message", "role": "user", "content": "fresh" }]
-        });
-        let diagnostics = body_diagnostics(&Channel::Responses, &original, &delta, true);
-        assert!(diagnostics.send_body_is_delta);
-        assert!(diagnostics.send_body_bytes < diagnostics.original_body_bytes);
     }
 
     #[test]
@@ -23422,89 +20450,6 @@ mod tests {
             Some(LineageCommitOutcome::Tombstoned { generation: 2 })
         );
         assert!(!state.continuation_lineage.contains_head("thread").await);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn late_stale_failure_cannot_clear_a_newer_proxy_success() {
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-late-session-failure-{}",
-            Uuid::new_v4().simple()
-        ));
-        let state = Arc::new(
-            AppState::for_test(
-                AppConfig::default(),
-                dir.join("config.toml"),
-                CacheStore::load(dir.join("cache.bin")).unwrap(),
-            )
-            .unwrap(),
-        );
-        state
-            .continuation_lineage
-            .seed_for_test(
-                "thread",
-                ResponseSessionState {
-                    generation: 1,
-                    parent_generation: None,
-                    response_id: "resp-root".to_string(),
-                    input: json!([{"type":"message","role":"user","content":"root"}]),
-                    output_items: vec![json!({
-                        "type":"message",
-                        "role":"assistant",
-                        "content":"done"
-                    })],
-                    finished_at: Instant::now(),
-                },
-            )
-            .await;
-        let stale_failure = state.continuation_lineage.begin("thread").await;
-        let winner = state.continuation_lineage.begin("thread").await;
-        let parent = LineageParent::Managed {
-            generation: 1,
-            response_id: "resp-root".to_string(),
-        };
-        let winner_input = json!([
-            {"type":"message","role":"user","content":"root"},
-            {"type":"message","role":"assistant","content":"done"},
-            {"type":"message","role":"user","content":"next"}
-        ]);
-        let (release_winner, wait_winner) = tokio::sync::oneshot::channel::<()>();
-        let winner_state = state.clone();
-        let winner_task = tokio::spawn(async move {
-            let _ = wait_winner.await;
-            update_response_session_with_id(
-                &winner_state,
-                Some(&winner),
-                &parent,
-                Some(&winner_input),
-                None,
-                Some("resp-winner".to_string()),
-                Vec::new(),
-            )
-            .await
-        });
-
-        release_winner.send(()).unwrap();
-        assert_eq!(
-            winner_task.await.unwrap(),
-            Some(LineageCommitOutcome::Applied { generation: 2 })
-        );
-        assert_eq!(
-            clear_response_session_reference(&state, Some(&stale_failure), Some("resp-root")).await,
-            Some(LineageInvalidateOutcome::Stale {
-                expected: 1,
-                actual: 2,
-            })
-        );
-        assert_eq!(
-            state
-                .continuation_lineage
-                .head("thread")
-                .await
-                .unwrap()
-                .response_id,
-            "resp-winner"
-        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -26663,7 +23608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_gap_breakdown_separates_new_tail_from_avoidable_gap() {
+    async fn provider_gap_breakdown_only_labels_pre_request_missed_recovery_as_avoidable() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-gap-breakdown-{}",
@@ -26712,8 +23657,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(regressed.total_tokens, 4_608);
-        assert_eq!(regressed.new_tail_tokens, 4_096);
-        assert_eq!(regressed.avoidable_tokens, 512);
+        assert_eq!(regressed.new_tail_tokens, 4_608);
+        assert_eq!(regressed.avoidable_tokens, 0);
+
+        let missed_recovery = provider_cache_gap_breakdown_with_guard(
+            &state,
+            Some("main-prefix"),
+            None,
+            Some(&regressed_prefix),
+            None,
+            Some(&PrefixGuardWaitDiagnostics {
+                pre_request_avoidable_tokens: 512,
+                recovery_applicable: true,
+                ..PrefixGuardWaitDiagnostics::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missed_recovery.new_tail_tokens, 4_096);
+        assert_eq!(missed_recovery.avoidable_tokens, 512);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -26938,6 +23900,8 @@ mod tests {
         let stale_receipt = PrefixGuardWaitDiagnostics {
             wait_ms: 500,
             source: Some("exact".to_string()),
+            pre_request_avoidable_tokens: 256,
+            recovery_applicable: true,
             exact_settle_window_elapsed: true,
             settled_exact_state_finished_at: Some(Instant::now()),
             ..PrefixGuardWaitDiagnostics::default()
@@ -26958,6 +23922,8 @@ mod tests {
         let matching_receipt = PrefixGuardWaitDiagnostics {
             wait_ms: 500,
             source: Some("exact".to_string()),
+            pre_request_avoidable_tokens: 256,
+            recovery_applicable: true,
             exact_settle_window_elapsed: true,
             settled_exact_state_finished_at: Some(settled_at),
             ..PrefixGuardWaitDiagnostics::default()
@@ -26978,6 +23944,8 @@ mod tests {
         let forged_sibling_receipt = PrefixGuardWaitDiagnostics {
             wait_ms: 500,
             source: Some("session-sibling".to_string()),
+            pre_request_avoidable_tokens: 256,
+            recovery_applicable: true,
             exact_settle_window_elapsed: true,
             settled_exact_state_finished_at: Some(settled_at),
             ..PrefixGuardWaitDiagnostics::default()
@@ -27027,6 +23995,8 @@ mod tests {
             false,
             false,
             false,
+            256,
+            true,
             true,
             false,
             Some(settled_at),
@@ -27048,6 +24018,8 @@ mod tests {
             false,
             false,
             false,
+            256,
+            true,
             true,
             true,
             Some(settled_at),
@@ -27239,7 +24211,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn current_tool_tail_preserves_avoidable_accounting_and_prioritizes_it() {
+    async fn current_tool_tail_keeps_its_first_posthoc_gap_out_of_avoidable_accounting() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-tool-tail-false-avoidable-{}",
@@ -27276,8 +24248,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(gap.total_tokens, 3_072);
-        assert_eq!(gap.avoidable_tokens, 2_560);
-        assert_eq!(gap.new_tail_tokens, 512);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 3_072);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -27506,7 +24478,6 @@ mod tests {
             config.clone(),
             None,
             None,
-            None,
             Some("normal-response-session".to_string()),
             Some(json!([{
                 "type": "message",
@@ -27680,7 +24651,6 @@ mod tests {
             None,
             None,
             AppConfig::default(),
-            None,
             None,
             None,
             None,
@@ -28493,7 +25463,7 @@ mod tests {
 
         let second_response = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             Bytes::from(
                 serde_json::to_vec(&json!({
                     "model": "gpt-5.5",
@@ -28678,7 +25648,6 @@ mod tests {
             None,
             AppConfig::default(),
             None,
-            None,
             Some(prefix_key.clone()),
             Some(session_key.clone()),
             Some(compaction_input.clone()),
@@ -28855,7 +25824,6 @@ mod tests {
             None,
             None,
             AppConfig::default(),
-            None,
             guard,
             prefix_key.clone(),
             None,
@@ -28988,7 +25956,6 @@ mod tests {
             None,
             None,
             AppConfig::default(),
-            None,
             None,
             None,
             None,
@@ -29244,7 +26211,6 @@ mod tests {
             None,
             None,
             AppConfig::default(),
-            None,
             None,
             None,
             None,
@@ -31236,7 +28202,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             LineageParent::FullReplay,
             false,
             false,
@@ -32213,13 +29178,6 @@ mod tests {
         assert!(!should_cooldown_prefix_after_prewarm_status(502));
         assert!(!should_cooldown_prefix_after_prewarm_status(503));
         assert!(should_cooldown_prefix_after_prewarm_status(429));
-
-        assert!(!should_cooldown_prefix_after_status(502));
-        assert!(should_cooldown_responses_sync_main_after_status(400));
-        assert!(should_cooldown_responses_sync_main_after_status(429));
-        assert!(should_cooldown_responses_sync_main_after_status(502));
-        assert!(should_cooldown_responses_sync_main_after_status(503));
-        assert!(!should_cooldown_responses_sync_main_after_status(401));
     }
 
     #[test]
@@ -33173,7 +30131,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn high_hit_medium_new_tail_advances_sent_bucket_for_next_guard() {
+    async fn high_hit_medium_new_tail_advances_sent_bucket_without_relabeling_its_first_gap() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-medium-tail-waterline-{}",
@@ -33260,14 +30218,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(next_gap.avoidable_tokens, 4_096);
-        assert_eq!(next_gap.new_tail_tokens, 0);
+        assert_eq!(next_gap.avoidable_tokens, 0);
+        assert_eq!(next_gap.new_tail_tokens, 4_096);
 
         fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
-    async fn medium_tool_tail_advances_aligned_bucket_for_next_guard() {
+    async fn medium_tool_tail_advances_aligned_bucket_without_relabeling_its_first_gap() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-medium-tool-tail-waterline-{}",
@@ -33337,14 +30295,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(gap.avoidable_tokens, 6_144);
-        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 6_144);
 
         fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
-    async fn high_hit_aligned_large_tool_tail_advances_sent_bucket() {
+    async fn high_hit_aligned_large_tool_tail_advances_bucket_without_posthoc_avoidable_gap() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-large-aligned-tool-tail-waterline-{}",
@@ -33415,8 +30373,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(gap.avoidable_tokens, 9_216);
-        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 9_216);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -33569,7 +30527,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_aligned_10k_tool_tail_advances_sent_bucket_for_next_guard() {
+    async fn compact_aligned_10k_tool_tail_advances_bucket_without_posthoc_avoidable_gap() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-10k-tool-tail-waterline-{}",
@@ -33649,8 +30607,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(next_gap.avoidable_tokens, 9_216);
-        assert_eq!(next_gap.new_tail_tokens, 1_024);
+        assert_eq!(next_gap.avoidable_tokens, 0);
+        assert_eq!(next_gap.new_tail_tokens, 10_240);
 
         fs::remove_dir_all(dir).ok();
     }
@@ -33769,6 +30727,8 @@ mod tests {
                 state_age_ms: None,
                 skip_reason: None,
                 budget_exhausted: false,
+                pre_request_avoidable_tokens: 0,
+                recovery_applicable: false,
                 exact_settle_window_elapsed: false,
                 settled_exact_state_finished_at: None,
                 cache_instability_score: Some(0),
@@ -34259,13 +31219,19 @@ mod tests {
             .lock()
             .await
             .insert(key.to_string(), prefix_state(64_512, 63_872, 0));
+        let new_tool_tail = TailInputDiagnostics {
+            tool_output_chars: 32_000,
+            largest_tool_output_chars: 32_000,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
 
         let guard = wait_for_provider_prefix_settle(
             &state,
             &Channel::Responses,
             Some(key),
             None,
-            &TailInputDiagnostics::default(),
+            &new_tool_tail,
             false,
             Some(responses_foreground_wait_cap()),
         )
@@ -34942,6 +31908,8 @@ mod tests {
             false,
             false,
             false,
+            0,
+            false,
             false,
             false,
             None,
@@ -35002,25 +31970,6 @@ mod tests {
         assert_eq!(kept.seen_bucket_tokens, 261_632);
 
         fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn response_session_reuse_follows_smart_hit_instead_of_prewarm() {
-        let mut config = AppConfig::default();
-        config.cache.mode = CacheMode::PrefixPrewarm;
-        config.cache.enabled = true;
-        config.cache.prewarm_enabled = true;
-
-        assert!(responses_session_reuse_enabled(&config));
-
-        config.cache.mode = CacheMode::SessionPrewarm;
-        assert!(responses_session_reuse_enabled(&config));
-
-        config.cache.prewarm_enabled = false;
-        assert!(responses_session_reuse_enabled(&config));
-
-        config.cache.enabled = false;
-        assert!(!responses_session_reuse_enabled(&config));
     }
 
     #[tokio::test]
@@ -35305,163 +32254,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn response_session_rejection_never_uses_status_alone_as_lineage_evidence() {
-        for status in [400, 404, 409, 410, 422, 502, 503] {
-            assert_eq!(
-                response_session_rejection_classification(status, "ordinary upstream error"),
-                ResponseSessionRejectionClass::TransientInvalid,
-                "status {status} without previous_response_id evidence must preserve lineage"
-            );
-        }
-    }
-
-    #[test]
-    fn response_session_rejection_classifies_stale_id_without_provider_cooldown() {
-        assert_eq!(
-            response_session_rejection_classification(
-                400,
-                "Previous response with id 'resp_old' not found. provider_code=previous_response_not_found"
-            ),
-            ResponseSessionRejectionClass::StaleReference
-        );
-        assert_eq!(
-            response_session_rejection_classification(
-                400,
-                "Unsupported parameter: previous_response_id"
-            ),
-            ResponseSessionRejectionClass::Unsupported
-        );
-        assert_eq!(
-            response_session_rejection_classification(
-                400,
-                "previous_response_id is only supported on Responses WebSocket v2"
-            ),
-            ResponseSessionRejectionClass::Unsupported
-        );
-        assert_eq!(
-            response_session_rejection_classification(422, "invalid request"),
-            ResponseSessionRejectionClass::TransientInvalid
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_response_session_rejection_does_not_disable_provider_delta() {
-        let config = AppConfig::default();
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-stale-id-no-provider-cooldown-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let key = "responses:bizd:gpt-5.5";
-
-        note_response_session_error_cooldown_for_rejection(
-            &state,
-            Some(key),
-            400,
-            "provider_code=previous_response_not_found Previous response not found",
-        )
-        .await;
-        assert!(
-            !response_session_cooldown_active(&state, Some(key)).await,
-            "a stale response id should clear that session only, not disable provider/model session-delta"
-        );
-
-        note_response_session_error_cooldown_for_rejection(
-            &state,
-            Some(key),
-            400,
-            "Unsupported parameter: previous_response_id",
-        )
-        .await;
-        assert_eq!(
-            response_session_cooldown_skip_reason(&state, Some(key))
-                .await
-                .as_deref(),
-            Some("provider_session_delta_unsupported")
-        );
-
-        let websocket_only_key = "responses:bizd:gpt-5.5:websocket-only";
-        note_response_session_error_cooldown_for_rejection(
-            &state,
-            Some(websocket_only_key),
-            400,
-            "previous_response_id is only supported on Responses WebSocket v2",
-        )
-        .await;
-        assert_eq!(
-            response_session_cooldown_skip_reason(&state, Some(websocket_only_key))
-                .await
-                .as_deref(),
-            Some("provider_session_delta_unsupported")
-        );
-        fs::remove_dir_all(dir).ok();
-    }
-    #[tokio::test]
-    async fn response_session_error_cooldown_is_scoped_to_responses_provider_model() {
-        let config = AppConfig::default();
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-cooldown-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let mut provider = ProviderConfig {
-            id: "bizd".to_string(),
-            name: "bizd".to_string(),
-            base_url: "https://bizd.example/v1".to_string(),
-            models_url: None,
-            is_full_url: false,
-            custom_user_agent: None,
-            channel: Channel::Responses,
-            prompt_cache_retention_enabled: false,
-            request_body_gzip_enabled: false,
-            use_system_proxy: false,
-            api_key_encrypted: None,
-            models: Vec::new(),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let responses = RouteDecision {
-            provider: provider.clone(),
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let capability = test_session_reuse_capability(&responses, "key", None);
-        let key = response_session_error_cooldown_key(&responses, Some(&capability));
-        assert!(key.is_some());
-        assert!(!response_session_cooldown_active(&state, key.as_deref()).await);
-        note_response_session_error_cooldown(&state, key.as_deref()).await;
-        assert!(response_session_cooldown_active(&state, key.as_deref()).await);
-        assert_eq!(
-            response_session_error_cooldown_secs(1, false),
-            RESPONSE_SESSION_ERROR_COOLDOWN_FIRST_SECS
-        );
-        assert_eq!(
-            response_session_error_cooldown_secs(2, false),
-            RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS
-        );
-        assert_eq!(
-            response_session_error_cooldown_secs(3, false),
-            RESPONSE_SESSION_ERROR_COOLDOWN_LONG_SECS
-        );
-        assert_eq!(
-            response_session_error_cooldown_secs(1, true),
-            RESPONSE_SESSION_UNSUPPORTED_COOLDOWN_SECS
-        );
-
-        provider.channel = Channel::Chat;
-        let chat = RouteDecision {
-            provider,
-            upstream_channel: Channel::Chat,
-            model: "gpt-5.5".to_string(),
-        };
-        assert!(response_session_error_cooldown_key(&chat, Some(&capability)).is_none());
-        fs::remove_dir_all(dir).ok();
-    }
-
     #[tokio::test]
     async fn request_body_gzip_fallback_cooldown_skips_repeated_attempts() {
         let config = AppConfig::default();
@@ -35499,842 +32291,26 @@ mod tests {
         let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
         let oversized_invalid = "x".repeat(ADMIN_PROBE_BODY_LIMIT + 1);
 
-        let unauthorized = admin_probe_response_session_reuse(
+        let unauthorized = admin_probe_cache_capabilities(
             AxumState(state.clone()),
             admin_request_with_body(oversized_invalid.clone(), None),
         )
         .await;
         assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
-        let authorized_oversized = admin_probe_response_session_reuse(
+        let authorized_oversized = admin_probe_cache_capabilities(
             AxumState(state.clone()),
             admin_request_with_body(oversized_invalid, Some("admin-local-key")),
         )
         .await;
         assert_eq!(authorized_oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-        let authorized_invalid = admin_probe_response_session_reuse(
+        let authorized_invalid = admin_probe_cache_capabilities(
             AxumState(state),
             admin_request_with_body("not-json".to_string(), Some("admin-local-key")),
         )
         .await;
         assert_eq!(authorized_invalid.status(), StatusCode::BAD_REQUEST);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
-    async fn response_session_reuse_probe_requires_usage_and_cached_token_evidence() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let compact_hits = Arc::new(AtomicUsize::new(0));
-        let include_usage = Arc::new(AtomicBool::new(false));
-        let compact_supported = Arc::new(AtomicBool::new(true));
-        let compact_fidelity_matches = Arc::new(AtomicBool::new(true));
-        let challenge = Arc::new(tokio::sync::Mutex::new(String::new()));
-        let expected_arguments = Arc::new(tokio::sync::Mutex::new(Value::Null));
-        let hits_for_route = hits.clone();
-        let compact_hits_for_route = compact_hits.clone();
-        let compact_supported_for_route = compact_supported.clone();
-        let compact_fidelity_matches_for_route = compact_fidelity_matches.clone();
-        let include_usage_for_route = include_usage.clone();
-        let challenge_for_route = challenge.clone();
-        let expected_arguments_for_route = expected_arguments.clone();
-        let expected_arguments_for_compact = expected_arguments.clone();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new()
-            .route(
-                "/v1/responses",
-                post(move |Json(body): Json<Value>| {
-                    let hits = hits_for_route.clone();
-                    let include_usage = include_usage_for_route.clone();
-                    let compact_fidelity_matches = compact_fidelity_matches_for_route.clone();
-                    let challenge = challenge_for_route.clone();
-                    let expected_arguments = expected_arguments_for_route.clone();
-                    async move {
-                        assert_eq!(body["stream"], true);
-                        let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                        let anchor_a =
-                            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-                        let anchor_b =
-                            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-                        let anchor_c =
-                            "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35";
-                        let mut response = match attempt {
-                            0 => {
-                                let input = body
-                                    .pointer("/input/0/content/0/text")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                assert!(input.len() > 8_000);
-                                assert!(body.get("previous_response_id").is_none());
-                                assert!(body.get("tools").is_none());
-                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_a));
-                                *challenge.lock().await = anchor_a.to_string();
-                                json!({
-                                    "id": "resp_probe_anchor",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "message",
-                                        "id": "msg_probe_anchor",
-                                        "status": "completed",
-                                        "role": "assistant",
-                                        "content": [{
-                                            "type": "output_text",
-                                            "text": anchor_a
-                                        }]
-                                    }]
-                                })
-                            }
-                            1 => {
-                                assert!(body.get("previous_response_id").is_none());
-                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_b));
-                                json!({
-                                    "id": "resp_probe_freshness_decoy",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "message",
-                                        "id": "msg_probe_freshness_decoy",
-                                        "status": "completed",
-                                        "role": "assistant",
-                                        "content": [{
-                                            "type": "output_text",
-                                            "text": anchor_b
-                                        }]
-                                    }]
-                                })
-                            }
-                            2 => {
-                                assert_eq!(body["previous_response_id"], "resp_probe_anchor");
-                                let serialized = serde_json::to_string(&body).unwrap();
-                                assert!(!serialized.contains(anchor_a));
-                                assert!(!serialized.contains("\"call_id\""));
-                                assert_eq!(
-                                    body.pointer("/tool_choice/name").and_then(Value::as_str),
-                                    Some("atoapi_fidelity_probe")
-                                );
-                                json!({
-                                    "id": "resp_probe_seed",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "function_call",
-                                        "id": "fc_probe_seed",
-                                        "status": "completed",
-                                        "call_id": "call_probe_seed",
-                                        "name": "atoapi_fidelity_probe",
-                                        "arguments": serde_json::to_string(&json!({"challenge": anchor_a})).unwrap()
-                                    }]
-                                })
-                            }
-                            3 => {
-                                assert!(body.get("previous_response_id").is_none());
-                                assert!(!serde_json::to_string(&body).unwrap().contains(anchor_c));
-                                json!({
-                                    "id": "resp_probe_lineage_decoy",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "message",
-                                        "id": "msg_probe_lineage_decoy",
-                                        "status": "completed",
-                                        "role": "assistant",
-                                        "content": [{
-                                            "type": "output_text",
-                                            "text": anchor_c
-                                        }]
-                                    }]
-                                })
-                            }
-                            4 => {
-                                assert_eq!(body["previous_response_id"], "resp_probe_seed");
-                                assert_eq!(body["input"][0]["type"], "function_call_output");
-                                assert_eq!(body["input"][0]["call_id"], "call_probe_seed");
-                                assert_eq!(
-                                    body.pointer("/tool_choice/name").and_then(Value::as_str),
-                                    Some("atoapi_fidelity_verify")
-                                );
-                                assert!(!serde_json::to_string(&body)
-                                    .unwrap()
-                                    .contains(challenge.lock().await.as_str()));
-                                let tool_output = body["input"][0]["output"].as_str().unwrap();
-                                let mut arguments: Map<String, Value> =
-                                    serde_json::from_str::<Value>(tool_output)
-                                        .unwrap()
-                                        .as_object()
-                                        .unwrap()
-                                        .clone();
-                                arguments.insert(
-                                    "challenge".to_string(),
-                                    Value::String(challenge.lock().await.clone()),
-                                );
-                                arguments.insert(
-                                    "seed_function_call".to_string(),
-                                    json!({
-                                        "id": "fc_probe_seed",
-                                        "status": "completed",
-                                        "call_id": "call_probe_seed",
-                                        "name": "atoapi_fidelity_probe",
-                                        "arguments": serde_json::to_string(&json!({
-                                            "challenge": challenge.lock().await.clone()
-                                        })).unwrap()
-                                    }),
-                                );
-                                let arguments = Value::Object(arguments);
-                                *expected_arguments.lock().await = arguments.clone();
-                                json!({
-                                    "id": "resp_probe_continuation",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "function_call",
-                                        "id": "fc_probe_verify",
-                                        "status": "completed",
-                                        "call_id": "call_probe_verify",
-                                        "name": "atoapi_fidelity_verify",
-                                        "arguments": serde_json::to_string(&arguments).unwrap()
-                                    }]
-                                })
-                            }
-                            5 => {
-                                assert!(body.get("previous_response_id").is_none());
-                                assert_eq!(
-                                    body["input"],
-                                    json!([
-                                        {
-                                            "type": "compaction",
-                                            "encrypted_content": "opaque-probe-compaction"
-                                        },
-                                        response_session_probe_user_message(
-                                            "Read the compacted context and reproduce the private fidelity markers exactly as previously required."
-                                        )
-                                    ])
-                                );
-                                let serialized = serde_json::to_string(&body).unwrap();
-                                assert!(!serialized.contains(challenge.lock().await.as_str()));
-                                assert!(!serialized.contains("resp_probe_seed"));
-                                assert!(!serialized.contains("call_probe_seed"));
-                                let mut arguments = expected_arguments.lock().await.clone();
-                                if !compact_fidelity_matches.load(Ordering::SeqCst) {
-                                    arguments["stdout"] =
-                                        Value::String("tampered-after-compaction".to_string());
-                                }
-                                json!({
-                                    "id": "resp_probe_after_compact",
-                                    "object": "response",
-                                    "status": "completed",
-                                    "error": null,
-                                    "output": [{
-                                        "type": "function_call",
-                                        "id": "fc_probe_after_compact",
-                                        "status": "completed",
-                                        "call_id": "call_probe_after_compact",
-                                        "name": "atoapi_fidelity_verify",
-                                        "arguments": serde_json::to_string(&arguments).unwrap()
-                                    }]
-                                })
-                            }
-                            _ => panic!("unexpected extra Responses probe request"),
-                        };
-                        if include_usage.load(Ordering::SeqCst) && matches!(attempt, 0 | 2 | 4) {
-                            response["usage"] = match attempt {
-                                0 => json!({
-                                    "input_tokens": 2_048,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": { "cached_tokens": 0 }
-                                }),
-                                2 => json!({
-                                    "input_tokens": 2_112,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": { "cached_tokens": 1_920 }
-                                }),
-                                _ => json!({
-                                    "input_tokens": 2_176,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": { "cached_tokens": 2_048 }
-                                }),
-                            };
-                        }
-                        raw_response(
-                            200,
-                            "text/event-stream",
-                            response_json_to_sse(
-                                &Channel::Responses,
-                                &serde_json::to_vec(&response).unwrap(),
-                            ),
-                        )
-                    }
-                }),
-            )
-            .route(
-                "/v1/responses/compact",
-                post(move |Json(body): Json<Value>| {
-                    let compact_hits = compact_hits_for_route.clone();
-                    let compact_supported = compact_supported_for_route.clone();
-                    let expected_arguments = expected_arguments_for_compact.clone();
-                    async move {
-                        compact_hits.fetch_add(1, Ordering::SeqCst);
-                        if !compact_supported.load(Ordering::SeqCst) {
-                            return raw_response(
-                                404,
-                                "application/json",
-                                serde_json::to_vec(&json!({
-                                    "error": { "message": "responses compact is unsupported" }
-                                }))
-                                .unwrap(),
-                            );
-                        }
-                        assert!(body["input"].as_array().is_some_and(|items| {
-                            items.iter().any(|item| item["type"] == "function_call")
-                                && items
-                                    .iter()
-                                    .any(|item| item["type"] == "function_call_output")
-                        }));
-                        assert!(!expected_arguments.lock().await.is_null());
-                        raw_response(
-                            200,
-                            "application/json",
-                            serde_json::to_vec(&json!({
-                                "id": "cmp_probe",
-                                "object": "response.compaction",
-                                "output": [{
-                                    "type": "compaction",
-                                    "encrypted_content": "opaque-probe-compaction"
-                                }]
-                            }))
-                            .unwrap(),
-                        )
-                    }
-                }),
-            );
-        tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream_app).await.unwrap();
-        });
-
-        let mut config = AppConfig::default();
-        config.local_key = "admin-local-key".to_string();
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "probe-provider".to_string();
-        config.providers = vec![provider];
-        let dir =
-            std::env::temp_dir().join(format!("atoapi-session-probe-{}", Uuid::new_v4().simple()));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
-
-        let unauthorized = admin_probe_response_session_reuse(
-            AxumState(state.clone()),
-            admin_probe_request("probe-provider", "gpt-5.5", None),
-        )
-        .await;
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
-
-        let response = admin_probe_response_session_reuse(
-            AxumState(state.clone()),
-            admin_probe_request("probe-provider", "gpt-5.5", Some("admin-local-key")),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let result: ProviderResponseSessionReuseProbeResult =
-            serde_json::from_slice(&response_body).unwrap();
-        assert_eq!(
-            result.status,
-            ProviderResponseSessionReuseStatus::Unverified,
-            "{}",
-            result.message
-        );
-        assert!(!result.enabled);
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
-        assert_eq!(compact_hits.load(Ordering::SeqCst), 0);
-        assert!(!state
-            .config
-            .read()
-            .await
-            .response_session_reuse_verified_for("probe-provider", "gpt-5.5"));
-
-        include_usage.store(true, Ordering::SeqCst);
-        hits.store(0, Ordering::SeqCst);
-        compact_hits.store(0, Ordering::SeqCst);
-        let verified_response = admin_probe_response_session_reuse(
-            AxumState(state.clone()),
-            admin_probe_request("probe-provider", "gpt-5.5", Some("admin-local-key")),
-        )
-        .await;
-        assert_eq!(verified_response.status(), StatusCode::OK);
-        let verified_body = axum::body::to_bytes(verified_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let verified: ProviderResponseSessionReuseProbeResult =
-            serde_json::from_slice(&verified_body).unwrap();
-        assert_eq!(
-            verified.status,
-            ProviderResponseSessionReuseStatus::Verified
-        );
-        assert!(verified.enabled);
-        assert!(verified.usage_verified);
-        assert_eq!(verified.first_input_tokens, Some(2_112));
-        assert_eq!(verified.first_cached_tokens, Some(1_920));
-        assert_eq!(verified.continuation_input_tokens, Some(2_176));
-        assert_eq!(verified.continuation_cached_tokens, Some(2_048));
-        assert_eq!(verified.compact_status, Some(200));
-        assert_eq!(verified.compact_continuation_status, Some(200));
-        assert!(verified.compact_fidelity_verified);
-        let capability = verified
-            .capability
-            .as_ref()
-            .expect("a verified streaming probe must return its exact capability scope");
-        assert_eq!(capability.channel, Channel::Responses);
-        assert_eq!(
-            capability.stream_shape,
-            ResponseSessionReuseStreamShape::StreamSse
-        );
-        assert!(capability.endpoint.ends_with("/v1/responses"));
-        assert!(!capability.key_realm_id.is_empty());
-        assert_eq!(hits.load(Ordering::SeqCst), 6);
-        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
-        let config = state.config.read().await;
-        assert!(config.response_session_reuse_verified_for_scope(
-            "probe-provider",
-            "gpt-5.5",
-            capability
-        ));
-        assert!(config
-            .response_session_reuse_for_provider("probe-provider")
-            .into_iter()
-            .find(|record| record.model_id == "gpt-5.5")
-            .is_some_and(|record| record.compact_fidelity_verified));
-        drop(config);
-
-        compact_supported.store(false, Ordering::SeqCst);
-        hits.store(0, Ordering::SeqCst);
-        compact_hits.store(0, Ordering::SeqCst);
-        let unsupported_compact =
-            probe_and_record_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
-                .await
-                .unwrap();
-        assert_eq!(
-            unsupported_compact.status,
-            ProviderResponseSessionReuseStatus::Verified
-        );
-        assert!(unsupported_compact.enabled);
-        assert!(unsupported_compact.usage_verified);
-        assert!(!unsupported_compact.compact_fidelity_verified);
-        assert_eq!(unsupported_compact.compact_status, Some(404));
-        assert_eq!(unsupported_compact.compact_continuation_status, None);
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
-        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
-        let config = state.config.read().await;
-        assert!(config.response_session_reuse_verified_for_scope(
-            "probe-provider",
-            "gpt-5.5",
-            unsupported_compact
-                .capability
-                .as_ref()
-                .expect("direct verification must retain its exact certificate scope")
-        ));
-        let persisted = config
-            .response_session_reuse_for_provider("probe-provider")
-            .into_iter()
-            .find(|record| record.model_id == "gpt-5.5")
-            .expect("direct certificate should remain persisted");
-        assert!(!persisted.compact_fidelity_verified);
-        drop(config);
-
-        compact_supported.store(true, Ordering::SeqCst);
-        compact_fidelity_matches.store(false, Ordering::SeqCst);
-        hits.store(0, Ordering::SeqCst);
-        compact_hits.store(0, Ordering::SeqCst);
-        let mismatched_compact =
-            probe_and_record_provider_response_session_reuse(&state, "probe-provider", "gpt-5.5")
-                .await
-                .unwrap();
-        assert_eq!(
-            mismatched_compact.status,
-            ProviderResponseSessionReuseStatus::Verified
-        );
-        assert!(mismatched_compact.enabled);
-        assert!(mismatched_compact.usage_verified);
-        assert!(!mismatched_compact.compact_fidelity_verified);
-        assert_eq!(mismatched_compact.compact_status, Some(200));
-        assert_eq!(mismatched_compact.compact_continuation_status, Some(200));
-        assert!(mismatched_compact.message.contains("typed fidelity failed"));
-        assert_eq!(hits.load(Ordering::SeqCst), 6);
-        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
-        let config = state.config.read().await;
-        assert!(config.response_session_reuse_verified_for_scope(
-            "probe-provider",
-            "gpt-5.5",
-            mismatched_compact
-                .capability
-                .as_ref()
-                .expect("typed compact mismatch must retain the direct certificate")
-        ));
-        assert!(config
-            .response_session_reuse_for_provider("probe-provider")
-            .into_iter()
-            .find(|record| record.model_id == "gpt-5.5")
-            .is_some_and(|record| !record.compact_fidelity_verified));
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn response_session_probe_usage_rejects_missing_cache_or_context_usage() {
-        let anchor = UsageRecord {
-            input_tokens: 2_048,
-            ..UsageRecord::default()
-        };
-        let missing_cache = UsageRecord {
-            input_tokens: 2_112,
-            cache_read_tokens: 64,
-            ..UsageRecord::default()
-        };
-        let missing_context = UsageRecord {
-            input_tokens: 1_024,
-            cache_read_tokens: 896,
-            ..UsageRecord::default()
-        };
-        let verified = UsageRecord {
-            input_tokens: 2_112,
-            cache_read_tokens: 1_920,
-            ..UsageRecord::default()
-        };
-
-        assert!(response_session_probe_plain_delta_usage_error(&anchor, &missing_cache).is_some());
-        assert!(
-            response_session_probe_plain_delta_usage_error(&anchor, &missing_context).is_some()
-        );
-        assert_eq!(
-            response_session_probe_plain_delta_usage_error(&anchor, &verified),
-            None
-        );
-        assert!(response_session_probe_usage_error(&anchor, &missing_cache).is_some());
-        assert!(response_session_probe_usage_error(&anchor, &missing_context).is_some());
-        assert_eq!(response_session_probe_usage_error(&anchor, &verified), None);
-    }
-
-    #[test]
-    fn response_session_probe_requires_completed_sse_shape() {
-        let json_response = ResponseSessionReuseProbeResponse {
-            status: 200,
-            content_type: "application/json".to_string(),
-            bytes: serde_json::to_vec(&json!({
-                "id": "resp-json",
-                "output": []
-            }))
-            .unwrap(),
-        };
-        assert!(!is_successful_response_session_sse_probe(&json_response));
-
-        let incomplete_sse = ResponseSessionReuseProbeResponse {
-            status: 200,
-            content_type: "text/event-stream".to_string(),
-            bytes: b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
-                .to_vec(),
-        };
-        assert!(!is_successful_response_session_sse_probe(&incomplete_sse));
-
-        let completed_sse = ResponseSessionReuseProbeResponse {
-            status: 200,
-            content_type: "text/event-stream; charset=utf-8".to_string(),
-            bytes: b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-ok\",\"output\":[]}}\n\n"
-                .to_vec(),
-        };
-        assert!(is_successful_response_session_sse_probe(&completed_sse));
-    }
-
-    #[test]
-    fn response_session_probe_verifier_rejects_any_typed_manifest_mutation() {
-        fn verifier_output(arguments: &Value) -> Vec<Value> {
-            vec![json!({
-                "type": "function_call",
-                "id": "fc_verify",
-                "status": "completed",
-                "call_id": "call_verify",
-                "name": "atoapi_fidelity_verify",
-                "arguments": serde_json::to_string(arguments).unwrap(),
-            })]
-        }
-
-        let payload = build_response_session_fidelity_payload("typed-manifest");
-        let seed_challenge = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        let seed_item = json!({
-            "type": "function_call",
-            "id": "fc_seed",
-            "status": "completed",
-            "call_id": "call_seed",
-            "name": "atoapi_fidelity_probe",
-            "arguments": serde_json::to_string(&json!({
-                "challenge": seed_challenge
-            })).unwrap()
-        });
-        let seed_call = response_session_probe_function_call(
-            std::slice::from_ref(&seed_item),
-            "atoapi_fidelity_probe",
-        )
-        .unwrap();
-        let expected = response_session_fidelity_expected_arguments(&seed_call, &payload);
-        assert!(response_session_probe_verifier_matches(
-            &verifier_output(&expected),
-            &expected
-        ));
-
-        let mut mutations = Vec::new();
-        let mut exit_code = expected.clone();
-        exit_code["exit_code"] = json!(0);
-        mutations.push(exit_code);
-
-        let mut merged_streams = expected.clone();
-        merged_streams["stdout"] = expected["stderr"].clone();
-        mutations.push(merged_streams);
-
-        let mut flattened_error = expected.clone();
-        flattened_error["error"] = expected["error"]["message"].clone();
-        mutations.push(flattened_error);
-
-        let mut truncated_long_content = expected.clone();
-        let mut truncated = truncated_long_content["long_content"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        truncated.pop();
-        truncated_long_content["long_content"] = Value::String(truncated);
-        mutations.push(truncated_long_content);
-
-        let mut reordered_duplicates = expected.clone();
-        reordered_duplicates["ordered_repeated"]
-            .as_array_mut()
-            .unwrap()
-            .swap(0, 1);
-        mutations.push(reordered_duplicates);
-
-        let mut changed_seed_item_id = expected.clone();
-        changed_seed_item_id["seed_function_call"]["id"] = json!("fc_other");
-        mutations.push(changed_seed_item_id);
-
-        let mut changed_seed_arguments = expected.clone();
-        changed_seed_arguments["seed_function_call"]["arguments"] =
-            json!("{\"challenge\":\"different\"}");
-        mutations.push(changed_seed_arguments);
-
-        let mut extra_field = expected.clone();
-        extra_field
-            .as_object_mut()
-            .unwrap()
-            .insert("unexpected".to_string(), json!(true));
-        mutations.push(extra_field);
-
-        for mutated in mutations {
-            assert!(!response_session_probe_verifier_matches(
-                &verifier_output(&mutated),
-                &expected
-            ));
-        }
-
-        let mut extra_output = verifier_output(&expected);
-        extra_output.push(json!({
-            "type": "message",
-            "id": "msg_extra",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{ "type": "output_text", "text": "extra" }]
-        }));
-        assert!(!response_session_probe_verifier_matches(
-            &extra_output,
-            &expected
-        ));
-    }
-
-    #[test]
-    fn response_session_probe_seed_requires_exact_call_id_and_arguments() {
-        let challenge = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-        let exact = json!({
-            "type": "function_call",
-            "id": "fc_seed",
-            "status": "completed",
-            "call_id": "call_seed",
-            "name": "atoapi_fidelity_probe",
-            "arguments": serde_json::to_string(&json!({ "challenge": challenge })).unwrap()
-        });
-        let parsed = response_session_probe_function_call(
-            std::slice::from_ref(&exact),
-            "atoapi_fidelity_probe",
-        )
-        .unwrap();
-        assert_eq!(parsed.call_id, "call_seed");
-        assert_eq!(parsed.challenge, challenge);
-
-        let mut missing_call_id = exact.clone();
-        missing_call_id.as_object_mut().unwrap().remove("call_id");
-        assert!(
-            response_session_probe_function_call(&[missing_call_id], "atoapi_fidelity_probe")
-                .is_err()
-        );
-
-        let mut extra_argument = exact.clone();
-        extra_argument["arguments"] = Value::String(
-            serde_json::to_string(&json!({ "challenge": challenge, "extra": true })).unwrap(),
-        );
-        assert!(
-            response_session_probe_function_call(&[extra_argument], "atoapi_fidelity_probe")
-                .is_err()
-        );
-
-        let mut predictable_challenge = exact.clone();
-        predictable_challenge["arguments"] =
-            Value::String(serde_json::to_string(&json!({ "challenge": "0".repeat(64) })).unwrap());
-        assert!(response_session_probe_function_call(
-            &[predictable_challenge],
-            "atoapi_fidelity_probe"
-        )
-        .is_err());
-
-        let reasoning_leak = json!({
-            "type": "reasoning",
-            "id": "reasoning_seed",
-            "summary": [{ "type": "summary_text", "text": challenge }]
-        });
-        assert!(response_session_probe_function_call(
-            &[reasoning_leak, exact.clone()],
-            "atoapi_fidelity_probe"
-        )
-        .is_err());
-
-        assert!(response_session_probe_function_call(
-            &[exact.clone(), exact],
-            "atoapi_fidelity_probe"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn response_session_probe_parses_crlf_multidata_completed_sse_once() {
-        let response = ResponseSessionReuseProbeResponse {
-            status: 200,
-            content_type: "text/event-stream; charset=utf-8".to_string(),
-            bytes: concat!(
-                "event: response.completed\r\n",
-                "data: {\"type\":\"response.completed\",\r\n",
-                "data: \"response\":{\"id\":\"resp-crlf\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc-crlf\",\"status\":\"completed\",\"call_id\":\"call-crlf\",\"name\":\"probe\",\"arguments\":\"{}\"}],\r\n",
-                "data: \"usage\":{\"input_tokens\":256,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":128}}}}\r\n\r\n"
-            )
-            .as_bytes()
-            .to_vec(),
-        };
-
-        let parsed = parse_successful_response_session_sse_probe(&response).unwrap();
-        assert_eq!(parsed.response_id, "resp-crlf");
-        assert_eq!(parsed.output_items.len(), 1);
-        assert_eq!(parsed.output_items[0]["call_id"], "call-crlf");
-        assert_eq!(parsed.usage.input_tokens, 256);
-        assert_eq!(parsed.usage.cache_read_tokens, 128);
-    }
-
-    #[test]
-    fn response_session_compaction_probe_requires_canonical_top_level_output() {
-        let canonical = serde_json::to_vec(&json!({
-            "id": "cmp-ok",
-            "object": "response.compaction",
-            "output": [{
-                "type": "compaction",
-                "encrypted_content": "opaque"
-            }]
-        }))
-        .unwrap();
-        assert_eq!(
-            response_session_compaction_output(&canonical)
-                .unwrap()
-                .len(),
-            1
-        );
-
-        let nested_only = serde_json::to_vec(&json!({
-            "id": "cmp-bad",
-            "output": [{
-                "type": "message",
-                "content": [{
-                    "type": "output_text",
-                    "data": { "type": "compaction" }
-                }]
-            }]
-        }))
-        .unwrap();
-        assert!(response_session_compaction_output(&nested_only).is_none());
-    }
-
-    #[tokio::test]
-    async fn responses_websocket_admin_probe_requires_auth_before_handshake() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_route = hits.clone();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses",
-            get(move || {
-                let hits = hits_for_route.clone();
-                async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    StatusCode::NOT_FOUND
-                }
-            }),
-        );
-        let server = tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream_app).await.unwrap();
-        });
-
-        let mut config = AppConfig::default();
-        config.local_key = "admin-local-key".to_string();
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "websocket-probe-provider".to_string();
-        config.providers = vec![provider];
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-websocket-admin-probe-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = Arc::new(AppState::for_test(config, dir.join("config.toml"), cache).unwrap());
-        let input = || ResponseSessionReuseProbeHttpInput {
-            provider_id: "websocket-probe-provider".to_string(),
-            model_id: "gpt-5.6-luna".to_string(),
-        };
-
-        let unauthorized = admin_probe_responses_websocket(
-            AxumState(state.clone()),
-            admin_probe_request(&input().provider_id, &input().model_id, None),
-        )
-        .await;
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
-
-        let response = admin_probe_responses_websocket(
-            AxumState(state),
-            admin_probe_request(
-                &input().provider_id,
-                &input().model_id,
-                Some("admin-local-key"),
-            ),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let result: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(result["status"], "unsupported");
-        assert_eq!(result["connection_attempts"], 1);
-        assert_eq!(result["messages_sent"], 0);
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-
-        server.abort();
-        let _ = server.await;
         fs::remove_dir_all(dir).ok();
     }
 
@@ -37072,485 +33048,6 @@ mod tests {
             .fields
             .iter()
             .all(|item| item.effect_status == ProviderCacheEffectStatus::Unverified));
-    }
-
-    #[tokio::test]
-    #[ignore = "sends seven explicit fidelity and compaction requests to the configured real upstream"]
-    async fn live_provider_response_session_reuse_qualification() {
-        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
-            .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
-        let model_id =
-            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
-        let state = AppState::load().expect("live-probe config should load");
-
-        let result = probe_provider_response_session_reuse(&state, &provider_id, &model_id)
-            .await
-            .expect("live response-session probe should complete");
-
-        println!(
-            "RESPONSE_SESSION_LIVE_RESULT status={:?} enabled={} first_status={:?} continuation_status={:?} message={}",
-            result.status,
-            result.enabled,
-            result.first_status,
-            result.continuation_status,
-            truncate_log_message(&result.message)
-        );
-        assert!(result.first_status.is_some());
-    }
-
-    #[tokio::test]
-    #[ignore = "sends seven explicit management requests per real fidelity sample"]
-    async fn live_provider_response_session_reuse_probe_samples() {
-        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
-            .expect("ATOAPI_TEST_PROVIDER is required for real fidelity samples");
-        let model_id =
-            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
-        let sample_count = std::env::var("ATOAPI_TEST_PAIRS")
-            .ok()
-            .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(18);
-        assert!(
-            (1..=50).contains(&sample_count),
-            "ATOAPI_TEST_PAIRS must be between 1 and 50"
-        );
-        let state = AppState::load().expect("isolated real-sample config should load");
-        let mut compact_verified = 0usize;
-
-        for sample in 1..=sample_count {
-            let result = probe_provider_response_session_reuse(&state, &provider_id, &model_id)
-                .await
-                .expect("real response-session sample should complete");
-            println!(
-                "RESPONSE_SESSION_REAL_SAMPLE {sample}/{sample_count} status={:?} compact={} message={}",
-                result.status,
-                result.compact_fidelity_verified,
-                truncate_log_message(&result.message)
-            );
-            assert_eq!(
-                result.status,
-                ProviderResponseSessionReuseStatus::Verified,
-                "real fidelity sample {sample} failed: {}",
-                result.message
-            );
-            assert!(result.enabled, "real sample must enable direct delta");
-            assert!(
-                result.usage_verified,
-                "real sample must include cached-token evidence for plain and typed delta"
-            );
-            compact_verified += usize::from(result.compact_fidelity_verified);
-        }
-
-        println!(
-            "RESPONSE_SESSION_REAL_SAMPLE_SUMMARY passed={sample_count} compact_verified={compact_verified}"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "opens one explicit WebSocket capability probe to the configured real upstream"]
-    async fn live_provider_responses_websocket_probe() {
-        let provider_id = std::env::var("ATOAPI_TEST_PROVIDER")
-            .expect("ATOAPI_TEST_PROVIDER is required for the ignored live probe");
-        let model_id =
-            std::env::var("ATOAPI_TEST_MODEL").unwrap_or_else(|_| "gpt-5.6-luna".to_string());
-        let state = AppState::load().expect("isolated live-probe config should load");
-
-        let result = probe_provider_responses_websocket(&state, &provider_id, &model_id)
-            .await
-            .expect("live WebSocket capability probe should complete");
-
-        println!(
-            "RESPONSES_WEBSOCKET_LIVE_RESULT {}",
-            serde_json::to_string(&result).expect("probe result should serialize")
-        );
-        assert_eq!(result.connection_attempts, 1);
-        assert!(result.messages_sent <= 2);
-    }
-
-    #[tokio::test]
-    async fn third_party_session_reuse_probe_rejects_input_only_continuation() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_route = hits.clone();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses",
-            post(move |Json(body): Json<Value>| {
-                let hits = hits_for_route.clone();
-                async move {
-                    assert_eq!(body["stream"], true);
-                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                    let anchor_a =
-                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-                    let anchor_b =
-                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-                    let anchor_c =
-                        "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35";
-                    let response = match attempt {
-                        0 | 1 => {
-                            let (response_id, item_id, challenge) = if attempt == 0 {
-                                (
-                                    "resp_probe_anchor",
-                                    "msg_probe_anchor",
-                                    anchor_a,
-                                )
-                            } else {
-                                (
-                                    "resp_probe_freshness_decoy",
-                                    "msg_probe_freshness_decoy",
-                                    anchor_b,
-                                )
-                            };
-                            assert!(!serde_json::to_string(&body).unwrap().contains(challenge));
-                            json!({
-                                "id": response_id,
-                                "object": "response",
-                                "usage": {
-                                    "input_tokens": 2_048,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": {"cached_tokens": 0}
-                                },
-                                "output": [{
-                                    "type": "message",
-                                    "id": item_id,
-                                    "status": "completed",
-                                    "role": "assistant",
-                                    "content": [{
-                                        "type": "output_text",
-                                        "text": challenge
-                                    }]
-                                }]
-                            })
-                        }
-                        2 => {
-                            assert_eq!(body["previous_response_id"], "resp_probe_anchor");
-                            let serialized = serde_json::to_string(&body).unwrap();
-                            assert!(!serialized.contains(anchor_a));
-                            assert!(!serialized.contains("\"call_id\""));
-                            json!({
-                                "id": "resp_probe_seed",
-                                "object": "response",
-                                "usage": {
-                                    "input_tokens": 2_048,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": {"cached_tokens": 0}
-                                },
-                                "output": [{
-                                    "type": "function_call",
-                                    "id": "fc_probe_seed",
-                                    "status": "completed",
-                                    "call_id": "call_probe_seed",
-                                    "name": "atoapi_fidelity_probe",
-                                    "arguments": serde_json::to_string(&json!({
-                                        "challenge": anchor_a
-                                    })).unwrap()
-                                }]
-                            })
-                        }
-                        3 => json!({
-                            "id": "resp_probe_lineage_decoy",
-                            "object": "response",
-                            "output": [{
-                                "type": "message",
-                                "id": "msg_probe_lineage_decoy",
-                                "status": "completed",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": anchor_c
-                                }]
-                            }]
-                        }),
-                        4 => {
-                            assert_eq!(body["previous_response_id"], "resp_probe_seed");
-                            let tool_output = body["input"][0]["output"].as_str().unwrap();
-                            let mut arguments = serde_json::from_str::<Value>(tool_output)
-                                .unwrap()
-                                .as_object()
-                                .unwrap()
-                                .clone();
-                            arguments.insert(
-                                "challenge".to_string(),
-                                Value::String(anchor_a.to_string()),
-                            );
-                            arguments.insert(
-                                "seed_function_call".to_string(),
-                                json!({
-                                    "id": "flattened-input-only",
-                                    "status": "completed",
-                                    "call_id": "call_probe_seed",
-                                    "name": "atoapi_fidelity_probe",
-                                    "arguments": serde_json::to_string(&json!({
-                                        "challenge": anchor_a
-                                    })).unwrap()
-                                }),
-                            );
-                            json!({
-                                "id": "resp_probe_continuation",
-                                "object": "response",
-                                "usage": {
-                                    "input_tokens": 2_112,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": {"cached_tokens": 1_920}
-                                },
-                                "output": [{
-                                    "type": "function_call",
-                                    "id": "fc_probe_verify",
-                                    "status": "completed",
-                                    "call_id": "call_probe_verify",
-                                    "name": "atoapi_fidelity_verify",
-                                    "arguments": serde_json::to_string(&Value::Object(arguments)).unwrap()
-                                }]
-                            })
-                        }
-                        _ => panic!("flattened continuation must stop before compaction"),
-                    };
-                    raw_response(
-                        200,
-                        "text/event-stream",
-                        response_json_to_sse(
-                            &Channel::Responses,
-                            &serde_json::to_vec(&response).unwrap(),
-                        ),
-                    )
-                }
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream_app).await.unwrap();
-        });
-
-        let mut config = AppConfig::default();
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "probe-provider-nonsemantic".to_string();
-        let verification_capability = test_session_reuse_capability(
-            &RouteDecision {
-                provider: provider.clone(),
-                upstream_channel: Channel::Responses,
-                model: "gpt-5.5".to_string(),
-            },
-            "key",
-            None,
-        );
-        config.providers = vec![provider];
-        config.record_response_session_reuse_probe(
-            "probe-provider-nonsemantic",
-            "gpt-5.5",
-            Some(verification_capability),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-probe-nonsemantic-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        assert!(state
-            .config
-            .read()
-            .await
-            .response_session_reuse_verified_for("probe-provider-nonsemantic", "gpt-5.5"));
-
-        let result = probe_and_record_provider_response_session_reuse(
-            &state,
-            "probe-provider-nonsemantic",
-            "gpt-5.5",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.status,
-            ProviderResponseSessionReuseStatus::Unsupported
-        );
-        assert!(!result.enabled);
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
-        assert!(!state
-            .config
-            .read()
-            .await
-            .response_session_reuse_verified_for("probe-provider-nonsemantic", "gpt-5.5"));
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
-    async fn response_session_probe_rejects_fixed_challenge_across_independent_seeds() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_route = hits.clone();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses",
-            post(move |Json(body): Json<Value>| {
-                let hits = hits_for_route.clone();
-                async move {
-                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                    assert!(attempt < 2, "fixed challenge must fail before continuation");
-                    let challenge =
-                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-                    assert!(!serde_json::to_string(&body).unwrap().contains(challenge));
-                    let response = json!({
-                        "id": format!("resp_fixed_{attempt}"),
-                        "object": "response",
-                        "status": "completed",
-                        "error": null,
-                        "output": [{
-                            "type": "message",
-                            "id": format!("msg_fixed_{attempt}"),
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": challenge
-                            }]
-                        }]
-                    });
-                    raw_response(
-                        200,
-                        "text/event-stream",
-                        response_json_to_sse(
-                            &Channel::Responses,
-                            &serde_json::to_vec(&response).unwrap(),
-                        ),
-                    )
-                }
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream_app).await.unwrap();
-        });
-
-        let mut config = AppConfig::default();
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "probe-provider-fixed-challenge".to_string();
-        config.providers = vec![provider];
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-probe-fixed-challenge-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-
-        let result = probe_provider_response_session_reuse(
-            &state,
-            "probe-provider-fixed-challenge",
-            "gpt-5.5",
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            result.status,
-            ProviderResponseSessionReuseStatus::Unsupported
-        );
-        assert!(!result.enabled);
-        assert!(result.message.contains("reused the same challenge"));
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
-    async fn response_session_probe_rejects_global_last_response_instead_of_previous_id() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits_for_route = hits.clone();
-        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses",
-            post(move |Json(body): Json<Value>| {
-                let hits = hits_for_route.clone();
-                async move {
-                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                    let anchor_a =
-                        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
-                    let anchor_b =
-                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-                    let response = match attempt {
-                        0 | 1 => {
-                            let (id, message_id, challenge) = if attempt == 0 {
-                                ("resp_anchor_a", "msg_anchor_a", anchor_a)
-                            } else {
-                                ("resp_anchor_b", "msg_anchor_b", anchor_b)
-                            };
-                            json!({
-                                "id": id,
-                                "object": "response",
-                                "status": "completed",
-                                "error": null,
-                                "output": [{
-                                    "type": "message",
-                                    "id": message_id,
-                                    "status": "completed",
-                                    "role": "assistant",
-                                    "content": [{
-                                        "type": "output_text",
-                                        "text": challenge
-                                    }]
-                                }]
-                            })
-                        }
-                        2 => {
-                            assert_eq!(body["previous_response_id"], "resp_anchor_a");
-                            assert!(!serde_json::to_string(&body).unwrap().contains("call_id"));
-                            json!({
-                                "id": "resp_wrong_global_last",
-                                "object": "response",
-                                "status": "completed",
-                                "error": null,
-                                "output": [{
-                                    "type": "function_call",
-                                    "id": "fc_wrong_global_last",
-                                    "status": "completed",
-                                    "call_id": "call_wrong_global_last",
-                                    "name": "atoapi_fidelity_probe",
-                                    "arguments": serde_json::to_string(&json!({
-                                        "challenge": anchor_b
-                                    })).unwrap()
-                                }]
-                            })
-                        }
-                        _ => panic!("global-last shim must fail before typed continuation"),
-                    };
-                    raw_response(
-                        200,
-                        "text/event-stream",
-                        response_json_to_sse(
-                            &Channel::Responses,
-                            &serde_json::to_vec(&response).unwrap(),
-                        ),
-                    )
-                }
-            }),
-        );
-        tokio::spawn(async move {
-            axum::serve(upstream_listener, upstream_app).await.unwrap();
-        });
-
-        let mut config = AppConfig::default();
-        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
-        provider.id = "probe-provider-global-last".to_string();
-        config.providers = vec![provider];
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-probe-global-last-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-
-        let result =
-            probe_provider_response_session_reuse(&state, "probe-provider-global-last", "gpt-5.5")
-                .await
-                .unwrap();
-
-        assert_eq!(
-            result.status,
-            ProviderResponseSessionReuseStatus::Unsupported
-        );
-        assert!(!result.enabled);
-        assert!(result.message.contains("selected by previous_response_id"));
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
-        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
@@ -38794,10 +34291,6 @@ mod tests {
             .unwrap();
         assert_eq!(*attempted_efforts.lock().await, vec!["ultra".to_string()]);
 
-        // Keep the second assertion focused on error classification rather
-        // than the independent short-lived prefix error guard.
-        state.prefix_error_cooldowns.lock().await.clear();
-
         let generic = handle_generation_for_agent(
             state.clone(),
             headers,
@@ -39108,45 +34601,197 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_third_party_delta_rejection_never_retries_full_context() {
+    async fn matching_local_previous_response_id_is_rebuilt_as_one_full_replay() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    let turn = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    captured.lock().await.push(body);
+                    let (response_id, output) = if turn == 1 {
+                        (
+                            "resp_seed",
+                            json!([{
+                                "type": "message",
+                                "id": "msg_seed",
+                                "status": "completed",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "seed answer" }]
+                            }]),
+                        )
+                    } else {
+                        ("resp_followup", json!([]))
+                    };
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        format!(
+                            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"model\":\"gpt-5.5\",\"output\":{output},\"usage\":{{\"input_tokens\":1024,\"output_tokens\":1}}}}}}\n\n"
+                        )
+                        .into_bytes(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "same-scope-full-replay";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-local-previous-full-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"same-scope-session","thread_id":"same-scope-thread","request_kind":"turn"}"#,
+            ),
+        );
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": [{ "type": "message", "role": "user", "content": "before" }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        tokio::time::timeout(TokioDuration::from_secs(2), async {
+            while state.continuation_lineage.is_empty().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the seed turn must publish local replay material");
+
+        let followup = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_seed",
+                    "input": [{ "type": "message", "role": "user", "content": "after" }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(followup.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(followup.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let captured = captured_bodies.lock().await.clone();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(captured[1].get("previous_response_id").is_none());
+        assert_eq!(
+            captured[1]["input"],
+            json!([
+                { "type": "message", "role": "user", "content": "before" },
+                {
+                    "type": "message",
+                    "id": "msg_seed",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "seed answer" }]
+                },
+                { "type": "message", "role": "user", "content": "after" }
+            ])
+        );
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_upstream_attempts.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both FullReplay turns must settle");
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics.recent_requests.iter().any(|request| {
+            request.response_context_plan.as_deref() == Some("full_replay_after_local_lineage")
+        }));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn normal_full_replay_never_injects_previous_response_id_retries_or_blocks_after_failure()
+    {
         let hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
-        let captured_second_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        // Capture the exact HTTP entity received by the hand-selected upstream.
+        // This makes the assertion cover the frozen wire, not merely a JSON
+        // value reserialized by the test server.
+        let captured_attempt_wires = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let hits_for_route = hits.clone();
         let chat_hits_for_route = chat_hits.clone();
-        let captured_for_route = captured_second_body.clone();
+        let captured_for_route = captured_attempt_wires.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = Router::new()
             .route(
                 "/v1/responses",
-                post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                    let hits = hits_for_route.clone();
-                    let captured = captured_for_route.clone();
-                    async move {
-                        if headers
-                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
-                            .and_then(|value| value.to_str().ok())
-                            == Some(CACHE_CAPABILITY_PROBE_REQUEST_KIND)
-                        {
-                            return Json(json!({
-                                "id": "resp_management_probe",
-                                "model": "gpt-5.5",
-                                "usage": {
-                                    "input_tokens": 2048,
-                                    "output_tokens": 1,
-                                    "input_tokens_details": {"cached_tokens": 0}
-                                },
-                                "output": [{
-                                    "type": "message",
-                                    "content": [{"type": "output_text", "text": "ACK"}]
-                                }]
-                            }))
-                            .into_response();
-                        }
-                        let attempt = hits.fetch_add(1, Ordering::SeqCst);
-                        if attempt == 0 {
-                            raw_response(
+                post(move |request: Request| {
+                        let hits = hits_for_route.clone();
+                        let captured = captured_for_route.clone();
+                        async move {
+                            let wire = to_bytes(request.into_body(), usize::MAX)
+                                .await
+                                .expect("the proxy must send a readable frozen request body")
+                                .to_vec();
+                            captured.lock().await.push(wire);
+                            let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                            if attempt == 0 {
+                                raw_response(
                                 200,
                                 "text/event-stream",
                                 concat!(
@@ -39158,15 +34803,25 @@ mod tests {
                                 .as_bytes()
                                 .to_vec(),
                             )
-                        } else {
-                            *captured.lock().await = body;
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "error": { "message": "Unsupported parameter: previous_response_id" }
-                                })),
+                        } else if attempt == 1 {
+                            raw_response(
+                                502,
+                                "text/html",
+                                b"upstream edge returned 502".to_vec(),
                             )
-                                .into_response()
+                        } else {
+                            raw_response(
+                                200,
+                                "text/event-stream",
+                                concat!(
+                                    "event: response.output_text.delta\n",
+                                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                                    "event: response.completed\n",
+                                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_second\",\"model\":\"gpt-5.5\",\"output\":[{\"type\":\"message\",\"id\":\"msg_second\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}],\"usage\":{\"input_tokens\":20,\"output_tokens\":1}}}\n\n"
+                                )
+                                .as_bytes()
+                                .to_vec(),
+                            )
                         }
                     }
                 }),
@@ -39203,24 +34858,7 @@ mod tests {
             supports_streaming: true,
             enabled: true,
         }];
-        let verification_capability = test_session_reuse_capability(
-            &RouteDecision {
-                provider: provider.clone(),
-                upstream_channel: Channel::Responses,
-                model: "gpt-5.5".to_string(),
-            },
-            "key",
-            None,
-        );
         config.providers = vec![provider];
-        config.record_response_session_reuse_probe(
-            "verified-third-party",
-            "gpt-5.5",
-            Some(verification_capability),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
         config.agent_injections = vec![AgentInjectionConfig {
             id: "codex".to_string(),
             label: "Codex".to_string(),
@@ -39258,11 +34896,75 @@ mod tests {
             ),
         );
         let stable_prefix = "stable prior context ".repeat(8_000);
+        let stable_tools = json!([
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Returns a stable lookup result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }
+            },
+            {
+                "type": "function",
+                "name": "run_check",
+                "description": "Runs a check which can report a failure.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }
+        ]);
+        // A completed tool and a failed tool are both part of the stable
+        // full-replay prefix. They must never be regenerated, reordered, or
+        // rebound to different call IDs by Atoapi on a later turn.
+        let stable_tool_history = json!([
+            { "type": "message", "role": "user", "content": stable_prefix.clone() },
+            {
+                "type": "function_call",
+                "id": "fc_lookup",
+                "status": "completed",
+                "call_id": "call_lookup",
+                "name": "lookup",
+                "arguments": r#"{"query":"stable context"}"#
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_lookup",
+                "output": r#"{"status":"ok","value":"stable-result"}"#
+            },
+            {
+                "type": "function_call",
+                "id": "fc_run_check",
+                "status": "completed",
+                "call_id": "call_run_check",
+                "name": "run_check",
+                "arguments": r#"{"path":"missing-file"}"#
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_run_check",
+                "output": r#"{"error":"command exited 1","stderr":"missing file"}"#
+            }
+        ]);
+        let seed_response_item = json!({
+            "type": "message",
+            "id": "msg_seed",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "ready" }]
+        });
         let first = Bytes::from(
             serde_json::to_vec(&json!({
                 "thread_id": "verified-session",
                 "model": "gpt-5.5",
-                "input": [{ "type": "message", "role": "user", "content": stable_prefix }]
+                "tools": stable_tools.clone(),
+                "input": stable_tool_history.clone()
             }))
             .unwrap(),
         );
@@ -39281,98 +34983,179 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(
             !state.continuation_lineage.is_empty().await,
-            "the seed stream must save a response id before the delta request"
+            "the seed stream must retain local lineage without enabling native delta"
         );
 
         let incremental_tail = "the only newly appended turn".repeat(16);
+        let mut second_input = stable_tool_history
+            .as_array()
+            .expect("the tool history fixture must be an array")
+            .clone();
+        second_input.push(seed_response_item.clone());
+        second_input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": incremental_tail
+        }));
         let second = Bytes::from(
             serde_json::to_vec(&json!({
                 "thread_id": "verified-session",
                 "model": "gpt-5.5",
-                 "input": [
-                     { "type": "message", "role": "user", "content": stable_prefix },
-                     {
-                         "type": "message",
-                         "id": "msg_seed",
-                         "status": "completed",
-                         "role": "assistant",
-                         "content": [{ "type": "output_text", "text": "ready" }]
-                     },
-                     { "type": "message", "role": "user", "content": incremental_tail }
-                 ]
+                "tools": stable_tools.clone(),
+                "input": second_input
             }))
             .unwrap(),
         );
-        let rejected = handle_generation_for_agent(
+        let second_response = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             second,
             Channel::Responses,
             Some("codex"),
         )
         .await;
 
-        let rejected_status = rejected.status();
-        let rejected_body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+        let second_status = second_response.status();
+        let second_body = axum::body::to_bytes(second_response.into_body(), usize::MAX)
             .await
             .unwrap();
         assert_eq!(
-            rejected_status,
-            StatusCode::BAD_REQUEST,
-            "hits={} body={}",
+            second_status,
+            StatusCode::BAD_GATEWAY,
+            "the failed inbound must retain its upstream result rather than retrying: hits={} body={}",
             hits.load(Ordering::SeqCst),
-            String::from_utf8_lossy(&rejected_body)
+            String::from_utf8_lossy(&second_body)
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
-        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
-        let captured = captured_second_body.lock().await.clone();
-        assert_eq!(captured["previous_response_id"], "resp_seed");
-        assert_eq!(captured["input"].as_array().map(Vec::len), Some(1));
-        let config = state.config.read().await;
-        assert!(!config.response_session_reuse_verified_for("verified-third-party", "gpt-5.5"));
-        drop(config);
-        fs::remove_dir_all(dir).ok();
-    }
 
-    #[test]
-    fn verified_third_party_session_reuse_is_model_scoped() {
-        let mut config = AppConfig::default();
-        let provider = test_responses_provider("https://third-party.example/v1".to_string());
-        let decision = RouteDecision {
-            provider,
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let capability = test_session_reuse_capability(&decision, "key", None);
-
-        assert!(!supports_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability)
-        ));
-        config.record_response_session_reuse_probe(
-            &decision.provider.id,
-            "gpt-5.5",
-            Some(capability.clone()),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
+        let mut third_input = stable_tool_history
+            .as_array()
+            .expect("the tool history fixture must be an array")
+            .clone();
+        third_input.push(seed_response_item);
+        third_input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "a fresh inbound after the upstream failure"
+        }));
+        let third = Bytes::from(
+            serde_json::to_vec(&json!({
+                "thread_id": "verified-session",
+                "model": "gpt-5.5",
+                "tools": stable_tools,
+                "input": third_input
+            }))
+            .unwrap(),
         );
-        assert!(supports_main_response_session_delta(
-            &config,
-            &decision,
-            Some(&capability)
-        ));
+        let third_response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            third,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        let third_status = third_response.status();
+        let third_body = axum::body::to_bytes(third_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            third_status,
+            StatusCode::OK,
+            "a new inbound must reach the hand-selected upstream immediately after a failure: hits={} body={}",
+            hits.load(Ordering::SeqCst),
+            String::from_utf8_lossy(&third_body)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 0);
+        let captured_wires = captured_attempt_wires.lock().await.clone();
+        assert_eq!(
+            captured_wires.len(),
+            3,
+            "every inbound must result in exactly one frozen upstream request"
+        );
+        let captured: Vec<Value> = captured_wires
+            .iter()
+            .map(|wire| {
+                serde_json::from_slice(wire)
+                    .expect("the exact upstream entity must remain valid JSON")
+            })
+            .collect();
+        for (attempt, (wire, body)) in captured_wires.iter().zip(&captured).enumerate() {
+            assert!(
+                body.get("previous_response_id").is_none(),
+                "full replay attempt {} must never turn local lineage into an upstream delta",
+                attempt + 1
+            );
+            assert_eq!(
+                wire.as_slice(),
+                serialize_responses_body_bytes_for_provider_prefix(body).as_slice(),
+                "attempt {} must be the final canonical frozen Responses wire",
+                attempt + 1
+            );
+        }
 
-        let other_model = RouteDecision {
-            model: "gpt-5.6".to_string(),
-            ..decision
-        };
-        assert!(!supports_main_response_session_delta(
-            &config,
-            &other_model,
-            Some(&capability)
-        ));
+        let first_input = captured[0]["input"]
+            .as_array()
+            .expect("the seed frozen body must retain its input array");
+        let second_input = captured[1]["input"]
+            .as_array()
+            .expect("the failed frozen body must retain its input array");
+        let third_input = captured[2]["input"]
+            .as_array()
+            .expect("the next frozen body must retain its input array");
+        assert_eq!(first_input.len(), 5);
+        assert_eq!(
+            &second_input[..first_input.len()],
+            first_input.as_slice(),
+            "the failed inbound must preserve the entire stable tool prefix before its new tail"
+        );
+        assert_eq!(
+            &third_input[..first_input.len()],
+            first_input.as_slice(),
+            "the next inbound must append after, not rewrite, the stable tool prefix"
+        );
+        assert_eq!(
+            Value::Array(first_input.clone()),
+            stable_tool_history,
+            "the frozen seed wire must retain the original tool history verbatim"
+        );
+        assert_eq!(captured[0]["tools"], captured[1]["tools"]);
+        assert_eq!(captured[0]["tools"], captured[2]["tools"]);
+        let first_static_digest =
+            PreparedWireRequest::from_value(&Channel::Responses, &captured[0])
+                .responses_static_projection_digest()
+                .map(ToOwned::to_owned);
+        let third_static_digest =
+            PreparedWireRequest::from_value(&Channel::Responses, &captured[2])
+                .responses_static_projection_digest()
+                .map(ToOwned::to_owned);
+        assert_eq!(
+            first_static_digest, third_static_digest,
+            "the static final wire (including tool definitions) must remain byte-stable"
+        );
+        assert_eq!(first_input[1]["call_id"], first_input[2]["call_id"]);
+        assert_eq!(first_input[3]["call_id"], first_input[4]["call_id"]);
+        assert_eq!(
+            first_input[1]["arguments"],
+            json!(r#"{"query":"stable context"}"#)
+        );
+        assert_eq!(
+            first_input[3]["arguments"],
+            json!(r#"{"path":"missing-file"}"#)
+        );
+        assert_eq!(
+            first_input[2]["output"],
+            json!(r#"{"status":"ok","value":"stable-result"}"#)
+        );
+        assert_eq!(
+            first_input[4]["output"],
+            json!(r#"{"error":"command exited 1","stderr":"missing file"}"#)
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -39776,87 +35559,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    #[tokio::test]
-    async fn expired_response_session_cooldown_keeps_failure_count() {
-        let config = AppConfig::default();
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-session-cooldown-expired-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let provider = ProviderConfig {
-            id: "bizd".to_string(),
-            name: "bizd".to_string(),
-            base_url: "https://bizd.example/v1".to_string(),
-            models_url: None,
-            is_full_url: false,
-            custom_user_agent: None,
-            channel: Channel::Responses,
-            prompt_cache_retention_enabled: false,
-            request_body_gzip_enabled: false,
-            use_system_proxy: false,
-            api_key_encrypted: None,
-            models: Vec::new(),
-            enabled: true,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        let responses = RouteDecision {
-            provider,
-            upstream_channel: Channel::Responses,
-            model: "gpt-5.5".to_string(),
-        };
-        let capability = test_session_reuse_capability(&responses, "key", None);
-        let key = response_session_error_cooldown_key(&responses, Some(&capability)).unwrap();
-
-        note_response_session_error_cooldown(&state, Some(&key)).await;
-        {
-            let mut cooldowns = state.response_session_error_cooldowns.lock().await;
-            let cooldown = cooldowns.get_mut(&key).unwrap();
-            cooldown.until = Instant::now() - std::time::Duration::from_secs(1);
-            assert_eq!(cooldown.failures, 1);
-        }
-
-        assert!(!response_session_cooldown_active(&state, Some(&key)).await);
-        note_response_session_error_cooldown(&state, Some(&key)).await;
-
-        let cooldowns = state.response_session_error_cooldowns.lock().await;
-        let cooldown = cooldowns.get(&key).unwrap();
-        assert_eq!(cooldown.failures, 2);
-        let remaining = cooldown.until.saturating_duration_since(Instant::now());
-        assert!(remaining.as_secs() > RESPONSE_SESSION_ERROR_COOLDOWN_SECOND_SECS - 60);
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
-    async fn responses_sync_main_respects_prefix_error_cooldown() {
-        let config = AppConfig::default();
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-sync-prefix-cooldown-{}",
-            Uuid::new_v4().simple()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let prefix_key = "prefix-sync-cooldown";
-
-        assert!(
-            !responses_sync_main_prefix_error_cooled_down(&state, true, Some(prefix_key)).await
-        );
-        note_prefix_error_cooldown(&state, Some(prefix_key)).await;
-        assert!(responses_sync_main_prefix_error_cooled_down(&state, true, Some(prefix_key)).await);
-        assert!(
-            !responses_sync_main_prefix_error_cooled_down(&state, false, Some(prefix_key)).await,
-            "streaming requests must not be blocked by the sync-main cooldown gate"
-        );
-        assert!(
-            !responses_sync_main_prefix_error_cooled_down(&state, true, None).await,
-            "missing prefix state key should not block sync requests"
-        );
-
-        fs::remove_dir_all(dir).ok();
-    }
-
     #[test]
     fn upstream_errors_are_scoped_by_cause() {
         assert_eq!(
@@ -39887,14 +35589,6 @@ mod tests {
         assert_eq!(
             responses_compact_url("https://api.example.com/v1/responses", "resp_123"),
             "https://api.example.com/v1/responses/resp_123/compact"
-        );
-        assert_eq!(
-            responses_compact_collection_url("https://api.example.com/v1"),
-            "https://api.example.com/v1/responses/compact"
-        );
-        assert_eq!(
-            responses_compact_collection_url("https://api.example.com/v1/responses"),
-            "https://api.example.com/v1/responses/compact"
         );
         assert!(should_fallback_compact_to_responses(404));
         assert!(should_fallback_compact_to_responses(405));
@@ -40638,38 +36332,66 @@ mod tests {
     async fn responses_compact_success_keeps_full_replay_boundary_for_next_turn() {
         let compact_hits = Arc::new(AtomicUsize::new(0));
         let captured_compact_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let main_hits = Arc::new(AtomicUsize::new(0));
+        let captured_main_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let compact_hits_for_route = compact_hits.clone();
         let captured_body_for_route = captured_compact_body.clone();
+        let main_hits_for_route = main_hits.clone();
+        let captured_main_bodies_for_route = captured_main_bodies.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
-        let upstream_app = Router::new().route(
-            "/v1/responses/:response_id/compact",
-            post(move |Json(body): Json<Value>| {
-                let hits = compact_hits_for_route.clone();
-                let captured = captured_body_for_route.clone();
-                async move {
-                    hits.fetch_add(1, Ordering::SeqCst);
-                    *captured.lock().await = body;
-                    Json(json!({
-                        "id": "resp_compacted",
-                        "object": "response",
-                        "model": "gpt-5.5",
-                        "status": "completed",
-                        "output": [{
-                            "type": "message",
-                            "id": "msg_compact",
-                            "role": "assistant",
-                            "content": [{ "type": "output_text", "text": "compact summary" }]
-                        }],
-                        "usage": {
-                            "input_tokens": 2048,
-                            "output_tokens": 64,
-                            "input_tokens_details": { "cached_tokens": 1536 }
-                        }
-                    }))
-                }
-            }),
-        );
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses/:response_id/compact",
+                post(move |Json(body): Json<Value>| {
+                    let hits = compact_hits_for_route.clone();
+                    let captured = captured_body_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        *captured.lock().await = body;
+                        Json(json!({
+                            "id": "resp_compacted",
+                            "object": "response",
+                            "model": "gpt-5.5",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "id": "msg_compact",
+                                "role": "assistant",
+                                "content": [{ "type": "output_text", "text": "compact summary" }]
+                            }],
+                            "usage": {
+                                "input_tokens": 2048,
+                                "output_tokens": 64,
+                                "input_tokens_details": { "cached_tokens": 1536 }
+                            }
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses",
+                post(move |Json(body): Json<Value>| {
+                    let hits = main_hits_for_route.clone();
+                    let captured = captured_main_bodies_for_route.clone();
+                    async move {
+                        let turn = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        captured.lock().await.push(body);
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            format!(
+                                concat!(
+                                    "event: response.completed\n",
+                                    "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_turn_{turn}\",\"model\":\"gpt-5.5\",\"output\":[{{\"type\":\"message\",\"id\":\"msg_turn_{turn}\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"turn {turn}\"}}]}}],\"usage\":{{\"input_tokens\":4096,\"output_tokens\":1,\"input_tokens_details\":{{\"cached_tokens\":3968}}}}}}}}\n\n"
+                                ),
+                                turn = turn
+                            )
+                            .into_bytes(),
+                        )
+                    }
+                }),
+            );
         tokio::spawn(async move {
             axum::serve(upstream_listener, upstream_app).await.unwrap();
         });
@@ -40840,27 +36562,345 @@ mod tests {
                 "content": [{ "type": "input_text", "text": "continue after compact" }]
             }
         ]);
-        let next_request = json!({
-            "model": "gpt-5.5",
-            "stream": true,
-            "input": next_input.clone()
-        });
-        let lease = state
-            .continuation_lineage
-            .begin(&continuation_scope.anchor_key)
-            .await;
-        let reuse = maybe_reuse_response_session(&next_request, Some(&lease), &decision, true);
+        let mut turn_headers = HeaderMap::new();
+        turn_headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-test-key"),
+        );
+        turn_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"compact-session","thread_id":"compact-thread","request_kind":"turn"}"#,
+            ),
+        );
+        let next = handle_generation_for_agent(
+            state.clone(),
+            turn_headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": next_input.clone()
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(next.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(next.into_body(), usize::MAX)
+            .await
+            .unwrap();
 
-        assert!(reuse.delta_body.is_none());
-        assert_eq!(next_request["input"], next_input);
+        let final_input = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "please compact context" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "continue after compact" }]
+            },
+            {
+                "type": "message",
+                "id": "msg_turn_1",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "turn 1" }]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "one real new tail" }]
+            }
+        ]);
+        let final_turn = handle_generation_for_agent(
+            state.clone(),
+            turn_headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": final_input.clone()
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(final_turn.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(final_turn.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let captured = captured_main_bodies.lock().await.clone();
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(main_hits.load(Ordering::SeqCst), 2);
         assert_eq!(
-            reuse.diagnostics.skip_reason.as_deref(),
-            Some("no_candidate")
+            captured.len(),
+            2,
+            "each post-compact inbound is one upstream POST"
+        );
+        assert!(captured
+            .iter()
+            .all(|body| body.get("previous_response_id").is_none()));
+        assert_eq!(captured[0]["input"], next_input);
+        assert_eq!(captured[1]["input"], final_input);
+        assert_eq!(
+            state
+                .continuation_lineage
+                .head(&continuation_scope.anchor_key)
+                .await
+                .as_deref()
+                .map(|head| (&head.response_id, &head.input)),
+            Some((&"resp_turn_2".to_string(), &final_input))
         );
     }
 
     #[tokio::test]
-    async fn codex_native_responses_strips_client_cache_key_without_losing_context() {
+    async fn codex_tool_full_replay_preserves_success_and_failure_history_on_the_frozen_wire() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    let turn = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    captured.lock().await.push(body);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        format!(
+                            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_tools_{turn}\",\"model\":\"gpt-5.5\",\"output\":[],\"usage\":{{\"input_tokens\":2048,\"output_tokens\":1,\"input_tokens_details\":{{\"cached_tokens\":1920}}}}}}}}\n\n",
+                            turn = turn
+                        )
+                        .into_bytes(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "tool-full-replay";
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "workspace-test".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, provider_id);
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-tool-full-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"tools-session","thread_id":"tools-thread","request_kind":"turn"}"#,
+            ),
+        );
+
+        let first_input = json!([
+            { "type": "message", "role": "user", "content": "inspect project state" },
+            {
+                "type": "function_call",
+                "id": "fc-success",
+                "status": "completed",
+                "call_id": "call-success-random",
+                "name": "read_file",
+                "arguments": "{\"path\":\"src/main.rs\"}"
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco-success",
+                "status": "completed",
+                "call_id": "call-success-random",
+                "output": { "contents": "fn main() {}", "ok": true }
+            },
+            {
+                "type": "function_call",
+                "id": "fc-failure",
+                "status": "completed",
+                "call_id": "call-failure-random",
+                "name": "run_command",
+                "arguments": "{\"command\":\"cargo test missing\"}"
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco-failure",
+                "status": "completed",
+                "call_id": "call-failure-random",
+                "output": { "error": "exit 1", "stderr": "missing target", "ok": false }
+            }
+        ]);
+        let tools = json!([
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": { "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }
+            },
+            {
+                "type": "function",
+                "name": "run_command",
+                "parameters": { "type": "object", "properties": { "command": { "type": "string" } }, "required": ["command"] }
+            }
+        ]);
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "instructions": "preserve tool history exactly",
+                    "tools": tools.clone(),
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": false,
+                    "input": first_input
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let mut second_items = first_input.as_array().unwrap().clone();
+        second_items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue with one real new tail"
+        }));
+        let second_input = Value::Array(second_items);
+        let second = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "instructions": "preserve tool history exactly",
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "parallel_tool_calls": false,
+                    "input": second_input.clone()
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let captured = captured_bodies.lock().await.clone();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(captured.len(), 2);
+        assert!(captured
+            .iter()
+            .all(|body| body.get("previous_response_id").is_none()));
+        let first_wire = &captured[0];
+        let second_wire = &captured[1];
+        assert_eq!(first_wire["tools"], second_wire["tools"]);
+        assert_eq!(first_wire["tool_choice"], second_wire["tool_choice"]);
+        assert_eq!(
+            first_wire["parallel_tool_calls"],
+            second_wire["parallel_tool_calls"]
+        );
+        let first_items = first_wire["input"].as_array().unwrap();
+        let second_items = second_wire["input"].as_array().unwrap();
+        assert_eq!(&second_items[..first_items.len()], first_items.as_slice());
+        assert_eq!(second_items.last(), second_input.as_array().unwrap().last());
+        for (call_index, output_index) in [(1usize, 2usize), (3usize, 4usize)] {
+            assert_eq!(
+                first_items[call_index]["call_id"],
+                first_items[output_index]["call_id"]
+            );
+            assert_eq!(
+                second_items[call_index]["call_id"],
+                second_items[output_index]["call_id"]
+            );
+        }
+        let first_fingerprints =
+            responses_wire_prefix_fingerprints(&Channel::Responses, first_wire).unwrap();
+        let second_fingerprints =
+            responses_wire_prefix_fingerprints(&Channel::Responses, second_wire).unwrap();
+        assert_eq!(
+            first_fingerprints.pre_input_wire,
+            second_fingerprints.pre_input_wire
+        );
+        assert_eq!(
+            first_fingerprints.tools_schema,
+            second_fingerprints.tools_schema
+        );
+        assert_eq!(
+            first_fingerprints.input_prefixes,
+            second_fingerprints.input_prefixes[..first_fingerprints.input_prefixes.len()]
+        );
+
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_upstream_attempts.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both tool turns must settle");
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_upstream_attempts
+            .iter()
+            .all(|attempt| attempt.attempt_index == 1));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_native_responses_strips_speculative_client_cache_controls_without_losing_context(
+    ) {
         let responses_hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
         let captured_responses_body = Arc::new(tokio::sync::Mutex::new(Value::Null));
@@ -41127,17 +37167,13 @@ mod tests {
             "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
         );
         assert_eq!(captured["input"][2]["vendor_output"]["exit_code"], 0);
-        let generated_key = captured
-            .get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .expect("the selected placement key must reach the one frozen upstream wire");
-        assert_eq!(generated_key.len(), 64);
-        assert_ne!(generated_key, "codex-native-placement-key");
-        assert_eq!(
-            captured
-                .get("prompt_cache_retention")
-                .and_then(Value::as_str),
-            Some("24h")
+        assert!(
+            captured.get("prompt_cache_key").is_none(),
+            "an unverified selected scope must not forward a caller key or inject one"
+        );
+        assert!(
+            captured.get("prompt_cache_retention").is_none(),
+            "an unverified selected scope must not guess legacy retention"
         );
         assert!(captured.get("prompt_cache_options").is_none());
         assert_eq!(
@@ -41159,7 +37195,7 @@ mod tests {
         );
         assert_eq!(
             metrics.recent_requests[0].provider_prefix_key.as_deref(),
-            Some(generated_key)
+            None
         );
         let validation = state.cache_validation.lock().await.status(Utc::now());
         assert_eq!(validation.mode, cache_validation::CacheValidationMode::Auto);
@@ -41232,9 +37268,9 @@ mod tests {
             Some("shared-client:pool-enabled-hit-not-exposed")
         );
 
-        // A generic 5xx is not a cache-field rejection and must not block the
-        // next independent inbound. That next request still gets exactly one
-        // upstream POST with the unchanged generated placement key.
+        // A generic 5xx must not block the next independent inbound. That
+        // request still gets exactly one upstream POST and remains neutral in
+        // an unverified cache-control scope.
         let after_502_body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",
@@ -41256,78 +37292,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(responses_hits.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            captured_responses_body
-                .lock()
-                .await
-                .get("prompt_cache_key")
-                .and_then(Value::as_str),
-            Some(generated_key)
-        );
-
-        // An explicit field rejection disables only this selected-Key scope;
-        // no retry is sent for the rejected request, and later traffic falls
-        // back to the neutral wire.
-        let rejected_body = Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": "gpt-5.5",
-                "stream": false,
-                "metadata": { "atoapi_test_reject_prompt_cache_key": true },
-                "input": [{ "type": "message", "role": "user", "content": "reject generated cache key" }]
-            }))
-            .unwrap(),
-        );
-        let rejected_response = handle_generation_for_agent(
-            state.clone(),
-            headers.clone(),
-            rejected_body,
-            Channel::Responses,
-            Some("codex"),
-        )
-        .await;
-        assert_eq!(rejected_response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(responses_hits.load(Ordering::SeqCst), 4);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let config = state.config.read().await;
-                if config.cache_capability_status_for_key(
-                    "mock-responses",
-                    "gpt-5.5",
-                    &Channel::Responses,
-                    None,
-                    ProviderCacheCapabilityField::PromptCacheKey,
-                ) == ProviderCacheCapabilityStatus::Unsupported
-                {
-                    break;
-                }
-                drop(config);
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the explicit field rejection must disable the exact cache-key scope");
-
-        let neutral_after_rejection = Bytes::from(
-            serde_json::to_vec(&json!({
-                "model": "gpt-5.5",
-                "stream": false,
-                "input": [{ "type": "message", "role": "user", "content": "neutral after explicit rejection" }]
-            }))
-            .unwrap(),
-        );
-        let neutral_response = handle_generation_for_agent(
-            state.clone(),
-            headers.clone(),
-            neutral_after_rejection,
-            Channel::Responses,
-            Some("codex"),
-        )
-        .await;
-        assert_eq!(neutral_response.status(), StatusCode::OK);
-        axum::body::to_bytes(neutral_response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        assert_eq!(responses_hits.load(Ordering::SeqCst), 5);
         assert!(captured_responses_body
             .lock()
             .await
@@ -41363,7 +37327,7 @@ mod tests {
         axum::body::to_bytes(untrusted_response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(responses_hits.load(Ordering::SeqCst), 6);
+        assert_eq!(responses_hits.load(Ordering::SeqCst), 4);
         assert!(captured_responses_body
             .lock()
             .await
@@ -44446,10 +40410,10 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
     }
 
     #[tokio::test]
-    async fn client_cache_key_is_replaced_before_a_normal_one_shot_wire() {
+    async fn client_cache_key_is_stripped_before_a_normal_one_shot_wire() {
         // Use a value that would cause a field-specific rejection if it ever
-        // crossed the normal wire. The normal request must instead succeed in
-        // one POST with no cooldown state.
+        // crossed the normal wire. Without an exact verified cache scope, the
+        // normal request must strip it and still succeed in one POST.
         let raw_client_key = "invalid_parameter";
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
@@ -44568,13 +40532,10 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
         );
         let captured_bodies = captured_bodies.lock().await;
         assert_eq!(captured_bodies.len(), 1);
-        let forwarded_key = captured_bodies[0]
-            .get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .expect("trusted native full replay receives only the generated placement key");
-        assert_ne!(forwarded_key, raw_client_key);
-        assert_eq!(forwarded_key.len(), 64);
-        assert!(forwarded_key.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(
+            captured_bodies[0].get("prompt_cache_key").is_none(),
+            "unverified cache controls must not cross an ordinary one-shot wire"
+        );
         drop(captured_bodies);
 
         let cooldown_keys = state

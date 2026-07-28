@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
@@ -15,10 +16,11 @@ const sourceConfigDir = resolve(
 const oldExecutable = resolve(
   String(
     args["old-exe"] ??
+      process.env.ATOAPI_WIRE_BASELINE_EXE ??
       join(
         repoRoot,
         "releases",
-        "v1.3.4-verified-native-delta-lineage-20260721",
+        "v1.3.10-agent-route-sync-20260726",
         "Atoapi.exe"
       )
   )
@@ -29,8 +31,15 @@ const newExecutable = resolve(
 const model = String(args.model ?? "gpt-5.6-terra").trim();
 const concurrency = boundedPositiveInteger(args.concurrency ?? 1, "--concurrency", 32);
 const gateHeaders = booleanArg(args["gate-headers"]);
+const baselineLabel = basename(dirname(oldExecutable));
 
 if (!model) throw new Error("--model must not be empty");
+if (!existsSync(oldExecutable)) {
+  throw new Error(`wire baseline executable is missing: ${oldExecutable}`);
+}
+if (!existsSync(newExecutable)) {
+  throw new Error(`FastRelay executable is missing: ${newExecutable}`);
+}
 if (gateHeaders && concurrency < 2) {
   throw new Error("--gate-headers requires --concurrency of at least 2");
 }
@@ -135,7 +144,11 @@ try {
     true,
     "each isolated inbound must make exactly one upstream POST"
   );
-  assert.equal(report.wire_equal, true, "FastRelay must preserve the v1.3.4 upstream wire body");
+  assert.equal(
+    report.wire_equal,
+    true,
+    `FastRelay must preserve the ${baselineLabel} upstream wire body`
+  );
   assert.equal(
     report.headers_equal,
     true,
@@ -144,7 +157,7 @@ try {
   assert.equal(
     report.shadow_identity_equal,
     true,
-    "FastRelay must preserve v1.3.4 shadow affinity identity for the same request"
+    `FastRelay must preserve ${baselineLabel} shadow affinity identity for the same request`
   );
   if (gateHeaders) {
     assert.equal(

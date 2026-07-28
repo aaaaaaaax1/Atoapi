@@ -119,6 +119,7 @@ impl PreparedWireDraft {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.body.len()
     }
@@ -246,6 +247,7 @@ impl PreparedResponseBody {
 
     /// Size of the retained canonical Responses encoding, when the body was
     /// an object and could be drafted.
+    #[cfg(test)]
     pub(super) fn initial_wire_len(&self) -> Option<usize> {
         self.wire_draft.as_ref().map(PreparedWireDraft::len)
     }
@@ -715,6 +717,7 @@ impl PreparedWireRequest {
         self.responses_static_projection_digest.as_deref()
     }
 
+    #[cfg(test)]
     pub(super) fn prompt_cache_breakpoint_present(&self) -> bool {
         self.protocol_breakpoint_provenance.is_present()
     }

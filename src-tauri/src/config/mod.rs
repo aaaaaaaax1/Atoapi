@@ -56,6 +56,38 @@ fn default_key_priority() -> u32 {
     5
 }
 
+fn default_new_key_pool_strategy() -> KeyLoadBalanceStrategy {
+    KeyLoadBalanceStrategy::Sequential
+}
+
+fn key_failure_exhausts_account_capacity(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+    [
+        "insufficient_quota",
+        "quota exceeded",
+        "quota exhausted",
+        "quota is exhausted",
+        "exceeded your current quota",
+        "out of credits",
+        "credits exhausted",
+        "credit balance",
+        "insufficient balance",
+        "balance is exhausted",
+        "billing hard limit",
+        "billing limit",
+        "payment required",
+        "http 402",
+        "余额不足",
+        "余额耗尽",
+        "余额",
+        "额度不足",
+        "额度耗尽",
+        "欠费",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
@@ -112,8 +144,11 @@ pub struct AppConfig {
     pub provider_compact_modes: Vec<ProviderCompactModeConfig>,
     #[serde(default)]
     pub provider_channel_modes: Vec<ProviderChannelModeConfig>,
-    #[serde(default)]
-    pub provider_response_session_reuse: Vec<ProviderResponseSessionReuseConfig>,
+    /// Retired v1.4.4 session-reuse certificates are read once so loading an
+    /// older configuration can rewrite it without preserving a feature that
+    /// no longer exists in the request path.
+    #[serde(default, rename = "provider_response_session_reuse", skip_serializing)]
+    _legacy_provider_response_session_reuse: Option<toml::Value>,
     #[serde(default)]
     pub provider_cache_capabilities: Vec<ProviderCacheCapabilityConfig>,
     pub updated_at: DateTime<Utc>,
@@ -214,101 +249,6 @@ pub struct ProviderChannelModeConfig {
     #[serde(default = "default_provider_channel_mode")]
     pub mode: ProviderChannelMode,
     pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ProviderResponseSessionReuseStatus {
-    Unverified,
-    Verified,
-    Unsupported,
-    Error,
-}
-
-pub const RESPONSE_SESSION_REUSE_EVIDENCE_VERSION: u32 = 3;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ResponseSessionReuseStreamShape {
-    NonStreamJson,
-    StreamSse,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ProviderResponseSessionReuseCapability {
-    pub endpoint: String,
-    pub channel: Channel,
-    pub key_realm_id: String,
-    pub stream_shape: ResponseSessionReuseStreamShape,
-    pub evidence_version: u32,
-}
-
-impl ProviderResponseSessionReuseCapability {
-    pub fn is_current(&self) -> bool {
-        self.channel == Channel::Responses
-            && self.stream_shape == ResponseSessionReuseStreamShape::StreamSse
-            && self.evidence_version == RESPONSE_SESSION_REUSE_EVIDENCE_VERSION
-    }
-}
-
-impl Default for ProviderResponseSessionReuseStatus {
-    fn default() -> Self {
-        Self::Unverified
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderResponseSessionReuseConfig {
-    pub provider_id: String,
-    pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability: Option<ProviderResponseSessionReuseCapability>,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub status: ProviderResponseSessionReuseStatus,
-    #[serde(default)]
-    pub usage_verified: bool,
-    #[serde(default)]
-    pub compact_fidelity_verified: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checked_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error: Option<String>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderResponseSessionReuseProbeResult {
-    pub provider_id: String,
-    pub model_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability: Option<ProviderResponseSessionReuseCapability>,
-    pub status: ProviderResponseSessionReuseStatus,
-    pub enabled: bool,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checked_at: Option<DateTime<Utc>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation_status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compact_status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compact_continuation_status: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_cached_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation_input_tokens: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation_cached_tokens: Option<u64>,
-    #[serde(default)]
-    pub usage_verified: bool,
-    #[serde(default)]
-    pub compact_fidelity_verified: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -529,34 +469,6 @@ pub struct ProviderCacheCapabilityProbeTarget {
     key_pool_updated_at: Option<DateTime<Utc>>,
 }
 
-/// A non-secret snapshot of the provider connection that a manual Responses
-/// session-reuse probe actually exercised.  It is intentionally transient:
-/// the probe command compares it again before persisting a verified result so
-/// an old endpoint or key pool cannot be marked as verified after settings
-/// change mid-probe.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderResponseSessionReuseProbeTarget {
-    provider_id: String,
-    base_url: String,
-    is_full_url: bool,
-    channel: Channel,
-    channel_mode: ProviderChannelMode,
-    provider_updated_at: DateTime<Utc>,
-    key_pool_updated_at: Option<DateTime<Utc>>,
-}
-
-/// The mutable capability state that a probe must not overwrite when the user
-/// changes the setting while its two management requests are in flight.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderResponseSessionReuseRecordSnapshot {
-    capability: Option<ProviderResponseSessionReuseCapability>,
-    enabled: bool,
-    status: ProviderResponseSessionReuseStatus,
-    usage_verified: bool,
-    compact_fidelity_verified: bool,
-    updated_at: DateTime<Utc>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyLoadBalanceStrategy {
@@ -638,7 +550,7 @@ pub struct ProviderKeyConfig {
 pub struct ProviderKeyPoolInput {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_new_key_pool_strategy")]
     pub strategy: KeyLoadBalanceStrategy,
     #[serde(default = "default_key_failure_threshold")]
     pub failure_threshold: u32,
@@ -934,8 +846,6 @@ pub struct PublicProvider {
     pub use_system_proxy: bool,
     pub non_sse_compact_compat_enabled: bool,
     #[serde(default)]
-    pub response_session_reuse_models: Vec<ProviderResponseSessionReuseConfig>,
-    #[serde(default)]
     pub cache_capabilities: Vec<ProviderCacheCapabilityConfig>,
     pub has_api_key: bool,
     pub key_pool: Option<PublicProviderKeyPool>,
@@ -1056,7 +966,7 @@ impl Default for AppConfig {
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
             provider_channel_modes: Vec::new(),
-            provider_response_session_reuse: Vec::new(),
+            _legacy_provider_response_session_reuse: None,
             provider_cache_capabilities: Vec::new(),
             updated_at: now,
         }
@@ -1086,7 +996,11 @@ impl AppConfig {
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             let mut changed = false;
             config.cache.normalize_fast_forwarding_hit_policy();
-            if config.normalize_provider_response_session_reuse_evidence_state() {
+            if config
+                ._legacy_provider_response_session_reuse
+                .take()
+                .is_some()
+            {
                 changed = true;
             }
             if config.normalize_provider_cache_capability_effect_state() {
@@ -1305,8 +1219,6 @@ impl AppConfig {
                     use_system_proxy: provider.use_system_proxy,
                     non_sse_compact_compat_enabled: self
                         .non_sse_compact_compat_enabled_for_provider(&provider.id),
-                    response_session_reuse_models: self
-                        .response_session_reuse_for_provider(&provider.id),
                     cache_capabilities: self.cache_capabilities_for_provider(&provider.id),
                     has_api_key: provider.api_key_encrypted.is_some(),
                     key_pool: self.public_key_pool_for_provider(&provider.id),
@@ -1502,10 +1414,15 @@ impl AppConfig {
             key.status = ProviderKeyStatus::Unhealthy;
             key.last_checked_at = Some(now);
             key.last_error = Some(message.chars().take(180).collect());
-            if force_cooldown || key.failures >= failure_threshold as u64 {
-                // `enabled` is the user's routing switch. Health failures only
-                // apply a temporary circuit-breaker cooldown, so a recovered
-                // key becomes selectable again without a settings rewrite.
+            if key_failure_exhausts_account_capacity(message) {
+                // Quota/balance exhaustion cannot recover through a wait. Turn
+                // only this Key off so the next inbound chooses the next
+                // configured Key; the failed inbound is never retried here.
+                key.enabled = false;
+                key.disabled_until = None;
+            } else if force_cooldown || key.failures >= failure_threshold as u64 {
+                // Temporary health failures preserve the user's routing switch
+                // and use a recoverable circuit-breaker cooldown instead.
                 key.disabled_until = Some(now + chrono::Duration::minutes(recovery_minutes as i64));
             }
             key.updated_at = now;
@@ -1542,31 +1459,6 @@ impl AppConfig {
             .find(|item| item.provider_id == provider_id)
             .map(|item| item.mode.clone())
             .unwrap_or_default()
-    }
-
-    pub fn response_session_reuse_for_provider(
-        &self,
-        provider_id: &str,
-    ) -> Vec<ProviderResponseSessionReuseConfig> {
-        let mut records = self
-            .provider_response_session_reuse
-            .iter()
-            .filter(|item| item.provider_id == provider_id)
-            .cloned()
-            .collect::<Vec<_>>();
-        records.sort_by(|left, right| {
-            right
-                .enabled
-                .cmp(&left.enabled)
-                .then_with(|| {
-                    (right.status == ProviderResponseSessionReuseStatus::Verified)
-                        .cmp(&(left.status == ProviderResponseSessionReuseStatus::Verified))
-                })
-                .then_with(|| right.updated_at.cmp(&left.updated_at))
-        });
-        let mut seen_models = std::collections::HashSet::new();
-        records.retain(|item| seen_models.insert(item.model_id.clone()));
-        records
     }
 
     pub fn cache_capabilities_for_provider(
@@ -2024,284 +1916,6 @@ impl AppConfig {
         self.updated_at = Utc::now();
     }
 
-    #[cfg(test)]
-    pub fn response_session_reuse_verified_for(&self, provider_id: &str, model_id: &str) -> bool {
-        self.provider_response_session_reuse.iter().any(|item| {
-            item.provider_id == provider_id
-                && item.model_id == model_id
-                && item.enabled
-                && item.status == ProviderResponseSessionReuseStatus::Verified
-                && item.usage_verified
-                && item
-                    .capability
-                    .as_ref()
-                    .is_some_and(ProviderResponseSessionReuseCapability::is_current)
-        })
-    }
-
-    pub fn response_session_reuse_verified_for_scope(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-        capability: &ProviderResponseSessionReuseCapability,
-    ) -> bool {
-        capability.is_current()
-            && self.provider_response_session_reuse.iter().any(|item| {
-                item.provider_id == provider_id
-                    && item.model_id == model_id
-                    && item.enabled
-                    && item.status == ProviderResponseSessionReuseStatus::Verified
-                    && item.usage_verified
-                    && item.capability.as_ref() == Some(capability)
-            })
-    }
-
-    pub fn response_session_reuse_record_snapshot(
-        &self,
-        provider_id: &str,
-        model_id: &str,
-    ) -> Vec<ProviderResponseSessionReuseRecordSnapshot> {
-        self.provider_response_session_reuse
-            .iter()
-            .filter(|item| item.provider_id == provider_id && item.model_id == model_id)
-            .map(|item| ProviderResponseSessionReuseRecordSnapshot {
-                capability: item.capability.clone(),
-                enabled: item.enabled,
-                status: item.status.clone(),
-                usage_verified: item.usage_verified,
-                compact_fidelity_verified: item.compact_fidelity_verified,
-                updated_at: item.updated_at,
-            })
-            .collect()
-    }
-
-    pub fn response_session_reuse_probe_target(
-        &self,
-        provider_id: &str,
-    ) -> Option<ProviderResponseSessionReuseProbeTarget> {
-        let provider = self
-            .providers
-            .iter()
-            .find(|provider| provider.id == provider_id)?;
-        Some(ProviderResponseSessionReuseProbeTarget {
-            provider_id: provider.id.clone(),
-            base_url: provider.base_url.clone(),
-            is_full_url: provider.is_full_url,
-            channel: provider.channel.clone(),
-            channel_mode: self.provider_channel_mode_for_provider(provider_id),
-            provider_updated_at: provider.updated_at,
-            key_pool_updated_at: self
-                .provider_key_pools
-                .iter()
-                .find(|pool| pool.provider_id == provider_id)
-                .map(|pool| pool.updated_at),
-        })
-    }
-
-    pub fn set_response_session_reuse_enabled(
-        &mut self,
-        provider_id: &str,
-        model_id: &str,
-        enabled: bool,
-    ) -> Result<()> {
-        let found = self
-            .provider_response_session_reuse
-            .iter()
-            .any(|item| item.provider_id == provider_id && item.model_id == model_id);
-        let verified = self.provider_response_session_reuse.iter().any(|item| {
-            item.provider_id == provider_id
-                && item.model_id == model_id
-                && item.status == ProviderResponseSessionReuseStatus::Verified
-                && item.usage_verified
-                && item
-                    .capability
-                    .as_ref()
-                    .is_some_and(ProviderResponseSessionReuseCapability::is_current)
-        });
-        if !found || (enabled && !verified) {
-            return Err(anyhow!(
-                "Responses session reuse must pass semantic, usage, and cache verification before enabling"
-            ));
-        }
-        let now = Utc::now();
-        for item in self
-            .provider_response_session_reuse
-            .iter_mut()
-            .filter(|item| item.provider_id == provider_id && item.model_id == model_id)
-        {
-            let current = item.status == ProviderResponseSessionReuseStatus::Verified
-                && item.usage_verified
-                && item
-                    .capability
-                    .as_ref()
-                    .is_some_and(ProviderResponseSessionReuseCapability::is_current);
-            item.enabled = enabled && current;
-            item.updated_at = now;
-        }
-        self.updated_at = now;
-        Ok(())
-    }
-
-    pub fn record_response_session_reuse_probe(
-        &mut self,
-        provider_id: &str,
-        model_id: &str,
-        capability: Option<ProviderResponseSessionReuseCapability>,
-        status: ProviderResponseSessionReuseStatus,
-        usage_verified: bool,
-        message: Option<String>,
-    ) {
-        let now = Utc::now();
-        let capability_is_current = capability
-            .as_ref()
-            .is_some_and(ProviderResponseSessionReuseCapability::is_current);
-        let status = if status == ProviderResponseSessionReuseStatus::Verified
-            && (!usage_verified || !capability_is_current)
-        {
-            ProviderResponseSessionReuseStatus::Unverified
-        } else {
-            status
-        };
-        let usage_verified = usage_verified
-            && capability_is_current
-            && status == ProviderResponseSessionReuseStatus::Verified;
-        let enabled = status == ProviderResponseSessionReuseStatus::Verified && usage_verified;
-        if enabled {
-            self.provider_response_session_reuse.retain(|item| {
-                item.provider_id != provider_id
-                    || item.model_id != model_id
-                    || item.capability.is_some()
-            });
-        }
-        if let Some(item) = self
-            .provider_response_session_reuse
-            .iter_mut()
-            .find(|item| {
-                item.provider_id == provider_id
-                    && item.model_id == model_id
-                    && item.capability == capability
-            })
-        {
-            item.capability = capability;
-            item.enabled = enabled;
-            item.status = status;
-            item.usage_verified = usage_verified;
-            item.compact_fidelity_verified = false;
-            item.checked_at = Some(now);
-            item.last_error = clean_optional_string(message);
-            item.updated_at = now;
-        } else {
-            self.provider_response_session_reuse
-                .push(ProviderResponseSessionReuseConfig {
-                    provider_id: provider_id.to_string(),
-                    model_id: model_id.to_string(),
-                    capability,
-                    enabled,
-                    status,
-                    usage_verified,
-                    compact_fidelity_verified: false,
-                    checked_at: Some(now),
-                    last_error: clean_optional_string(message),
-                    updated_at: now,
-                });
-        }
-        self.updated_at = now;
-    }
-
-    pub fn set_response_session_reuse_compact_fidelity(
-        &mut self,
-        provider_id: &str,
-        model_id: &str,
-        capability: Option<&ProviderResponseSessionReuseCapability>,
-        verified: bool,
-    ) {
-        let now = Utc::now();
-        if let Some(item) = self
-            .provider_response_session_reuse
-            .iter_mut()
-            .find(|item| {
-                item.provider_id == provider_id
-                    && item.model_id == model_id
-                    && item.capability.as_ref() == capability
-            })
-        {
-            item.compact_fidelity_verified = verified
-                && item.enabled
-                && item.status == ProviderResponseSessionReuseStatus::Verified
-                && item.usage_verified;
-            item.updated_at = now;
-            self.updated_at = now;
-        }
-    }
-
-    fn normalize_provider_response_session_reuse_evidence_state(&mut self) -> bool {
-        let now = Utc::now();
-        let mut changed = false;
-        for item in &mut self.provider_response_session_reuse {
-            let mut item_changed = false;
-            let capability_is_current = item
-                .capability
-                .as_ref()
-                .is_some_and(ProviderResponseSessionReuseCapability::is_current);
-            if item.status == ProviderResponseSessionReuseStatus::Verified && !capability_is_current
-            {
-                item.status = ProviderResponseSessionReuseStatus::Unverified;
-                item.last_error = Some(
-                    "Session-reuse certificate scope changed; run compatibility verification again."
-                        .to_string(),
-                );
-                item_changed = true;
-            }
-            if item.status == ProviderResponseSessionReuseStatus::Verified && !item.usage_verified {
-                item.status = ProviderResponseSessionReuseStatus::Unverified;
-                item.last_error = Some(
-                    "Compatibility verification must be run again because this record predates usage and cache verification."
-                        .to_string(),
-                );
-                item_changed = true;
-            }
-            if item.status != ProviderResponseSessionReuseStatus::Verified && item.usage_verified {
-                item.usage_verified = false;
-                item_changed = true;
-            }
-            if item.compact_fidelity_verified
-                && (!capability_is_current
-                    || item.status != ProviderResponseSessionReuseStatus::Verified
-                    || !item.usage_verified)
-            {
-                item.compact_fidelity_verified = false;
-                item_changed = true;
-            }
-            if item.enabled
-                && (item.status != ProviderResponseSessionReuseStatus::Verified
-                    || !item.usage_verified)
-            {
-                item.enabled = false;
-                item_changed = true;
-            }
-            if item_changed {
-                item.updated_at = now;
-                changed = true;
-            }
-        }
-        if changed {
-            self.updated_at = now;
-        }
-        changed
-    }
-
-    pub fn clear_response_session_reuse_for_provider(&mut self, provider_id: &str) {
-        self.provider_response_session_reuse
-            .retain(|item| item.provider_id != provider_id);
-        self.updated_at = Utc::now();
-    }
-
-    pub fn clear_response_session_reuse_for_model(&mut self, provider_id: &str, model_id: &str) {
-        self.provider_response_session_reuse
-            .retain(|item| item.provider_id != provider_id || item.model_id != model_id);
-        self.updated_at = Utc::now();
-    }
-
     fn provider_key(&self, provider_id: &str, key_id: &str) -> Option<&ProviderKeyConfig> {
         self.provider_key_pools
             .iter()
@@ -2393,7 +2007,6 @@ impl AppConfig {
         }
 
         if invalidate_provider_capabilities {
-            self.clear_response_session_reuse_for_provider(&id);
             self.clear_cache_capabilities_for_provider(&id);
         }
 
@@ -3029,18 +2642,6 @@ mod tests {
             config.upstream_proxy_url_for(true),
             Some("http://127.0.0.1:7897")
         );
-    }
-
-    fn test_response_session_capability(
-        key_realm_id: &str,
-    ) -> ProviderResponseSessionReuseCapability {
-        ProviderResponseSessionReuseCapability {
-            endpoint: "https://provider.example/v1/responses".to_string(),
-            channel: Channel::Responses,
-            key_realm_id: key_realm_id.to_string(),
-            stream_shape: ResponseSessionReuseStreamShape::StreamSse,
-            evidence_version: RESPONSE_SESSION_REUSE_EVIDENCE_VERSION,
-        }
     }
 
     #[test]
@@ -3798,6 +3399,68 @@ enabled = true
     }
 
     #[test]
+    fn quota_failure_disables_key_but_temporary_transport_failure_does_not() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 3,
+                recovery_minutes: 5,
+                keys: vec![
+                    key_input("key-quota", Some("sk-quota"), true, 5),
+                    key_input("key-network", Some("sk-network"), true, 5),
+                ],
+            })))
+            .expect("provider should save");
+
+        config.mark_provider_key_failure(
+            &provider_id,
+            Some("key-quota"),
+            "HTTP 402: insufficient_quota; balance is exhausted",
+            true,
+        );
+        let quota_key = config
+            .provider_key(&provider_id, "key-quota")
+            .expect("quota key should exist");
+        assert!(
+            !quota_key.enabled,
+            "quota exhaustion should turn the Key off"
+        );
+        assert_eq!(quota_key.status, ProviderKeyStatus::Unhealthy);
+        let next_key = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("next inbound should select a remaining Key")
+            .expect("remaining Key should be available");
+        assert_eq!(next_key.key_id.as_deref(), Some("key-network"));
+
+        config.mark_provider_key_failure(
+            &provider_id,
+            Some("key-network"),
+            "request failed: connection timed out",
+            true,
+        );
+        let network_key = config
+            .provider_key(&provider_id, "key-network")
+            .expect("network key should exist");
+        assert!(
+            network_key.enabled,
+            "temporary transport errors must not turn a Key off"
+        );
+        assert!(
+            network_key.disabled_until.is_some(),
+            "temporary errors still receive a cooldown"
+        );
+    }
+
+    #[test]
+    fn new_key_pool_input_defaults_to_sequential_order() {
+        let input: ProviderKeyPoolInput = serde_json::from_str(r#"{"enabled":true,"keys":[]}"#)
+            .expect("new key-pool input should deserialize");
+        assert_eq!(input.strategy, KeyLoadBalanceStrategy::Sequential);
+    }
+
+    #[test]
     fn re_enabling_a_key_clears_stale_health_cooldown_and_error() {
         let mut config = AppConfig::default();
         let provider_id = config
@@ -4072,470 +3735,28 @@ enabled = true
     }
 
     #[test]
-    fn response_session_reuse_requires_model_scoped_verification() {
-        let mut config = AppConfig::default();
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-
-        assert!(config.response_session_reuse_verified_for("provider-a", "model-a"));
-        assert!(!config.response_session_reuse_verified_for("provider-a", "model-b"));
-
-        config
-            .set_response_session_reuse_enabled("provider-a", "model-a", false)
-            .unwrap();
-        assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
-
-        config
-            .set_response_session_reuse_enabled("provider-a", "model-a", true)
-            .unwrap();
-        assert!(config.response_session_reuse_verified_for("provider-a", "model-a"));
-
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            false,
-            Some("previous_response_id is not supported".to_string()),
-        );
-        assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
-    }
-
-    #[test]
-    fn response_session_reuse_requires_exact_current_capability_scope() {
-        let mut config = AppConfig::default();
-        let baseline = test_response_session_capability("key-a");
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(baseline.clone()),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-
-        assert!(config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &baseline
-        ));
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-b",
-            &baseline
-        ));
-
-        let mut changed_endpoint = baseline.clone();
-        changed_endpoint.endpoint = "https://provider.example/V1/responses".to_string();
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &changed_endpoint
-        ));
-
-        let mut changed_channel = baseline.clone();
-        changed_channel.channel = Channel::Chat;
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &changed_channel
-        ));
-
-        let mut changed_key = baseline.clone();
-        changed_key.key_realm_id = "key-b".to_string();
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &changed_key
-        ));
-
-        let mut changed_shape = baseline.clone();
-        changed_shape.stream_shape = ResponseSessionReuseStreamShape::NonStreamJson;
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &changed_shape
-        ));
-
-        let mut future_version = baseline.clone();
-        future_version.evidence_version = RESPONSE_SESSION_REUSE_EVIDENCE_VERSION + 1;
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &future_version
-        ));
-
-        let second_key = test_response_session_capability("key-b");
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(second_key.clone()),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        assert!(config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &baseline
-        ));
-        assert!(config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &second_key
-        ));
-
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(baseline.clone()),
-            ProviderResponseSessionReuseStatus::Unsupported,
-            false,
-            Some("key-a rejected previous_response_id".to_string()),
-        );
-        assert!(!config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &baseline
-        ));
-        assert!(config.response_session_reuse_verified_for_scope(
-            "provider-a",
-            "model-a",
-            &second_key
-        ));
-    }
-
-    #[test]
-    fn legacy_unscoped_response_session_certificate_is_never_accepted() {
-        let now = Utc::now();
-        let mut config = AppConfig::default();
-        config
-            .provider_response_session_reuse
-            .push(ProviderResponseSessionReuseConfig {
-                provider_id: "provider-a".to_string(),
-                model_id: "model-a".to_string(),
-                capability: None,
-                enabled: true,
-                status: ProviderResponseSessionReuseStatus::Verified,
-                usage_verified: true,
-                compact_fidelity_verified: false,
-                checked_at: Some(now),
-                last_error: None,
-                updated_at: now,
-            });
-
-        assert!(config.normalize_provider_response_session_reuse_evidence_state());
-        assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
-        let record = &config.provider_response_session_reuse[0];
-        assert_eq!(
-            record.status,
-            ProviderResponseSessionReuseStatus::Unverified
-        );
-        assert!(!record.enabled);
-        assert!(!record.usage_verified);
-    }
-
-    #[test]
-    fn v2_response_session_certificate_requires_v3_reverification() {
+    fn retired_response_session_records_are_removed_on_load() {
         let dir = std::env::temp_dir().join(format!(
-            "atoapi-v2-session-reuse-{}",
+            "atoapi-retired-session-reuse-{}",
             Uuid::new_v4().simple()
         ));
         let path = dir.join("config.toml");
-        let now = Utc::now();
-        let mut old_capability = test_response_session_capability("key-a");
-        old_capability.evidence_version = 2;
-        let mut config = AppConfig::default();
-        config
-            .provider_response_session_reuse
-            .push(ProviderResponseSessionReuseConfig {
-                provider_id: "provider-a".to_string(),
-                model_id: "model-a".to_string(),
-                capability: Some(old_capability),
-                enabled: true,
-                status: ProviderResponseSessionReuseStatus::Verified,
-                usage_verified: true,
-                compact_fidelity_verified: true,
-                checked_at: Some(now),
-                last_error: None,
-                updated_at: now,
-            });
-        config.save(&path).unwrap();
-
-        let loaded = AppConfig::load_or_create(&path).unwrap();
-        let record = &loaded.provider_response_session_reuse[0];
-        assert_eq!(
-            record.status,
-            ProviderResponseSessionReuseStatus::Unverified
-        );
-        assert!(!record.enabled);
-        assert!(!record.usage_verified);
-        assert!(!record.compact_fidelity_verified);
-        assert!(record
-            .last_error
-            .as_deref()
-            .is_some_and(|message| message.contains("verification")));
-        assert!(!loaded.response_session_reuse_verified_for("provider-a", "model-a"));
-
-        let persisted = fs::read_to_string(&path).unwrap();
-        assert!(persisted.contains("evidence_version = 2"));
-        assert!(persisted.contains("status = \"unverified\""));
-        assert!(persisted.contains("enabled = false"));
-        assert!(persisted.contains("usage_verified = false"));
-        assert!(persisted.contains("compact_fidelity_verified = false"));
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn legacy_verified_response_session_record_requires_reverification_on_load() {
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-legacy-session-reuse-{}",
-            Uuid::new_v4().simple()
-        ));
-        let path = dir.join("config.toml");
-        let mut config = AppConfig::default();
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        config.save(&path).unwrap();
-
-        let current = fs::read_to_string(&path).unwrap();
-        assert!(current.contains("usage_verified = true"));
-        fs::write(&path, current.replace("usage_verified = true\n", "")).unwrap();
-
-        let loaded = AppConfig::load_or_create(&path).unwrap();
-        let record = loaded
-            .provider_response_session_reuse
-            .iter()
-            .find(|item| item.provider_id == "provider-a" && item.model_id == "model-a")
-            .unwrap();
-        assert_eq!(
-            record.status,
-            ProviderResponseSessionReuseStatus::Unverified
-        );
-        assert!(!record.enabled);
-        assert!(!record.usage_verified);
-        assert!(record
-            .last_error
-            .as_deref()
-            .is_some_and(|message| message.contains("must be run again")));
-        assert!(!loaded.response_session_reuse_verified_for("provider-a", "model-a"));
-
-        let persisted = fs::read_to_string(&path).unwrap();
-        assert!(persisted.contains("usage_verified = false"));
-        assert!(persisted.contains("status = \"unverified\""));
-        assert!(persisted.contains("enabled = false"));
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn response_session_reuse_cannot_be_reenabled_without_usage_evidence() {
-        let mut config = AppConfig::default();
-        let now = Utc::now();
-        config
-            .provider_response_session_reuse
-            .push(ProviderResponseSessionReuseConfig {
-                provider_id: "provider-a".to_string(),
-                model_id: "model-a".to_string(),
-                capability: Some(test_response_session_capability("key-a")),
-                enabled: false,
-                status: ProviderResponseSessionReuseStatus::Verified,
-                usage_verified: false,
-                compact_fidelity_verified: false,
-                checked_at: Some(now),
-                last_error: None,
-                updated_at: now,
-            });
-
-        assert!(config
-            .set_response_session_reuse_enabled("provider-a", "model-a", true)
-            .is_err());
-        assert!(!config.response_session_reuse_verified_for("provider-a", "model-a"));
-    }
-
-    #[test]
-    fn response_session_reuse_snapshot_changes_when_user_disables_it() {
-        let mut config = AppConfig::default();
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        let before = config.response_session_reuse_record_snapshot("provider-a", "model-a");
-        assert!(!before.is_empty(), "verified record should have a snapshot");
-
-        config
-            .set_response_session_reuse_enabled("provider-a", "model-a", false)
-            .unwrap();
-
-        assert_ne!(
-            config.response_session_reuse_record_snapshot("provider-a", "model-a"),
-            before
-        );
-    }
-
-    #[test]
-    fn response_session_reuse_snapshot_includes_usage_evidence() {
-        let mut config = AppConfig::default();
-        config.record_response_session_reuse_probe(
-            "provider-a",
-            "model-a",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        let before = config.response_session_reuse_record_snapshot("provider-a", "model-a");
-        assert!(!before.is_empty());
-
-        config.provider_response_session_reuse[0].usage_verified = false;
-
-        assert_ne!(
-            config.response_session_reuse_record_snapshot("provider-a", "model-a"),
-            before
-        );
-    }
-
-    #[test]
-    fn provider_connection_change_invalidates_session_reuse_verification() {
-        let mut config = AppConfig::default();
-        config.upsert_provider(provider_input(None)).unwrap();
-        config.record_response_session_reuse_probe(
-            "share",
-            "gpt-5.5",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        config.record_cache_capability_probe(
-            "share",
-            "gpt-5.5",
-            Channel::Responses,
-            ProviderCacheCapabilityField::PromptCacheKey,
-            ProviderCacheCapabilityStatus::Verified,
-            None,
-        );
-        assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));
-        let probe_target = config
-            .response_session_reuse_probe_target("share")
-            .expect("provider probe target should exist");
-
-        let mut changed = provider_input(None);
-        changed.base_url = "https://other.example/v1".to_string();
-        config.upsert_provider(changed).unwrap();
-
-        assert!(!config.response_session_reuse_verified_for("share", "gpt-5.5"));
-        assert_eq!(
-            config.cache_capability_status(
-                "share",
-                "gpt-5.5",
-                &Channel::Responses,
-                ProviderCacheCapabilityField::PromptCacheKey,
+        let current = toml::to_string(&AppConfig::default()).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{current}\n[[provider_response_session_reuse]]\nprovider_id = \"provider-a\"\nmodel_id = \"model-a\"\nenabled = true\nstatus = \"verified\"\n"
             ),
-            ProviderCacheCapabilityStatus::Unverified
-        );
-        assert_ne!(
-            config.response_session_reuse_probe_target("share").as_ref(),
-            Some(&probe_target)
-        );
-    }
+        )
+        .unwrap();
 
-    #[test]
-    fn provider_key_pool_secret_change_invalidates_session_reuse_verification() {
-        let mut config = AppConfig::default();
-        config
-            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
-                enabled: true,
-                strategy: KeyLoadBalanceStrategy::RoundRobin,
-                failure_threshold: 3,
-                recovery_minutes: 5,
-                keys: vec![key_input("key-a", Some("sk-original"), true, 5)],
-            })))
-            .unwrap();
-        config.record_response_session_reuse_probe(
-            "share",
-            "gpt-5.5",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));
-        let probe_target = config
-            .response_session_reuse_probe_target("share")
-            .expect("provider probe target should exist");
+        let _loaded = AppConfig::load_or_create(&path).unwrap();
 
-        config
-            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
-                enabled: true,
-                strategy: KeyLoadBalanceStrategy::RoundRobin,
-                failure_threshold: 3,
-                recovery_minutes: 5,
-                keys: vec![key_input("key-a", Some("sk-replaced"), true, 5)],
-            })))
-            .unwrap();
-
-        assert!(!config.response_session_reuse_verified_for("share", "gpt-5.5"));
-        assert_ne!(
-            config.response_session_reuse_probe_target("share").as_ref(),
-            Some(&probe_target)
-        );
-    }
-
-    #[test]
-    fn provider_key_pool_routing_change_invalidates_session_reuse_verification() {
-        let mut config = AppConfig::default();
-        config
-            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
-                enabled: true,
-                strategy: KeyLoadBalanceStrategy::Priority,
-                failure_threshold: 3,
-                recovery_minutes: 5,
-                keys: vec![
-                    key_input("key-a", Some("sk-a"), true, 10),
-                    key_input("key-b", Some("sk-b"), true, 5),
-                ],
-            })))
-            .unwrap();
-        config.record_response_session_reuse_probe(
-            "share",
-            "gpt-5.5",
-            Some(test_response_session_capability("key-a")),
-            ProviderResponseSessionReuseStatus::Verified,
-            true,
-            None,
-        );
-        assert!(config.response_session_reuse_verified_for("share", "gpt-5.5"));
-
-        config
-            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
-                enabled: true,
-                strategy: KeyLoadBalanceStrategy::Priority,
-                failure_threshold: 3,
-                recovery_minutes: 5,
-                keys: vec![
-                    key_input("key-a", None, false, 10),
-                    key_input("key-b", None, true, 5),
-                ],
-            })))
-            .unwrap();
-
-        assert!(!config.response_session_reuse_verified_for("share", "gpt-5.5"));
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("provider_response_session_reuse"));
+        assert!(!persisted.contains("status = \"verified\""));
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

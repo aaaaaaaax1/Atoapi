@@ -82,7 +82,6 @@ pub struct AppState {
     /// request path so it can never delay upstream dispatch.
     pub final_scope_waterlines: StdMutex<FinalScopeWaterlineLedger>,
     pub final_scope_observations: FinalScopeObservationRegistry,
-    pub prefix_error_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -94,7 +93,6 @@ pub struct AppState {
     /// after configuration or upstream capability changes.
     pub client_prompt_cache_key_rejection_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
-    pub response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
     pub continuation_lineage: ContinuationLineageIndex,
     pub provider_route_affinity: Mutex<HashMap<String, String>>,
     /// Last successfully planned primary model for each Agent/upstream pair.
@@ -243,21 +241,14 @@ pub struct PrefixWarmState {
     pub responses_static_projection_digest: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ResponseSessionCooldownState {
-    pub until: std::time::Instant,
-    pub failures: u32,
-    pub unsupported: bool,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedRuntimeState {
     #[serde(default)]
     prefix_states: HashMap<String, PersistedPrefixWarmState>,
     #[serde(default, skip_serializing, rename = "response_sessions")]
-    _legacy_response_sessions: HashMap<String, PersistedResponseSessionState>,
-    #[serde(default)]
-    response_session_error_cooldowns: HashMap<String, PersistedResponseSessionCooldownState>,
+    _legacy_response_sessions: serde_json::Value,
+    #[serde(default, skip_serializing, rename = "response_session_error_cooldowns")]
+    _legacy_response_session_error_cooldowns: serde_json::Value,
     #[serde(default)]
     shadow_affinity: ShadowAffinityStore,
 }
@@ -288,39 +279,18 @@ struct PersistedPrefixWarmState {
     responses_static_projection_digest: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedResponseSessionState {
-    saved_at: chrono::DateTime<Utc>,
-    response_id: String,
-    input: serde_json::Value,
-    #[serde(default)]
-    scope_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedResponseSessionCooldownState {
-    saved_at: chrono::DateTime<Utc>,
-    until_at: chrono::DateTime<Utc>,
-    failures: u32,
-    #[serde(default)]
-    unsupported: bool,
-}
-
 #[derive(Debug, Default)]
 struct RuntimeStateMaps {
     prefix_states: HashMap<String, PrefixWarmState>,
-    response_session_error_cooldowns: HashMap<String, ResponseSessionCooldownState>,
     shadow_affinity: ShadowAffinityStore,
 }
 
 fn capture_runtime_state(
     prefix_states: &Mutex<HashMap<String, PrefixWarmState>>,
-    response_session_error_cooldowns: &Mutex<HashMap<String, ResponseSessionCooldownState>>,
     shadow_affinity: &Mutex<ShadowAffinityStore>,
 ) -> RuntimeStateMaps {
     RuntimeStateMaps {
         prefix_states: prefix_states.blocking_lock().clone(),
-        response_session_error_cooldowns: response_session_error_cooldowns.blocking_lock().clone(),
         shadow_affinity: shadow_affinity.blocking_lock().clone(),
     }
 }
@@ -423,22 +393,12 @@ impl RuntimeStateJournal {
     fn new(
         path: PathBuf,
         prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
-        response_session_error_cooldowns: Arc<Mutex<HashMap<String, ResponseSessionCooldownState>>>,
         shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
         metrics: MetricsStore,
     ) -> Self {
         Self::new_with_job(metrics, move || {
-            let snapshot = capture_runtime_state(
-                &prefix_states,
-                &response_session_error_cooldowns,
-                &shadow_affinity,
-            );
-            save_runtime_state(
-                &path,
-                &snapshot.prefix_states,
-                &snapshot.response_session_error_cooldowns,
-                &snapshot.shadow_affinity,
-            )
+            let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
+            save_runtime_state(&path, &snapshot.prefix_states, &snapshot.shadow_affinity)
         })
     }
 
@@ -523,7 +483,6 @@ impl RuntimeStateJournal {
     }
 }
 
-const RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(30 * 60);
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
 const PREFIX_RUNTIME_STATE_LIMIT: usize = 8_192;
 const PREFIX_RUNTIME_STATE_MAINTENANCE_INTERVAL: u64 = 128;
@@ -553,15 +512,12 @@ impl AppState {
             &mut runtime_state.shadow_affinity,
         );
         let prefix_states = Arc::new(Mutex::new(runtime_state.prefix_states));
-        let response_session_error_cooldowns =
-            Arc::new(Mutex::new(runtime_state.response_session_error_cooldowns));
         let continuation_lineage = ContinuationLineageIndex::default();
         let agent_runtime_models = agent_injection::codex_runtime_model_bindings(&config);
         let shadow_affinity = Arc::new(Mutex::new(runtime_state.shadow_affinity));
         let runtime_state_journal = RuntimeStateJournal::new(
             runtime_state_path.clone(),
             prefix_states.clone(),
-            response_session_error_cooldowns.clone(),
             shadow_affinity.clone(),
             metrics.clone(),
         );
@@ -578,7 +534,6 @@ impl AppState {
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
             final_scope_observations: FinalScopeObservationRegistry::default(),
-            prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
@@ -586,7 +541,6 @@ impl AppState {
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
-            response_session_error_cooldowns,
             continuation_lineage,
             provider_route_affinity: Mutex::new(HashMap::new()),
             agent_runtime_models: StdMutex::new(agent_runtime_models),
@@ -608,14 +562,12 @@ impl AppState {
         cache.attach_error_reporter(metrics.clone());
         let config_persistence = ConfigWriteCoordinator::new(config_path.clone(), metrics.clone());
         let prefix_states = Arc::new(Mutex::new(HashMap::new()));
-        let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let continuation_lineage = ContinuationLineageIndex::default();
         let agent_runtime_models = agent_injection::codex_runtime_model_bindings(&config);
         let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
         let runtime_state_journal = RuntimeStateJournal::new(
             runtime_state_path.clone(),
             prefix_states.clone(),
-            response_session_error_cooldowns.clone(),
             shadow_affinity.clone(),
             metrics.clone(),
         );
@@ -632,7 +584,6 @@ impl AppState {
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
             final_scope_observations: FinalScopeObservationRegistry::default(),
-            prefix_error_cooldowns: Mutex::new(HashMap::new()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
@@ -640,7 +591,6 @@ impl AppState {
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
-            response_session_error_cooldowns,
             continuation_lineage,
             provider_route_affinity: Mutex::new(HashMap::new()),
             agent_runtime_models: StdMutex::new(agent_runtime_models),
@@ -1185,17 +1135,12 @@ fn trim_prefix_runtime_states(prefix_states: &mut HashMap<String, PrefixWarmStat
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
-    response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
     shadow_affinity: &ShadowAffinityStore,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let persisted = PersistedRuntimeState::from_runtime(
-        prefix_states,
-        response_session_error_cooldowns,
-        shadow_affinity,
-    );
+    let persisted = PersistedRuntimeState::from_runtime(prefix_states, shadow_affinity);
     let raw = serde_json::to_string_pretty(&persisted)?;
     let backup_path = runtime_state_backup_path(path);
     if let Ok(previous) = fs::read(path) {
@@ -1263,7 +1208,6 @@ fn sync_runtime_state_parent(_parent: &Path) -> Result<()> {
 impl PersistedRuntimeState {
     fn from_runtime(
         prefix_states: &HashMap<String, PrefixWarmState>,
-        response_session_error_cooldowns: &HashMap<String, ResponseSessionCooldownState>,
         shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
         let now = Utc::now();
@@ -1297,39 +1241,10 @@ impl PersistedRuntimeState {
                 )
             })
             .collect();
-        let response_session_error_cooldowns = response_session_error_cooldowns
-            .iter()
-            .filter_map(|(key, state)| {
-                if !state.unsupported {
-                    return None;
-                }
-                let remaining = state.until.checked_duration_since(Instant::now());
-                let until_at = remaining
-                    .and_then(|duration| chrono::Duration::from_std(duration).ok())
-                    .map(|duration| now + duration)
-                    .unwrap_or(now);
-                let expired_recently = Instant::now()
-                    .checked_duration_since(state.until)
-                    .map(|elapsed| elapsed <= RUNTIME_STATE_TTL)
-                    .unwrap_or(false);
-                (remaining.is_some() || expired_recently).then(|| {
-                    (
-                        key.clone(),
-                        PersistedResponseSessionCooldownState {
-                            saved_at: now,
-                            until_at,
-                            failures: state.failures,
-                            unsupported: state.unsupported,
-                        },
-                    )
-                })
-            })
-            .collect();
-
         Self {
             prefix_states,
-            _legacy_response_sessions: HashMap::new(),
-            response_session_error_cooldowns,
+            _legacy_response_sessions: serde_json::Value::Null,
+            _legacy_response_session_error_cooldowns: serde_json::Value::Null,
             shadow_affinity: shadow_affinity.clone(),
         }
     }
@@ -1372,47 +1287,10 @@ impl PersistedRuntimeState {
             })
             .collect();
         trim_prefix_runtime_states(&mut prefix_states);
-        // Legacy plaintext response-session snapshots are deliberately not
-        // admitted into the active continuation map.  A restart therefore
-        // falls back to the Agent's complete request instead of trusting a
-        // stale or cross-key response reference.
-        let response_session_error_cooldowns = self
-            .response_session_error_cooldowns
-            .into_iter()
-            .filter_map(|(key, state)| {
-                let age = (now - state.saved_at).to_std().ok()?;
-                if !state.unsupported {
-                    return None;
-                }
-                let active = state.until_at > now;
-                if !active && age > RUNTIME_STATE_TTL {
-                    return None;
-                }
-                let until_delta = (state.until_at - now).to_std().ok().map(|duration| {
-                    if state.unsupported {
-                        duration.min(StdDuration::from_secs(5 * 60))
-                    } else {
-                        duration
-                    }
-                });
-                let until = until_delta
-                    .and_then(|duration| instant_now.checked_add(duration))
-                    .unwrap_or(instant_now);
-                Some((
-                    key,
-                    ResponseSessionCooldownState {
-                        until,
-                        failures: state.failures,
-                        unsupported: state.unsupported,
-                    },
-                ))
-            })
-            .collect();
         let mut shadow_affinity = self.shadow_affinity;
         crate::proxy::cache_affinity::evict_assignments(&mut shadow_affinity, now);
         RuntimeStateMaps {
             prefix_states,
-            response_session_error_cooldowns,
             shadow_affinity,
         }
     }
@@ -1619,18 +1497,12 @@ mod tests {
     #[tokio::test]
     async fn runtime_snapshot_does_not_touch_the_memory_only_lineage_index() {
         let prefix_states = Arc::new(Mutex::new(HashMap::new()));
-        let response_session_error_cooldowns = Arc::new(Mutex::new(HashMap::new()));
         let shadow_affinity = Arc::new(Mutex::new(ShadowAffinityStore::default()));
 
         let prefix_states_for_capture = prefix_states.clone();
-        let cooldowns_for_capture = response_session_error_cooldowns.clone();
         let shadow_affinity_for_capture = shadow_affinity.clone();
         let snapshot = tokio::task::spawn_blocking(move || {
-            capture_runtime_state(
-                &prefix_states_for_capture,
-                &cooldowns_for_capture,
-                &shadow_affinity_for_capture,
-            )
+            capture_runtime_state(&prefix_states_for_capture, &shadow_affinity_for_capture)
         })
         .await
         .unwrap();
@@ -1650,7 +1522,6 @@ mod tests {
         // while allowing normal Windows scheduler variance around 10ms.
         const RUNTIME_SNAPSHOT_P95_BUDGET_US: u128 = 12_000;
         let prefix_states = Mutex::new(HashMap::new());
-        let response_session_error_cooldowns = Mutex::new(HashMap::new());
         let shadow_affinity = Mutex::new(ShadowAffinityStore::default());
         let now = Utc::now();
 
@@ -1725,11 +1596,7 @@ mod tests {
         let mut samples = Vec::new();
         for _ in 0..21 {
             let started = Instant::now();
-            let snapshot = capture_runtime_state(
-                &prefix_states,
-                &response_session_error_cooldowns,
-                &shadow_affinity,
-            );
+            let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
             black_box(snapshot);
             samples.push(started.elapsed().as_micros());
         }
@@ -1811,56 +1678,24 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("runtime-state.json");
-        let key = "responses:share:gpt-5.5".to_string();
-        let mut cooldowns = HashMap::from([(
-            key.clone(),
-            ResponseSessionCooldownState {
-                until: Instant::now() + StdDuration::from_secs(300),
-                failures: 1,
-                unsupported: true,
-            },
-        )]);
+        let key = "prefix-atomic".to_string();
+        let mut prefix_states = HashMap::from([(key.clone(), prefix_state_at(Instant::now()))]);
+        prefix_states.get_mut(&key).unwrap().cache_read_tokens = 1;
 
-        save_runtime_state(
-            &path,
-            &HashMap::new(),
-            &cooldowns,
-            &ShadowAffinityStore::default(),
-        )
-        .unwrap();
-        cooldowns.get_mut(&key).unwrap().failures = 2;
-        save_runtime_state(
-            &path,
-            &HashMap::new(),
-            &cooldowns,
-            &ShadowAffinityStore::default(),
-        )
-        .unwrap();
-        cooldowns.get_mut(&key).unwrap().failures = 3;
-        save_runtime_state(
-            &path,
-            &HashMap::new(),
-            &cooldowns,
-            &ShadowAffinityStore::default(),
-        )
-        .unwrap();
+        save_runtime_state(&path, &prefix_states, &ShadowAffinityStore::default()).unwrap();
+        prefix_states.get_mut(&key).unwrap().cache_read_tokens = 2;
+        save_runtime_state(&path, &prefix_states, &ShadowAffinityStore::default()).unwrap();
+        prefix_states.get_mut(&key).unwrap().cache_read_tokens = 3;
+        save_runtime_state(&path, &prefix_states, &ShadowAffinityStore::default()).unwrap();
 
         let (current, _) = read_runtime_state_file(&path).unwrap();
         let (previous, _) = read_runtime_state_file(&runtime_state_backup_path(&path)).unwrap();
         assert_eq!(
-            current
-                .response_session_error_cooldowns
-                .get(&key)
-                .unwrap()
-                .failures,
+            current.prefix_states.get(&key).unwrap().cache_read_tokens,
             3
         );
         assert_eq!(
-            previous
-                .response_session_error_cooldowns
-                .get(&key)
-                .unwrap()
-                .failures,
+            previous.prefix_states.get(&key).unwrap().cache_read_tokens,
             2
         );
         assert!(!fs::read_dir(&dir).unwrap().any(|entry| {
@@ -1881,33 +1716,17 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("runtime-state.json");
-        let key = "responses:share:gpt-5.5".to_string();
-        let cooldowns = HashMap::from([(
-            key.clone(),
-            ResponseSessionCooldownState {
-                until: Instant::now() + StdDuration::from_secs(300),
-                failures: 7,
-                unsupported: true,
-            },
-        )]);
-        save_runtime_state(
-            &path,
-            &HashMap::new(),
-            &cooldowns,
-            &ShadowAffinityStore::default(),
-        )
-        .unwrap();
+        let key = "prefix-recovery".to_string();
+        let mut prefix_states = HashMap::from([(key.clone(), prefix_state_at(Instant::now()))]);
+        prefix_states.get_mut(&key).unwrap().cache_read_tokens = 7;
+        save_runtime_state(&path, &prefix_states, &ShadowAffinityStore::default()).unwrap();
         fs::copy(&path, runtime_state_backup_path(&path)).unwrap();
         fs::write(&path, b"{damaged-json").unwrap();
 
         let recovered = load_runtime_state(&path).unwrap();
 
         assert_eq!(
-            recovered
-                .response_session_error_cooldowns
-                .get(&key)
-                .unwrap()
-                .failures,
+            recovered.prefix_states.get(&key).unwrap().cache_read_tokens,
             7
         );
         assert!(read_runtime_state_file(&path).is_ok());
@@ -1934,7 +1753,6 @@ mod tests {
         let recovered = load_runtime_state(&path).unwrap();
 
         assert!(recovered.prefix_states.is_empty());
-        assert!(recovered.response_session_error_cooldowns.is_empty());
         assert!(!path.exists());
         fs::remove_dir_all(dir).ok();
     }
@@ -2243,14 +2061,6 @@ mod tests {
                 },
             )
             .await;
-        state.response_session_error_cooldowns.lock().await.insert(
-            "responses:share:gpt-5.5".to_string(),
-            ResponseSessionCooldownState {
-                until: Instant::now() + StdDuration::from_secs(3600),
-                failures: 2,
-                unsupported: true,
-            },
-        );
         let shadow_now = Utc::now();
         let mut shadow_affinity = state.shadow_affinity.lock().await;
         shadow_affinity.assignments.insert(
@@ -2332,18 +2142,15 @@ mod tests {
         assert!(!raw.contains("SENSITIVE_SOURCE_MARKER"));
         assert!(!raw.contains("SENSITIVE_ERROR_MARKER"));
         assert!(!raw.contains("resp_sensitive_123"));
+        assert!(
+            !raw.contains("response_session_error_cooldowns"),
+            "retired session-reuse cooldowns must not be persisted"
+        );
         let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
 
         let prefix = loaded.prefix_states.get("prefix-a").unwrap();
         assert_eq!(prefix.cache_read_tokens, 166_912);
         assert_eq!(prefix.recent_clean_tiny_gap_streak, 0);
-        let cooldown = loaded
-            .response_session_error_cooldowns
-            .get("responses:share:gpt-5.5")
-            .unwrap();
-        assert_eq!(cooldown.failures, 2);
-        assert!(cooldown.unsupported);
-        assert!(cooldown.until > Instant::now());
         let shadow = loaded
             .shadow_affinity
             .assignments
@@ -2519,39 +2326,6 @@ mod tests {
                 .map(|state| state.cache_read_tokens),
             Some(164_736)
         );
-    }
-
-    #[tokio::test]
-    async fn runtime_state_drops_transient_response_session_cooldowns() {
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-runtime-state-transient-cooldown-{}",
-            Uuid::new_v4().simple()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let state = AppState::for_test(
-            AppConfig::default(),
-            dir.join("config.toml"),
-            CacheStore::load(dir.join("cache.bin")).unwrap(),
-        )
-        .unwrap();
-        state.response_session_error_cooldowns.lock().await.insert(
-            "responses:share:gpt-5.5".to_string(),
-            ResponseSessionCooldownState {
-                until: Instant::now() + StdDuration::from_secs(3600),
-                failures: 2,
-                unsupported: false,
-            },
-        );
-
-        state.persist_runtime_state().await.unwrap();
-        let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
-
-        assert!(
-            loaded.response_session_error_cooldowns.is_empty(),
-            "transient session-delta failures must not survive restart and block exact session retry"
-        );
-
-        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]

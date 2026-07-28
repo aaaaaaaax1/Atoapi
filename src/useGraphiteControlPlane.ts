@@ -17,7 +17,6 @@ import {
   type ProviderInput,
   type ProviderKeyTestResult,
   type ProviderNetworkPathDiagnosticResult,
-  type ProviderResponseSessionReuseProbeResult,
   type ProxyStatus
 } from "./lib/api";
 import type {
@@ -27,7 +26,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.3";
+const APP_VERSION = "v1.4.6";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -171,7 +170,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       non_sse_compact_compat_enabled: editablePayload.non_sse_compact_compat_enabled,
       key_pool: {
         enabled: editablePayload.key_pool?.enabled ?? existing?.key_pool?.enabled ?? editablePayload.keys.length > 0,
-        strategy: editablePayload.key_pool?.strategy ?? existing?.key_pool?.strategy ?? "round-robin",
+        strategy: editablePayload.key_pool?.strategy ?? existing?.key_pool?.strategy ?? "sequential",
         failure_threshold: editablePayload.key_pool?.failure_threshold ?? existing?.key_pool?.failure_threshold ?? 3,
         recovery_minutes: editablePayload.key_pool?.recovery_minutes ?? existing?.key_pool?.recovery_minutes ?? 10,
         keys: editablePayload.keys.map((key) => {
@@ -432,14 +431,21 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         : providerTestInput(provider, null);
       if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
       const startedAt = performance.now();
-      const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", {
-        input
+      const activeKeyResult = await command<ProviderKeyTestResult>("test_active_provider_key", {
+        providerId: provider.id,
+        provider_id: provider.id
       });
+      const result: ProviderConnectionPathTestResult = {
+        ...activeKeyResult,
+        recommended_use_system_proxy: provider.use_system_proxy,
+        paths: []
+      };
+      setConfig(await command<AppConfig>("get_config"));
       const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
       const selectedPath = result.paths.find((path) =>
         result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
       );
-      const pathLabel = result.recommended_use_system_proxy ? "系统代理" : "直连";
+      const pathLabel = "当前 Key";
       setProviderConnectionStatus((current) => ({
         ...current,
         [provider.id]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
@@ -520,41 +526,6 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       return config?.local_key
         ? { payload: { secret: config.local_key, targetId } }
         : { error: "本地 Key 尚未设置" };
-    }
-    if (action === "probe-session-reuse") {
-      const providerId = text("providerId");
-      const modelId = text("modelId");
-      if (!providerId) throw new Error("请先保存上游，再验证会话复用");
-      if (!modelId) throw new Error("请选择或填写一个实际模型 ID，再验证会话复用");
-      const result = await command<ProviderResponseSessionReuseProbeResult>(
-        "probe_provider_response_session_reuse",
-        { input: { provider_id: providerId, model_id: modelId } }
-      );
-      const nextConfig = await command<AppConfig>("get_config");
-      setConfig(nextConfig);
-      const compatibility = nextConfig.providers.find((provider) => provider.id === providerId);
-      return result.status === "verified" && result.enabled
-        ? { notice: `${modelId} 已验证并启用会话增量复用`, payload: { compatibility } }
-        : { error: `${modelId} 未启用会话复用：${result.message}`, payload: { compatibility } };
-    }
-    if (action === "set-session-reuse") {
-      const providerId = text("providerId");
-      const modelId = text("modelId");
-      if (!providerId) throw new Error("未找到会话复用对应的上游");
-      if (!modelId) throw new Error("请选择或填写会话复用对应的实际模型 ID");
-      const enabled = payload.enabled === true;
-      const nextConfig = await command<AppConfig>("set_provider_response_session_reuse_enabled", {
-        providerId,
-        provider_id: providerId,
-        modelId,
-        model_id: modelId,
-        enabled
-      });
-      setConfig(nextConfig);
-      return {
-        notice: enabled ? `${modelId} 会话复用已开启` : `${modelId} 会话复用已关闭`,
-        payload: { compatibility: nextConfig.providers.find((provider) => provider.id === providerId) }
-      };
     }
     if (action === "probe-cache-capabilities") {
       const providerId = text("providerId");

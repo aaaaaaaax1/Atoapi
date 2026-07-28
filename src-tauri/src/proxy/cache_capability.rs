@@ -1,6 +1,6 @@
-use crate::config::{
-    AppConfig, Channel, ProviderCacheCapabilityField, ProviderCacheCapabilityStatus, ProviderConfig,
-};
+#[cfg(test)]
+use crate::config::ProviderCacheCapabilityStatus;
+use crate::config::{AppConfig, Channel, ProviderCacheCapabilityField, ProviderConfig};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -40,6 +40,7 @@ pub(super) struct CacheControlApplicationReceipt {
 }
 
 impl CacheControlApplicationReceipt {
+    #[cfg(test)]
     pub(super) fn changed_fields(&self) -> &[String] {
         &self.changed_fields
     }
@@ -119,39 +120,20 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
     let probe_selected = |field| controlled_probe_fields.contains(&field) && probe_accepted(field);
     let allowed = |field| probe_selected(field) || promoted(field);
     let enable_modern_options = allowed(ProviderCacheCapabilityField::PromptCacheOptions);
-    let retention_status = config.cache_capability_status_for_key(
-        &provider.id,
-        model,
-        channel,
-        key_id,
-        ProviderCacheCapabilityField::PromptCacheRetention,
-    );
-    let retention_has_capability_record = config
-        .cache_capability_for_key(
-            &provider.id,
-            model,
-            channel,
-            key_id,
-            ProviderCacheCapabilityField::PromptCacheRetention,
-        )
-        .is_some();
-    let legacy_retention_default =
-        !provider_uses_official_openai_api(provider) && !retention_has_capability_record;
-
     NativeCachePlan {
         // `prompt_cache_key` is never a normal routing rule. A schema probe
         // can accept the field without proving that it affects the upstream
         // cache, so retain it only for an administrator-started candidate.
         preserve_prompt_cache_key: probe_selected(ProviderCacheCapabilityField::PromptCacheKey),
-        // Retention is a user-selected legacy compatibility control. Keep it
-        // for a third-party upstream with no capability record, unless this
-        // exact provider/model/key rejected it or modern options supersede it.
-        // Once a capability record exists, preserve its measured scope rules.
+        // No cache-control field is guessed for an unknown third-party
+        // schema. Ordinary traffic requires a positive effect certificate in
+        // this exact provider/model/channel/selected-Key scope; the only
+        // exception is an already-selected single-field validation candidate.
+        // This preserves the user's one-request contract without making an
+        // unrelated upstream reject a speculative compatibility field.
         enable_prompt_cache_retention: provider.prompt_cache_retention_enabled
-            && retention_status != ProviderCacheCapabilityStatus::Unsupported
             && !enable_modern_options
-            && (legacy_retention_default
-                || allowed(ProviderCacheCapabilityField::PromptCacheRetention)),
+            && allowed(ProviderCacheCapabilityField::PromptCacheRetention),
         enable_modern_options,
         // This control has repeatedly been rejected by the active upstream
         // class. Production keeps its schema probe and final-wire diagnostics
@@ -161,18 +143,6 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
         enable_explicit_breakpoint: cfg!(test)
             && allowed(ProviderCacheCapabilityField::PromptCacheBreakpoint),
     }
-}
-
-fn provider_uses_official_openai_api(provider: &ProviderConfig) -> bool {
-    let endpoint = provider.base_url.trim().to_ascii_lowercase();
-    let authority = endpoint
-        .strip_prefix("https://")
-        .or_else(|| endpoint.strip_prefix("http://"))
-        .unwrap_or(&endpoint)
-        .split('/')
-        .next()
-        .unwrap_or_default();
-    matches!(authority, "api.openai.com" | "api.openai.com:443")
 }
 
 #[cfg(test)]
@@ -221,6 +191,7 @@ pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePla
 /// Applies the same cache-control plan through the final wire holder. Every
 /// mutation is constrained to a named root, so a late cache control cannot
 /// leave the semantic body ahead of a retained draft member.
+#[cfg(test)]
 pub(super) fn apply_prepared(
     request: &mut PreparedResponseBody,
     channel: &Channel,
@@ -658,10 +629,6 @@ pub(super) fn contains_protocol_cache_breakpoint(value: &Value, channel: &Channe
             .is_some_and(|payload| contains_protocol_cache_breakpoint_in_root(payload, channel))
 }
 
-pub(super) fn responses_input_contains_protocol_cache_breakpoint(value: &Value) -> bool {
-    contains_protocol_cache_breakpoint_in_root(value, &Channel::Responses)
-}
-
 /// Returns a compact, versioned digest for exactly one legal Responses
 /// breakpoint in the final wire. Source ownership comes from the prepared-body
 /// insertion witness, never from this structural shape alone.
@@ -1013,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn unverified_provider_keeps_user_enabled_legacy_retention() {
+    fn unverified_provider_strips_speculative_cache_controls() {
         let config = AppConfig::default();
         let plan = plan(
             &config,
@@ -1032,9 +999,16 @@ mod tests {
             ]}]
         });
         let changed = apply(&mut body, &Channel::Responses, plan);
-        assert_eq!(changed, vec!["prompt_cache_key", "prompt_cache_options"]);
+        assert_eq!(
+            changed,
+            vec![
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "prompt_cache_options"
+            ]
+        );
         assert!(body.get("prompt_cache_key").is_none());
-        assert_eq!(body["prompt_cache_retention"], PROMPT_CACHE_RETENTION_VALUE);
+        assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("prompt_cache_options").is_none());
         assert!(!contains_cache_breakpoint(&body));
     }
@@ -1215,6 +1189,90 @@ mod tests {
             body.body()["prompt_cache_retention"],
             PROMPT_CACHE_RETENTION_VALUE
         );
+    }
+
+    #[test]
+    fn final_cache_controls_are_bound_to_the_selected_key_and_model_scope() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe_for_key(
+            "provider-a",
+            "gpt-5.6-terra",
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-terra",
+            &Channel::Responses,
+            Some("key-a"),
+            Some(EFFECT_SCOPE_NONE),
+            &[ProviderCacheCapabilityField::PromptCacheRetention],
+            crate::config::ProviderCacheEffectStatus::Promoted,
+            Some("measured only for key-a / terra".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        let initial = json!({
+            "model": "gpt-5.6-terra",
+            "prompt_cache_key": "caller-owned-and-unverified",
+            "prompt_cache_retention": "24h",
+            "prompt_cache_options": {"mode":"implicit"},
+            "input": [{"type":"message","role":"user","content":"stable"}]
+        });
+
+        for (model, key_id) in [
+            ("gpt-5.6-terra", Some("key-b")),
+            ("gpt-5.6-sol", Some("key-a")),
+        ] {
+            let mut body = PreparedResponseBody::responses(initial.clone());
+            apply_prepared(
+                &mut body,
+                &Channel::Responses,
+                plan_with_effect_scope_and_probe_fields(
+                    &config,
+                    &provider("https://third.example/v1"),
+                    model,
+                    &Channel::Responses,
+                    key_id,
+                    Some(EFFECT_SCOPE_NONE),
+                    &[],
+                ),
+            );
+            let (final_body, final_wire) = body.into_prepared_wire(&Channel::Responses);
+            let parsed_final_wire: Value = serde_json::from_slice(final_wire.body()).unwrap();
+            assert_eq!(parsed_final_wire, final_body);
+            assert!(parsed_final_wire.get("prompt_cache_key").is_none());
+            assert!(parsed_final_wire.get("prompt_cache_retention").is_none());
+            assert!(parsed_final_wire.get("prompt_cache_options").is_none());
+        }
+
+        let mut verified_body = PreparedResponseBody::responses(initial);
+        apply_prepared(
+            &mut verified_body,
+            &Channel::Responses,
+            plan_with_effect_scope_and_probe_fields(
+                &config,
+                &provider("https://third.example/v1"),
+                "gpt-5.6-terra",
+                &Channel::Responses,
+                Some("key-a"),
+                Some(EFFECT_SCOPE_NONE),
+                &[],
+            ),
+        );
+        let (_, verified_wire) = verified_body.into_prepared_wire(&Channel::Responses);
+        let verified_final_wire: Value = serde_json::from_slice(verified_wire.body()).unwrap();
+        assert!(verified_final_wire.get("prompt_cache_key").is_none());
+        assert_eq!(
+            verified_final_wire["prompt_cache_retention"],
+            PROMPT_CACHE_RETENTION_VALUE
+        );
+        assert!(verified_final_wire.get("prompt_cache_options").is_none());
     }
 
     #[test]

@@ -103,10 +103,6 @@ impl CompactionStart {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LineageParent {
     FullReplay,
-    Managed {
-        generation: u64,
-        response_id: String,
-    },
     ExternalContinuation,
 }
 
@@ -616,29 +612,11 @@ fn apply_commit(
     if !replacement_allowed {
         return LineageCommitOutcome::Regressive;
     }
-    if let LineageParent::Managed {
-        generation,
-        response_id,
-    } = parent
-    {
-        let current = slot.head.as_ref();
-        if *generation != lease.expected_generation
-            || lease.head().is_none_or(|head| {
-                head.generation != *generation || head.response_id != *response_id
-            })
-            || current.is_none_or(|head| {
-                head.generation != *generation || head.response_id != *response_id
-            })
-        {
-            return LineageCommitOutcome::ParentMismatch;
-        }
-    }
     let generation = current_generation
         .checked_add(1)
         .expect("continuation lineage generation overflow");
     let parent_generation = match parent {
         LineageParent::FullReplay => None,
-        LineageParent::Managed { generation, .. } => Some(*generation),
         LineageParent::ExternalContinuation => return LineageCommitOutcome::ExternalContinuation,
     };
     let head = Arc::new(ResponseSessionState {
@@ -795,10 +773,7 @@ mod tests {
         let right = index.begin("thread").await;
         assert_eq!(left.expected_generation(), 1);
         assert_eq!(right.expected_generation(), 1);
-        let parent = LineageParent::Managed {
-            generation: 1,
-            response_id: "resp-root".to_string(),
-        };
+        let parent = LineageParent::FullReplay;
         assert_eq!(
             index
                 .commit(&right, &parent, candidate("resp-right", "right"), true)
@@ -816,7 +791,7 @@ mod tests {
         );
         let head = index.head("thread").await.unwrap();
         assert_eq!(head.response_id, "resp-right");
-        assert_eq!(head.parent_generation, Some(1));
+        assert_eq!(head.parent_generation, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -833,10 +808,7 @@ mod tests {
             .await;
         let left = index.begin("thread").await;
         let right = index.begin("thread").await;
-        let parent = LineageParent::Managed {
-            generation: 1,
-            response_id: "resp-root".to_string(),
-        };
+        let parent = LineageParent::FullReplay;
         let (release_left, wait_left) = tokio::sync::oneshot::channel::<()>();
         let (release_right, wait_right) = tokio::sync::oneshot::channel::<()>();
 
@@ -889,10 +861,7 @@ mod tests {
             .await;
         let old_failure = index.begin("thread").await;
         let winner = index.begin("thread").await;
-        let parent = LineageParent::Managed {
-            generation: 1,
-            response_id: "resp-root".to_string(),
-        };
+        let parent = LineageParent::FullReplay;
         index
             .commit(&winner, &parent, candidate("resp-new", "new"), true)
             .await;
@@ -941,10 +910,7 @@ mod tests {
             index
                 .commit(
                     &old_request,
-                    &LineageParent::Managed {
-                        generation: 1,
-                        response_id: "resp-root".to_string(),
-                    },
+                    &LineageParent::FullReplay,
                     candidate("resp-old", "old"),
                     true,
                 )

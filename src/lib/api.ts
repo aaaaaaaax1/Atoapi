@@ -14,7 +14,6 @@ export type AgentInjectionKind =
   | "proxy-mode";
 export type KeyLoadBalanceStrategy = "round-robin" | "priority" | "least-used" | "random" | "sequential";
 export type ProviderKeyStatus = "unknown" | "healthy" | "unhealthy";
-export type ProviderResponseSessionReuseStatus = "unverified" | "verified" | "unsupported" | "error";
 export type ProviderCacheCapabilityField =
   | "prompt-cache-key"
   | "prompt-cache-retention"
@@ -50,7 +49,6 @@ export interface ProviderConfig {
   request_body_gzip_enabled: boolean;
   use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
-  response_session_reuse_models?: ProviderResponseSessionReuseConfig[];
   cache_capabilities?: ProviderCacheCapabilityConfig[];
   has_api_key: boolean;
   key_pool?: PublicProviderKeyPool | null;
@@ -1138,41 +1136,6 @@ function fallback(name: string, args?: Record<string, unknown>) {
       models_count: key.enabled ? 3 : 0
     }));
   }
-  if (name === "probe_provider_response_session_reuse") {
-    const input = args?.input as ProviderResponseSessionReuseProbeInput | undefined;
-    return {
-      provider_id: input?.provider_id ?? "",
-      model_id: input?.model_id ?? "",
-      status: "error",
-      enabled: false,
-      message: "预览模式不会向外部上游发送会话复用兼容性探测",
-      checked_at: new Date().toISOString(),
-      first_status: null,
-      continuation_status: null,
-      compact_status: null,
-      compact_continuation_status: null,
-      first_input_tokens: null,
-      first_cached_tokens: null,
-      continuation_input_tokens: null,
-      continuation_cached_tokens: null,
-      usage_verified: false,
-      compact_fidelity_verified: false
-    } satisfies ProviderResponseSessionReuseProbeResult;
-  }
-  if (name === "set_provider_response_session_reuse_enabled") {
-    const providerId = String(args?.providerId ?? args?.provider_id ?? "");
-    const modelId = String(args?.modelId ?? args?.model_id ?? "");
-    const enabled = Boolean(args?.enabled);
-    fallbackConfig = withProvider(providerId, (provider) => ({
-      ...provider,
-      response_session_reuse_models: (provider.response_session_reuse_models ?? []).map((item) =>
-        item.model_id === modelId && item.status === "verified" && item.usage_verified === true
-          ? { ...item, enabled, updated_at: new Date().toISOString() }
-          : item
-      )
-    }));
-    return fallbackConfig;
-  }
   if (name === "select_provider" && (args?.providerId || args?.provider_id)) {
     const providerId = String(args.providerId ?? args.provider_id);
     const provider = fallbackConfig.providers.find((item) => item.id === providerId);
@@ -1291,7 +1254,6 @@ function fallback(name: string, args?: Record<string, unknown>) {
       request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? true,
       use_system_proxy: input.use_system_proxy ?? existing?.use_system_proxy ?? true,
       non_sse_compact_compat_enabled: input.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
-      response_session_reuse_models: existing?.response_session_reuse_models ?? [],
       has_api_key: Boolean(input.api_key) || existing?.has_api_key || false,
       key_pool: input.key_pool
         ? previewKeyPool(input.key_pool, existing?.key_pool ?? null)
@@ -1513,54 +1475,6 @@ function injection(id: string, label: string, kind: AgentInjectionKind): AgentIn
     last_status: null,
     hidden_provider_ids: []
   };
-}
-
-export interface ProviderResponseSessionReuseConfig {
-  provider_id: string;
-  model_id: string;
-  capability?: ProviderResponseSessionReuseCapability | null;
-  enabled: boolean;
-  status: ProviderResponseSessionReuseStatus;
-  usage_verified: boolean;
-  compact_fidelity_verified: boolean;
-  checked_at?: string | null;
-  last_error?: string | null;
-  updated_at: string;
-}
-
-export interface ProviderResponseSessionReuseProbeResult {
-  provider_id: string;
-  model_id: string;
-  capability?: ProviderResponseSessionReuseCapability | null;
-  status: ProviderResponseSessionReuseStatus;
-  enabled: boolean;
-  message: string;
-  checked_at?: string | null;
-  first_status?: number | null;
-  continuation_status?: number | null;
-  compact_status?: number | null;
-  compact_continuation_status?: number | null;
-  first_input_tokens?: number | null;
-  first_cached_tokens?: number | null;
-  continuation_input_tokens?: number | null;
-  continuation_cached_tokens?: number | null;
-  usage_verified: boolean;
-  compact_fidelity_verified: boolean;
-}
-
-export type ResponseSessionReuseStreamShape = "non-stream-json" | "stream-sse";
-
-export interface ProviderResponseSessionReuseCapability {
-  endpoint: string;
-  channel: Channel;
-  key_realm_id: string;
-  stream_shape: ResponseSessionReuseStreamShape;
-  evidence_version: number;
-}
-
-export interface ProviderResponseSessionReuseProbeInput {
-  provider_id: string;
-  model_id: string;
 }
 
 export interface ProviderCacheCapabilityConfig {
