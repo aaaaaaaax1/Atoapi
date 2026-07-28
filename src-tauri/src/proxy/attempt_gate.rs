@@ -1,9 +1,11 @@
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Agent requests always receive exactly one upstream-send authorization.
-/// Compatibility decisions are persisted for a later independent inbound
-/// request; they never expand this request's attempt budget.
+/// Each independent Agent inbound receives exactly one upstream-send
+/// authorization. Gates are scoped to an inbound request, never globally or
+/// to a session. Compatibility decisions are persisted for a later
+/// independent inbound request; they never expand this request's attempt
+/// budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttemptPolicy {
     Single,
@@ -136,15 +138,23 @@ mod tests {
     }
 
     #[test]
-    fn tokens_are_unique_even_for_the_same_inbound_id() {
-        let mut first = AttemptGate::new("same-inbound", AttemptPolicy::Single).unwrap();
-        let mut second = AttemptGate::new("same-inbound", AttemptPolicy::Single).unwrap();
+    fn independent_inbounds_each_receive_their_own_one_shot_authorization() {
+        let mut first = AttemptGate::new("inbound-1", AttemptPolicy::Single).unwrap();
+        let mut second = AttemptGate::new("inbound-2", AttemptPolicy::Single).unwrap();
 
         let first_primary = first.primary().unwrap();
         let second_primary = second.primary().unwrap();
         assert_ne!(first_primary.attempt_id(), second_primary.attempt_id());
-        assert_eq!(first_primary.inbound_request_id(), "same-inbound");
-        assert_eq!(second_primary.inbound_request_id(), "same-inbound");
+        assert_eq!(first_primary.inbound_request_id(), "inbound-1");
+        assert_eq!(second_primary.inbound_request_id(), "inbound-2");
+        assert_eq!(
+            first.primary().unwrap_err(),
+            AttemptGateError::PrimaryAlreadyIssued
+        );
+        assert_eq!(
+            second.primary().unwrap_err(),
+            AttemptGateError::PrimaryAlreadyIssued
+        );
     }
 
     #[test]

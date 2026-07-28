@@ -53,6 +53,11 @@ if (includeWireCompat) {
   checks.splice(
     -1,
     0,
+    [
+      "fresh release executable for isolated wire compatibility",
+      cargo,
+      ["build", "--manifest-path", "src-tauri/Cargo.toml", "--release"]
+    ],
     ["isolated retained-baseline wire compatibility", npm, ["run", "test:isolated-wire-compat"]],
     ["isolated same-prefix dispatch stress", npm, ["run", "test:isolated-wire-stress"]],
     ["isolated same-prefix header-gate concurrency", npm, ["run", "test:isolated-wire-header-concurrency"]]

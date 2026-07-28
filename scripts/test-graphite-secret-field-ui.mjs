@@ -48,14 +48,18 @@ assert.match(
   "revealing a key must replace only the visual mask after the explicit reveal response"
 );
 
+const draftConnectionTest = controlPlane.match(
+  /async function testDraftProviderConnection\([\s\S]*?\): Promise<GraphiteBridgeResponse> \{([\s\S]*?)\n  \}\n\n  async function onBridgeAction/
+)?.[1];
+assert.ok(draftConnectionTest, "the editor connection-test helper must remain bounded");
 assert.match(
-  controlPlane,
-  /const savedProvider = input\.provider_id[\s\S]{0,420}!input\.api_key\?\.trim\(\)\s*&&\s*!savedProvider/,
+  draftConnectionTest,
+  /const savedProvider = config\?\.providers\.find\(\(item\) => item\.id === providerId\);[\s\S]{0,420}draftProviderTestInput\(draft, null, savedProvider\?\.is_full_url \?\? false\);[\s\S]{0,240}!input\.api_key\?\.trim\(\)\s*&&\s*!savedProvider/,
   "testing an existing provider must be allowed to use its saved backend key while a new draft still requires a typed key"
 );
 assert.match(
-  controlPlane,
-  /draftProviderTestInput\(draft, null\)/,
+  draftConnectionTest,
+  /draftProviderTestInput\(draft, null, savedProvider\?\.is_full_url \?\? false\)/,
   "the provider test must preserve the editable URL while relying on the saved key by provider id"
 );
 

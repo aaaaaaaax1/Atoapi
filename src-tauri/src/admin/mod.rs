@@ -1607,6 +1607,8 @@ async fn test_provider_connection_paths_inner(
     state: &AppState,
     input: &ProviderKeyTestInput,
 ) -> Result<ProviderConnectionPathTestResult> {
+    let resolved_input = resolve_connection_path_test_input(state, input).await?;
+    let input = &resolved_input;
     let mut upstream_secret = input
         .api_key
         .as_deref()
@@ -1698,6 +1700,54 @@ async fn test_provider_connection_paths_inner(
         message: "neither direct nor system-proxy path returned a valid model list".to_string(),
         paths: last_paths,
     })
+}
+
+/// Resolves a saved provider's diagnostic credential from the same Key pool
+/// selection rules as an ordinary request, without changing the saved pool
+/// cursor, counters, health, or proxy setting. A draft-secret or an explicitly
+/// selected Key always wins so users can still test an unsaved edit by hand.
+async fn resolve_connection_path_test_input(
+    state: &AppState,
+    input: &ProviderKeyTestInput,
+) -> Result<ProviderKeyTestInput> {
+    let config = state.config.read().await;
+    connection_path_test_input_from_config(&config, input)
+}
+
+fn connection_path_test_input_from_config(
+    config: &AppConfig,
+    input: &ProviderKeyTestInput,
+) -> Result<ProviderKeyTestInput> {
+    if input
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+        || input
+            .key_id
+            .as_deref()
+            .is_some_and(|key_id| !key_id.trim().is_empty())
+    {
+        return Ok(input.clone());
+    }
+    let Some(provider_id) = input
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+    else {
+        return Ok(input.clone());
+    };
+
+    // Selection is evaluated on a copy. A manual connection test must never
+    // rotate a sequential pool, revive a disabled Key, or mutate the editor.
+    let mut selection_snapshot = config.clone();
+    let selected = selection_snapshot
+        .select_provider_key_for_request(provider_id, None, None)?
+        .ok_or_else(|| anyhow!("provider API key is not configured"))?;
+    let mut resolved = input.clone();
+    resolved.key_id = selected.key_id;
+    resolved.api_key = Some(selected.secret);
+    Ok(resolved)
 }
 
 /// Returns the faster successful path. A tie intentionally preserves direct
@@ -2757,6 +2807,38 @@ mod tests {
             .to_string();
         assert!(error.contains("key pool has no enabled usable key"));
         assert!(!error.contains("legacy-connection-key"));
+
+        let mut connection_test_snapshot = config.clone();
+        connection_test_snapshot
+            .provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id)
+            .unwrap()
+            .keys
+            .iter_mut()
+            .find(|key| key.id == "current-key")
+            .unwrap()
+            .disabled_until = None;
+        let before = toml::to_string(&connection_test_snapshot).unwrap();
+        let selected = connection_path_test_input_from_config(
+            &connection_test_snapshot,
+            &ProviderKeyTestInput {
+                provider_id: Some(provider_id.to_string()),
+                key_id: None,
+                api_key: None,
+                base_url: "https://draft.example/v1".to_string(),
+                models_url: None,
+                is_full_url: false,
+                custom_user_agent: None,
+                channel: Channel::Responses,
+                use_system_proxy: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.key_id.as_deref(), Some("current-key"));
+        assert_eq!(selected.api_key.as_deref(), Some("current-secret"));
+        assert_eq!(selected.base_url, "https://draft.example/v1");
+        assert_eq!(toml::to_string(&connection_test_snapshot).unwrap(), before);
     }
 
     #[test]

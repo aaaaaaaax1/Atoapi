@@ -83,20 +83,29 @@ assert.match(
   "the control plane must retain a saved key ID while testing an edited draft endpoint"
 );
 
-const providerListTestStart = controlPlane.indexOf('if (action === "test-provider")');
-const providerListTestEnd = controlPlane.indexOf('if (action === "test-provider-key")', providerListTestStart);
-assert.ok(providerListTestStart >= 0 && providerListTestEnd > providerListTestStart, "the saved-provider test action must remain bounded");
-const providerListTest = controlPlane.slice(providerListTestStart, providerListTestEnd);
+const providerListTest = controlPlane.match(
+  /async function testSavedProviderKeyHealth\(providerId: string\): Promise<GraphiteBridgeResponse> \{([\s\S]*?)\n  \}\n\n  async function testDraftProviderConnection/
+)?.[1];
+assert.ok(providerListTest, "the saved-provider Key-health test must remain bounded");
 assert.match(
   providerListTest,
   /command<ProviderKeyTestResult>\("test_active_provider_key",\s*\{\s*providerId:\s*provider\.id,\s*provider_id:\s*provider\.id\s*\}\)/,
   "the provider-list health button must use the Key the next ordinary inbound would select"
 );
-const savedProviderKeyTest = providerListTest.slice(providerListTest.indexOf("const activeKeyResult"));
 assert.doesNotMatch(
-  savedProviderKeyTest,
+  providerListTest,
   /test_provider_connection_paths/,
   "the provider-list health button must not dispatch through the editor connection-key path"
+);
+assert.match(
+  providerListTest,
+  /payload:\s*\{ keyPoolHealth \}/,
+  "the provider-list health button must refresh the persisted Key-health state"
+);
+assert.match(
+  controlPlane,
+  /if \(providerId && !\("provider" in payload\)\) \{\s*return testSavedProviderKeyHealth\(providerId\);/,
+  "a provider-list test must not accidentally take the editor connection-test path"
 );
 
 assert.match(

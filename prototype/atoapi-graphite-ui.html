@@ -6642,8 +6642,9 @@
                 </div>
               </div>
               <div class="form-section">
-                <div class="form-section-head"><div><h3>连接测试</h3><p>可直接使用当前填写的 URL 与 Key，不必先保存。</p></div><button class="secondary-button" type="button" data-mock-action="测试当前连接"><i class="icon" data-lucide="activity"></i>测试连接</button></div>
+                <div class="form-section-head"><div><h3>连接测试</h3><p>可直接使用当前填写的 URL 与 Key，不必先保存；测试仅给出建议，不会修改代理开关。</p></div><button class="secondary-button" type="button" data-mock-action="测试当前连接"><i class="icon" data-lucide="activity"></i>测试连接</button></div>
                 <div class="option-row"><div><b>使用系统代理</b><small>当前选择：直连</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="false" aria-label="使用系统代理"></button></div>
+                <div class="status-band" id="providerConnectionTestResult" hidden><span class="status-icon"><i class="icon" data-lucide="activity"></i></span><div><b>尚未测试</b><small>测试会获取模型，并仅给出直连或系统代理建议。</small></div></div>
               </div>
             </section>
 

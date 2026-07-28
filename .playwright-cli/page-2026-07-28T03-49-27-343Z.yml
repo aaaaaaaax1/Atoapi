@@ -1,0 +1,139 @@
+- iframe [active] [ref=e3]:
+  - generic [active] [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e7] [cursor=pointer]:
+            - strong [ref=f1e8]: Atoapi
+            - generic [ref=f1e9]: Graphite · v1.4.6
+        - tablist "Agent 列表" [ref=f1e10]:
+          - tab "Claude Code 已关闭" [ref=f1e500] [cursor=pointer]:
+            - generic [ref=f1e506]:
+              - generic [ref=f1e507]: Claude Code
+              - generic [ref=f1e508]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e510] [cursor=pointer]:
+            - generic [ref=f1e514]:
+              - generic [ref=f1e515]: Claude Desktop
+              - generic [ref=f1e516]: 已关闭
+          - tab "Codex 已关闭" [selected] [ref=f1e518] [cursor=pointer]:
+            - generic [ref=f1e523]:
+              - generic [ref=f1e524]: Codex
+              - generic [ref=f1e525]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e527] [cursor=pointer]:
+            - generic [ref=f1e531]:
+              - generic [ref=f1e532]: Gemini
+              - generic [ref=f1e533]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e535] [cursor=pointer]:
+            - generic [ref=f1e540]:
+              - generic [ref=f1e541]: OpenCode
+              - generic [ref=f1e542]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e544] [cursor=pointer]:
+            - generic [ref=f1e549]:
+              - generic [ref=f1e550]: OpenClaw
+              - generic [ref=f1e551]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e553] [cursor=pointer]:
+            - generic [ref=f1e561]:
+              - generic [ref=f1e562]: Hermes
+              - generic [ref=f1e563]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e565] [cursor=pointer]:
+            - generic [ref=f1e574]:
+              - generic [ref=f1e575]: 本地代理模式
+              - generic [ref=f1e576]: 已关闭
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]:
+            - generic [ref=f1e13]: 代理运行中
+            - generic [ref=f1e14]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e15] [cursor=pointer]
+      - region [ref=f1e240]:
+        - generic [ref=f1e18]:
+          - switch "启用当前 Agent" [ref=f1e19] [cursor=pointer]
+          - generic [ref=f1e20]:
+            - heading "Codex" [level=1] [ref=f1e241]
+            - paragraph [ref=f1e22]: 未选择上游
+        - generic [ref=f1e23]:
+          - generic [ref=f1e583]:
+            - generic [ref=f1e584]: Base URL
+            - code [ref=f1e585]: http://127.0.0.1:18883/codex/v1
+            - button "复制 Base URL" [ref=f1e586] [cursor=pointer]
+          - generic [ref=f1e590]:
+            - generic [ref=f1e591]: Local Key
+            - code [ref=f1e592]: ato-local-preview
+            - button "复制本地 Key" [ref=f1e593] [cursor=pointer]
+        - button "新增上游" [ref=f1e25] [cursor=pointer]
+      - main [ref=f1e28]:
+        - generic [ref=f1e29]:
+          - generic [ref=f1e30]:
+            - generic [ref=f1e31]:
+              - heading "上游路由" [level=2] [ref=f1e32]
+              - paragraph [ref=f1e33]: 当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。
+            - generic [ref=f1e34]:
+              - generic [ref=f1e35]: 0 个可用上游
+              - generic [ref=f1e36]: 一次入站 · 一次上游
+          - generic [ref=f1e37]: 当前没有上游配置
+      - contentinfo [ref=f1e38]:
+        - button "打开缓存统计与请求记录" [ref=f1e39] [cursor=pointer]:
+          - generic [ref=f1e41]: 缓存与记录
+          - generic [ref=f1e42]:
+            - text: 命中率
+            - strong [ref=f1e603]: —
+          - generic [ref=f1e44]: — 成功
+    - dialog [ref=f1e313]:
+      - banner [ref=f1e314]:
+        - generic [ref=f1e315]:
+          - heading "新增上游" [level=2] [ref=f1e316]
+          - paragraph [ref=f1e317]: 加入当前 Agent 的独立上游列表，不改变当前使用上游
+        - button "关闭上游编辑器" [ref=f1e318] [cursor=pointer]
+      - generic [ref=f1e323]:
+        - tablist "上游配置分类" [ref=f1e324]:
+          - tab "连接信息" [selected] [ref=f1e325] [cursor=pointer]
+          - tab "模型映射" [ref=f1e326] [cursor=pointer]
+          - tab "多 Key" [ref=f1e327] [cursor=pointer]
+          - tab "传输与缓存" [ref=f1e328] [cursor=pointer]
+        - generic [ref=f1e330]:
+          - generic [ref=f1e331]:
+            - generic [ref=f1e333]:
+              - heading "连接信息" [level=3] [ref=f1e334]
+              - paragraph [ref=f1e335]: 模型列表仅用于辅助添加映射，不影响基础代理。
+            - generic [ref=f1e336]:
+              - generic [ref=f1e337]:
+                - generic [ref=f1e338]: 上游名称
+                - textbox "上游名称" [ref=f1e339]: 新上游
+              - generic [ref=f1e340]:
+                - generic [ref=f1e341]: 通道
+                - combobox "通道" [ref=f1e342]:
+                  - option "Auto"
+                  - option "Responses" [selected]
+                  - option "Chat"
+                  - option "Anthropic"
+              - generic [ref=f1e343]:
+                - generic [ref=f1e344]: Base URL
+                - textbox "Base URL" [ref=f1e345]: https://preview.example/v1
+              - generic [ref=f1e346]:
+                - generic [ref=f1e347]: API Key
+                - generic [ref=f1e348]:
+                  - textbox "API Key 显示 API Key" [ref=f1e349]:
+                    - /placeholder: 输入上游 API Key
+                    - text: sk-preview-test
+                  - button "显示 API Key" [ref=f1e350] [cursor=pointer]
+              - generic [ref=f1e354]:
+                - generic [ref=f1e355]: Models URL（可选）
+                - textbox "Models URL（可选）" [ref=f1e356]
+          - generic [ref=f1e357]:
+            - generic [ref=f1e358]:
+              - generic [ref=f1e359]:
+                - heading "连接测试" [level=3] [ref=f1e360]
+                - paragraph [ref=f1e361]: 直连 118ms · 系统代理 132ms
+              - button "测试连接" [ref=f1e362] [cursor=pointer]
+            - generic [ref=f1e365]:
+              - generic [ref=f1e366]:
+                - generic [ref=f1e367]: 使用系统代理
+                - generic [ref=f1e368]: 当前选择：直连
+              - switch "使用系统代理" [ref=f1e369] [cursor=pointer]
+            - generic [ref=f1e374]:
+              - generic [ref=f1e375]: 测试通过 · 推荐直连
+              - generic [ref=f1e376]: 已获取 2 个模型；当前仍为直连，开关不会被测试自动修改，请手动决定是否切换。 · 118ms
+      - contentinfo [ref=f1e377]:
+        - button "取消" [ref=f1e378] [cursor=pointer]
+        - button "保存上游" [ref=f1e379] [cursor=pointer]
+    - status: 新上游 连通正常 · 推荐直连 118ms · 2 个模型；当前代理开关未被修改，请手动决定。

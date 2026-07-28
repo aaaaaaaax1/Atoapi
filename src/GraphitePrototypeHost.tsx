@@ -85,7 +85,14 @@ export interface GraphitePrototypeHostProps {
   proxyStatus: ProxyStatus | null;
   networkPathDiagnostic: {
     provider_id: string;
-    paths: Array<{ path: string; ok: boolean; elapsed_ms: number; status?: number | null; error?: string | null }>;
+    paths: Array<{
+      path: string;
+      ok: boolean;
+      elapsed_ms: number;
+      status?: number | null;
+      http_version?: string | null;
+      error?: string | null;
+    }>;
   } | null;
   cacheValidation: CacheValidationStatus | null;
   appVersion: string;
@@ -168,7 +175,23 @@ const bridgeSource = String.raw`
     if (!node) return;
     node.setAttribute("aria-checked", String(Boolean(checked)));
     if (typeof disabled === "boolean") node.disabled = disabled;
+    if (label === "使用系统代理") syncSystemProxySelection(Boolean(checked));
   };
+  function currentSystemProxySelection() {
+    return $bridge('[aria-label="使用系统代理"]')?.getAttribute("aria-checked") === "true";
+  }
+  function syncSystemProxySelection(checked) {
+    const toggle = $bridge('[aria-label="使用系统代理"]');
+    const description = toggle?.closest(".option-row")?.querySelector("small");
+    if (description) description.textContent = "当前选择：" + (checked ? "系统代理" : "直连");
+  }
+  function clearConnectionPathTest() {
+    const result = $bridge("#providerConnectionTestResult");
+    if (!result) return;
+    result.hidden = true;
+    result.querySelector("b")?.replaceChildren(document.createTextNode("尚未测试"));
+    result.querySelector("small")?.replaceChildren(document.createTextNode("测试会获取模型，并仅给出直连或系统代理建议。"));
+  }
   const ensureCompactionPolicySwitch = () => {
     const existing = $bridge('[aria-label="计入压缩"]');
     if (existing) return existing;
@@ -337,6 +360,7 @@ const bridgeSource = String.raw`
     normalizeKeyPriorities();
     if (failureThreshold) failureThreshold.value = String(detail?.key_pool?.failure_threshold ?? 3);
     setSwitch("使用系统代理", detail?.use_system_proxy ?? true);
+    clearConnectionPathTest();
     setSwitch("prompt cache retention", detail?.prompt_cache_retention_enabled ?? true);
     setSwitch("大请求体 gzip", detail?.request_body_gzip_enabled ?? true);
     setSwitch("非 SSE compact 兼容", detail?.non_sse_compact_compat_enabled || false);
@@ -617,28 +641,39 @@ const bridgeSource = String.raw`
     const description = $bridge("#providerGeneral .form-section:nth-of-type(2) .form-section-head p");
     if (!description) return;
     if (!diagnostic?.paths?.length) {
-      description.textContent = "诊断只在用户点击后执行。";
+      description.textContent = "点击测试会校验连通并获取模型；结果只给出直连或系统代理建议，不会改开关。";
       return;
     }
     description.textContent = diagnostic.paths.map((path) => {
       const label = path.path === "direct" ? "直连" : path.path === "system-proxy" ? "系统代理" : path.path === "explicit-proxy" ? "显式代理" : path.path;
-      return label + " " + (path.ok ? path.elapsed_ms + "ms" : "失败");
+      const protocol = path.http_version ? " · " + path.http_version : "";
+      return label + " " + (path.ok ? path.elapsed_ms + "ms" + protocol : "失败");
     }).join(" · ");
   }
 
   function applyConnectionPathTest(result) {
-    if (!result?.paths?.length) return;
-    const useSystemProxy = result.recommended_use_system_proxy === true;
-    setSwitch("使用系统代理", useSystemProxy);
-    applyNetworkDiagnostic({ paths: result.paths });
-    const description = $bridge("#providerGeneral .form-section:nth-of-type(2) .form-section-head p");
-    if (description && result.ok) {
-      const selected = result.paths.find((path) => useSystemProxy
-        ? path.path === "system-proxy"
-        : path.path === "direct");
-      const label = useSystemProxy ? "系统代理" : "直连";
-      description.textContent = "已选择更快的" + label + "路径" + (selected ? " · " + selected.elapsed_ms + "ms" : "") + "，保存后生效。";
+    const resultBand = $bridge("#providerConnectionTestResult");
+    if (!resultBand) return;
+    if (result?.paths?.length) applyNetworkDiagnostic({ paths: result.paths });
+    const recommendedSystemProxy = result?.recommended_use_system_proxy === true;
+    const recommendedLabel = recommendedSystemProxy ? "系统代理" : "直连";
+    const currentLabel = currentSystemProxySelection() ? "系统代理" : "直连";
+    const selected = result?.paths?.find((path) => recommendedSystemProxy
+      ? path.path === "system-proxy"
+      : path.path === "direct");
+    const title = resultBand.querySelector("b");
+    const detail = resultBand.querySelector("small");
+    if (title) title.textContent = result?.ok ? "测试通过 · 推荐" + recommendedLabel : "测试未通过";
+    if (detail) {
+      if (result?.ok) {
+        const timing = selected ? " · " + selected.elapsed_ms + "ms" + (selected.http_version ? " · " + selected.http_version : "") : "";
+        const modelCount = Number(result.models_count || 0);
+        detail.textContent = "已获取 " + modelCount + " 个模型；当前仍为" + currentLabel + "，开关不会被测试自动修改，请手动决定是否切换。" + timing;
+      } else {
+        detail.textContent = result?.message || "直连和系统代理均未返回有效模型列表。";
+      }
     }
+    resultBand.hidden = false;
   }
 
   function activeRequestScope(metric) {

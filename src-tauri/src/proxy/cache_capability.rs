@@ -125,12 +125,10 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
         // can accept the field without proving that it affects the upstream
         // cache, so retain it only for an administrator-started candidate.
         preserve_prompt_cache_key: probe_selected(ProviderCacheCapabilityField::PromptCacheKey),
-        // No cache-control field is guessed for an unknown third-party
-        // schema. Ordinary traffic requires a positive effect certificate in
-        // this exact provider/model/channel/selected-Key scope; the only
-        // exception is an already-selected single-field validation candidate.
-        // This preserves the user's one-request contract without making an
-        // unrelated upstream reject a speculative compatibility field.
+        // Ordinary provider controls remain strictly bound to their measured
+        // scope. The native Codex FullReplay compatibility path is applied by
+        // the caller only after it proves the trusted session and selected Key
+        // boundary, so it cannot leak into generic provider traffic here.
         enable_prompt_cache_retention: provider.prompt_cache_retention_enabled
             && !enable_modern_options
             && allowed(ProviderCacheCapabilityField::PromptCacheRetention),
@@ -277,6 +275,23 @@ pub(super) fn apply_generated_prompt_cache_key(
         receipt.mark_changed("prompt_cache_key");
     }
     receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheKey);
+    changed
+}
+
+/// Applies the legacy `24h` retention control only after the caller has
+/// established the trusted native Codex FullReplay and selected-Key boundary.
+/// Generic provider planning remains strict; this helper only records the
+/// final wire mutation for rejection handling and diagnostics.
+pub(super) fn apply_legacy_prompt_cache_retention(
+    request: &mut PreparedResponseBody,
+    receipt: &mut CacheControlApplicationReceipt,
+) -> bool {
+    let retention = Value::String(PROMPT_CACHE_RETENTION_VALUE.to_string());
+    let changed = request.set_root("prompt_cache_retention", retention);
+    if changed {
+        receipt.mark_changed("prompt_cache_retention");
+    }
+    receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheRetention);
     changed
 }
 
@@ -1839,6 +1854,30 @@ mod tests {
         assert!(receipt
             .injected_fields()
             .contains(&ProviderCacheCapabilityField::PromptCacheKey));
+    }
+
+    #[test]
+    fn legacy_prompt_cache_retention_is_present_and_receipted_on_the_final_body() {
+        let mut prepared = PreparedResponseBody::responses(json!({
+            "model": "gpt-5.6-terra",
+            "input": [{"role": "user", "content": "stable"}]
+        }));
+        let mut receipt = CacheControlApplicationReceipt::default();
+
+        assert!(apply_legacy_prompt_cache_retention(
+            &mut prepared,
+            &mut receipt
+        ));
+        assert_eq!(
+            prepared
+                .body()
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some(PROMPT_CACHE_RETENTION_VALUE)
+        );
+        assert!(receipt
+            .injected_fields()
+            .contains(&ProviderCacheCapabilityField::PromptCacheRetention));
     }
 
     #[test]

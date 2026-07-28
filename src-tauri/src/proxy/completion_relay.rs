@@ -1105,7 +1105,11 @@ pub(super) async fn stream_upstream(
             stream_success_for_cache && !confirmed_compaction,
         )
         .await;
-        let gap_breakdown = prefix_observation.gap;
+        let (gap_breakdown, final_scope_rollback_reclassified) =
+            reconcile_gap_with_final_scope_rollback(
+                prefix_observation.gap,
+                upstream_request_diagnostics.final_scope_waterline.as_ref(),
+            );
         let mut prefix_lag = usage_record
             .as_ref()
             .map(|record| {
@@ -1120,6 +1124,8 @@ pub(super) async fn stream_upstream(
             .unwrap_or_default();
         if prefix_observation.static_wire_drift {
             prefix_lag.classification = Some("static_wire_drift".to_string());
+        } else if final_scope_rollback_reclassified {
+            prefix_lag.classification = Some("provider_waterline_rollback".to_string());
         }
         if confirmed_compaction {
             let shadow_assignment_key =

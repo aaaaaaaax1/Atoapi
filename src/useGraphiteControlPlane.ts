@@ -26,7 +26,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.6";
+const APP_VERSION = "v1.4.7";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -319,6 +319,64 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
   }
 
+  async function testSavedProviderKeyHealth(providerId: string): Promise<GraphiteBridgeResponse> {
+    const provider = config?.providers.find((item) => item.id === providerId);
+    if (!provider) throw new Error("未找到待测试的上游配置");
+
+    // The provider-list button is a Key-pool health test, not an editor
+    // connection test. Keep it on the exact Key ordinary traffic would choose
+    // and refresh the persisted Key health after the result.
+    const startedAt = performance.now();
+    const activeKeyResult = await command<ProviderKeyTestResult>("test_active_provider_key", {
+      providerId: provider.id,
+      provider_id: provider.id
+    });
+    const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+    const nextConfig = await command<AppConfig>("get_config");
+    setConfig(nextConfig);
+    const keyPoolHealth = graphiteKeyPoolHealth(nextConfig, provider.id);
+    setProviderConnectionStatus((current) => ({
+      ...current,
+      [provider.id]: activeKeyResult.ok
+        ? `当前 Key 可用 · ${elapsedMs}ms`
+        : `当前 Key 失败 · ${elapsedMs}ms`
+    }));
+    return activeKeyResult.ok
+      ? {
+          notice: `${provider.name} 当前 Key 连通正常 · ${activeKeyResult.models_count} 个模型`,
+          payload: { keyPoolHealth }
+        }
+      : { error: activeKeyResult.message, payload: { keyPoolHealth } };
+  }
+
+  async function testDraftProviderConnection(
+    draft: GraphiteProviderPayload,
+    providerId: string
+  ): Promise<GraphiteBridgeResponse> {
+    const savedProvider = config?.providers.find((item) => item.id === providerId);
+    const input = draftProviderTestInput(draft, null, savedProvider?.is_full_url ?? false);
+    if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
+    if (!input.api_key?.trim() && !savedProvider) throw new Error("请先填写 API Key");
+    const startedAt = performance.now();
+    const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", { input });
+    const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+    const selectedPath = result.paths.find((path) =>
+      result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
+    );
+    const pathLabel = result.recommended_use_system_proxy ? "系统代理" : "直连";
+    const statusKey = savedProvider?.id ?? `draft:${draft.name || draft.base_url}`;
+    setProviderConnectionStatus((current) => ({
+      ...current,
+      [statusKey]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
+    }));
+    return result.ok
+      ? {
+          notice: `${draft.name || savedProvider?.name || "未保存上游"} 连通正常 · 推荐${pathLabel}${selectedPath ? ` ${selectedPath.elapsed_ms}ms${selectedPath.http_version ? ` · ${selectedPath.http_version}` : ""}` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；当前代理开关未被修改，请手动决定。`,
+          payload: { connectionTest: result }
+        }
+      : { error: result.message };
+  }
+
   async function onBridgeAction(
     action: string,
     payload: Record<string, unknown>
@@ -399,63 +457,13 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     if (action === "test-provider") {
       const draft = providerPayload();
       const providerId = text("providerId") || draft.id || "";
-      const provider = config?.providers.find((item) => item.id === providerId);
-      if (!provider) {
-        const input = draftProviderTestInput(draft, null);
-        if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
-        const savedProvider = input.provider_id
-          ? config?.providers.find((item) => item.id === input.provider_id)
-          : undefined;
-        if (!input.api_key?.trim() && !savedProvider) throw new Error("请先填写 API Key");
-        const startedAt = performance.now();
-        const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", { input });
-        const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
-        const selectedPath = result.paths.find((path) =>
-          result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
-        );
-        const pathLabel = result.recommended_use_system_proxy ? "系统代理" : "直连";
-        const statusKey = `draft:${draft.name || draft.base_url}`;
-        setProviderConnectionStatus((current) => ({
-          ...current,
-          [statusKey]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
-        }));
-        return result.ok
-          ? {
-              notice: `${draft.name || "未保存上游"} 连通正常 · ${pathLabel}更快${selectedPath ? ` ${selectedPath.elapsed_ms}ms` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；已更新当前开关，保存后生效`,
-              payload: { connectionTest: result }
-            }
-          : { error: result.message };
+      // Provider-list actions contain only providerId. Editor actions include
+      // the unsaved provider payload and therefore must retain their dual-path
+      // connection recommendation behavior.
+      if (providerId && !("provider" in payload)) {
+        return testSavedProviderKeyHealth(providerId);
       }
-      const input = draft.id === provider.id
-        ? draftProviderTestInput(draft, null)
-        : providerTestInput(provider, null);
-      if (!input.base_url.trim()) throw new Error("请先填写 Base URL");
-      const startedAt = performance.now();
-      const activeKeyResult = await command<ProviderKeyTestResult>("test_active_provider_key", {
-        providerId: provider.id,
-        provider_id: provider.id
-      });
-      const result: ProviderConnectionPathTestResult = {
-        ...activeKeyResult,
-        recommended_use_system_proxy: provider.use_system_proxy,
-        paths: []
-      };
-      setConfig(await command<AppConfig>("get_config"));
-      const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
-      const selectedPath = result.paths.find((path) =>
-        result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
-      );
-      const pathLabel = "当前 Key";
-      setProviderConnectionStatus((current) => ({
-        ...current,
-        [provider.id]: result.ok ? `${pathLabel}更快 · ${selectedPath?.elapsed_ms ?? elapsedMs}ms` : `失败 · ${elapsedMs}ms`
-      }));
-      return result.ok
-        ? {
-            notice: `${provider.name} 连通正常 · ${pathLabel}更快${selectedPath ? ` ${selectedPath.elapsed_ms}ms` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；已更新当前开关，保存后生效`,
-            payload: { connectionTest: result }
-          }
-        : { error: result.message };
+      return testDraftProviderConnection(draft, providerId);
     }
     if (action === "test-provider-key") {
       const draft = providerPayload();
@@ -734,28 +742,18 @@ function isMetricsRefreshPolicy(value: string): value is MetricsRefreshPolicy {
   return value === "visible-1s" || value === "5s" || value === "manual";
 }
 
-function providerTestInput(provider: ProviderConfig, keyId: string | null) {
-  return {
-    provider_id: provider.id,
-    key_id: keyId,
-    api_key: null,
-    base_url: provider.base_url,
-    models_url: provider.models_url ?? null,
-    is_full_url: provider.is_full_url,
-    custom_user_agent: provider.custom_user_agent ?? null,
-    channel: provider.channel,
-    use_system_proxy: provider.use_system_proxy
-  };
-}
-
-function draftProviderTestInput(provider: GraphiteProviderPayload, key: string | null | undefined) {
+function draftProviderTestInput(
+  provider: GraphiteProviderPayload,
+  key: string | null | undefined,
+  isFullUrl = false
+) {
   return {
     provider_id: provider.id ?? null,
     key_id: null,
     api_key: key ?? cleanOptionalText(provider.api_key),
     base_url: provider.base_url ?? "",
     models_url: cleanOptionalText(provider.models_url),
-    is_full_url: false,
+    is_full_url: isFullUrl,
     custom_user_agent: cleanOptionalText(provider.custom_user_agent),
     channel: provider.channel || "responses",
     use_system_proxy: provider.use_system_proxy ?? true

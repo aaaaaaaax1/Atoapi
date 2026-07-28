@@ -939,32 +939,21 @@ async fn run_responses_compact_for_authorized_agent(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &err),
     };
     let requested_model_for_log = requested_model_for_log(&client_request, &decision.model);
-    let selected_provider_key =
-        match select_provider_api_key(&state, &decision.provider.id, None, None).await {
-            Ok(selected) => selected,
-            Err(err) => {
-                if let Some(message) = provider_key_configuration_error_message(&err) {
-                    return json_error(StatusCode::BAD_REQUEST, message);
-                }
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("failed to select provider key: {err}"),
-                );
-            }
-        };
-    let api_key = selected_provider_key.secret.clone();
-    if api_key.trim().is_empty() {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "provider API key is not configured",
-        );
-    }
     let mut upstream_body = transform_request_for_channel(
         &client_request,
         &Channel::Responses,
         &decision.upstream_channel,
     );
     let native_responses_passthrough = matches!(decision.upstream_channel, Channel::Responses);
+    // Codex uses the same stable placement key when it asks the official
+    // compact endpoint to establish a new context anchor.  This is still a
+    // caller-owned routing hint, not continuation state: it may pass only on
+    // an untouched native Responses compact wire.
+    let client_owned_prompt_cache_key = client_owned_native_prompt_cache_key_for_compact(
+        &client_request,
+        native_responses_passthrough,
+        trusted_codex_metadata.is_some(),
+    );
     set_request_model(&mut upstream_body, &decision.model);
     set_stream_flag(&mut upstream_body, false);
     let reasoning_diagnostics = apply_model_reasoning_effort(
@@ -975,15 +964,94 @@ async fn run_responses_compact_for_authorized_agent(
     );
     let identity_client_request =
         identity_request_with_codex_metadata(&client_request, trusted_codex_metadata.as_ref());
+    let compact_session_identity = SessionIdentity::derive_for_agent(
+        &config,
+        &decision,
+        &identity_client_request,
+        &upstream_body,
+        authorized_agent.as_deref(),
+    );
     if native_responses_passthrough {
         strip_provider_cache_key_fields(&mut upstream_body);
-        let mut provider_prefix_body = upstream_body.clone();
-        normalize_responses_request(&mut provider_prefix_body);
-        optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
-        strip_root_provider_cache_metadata_for_native(&mut upstream_body);
     } else {
         optimize_provider_prefix(&mut upstream_body, &config, &decision);
     }
+    let mut provider_prefix_body = upstream_body.clone();
+    if native_responses_passthrough {
+        normalize_responses_request(&mut provider_prefix_body);
+        optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
+        strip_root_provider_cache_metadata_for_native(&mut upstream_body);
+    }
+    // Compaction is a new context epoch, not a new Key realm.  Reuse the
+    // same stable selection scope as normal FullReplay so a sequential or
+    // ordered multi-Key pool does not discard its warm upstream cache just as
+    // Codex establishes the next anchor.
+    let provider_prefix_selection_fingerprint = compact_session_identity
+        .as_ref()
+        .map(|identity| identity.control_fingerprint.clone())
+        .or_else(|| {
+            Some(provider_prefix_fingerprint(
+                &provider_prefix_body,
+                &decision.upstream_channel,
+            ))
+        });
+    let provider_prefix_selection_key = provider_prefix_control_key(
+        provider_prefix_selection_fingerprint.as_deref(),
+        &decision,
+        &decision.upstream_channel,
+    );
+    let selected_provider_key = match select_provider_api_key(
+        &state,
+        &decision.provider.id,
+        None,
+        provider_prefix_selection_key.as_deref(),
+    )
+    .await
+    {
+        Ok(selected) => selected,
+        Err(err) => {
+            if let Some(message) = provider_key_configuration_error_message(&err) {
+                return json_error(StatusCode::BAD_REQUEST, message);
+            }
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to select provider key: {err}"),
+            );
+        }
+    };
+    let api_key = selected_provider_key.secret.clone();
+    if api_key.trim().is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "provider API key is not configured",
+        );
+    }
+    let client_owned_prompt_cache_key_local_id =
+        client_owned_prompt_cache_key
+            .as_deref()
+            .and_then(|cache_key| {
+                client_owned_prompt_cache_key_cooldown_local_id(
+                    &config,
+                    &decision,
+                    compact_session_identity.as_ref(),
+                    &selected_provider_key,
+                    authorized_agent.as_deref(),
+                    cache_key,
+                )
+            });
+    let client_owned_prompt_cache_key_cooling_down =
+        client_prompt_cache_key_rejection_cooldown_active(
+            &state,
+            client_owned_prompt_cache_key_local_id.as_deref(),
+        );
+    let client_owned_prompt_cache_key_provider_allowed = config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        &decision.upstream_channel,
+        selected_provider_key.key_id.as_deref(),
+        ProviderCacheCapabilityField::PromptCacheKey,
+    )
+        != ProviderCacheCapabilityStatus::Unsupported;
     // Compaction may change a lineage epoch, so it must use the same
     // adapter-attested scope as Native Responses continuation. Client-body
     // identity hints remain usable for cache placement but cannot begin or
@@ -1087,6 +1155,31 @@ async fn run_responses_compact_for_authorized_agent(
     } else {
         compact_request_body_for_official_endpoint(&upstream_body)
     };
+    let client_owned_prompt_cache_key_active = client_owned_prompt_cache_key_is_active(
+        client_owned_prompt_cache_key.is_some(),
+        client_owned_prompt_cache_key_cooling_down,
+        client_owned_prompt_cache_key_provider_allowed,
+        &active_request_channel,
+    );
+    if client_owned_prompt_cache_key_active {
+        if let Some(object) = active_upstream_body.as_object_mut() {
+            object.insert(
+                "prompt_cache_key".to_string(),
+                Value::String(
+                    client_owned_prompt_cache_key
+                        .as_deref()
+                        .expect("an active compact client cache key must be present")
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    let client_prompt_cache_key_for_error_redaction =
+        client_owned_prompt_cache_key_active.then(|| {
+            client_owned_prompt_cache_key
+                .clone()
+                .expect("a forwarded compact client key remains available for in-memory redaction")
+        });
     let compact_chat_fast_json = initial_chat_compat
         && matches!(active_request_channel, Channel::Chat)
         && should_use_chat_non_stream_compact_fast_path();
@@ -1239,9 +1332,27 @@ async fn run_responses_compact_for_authorized_agent(
             );
         }
     };
-    let upstream_request_diagnostics = send_outcome.diagnostics;
+    let mut upstream_request_diagnostics = send_outcome.diagnostics;
     let upstream = send_outcome.response;
     let upstream_response_headers_at_ms = started.elapsed().as_millis() as u64;
+
+    upstream_request_diagnostics.sent_cache_capability_fields =
+        cache_capability::present_fields(&active_upstream_body, &active_request_channel);
+    // A caller-owned placement key is scoped to this compact conversation.
+    // A field-specific rejection cools only that opaque scope below; it must
+    // never mark the whole provider/key realm unsupported.
+    upstream_request_diagnostics.client_owned_prompt_cache_key =
+        client_owned_prompt_cache_key_active;
+    upstream_request_diagnostics.client_owned_prompt_cache_key_local_id =
+        client_owned_prompt_cache_key_active
+            .then(|| client_owned_prompt_cache_key_local_id.clone())
+            .flatten();
+    if upstream_request_diagnostics.client_owned_prompt_cache_key {
+        upstream_request_diagnostics
+            .sent_cache_capability_fields
+            .retain(|field| *field != ProviderCacheCapabilityField::PromptCacheKey);
+    }
+    upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
 
     let status = upstream.status().as_u16();
     let content_type = upstream
@@ -1251,13 +1362,6 @@ async fn run_responses_compact_for_authorized_agent(
         .unwrap_or("application/json")
         .to_string();
     let used_fallback = official_compact_cooled_down;
-    // Compact requests share the data-plane one-shot contract: endpoint and
-    // protocol rejections update compatibility state for the next request,
-    // never trigger a second upstream POST for this one.
-    if compact_url.is_some() && should_fallback_compact_to_responses(status) {
-        note_compact_endpoint_cooldown(&state, &compact_chat_compat_cooldown_key).await;
-    }
-
     // The unified terminal settlement records key health after the original
     // compact response; a healthy key is selected only on the next inbound.
 
@@ -1370,7 +1474,27 @@ async fn run_responses_compact_for_authorized_agent(
     let bytes = body_read.bytes;
     let upstream_body_error = upstream_body_has_error(&bytes, &content_type);
     let compact_success_for_cache = is_success_status && !upstream_body_error;
-    let key_error_summary = (!compact_success_for_cache).then(|| upstream_error_summary(&bytes));
+    let key_error_summary = (!compact_success_for_cache).then(|| {
+        upstream_error_summary_redacting(
+            &bytes,
+            client_prompt_cache_key_for_error_redaction.as_deref(),
+        )
+    });
+    let cache_capability_rejected_fields = (!compact_success_for_cache)
+        .then(|| cache_capability_rejection_fields_from_error_bytes(&bytes))
+        .unwrap_or_default();
+    // A field-level cache rejection proves that this compact endpoint is
+    // alive.  Cool only the caller-owned placement scope, not the endpoint:
+    // the next independent compact request can omit that key and still use
+    // the official path.  A genuine endpoint/schema rejection retains the
+    // existing next-inbound compatibility fallback, never a same-inbound
+    // retry.
+    if compact_url.is_some()
+        && should_fallback_compact_to_responses(status)
+        && cache_capability_rejected_fields.is_empty()
+    {
+        note_compact_endpoint_cooldown(&state, &compact_chat_compat_cooldown_key).await;
+    }
     note_selected_provider_key_status(
         &state,
         &decision.provider.id,
@@ -1379,7 +1503,28 @@ async fn run_responses_compact_for_authorized_agent(
         key_error_summary.as_deref(),
     )
     .await;
-    let provider_prefix_key = openai_prompt_cache_key(&active_upstream_body);
+    if let Some(error_summary) = key_error_summary.as_deref() {
+        note_runtime_cache_capability_rejection(
+            &state,
+            &decision,
+            &active_request_channel,
+            &upstream_request_diagnostics,
+            status,
+            error_summary,
+            &cache_capability_rejected_fields,
+        )
+        .await;
+    }
+    let provider_prefix_key = if upstream_request_diagnostics.client_owned_prompt_cache_key {
+        // Caller-owned placement keys are never metrics/history identifiers.
+        // Retain only the opaque local scope when trusted metadata made one
+        // available; otherwise omit it rather than persisting caller bytes.
+        upstream_request_diagnostics
+            .client_owned_prompt_cache_key_local_id
+            .clone()
+    } else {
+        openai_prompt_cache_key(&active_upstream_body)
+    };
     let provider_prefix_fingerprint = Some(provider_prefix_fingerprint(
         &active_upstream_body,
         &active_request_channel,
@@ -1486,7 +1631,12 @@ async fn run_responses_compact_for_authorized_agent(
     )
     .await;
     if !compact_success_for_cache {
-        let error_summary = upstream_error_summary(&bytes);
+        let error_summary = key_error_summary.clone().unwrap_or_else(|| {
+            upstream_error_summary_redacting(
+                &bytes,
+                client_prompt_cache_key_for_error_redaction.as_deref(),
+            )
+        });
         compact_metric_errors.push((
             upstream_error_scope(status, &error_summary).to_string(),
             error_summary,
@@ -1678,7 +1828,12 @@ async fn run_responses_compact_for_authorized_agent(
                     "response_completed",
                 )
             } else {
-                let summary = upstream_error_summary(&bytes);
+                let summary = key_error_summary.clone().unwrap_or_else(|| {
+                    upstream_error_summary_redacting(
+                        &bytes,
+                        client_prompt_cache_key_for_error_redaction.as_deref(),
+                    )
+                });
                 (
                     AgentAttemptOutcome::HttpError,
                     AgentInboundOutcome::HttpError,
@@ -1937,10 +2092,16 @@ async fn run_generation_for_authorized_agent(
         &client_request,
         trusted_codex_metadata.as_ref(),
     );
-    // A caller-supplied placement key is never a normal routing rule. Field
-    // acceptance does not prove real cache benefit, and the key is therefore
-    // retained only by an explicit administrator-started probe path.
-    let client_owned_prompt_cache_key: Option<String> = None;
+    // Codex supplies a stable placement key for ordinary native Responses
+    // turns. Preserve that exact upstream hint when it is safe to do so;
+    // unlike an Atoapi-generated experiment, this is transparent forwarding
+    // of the caller's own cache affinity.
+    let client_owned_prompt_cache_key = client_owned_native_prompt_cache_key(
+        &client_request,
+        native_responses_passthrough,
+        client_request_starts_compaction_epoch,
+        trusted_codex_metadata.is_some(),
+    );
     let (agent_log_id, agent_log_label) =
         request_agent_log_fields(&config, authorized_agent.as_deref());
     let responses_from_incremental_cross_protocol_stream = client_requested_stream
@@ -2221,6 +2382,20 @@ async fn run_generation_for_authorized_agent(
             &state,
             client_owned_prompt_cache_key_local_id.as_deref(),
         );
+    let client_owned_prompt_cache_key_provider_allowed = config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        &decision.upstream_channel,
+        selected_provider_key.key_id.as_deref(),
+        ProviderCacheCapabilityField::PromptCacheKey,
+    )
+        != ProviderCacheCapabilityStatus::Unsupported;
+    let client_owned_prompt_cache_key_active = client_owned_prompt_cache_key_is_active(
+        client_owned_prompt_cache_key.is_some(),
+        client_owned_prompt_cache_key_cooling_down,
+        client_owned_prompt_cache_key_provider_allowed,
+        &decision.upstream_channel,
+    );
     if client_owned_prompt_cache_key_cooling_down {
         // A prior independent request proved that this exact caller placement
         // is rejected for this exact Agent/session/Key realm. Keep the current
@@ -2572,6 +2747,11 @@ async fn run_generation_for_authorized_agent(
         .filter(|identity| session_identity_source_is_trusted(identity.source));
     let generated_prompt_cache_key_value = trusted_generated_cache_identity
         .map(|identity| generated_prompt_cache_key(identity, &decision, &selected_provider_key));
+    // Direct connection-info Keys used the v1.3.x placement key. Preserve that
+    // stable value on the normal compatibility path so an upgrade does not
+    // cold-start a working upstream cache; pooled Keys stay realm-scoped.
+    let legacy_direct_prompt_cache_key_value =
+        trusted_generated_cache_identity.map(|identity| identity.provider_cache_key.clone());
     let generated_key_session_scope_id = generated_prompt_cache_key_value
         .as_deref()
         .map(generated_prompt_cache_key_session_scope_id);
@@ -2658,6 +2838,22 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
+    // Retain the established one-shot cache placement for trusted native Codex
+    // FullReplay. Only an exact field rejection disables this selected
+    // provider/model/channel/Key scope; generic failures never silently erase
+    // the user's working cache behavior.
+    let generated_prompt_cache_key_recovery_enabled = generated_prompt_cache_key_eligible
+        && smart_hit_enabled(&config)
+        && generated_prompt_cache_key_compatibility_allowed(
+            &config,
+            &decision,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        )
+        && !validation_selection.as_ref().is_some_and(|selection| {
+            selection.mode == cache_validation::CacheValidationMode::Baseline
+                && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey)
+        });
     // A generated placement key may also be measured in an explicit candidate
     // run. Promotion certificates remain exact-session scoped, so they cannot
     // make a different conversation eligible.
@@ -2714,10 +2910,50 @@ async fn run_generation_for_authorized_agent(
             &[]
         },
     );
+    let generated_prompt_cache_retention_recovery_enabled = generated_prompt_cache_key_eligible
+        && decision.provider.prompt_cache_retention_enabled
+        && active_upstream_body
+            .body()
+            .get("prompt_cache_retention")
+            .is_none()
+        && active_upstream_body
+            .body()
+            .get("prompt_cache_options")
+            .is_none()
+        && generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &active_request_channel,
+            selected_provider_key.key_id.as_deref(),
+        )
+        && !validation_selection.as_ref().is_some_and(|selection| {
+            selection.mode == cache_validation::CacheValidationMode::Baseline
+                && controlled_probe_fields
+                    .contains(&ProviderCacheCapabilityField::PromptCacheRetention)
+        });
+    if generated_prompt_cache_retention_recovery_enabled {
+        cache_capability::apply_legacy_prompt_cache_retention(
+            &mut active_upstream_body,
+            &mut cache_control_application,
+        );
+    }
     let generated_prompt_cache_key_requested = candidate_cache_routing_requested
         && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
-    if let Some(cache_key) = selected_prompt_cache_placement_key(
+    if client_owned_prompt_cache_key_active {
+        active_upstream_body.set_root(
+            "prompt_cache_key",
+            Value::String(
+                client_owned_prompt_cache_key
+                    .as_deref()
+                    .expect("an active native Codex cache key must be present")
+                    .to_string(),
+            ),
+        );
+    } else if let Some(cache_key) = selected_prompt_cache_placement_key(
+        legacy_direct_prompt_cache_key_value.as_deref(),
         generated_prompt_cache_key_value.as_deref(),
+        &selected_provider_key,
+        generated_prompt_cache_key_recovery_enabled,
         generated_prompt_cache_key_requested,
         generated_prompt_cache_key_promoted,
         generated_prompt_cache_key_eligible,
@@ -3652,7 +3888,11 @@ async fn run_generation_for_authorized_agent(
         is_success_status && !sync_compact_diagnostic_only && !confirmed_compaction,
     )
     .await;
-    let gap_breakdown = prefix_observation.gap;
+    let (gap_breakdown, final_scope_rollback_reclassified) =
+        reconcile_gap_with_final_scope_rollback(
+            prefix_observation.gap,
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+        );
     let mut prefix_lag = usage_record
         .as_ref()
         .map(|record| {
@@ -3667,6 +3907,8 @@ async fn run_generation_for_authorized_agent(
         .unwrap_or_default();
     if prefix_observation.static_wire_drift {
         prefix_lag.classification = Some("static_wire_drift".to_string());
+    } else if final_scope_rollback_reclassified {
+        prefix_lag.classification = Some("provider_waterline_rollback".to_string());
     }
     if confirmed_compaction {
         let shadow_assignment_key = mark_shadow_compaction_boundary(&mut shadow_affinity_decision);
@@ -4793,6 +5035,39 @@ fn apply_prefix_lag_diagnostics(log: &mut RequestLog, diagnostics: PrefixLagDiag
     log.prefix_lag_input_delta_tokens = diagnostics.input_delta_tokens;
     log.prefix_lag_cache_delta_tokens = diagnostics.cache_delta_tokens;
     log.prefix_lag_previous_gap_tokens = diagnostics.previous_gap_tokens;
+}
+
+/// The prefix controller must conservatively treat a dynamic tool tail as
+/// unreliable evidence. The final-scope ledger is stricter: when it proves an
+/// exact predecessor on the same frozen wire and observes a rollback from an
+/// already-settled cache waterline, that portion cannot be a new tail. Move
+/// only that proven portion from the display attribution to upstream
+/// instability; never change raw usage, local recovery accounting, routing,
+/// or the one-shot request itself.
+pub(in crate::proxy) fn reconcile_gap_with_final_scope_rollback(
+    gap_breakdown: Option<ProviderCacheGapBreakdown>,
+    final_scope: Option<&FinalScopeWaterlineLog>,
+) -> (Option<ProviderCacheGapBreakdown>, bool) {
+    let Some(mut gap) = gap_breakdown else {
+        return (None, false);
+    };
+    let Some(final_scope) = final_scope else {
+        return (Some(gap), false);
+    };
+    let exact_same_scope = final_scope.outcome == "settled"
+        && final_scope.predecessor_exact
+        && final_scope.predecessor_bound
+        && !final_scope.continuity_reset;
+    if !exact_same_scope {
+        return (Some(gap), false);
+    }
+    let proven_rollback = final_scope.rollback_tokens_128.min(gap.new_tail_tokens);
+    if proven_rollback == 0 {
+        return (Some(gap), false);
+    }
+    gap.new_tail_tokens = gap.new_tail_tokens.saturating_sub(proven_rollback);
+    gap.provider_unstable_tokens = gap.provider_unstable_tokens.saturating_add(proven_rollback);
+    (Some(gap), true)
 }
 
 fn upstream_ttft_ms(ttft_ms: u64, prefix_guard_wait_ms: Option<u64>) -> u64 {
@@ -11171,18 +11446,67 @@ fn apply_candidate_prompt_cache_routing(
     }
 }
 
-/// Selects an Atoapi-generated placement only for a controlled candidate or
-/// a positive, exact-session effect certificate. Unknown third-party cache
-/// schemas never receive a speculative `prompt_cache_key` on ordinary traffic.
+/// The compatibility path is opt-out only after the exact upstream Key realm
+/// rejects the field. Unknown and transient errors must not erase the stable
+/// v1.3.x cache placement from ordinary trusted Codex traffic.
+fn generated_prompt_cache_key_compatibility_allowed(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    channel: &Channel,
+    key_id: Option<&str>,
+) -> bool {
+    config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        channel,
+        key_id,
+        ProviderCacheCapabilityField::PromptCacheKey,
+    ) != ProviderCacheCapabilityStatus::Unsupported
+}
+
+/// The legacy retention field follows the same trusted native FullReplay and
+/// selected-Key boundary as the generated placement key, but its field-level
+/// rejection is independent: a Key that rejects only the placement key may
+/// still retain a working `24h` control.
+fn generated_prompt_cache_retention_compatibility_allowed(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    channel: &Channel,
+    key_id: Option<&str>,
+) -> bool {
+    config.cache_capability_status_for_key(
+        &decision.provider.id,
+        &decision.model,
+        channel,
+        key_id,
+        ProviderCacheCapabilityField::PromptCacheRetention,
+    ) != ProviderCacheCapabilityStatus::Unsupported
+}
+
+/// Selects the final provider cache placement without weakening Key-realm
+/// isolation. A direct connection keeps its legacy stable key for upgrade
+/// continuity; pooled Keys, candidates and promotions use the selected-Key
+/// realm placement.
 fn selected_prompt_cache_placement_key<'a>(
+    legacy_direct_key: Option<&'a str>,
     generated_key: Option<&'a str>,
+    selected_provider_key: &SelectedProviderKey,
+    recovery_enabled: bool,
     candidate_requested: bool,
     promoted: bool,
     eligible: bool,
 ) -> Option<&'a str> {
-    (eligible && (candidate_requested || promoted))
-        .then_some(generated_key)
-        .flatten()
+    if !eligible || !(recovery_enabled || candidate_requested || promoted) {
+        return None;
+    }
+    if recovery_enabled
+        && !candidate_requested
+        && !promoted
+        && selected_provider_key.key_id.is_none()
+    {
+        return legacy_direct_key;
+    }
+    generated_key
 }
 
 /// The production placement key is fully Atoapi-owned. It combines a stable
@@ -11831,7 +12155,6 @@ fn provider_prompt_cache_key_material(request: &Value, channel: &Channel) -> Str
     serialize_responses_body_for_provider_prefix(&material)
 }
 
-#[cfg(test)]
 fn provider_prompt_cache_key_is_valid(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= CLIENT_PROMPT_CACHE_KEY_MAX_CHARS
@@ -11839,23 +12162,41 @@ fn provider_prompt_cache_key_is_valid(key: &str) -> bool {
 }
 
 /// A client-provided cache key is an upstream placement hint, not local
-/// session or continuation truth. Keep its exact bytes only when this is an
-/// untransformed native Responses request; transformations and the compact
-/// endpoint have their own schema and must keep generating their own hint.
-#[cfg(test)]
+/// session or continuation truth. Normal generation keeps compaction epoch
+/// triggers separate, while the dedicated official compact endpoint may
+/// transparently preserve the caller's own stable placement key.
 fn client_owned_native_prompt_cache_key(
     request: &Value,
     native_responses_passthrough: bool,
     compaction_requested: bool,
+    trusted_codex_context: bool,
 ) -> Option<String> {
-    (native_responses_passthrough && !compaction_requested)
+    (trusted_codex_context && !compaction_requested)
+        .then(|| {
+            client_owned_native_prompt_cache_key_for_compact(
+                request,
+                native_responses_passthrough,
+                trusted_codex_context,
+            )
+        })
+        .flatten()
+}
+
+/// The standalone compact API has an official `prompt_cache_key` field.  It
+/// begins a new local lineage epoch, but its caller-owned placement hint must
+/// remain stable with the surrounding native Responses turns.
+fn client_owned_native_prompt_cache_key_for_compact(
+    request: &Value,
+    native_responses_passthrough: bool,
+    trusted_codex_context: bool,
+) -> Option<String> {
+    (native_responses_passthrough && trusted_codex_context)
         .then(|| request.get("prompt_cache_key").and_then(Value::as_str))
         .flatten()
         .filter(|key| provider_prompt_cache_key_is_valid(key))
         .map(ToOwned::to_owned)
 }
 
-#[cfg(test)]
 fn client_owned_prompt_cache_key_is_active(
     client_key_is_valid: bool,
     cooling_down: bool,
@@ -19130,23 +19471,121 @@ mod tests {
     }
 
     #[test]
-    fn generated_prompt_cache_key_requires_candidate_or_proven_scope() {
+    fn generated_prompt_cache_key_preserves_legacy_continuity_without_cross_key_reuse() {
+        let direct_key = SelectedProviderKey {
+            secret: "direct-upstream-secret".to_string(),
+            key_id: None,
+        };
+        let pooled_key = SelectedProviderKey {
+            secret: "pooled-upstream-secret".to_string(),
+            key_id: Some("pool-key".to_string()),
+        };
         assert_eq!(
-            selected_prompt_cache_placement_key(Some("realm-placement"), false, false, true,),
-            None
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &direct_key,
+                true,
+                false,
+                false,
+                true,
+            ),
+            Some("legacy-direct-placement")
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(Some("realm-placement"), true, false, true,),
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &pooled_key,
+                true,
+                false,
+                false,
+                true,
+            ),
             Some("realm-placement")
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(Some("realm-placement"), false, true, true,),
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &pooled_key,
+                false,
+                false,
+                false,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &pooled_key,
+                false,
+                true,
+                false,
+                true,
+            ),
             Some("realm-placement")
         );
         assert_eq!(
-            selected_prompt_cache_placement_key(Some("realm-placement"), false, false, false,),
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &pooled_key,
+                false,
+                false,
+                true,
+                true,
+            ),
+            Some("realm-placement")
+        );
+        assert_eq!(
+            selected_prompt_cache_placement_key(
+                Some("legacy-direct-placement"),
+                Some("realm-placement"),
+                &pooled_key,
+                true,
+                false,
+                false,
+                false,
+            ),
             None
         );
+    }
+
+    #[test]
+    fn native_codex_retention_compatibility_stops_only_after_its_exact_field_rejection() {
+        let mut config = AppConfig::default();
+        let decision = reasoning_test_decision(None, &[]);
+
+        assert!(generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("field rejected".to_string()),
+        );
+        assert!(!generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+        assert!(generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-b"),
+        ));
     }
 
     #[test]
@@ -21227,7 +21666,12 @@ mod tests {
         let raw = "codex-native-placement-key";
 
         assert_eq!(
-            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), true, false),
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": raw}),
+                true,
+                false,
+                true,
+            ),
             Some(raw.to_string())
         );
         assert_eq!(
@@ -21235,6 +21679,7 @@ mod tests {
                 &json!({"prompt_cache_key": format!(" {raw}")}),
                 true,
                 false,
+                true,
             ),
             None
         );
@@ -21243,15 +21688,36 @@ mod tests {
                 &json!({"prompt_cache_key": "contains\ncontrol"}),
                 true,
                 false,
+                true,
             ),
             None
         );
         assert_eq!(
-            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), false, false),
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": raw}),
+                false,
+                false,
+                true,
+            ),
             None
         );
         assert_eq!(
-            client_owned_native_prompt_cache_key(&json!({"prompt_cache_key": raw}), true, true),
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": raw}),
+                true,
+                false,
+                false,
+            ),
+            None,
+            "a cache placement key requires attested Codex turn metadata"
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_key(
+                &json!({"prompt_cache_key": raw}),
+                true,
+                true,
+                true,
+            ),
             None,
             "compaction must use the generated placement path"
         );
@@ -21355,7 +21821,7 @@ mod tests {
             responses_request_starts_compaction_epoch(&Channel::Responses, &trigger_request, None);
         assert!(trigger_compaction);
         assert_eq!(
-            client_owned_native_prompt_cache_key(&trigger_request, true, trigger_compaction),
+            client_owned_native_prompt_cache_key(&trigger_request, true, trigger_compaction, true,),
             None
         );
 
@@ -21371,7 +21837,7 @@ mod tests {
         );
         assert!(header_compaction);
         assert_eq!(
-            client_owned_native_prompt_cache_key(&ordinary_request, true, header_compaction),
+            client_owned_native_prompt_cache_key(&ordinary_request, true, header_compaction, true,),
             None
         );
         assert!(!responses_request_starts_compaction_epoch(
@@ -35675,6 +36141,378 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_native_cache_key_is_forwarded_once_on_official_compact_wire() {
+        // The official compact endpoint accepts the same caller-owned stable
+        // placement key as normal native Responses turns.  It must survive
+        // Atoapi's compact-body cleanup without creating a second POST.
+        let raw_client_key = "codex-native-placement-key";
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = upstream_hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses/:response_id/compact",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body);
+                    Json(json!({
+                        "id": "resp_compacted",
+                        "object": "response",
+                        "model": "gpt-5.5",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "compact summary"}]
+                        }],
+                        "usage": {
+                            "input_tokens": 2048,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": 1920}
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let config = test_codex_compact_config(
+            format!("http://{upstream_addr}/v1"),
+            "codex-native-compact-cache-key",
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-native-compact-cache-key-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "prompt_cache_key": raw_client_key,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "compact this stable prefix"}]
+                }]
+            }))
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"compact-session","thread_id":"compact-thread","conversation_id":"compact-conversation","request_kind":"compaction"}"#,
+            ),
+        );
+
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "each inbound compact request must create exactly one upstream POST"
+        );
+        let captured = captured_bodies.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0].get("prompt_cache_key").and_then(Value::as_str),
+            Some(raw_client_key),
+            "the official compact wire must preserve Codex's stable placement key"
+        );
+        assert!(captured[0].get("response_id").is_none());
+        assert!(captured[0].get("stream").is_none());
+        drop(captured);
+
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.agent_generation.inbound_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.agent_generation.successful_inbounds, 1);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_native_cache_key_is_not_forwarded_to_known_unsupported_compact_provider() {
+        let raw_client_key = "codex-native-placement-key";
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = upstream_hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses/:response_id/compact",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body);
+                    Json(json!({
+                        "id": "resp_compacted",
+                        "object": "response",
+                        "model": "gpt-5.5",
+                        "status": "completed",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 2048,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": 1920}
+                        }
+                    }))
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "codex-native-compact-cache-key-unsupported";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.record_cache_capability_probe_for_key(
+            provider_id,
+            "gpt-5.5",
+            Channel::Responses,
+            None,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("known unsupported in this selected-key scope".to_string()),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-native-compact-cache-key-unsupported-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "prompt_cache_key": raw_client_key,
+                "input": [{"role": "user", "content": "compact this stable prefix"}]
+            }))
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"compact-session","thread_id":"compact-thread","conversation_id":"compact-conversation","request_kind":"compaction"}"#,
+            ),
+        );
+
+        let response = handle_responses_compact_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let captured = captured_bodies.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].get("prompt_cache_key").is_none(),
+            "a known-unsupported selected provider/key scope must keep working without the field"
+        );
+        drop(captured);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_native_compact_key_rejection_cools_only_the_next_same_scope() {
+        let raw_client_key = "codex-native-placement-key";
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = upstream_hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses/:response_id/compact",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body);
+                    if attempt == 0 {
+                        return raw_response(
+                            400,
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": {
+                                    "code": "invalid_parameter",
+                                    "param": "prompt_cache_key",
+                                    "message": format!(
+                                        "prompt_cache_key {raw_client_key} is not accepted"
+                                    )
+                                }
+                            }))
+                            .unwrap(),
+                        );
+                    }
+                    raw_response(
+                        200,
+                        "application/json",
+                        serde_json::to_vec(&json!({
+                            "id": "resp_compacted",
+                            "object": "response",
+                            "model": "gpt-5.5",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 2048,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": 1920}
+                            }
+                        }))
+                        .unwrap(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "codex-native-compact-cache-key-rejection";
+        let config = test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-native-compact-cache-key-rejection-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"compact-session","thread_id":"compact-thread","conversation_id":"compact-conversation","request_kind":"compaction"}"#,
+            ),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "prompt_cache_key": raw_client_key,
+                "input": [{"role": "user", "content": "compact this stable prefix"}]
+            }))
+            .unwrap(),
+        );
+
+        let first = handle_responses_compact_for_agent(
+            state.clone(),
+            headers.clone(),
+            request.clone(),
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let second = handle_responses_compact_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Some("resp_old".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            2,
+            "two independent inbounds may each use one POST, but neither may retry"
+        );
+        let captured = captured_bodies.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured[0].get("prompt_cache_key").and_then(Value::as_str),
+            Some(raw_client_key)
+        );
+        assert!(
+            captured[1].get("prompt_cache_key").is_none(),
+            "the next same scoped compact request must keep working without a rejected caller key"
+        );
+        drop(captured);
+
+        assert_eq!(
+            state.config.read().await.cache_capability_status_for_key(
+                provider_id,
+                "gpt-5.5",
+                &Channel::Responses,
+                None,
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            ProviderCacheCapabilityStatus::Unverified,
+            "one caller-owned key rejection must not disable the field for every session"
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
+        assert!(!serde_json::to_string(&metrics)
+            .unwrap()
+            .contains(raw_client_key));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn codex_responses_compact_transport_failure_settles_one_agent_attempt() {
         let unavailable_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_addr = unavailable_listener.local_addr().unwrap();
@@ -36037,6 +36875,203 @@ mod tests {
         assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
         assert_eq!(metrics.recent_agent_upstream_attempts[0].status, Some(401));
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_compact_reuses_the_normal_full_replay_key_affinity() {
+        let normal_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let compact_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let normal_hits = Arc::new(AtomicUsize::new(0));
+        let compact_hits = Arc::new(AtomicUsize::new(0));
+        let normal_authorizations_for_route = normal_authorizations.clone();
+        let compact_authorizations_for_route = compact_authorizations.clone();
+        let normal_hits_for_route = normal_hits.clone();
+        let compact_hits_for_route = compact_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                    let authorizations = normal_authorizations_for_route.clone();
+                    let hits = normal_hits_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        authorizations.lock().await.push(
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        raw_response(
+                            200,
+                            "text/event-stream",
+                            concat!(
+                                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_turn\",\"usage\":{\"input_tokens\":2048,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":1920}}}}\n\n",
+                                "data: [DONE]\n\n"
+                            )
+                            .as_bytes()
+                            .to_vec(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/responses/:response_id/compact",
+                post(move |headers: HeaderMap, Json(_body): Json<Value>| {
+                    let authorizations = compact_authorizations_for_route.clone();
+                    let hits = compact_hits_for_route.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        authorizations.lock().await.push(
+                            headers
+                                .get(header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        Json(json!({
+                            "id": "resp_compacted",
+                            "object": "response",
+                            "model": "gpt-5.5",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 2048,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": 1920}
+                            }
+                        }))
+                    }
+                }),
+            );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "compact-key-affinity";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        let now = Utc::now();
+        config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
+            provider_id: provider_id.to_string(),
+            enabled: true,
+            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 1,
+            recovery_minutes: 5,
+            next_index: 0,
+            keys: [("key-a", "secret-a"), ("key-b", "secret-b")]
+                .into_iter()
+                .map(|(id, secret)| crate::config::ProviderKeyConfig {
+                    id: id.to_string(),
+                    alias: None,
+                    key_encrypted: Some(secret.to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .collect(),
+            updated_at: now,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-compact-key-affinity-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(cache_path(&dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut normal_headers = test_local_auth_headers();
+        normal_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"key-affinity-session","thread_id":"key-affinity-thread","conversation_id":"key-affinity-conversation","request_kind":"turn"}"#,
+            ),
+        );
+        let input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "keep this cache on one key"}]
+        }]);
+        let normal_request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": input
+            }))
+            .unwrap(),
+        );
+        let normal_response = handle_generation_for_agent(
+            state.clone(),
+            normal_headers,
+            normal_request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(normal_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(normal_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let mut compact_headers = test_local_auth_headers();
+        compact_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"key-affinity-session","thread_id":"key-affinity-thread","conversation_id":"key-affinity-conversation","request_kind":"compaction"}"#,
+            ),
+        );
+        let compact_request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.5",
+                "input": input
+            }))
+            .unwrap(),
+        );
+        let compact_response = handle_responses_compact_for_agent(
+            state.clone(),
+            compact_headers,
+            compact_request,
+            Some("resp_turn".to_string()),
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(compact_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(compact_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(normal_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(compact_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            normal_authorizations.lock().await.as_slice(),
+            ["Bearer secret-a"]
+        );
+        assert_eq!(
+            compact_authorizations.lock().await.as_slice(),
+            ["Bearer secret-a"],
+            "compaction must retain the normal FullReplay key affinity instead of rotating"
+        );
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 2);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 2);
+        assert_eq!(metrics.agent_generation.generation_attempts, 2);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -36899,7 +37934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_native_responses_strips_speculative_client_cache_controls_without_losing_context(
+    async fn codex_native_responses_preserves_attested_cache_key_but_strips_speculative_controls_without_losing_context(
     ) {
         let responses_hits = Arc::new(AtomicUsize::new(0));
         let chat_hits = Arc::new(AtomicUsize::new(0));
@@ -37167,13 +38202,17 @@ mod tests {
             "G:\\Atoapi\\src-tauri\\src\\proxy\\mod.rs"
         );
         assert_eq!(captured["input"][2]["vendor_output"]["exit_code"], 0);
-        assert!(
-            captured.get("prompt_cache_key").is_none(),
-            "an unverified selected scope must not forward a caller key or inject one"
+        assert_eq!(
+            captured.get("prompt_cache_key").and_then(Value::as_str),
+            Some("codex-native-placement-key"),
+            "an attested native Codex turn preserves its own stable placement key"
         );
-        assert!(
-            captured.get("prompt_cache_retention").is_none(),
-            "an unverified selected scope must not guess legacy retention"
+        assert_eq!(
+            captured
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h"),
+            "a trusted native Codex FullReplay keeps the user-enabled legacy retention path"
         );
         assert!(captured.get("prompt_cache_options").is_none());
         assert_eq!(
@@ -37193,10 +38232,12 @@ mod tests {
             metrics.recent_requests[0].shadow_affinity_trusted_identity,
             Some(true)
         );
-        assert_eq!(
-            metrics.recent_requests[0].provider_prefix_key.as_deref(),
-            None
-        );
+        let provider_prefix_key = metrics.recent_requests[0]
+            .provider_prefix_key
+            .as_deref()
+            .expect("the attested caller key must be represented by an opaque local scope");
+        assert!(provider_prefix_key.starts_with("client-cache-key:"));
+        assert_ne!(provider_prefix_key, "codex-native-placement-key");
         let validation = state.cache_validation.lock().await.status(Utc::now());
         assert_eq!(validation.mode, cache_validation::CacheValidationMode::Auto);
         assert_eq!(validation.candidate_applied_requests, 0);
@@ -37268,9 +38309,9 @@ mod tests {
             Some("shared-client:pool-enabled-hit-not-exposed")
         );
 
-        // A generic 5xx must not block the next independent inbound. That
-        // request still gets exactly one upstream POST and remains neutral in
-        // an unverified cache-control scope.
+        // A generic 5xx must not block the next independent trusted native
+        // inbound. It still gets exactly one upstream POST and preserves the
+        // compatible generated placement/retention path.
         let after_502_body = Bytes::from(
             serde_json::to_vec(&json!({
                 "model": "gpt-5.5",
@@ -37292,11 +38333,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(responses_hits.load(Ordering::SeqCst), 3);
-        assert!(captured_responses_body
-            .lock()
-            .await
-            .get("prompt_cache_key")
-            .is_none());
+        let after_502_capture = captured_responses_body.lock().await.clone();
+        assert_eq!(
+            after_502_capture
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            after_502_capture
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h")
+        );
 
         // A content-derived fallback has no trusted session identity. It must
         // not receive an Atoapi-generated placement key, even if a caller
@@ -40410,11 +41460,11 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
     }
 
     #[tokio::test]
-    async fn client_cache_key_is_stripped_before_a_normal_one_shot_wire() {
-        // Use a value that would cause a field-specific rejection if it ever
-        // crossed the normal wire. Without an exact verified cache scope, the
-        // normal request must strip it and still succeed in one POST.
-        let raw_client_key = "invalid_parameter";
+    async fn codex_native_cache_key_is_forwarded_once_on_the_normal_wire() {
+        // Codex owns this stable placement key. Atoapi must preserve it on an
+        // untouched native Responses request instead of replacing it with a
+        // generated experiment or stripping it from the normal one-shot wire.
+        let raw_client_key = "codex-native-placement-key";
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let upstream_hits_for_route = upstream_hits.clone();
@@ -40428,26 +41478,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
                 let captured_bodies = captured_bodies_for_route.clone();
                 async move {
                     upstream_hits.fetch_add(1, Ordering::SeqCst);
-                    let cache_key = body
-                        .get("prompt_cache_key")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
                     captured_bodies.lock().await.push(body);
-                    if cache_key == raw_client_key {
-                        return raw_response(
-                            400,
-                            "application/json",
-                            serde_json::to_vec(&json!({
-                                "error": {
-                                    "message": format!(
-                                        "{raw_client_key} prompt_cache_key"
-                                    )
-                                }
-                            }))
-                            .unwrap(),
-                        );
-                    }
                     raw_response(
                         200,
                         "text/event-stream",
@@ -40532,9 +41563,12 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
         );
         let captured_bodies = captured_bodies.lock().await;
         assert_eq!(captured_bodies.len(), 1);
-        assert!(
-            captured_bodies[0].get("prompt_cache_key").is_none(),
-            "unverified cache controls must not cross an ordinary one-shot wire"
+        assert_eq!(
+            captured_bodies[0]
+                .get("prompt_cache_key")
+                .and_then(Value::as_str),
+            Some(raw_client_key),
+            "the normal native Codex wire must preserve its stable cache placement"
         );
         drop(captured_bodies);
 
@@ -40552,6 +41586,160 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
             "upstream error echoes must not reach metrics/history UI data"
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_native_cache_key_is_not_forwarded_to_known_unsupported_normal_provider() {
+        let raw_client_key = "codex-native-placement-key";
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = upstream_hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    captured.lock().await.push(body);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ready\"}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_supported_without_key\",\"usage\":{\"input_tokens\":1024,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":896}}}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "client-key-known-unsupported-provider";
+        let mut config = AppConfig::default();
+        config.local_key = "local-client-key-test".to_string();
+        config.workspace_fingerprint = "client-key-known-unsupported-workspace".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, provider_id);
+        config.record_cache_capability_probe_for_key(
+            provider_id,
+            "gpt-5.6-sol",
+            Channel::Responses,
+            None,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("known unsupported in this selected-key scope".to_string()),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-client-key-known-unsupported-wire-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer local-client-key-test"),
+        );
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"thread_id":"client-key-thread","session_id":"client-key-session"}"#,
+            ),
+        );
+        let request = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "prompt_cache_key": raw_client_key,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "preserve normal functionality"}]
+                }]
+            }))
+            .unwrap(),
+        );
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        let captured = captured_bodies.lock().await;
+        assert_eq!(captured.len(), 1);
+        assert!(
+            captured[0].get("prompt_cache_key").is_none(),
+            "known unsupported scopes must preserve normal traffic without the cache field"
+        );
+        drop(captured);
+        let metrics = state.metrics.snapshot().await;
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(metrics.retries, 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn final_scope_rollback_reclassifies_only_misattributed_new_tail() {
+        let gap = ProviderCacheGapBreakdown {
+            total_tokens: 20_000,
+            new_tail_tokens: 18_000,
+            avoidable_tokens: 0,
+            provider_unstable_tokens: 2_000,
+        };
+        let final_scope = FinalScopeWaterlineLog {
+            outcome: "settled".to_string(),
+            predecessor_exact: true,
+            predecessor_bound: true,
+            rollback_tokens_128: 12_800,
+            ..FinalScopeWaterlineLog::default()
+        };
+
+        let (reconciled, reclassified) =
+            reconcile_gap_with_final_scope_rollback(Some(gap), Some(&final_scope));
+        let reconciled = reconciled.unwrap();
+        assert!(reclassified);
+        assert_eq!(reconciled.total_tokens, 20_000);
+        assert_eq!(reconciled.new_tail_tokens, 5_200);
+        assert_eq!(reconciled.provider_unstable_tokens, 14_800);
+        assert_eq!(reconciled.avoidable_tokens, 0);
+
+        let non_exact = FinalScopeWaterlineLog {
+            predecessor_exact: false,
+            ..final_scope
+        };
+        let (unchanged, reclassified) =
+            reconcile_gap_with_final_scope_rollback(Some(gap), Some(&non_exact));
+        assert!(!reclassified);
+        assert_eq!(unchanged.unwrap().new_tail_tokens, gap.new_tail_tokens);
     }
 
     #[tokio::test]
