@@ -6327,6 +6327,44 @@
       background: rgba(120, 200, 157, .075) !important;
       box-shadow: inset 0 1px 0 rgba(120, 200, 157, .52);
     }
+
+    .release-champion-summary {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      align-items: baseline;
+      gap: 3px 8px;
+      margin-top: 11px;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--muted);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.018);
+    }
+
+    .release-champion-summary > span {
+      color: var(--muted);
+      font-size: 10px;
+    }
+
+    .release-champion-summary > b {
+      min-width: 0;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .release-champion-summary > small {
+      grid-column: 1 / -1;
+      color: var(--muted);
+      font-size: 10px;
+      overflow-wrap: anywhere;
+    }
+
+    .release-champion-summary.is-improving { border-left-color: var(--success); }
+    .release-champion-summary.is-improving > b { color: var(--success); }
+    .release-champion-summary.is-regressed { border-left-color: #ea8c65; }
+    .release-champion-summary.is-regressed > b { color: #f0a17d; }
+    .release-champion-summary.is-tied { border-left-color: #d4bb72; }
+    .release-champion-summary.is-tied > b { color: #e2ca82; }
   </style>
 </head>
 <body>
@@ -6428,6 +6466,10 @@
                 <span>最近 128 次成功请求<br />冷启动已单独分类</span>
               </div>
               <progress max="100" value="95.8" aria-label="缓存命中率 95.8%"></progress>
+              <div class="release-champion-summary is-pending" id="releaseChampionSummary" role="status">
+                <span>版本对比</span><b>等待可比 cohort</b>
+                <small>同 Provider · Key realm · 模型 · 请求族</small>
+              </div>
               <div class="micro-stats">
                 <div class="micro-stat"><span>缺口</span><b>5.4 万</b></div>
                 <div class="micro-stat"><span>可避免</span><b>768</b></div>

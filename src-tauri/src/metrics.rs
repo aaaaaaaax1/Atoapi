@@ -1,5 +1,6 @@
 use crate::metrics_history::{
     MetricsHistory, MetricsHistoryObservation, MetricsTrendQueryInput, MetricsTrendSnapshot,
+    ReleaseChampionQueryInput, ReleaseChampionSnapshot, ReleaseCohortScope, ReleaseRuntimeIdentity,
 };
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -98,6 +99,7 @@ pub struct ShadowAffinityMetrics {
 #[serde(rename_all = "snake_case")]
 pub enum AgentInboundOutcome {
     Success,
+    LocalRejection,
     HttpError,
     TransportError,
     StreamError,
@@ -176,6 +178,12 @@ enum MetricsTerminal {
         inbound_outcome: AgentInboundOutcome,
         terminal_state: Option<String>,
     },
+    AgentLocalRejection {
+        inbound_request_id: String,
+        request: RequestLog,
+        inbound_outcome: AgentInboundOutcome,
+        terminal_state: Option<String>,
+    },
     AgentOwnerFailure {
         inbound_request_id: String,
         request: RequestLog,
@@ -188,6 +196,17 @@ pub struct AgentTerminalSettlement {
     pub inbound_request_id: String,
     pub attempt_id: String,
     pub attempt_finish: AgentAttemptFinish,
+    pub request: RequestLog,
+    pub inbound_outcome: AgentInboundOutcome,
+    pub terminal_state: Option<String>,
+}
+
+/// Completes an Agent inbound before any upstream attempt is started.  This is
+/// reserved for local safety/validation rejections, so an attempt count of
+/// zero remains truthful in the public metrics snapshot.
+#[derive(Debug, Clone)]
+pub struct AgentLocalRejectionSettlement {
+    pub inbound_request_id: String,
     pub request: RequestLog,
     pub inbound_outcome: AgentInboundOutcome,
     pub terminal_state: Option<String>,
@@ -271,6 +290,23 @@ impl MetricsTransaction {
                 inbound_request_id,
                 attempt_id: settlement.attempt_id.trim().to_string(),
                 attempt_finish: settlement.attempt_finish,
+                request: settlement.request,
+                inbound_outcome: settlement.inbound_outcome,
+                terminal_state: settlement.terminal_state,
+            },
+            usage: None,
+            errors: Vec::new(),
+        }
+    }
+
+    pub fn agent_local_rejection(mut settlement: AgentLocalRejectionSettlement) -> Self {
+        let inbound_request_id = settlement.inbound_request_id.trim().to_string();
+        settlement.request.id = inbound_request_id.clone();
+        settlement.request.inbound_request_id = Some(inbound_request_id.clone());
+        Self {
+            commit_key: metrics_transaction_key(&inbound_request_id),
+            terminal: MetricsTerminal::AgentLocalRejection {
+                inbound_request_id,
                 request: settlement.request,
                 inbound_outcome: settlement.inbound_outcome,
                 terminal_state: settlement.terminal_state,
@@ -1202,14 +1238,16 @@ impl MetricsCommitTracker {
 impl MetricsStore {
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::with_history(MetricsHistory::in_memory())
+        Self::with_history(MetricsHistory::in_memory(), Utc::now())
     }
 
     pub fn with_history_path(path: PathBuf) -> Self {
-        Self::with_history(MetricsHistory::load(path))
+        let started_at = Utc::now();
+        let runtime = ReleaseRuntimeIdentity::current(started_at);
+        Self::with_history(MetricsHistory::load_with_runtime(path, runtime), started_at)
     }
 
-    fn with_history(history: MetricsHistory) -> Self {
+    fn with_history(history: MetricsHistory, started_at: DateTime<Utc>) -> Self {
         Self {
             commit_tracker: Arc::new(MetricsCommitTracker {
                 state: StdMutex::new(MetricsCommitTrackerState {
@@ -1219,7 +1257,7 @@ impl MetricsStore {
                 notify: Notify::new(),
             }),
             inner: Arc::new(RwLock::new(MetricsInner {
-                started_at: Utc::now(),
+                started_at,
                 total_requests: 0,
                 successful_requests: 0,
                 upstream_requests: 0,
@@ -1550,6 +1588,13 @@ impl MetricsStore {
         self.history.query(input)
     }
 
+    pub fn release_champion(
+        &self,
+        input: ReleaseChampionQueryInput,
+    ) -> anyhow::Result<ReleaseChampionSnapshot> {
+        self.history.release_champion(input)
+    }
+
     pub(crate) async fn flush_history(&self) -> anyhow::Result<()> {
         self.history.flush().await
     }
@@ -1767,6 +1812,27 @@ fn commit_metrics_transaction(
                 cache_creation_tokens,
             )
         }
+        MetricsTerminal::AgentLocalRejection {
+            inbound_request_id,
+            mut request,
+            inbound_outcome,
+            terminal_state,
+        } => {
+            request.cold_start = cold_start;
+            let (finished, observation) = finish_agent_inbound_inner(
+                inner,
+                &inbound_request_id,
+                request,
+                inbound_outcome,
+                terminal_state,
+                cache_creation_tokens,
+            );
+            if finished {
+                observation
+            } else {
+                None
+            }
+        }
         MetricsTerminal::AgentOwnerFailure {
             inbound_request_id,
             mut request,
@@ -1897,6 +1963,9 @@ fn finish_agent_inbound_inner(
     request.upstream_request_id = active.last_attempt_id.clone();
     request.upstream_attempt_index = (active.attempt_count > 0).then_some(active.attempt_count);
     request.upstream_attempt_total = Some(active.attempt_count);
+    // The inbound summary must represent a locally rejected request as zero
+    // upstream attempts rather than leaving a stale/ambiguous `None` value.
+    request.upstream_attempts = Some(active.attempt_count);
     let successful = outcome.is_success() && request_log_is_successful_history(&request);
     if successful {
         inner.agent_generation.successful_inbounds += 1;
@@ -2193,6 +2262,7 @@ fn metrics_history_observation(
         at: log.at,
         agent_id: agent_id.to_string(),
         provider_id: provider_id.to_string(),
+        release_scope: release_cohort_scope(log, agent_id, provider_id),
         input_tokens: log.input_tokens.unwrap_or_default(),
         output_tokens: log.output_tokens.unwrap_or_default(),
         cache_read_tokens: log.cache_read_tokens.unwrap_or_default(),
@@ -2202,6 +2272,38 @@ fn metrics_history_observation(
         cache_new_tail_gap_tokens: log.cache_new_tail_gap_tokens.unwrap_or_default(),
         compaction: request_log_is_confirmed_compaction(log),
         cold_start: log.cold_start == Some(true),
+    })
+}
+
+fn release_cohort_scope(
+    log: &RequestLog,
+    agent_id: &str,
+    provider_id: &str,
+) -> Option<ReleaseCohortScope> {
+    let provider_realm_id = log
+        .shadow_affinity_realm_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let model = log.model.trim();
+    let client_channel = log.client_channel.trim();
+    let upstream_channel = log.upstream_channel.trim();
+    let upstream_call_kind = log
+        .upstream_call_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if model.is_empty() || client_channel.is_empty() || upstream_channel.is_empty() {
+        return None;
+    }
+    Some(ReleaseCohortScope {
+        agent_id: agent_id.to_string(),
+        provider_id: provider_id.to_string(),
+        provider_realm_id: provider_realm_id.to_string(),
+        model: model.to_string(),
+        client_channel: client_channel.to_string(),
+        upstream_channel: upstream_channel.to_string(),
+        upstream_call_kind: upstream_call_kind.to_string(),
     })
 }
 

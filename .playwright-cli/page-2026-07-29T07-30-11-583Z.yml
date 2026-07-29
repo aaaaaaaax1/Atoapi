@@ -1,0 +1,190 @@
+- iframe [active] [ref=e3]:
+  - generic [ref=f1e1]:
+    - generic [ref=f1e2]:
+      - banner [ref=f1e3]:
+        - generic [ref=f1e4]:
+          - button "打开设置" [ref=f1e5] [cursor=pointer]
+          - button "查看版本" [ref=f1e7] [cursor=pointer]:
+            - strong [ref=f1e8]: Atoapi
+            - generic [ref=f1e9]: Graphite · v1.4.10
+        - tablist "Agent 列表" [ref=f1e10]:
+          - tab "Claude Code 已关闭" [selected] [ref=f1e48] [cursor=pointer]:
+            - generic [ref=f1e54]:
+              - generic [ref=f1e55]: Claude Code
+              - generic [ref=f1e56]: 已关闭
+          - tab "Claude Desktop 已关闭" [ref=f1e58] [cursor=pointer]:
+            - generic [ref=f1e62]:
+              - generic [ref=f1e63]: Claude Desktop
+              - generic [ref=f1e64]: 已关闭
+          - tab "Codex 已关闭" [ref=f1e66] [cursor=pointer]:
+            - generic [ref=f1e71]:
+              - generic [ref=f1e72]: Codex
+              - generic [ref=f1e73]: 已关闭
+          - tab "Gemini 已关闭" [ref=f1e75] [cursor=pointer]:
+            - generic [ref=f1e79]:
+              - generic [ref=f1e80]: Gemini
+              - generic [ref=f1e81]: 已关闭
+          - tab "OpenCode 已关闭" [ref=f1e83] [cursor=pointer]:
+            - generic [ref=f1e88]:
+              - generic [ref=f1e89]: OpenCode
+              - generic [ref=f1e90]: 已关闭
+          - tab "OpenClaw 已关闭" [ref=f1e92] [cursor=pointer]:
+            - generic [ref=f1e97]:
+              - generic [ref=f1e98]: OpenClaw
+              - generic [ref=f1e99]: 已关闭
+          - tab "Hermes 已关闭" [ref=f1e101] [cursor=pointer]:
+            - generic [ref=f1e109]:
+              - generic [ref=f1e110]: Hermes
+              - generic [ref=f1e111]: 已关闭
+          - tab "本地代理模式 已关闭" [ref=f1e113] [cursor=pointer]:
+            - generic [ref=f1e122]:
+              - generic [ref=f1e123]: 本地代理模式
+              - generic [ref=f1e124]: 已关闭
+        - generic [ref=f1e11]:
+          - generic [ref=f1e12]:
+            - generic [ref=f1e13]: 代理运行中
+            - generic [ref=f1e14]: 127.0.0.1:18883
+          - button "刷新模拟数据" [ref=f1e15] [cursor=pointer]
+      - main [ref=f1e28]:
+        - generic [ref=f1e192]:
+          - generic [ref=f1e193]:
+            - generic [ref=f1e194]:
+              - button "返回 Agent" [ref=f1e195] [cursor=pointer]
+              - generic [ref=f1e198]:
+                - heading "缓存统计" [level=2] [ref=f1e199]
+                - paragraph [ref=f1e200]: 成功记录与错误记录分离，详情按需展开。
+            - button "刷新" [ref=f1e201] [cursor=pointer]
+          - generic [ref=f1e207]:
+            - generic [ref=f1e208]:
+              - generic [ref=f1e209]: 历史命中率
+              - generic [ref=f1e210]: —
+            - generic [ref=f1e211]:
+              - generic [ref=f1e212]: 累计输入
+              - generic [ref=f1e213]: —
+            - generic [ref=f1e214]:
+              - generic [ref=f1e215]: 累计命中
+              - generic [ref=f1e216]: —
+            - generic [ref=f1e217]:
+              - generic [ref=f1e218]: 成功请求
+              - generic [ref=f1e219]:
+                - generic [ref=f1e220]: —
+                - generic [ref=f1e221]: 压缩 — · 冷启动 —
+          - tablist "缓存统计视图" [ref=f1e222]:
+            - tab "概览" [selected] [ref=f1e223] [cursor=pointer]
+            - tab "请求记录" [ref=f1e224] [cursor=pointer]
+            - tab "上游统计" [ref=f1e225] [cursor=pointer]
+          - generic [ref=f1e226]:
+            - generic [ref=f1e227]:
+              - generic [ref=f1e228]:
+                - text: Provider cache
+                - generic [ref=f1e229]:
+                  - strong [ref=f1e230]: —
+                  - generic [ref=f1e231]: 全部 · — 条成功记录
+                - progressbar "缓存命中率 95.8%" [ref=f1e232]
+                - status [ref=f1e233]:
+                  - generic [ref=f1e234]: 版本对比
+                  - generic [ref=f1e235]: 读取可比版本 cohort…
+                  - generic [ref=f1e236]: 同 Provider · Key realm · 模型 · 请求族；历史旧桶不会冒充冠军
+                - generic [ref=f1e237]:
+                  - generic [ref=f1e238]:
+                    - generic [ref=f1e239]: 缺口
+                    - generic [ref=f1e240]: —
+                  - generic [ref=f1e241]:
+                    - generic [ref=f1e242]: 可避免
+                    - generic [ref=f1e243]: —
+                  - generic [ref=f1e244]:
+                    - generic [ref=f1e245]: 新尾部
+                    - generic [ref=f1e246]: —
+              - generic [ref=f1e247]:
+                - text: Policy
+                - generic [ref=f1e248]:
+                  - generic [ref=f1e249]:
+                    - generic [ref=f1e250]:
+                      - generic [ref=f1e251]: 智能缓存
+                      - generic [ref=f1e252]: 前缀稳定与真实 usage 统计
+                    - switch "智能缓存" [checked] [ref=f1e253] [cursor=pointer]
+                  - generic [ref=f1e254]:
+                    - generic [ref=f1e255]:
+                      - generic [ref=f1e256]: 计入冷启动和压缩
+                      - generic [ref=f1e257]: 仅影响当前统计视图；两类请求同步计入或排除
+                    - switch "计入冷启动和压缩" [checked] [ref=f1e258] [cursor=pointer]
+                  - generic [ref=f1e259]:
+                    - generic [ref=f1e260]:
+                      - generic [ref=f1e261]: 提示详细错误
+                      - generic [ref=f1e262]: 主列表保持简洁，详情抽屉保留原文
+                    - switch "提示详细错误" [ref=f1e263] [cursor=pointer]
+            - region [ref=f1e264]:
+              - generic [ref=f1e265]:
+                - generic [ref=f1e266]:
+                  - generic [ref=f1e267]: Cache trend
+                  - heading "缓存趋势" [level=3] [ref=f1e268]
+                  - paragraph [ref=f1e269]: 全部 · 07/28 15:30 → 07/29 15:30 · [start, end)
+                - generic [ref=f1e270]:
+                  - generic [ref=f1e271]:
+                    - generic [ref=f1e272]: 趋势上游范围
+                    - button "趋势上游范围" [ref=f1e273] [cursor=pointer]:
+                      - generic [ref=f1e274]: 全部
+                  - group "趋势时间范围" [ref=f1e277]:
+                    - button "今天" [ref=f1e278] [cursor=pointer]
+                    - button "1d" [pressed] [ref=f1e279] [cursor=pointer]
+                    - button "7d" [ref=f1e280] [cursor=pointer]
+                    - button "14d" [ref=f1e281] [cursor=pointer]
+                    - button "30d" [ref=f1e282] [cursor=pointer]
+                    - button "自定义" [ref=f1e283] [cursor=pointer]
+                  - button "重新加载缓存趋势" [ref=f1e284] [cursor=pointer]:
+                    - generic [ref=f1e290]: 刷新
+              - generic "所选时间范围缓存摘要" [ref=f1e291]:
+                - generic [ref=f1e292]:
+                  - generic [ref=f1e293]: 成功请求
+                  - generic "45" [ref=f1e294]
+                - generic [ref=f1e295]:
+                  - generic [ref=f1e296]: 输入
+                  - generic "747,278" [ref=f1e297]
+                - generic [ref=f1e298]:
+                  - generic [ref=f1e299]: 输出
+                  - generic "6,205" [ref=f1e300]
+                - generic [ref=f1e301]:
+                  - generic [ref=f1e302]: 缓存命中
+                  - generic "702,018" [ref=f1e303]
+                - generic [ref=f1e304]:
+                  - generic [ref=f1e305]: 未命中
+                  - generic "45,260" [ref=f1e306]
+                - generic [ref=f1e307]:
+                  - generic [ref=f1e308]: 缓存创建
+                  - generic "8,147" [ref=f1e309]
+                - generic [ref=f1e310]:
+                  - generic [ref=f1e311]: 加权命中率
+                  - generic "93.9%" [ref=f1e312]
+              - generic [ref=f1e313]:
+                - generic [ref=f1e314]:
+                  - generic "趋势图例" [ref=f1e315]:
+                    - generic [ref=f1e316]: 输入
+                    - generic [ref=f1e318]: 输出
+                    - generic [ref=f1e320]: 缓存命中
+                    - generic [ref=f1e322]: 未命中
+                    - generic [ref=f1e324]: 命中率（右轴）
+                  - generic [ref=f1e326]: 左轴 Tokens · 右轴命中率
+                - img "缓存趋势图 使用左右方向键浏览时间点，显示输入、输出、缓存命中、未命中和加权命中率。" [ref=f1e328]:
+                  - generic [ref=f1e329]: 72.6k
+                  - generic [ref=f1e330]: 100%
+                  - generic [ref=f1e331]: 54.5k
+                  - generic [ref=f1e332]: 75%
+                  - generic [ref=f1e333]: 36.3k
+                  - generic [ref=f1e334]: 50%
+                  - generic [ref=f1e335]: 18.2k
+                  - generic [ref=f1e336]: 25%
+                  - generic [ref=f1e337]: "0"
+                  - generic [ref=f1e338]: 0%
+                  - generic [ref=f1e345]: 07/28 15:30
+                  - generic [ref=f1e346]: 07/28 21:30
+                  - generic [ref=f1e347]: 07/29 03:30
+                  - generic [ref=f1e348]: 07/29 07:30
+                  - generic [ref=f1e349]: 07/29 13:30
+      - contentinfo [ref=f1e38]:
+        - button "关闭缓存统计与请求记录" [active] [pressed] [ref=f1e355] [cursor=pointer]:
+          - generic [ref=f1e41]: 缓存与记录
+          - generic [ref=f1e42]:
+            - text: 命中率
+            - strong [ref=f1e153]: —
+          - generic [ref=f1e44]: — 成功
+    - status

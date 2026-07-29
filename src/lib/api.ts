@@ -581,6 +581,46 @@ export interface MetricsTrendSnapshot {
   points: MetricsTrendPoint[];
 }
 
+export interface ReleaseChampionQueryInput {
+  agent_id: string;
+  provider_id?: string | null;
+  include_cold_starts: boolean;
+  include_compactions: boolean;
+}
+
+export type ReleaseChampionStatus =
+  | "improving"
+  | "regressed"
+  | "tied"
+  | "insufficient_current_samples"
+  | "no_comparable_champion"
+  | "awaiting_current_cohort"
+  | "legacy_history_unattributed"
+  | "incomplete_filter";
+
+export interface ReleaseCohortSummary {
+  app_version: string;
+  git_commit: string;
+  executable_sha256: string;
+  process_started_at?: string | null;
+  provider_id: string;
+  model: string;
+  request_family: string;
+  key_realm_fingerprint: string;
+  values: MetricsTrendValues;
+  sample_eligible: boolean;
+}
+
+export interface ReleaseChampionSnapshot {
+  status: ReleaseChampionStatus;
+  reason: string;
+  current?: ReleaseCohortSummary | null;
+  champion?: ReleaseCohortSummary | null;
+  delta_cache_hit_rate?: number | null;
+  minimum_successful_requests: number;
+  minimum_input_tokens: number;
+}
+
 export interface ProviderTrafficStats {
   provider: string;
   total_requests: number;
@@ -1026,6 +1066,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
   if (name === "get_metrics") return fallbackMetrics;
   if (name === "get_metrics_trend") {
     return fallbackMetricsTrend(args?.input as MetricsTrendInput | undefined);
+  }
+  if (name === "get_release_champion") {
+    return fallbackReleaseChampion(args?.input as ReleaseChampionQueryInput | undefined);
   }
   if (name === "get_cache_validation_status") return fallbackCacheValidation;
   if (name === "set_cache_validation_mode") {
@@ -1647,6 +1690,20 @@ function fallbackMetricsTrend(input?: MetricsTrendInput): MetricsTrendSnapshot {
     compaction_filter_complete: includeCompactions,
     summary,
     points
+  };
+}
+
+function fallbackReleaseChampion(input?: ReleaseChampionQueryInput): ReleaseChampionSnapshot {
+  return {
+    status: "awaiting_current_cohort",
+    reason: input?.agent_id
+      ? "预览模式不保存可验证 build cohort；桌面运行版会在同 Key realm 样本齐备后自动比较。"
+      : "请选择 Agent 后读取版本命中对比。",
+    current: null,
+    champion: null,
+    delta_cache_hit_rate: null,
+    minimum_successful_requests: 10,
+    minimum_input_tokens: 128_000
   };
 }
 

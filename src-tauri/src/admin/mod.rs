@@ -21,7 +21,10 @@ use crate::{
         ProviderInput, PublicConfig,
     },
     metrics::MetricsSnapshot,
-    metrics_history::{MetricsTrendQueryInput, MetricsTrendSnapshot},
+    metrics_history::{
+        MetricsTrendQueryInput, MetricsTrendSnapshot, ReleaseChampionQueryInput,
+        ReleaseChampionSnapshot,
+    },
     proxy::{
         self,
         cache_validation::{
@@ -1930,6 +1933,20 @@ pub async fn get_metrics_trend(
     input: MetricsTrendQueryInput,
 ) -> CommandResult<MetricsTrendSnapshot> {
     state.metrics.trend(input).map_err(to_command_error)
+}
+
+/// Returns the current runtime cohort against the best persisted build with
+/// exactly the same key-safe cache scope. Legacy hourly history is never
+/// promoted into a version champion.
+#[tauri::command]
+pub async fn get_release_champion(
+    state: State<'_, Arc<AppState>>,
+    input: ReleaseChampionQueryInput,
+) -> CommandResult<ReleaseChampionSnapshot> {
+    state
+        .metrics
+        .release_champion(input)
+        .map_err(to_command_error)
 }
 
 #[tauri::command]

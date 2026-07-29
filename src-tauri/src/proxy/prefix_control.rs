@@ -325,11 +325,13 @@ impl PrefixController {
             input.previous,
             input.final_responses_static_projection,
         );
+        let static_drift_giant_cold_read = giant_cold_read_pending(record);
         if static_projection_drifted(input.previous, input.final_responses_static_projection) {
-            // Do not retain the old waterline or its settle/wait evidence
-            // after any static frozen-wire change. The current request starts
-            // a fresh baseline, so the next turn can only learn from matching
-            // static wire evidence.
+            // Do not retain the old waterline after any static frozen-wire
+            // change.  A giant cold read observed on the *new* wire is still
+            // fresh evidence, however: its exact children must retain the
+            // short-lived cold marker so they are not later reported as user
+            // input while the provider materialises the new cache root.
             return PrefixStateObservation {
                 next: Some(PrefixWarmState {
                     finished_at: Instant::now(),
@@ -344,8 +346,8 @@ impl PrefixController {
                     avoidable_shortfall_tokens_128: 0,
                     small_gap_recovery_streak: 0,
                     recent_clean_tiny_gap_streak: 0,
-                    cache_instability_score: 0,
-                    settle_after_cold_read: false,
+                    cache_instability_score: u32::from(static_drift_giant_cold_read) * 2,
+                    settle_after_cold_read: static_drift_giant_cold_read,
                     tail_tool_output_chars: input.tail.tool_output_chars,
                     tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
                     tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),
@@ -608,6 +610,16 @@ fn repeated_giant_cold_read_after_pending(
         && previous.input_tokens >= 128_000
         && previous.cache_read_tokens <= 4_096
         && record.input_tokens >= 128_000
+        && record.cache_read_tokens <= 4_096
+        && provider_cache_shortfall(record) >= 65_536
+        && provider_cache_ratio(record).unwrap_or_default() < 0.05
+}
+
+/// This is deliberately independent of the prior waterline.  A static wire
+/// change starts a new baseline, but a giant read that is effectively cold on
+/// that new baseline still needs a short-lived marker for exact descendants.
+fn giant_cold_read_pending(record: &UsageRecord) -> bool {
+    record.input_tokens >= 128_000
         && record.cache_read_tokens <= 4_096
         && provider_cache_shortfall(record) >= 65_536
         && provider_cache_ratio(record).unwrap_or_default() < 0.05
@@ -1366,6 +1378,105 @@ mod tests {
         assert_eq!(gap.avoidable_tokens, 0);
         assert_eq!(gap.provider_unstable_tokens, 0);
         assert_eq!(gap.new_tail_tokens, gap.total_tokens);
+    }
+
+    #[test]
+    fn static_wire_drift_giant_cold_root_keeps_pending_state_for_exact_child() {
+        let previous = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 207_744,
+            cache_read_tokens: 207_744,
+            shortfall_tokens: 0,
+            seen_bucket_tokens: 207_744,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 0,
+            seen_bucket_tokens_128: 207_744,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 0,
+            cache_instability_score: 0,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: Some("static-a".to_string()),
+        };
+        let giant_root = UsageRecord {
+            input_tokens: 208_005,
+            cache_read_tokens: 3_456,
+            ..UsageRecord::default()
+        };
+        let giant_tail = TailInputDiagnostics {
+            input_items: 770,
+            tool_output_chars: 488_972,
+            largest_tool_output_chars: 488_972,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let root = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &giant_root,
+            tail: &giant_tail,
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::Observed(Some(
+                "static-b",
+            )),
+        });
+
+        assert!(root.static_wire_drift);
+        let root_state = root
+            .next
+            .expect("a giant cold root on the new wire must leave pending evidence");
+        assert!(root_state.settle_after_cold_read);
+        assert_eq!(root_state.cache_instability_score, 2);
+        assert_eq!(
+            root_state.responses_static_projection_digest.as_deref(),
+            Some("static-b")
+        );
+
+        let exact_child = UsageRecord {
+            input_tokens: 213_072,
+            cache_read_tokens: 3_456,
+            ..UsageRecord::default()
+        };
+        let gap = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&root_state),
+            previous_best: Some(&root_state),
+            previous_family: None,
+            usage: &exact_child,
+            tail: &TailInputDiagnostics::default(),
+            guard_budget_exhausted: false,
+            pre_request_avoidable_tokens: 0,
+            recovery_applicable: false,
+            exact_settle_window_elapsed: false,
+            static_wire_drift: false,
+        });
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 0);
+        assert_eq!(gap.provider_unstable_tokens, gap.total_tokens);
+
+        let child = PrefixController::observe(PrefixStateInput {
+            previous: Some(&root_state),
+            usage: &exact_child,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::Observed(Some(
+                "static-b",
+            )),
+        });
+        assert!(
+            child
+                .next
+                .expect("an exact giant cold child must preserve the pending marker")
+                .settle_after_cold_read
+        );
     }
 
     #[test]

@@ -370,4 +370,40 @@ assert.match(
   "the full custom date field, not only its calendar icon, must activate the picker"
 );
 
+assert.match(
+  html,
+  /id=["']releaseChampionSummary["'][\s\S]{0,260}同 Provider · Key realm · 模型 · 请求族/,
+  "the cache overview must reserve a compact, explicit version-champion comparison slot"
+);
+assert.match(
+  api,
+  /export interface ReleaseChampionQueryInput[\s\S]{0,420}include_compactions/,
+  "the frontend API must expose the same cohort filter dimensions as the trend API"
+);
+assert.match(
+  api,
+  /export type ReleaseChampionStatus[\s\S]{0,420}["']regressed["'][\s\S]{0,420}["']legacy_history_unattributed["']/,
+  "the UI contract must distinguish a regression from legacy data that cannot be attributed"
+);
+assert.match(
+  host,
+  /send\(["']load-release-champion["'][\s\S]{0,720}include_compactions/,
+  "the iframe must request a release comparison for the active Provider scope and both filters"
+);
+assert.match(
+  host,
+  /command\s*<\s*ReleaseChampionSnapshot\s*>\s*\(\s*["']get_release_champion["']\s*,\s*\{\s*input\s*\}\s*\)/,
+  "the host must call the dedicated cohort command rather than infer version status from hourly metrics"
+);
+assert.match(
+  host,
+  /regressed:\s*\[["']is-regressed["'][\s\S]{0,160}低于冠军/,
+  "a negative optimization must be visibly labeled as below champion"
+);
+assert.match(
+  host,
+  /legacy_history_unattributed:\s*\[["']is-pending["'][\s\S]{0,160}历史未归属版本/,
+  "unattributed old history must fail closed in the UI instead of being called a champion"
+);
+
 console.log("graphite metrics trend UI regression tests passed");

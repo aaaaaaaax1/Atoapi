@@ -273,15 +273,32 @@ fn is_generic_responses_error_event(event: &str) -> bool {
 /// compatibility failure; otherwise the client may act on the raw error and
 /// close before the relay can publish its native `response.failed` at EOF.
 fn is_generic_responses_error_data(data: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(data)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(is_generic_responses_error_event)
-        })
-        .unwrap_or(false)
+    is_plain_upstream_request_blocked(data)
+        || serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(is_generic_responses_error_event)
+            })
+            .unwrap_or(false)
+}
+
+/// Some third-party Responses relays emit a bare SSE data line such as
+/// `data: Request blocked` after a successful HTTP status.  That is a
+/// terminal upstream error, not ordinary model text.  Keep the match narrow
+/// so normal provider prose remains on the byte-for-byte passthrough path.
+fn is_plain_upstream_request_blocked(data: &str) -> bool {
+    let normalized = data.trim().to_ascii_lowercase();
+    [
+        "request blocked",
+        "request has been blocked",
+        "blocked by waf",
+        "blocked by cloudflare",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
 }
 
 fn generic_responses_error_frame_summary(
@@ -316,14 +333,13 @@ fn terminal_failure_message(failure: TerminalFailure, upstream_summary: Option<&
         .to_string()
 }
 
-fn terminal_failure_message_with_trace(
-    failure: TerminalFailure,
-    upstream_summary: Option<&str>,
+fn failure_message_with_trace(
+    message: impl Into<String>,
     request_id: &str,
     upstream_trace_source: Option<&str>,
     upstream_trace_id: Option<&str>,
 ) -> String {
-    let mut message = terminal_failure_message(failure, upstream_summary);
+    let mut message = message.into();
     let mut trace = Vec::new();
     if let Some(request_id) = trace_component(request_id) {
         trace.push(format!("atoapi_trace_id={request_id}"));
@@ -342,6 +358,21 @@ fn terminal_failure_message_with_trace(
     message
 }
 
+fn terminal_failure_message_with_trace(
+    failure: TerminalFailure,
+    upstream_summary: Option<&str>,
+    request_id: &str,
+    upstream_trace_source: Option<&str>,
+    upstream_trace_id: Option<&str>,
+) -> String {
+    failure_message_with_trace(
+        terminal_failure_message(failure, upstream_summary),
+        request_id,
+        upstream_trace_source,
+        upstream_trace_id,
+    )
+}
+
 fn trace_component(value: &str) -> Option<String> {
     let value = value.trim();
     let value = value
@@ -352,13 +383,102 @@ fn trace_component(value: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn terminal_failure_type(failure: TerminalFailure) -> &'static str {
-    match failure {
-        TerminalFailure::ErrorEvent => "upstream_sse_error",
-        TerminalFailure::FrameTooLarge => "upstream_sse_frame_too_large",
-        TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
-        TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResponsesFailureCode {
+    UpstreamSseError,
+    UpstreamSseFrameTooLarge,
+    UpstreamIncompleteEof,
+    UpstreamStreamError,
+    UpstreamRequestBlocked,
+    UpstreamWafBlocked,
+    ContextPayloadUnsafe,
+}
+
+impl ResponsesFailureCode {
+    pub(super) const fn code(self) -> &'static str {
+        match self {
+            Self::UpstreamSseError => "upstream_sse_error",
+            Self::UpstreamSseFrameTooLarge => "upstream_sse_frame_too_large",
+            Self::UpstreamIncompleteEof => "upstream_incomplete_eof",
+            Self::UpstreamStreamError => "upstream_stream_error",
+            Self::UpstreamRequestBlocked => "upstream_request_blocked",
+            Self::UpstreamWafBlocked => "upstream_waf_blocked",
+            Self::ContextPayloadUnsafe => "compaction_required",
+        }
     }
+
+    pub(super) const fn error_type(self) -> &'static str {
+        match self {
+            Self::ContextPayloadUnsafe => "context_payload_unsafe",
+            _ => self.code(),
+        }
+    }
+
+    const fn is_upstream_blocked(self) -> bool {
+        matches!(
+            self,
+            Self::UpstreamRequestBlocked | Self::UpstreamWafBlocked
+        )
+    }
+}
+
+fn response_failure_code_for_terminal(
+    failure: TerminalFailure,
+    upstream_summary: Option<&str>,
+    upstream_trace_source: Option<&str>,
+) -> ResponsesFailureCode {
+    if matches!(failure, TerminalFailure::ErrorEvent)
+        && upstream_summary.is_some_and(is_plain_upstream_request_blocked)
+    {
+        return if upstream_trace_source.is_some_and(|source| source.eq_ignore_ascii_case("cf-ray"))
+        {
+            ResponsesFailureCode::UpstreamWafBlocked
+        } else {
+            ResponsesFailureCode::UpstreamRequestBlocked
+        };
+    }
+    match failure {
+        TerminalFailure::ErrorEvent => ResponsesFailureCode::UpstreamSseError,
+        TerminalFailure::FrameTooLarge => ResponsesFailureCode::UpstreamSseFrameTooLarge,
+        TerminalFailure::IncompleteEof => ResponsesFailureCode::UpstreamIncompleteEof,
+        TerminalFailure::TransportErrorBeforeTerminal => ResponsesFailureCode::UpstreamStreamError,
+    }
+}
+
+pub(super) fn canonical_responses_failure_payload(
+    model: &str,
+    response_id: Option<&str>,
+    failure_code: ResponsesFailureCode,
+    message: impl Into<String>,
+    request_id: &str,
+    upstream_trace_source: Option<&str>,
+    upstream_trace_id: Option<&str>,
+) -> serde_json::Value {
+    let response_id = response_id
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("resp_atoapi_{}", Uuid::new_v4().simple()));
+    serde_json::json!({
+        "type": "response.failed",
+        "response": {
+            "id": response_id,
+            "object": "response",
+            "created_at": Utc::now().timestamp(),
+            "status": "failed",
+            "model": model,
+            "output": [],
+            "error": {
+                "type": failure_code.error_type(),
+                "code": failure_code.code(),
+                "message": failure_message_with_trace(
+                    message,
+                    request_id,
+                    upstream_trace_source,
+                    upstream_trace_id,
+                ),
+            },
+        },
+    })
 }
 
 fn canonical_responses_failure_frame(
@@ -370,32 +490,15 @@ fn canonical_responses_failure_frame(
     upstream_trace_source: Option<&str>,
     upstream_trace_id: Option<&str>,
 ) -> Bytes {
-    let response_id = response_id
-        .filter(|id| !id.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("resp_atoapi_{}", Uuid::new_v4().simple()));
-    let payload = serde_json::json!({
-        "type": "response.failed",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "created_at": Utc::now().timestamp(),
-            "status": "failed",
-            "model": model,
-            "output": [],
-            "error": {
-                "type": terminal_failure_type(failure),
-                "code": terminal_failure_type(failure),
-                "message": terminal_failure_message_with_trace(
-                    failure,
-                    upstream_summary,
-                    request_id,
-                    upstream_trace_source,
-                    upstream_trace_id,
-                ),
-            },
-        },
-    });
+    let payload = canonical_responses_failure_payload(
+        model,
+        response_id,
+        response_failure_code_for_terminal(failure, upstream_summary, upstream_trace_source),
+        terminal_failure_message(failure, upstream_summary),
+        request_id,
+        upstream_trace_source,
+        upstream_trace_id,
+    );
     let payload = serde_json::to_string(&payload).unwrap_or_else(|_| {
         "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
     });
@@ -448,6 +551,7 @@ pub(super) async fn stream_upstream(
     agent_generation: bool,
     response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
     client_prompt_cache_key_for_redaction: Option<String>,
+    full_replay_risk_scope: Option<ResponsesRouteScope>,
 ) -> Response {
     // Streaming must behave like a normal proxy: do not hold prefix/session locks
     // for the whole SSE response. The guarded section has already covered request
@@ -631,6 +735,7 @@ pub(super) async fn stream_upstream(
         let mut stream_metric_errors = Vec::<(String, String)>::new();
         let mut terminal_publication = None;
         let mut terminal_precheck = TerminalPrecheckGuard::new(&client_channel);
+        let mut generic_responses_failure_code = None;
         let state_for_stream = state.clone();
         loop {
             let upstream_wait_started = Instant::now();
@@ -686,6 +791,13 @@ pub(super) async fn stream_upstream(
                             &chunk,
                             client_prompt_cache_key_for_redaction.as_deref(),
                         );
+                        generic_responses_failure_code = Some(response_failure_code_for_terminal(
+                            TerminalFailure::ErrorEvent,
+                            (!summary.trim().is_empty()).then_some(summary.as_str()),
+                            upstream_request_diagnostics
+                                .upstream_trace_source
+                                .as_deref(),
+                        ));
                         // Generic SSE errors usually carry only an `error`
                         // object, not the response id published earlier by
                         // `response.created`. Preserve that known identity so
@@ -846,6 +958,17 @@ pub(super) async fn stream_upstream(
             &stream_metadata,
             stream_end,
         );
+        let terminal_failure_code = generic_responses_failure_code.or_else(|| {
+            terminal_verdict.failure.map(|failure| {
+                response_failure_code_for_terminal(
+                    failure,
+                    stream_metadata.error_summary.as_deref(),
+                    upstream_request_diagnostics
+                        .upstream_trace_source
+                        .as_deref(),
+                )
+            })
+        });
         if terminal_verdict.trailing_transport_anomaly {
             sse_end_reason = "upstream_trailing_transport_anomaly".to_string();
         } else if let Some(anomaly) = terminal_verdict.trailing_protocol_anomaly {
@@ -866,14 +989,17 @@ pub(super) async fn stream_upstream(
                 }
             };
             stream_metric_errors.push(("upstream_trailing_protocol_anomaly".to_string(), detail));
-        } else if let Some(failure) = terminal_verdict.failure {
-            sse_end_reason = match failure {
-                TerminalFailure::ErrorEvent => "upstream_sse_error",
-                TerminalFailure::FrameTooLarge => "upstream_sse_frame_too_large",
-                TerminalFailure::IncompleteEof => "upstream_incomplete_eof",
-                TerminalFailure::TransportErrorBeforeTerminal => "upstream_stream_error",
+        } else if let Some(failure_code) = terminal_failure_code {
+            sse_end_reason = failure_code.code().to_string();
+        }
+        if terminal_failure_code.is_some_and(ResponsesFailureCode::is_upstream_blocked) {
+            if let Some(scope) = full_replay_risk_scope.clone() {
+                state_for_stream
+                    .full_replay_risk_observations
+                    .lock()
+                    .await
+                    .note_blocked(scope);
             }
-            .to_string();
         }
         let mut canonical_failure_enqueued = false;
         if !downstream_disconnected
@@ -1047,9 +1173,10 @@ pub(super) async fn stream_upstream(
             }
         }
         let terminal_error_scope = match terminal_verdict.failure {
-            Some(TerminalFailure::ErrorEvent | TerminalFailure::IncompleteEof) => {
-                Some("upstream_sse_error")
+            Some(TerminalFailure::ErrorEvent) => {
+                terminal_failure_code.map(ResponsesFailureCode::code)
             }
+            Some(TerminalFailure::IncompleteEof) => Some("upstream_sse_error"),
             Some(TerminalFailure::FrameTooLarge) => Some("upstream_sse_frame_too_large"),
             Some(TerminalFailure::TransportErrorBeforeTerminal) | None => None,
         };
@@ -1378,12 +1505,22 @@ pub(super) async fn stream_upstream(
                             Some("upstream_incomplete_eof".to_string()),
                             "incomplete_eof",
                         ),
-                        Some(TerminalFailure::ErrorEvent) => (
-                            AgentAttemptOutcome::StreamError,
-                            AgentInboundOutcome::StreamError,
-                            Some("upstream_sse_error".to_string()),
-                            "sse_error",
-                        ),
+                        Some(TerminalFailure::ErrorEvent) => {
+                            let code = terminal_failure_code
+                                .unwrap_or(ResponsesFailureCode::UpstreamSseError);
+                            (
+                                AgentAttemptOutcome::StreamError,
+                                AgentInboundOutcome::StreamError,
+                                Some(code.code().to_string()),
+                                if matches!(code, ResponsesFailureCode::UpstreamWafBlocked) {
+                                    "upstream_waf_blocked"
+                                } else if code.is_upstream_blocked() {
+                                    "upstream_request_blocked"
+                                } else {
+                                    "sse_error"
+                                },
+                            )
+                        }
                         Some(TerminalFailure::FrameTooLarge) => (
                             AgentAttemptOutcome::StreamError,
                             AgentInboundOutcome::StreamError,

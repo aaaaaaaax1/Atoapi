@@ -34,7 +34,8 @@ use crate::{
         cache_affinity::ShadowAffinityStore,
         cache_validation::CacheValidationController,
         final_scope_waterline::{FinalScopeObservationRegistry, FinalScopeWaterlineLedger},
-        DispatchDrainOutcome, DispatchTracker, TransportClients, WarmPendingRegistry,
+        DispatchDrainOutcome, DispatchTracker, ResponsesFullReplayRiskObservations,
+        TransportClients, WarmPendingRegistry,
     },
 };
 
@@ -91,6 +92,10 @@ pub struct AppState {
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_endpoint_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
+    /// Bounded, process-local observations of an upstream rejecting a
+    /// Responses FullReplay payload after HTTP headers.  Values are opaque
+    /// route scopes only; no request body, tool output, or Key is retained.
+    pub full_replay_risk_observations: Mutex<ResponsesFullReplayRiskObservations>,
     /// Process-local, opaque cooldowns for caller-provided native Responses
     /// placement keys rejected by an upstream. These must never be persisted:
     /// a caller key is wire-only data and a new process gets one fresh chance
@@ -544,6 +549,9 @@ impl AppState {
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            full_replay_risk_observations: Mutex::new(
+                ResponsesFullReplayRiskObservations::default(),
+            ),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
@@ -595,6 +603,9 @@ impl AppState {
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
+            full_replay_risk_observations: Mutex::new(
+                ResponsesFullReplayRiskObservations::default(),
+            ),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,

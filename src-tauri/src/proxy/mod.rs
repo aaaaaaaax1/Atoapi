@@ -16,9 +16,9 @@ use crate::{
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
-        AgentInboundStart, AgentOwnerFailureSettlement, AgentTerminalSettlement,
-        FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
-        ResponsesWirePrefixFingerprints, UsageRecord,
+        AgentInboundStart, AgentLocalRejectionSettlement, AgentOwnerFailureSettlement,
+        AgentTerminalSettlement, FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore,
+        MetricsTransaction, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
     },
     state::{AppState, PrefixWarmState},
 };
@@ -70,6 +70,7 @@ mod json_canonical;
 mod prefix_control;
 mod prepared_wire_request;
 mod request_plan;
+mod responses_full_replay_risk;
 mod responses_stream;
 mod session_identity;
 mod settlement_pipeline;
@@ -92,7 +93,9 @@ use cache_control_core::{
 };
 pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
-use completion_relay::stream_upstream;
+use completion_relay::{
+    canonical_responses_failure_payload, stream_upstream, ResponsesFailureCode,
+};
 #[cfg(test)]
 use completion_relay::{
     relay_chunk_parts, BoundedCacheCapture, STREAM_CACHE_CAPTURE_BYTE_LIMIT,
@@ -118,6 +121,12 @@ use prepared_wire_request::{
     serialize_responses_body_bytes_for_provider_prefix, PreparedResponseBody,
 };
 use request_plan::{OneShotRequestPlan, RequestPlan};
+use responses_full_replay_risk::{
+    evaluate_full_replay_risk, FullReplayRiskInput, FullReplayRiskSignals,
+};
+pub(crate) use responses_full_replay_risk::{
+    ResponsesFullReplayRiskObservations, ResponsesRouteScope,
+};
 use responses_stream::{
     evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
     StreamEnd, TerminalCompatibility, TerminalFailure, TerminalPrecheckGuard,
@@ -2475,13 +2484,15 @@ async fn run_generation_for_authorized_agent(
     if let Some(stale_session) = stale_external_continuation {
         // A local managed head carries the old provider/model/key-realm in
         // its scope. Forwarding it after a hot switch leaks an invalid remote
-        // reference into the selected route. Rebuild the safe full replay
-        // when the incoming turn is only an incremental continuation.
+        // reference into the selected route. Rebuild only a *proven*
+        // incremental continuation: a client may already have supplied the
+        // complete FullReplay history, whose Atoapi-owned marker/noise differs
+        // from the stored wire. Prepending in that case duplicates history.
         if let Some(request) = upstream_body.as_object_mut() {
-            if let Some(input) =
+            if let Some(recovery) =
                 full_replay_input_after_route_switch(&stale_session, request.get("input"))
             {
-                request.insert("input".to_string(), input);
+                request.insert("input".to_string(), recovery.input);
             }
             request.remove("previous_response_id");
         }
@@ -2534,12 +2545,13 @@ async fn run_generation_for_authorized_agent(
             upstream_body.as_object_mut(),
         ) {
             if let Some(local_head) = lease.head().filter(|head| head.response_id == response_id) {
-                if let Some(input) =
+                if let Some(recovery) =
                     full_replay_input_after_route_switch(local_head, request.get("input"))
                 {
-                    request.insert("input".to_string(), input);
+                    let rebuilt_incremental = recovery.rebuilt_incremental;
+                    request.insert("input".to_string(), recovery.input);
                     request.remove("previous_response_id");
-                    full_replay_after_local_lineage = true;
+                    full_replay_after_local_lineage = rebuilt_incremental;
                 }
             }
         }
@@ -3111,6 +3123,161 @@ async fn run_generation_for_authorized_agent(
             active_channel: &active_request_channel,
             final_wire: &final_wire_receipt,
         });
+    // This is the first point where the semantic body and the actual outbound
+    // Responses wire are both final.  A safety decision here can therefore
+    // stop an unsafe FullReplay before the one-shot transport seam, without
+    // changing normal/delta routes or dispatching a second request.
+    apply_prepared_body_lengths(&mut diagnostics, generation_envelope.request_plan());
+    let full_replay_risk_scope = (matches!(client_channel, Channel::Responses)
+        && matches!(active_request_channel, Channel::Responses)
+        && final_scope_waterline_is_full_replay)
+        .then(|| {
+            ResponsesRouteScope::new(
+                decision.provider.id.clone(),
+                decision.model.clone(),
+                active_request_channel.label(),
+                affinity_identity::realm_id(&decision, &selected_provider_key),
+            )
+        });
+    let route_previously_blocked = match full_replay_risk_scope.as_ref() {
+        Some(scope) => state
+            .full_replay_risk_observations
+            .lock()
+            .await
+            .recently_blocked(scope),
+        None => false,
+    };
+    let full_replay_risk = evaluate_full_replay_risk(FullReplayRiskInput {
+        is_responses_route: matches!(client_channel, Channel::Responses)
+            && matches!(active_request_channel, Channel::Responses),
+        is_full_replay: final_scope_waterline_is_full_replay,
+        has_native_continuation: generation_envelope
+            .body()
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty()),
+        final_body_bytes: generation_envelope.request_plan().body_len() as u64,
+        route_previously_blocked,
+        signals: FullReplayRiskSignals {
+            input_items: tail_input_diagnostics.input_items,
+            tool_output_chars: tail_input_diagnostics.tool_output_chars,
+            largest_tool_output_chars: tail_input_diagnostics.largest_tool_output_chars,
+            tool_output_lines: tail_input_diagnostics.tool_output_lines,
+            repeated_line_chars: tail_input_diagnostics.tool_output_repeated_line_chars,
+            timestamp_like_count: tail_input_diagnostics.tool_output_timestamp_like_count,
+            path_like_count: tail_input_diagnostics.tool_output_path_like_count,
+            url_like_count: tail_input_diagnostics.tool_output_url_like_count,
+            hash_like_count: tail_input_diagnostics.tool_output_hash_like_count,
+            json_like_chars: tail_input_diagnostics.tool_output_json_like_chars,
+        },
+    });
+    // Register the inbound before a possible local rejection so Codex metrics
+    // truthfully report attempt_count=0 rather than losing the request.
+    let agent_policy = AttemptPolicy::Single;
+    if agent_generation {
+        let gate = AttemptGate::new(request_id.clone(), agent_policy)
+            .expect("a generated request id must be valid for the attempt gate");
+        let began = state
+            .metrics
+            .begin_agent_inbound(AgentInboundStart {
+                inbound_request_id: request_id.clone(),
+                at: Utc::now(),
+                attempt_policy: agent_attempt_policy_label(gate.policy()).to_string(),
+                attempt_budget: gate.budget() as u64,
+            })
+            .await;
+        assert!(began, "a fresh Agent inbound id must begin exactly once");
+    }
+    if let Some(rejection) = full_replay_risk {
+        let diagnostic = rejection.diagnostic_summary();
+        let client_message = format!(
+            "full-replay context payload is unsafe for this upstream route; {diagnostic}; compact this conversation or start a new clean continuation"
+        );
+        let mut request_log = upstream_transport_failure_log(
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible.then_some(metrics_cache_key.as_str()),
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            &prefix_guard_wait,
+            local_prepare_ms,
+            &diagnostics,
+            generation_envelope.body(),
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            "responses_full_replay_risk_gate",
+        );
+        request_log.status = StatusCode::UNPROCESSABLE_ENTITY.as_u16();
+        request_log.agent_id = authorized_agent.clone();
+        request_log.agent_label = authorized_agent.clone();
+        request_log.upstream_request_id = None;
+        request_log.upstream_attempt_index = None;
+        request_log.upstream_attempt_total = Some(0);
+        request_log.upstream_attempts = Some(0);
+        request_log.upstream_call_kind = Some("local_rejection".to_string());
+        request_log.upstream_call_source = Some("responses_full_replay_risk_gate".to_string());
+        request_log.upstream_header_wait_class = Some("local:context_payload_unsafe".to_string());
+        request_log.provider_cache_diagnostic =
+            Some(format!("full_replay_risk:{}", rejection.reason.label()));
+        request_log.sse_end_reason = Some("context_payload_unsafe".to_string());
+        request_log.downstream_disconnected = Some(false);
+        request_log.downstream_disconnect_stage = None;
+        apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
+        apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
+        if agent_generation {
+            let mut transaction =
+                MetricsTransaction::agent_local_rejection(AgentLocalRejectionSettlement {
+                    inbound_request_id: request_id.clone(),
+                    request: request_log,
+                    inbound_outcome: AgentInboundOutcome::LocalRejection,
+                    terminal_state: Some("context_payload_unsafe".to_string()),
+                });
+            transaction.observe_error("context_payload_unsafe", diagnostic.clone());
+            state.metrics.commit(transaction).await;
+        } else {
+            let mut transaction = MetricsTransaction::local_rejection(request_log);
+            transaction.observe_error("context_payload_unsafe", diagnostic.clone());
+            state.metrics.commit(transaction).await;
+        }
+        let failure_payload = canonical_responses_failure_payload(
+            &decision.model,
+            None,
+            ResponsesFailureCode::ContextPayloadUnsafe,
+            client_message,
+            &request_id,
+            None,
+            None,
+        );
+        let (status, content_type, body) = if client_requested_stream {
+            let payload = serde_json::to_string(&failure_payload).unwrap_or_else(|_| {
+                "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
+            });
+            (
+                StatusCode::OK.as_u16(),
+                "text/event-stream",
+                Bytes::from(format!("event: response.failed\ndata: {payload}\n\n")),
+            )
+        } else {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                "application/json",
+                Bytes::from(
+                    serde_json::to_vec(&failure_payload)
+                        .unwrap_or_else(|_| b"{\"type\":\"response.failed\"}".to_vec()),
+                ),
+            )
+        };
+        let response = raw_bytes_response(status, content_type, body);
+        if let Some(handoff) = response_handoff {
+            let _ = handoff.send(response);
+            return Response::new(Body::empty());
+        }
+        return response;
+    }
     upstream_request_diagnostics.warm_pending_scope_digest = upstream_request_diagnostics
         .final_scope_shadow
         .as_ref()
@@ -3157,7 +3324,6 @@ async fn run_generation_for_authorized_agent(
     )
     .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
     upstream_request_diagnostics.final_wire_receipt = Some(final_wire_receipt);
-    apply_prepared_body_lengths(&mut diagnostics, generation_envelope.request_plan());
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
         &active_request_channel,
         client_requested_stream,
@@ -3176,20 +3342,9 @@ async fn run_generation_for_authorized_agent(
     drop(prefix_guard);
     // A compatibility downgrade is durable state for the next independent
     // Agent request, never an authorization to repeat this inbound request.
-    let agent_policy = AttemptPolicy::Single;
     let mut agent_attempt_gate = if agent_generation {
         let gate = AttemptGate::new(request_id.clone(), agent_policy)
             .expect("a generated request id must be valid for the attempt gate");
-        let began = state
-            .metrics
-            .begin_agent_inbound(AgentInboundStart {
-                inbound_request_id: request_id.clone(),
-                at: Utc::now(),
-                attempt_policy: agent_attempt_policy_label(gate.policy()).to_string(),
-                attempt_budget: gate.budget() as u64,
-            })
-            .await;
-        assert!(began, "a fresh Agent inbound id must begin exactly once");
         Some(gate)
     } else {
         None
@@ -3530,6 +3685,7 @@ async fn run_generation_for_authorized_agent(
             agent_generation,
             response_handoff,
             client_prompt_cache_key_for_error_redaction.clone(),
+            full_replay_risk_scope,
         )
         .await;
         return response;
@@ -6905,13 +7061,27 @@ fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionA
 fn full_replay_input_after_route_switch(
     session: &ResponseSessionState,
     current: Option<&Value>,
-) -> Option<Value> {
+) -> Option<FullReplayInputRecovery> {
     let (Value::Array(previous_items), Value::Array(current_items)) = (&session.input, current?)
     else {
         return None;
     };
-    if response_input_starts_with(current_items, previous_items) {
-        return Some(Value::Array(current_items.clone()));
+    if response_input_starts_with_for_full_replay_recovery(current_items, previous_items) {
+        return Some(FullReplayInputRecovery {
+            input: Value::Array(current_items.clone()),
+            rebuilt_incremental: false,
+        });
+    }
+    if !response_session_incremental_input_is_proven_safe(session, current_items) {
+        // The old response id is local-only on a FullReplay route. When the
+        // caller's input is not provably a delta, preserving it is safer than
+        // grafting a stale local history onto a potentially complete/new
+        // conversation. This changes neither upstream selection nor the
+        // number of POSTs; the caller still gets exactly one FullReplay.
+        return Some(FullReplayInputRecovery {
+            input: Value::Array(current_items.clone()),
+            rebuilt_incremental: false,
+        });
     }
 
     let mut replay = Vec::with_capacity(
@@ -6923,60 +7093,86 @@ fn full_replay_input_after_route_switch(
     replay.extend(previous_items.iter().cloned());
     replay.extend(session.output_items.iter().cloned());
     replay.extend(current_items.iter().cloned());
-    Some(Value::Array(replay))
+    Some(FullReplayInputRecovery {
+        input: Value::Array(replay),
+        rebuilt_incremental: true,
+    })
 }
 
-fn response_input_starts_with(current: &[Value], prefix: &[Value]) -> bool {
+#[derive(Debug, Clone, PartialEq)]
+struct FullReplayInputRecovery {
+    input: Value,
+    rebuilt_incremental: bool,
+}
+
+/// FullReplay recovery must compare the semantic prefix that the upstream
+/// will receive, rather than raw client JSON. Atoapi can legally add/remove
+/// its own protocol breakpoint, and clients commonly vary trace/status/id
+/// metadata in replayed Responses items. Those fields are not permission to
+/// concatenate another copy of an already complete history.
+fn response_input_starts_with_for_full_replay_recovery(
+    current: &[Value],
+    prefix: &[Value],
+) -> bool {
     current.len() >= prefix.len()
         && prefix
             .iter()
             .zip(current.iter())
-            .all(|(expected, current)| expected == current)
+            .all(|(expected, current)| {
+                response_input_item_equal_for_full_replay_recovery(expected, current)
+            })
 }
 
-#[cfg(any())]
-fn appended_response_input_delta_for_session(
+fn response_input_item_equal_for_full_replay_recovery(left: &Value, right: &Value) -> bool {
+    if cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(left, right) {
+        return true;
+    }
+    let mut left = left.clone();
+    let mut right = right.clone();
+    strip_responses_provider_noise(&mut left);
+    strip_responses_provider_noise(&mut right);
+    cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(&left, &right)
+}
+
+/// The third-party route cannot forward a local `previous_response_id`, so it
+/// may rebuild only an input that is structurally a normal continuation:
+/// expected tool outputs followed by user/system/developer messages. All
+/// other shapes are left intact to avoid duplicating an ambiguous full replay.
+fn response_session_incremental_input_is_proven_safe(
     session: &ResponseSessionState,
-    current: &Value,
-) -> Option<Value> {
-    let (Value::Array(previous_items), Value::Array(current_items)) = (&session.input, current)
-    else {
-        return None;
+    current_items: &[Value],
+) -> bool {
+    let Some(previous_items) = session.input.as_array() else {
+        return false;
     };
-    if session.output_items.is_empty() {
-        return None;
+    if current_items.is_empty() {
+        return false;
     }
-    let expected_len = previous_items
-        .len()
-        .checked_add(session.output_items.len())?;
-    if current_items.len() <= expected_len {
-        return None;
+    let Some(expected) = expected_response_call_outputs(&session.output_items) else {
+        return false;
+    };
+    if !response_session_delta_input_is_safe(current_items, &expected) {
+        return false;
     }
-    let exact_prefix = previous_items
-        .iter()
-        .chain(session.output_items.iter())
-        .zip(current_items.iter().take(expected_len))
-        .all(|(expected, current)| expected == current);
-    if !exact_prefix {
-        return None;
+    // Without a pending tool result, a native Responses continuation is one
+    // new message. A longer all-message sequence is indistinguishable from a
+    // caller-provided shortened full history, so preserve it rather than
+    // concatenating stale context. With pending tool outputs, allow only the
+    // exact outputs plus at most two follow-up instruction/message items.
+    if expected.is_empty() {
+        return current_items.len() == 1;
     }
-
-    let expected_call_outputs = expected_response_call_outputs(&session.output_items)?;
-    let delta = &current_items[expected_len..];
-    if delta.is_empty() || !response_session_delta_input_is_safe(delta, &expected_call_outputs) {
-        return None;
-    }
-    Some(Value::Array(delta.to_vec()))
+    current_items.len() <= expected.len().saturating_add(2)
+        && (current_items.len() < previous_items.len()
+            || current_items.len() <= expected.len().saturating_add(1))
 }
 
-#[cfg(any())]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExpectedResponseCallOutput {
     call_id: String,
     item_type: String,
 }
 
-#[cfg(any())]
 fn expected_response_call_outputs(
     output_items: &[Value],
 ) -> Option<Vec<ExpectedResponseCallOutput>> {
@@ -7007,7 +7203,6 @@ fn expected_response_call_outputs(
     Some(expected)
 }
 
-#[cfg(any())]
 fn response_session_delta_input_is_safe(
     delta: &[Value],
     expected_call_outputs: &[ExpectedResponseCallOutput],
@@ -16307,6 +16502,7 @@ mod tests {
             agent_generation,
             None,
             None,
+            None,
         )
         .await
     }
@@ -16374,6 +16570,7 @@ mod tests {
             false,
             None,
             Some(raw_client_key.to_string()),
+            None,
         )
         .await
     }
@@ -25254,6 +25451,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await;
 
@@ -25423,6 +25621,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -25672,6 +25871,325 @@ mod tests {
             metrics.recent_failed_requests[0].sse_end_reason.as_deref(),
             Some("upstream_sse_error")
         );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stream_upstream_classifies_plain_request_blocked_as_waf_and_records_safe_scope() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-stream-request-blocked-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                AppConfig::default(),
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/stream",
+            axum::routing::post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    let stream = async_stream::stream! {
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_blocked\",\"object\":\"response\"}}\n\n",
+                        ));
+                        yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                            b"data: Request blocked\n\n",
+                        ));
+                    };
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header("cf-ray", "test-waf-ray-HKG")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let upstream = state
+            .upstream_client(false)
+            .post(format!("http://{upstream_addr}/stream"))
+            .send()
+            .await
+            .unwrap();
+        let route_scope =
+            ResponsesRouteScope::new("provider", "gpt-5.6-terra", "responses", "opaque-key-realm");
+        let mut upstream_diagnostics = UpstreamRequestDiagnostics::default();
+        upstream_diagnostics.upstream_trace_source = Some("cf-ray".to_string());
+        upstream_diagnostics.upstream_trace_id = Some("test-waf-ray-HKG".to_string());
+        let response = stream_upstream(
+            state.clone(),
+            upstream,
+            "text/event-stream".to_string(),
+            200,
+            Instant::now(),
+            "request-blocked-trace".to_string(),
+            Channel::Responses,
+            RouteDecision {
+                provider: test_responses_provider(format!("http://{upstream_addr}/v1")),
+                model: "gpt-5.6-terra".to_string(),
+                upstream_channel: Channel::Responses,
+            },
+            false,
+            Vec::new(),
+            "cache-key".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            AppConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            LineageParent::FullReplay,
+            false,
+            false,
+            false,
+            BodyDiagnostics::default(),
+            TailInputDiagnostics::default(),
+            SessionAnchorDiagnostics::default(),
+            ResponseSessionReuseDiagnostics::default(),
+            None,
+            None,
+            None,
+            None,
+            PrefixGuardWaitDiagnostics::default(),
+            0,
+            upstream_diagnostics,
+            None,
+            0,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some(route_scope.clone()),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(!text.contains("data: Request blocked"));
+        assert!(!text.contains("event: response.completed"));
+        assert!(text.contains("\"code\":\"upstream_waf_blocked\""));
+        assert!(text.contains("Request blocked"));
+        assert!(text.contains("atoapi_trace_id=request-blocked-trace"));
+        assert!(text.contains("upstream_trace=cf-ray:test-waf-ray-HKG"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("blocked SSE settlement must complete");
+        let log = &metrics.recent_failed_requests[0];
+        assert_eq!(log.sse_end_reason.as_deref(), Some("upstream_waf_blocked"));
+        assert_eq!(log.downstream_disconnected, Some(false));
+        assert!(metrics
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "upstream_waf_blocked"));
+        assert!(state
+            .full_replay_risk_observations
+            .lock()
+            .await
+            .recently_blocked(&route_scope));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unsafe_full_replay_is_rejected_locally_without_payload_leak_or_upstream_post() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-full-replay-risk-gate-{}",
+            Uuid::new_v4().simple()
+        ));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_small\",\"model\":\"gpt-5.6-terra\",\"output\":[],\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), "risk-provider");
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.6-terra".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-terra".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"risk-session","thread_id":"risk-thread","request_kind":"turn"}"#,
+            ),
+        );
+
+        let sensitive_marker = "SENSITIVE_FULL_REPLAY_TOOL_OUTPUT_MUST_NEVER_LEAK";
+        let noisy_line =
+            "{\"path\":\"C:/workspace/generated/file.rs\",\"timestamp\":\"2026-07-29T10:00:00Z\",\"hash\":\"0123456789abcdef0123456789abcdef\"}\n";
+        let noisy_tool_output = format!("{}{}", noisy_line.repeat(20_000), sensitive_marker);
+        assert!(noisy_tool_output.len() >= 1_500_000);
+        let mut input = (0..512)
+            .map(|index| {
+                json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": format!("stable historical item {index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": "call_large_diagnostic",
+            "output": noisy_tool_output,
+        }));
+        let dangerous = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-terra",
+                "stream": true,
+                "input": input,
+            }))
+            .unwrap(),
+        );
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            dangerous,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(text.matches("event: response.failed").count(), 1);
+        assert!(text.contains("\"type\":\"context_payload_unsafe\""));
+        assert!(text.contains("\"code\":\"compaction_required\""));
+        assert!(text.contains("full_replay=true"));
+        assert!(!text.contains(sensitive_marker));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_agent_inbound_outcomes.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("local full-replay rejection must settle its inbound metrics");
+        assert_eq!(metrics.upstream_requests, 0);
+        assert!(metrics.recent_agent_upstream_attempts.is_empty());
+        let inbound = &metrics.recent_agent_inbound_outcomes[0];
+        assert_eq!(inbound.attempt_count, 0);
+        assert_eq!(inbound.outcome, AgentInboundOutcome::LocalRejection);
+        assert_eq!(inbound.request.upstream_attempts, Some(0));
+        assert!(metrics
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "context_payload_unsafe"));
+        assert!(!serde_json::to_string(&metrics)
+            .unwrap()
+            .contains(sensitive_marker));
+
+        // A normal small FullReplay still crosses the same single POST seam
+        // and retains its ordinary Responses streaming behavior.
+        let small = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-terra",
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":"hello"}],
+            }))
+            .unwrap(),
+        );
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            small,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("response.completed"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -26421,6 +26939,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await;
 
@@ -26598,6 +27117,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         )
         .await;
 
@@ -26728,6 +27248,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -26983,6 +27504,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -28969,6 +29491,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -35406,8 +35929,164 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn full_replay_recovery_preserves_complete_history_with_protocol_breakpoint_or_noise() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp_seed".to_string(),
+            input: json!([{
+                "type": "message",
+                "role": "user",
+                "metadata": { "trace": "old" },
+                "content": [{ "type": "input_text", "text": "before" }]
+            }]),
+            output_items: vec![json!({
+                "type": "message",
+                "id": "msg_seed",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            })],
+            finished_at: Instant::now(),
+        };
+        let current = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "metadata": { "trace": "new" },
+                "content": [{
+                    "type": "input_text",
+                    "text": "before",
+                    "prompt_cache_breakpoint": { "mode": "explicit" }
+                }]
+            },
+            {
+                "type": "message",
+                "id": "msg_seed",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            },
+            { "type": "message", "role": "user", "content": "after" }
+        ]);
+
+        let recovery = full_replay_input_after_route_switch(&session, Some(&current))
+            .expect("array full history should be recoverable");
+        assert!(!recovery.rebuilt_incremental);
+        assert_eq!(recovery.input, current);
+    }
+
+    #[test]
+    fn full_replay_recovery_rebuilds_only_proven_incremental_delta() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp_seed".to_string(),
+            input: json!([{ "type": "message", "role": "user", "content": "before" }]),
+            output_items: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            })],
+            finished_at: Instant::now(),
+        };
+        let delta = json!([{ "type": "message", "role": "user", "content": "after" }]);
+
+        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+            .expect("a normal one-message continuation must be recoverable");
+        assert!(recovery.rebuilt_incremental);
+        assert_eq!(
+            recovery.input,
+            json!([
+                { "type": "message", "role": "user", "content": "before" },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "seed answer" }]
+                },
+                { "type": "message", "role": "user", "content": "after" }
+            ])
+        );
+    }
+
+    #[test]
+    fn full_replay_recovery_rebuilds_proven_tool_result_delta() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp_tool".to_string(),
+            input: json!([{ "type": "message", "role": "user", "content": "inspect" }]),
+            output_items: vec![json!({
+                "type": "function_call",
+                "call_id": "call_inspect",
+                "name": "inspect",
+                "arguments": "{}"
+            })],
+            finished_at: Instant::now(),
+        };
+        let delta = json!([
+            {
+                "type": "function_call_output",
+                "call_id": "call_inspect",
+                "output": "safe result"
+            },
+            { "type": "message", "role": "user", "content": "continue" }
+        ]);
+
+        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+            .expect("matching tool output plus a user message is a proven continuation");
+        assert!(recovery.rebuilt_incremental);
+        assert_eq!(
+            recovery.input,
+            json!([
+                { "type": "message", "role": "user", "content": "inspect" },
+                {
+                    "type": "function_call",
+                    "call_id": "call_inspect",
+                    "name": "inspect",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_inspect",
+                    "output": "safe result"
+                },
+                { "type": "message", "role": "user", "content": "continue" }
+            ])
+        );
+    }
+
+    #[test]
+    fn full_replay_recovery_preserves_ambiguous_history_instead_of_prepending() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp_seed".to_string(),
+            input: json!([
+                { "type": "message", "role": "user", "content": "before" },
+                { "type": "message", "role": "user", "content": "old detail" }
+            ]),
+            output_items: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            })],
+            finished_at: Instant::now(),
+        };
+        let ambiguous = json!([
+            { "type": "message", "role": "user", "content": "rewritten root" },
+            { "type": "message", "role": "user", "content": "new detail" }
+        ]);
+
+        let recovery = full_replay_input_after_route_switch(&session, Some(&ambiguous))
+            .expect("a caller-supplied history remains valid input");
+        assert!(!recovery.rebuilt_incremental);
+        assert_eq!(recovery.input, ambiguous);
+    }
+
     #[tokio::test]
-    async fn matching_local_previous_response_id_is_rebuilt_as_one_full_replay() {
+    async fn local_previous_response_id_rebuilds_only_a_proven_delta_once() {
         let hits = Arc::new(AtomicUsize::new(0));
         let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let hits_for_route = hits.clone();
@@ -35515,7 +36194,7 @@ mod tests {
 
         let followup = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             Bytes::from(
                 serde_json::to_vec(&json!({
                     "model": "gpt-5.5",
@@ -35534,8 +36213,62 @@ mod tests {
             .await
             .unwrap();
 
+        tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_upstream_attempts.len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rebuilt delta must settle before replaying complete history");
+
+        let complete_history = json!([
+            {
+                "type": "message",
+                "role": "user",
+                "metadata": { "trace": "replayed-history" },
+                "content": "before"
+            },
+            {
+                "type": "message",
+                "id": "msg_seed",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            },
+            { "type": "message", "role": "user", "content": "after" },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "complete history must not be prepended again"
+            }
+        ]);
+        let complete_replay = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_followup",
+                    "input": complete_history.clone()
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(complete_replay.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(complete_replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
         let captured = captured_bodies.lock().await.clone();
-        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert!(captured[1].get("previous_response_id").is_none());
         assert_eq!(
             captured[1]["input"],
@@ -35551,18 +36284,21 @@ mod tests {
                 { "type": "message", "role": "user", "content": "after" }
             ])
         );
+        assert!(captured[2].get("previous_response_id").is_none());
+        assert_eq!(captured[2]["input"], complete_history);
         let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
             loop {
                 let snapshot = state.metrics.snapshot().await;
-                if snapshot.recent_agent_upstream_attempts.len() == 2 {
+                if snapshot.recent_agent_upstream_attempts.len() == 3 {
                     break snapshot;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("both FullReplay turns must settle");
+        .expect("every FullReplay inbound must settle exactly once");
         assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
         assert!(metrics.recent_requests.iter().any(|request| {
             request.response_context_plan.as_deref() == Some("full_replay_after_local_lineage")
         }));

@@ -9,6 +9,8 @@ import type {
   CacheValidationStatus,
   Channel,
   MetricsSnapshot,
+  ReleaseChampionQueryInput,
+  ReleaseChampionSnapshot,
   MetricsTrendInput,
   MetricsTrendSnapshot,
   ProxyStatus,
@@ -202,6 +204,10 @@ const bridgeSource = String.raw`
   let requestScopeId = "";
   let requestPage = 1;
   let lastTrendContextKey = "";
+  let latestReleaseChampion = null;
+  let latestReleaseChampionError = "";
+  let lastReleaseChampionContextKey = "";
+  let releaseChampionSequence = 0;
   let draggingProviderId = "";
   let keyPointerDrag = null;
 
@@ -226,6 +232,36 @@ const bridgeSource = String.raw`
       controller.request("context");
     }
     lastTrendContextKey = contextKey;
+    if (overviewVisible) requestReleaseChampion(loadWhenChanged);
+  }
+
+  function releaseChampionContext(metricState, scope, agent) {
+    return [
+      agent?.sourceId || agent?.id || "",
+      scope?.providerId || "all",
+      metricState.includeColdStarts !== false ? "cold-in" : "cold-out",
+      metricState.includeCompactions !== false ? "compact-in" : "compact-out"
+    ].join("|");
+  }
+
+  function requestReleaseChampion(force = false) {
+    const metricState = host.state?.metrics || {};
+    const scope = activeRequestScope(metricState);
+    const agent = currentAgent();
+    const contextKey = releaseChampionContext(metricState, scope, agent);
+    if (!force && contextKey === lastReleaseChampionContextKey && latestReleaseChampion) return;
+    lastReleaseChampionContextKey = contextKey;
+    const sequence = ++releaseChampionSequence;
+    send("load-release-champion", {
+      sequence,
+      contextKey,
+      input: {
+        agent_id: agent?.sourceId || agent?.id || "",
+        provider_id: scope?.providerId || null,
+        include_cold_starts: metricState.includeColdStarts !== false,
+        include_compactions: metricState.includeCompactions !== false
+      }
+    });
   }
 
   trendController()?.setExternalLoader((query) => {
@@ -728,6 +764,7 @@ const bridgeSource = String.raw`
       setSwitch("计入冷启动和压缩", includeSpecialRequests);
       setSwitch("提示详细错误", metricState.showDetailedErrors === true);
     }
+    applyReleaseChampion(metricState);
     const dock = $bridge("#cacheButton");
     if (dock) {
       const values = dock.querySelectorAll(".utility-stat");
@@ -737,6 +774,50 @@ const bridgeSource = String.raw`
     const body = $bridge("#providersPanel tbody");
     if (body && Array.isArray(metricState.providerRows)) {
       body.innerHTML = metricState.providerRows.map((row) => "<tr><td>" + escape(row.provider) + "</td><td>" + escape(row.successful) + "</td><td>" + escape(row.input) + "</td><td>" + escape(row.cached) + "</td><td>" + escape(row.ttft) + "</td><td>" + escape(row.ratio) + "</td></tr>").join("") || "<tr><td colspan=\"6\">暂无上游统计</td></tr>";
+    }
+  }
+
+  function applyReleaseChampion(metricState) {
+    const banner = $bridge("#releaseChampionSummary");
+    if (!banner) return;
+    const scope = activeRequestScope(metricState);
+    const agent = currentAgent();
+    const contextKey = releaseChampionContext(metricState, scope, agent);
+    const title = banner.querySelector("b");
+    const details = banner.querySelector("small");
+    const snapshot = contextKey === lastReleaseChampionContextKey ? latestReleaseChampion : null;
+    banner.className = "release-champion-summary is-pending";
+    if (!snapshot) {
+      if (title) title.textContent = latestReleaseChampionError || "读取可比版本 cohort…";
+      if (details) details.textContent = "同 Provider · Key realm · 模型 · 请求族；历史旧桶不会冒充冠军";
+      return;
+    }
+    const status = String(snapshot.status || "awaiting_current_cohort");
+    const delta = Number(snapshot.delta_cache_hit_rate);
+    const positivePp = Number.isFinite(delta) ? (delta * 100).toFixed(3) + "pp" : "";
+    const current = snapshot.current || null;
+    const champion = snapshot.champion || null;
+    const statuses = {
+      improving: ["is-improving", "正优化 · 超过冠军 +" + positivePp],
+      regressed: ["is-regressed", "负优化 · 低于冠军 " + Math.abs(delta * 100).toFixed(3) + "pp"],
+      tied: ["is-tied", "持平 · 与冠军一致"],
+      insufficient_current_samples: ["is-pending", "样本积累中 · 暂不判定"],
+      no_comparable_champion: ["is-pending", "不可比 · 尚无同 cohort 冠军"],
+      awaiting_current_cohort: ["is-pending", "等待当前 cohort"],
+      legacy_history_unattributed: ["is-pending", "历史未归属版本 · 不冒充冠军"],
+      incomplete_filter: ["is-pending", "筛选统计不完整 · 暂不判定"]
+    };
+    const display = statuses[status] || statuses.awaiting_current_cohort;
+    banner.className = "release-champion-summary " + display[0];
+    if (title) title.textContent = display[1];
+    if (details) {
+      if (current && champion) {
+        const currentRate = (Number(current.values?.cache_hit_rate || 0) * 100).toFixed(3) + "%";
+        const championRate = (Number(champion.values?.cache_hit_rate || 0) * 100).toFixed(3) + "%";
+        details.textContent = "当前 v" + current.app_version + " " + currentRate + " · 冠军 v" + champion.app_version + " " + championRate + " · 同 Provider / Key realm / 模型 / 请求族";
+      } else {
+        details.textContent = String(snapshot.reason || "等待可验证的同 cohort 数据");
+      }
     }
   }
 
@@ -907,6 +988,14 @@ const bridgeSource = String.raw`
         const trend = message.payload.metricsTrend;
         if (trend.error) trendController()?.setError(trend.error, trend.sequence, trend.rangeKey);
         else trendController()?.setData(trend.data, trend.sequence, trend.rangeKey);
+      }
+      if (message.payload?.releaseChampion) {
+        const comparison = message.payload.releaseChampion;
+        if (comparison.sequence === releaseChampionSequence && comparison.contextKey === lastReleaseChampionContextKey) {
+          latestReleaseChampion = comparison.data || null;
+          latestReleaseChampionError = comparison.error ? String(comparison.error) : "";
+          applyMetrics(host.state);
+        }
       }
       if (message.notice) showToast(message.notice);
       if (message.error) showToast(message.error);
@@ -2115,6 +2204,29 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
       const acknowledge = (response?: GraphiteBridgeResponse) =>
         send({ kind: "ack", requestId: event.data.requestId, ...response });
       const run = async () => {
+        if (action === "load-release-champion") {
+          const sequence = Number(payload.sequence ?? 0);
+          const contextKey = String(payload.contextKey ?? "");
+          const input = payload.input as unknown as ReleaseChampionQueryInput | undefined;
+          try {
+            if (!input?.agent_id || !contextKey) {
+              throw new Error("版本命中对比范围不完整");
+            }
+            const data = await command<ReleaseChampionSnapshot>("get_release_champion", { input });
+            acknowledge({ payload: { releaseChampion: { sequence, contextKey, data } } });
+          } catch (error) {
+            acknowledge({
+              payload: {
+                releaseChampion: {
+                  sequence,
+                  contextKey,
+                  error: error instanceof Error ? error.message : String(error)
+                }
+              }
+            });
+          }
+          return;
+        }
         if (action === "load-metrics-trend") {
           const sequence = Number(payload.sequence ?? 0);
           const rangeKey = String(payload.rangeKey ?? "");

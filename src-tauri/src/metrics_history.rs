@@ -2,9 +2,11 @@ use crate::persistence::{WriteBehindCoordinator, WriteOperation};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    io::{BufReader, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -13,6 +15,8 @@ const METRICS_HISTORY_VERSION: u32 = 1;
 const HOUR_SECONDS: i64 = 60 * 60;
 const RETENTION_HOURS: i64 = 32 * 24;
 const MAX_QUERY_HOURS: i64 = 30 * 24;
+const MIN_RELEASE_CHAMPION_REQUESTS: u64 = 10;
+const MIN_RELEASE_CHAMPION_INPUT_TOKENS: u64 = 128_000;
 // This only runs at final shutdown, never on the request settlement path.
 const METRICS_HISTORY_FLUSH_RETRIES: usize = 2;
 
@@ -37,6 +41,98 @@ pub struct MetricsTrendQueryInput {
 
 fn default_include_compactions() -> bool {
     true
+}
+
+/// Identifies the exact executable which wrote a release-cohort observation.
+/// The user-facing comparison never relies on the package version alone: a
+/// rebuilt binary with the same version remains a separate candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReleaseBuildIdentity {
+    pub app_version: String,
+    pub git_commit: String,
+    pub executable_sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseRuntimeIdentity {
+    pub build: ReleaseBuildIdentity,
+    pub process_started_at: DateTime<Utc>,
+}
+
+impl ReleaseRuntimeIdentity {
+    pub(crate) fn current(process_started_at: DateTime<Utc>) -> Self {
+        Self {
+            build: ReleaseBuildIdentity {
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                git_commit: env!("ATOAPI_GIT_COMMIT").to_string(),
+                executable_sha256: current_executable_sha256(),
+            },
+            process_started_at,
+        }
+    }
+}
+
+/// A key-safe comparison scope. `provider_realm_id` is already a one-way
+/// affinity identity over deployment, channel, model, and selected Key; it
+/// deliberately never contains the raw URL or credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReleaseCohortScope {
+    pub agent_id: String,
+    pub provider_id: String,
+    pub provider_realm_id: String,
+    pub model: String,
+    pub client_channel: String,
+    pub upstream_channel: String,
+    pub upstream_call_kind: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseChampionQueryInput {
+    pub agent_id: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub include_cold_starts: bool,
+    #[serde(default = "default_include_compactions")]
+    pub include_compactions: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseChampionStatus {
+    Improving,
+    Regressed,
+    Tied,
+    InsufficientCurrentSamples,
+    NoComparableChampion,
+    AwaitingCurrentCohort,
+    LegacyHistoryUnattributed,
+    IncompleteFilter,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReleaseCohortSummary {
+    pub app_version: String,
+    pub git_commit: String,
+    pub executable_sha256: String,
+    pub process_started_at: Option<String>,
+    pub provider_id: String,
+    pub model: String,
+    pub request_family: String,
+    pub key_realm_fingerprint: String,
+    pub values: MetricsTrendValues,
+    pub sample_eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ReleaseChampionSnapshot {
+    pub status: ReleaseChampionStatus,
+    pub reason: String,
+    pub current: Option<ReleaseCohortSummary>,
+    pub champion: Option<ReleaseCohortSummary>,
+    pub delta_cache_hit_rate: Option<f64>,
+    pub minimum_successful_requests: u64,
+    pub minimum_input_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -81,6 +177,10 @@ pub(crate) struct MetricsHistoryObservation {
     pub at: DateTime<Utc>,
     pub agent_id: String,
     pub provider_id: String,
+    /// Present only when the terminal request supplied an attested, key-safe
+    /// affinity realm. Legacy history remains available for trends but is
+    /// intentionally excluded from version-champion comparisons.
+    pub release_scope: Option<ReleaseCohortScope>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -226,10 +326,67 @@ struct ScopeCounters {
     compaction_breakdown_complete: bool,
 }
 
+impl ScopeCounters {
+    fn observe(&mut self, counters: TrendCounters, cold_start: bool, compaction: bool) {
+        if self.total.successful_requests == 0
+            && self.cold_start.successful_requests == 0
+            && self.compaction.successful_requests == 0
+            && self.cold_start_compaction.successful_requests == 0
+        {
+            self.compaction_breakdown_complete = true;
+        }
+        self.total.add_assign(counters);
+        if cold_start {
+            self.cold_start.add_assign(counters);
+        }
+        if compaction {
+            self.compaction.add_assign(counters);
+            if cold_start {
+                self.cold_start_compaction.add_assign(counters);
+            }
+        }
+    }
+
+    fn add_assign(&mut self, other: &Self) {
+        let was_empty = self.total.successful_requests == 0
+            && self.cold_start.successful_requests == 0
+            && self.compaction.successful_requests == 0
+            && self.cold_start_compaction.successful_requests == 0;
+        self.total.add_assign(other.total);
+        self.cold_start.add_assign(other.cold_start);
+        self.compaction.add_assign(other.compaction);
+        self.cold_start_compaction
+            .add_assign(other.cold_start_compaction);
+        if was_empty {
+            self.compaction_breakdown_complete = other.compaction_breakdown_complete;
+        } else {
+            self.compaction_breakdown_complete &= other.compaction_breakdown_complete;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct HourBucket {
     #[serde(default)]
     by_agent_provider: BTreeMap<String, BTreeMap<String, ScopeCounters>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ReleaseCohortRun {
+    #[serde(default)]
+    counters: ScopeCounters,
+    #[serde(default)]
+    last_observed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReleaseCohortEntry {
+    build: ReleaseBuildIdentity,
+    scope: ReleaseCohortScope,
+    #[serde(default)]
+    runs: BTreeMap<String, ReleaseCohortRun>,
+    #[serde(default)]
+    last_observed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +394,11 @@ struct PersistedMetricsHistory {
     version: u32,
     #[serde(default)]
     buckets: BTreeMap<i64, HourBucket>,
+    /// Added without changing the v1 trend schema. Older files deserialize
+    /// with an empty map and therefore fail closed as un-attributable rather
+    /// than fabricating a historical version champion.
+    #[serde(default)]
+    release_cohorts: BTreeMap<String, ReleaseCohortEntry>,
 }
 
 impl Default for PersistedMetricsHistory {
@@ -244,12 +406,18 @@ impl Default for PersistedMetricsHistory {
         Self {
             version: METRICS_HISTORY_VERSION,
             buckets: BTreeMap::new(),
+            release_cohorts: BTreeMap::new(),
         }
     }
 }
 
 impl PersistedMetricsHistory {
-    fn observe(&mut self, observation: MetricsHistoryObservation, now: DateTime<Utc>) -> bool {
+    fn observe(
+        &mut self,
+        observation: MetricsHistoryObservation,
+        runtime: Option<&ReleaseRuntimeIdentity>,
+        now: DateTime<Utc>,
+    ) -> bool {
         let agent_id = observation.agent_id.trim();
         let provider_id = observation.provider_id.trim();
         if agent_id.is_empty() || provider_id.is_empty() {
@@ -272,29 +440,64 @@ impl PersistedMetricsHistory {
             .or_default()
             .entry(provider_id.to_string())
             .or_default();
-        if scope.total.successful_requests == 0
-            && scope.cold_start.successful_requests == 0
-            && scope.compaction.successful_requests == 0
-            && scope.cold_start_compaction.successful_requests == 0
+        scope.observe(counters, observation.cold_start, observation.compaction);
+        if let (Some(runtime), Some(release_scope)) = (runtime, observation.release_scope.as_ref())
         {
-            scope.compaction_breakdown_complete = true;
-        }
-        scope.total.add_assign(counters);
-        if observation.cold_start {
-            scope.cold_start.add_assign(counters);
-        }
-        if observation.compaction {
-            scope.compaction.add_assign(counters);
-            if observation.cold_start {
-                scope.cold_start_compaction.add_assign(counters);
-            }
+            self.observe_release_cohort(
+                runtime,
+                release_scope,
+                counters,
+                observation.cold_start,
+                observation.compaction,
+                now,
+            );
         }
         true
+    }
+
+    fn observe_release_cohort(
+        &mut self,
+        runtime: &ReleaseRuntimeIdentity,
+        scope: &ReleaseCohortScope,
+        counters: TrendCounters,
+        cold_start: bool,
+        compaction: bool,
+        now: DateTime<Utc>,
+    ) {
+        let cohort_id = release_cohort_id(&runtime.build, scope);
+        let entry = self
+            .release_cohorts
+            .entry(cohort_id)
+            .or_insert_with(|| ReleaseCohortEntry {
+                build: runtime.build.clone(),
+                scope: scope.clone(),
+                runs: BTreeMap::new(),
+                last_observed_at: None,
+            });
+        let process_started_at = runtime
+            .process_started_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let run = entry.runs.entry(process_started_at).or_default();
+        run.counters.observe(counters, cold_start, compaction);
+        run.last_observed_at = Some(now);
+        entry.last_observed_at = Some(now);
     }
 
     fn prune(&mut self, now: DateTime<Utc>) {
         let oldest = hour_start_timestamp(now - Duration::hours(RETENTION_HOURS));
         self.buckets.retain(|start, _| *start >= oldest);
+        let oldest_at = DateTime::<Utc>::from_timestamp(oldest, 0)
+            .expect("metrics history retention boundary must be representable");
+        self.release_cohorts.retain(|_, cohort| {
+            cohort.runs.retain(|_, run| {
+                run.last_observed_at
+                    .is_some_and(|observed_at| observed_at >= oldest_at)
+            });
+            !cohort.runs.is_empty()
+                && cohort
+                    .last_observed_at
+                    .is_some_and(|observed_at| observed_at >= oldest_at)
+        });
     }
 
     fn query(
@@ -351,6 +554,269 @@ impl PersistedMetricsHistory {
             points,
         }
     }
+
+    fn release_champion(
+        &self,
+        runtime: Option<&ReleaseRuntimeIdentity>,
+        input: &ReleaseChampionQueryInput,
+    ) -> Result<ReleaseChampionSnapshot> {
+        let agent_id = input.agent_id.trim();
+        if agent_id.is_empty() {
+            return Err(anyhow!("agent_id is required"));
+        }
+        let provider_id = input
+            .provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(runtime) = runtime else {
+            return Ok(empty_release_champion(
+                ReleaseChampionStatus::AwaitingCurrentCohort,
+                "当前运行未提供可验证 build identity".to_string(),
+            ));
+        };
+        let process_started_at = runtime
+            .process_started_at
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let mut current: Option<(&ReleaseCohortEntry, &ReleaseCohortRun)> = None;
+        for entry in self.release_cohorts.values() {
+            if entry.build != runtime.build
+                || entry.scope.agent_id != agent_id
+                || provider_id.is_some_and(|provider_id| entry.scope.provider_id != provider_id)
+            {
+                continue;
+            }
+            let Some(run) = entry.runs.get(&process_started_at) else {
+                continue;
+            };
+            let replace = match current {
+                Some((_, existing)) => run.last_observed_at > existing.last_observed_at,
+                None => true,
+            };
+            if replace {
+                current = Some((entry, run));
+            }
+        }
+        let Some((current_entry, current_run)) = current else {
+            let reason = if self.release_cohorts.is_empty() {
+                "历史记录未带版本 cohort；从本版本开始积累可比样本".to_string()
+            } else {
+                "当前所选 Provider 尚无带 key-realm 的版本 cohort 请求".to_string()
+            };
+            return Ok(empty_release_champion(
+                if self.release_cohorts.is_empty() {
+                    ReleaseChampionStatus::LegacyHistoryUnattributed
+                } else {
+                    ReleaseChampionStatus::AwaitingCurrentCohort
+                },
+                reason,
+            ));
+        };
+
+        let (current_counters, current_complete) = effective_counters(
+            &current_run.counters,
+            input.include_cold_starts,
+            input.include_compactions,
+        );
+        let current_summary = release_summary(
+            &current_entry.build,
+            &current_entry.scope,
+            current_counters,
+            Some(runtime.process_started_at),
+        );
+        if !current_complete {
+            return Ok(ReleaseChampionSnapshot {
+                status: ReleaseChampionStatus::IncompleteFilter,
+                reason: "当前 cohort 含旧式压缩统计，不能精确应用所选过滤条件".to_string(),
+                current: Some(current_summary),
+                champion: None,
+                delta_cache_hit_rate: None,
+                minimum_successful_requests: MIN_RELEASE_CHAMPION_REQUESTS,
+                minimum_input_tokens: MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+            });
+        }
+
+        let mut champion: Option<ReleaseCohortSummary> = None;
+        for entry in self.release_cohorts.values() {
+            if entry.build == runtime.build || entry.scope != current_entry.scope {
+                continue;
+            }
+            let combined = combined_release_counters(entry);
+            let (counters, complete) = effective_counters(
+                &combined,
+                input.include_cold_starts,
+                input.include_compactions,
+            );
+            if !complete {
+                continue;
+            }
+            let summary = release_summary(&entry.build, &entry.scope, counters, None);
+            if !summary.sample_eligible || release_summary_beats(&summary, champion.as_ref()) {
+                champion = Some(summary);
+            }
+        }
+
+        if !current_summary.sample_eligible {
+            return Ok(ReleaseChampionSnapshot {
+                status: ReleaseChampionStatus::InsufficientCurrentSamples,
+                reason: format!(
+                    "当前 build 需要至少 {MIN_RELEASE_CHAMPION_REQUESTS} 条成功请求且 {MIN_RELEASE_CHAMPION_INPUT_TOKENS} input tokens 才参与冠军判断"
+                ),
+                current: Some(current_summary),
+                champion,
+                delta_cache_hit_rate: None,
+                minimum_successful_requests: MIN_RELEASE_CHAMPION_REQUESTS,
+                minimum_input_tokens: MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+            });
+        }
+
+        let Some(champion) = champion else {
+            return Ok(ReleaseChampionSnapshot {
+                status: if self.release_cohorts.is_empty() {
+                    ReleaseChampionStatus::LegacyHistoryUnattributed
+                } else {
+                    ReleaseChampionStatus::NoComparableChampion
+                },
+                reason: "未找到同 Provider、同 Key realm、同模型、同请求族的历史 build 冠军"
+                    .to_string(),
+                current: Some(current_summary),
+                champion: None,
+                delta_cache_hit_rate: None,
+                minimum_successful_requests: MIN_RELEASE_CHAMPION_REQUESTS,
+                minimum_input_tokens: MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+            });
+        };
+        let delta_cache_hit_rate =
+            current_summary.values.cache_hit_rate - champion.values.cache_hit_rate;
+        let status = if delta_cache_hit_rate > 0.000_01 {
+            ReleaseChampionStatus::Improving
+        } else if delta_cache_hit_rate < -0.000_01 {
+            ReleaseChampionStatus::Regressed
+        } else {
+            ReleaseChampionStatus::Tied
+        };
+        Ok(ReleaseChampionSnapshot {
+            status,
+            reason:
+                "当前与冠军使用相同的 Provider、Key realm、模型和请求族；统计未伪造冷启动或压缩"
+                    .to_string(),
+            current: Some(current_summary),
+            champion: Some(champion),
+            delta_cache_hit_rate: Some(delta_cache_hit_rate),
+            minimum_successful_requests: MIN_RELEASE_CHAMPION_REQUESTS,
+            minimum_input_tokens: MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+        })
+    }
+}
+
+fn empty_release_champion(
+    status: ReleaseChampionStatus,
+    reason: String,
+) -> ReleaseChampionSnapshot {
+    ReleaseChampionSnapshot {
+        status,
+        reason,
+        current: None,
+        champion: None,
+        delta_cache_hit_rate: None,
+        minimum_successful_requests: MIN_RELEASE_CHAMPION_REQUESTS,
+        minimum_input_tokens: MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+    }
+}
+
+fn combined_release_counters(entry: &ReleaseCohortEntry) -> ScopeCounters {
+    let mut combined = ScopeCounters::default();
+    for run in entry.runs.values() {
+        combined.add_assign(&run.counters);
+    }
+    combined
+}
+
+fn release_summary(
+    build: &ReleaseBuildIdentity,
+    scope: &ReleaseCohortScope,
+    counters: TrendCounters,
+    process_started_at: Option<DateTime<Utc>>,
+) -> ReleaseCohortSummary {
+    let values = counters.into_values();
+    ReleaseCohortSummary {
+        app_version: build.app_version.clone(),
+        git_commit: build.git_commit.clone(),
+        executable_sha256: build.executable_sha256.clone(),
+        process_started_at: process_started_at
+            .map(|value| value.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        provider_id: scope.provider_id.clone(),
+        model: scope.model.clone(),
+        request_family: format!(
+            "{}:{}:{}",
+            scope.client_channel, scope.upstream_channel, scope.upstream_call_kind
+        ),
+        key_realm_fingerprint: scope.provider_realm_id.clone(),
+        sample_eligible: values.successful_requests >= MIN_RELEASE_CHAMPION_REQUESTS
+            && values.input_tokens >= MIN_RELEASE_CHAMPION_INPUT_TOKENS,
+        values,
+    }
+}
+
+fn release_summary_beats(
+    candidate: &ReleaseCohortSummary,
+    current: Option<&ReleaseCohortSummary>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    candidate
+        .values
+        .cache_hit_rate
+        .total_cmp(&current.values.cache_hit_rate)
+        .then_with(|| {
+            candidate
+                .values
+                .input_tokens
+                .cmp(&current.values.input_tokens)
+        })
+        .is_gt()
+}
+
+fn release_cohort_id(build: &ReleaseBuildIdentity, scope: &ReleaseCohortScope) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "atoapi-release-cohort-v1",
+        build.app_version.as_str(),
+        build.git_commit.as_str(),
+        build.executable_sha256.as_str(),
+        scope.agent_id.as_str(),
+        scope.provider_id.as_str(),
+        scope.provider_realm_id.as_str(),
+        scope.model.as_str(),
+        scope.client_channel.as_str(),
+        scope.upstream_channel.as_str(),
+        scope.upstream_call_kind.as_str(),
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn current_executable_sha256() -> String {
+    let Ok(path) = std::env::current_exe() else {
+        return "unavailable".to_string();
+    };
+    let Ok(file) = fs::File::open(path) else {
+        return "unavailable".to_string();
+    };
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(_) => return "unavailable".to_string(),
+        }
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn effective_counters(
@@ -396,6 +862,7 @@ pub(crate) struct MetricsHistory {
     /// live trend mutex or the MetricsStore settlement path.
     pending: Option<Arc<Mutex<Vec<MetricsHistoryObservation>>>>,
     writer: Option<WriteBehindCoordinator>,
+    runtime: Option<ReleaseRuntimeIdentity>,
 }
 
 impl std::fmt::Debug for MetricsHistory {
@@ -414,15 +881,25 @@ impl MetricsHistory {
             state: Arc::new(Mutex::new(PersistedMetricsHistory::default())),
             pending: None,
             writer: None,
+            runtime: None,
         }
     }
 
     pub(crate) fn load(path: PathBuf) -> Self {
         let write_job: Arc<MetricsHistoryWriteJob> = Arc::new(save_metrics_history);
-        Self::load_with_write_job(path, write_job)
+        Self::load_with_write_job(path, write_job, None)
     }
 
-    fn load_with_write_job(path: PathBuf, write_job: Arc<MetricsHistoryWriteJob>) -> Self {
+    pub(crate) fn load_with_runtime(path: PathBuf, runtime: ReleaseRuntimeIdentity) -> Self {
+        let write_job: Arc<MetricsHistoryWriteJob> = Arc::new(save_metrics_history);
+        Self::load_with_write_job(path, write_job, Some(runtime))
+    }
+
+    fn load_with_write_job(
+        path: PathBuf,
+        write_job: Arc<MetricsHistoryWriteJob>,
+        runtime: Option<ReleaseRuntimeIdentity>,
+    ) -> Self {
         let history = match load_metrics_history(&path) {
             Ok(history) => history,
             Err(error) => {
@@ -446,6 +923,7 @@ impl MetricsHistory {
         let pending_for_writer = pending.clone();
         let writer_state_for_writer = writer_state.clone();
         let write_job_for_writer = write_job.clone();
+        let runtime_for_writer = runtime.clone();
         let writer = WriteBehindCoordinator::new("metrics_history_save", move |operation| {
             debug_assert_eq!(operation, WriteOperation::Snapshot);
             let pending = {
@@ -461,7 +939,7 @@ impl MetricsHistory {
                 if !pending.is_empty() {
                     let now = Utc::now();
                     for observation in pending {
-                        let _ = writer_state.observe(observation, now);
+                        let _ = writer_state.observe(observation, runtime_for_writer.as_ref(), now);
                     }
                 }
                 writer_state.clone()
@@ -472,6 +950,7 @@ impl MetricsHistory {
             state,
             pending: Some(pending),
             writer: Some(writer),
+            runtime,
         }
     }
 
@@ -480,7 +959,7 @@ impl MetricsHistory {
         path: PathBuf,
         write_job: impl Fn(&Path, &PersistedMetricsHistory) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
-        Self::load_with_write_job(path, Arc::new(write_job))
+        Self::load_with_write_job(path, Arc::new(write_job), None)
     }
 
     pub(crate) fn observe(&self, observation: MetricsHistoryObservation) {
@@ -489,7 +968,7 @@ impl MetricsHistory {
             .state
             .lock()
             .expect("metrics history lock must not be poisoned")
-            .observe(observation, Utc::now());
+            .observe(observation, self.runtime.as_ref(), Utc::now());
         if changed {
             if let (Some(pending), Some(writer)) = (&self.pending, &self.writer) {
                 pending
@@ -533,6 +1012,16 @@ impl MetricsHistory {
                 input.include_cold_starts,
                 input.include_compactions,
             ))
+    }
+
+    pub(crate) fn release_champion(
+        &self,
+        input: ReleaseChampionQueryInput,
+    ) -> Result<ReleaseChampionSnapshot> {
+        self.state
+            .lock()
+            .expect("metrics history lock must not be poisoned")
+            .release_champion(self.runtime.as_ref(), &input)
     }
 
     pub(crate) async fn flush(&self) -> Result<()> {
@@ -688,6 +1177,7 @@ mod tests {
             at,
             agent_id: "codex".to_string(),
             provider_id: provider_id.to_string(),
+            release_scope: None,
             input_tokens: 1_000,
             output_tokens: 25,
             cache_read_tokens: 900,
@@ -728,6 +1218,52 @@ mod tests {
         }
     }
 
+    fn release_runtime(
+        version: &str,
+        commit: &str,
+        executable_sha256: &str,
+        process_started_at: DateTime<Utc>,
+    ) -> ReleaseRuntimeIdentity {
+        ReleaseRuntimeIdentity {
+            build: ReleaseBuildIdentity {
+                app_version: version.to_string(),
+                git_commit: commit.to_string(),
+                executable_sha256: executable_sha256.to_string(),
+            },
+            process_started_at,
+        }
+    }
+
+    fn release_observation(
+        at: DateTime<Utc>,
+        realm: &str,
+        cache_read_tokens: u64,
+    ) -> MetricsHistoryObservation {
+        MetricsHistoryObservation {
+            at,
+            agent_id: "codex".to_string(),
+            provider_id: "provider-a".to_string(),
+            release_scope: Some(ReleaseCohortScope {
+                agent_id: "codex".to_string(),
+                provider_id: "provider-a".to_string(),
+                provider_realm_id: realm.to_string(),
+                model: "gpt-test".to_string(),
+                client_channel: "responses".to_string(),
+                upstream_channel: "responses".to_string(),
+                upstream_call_kind: "stream".to_string(),
+            }),
+            input_tokens: 20_000,
+            output_tokens: 25,
+            cache_read_tokens,
+            cache_creation_tokens: 0,
+            cache_shortfall_tokens: 20_000_u64.saturating_sub(cache_read_tokens),
+            cache_avoidable_gap_tokens: 0,
+            cache_new_tail_gap_tokens: 20_000_u64.saturating_sub(cache_read_tokens),
+            compaction: false,
+            cold_start: false,
+        }
+    }
+
     #[test]
     fn queries_scoped_hour_buckets_and_fills_missing_hours() {
         let history = MetricsHistory::in_memory();
@@ -760,6 +1296,108 @@ mod tests {
             .unwrap();
         assert_eq!(provider.summary.successful_requests, 1);
         assert_eq!(provider.summary.input_tokens, 1_000);
+    }
+
+    #[test]
+    fn release_champion_compares_only_the_same_key_safe_cohort() {
+        let start = hour_now() - Duration::hours(1);
+        let champion_runtime =
+            release_runtime("1.4.9", "commit-champion", "a".repeat(64).as_str(), start);
+        let candidate_runtime = release_runtime(
+            "1.4.10",
+            "commit-candidate",
+            "b".repeat(64).as_str(),
+            start + Duration::minutes(10),
+        );
+        let mut history = PersistedMetricsHistory::default();
+        for index in 0..10 {
+            let at = start + Duration::seconds(index);
+            assert!(history.observe(
+                release_observation(at, "realm-a", 19_800),
+                Some(&champion_runtime),
+                at,
+            ));
+            // A perfect but different selected Key/endpoint realm must never
+            // be allowed to become the candidate's apparent champion.
+            assert!(history.observe(
+                release_observation(at, "realm-other", 20_000),
+                Some(&champion_runtime),
+                at,
+            ));
+        }
+        for index in 0..10 {
+            let at = candidate_runtime.process_started_at + Duration::seconds(index);
+            assert!(history.observe(
+                release_observation(at, "realm-a", 19_000),
+                Some(&candidate_runtime),
+                at,
+            ));
+        }
+
+        let comparison = history
+            .release_champion(
+                Some(&candidate_runtime),
+                &ReleaseChampionQueryInput {
+                    agent_id: "codex".to_string(),
+                    provider_id: Some("provider-a".to_string()),
+                    include_cold_starts: true,
+                    include_compactions: true,
+                },
+            )
+            .expect("the release cohort query must be valid");
+        assert_eq!(comparison.status, ReleaseChampionStatus::Regressed);
+        assert!(comparison
+            .delta_cache_hit_rate
+            .is_some_and(|delta| delta < 0.0));
+        assert_eq!(
+            comparison
+                .champion
+                .as_ref()
+                .expect("same-realm champion must exist")
+                .key_realm_fingerprint,
+            "realm-a"
+        );
+        assert_eq!(
+            comparison
+                .champion
+                .as_ref()
+                .expect("same-realm champion must exist")
+                .app_version,
+            "1.4.9"
+        );
+        assert!(
+            comparison
+                .current
+                .as_ref()
+                .expect("current candidate must be reported")
+                .sample_eligible
+        );
+    }
+
+    #[test]
+    fn release_champion_fails_closed_for_unattributed_legacy_history() {
+        let start = hour_now();
+        let runtime = release_runtime("1.4.10", "commit", &"c".repeat(64), start);
+        let mut history = PersistedMetricsHistory::default();
+        assert!(history.observe(observation(start, "provider-a", false), None, start));
+
+        let comparison = history
+            .release_champion(
+                Some(&runtime),
+                &ReleaseChampionQueryInput {
+                    agent_id: "codex".to_string(),
+                    provider_id: Some("provider-a".to_string()),
+                    include_cold_starts: true,
+                    include_compactions: true,
+                },
+            )
+            .expect("legacy history must remain readable");
+        assert_eq!(
+            comparison.status,
+            ReleaseChampionStatus::LegacyHistoryUnattributed
+        );
+        assert!(comparison.current.is_none());
+        assert!(comparison.champion.is_none());
     }
 
     #[test]
@@ -996,6 +1634,63 @@ mod tests {
                 .summary
                 .successful_requests,
             0
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn persists_release_cohorts_across_builds_without_promoting_legacy_buckets() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-release-cohort-history-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("metrics-history.json");
+        let start = hour_now() - Duration::hours(1);
+        let champion_sha = "a".repeat(64);
+        let candidate_sha = "b".repeat(64);
+        let champion_runtime = release_runtime("1.4.9", "commit-a", &champion_sha, start);
+        let candidate_runtime = release_runtime(
+            "1.4.10",
+            "commit-b",
+            &candidate_sha,
+            start + Duration::minutes(10),
+        );
+
+        let champion_history = MetricsHistory::load_with_runtime(path.clone(), champion_runtime);
+        for index in 0..10 {
+            champion_history.observe(release_observation(
+                start + Duration::seconds(index),
+                "realm-a",
+                19_800,
+            ));
+        }
+        champion_history.flush().await.unwrap();
+
+        let candidate_history = MetricsHistory::load_with_runtime(path.clone(), candidate_runtime);
+        for index in 0..10 {
+            candidate_history.observe(release_observation(
+                start + Duration::minutes(10) + Duration::seconds(index),
+                "realm-a",
+                19_000,
+            ));
+        }
+        candidate_history.flush().await.unwrap();
+        let comparison = candidate_history
+            .release_champion(ReleaseChampionQueryInput {
+                agent_id: "codex".to_string(),
+                provider_id: Some("provider-a".to_string()),
+                include_cold_starts: true,
+                include_compactions: true,
+            })
+            .unwrap();
+        assert_eq!(comparison.status, ReleaseChampionStatus::Regressed);
+        assert_eq!(
+            comparison
+                .champion
+                .as_ref()
+                .expect("persisted champion must be restored")
+                .executable_sha256,
+            champion_sha
         );
         fs::remove_dir_all(dir).ok();
     }
