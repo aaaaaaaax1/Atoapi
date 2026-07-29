@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "atoapi"
-version = "1.4.9"
+version = "1.4.10"
 dependencies = [
  "aes-gcm",
  "anyhow",

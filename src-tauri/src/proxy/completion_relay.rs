@@ -1002,6 +1002,7 @@ pub(super) async fn stream_upstream(
             response_session_update.as_ref(),
             response_session_response_id.as_deref(),
         );
+        let warm_pending_committed_head = committed_head.clone();
         let rebased_from_head = rebased_waterline_control_head(
             response_session_lease.as_ref(),
             response_session_update.as_ref(),
@@ -1018,6 +1019,16 @@ pub(super) async fn stream_upstream(
                     rebased_from_head,
                 )
             });
+        settle_giant_cold_prefix_pending(
+            &state_for_stream,
+            &upstream_request_diagnostics,
+            prefix_state_key.as_deref(),
+            warm_pending_committed_head.as_ref(),
+            raw_final_scope_usage,
+            stream_success_for_cache,
+            confirmed_compaction,
+        )
+        .await;
         if let Some(publication) = terminal_publication.take() {
             publication.finish();
         }

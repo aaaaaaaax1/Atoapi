@@ -34,7 +34,7 @@ use crate::{
         cache_affinity::ShadowAffinityStore,
         cache_validation::CacheValidationController,
         final_scope_waterline::{FinalScopeObservationRegistry, FinalScopeWaterlineLedger},
-        DispatchDrainOutcome, DispatchTracker, TransportClients,
+        DispatchDrainOutcome, DispatchTracker, TransportClients, WarmPendingRegistry,
     },
 };
 
@@ -82,6 +82,10 @@ pub struct AppState {
     /// request path so it can never delay upstream dispatch.
     pub final_scope_waterlines: StdMutex<FinalScopeWaterlineLedger>,
     pub final_scope_observations: FinalScopeObservationRegistry,
+    /// Bounded process-only state for rare giant-prefix cache warm-up.  This is
+    /// deliberately kept out of runtime persistence: it is valid only for the
+    /// exact continuation heads accepted by the current process.
+    pub warm_pending: Mutex<WarmPendingRegistry>,
     #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
@@ -534,6 +538,7 @@ impl AppState {
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
             final_scope_observations: FinalScopeObservationRegistry::default(),
+            warm_pending: Mutex::new(WarmPendingRegistry::default()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
@@ -584,6 +589,7 @@ impl AppState {
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
             final_scope_observations: FinalScopeObservationRegistry::default(),
+            warm_pending: Mutex::new(WarmPendingRegistry::default()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
             request_body_gzip_cooldowns: Mutex::new(HashMap::new()),

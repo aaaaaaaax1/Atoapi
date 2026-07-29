@@ -134,7 +134,10 @@ impl PrefixController {
         if !input.source_is_exact {
             return skip("non_exact_prefix_state", false);
         }
-        if input.settle_after_cold_read && input.state_age < MAX_FOREGROUND_WAIT {
+        if input.settle_after_cold_read
+            && input.cache_instability_score < 8
+            && input.state_age < MAX_FOREGROUND_WAIT
+        {
             let request_budget = input.request_budget.min(MAX_FOREGROUND_WAIT);
             if request_budget.is_zero() {
                 return blocked_recovery("local_guard_budget_exhausted");
@@ -253,6 +256,7 @@ impl PrefixController {
                 || input.tail.message_chars >= 80_000;
         let cold_read_after_warm = small_context_cold_read_after_warm(input.previous_exact, record)
             || provider_prefix_break_after_warm_state(input.previous_exact, record)
+            || repeated_giant_cold_read_after_pending(input.previous_exact, record)
             || (provider_prefix_break_after_warm_state(input.previous_best, record)
                 && cold_read_has_unreliable_dynamic_tail)
             || (input.previous_exact.is_none()
@@ -358,6 +362,8 @@ impl PrefixController {
                 && (record.input_tokens >= 32_000 || responses_tool_tail_burst(input.tail));
         let huge_dynamic_history_cold_read =
             responses_huge_dynamic_history_cold_read(record, input.tail);
+        let repeated_giant_cold_read =
+            repeated_giant_cold_read_after_pending(input.previous, record);
         let weak_full_retry_after_session_delta =
             provider_prefix_weak_full_retry_after_session_delta(
                 input.previous,
@@ -367,6 +373,7 @@ impl PrefixController {
         if prefix_break_after_warm
             || weak_full_retry_after_session_delta
             || huge_dynamic_history_cold_read
+            || repeated_giant_cold_read
         {
             let mut preserved = input.previous.cloned().unwrap_or_else(|| PrefixWarmState {
                 finished_at: Instant::now(),
@@ -389,7 +396,10 @@ impl PrefixController {
                 responses_static_projection_digest: responses_static_projection_digest.clone(),
             });
             preserved.finished_at = Instant::now();
-            let instability_bump = if prefix_break_after_warm || huge_dynamic_history_cold_read {
+            let instability_bump = if prefix_break_after_warm
+                || huge_dynamic_history_cold_read
+                || repeated_giant_cold_read
+            {
                 2
             } else {
                 1
@@ -398,8 +408,9 @@ impl PrefixController {
                 .cache_instability_score
                 .saturating_add(instability_bump)
                 .min(8);
-            preserved.settle_after_cold_read =
-                prefix_break_after_warm || huge_dynamic_history_cold_read;
+            preserved.settle_after_cold_read = prefix_break_after_warm
+                || huge_dynamic_history_cold_read
+                || repeated_giant_cold_read;
             preserved.shortfall_tokens = provider_cache_shortfall(record);
             preserved.shortfall_tokens_128 = provider_cache_shortfall_128(record);
             preserved.avoidable_shortfall_tokens = 0;
@@ -579,6 +590,27 @@ impl PrefixController {
             static_wire_drift: false,
         }
     }
+}
+
+/// A giant root may be cold while the upstream materialises its cache.  Its
+/// next exact children carry only small appended tails, so they no longer meet
+/// the original "huge dynamic tail" detector.  Keep the short-lived cold
+/// evidence intact until a real cache recovery rather than learning the tiny
+/// cache read as a new baseline and misreporting the old prefix as user input.
+fn repeated_giant_cold_read_after_pending(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    previous.settle_after_cold_read
+        && previous.input_tokens >= 128_000
+        && previous.cache_read_tokens <= 4_096
+        && record.input_tokens >= 128_000
+        && record.cache_read_tokens <= 4_096
+        && provider_cache_shortfall(record) >= 65_536
+        && provider_cache_ratio(record).unwrap_or_default() < 0.05
 }
 
 fn static_projection_drifted(
@@ -1644,5 +1676,101 @@ mod tests {
             .next
             .expect("successful usage must update state");
         assert_eq!(next.cache_instability_score, 8);
+    }
+
+    #[test]
+    fn repeated_exact_giant_cold_reads_stay_provider_unstable_until_recovery() {
+        let root = UsageRecord {
+            input_tokens: 272_621,
+            cache_read_tokens: 3_801,
+            ..UsageRecord::default()
+        };
+        let root_tail = TailInputDiagnostics {
+            input_items: 666,
+            message_chars: 140_000,
+            tool_output_chars: 580_000,
+            largest_tool_output_chars: 58_000,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let root_state = PrefixController::observe(PrefixStateInput {
+            previous: None,
+            usage: &root,
+            tail: &root_tail,
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
+        })
+        .next
+        .expect("a giant cold root must leave a guarded state");
+        assert!(root_state.settle_after_cold_read);
+
+        let mut previous = root_state;
+        for input_tokens in [278_424, 281_839, 283_954] {
+            let repeated_cold = UsageRecord {
+                input_tokens,
+                cache_read_tokens: 3_801,
+                ..UsageRecord::default()
+            };
+            let gap = PrefixController::classify_gap(PrefixGapInput {
+                previous_exact: Some(&previous),
+                previous_best: Some(&previous),
+                previous_family: None,
+                usage: &repeated_cold,
+                tail: &TailInputDiagnostics::default(),
+                guard_budget_exhausted: false,
+                pre_request_avoidable_tokens: 0,
+                recovery_applicable: false,
+                exact_settle_window_elapsed: false,
+                static_wire_drift: false,
+            });
+            assert_eq!(gap.new_tail_tokens, 0);
+            assert_eq!(gap.avoidable_tokens, 0);
+            assert_eq!(gap.provider_unstable_tokens, gap.total_tokens);
+
+            previous = PrefixController::observe(PrefixStateInput {
+                previous: Some(&previous),
+                usage: &repeated_cold,
+                tail: &TailInputDiagnostics::default(),
+                used_response_session: false,
+                retried_full_response: false,
+                guard_budget_exhausted: false,
+                exact_settle_window_elapsed: false,
+                final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
+            })
+            .next
+            .expect("a repeated giant cold read must retain the pending state");
+            assert!(previous.settle_after_cold_read);
+        }
+        assert_eq!(previous.cache_instability_score, 8);
+        let exhausted = PrefixController::before_request(PrefixControlInput {
+            cache_instability_score: previous.cache_instability_score,
+            settle_after_cold_read: previous.settle_after_cold_read,
+            ..input(0)
+        });
+        assert_eq!(exhausted.wait, Duration::ZERO);
+        assert_eq!(exhausted.skip_reason, Some("no_avoidable_gap"));
+
+        let recovered = UsageRecord {
+            input_tokens: 285_637,
+            cache_read_tokens: 278_080,
+            ..UsageRecord::default()
+        };
+        let next = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &recovered,
+            tail: &TailInputDiagnostics::default(),
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::NotApplicable,
+        })
+        .next
+        .expect("a recovered read must settle the prefix state");
+        assert!(!next.settle_after_cold_read);
+        assert!(next.cache_read_tokens >= 278_080);
     }
 }

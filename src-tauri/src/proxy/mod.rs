@@ -81,6 +81,7 @@ mod streaming_responses_anthropic;
 mod streaming_responses_chat;
 mod transform_codex_chat;
 mod transport;
+mod warm_pending;
 #[cfg(test)]
 mod wire_fixture_tests;
 use action_scope::{ActionScopeInput, CompositeActionScope};
@@ -127,6 +128,8 @@ use settlement_pipeline::{
     AgentOwnerSettlementGuard,
 };
 pub(crate) use transport::TransportClients;
+use warm_pending::WarmPendingClaim;
+pub(crate) use warm_pending::WarmPendingRegistry;
 #[cfg(test)]
 const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
 #[cfg(test)]
@@ -278,6 +281,10 @@ struct UpstreamRequestDiagnostics {
     final_wire_receipt: Option<FinalWireReceipt>,
     final_scope_shadow: Option<FinalScopeShadowReceipt>,
     final_scope_waterline: Option<FinalScopeWaterlineLog>,
+    // Process-local warm-up coordination. These opaque values are never
+    // persisted, logged, routed, or sent upstream.
+    warm_pending_scope_digest: Option<String>,
+    warm_pending_claim: Option<WarmPendingClaim>,
 }
 impl UpstreamRequestDiagnostics {
     fn absorb(&mut self, next: &UpstreamRequestDiagnostics) {
@@ -337,6 +344,12 @@ impl UpstreamRequestDiagnostics {
         }
         if next.final_scope_waterline.is_some() {
             self.final_scope_waterline = next.final_scope_waterline.clone();
+        }
+        if next.warm_pending_scope_digest.is_some() {
+            self.warm_pending_scope_digest = next.warm_pending_scope_digest.clone();
+        }
+        if next.warm_pending_claim.is_some() {
+            self.warm_pending_claim = next.warm_pending_claim.clone();
         }
     }
 }
@@ -2602,7 +2615,7 @@ async fn run_generation_for_authorized_agent(
         );
     }
     let local_prepare_ms = started.elapsed().as_millis() as u64;
-    let prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
+    let mut prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
         wait_for_provider_prefix_settle(
             &state,
             &decision.upstream_channel,
@@ -3098,6 +3111,44 @@ async fn run_generation_for_authorized_agent(
             active_channel: &active_request_channel,
             final_wire: &final_wire_receipt,
         });
+    upstream_request_diagnostics.warm_pending_scope_digest = upstream_request_diagnostics
+        .final_scope_shadow
+        .as_ref()
+        .filter(|receipt| receipt.eligible_for_shadow_observation)
+        .map(|receipt| receipt.digest.clone());
+    let warm_pending_predecessor = final_scope_predecessor.clone();
+    if let Some(claim) = {
+        let mut warm_pending = state.warm_pending.lock().await;
+        warm_pending.claim(
+            prefix_state_update_key.as_deref(),
+            upstream_request_diagnostics
+                .warm_pending_scope_digest
+                .as_deref(),
+            final_scope_waterline_is_full_replay,
+            &warm_pending_predecessor,
+        )
+    } {
+        // The ordinary 500ms exact-prefix settle may already have run earlier
+        // in preparation.  The rare giant-cold controller tops that up to a
+        // hard 2s total, never sleeps while holding state and never dispatches
+        // another upstream request.
+        let already_waited = TokioDuration::from_millis(prefix_guard_wait.wait_ms);
+        let wait = claim.wait_duration().saturating_sub(already_waited);
+        // Claiming removes the entry so sibling requests never queue.  Keep
+        // the claim even when its window has just expired: terminal
+        // settlement must then consume it rather than mistakenly arming a
+        // fresh three-request window as if this were a new cold root.
+        upstream_request_diagnostics.warm_pending_claim = Some(claim);
+        if !wait.is_zero() {
+            sleep(wait).await;
+            prefix_guard_wait.wait_ms = prefix_guard_wait
+                .wait_ms
+                .saturating_add(wait.as_millis() as u64);
+            prefix_guard_wait.reason = Some("responses_giant_cold_prefix_warm_pending".to_string());
+            prefix_guard_wait.source = Some("exact".to_string());
+            prefix_guard_wait.skip_reason = None;
+        }
+    }
     let mut final_scope_dispatch = begin_final_scope_waterline(
         &state,
         upstream_request_diagnostics.final_scope_shadow.as_ref(),
@@ -3862,6 +3913,7 @@ async fn run_generation_for_authorized_agent(
         response_session_update.as_ref(),
         response_session_response_id.as_deref(),
     );
+    let warm_pending_committed_head = committed_head.clone();
     let rebased_from_head = rebased_waterline_control_head(
         response_session_lease.as_ref(),
         response_session_update.as_ref(),
@@ -3876,6 +3928,16 @@ async fn run_generation_for_authorized_agent(
                 rebased_from_head,
             )
         });
+    settle_giant_cold_prefix_pending(
+        &state,
+        &upstream_request_diagnostics,
+        prefix_state_update_key.as_deref(),
+        warm_pending_committed_head.as_ref(),
+        usage_record.as_ref(),
+        is_success_status,
+        confirmed_compaction,
+    )
+    .await;
     let final_responses_static_projection = if matches!(active_request_channel, Channel::Responses)
     {
         FinalResponsesStaticProjection::Observed(
@@ -4883,6 +4945,30 @@ fn provider_prefix_wait_reason_for_channel(
 
 fn responses_foreground_wait_cap() -> TokioDuration {
     TokioDuration::from_millis(500)
+}
+
+async fn settle_giant_cold_prefix_pending(
+    state: &AppState,
+    upstream_request_diagnostics: &UpstreamRequestDiagnostics,
+    prefix_control_key: Option<&str>,
+    committed_head: Option<&WaterlineControlHead>,
+    raw_usage: Option<&UsageRecord>,
+    upstream_succeeded: bool,
+    confirmed_compaction: bool,
+) {
+    let mut warm_pending = state.warm_pending.lock().await;
+    warm_pending.settle(
+        upstream_request_diagnostics.warm_pending_claim.as_ref(),
+        prefix_control_key,
+        upstream_request_diagnostics
+            .warm_pending_scope_digest
+            .as_deref(),
+        upstream_request_diagnostics.final_scope_waterline.as_ref(),
+        committed_head,
+        raw_usage,
+        upstream_succeeded,
+        confirmed_compaction,
+    );
 }
 
 fn responses_exact_prefix_is_high_hit(state: &PrefixWarmState) -> bool {

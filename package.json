@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.4.9",
+  "version": "1.4.10",
   "private": true,
   "type": "module",
   "scripts": {
@@ -18,6 +18,7 @@
     "test:isolated-wire-compat": "node scripts/verify-isolated-wire-compat.mjs",
     "test:isolated-wire-stress": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12",
     "test:isolated-wire-header-concurrency": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12 --gate-headers",
+    "test:giant-cold-warm-pending": "node scripts/verify-giant-cold-warm-pending.mjs",
     "test:terminal-handoff": "node scripts/verify-terminal-publication-handoff.mjs",
     "verify:idless-control-prefix": "node scripts/verify-missing-response-id-control-prefix.mjs",
     "test:release-champion": "node scripts/verify-release-champion.mjs --self-test",
