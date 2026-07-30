@@ -47,6 +47,7 @@ export interface GraphiteProviderPayload {
   prompt_cache_retention_enabled: boolean;
   request_body_gzip_enabled: boolean;
   non_sse_compact_compat_enabled: boolean;
+  auto_compact_token_limit?: number | null;
   models: Array<{
     id: string;
     request_model_id?: string | null;
@@ -388,6 +389,12 @@ const bridgeSource = String.raw`
     setSwitch("prompt cache retention", detail?.prompt_cache_retention_enabled ?? true);
     setSwitch("大请求体 gzip", detail?.request_body_gzip_enabled ?? true);
     setSwitch("非 SSE compact 兼容", detail?.non_sse_compact_compat_enabled || false);
+    const autoCompactLimit = $bridge("#providerAutoCompactTokenLimit");
+    if (autoCompactLimit) {
+      autoCompactLimit.value = detail?.auto_compact_token_limit
+        ? String(detail.auto_compact_token_limit)
+        : "";
+    }
     setKeyPoolEnabled(detail?.key_pool?.enabled === true);
     applyCacheValidation(detail);
     applyNetworkDiagnostic(detail?.network_diagnostic);
@@ -561,6 +568,13 @@ const bridgeSource = String.raw`
     }).filter((mapping) => mapping.id);
     const strategy = strategyFromUi($bridge("#providerKeys .form-grid select")?.value || "顺序");
     const failureThreshold = Number($bridge("#providerKeys .form-grid input")?.value) || 3;
+    const autoCompactValue = $bridge("#providerAutoCompactTokenLimit")?.value.trim() || "";
+    const autoCompactTokenLimit = autoCompactValue
+      ? Math.trunc(Number(autoCompactValue))
+      : null;
+    if (autoCompactValue && (!Number.isFinite(autoCompactTokenLimit) || autoCompactTokenLimit <= 0)) {
+      throw new Error("自动压缩阈值必须是大于 0 的 token 整数");
+    }
     const orderedKeys = keyPool.filter((key) => !key.isNew || String(key.secret || "").trim());
     const keys = orderedKeys.map((key) => {
       const priority = Number(key.priority);
@@ -590,6 +604,7 @@ const bridgeSource = String.raw`
       prompt_cache_retention_enabled: switchState("prompt cache retention", detail.prompt_cache_retention_enabled ?? true),
       request_body_gzip_enabled: switchState("大请求体 gzip", detail.request_body_gzip_enabled ?? true),
       non_sse_compact_compat_enabled: switchState("非 SSE compact 兼容", detail.non_sse_compact_compat_enabled || false),
+      auto_compact_token_limit: autoCompactTokenLimit,
       models: formModels,
       keys,
       key_pool: {
@@ -1833,6 +1848,7 @@ function buildState(
     prompt_cache_retention_enabled: provider.prompt_cache_retention_enabled,
     request_body_gzip_enabled: provider.request_body_gzip_enabled,
     non_sse_compact_compat_enabled: provider.non_sse_compact_compat_enabled,
+    auto_compact_token_limit: provider.auto_compact_token_limit ?? null,
     key_pool: provider.key_pool
       ? {
           enabled: provider.key_pool.enabled,

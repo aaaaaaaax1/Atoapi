@@ -97,7 +97,7 @@ async function runLiveComparison(options) {
     );
   }
   const pairs = boundedInteger(options.pairs ?? 2, "--pairs", 1, 8);
-  const turns = boundedInteger(options.turns ?? 6, "--turns", 4, 60);
+  const turns = boundedInteger(options.turns ?? 6, "--turns", 3, 60);
   const requestedPort = boundedInteger(options.port ?? 18_885, "--port", 1_024, 65_500);
   if (requestedPort === 18_883) {
     throw new FailClosedError(
@@ -115,9 +115,21 @@ async function runLiveComparison(options) {
     options["stable-instruction-chars"] ?? 16_384,
     "--stable-instruction-chars",
     1_024,
-    160_000
+    200_000
   );
   const toolChars = boundedInteger(options["tool-chars"] ?? 32_768, "--tool-chars", 1_024, 512_000);
+  const turnDelayMs = boundedInteger(
+    options["turn-delay-ms"] ?? 0,
+    "--turn-delay-ms",
+    0,
+    5_000
+  );
+  const requireCandidateGuardedRequests = boundedInteger(
+    options["require-candidate-guarded-requests"] ?? 0,
+    "--require-candidate-guarded-requests",
+    0,
+    turns
+  );
   const maxTtftRegressionMs = boundedInteger(
     options["max-ttft-regression-ms"] ?? 0,
     "--max-ttft-regression-ms",
@@ -168,6 +180,8 @@ async function runLiveComparison(options) {
     max_output_tokens: maxOutputTokens,
     stable_instruction_chars: stableInstructionChars,
     tool_chars: toolChars,
+    turn_delay_ms: turnDelayMs,
+    require_candidate_guarded_requests: requireCandidateGuardedRequests,
     client_prompt_cache_key: Boolean(options["prompt-cache-key-prefix"]),
     max_ttft_regression_ms: maxTtftRegressionMs
   };
@@ -278,25 +292,26 @@ async function exerciseScenario(spec) {
   };
   const sessionId = `release-champion-${spec.arm}-${spec.pair}-${spec.lane.slice(0, 12)}`;
   const threadId = `release-champion-thread-${spec.pair}-${spec.lane.slice(12, 24)}`;
-  const stableInstructions = buildStableInstructions(spec.settings.stable_instruction_chars, spec.lane);
+  const stableInstructions = buildStableInstructions(spec.settings.stable_instruction_chars);
   const requests = [];
   let fatal = null;
 
   for (let turn = 0; turn < spec.settings.turns; turn += 1) {
     let requestKind = "turn";
     let phase = turn === 0 ? "seed" : `followup-${turn}`;
-    if (turn > 0 && spec.settings.scenario === "tool-burst" && turn === 1) {
+    const toolTailMaturityTurn = spec.settings.scenario === "tool-tail-maturity" && turn === 2;
+    if (turn > 0 && (spec.settings.scenario === "tool-burst" && turn === 1 || toolTailMaturityTurn)) {
       const callId = `call_${spec.lane.slice(0, 20)}`;
       state.input.push(
         { type: "function_call", call_id: callId, name: "read_release_fixture", arguments: "{}" },
         {
           type: "function_call_output",
           call_id: callId,
-          output: buildToolOutput(spec.settings.tool_chars, spec.lane)
+          output: buildToolOutput(spec.settings.tool_chars)
         },
         message("Use the completed tool output. Reply with OK only.")
       );
-      phase = "tool-burst";
+      phase = toolTailMaturityTurn ? "tool-tail-maturity" : "tool-burst";
     } else if (turn > 0 && spec.settings.scenario === "compacted-anchor" && turn === 1) {
       state.input.push({ type: "compaction_trigger" });
       requestKind = "compaction";
@@ -331,6 +346,9 @@ async function exerciseScenario(spec) {
       state.input = compacted;
       state.compactionSeen = true;
     }
+    if (turn + 1 < spec.settings.turns && spec.settings.turn_delay_ms > 0) {
+      await delay(spec.settings.turn_delay_ms);
+    }
   }
 
   const run = buildDynamicRun({
@@ -340,6 +358,9 @@ async function exerciseScenario(spec) {
     executable: spec.executable,
     scenario: spec.settings.scenario,
     promptCacheKeyUsed: Boolean(spec.promptCacheKey),
+    minimumGuardedRequests: spec.arm === "candidate"
+      ? spec.settings.require_candidate_guarded_requests
+      : 0,
     requests,
     fatal,
     compactionSeen: state.compactionSeen
@@ -456,6 +477,12 @@ async function sendOneInbound(spec) {
     cache_avoidable_gap_tokens: number(metric?.cache_avoidable_gap_tokens),
     cache_new_tail_gap_tokens: number(metric?.cache_new_tail_gap_tokens),
     cache_shortfall_tokens: number(metric?.cache_shortfall_tokens),
+    // Keep the local and upstream portions separate in the release evidence.
+    // This is diagnostic only: the release gate below still evaluates total
+    // TTFT, so an upstream regression cannot be silently reclassified away.
+    prefix_guard_wait_ms: number(metric?.prefix_guard_wait_ms),
+    local_prepare_ms: number(metric?.local_prepare_ms),
+    upstream_ttft_ms: number(metric?.upstream_ttft_ms),
     ttft_ms: number(metric?.ttft_ms),
     upstream_attempt_index: metric?.upstream_attempt_index ?? null,
     upstream_attempt_total: metric?.upstream_attempt_total ?? null,
@@ -553,6 +580,12 @@ function buildDynamicRun(input) {
     avoidable_gap_tokens: sum(comparable, "cache_avoidable_gap_tokens"),
     new_tail_gap_tokens: sum(comparable, "cache_new_tail_gap_tokens"),
     shortfall_tokens: sum(comparable, "cache_shortfall_tokens"),
+    guarded_requests: comparable.filter((item) => number(item.prefix_guard_wait_ms) > 0).length,
+    local_proxy_overhead_p95_ms: percentile(
+      comparable.map((item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)),
+      95
+    ),
+    upstream_ttft_p95_ms: percentile(comparable.map((item) => item.upstream_ttft_ms), 95),
     ttft_p95_ms: percentile(comparable.map((item) => item.ttft_ms), 95),
     usage_coverage: usageCoverage,
     observed_realm_ids: observedRealms
@@ -568,6 +601,8 @@ function buildDynamicRun(input) {
     warm_stable_prefix_evidence_present: warmCacheableTokens > 0,
     one_observed_key_realm: observedRealms.length === 1,
     avoidable_gap_zero: metrics.avoidable_gap_tokens === 0,
+    required_guarded_requests:
+      metrics.guarded_requests >= number(input.minimumGuardedRequests),
     compaction_observed: input.scenario !== "compacted-anchor" || input.compactionSeen === true
   };
   return {
@@ -621,7 +656,6 @@ function aggregateArm(arm, cohort, executable, runs) {
   const normalized = runs.map((run) => validateDynamicRun(run, arm));
   const metrics = emptyMetrics();
   const observedRealms = [];
-  const ttftSamples = [];
   for (const run of normalized) {
     const source = run.metrics;
     for (const key of [
@@ -635,11 +669,11 @@ function aggregateArm(arm, cohort, executable, runs) {
       "warm_stable_prefix_cached_tokens_128",
       "avoidable_gap_tokens",
       "new_tail_gap_tokens",
-      "shortfall_tokens"
+      "shortfall_tokens",
+      "guarded_requests"
     ]) {
       metrics[key] += number(source[key]);
     }
-    ttftSamples.push(number(source.ttft_p95_ms));
     metrics.cacheable_request_count += number(source.cacheable_request_count);
     metrics.full_bucket_denominator += number(source.full_bucket_denominator);
     observedRealms.push(...array(source.observed_realm_ids));
@@ -666,7 +700,16 @@ function aggregateArm(arm, cohort, executable, runs) {
   metrics.full_bucket_rate = ratio(metrics.full_bucket_requests, cacheableRows.length);
   metrics.cacheable_request_count = cacheableRows.length;
   metrics.full_bucket_denominator = cacheableRows.length;
-  metrics.ttft_p95_ms = percentile(ttftSamples, 95);
+  const comparableRows = retainedRequests.filter((item) => number(item.input_tokens) > 0);
+  metrics.local_proxy_overhead_p95_ms = percentile(
+    comparableRows.map((item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)),
+    95
+  );
+  metrics.upstream_ttft_p95_ms = percentile(
+    comparableRows.map((item) => number(item.upstream_ttft_ms)),
+    95
+  );
+  metrics.ttft_p95_ms = percentile(comparableRows.map((item) => number(item.ttft_ms)), 95);
   metrics.usage_coverage = normalized.length > 0 && normalized.every(
     (run) => number(run.metrics?.usage_coverage) === 1
   ) ? 1 : 0;
@@ -934,6 +977,9 @@ function emptyMetrics() {
     avoidable_gap_tokens: 0,
     new_tail_gap_tokens: 0,
     shortfall_tokens: 0,
+    guarded_requests: 0,
+    local_proxy_overhead_p95_ms: 0,
+    upstream_ttft_p95_ms: 0,
     ttft_p95_ms: 0,
     usage_coverage: 0,
     observed_realm_ids: []
@@ -953,15 +999,17 @@ function message(text) {
   };
 }
 
-function buildStableInstructions(targetChars, lane) {
-  const prefix = `Release-cache validation lane ${lane.slice(0, 24)}. Preserve the supplied history. `;
+function buildStableInstructions(targetChars) {
+  // The lane belongs only in the opaque prompt cache key. Keeping the body
+  // identical across arms makes raw upstream token telemetry comparable.
+  const prefix = "Release-cache validation fixture. Preserve the supplied history. ";
   const unit = "Follow the existing instructions exactly; reply with OK only when asked. ";
   return (prefix + unit.repeat(Math.ceil(Math.max(0, targetChars - prefix.length) / unit.length)))
     .slice(0, targetChars);
 }
 
-function buildToolOutput(targetChars, lane) {
-  const unit = `tool-output:${lane.slice(0, 16)}: stable release validation data; `;
+function buildToolOutput(targetChars) {
+  const unit = "tool-output: stable release validation data; ";
   return unit.repeat(Math.ceil(targetChars / unit.length)).slice(0, targetChars);
 }
 
@@ -1015,13 +1063,14 @@ function requestFamilyForScenario(scenario) {
   return {
     "full-replay": "codex-responses-full-replay",
     "tool-burst": "codex-responses-tool-burst",
+    "tool-tail-maturity": "codex-responses-tool-burst",
     "compacted-anchor": "codex-responses-compacted-anchor"
   }[scenario];
 }
 
 function normalizeScenario(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  return new Set(["full-replay", "tool-burst", "compacted-anchor"]).has(normalized)
+  return new Set(["full-replay", "tool-burst", "tool-tail-maturity", "compacted-anchor"]).has(normalized)
     ? normalized
     : null;
 }
@@ -1294,7 +1343,7 @@ function printUsage() {
     --champion-exe <old.exe> --candidate-exe <new.exe> \\
     --source-config-dir <Atoapi-config-dir> --model <model> \\
     --key-realm-hash <opaque-hash> [--provider-id <id>] \\
-    [--scenario full-replay|tool-burst|compacted-anchor] [--pairs 2] [--turns 6]
+    [--scenario full-replay|tool-burst|tool-tail-maturity|compacted-anchor] [--pairs 2] [--turns 6]
 
 Offline comparison (does not start any process):
   node scripts/verify-release-champion.mjs \\
@@ -1318,6 +1367,7 @@ function runSelfTest() {
   assert.equal(cacheableInputTokens128(1_151), 1_024);
   assert.equal(cacheableInputTokens128(1_152), 1_152);
   assert.equal(normalizeScenario("tool_burst"), "tool-burst");
+  assert.equal(normalizeScenario("tool_tail_maturity"), "tool-tail-maturity");
   assert.equal(requestFamilyForScenario("full-replay"), "codex-responses-full-replay");
   const cohort = {
     provider_id: "provider-a",

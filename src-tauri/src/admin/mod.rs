@@ -2592,6 +2592,8 @@ mod tests {
             request_body_gzip_enabled: true,
             use_system_proxy: true,
             non_sse_compact_compat_enabled: false,
+            auto_compact_token_limit: None,
+            auto_compact_token_limit_configured: false,
             api_key: None,
             key_pool: None,
             enabled: true,

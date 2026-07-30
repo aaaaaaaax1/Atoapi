@@ -15,6 +15,12 @@ use super::{
 };
 
 const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
+// A provider cache commit can outlive the first 500ms local handoff window.
+// This longer boundary is deliberately limited to an already-exact, already
+// high-hit Responses prefix with a material tool tail in the observed narrow
+// 500ms..1s interval. Every other guard branch remains capped at
+// MAX_FOREGROUND_WAIT.
+const MAX_EXACT_COMMIT_MATURITY_WAIT: Duration = Duration::from_secs(1);
 const MAX_EXACT_EVIDENCE_AGE: Duration = Duration::from_secs(30);
 const MIN_REPEATED_AVOIDABLE_STREAK: u32 = 2;
 pub(super) const MIN_CLEAN_TINY_RECOVERY_STREAK: u32 = 2;
@@ -36,6 +42,9 @@ pub(super) struct PrefixControlInput {
     pub cache_instability_score: u32,
     pub tiny_instability_recovery_safe: bool,
     pub current_tail_is_settle_safe: bool,
+    /// Only material tool output has shown the short post-handoff cache-commit
+    /// loss this branch is intended to prevent.
+    pub current_tail_has_commit_maturity_risk: bool,
     pub settle_after_cold_read: bool,
     pub compaction_requested: bool,
     pub state_age: Duration,
@@ -183,6 +192,22 @@ impl PrefixController {
                 && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
             {
                 return settle_for_remaining_window(input, "responses_fresh_exact_prefix_settle");
+            }
+            // The observed cache-commit loss is confined to the 500ms..1s
+            // post-handoff window. Do not broaden the ordinary wait: only
+            // this precise exact/high-hit interval may wait until the bounded
+            // one-second maturity point.
+            if !input.compaction_requested
+                && input.recent_exact_high_hit
+                && input.current_tail_has_commit_maturity_risk
+                && input.state_age >= MAX_FOREGROUND_WAIT
+                && input.state_age < MAX_EXACT_COMMIT_MATURITY_WAIT
+                && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
+            {
+                return settle_for_exact_commit_maturity_window(
+                    input,
+                    "responses_exact_commit_maturity_settle",
+                );
             }
             return skip("no_avoidable_gap", false);
         }
@@ -847,6 +872,25 @@ fn settle_for_observed_gap_window(
     }
 }
 
+fn settle_for_exact_commit_maturity_window(
+    input: PrefixControlInput,
+    reason: &'static str,
+) -> PrefixControlDecision {
+    let request_budget = input.request_budget.min(MAX_EXACT_COMMIT_MATURITY_WAIT);
+    if request_budget.is_zero() {
+        return blocked_recovery("local_guard_budget_exhausted");
+    }
+    let requested = MAX_EXACT_COMMIT_MATURITY_WAIT.saturating_sub(input.state_age);
+    let wait = requested.min(request_budget);
+    PrefixControlDecision {
+        wait,
+        reason: Some(reason),
+        skip_reason: None,
+        budget_exhausted: wait < requested,
+        recovery_applicable: true,
+    }
+}
+
 fn skip(reason: &'static str, budget_exhausted: bool) -> PrefixControlDecision {
     PrefixControlDecision {
         wait: Duration::ZERO,
@@ -881,6 +925,7 @@ mod tests {
             cache_instability_score: 0,
             tiny_instability_recovery_safe: false,
             current_tail_is_settle_safe: true,
+            current_tail_has_commit_maturity_risk: false,
             settle_after_cold_read: false,
             compaction_requested: false,
             state_age: Duration::ZERO,
@@ -933,6 +978,71 @@ mod tests {
             Some("responses_fresh_exact_prefix_settle")
         );
         assert_eq!(unsafe_tail.skip_reason, None);
+    }
+
+    #[test]
+    fn exact_high_hit_post_handoff_waits_only_until_commit_maturity() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            current_tail_has_commit_maturity_risk: true,
+            state_age: Duration::from_millis(700),
+            request_budget: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            ..input(0)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(300));
+        assert_eq!(
+            decision.reason,
+            Some("responses_exact_commit_maturity_settle")
+        );
+        assert!(!decision.budget_exhausted);
+
+        let capped = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            current_tail_has_commit_maturity_risk: true,
+            state_age: Duration::from_millis(700),
+            request_budget: Duration::from_millis(200),
+            ..input(0)
+        });
+        assert_eq!(capped.wait, Duration::from_millis(200));
+        assert!(capped.budget_exhausted);
+
+        let ordinary = PrefixController::before_request(PrefixControlInput {
+            state_age: Duration::from_millis(700),
+            request_budget: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            ..input(0)
+        });
+        assert_eq!(ordinary.wait, Duration::ZERO);
+        assert_eq!(ordinary.skip_reason, Some("no_avoidable_gap"));
+
+        let compact = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            current_tail_has_commit_maturity_risk: true,
+            compaction_requested: true,
+            state_age: Duration::from_millis(700),
+            request_budget: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            ..input(0)
+        });
+        assert_eq!(compact.wait, Duration::ZERO);
+        assert_eq!(compact.skip_reason, Some("no_avoidable_gap"));
+
+        let mature = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            current_tail_has_commit_maturity_risk: true,
+            state_age: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            request_budget: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            ..input(0)
+        });
+        assert_eq!(mature.wait, Duration::ZERO);
+        assert_eq!(mature.skip_reason, Some("no_avoidable_gap"));
+
+        let ordinary_tail = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            state_age: Duration::from_millis(700),
+            request_budget: MAX_EXACT_COMMIT_MATURITY_WAIT,
+            ..input(0)
+        });
+        assert_eq!(ordinary_tail.wait, Duration::ZERO);
+        assert_eq!(ordinary_tail.skip_reason, Some("no_avoidable_gap"));
     }
 
     #[test]
@@ -1584,6 +1694,7 @@ mod tests {
             tiny_instability_recovery_safe: next.recent_clean_tiny_gap_streak
                 >= MIN_CLEAN_TINY_RECOVERY_STREAK,
             current_tail_is_settle_safe: true,
+            current_tail_has_commit_maturity_risk: false,
             settle_after_cold_read: next.settle_after_cold_read,
             compaction_requested: false,
             state_age: Duration::ZERO,

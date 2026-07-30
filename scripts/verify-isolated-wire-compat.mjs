@@ -10,9 +10,10 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
-const sourceConfigDir = resolve(
-  String(args["source-config-dir"] ?? defaultConfigDir())
-);
+const syntheticConfig = booleanArg(args["synthetic-config"]);
+const sourceConfigDir = syntheticConfig
+  ? null
+  : resolve(String(args["source-config-dir"] ?? defaultConfigDir()));
 const oldExecutable = resolve(
   String(
     args["old-exe"] ??
@@ -31,9 +32,14 @@ const newExecutable = resolve(
 const model = String(args.model ?? "gpt-5.6-terra").trim();
 const concurrency = boundedPositiveInteger(args.concurrency ?? 1, "--concurrency", 32);
 const gateHeaders = booleanArg(args["gate-headers"]);
+const scenario = String(args.scenario ?? "ordinary").trim().toLowerCase();
 const baselineLabel = basename(dirname(oldExecutable));
+const COMMIT_MATURITY_PROBE_DELAY_MS = 700;
 
 if (!model) throw new Error("--model must not be empty");
+if (!new Set(["ordinary", "lineage-recovery", "commit-maturity"]).has(scenario)) {
+  throw new Error("--scenario must be ordinary, lineage-recovery, or commit-maturity");
+}
 if (!existsSync(oldExecutable)) {
   throw new Error(`wire baseline executable is missing: ${oldExecutable}`);
 }
@@ -43,11 +49,20 @@ if (!existsSync(newExecutable)) {
 if (gateHeaders && concurrency < 2) {
   throw new Error("--gate-headers requires --concurrency of at least 2");
 }
+if (gateHeaders && scenario !== "ordinary") {
+  throw new Error("--gate-headers is supported only by the ordinary scenario");
+}
+if (scenario !== "ordinary" && concurrency !== 1) {
+  throw new Error(`--scenario ${scenario} requires --concurrency 1`);
+}
 
 let upstream = null;
 let upstreamPort = null;
 let tempRoot = null;
 let headerGate = null;
+let activeMockArm = null;
+let activeMockScenario = null;
+const mockTurnByArm = new Map();
 
 try {
   const captured = [];
@@ -69,7 +84,11 @@ try {
     }
     // Deliberately never retain or print Authorization. The test is interested
     // only in the final request JSON and request count.
+    const arm = activeMockArm ?? "unknown";
+    const turn = (mockTurnByArm.get(arm) ?? 0) + 1;
+    mockTurnByArm.set(arm, turn);
     captured.push({
+      arm,
       body: parsed,
       requestKind: String(request.headers["x-atoapi-request-kind"] ?? ""),
       headers: safeHeaders(request.headers)
@@ -79,12 +98,41 @@ try {
       "cache-control": "no-cache",
       "content-type": "text/event-stream; charset=utf-8"
     });
+    const responseId = turn === 1
+      ? "resp_wire_seed"
+      : turn === 2
+        ? "resp_wire_followup"
+        : "resp_wire_terminal";
+    const output = turn === 1
+      ? [{
+        type: "message",
+        id: "msg_wire_seed",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "seed answer" }]
+      }]
+      : [];
     response.end([
       "event: response.output_text.delta",
       'data: {"type":"response.output_text.delta","delta":"OK"}',
       "",
       "event: response.completed",
-      'data: {"type":"response.completed","response":{"id":"resp_wire_compat","model":"mock","status":"completed","usage":{"input_tokens":4096,"output_tokens":1,"input_tokens_details":{"cached_tokens":3968}}}}',
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: {
+          id: responseId,
+          model: "mock",
+          status: "completed",
+          output,
+          usage: {
+            input_tokens: activeMockScenario === "commit-maturity" ? 32768 : 4096,
+            output_tokens: 1,
+            input_tokens_details: {
+              cached_tokens: activeMockScenario === "commit-maturity" ? 32768 : 3968
+            }
+          }
+        }
+      })}`,
       "",
       "data: [DONE]",
       ""
@@ -101,7 +149,9 @@ try {
     captured,
     model,
     concurrency,
-    gateHeaders
+    gateHeaders,
+    syntheticConfig,
+    scenario
   });
   const newRun = await runIsolatedCapture({
     label: "fastrelay",
@@ -111,27 +161,56 @@ try {
     captured,
     model,
     concurrency,
-    gateHeaders
+    gateHeaders,
+    syntheticConfig,
+    scenario
   });
 
   const baseline = oldRun.upstreamBody;
   const fastrelay = newRun.upstreamBody;
   const differingPaths = diffPaths(baseline, fastrelay);
   const identity = compareIdentityMarkers(oldRun.identityMarkers, newRun.identityMarkers);
-  const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders);
-  const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders);
+  const ignoreBodyLength = scenario === "lineage-recovery";
+  const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders, ignoreBodyLength);
+  const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders, ignoreBodyLength);
+  const recovery = scenario === "lineage-recovery"
+    ? summarizeLineageRecovery(baseline, fastrelay, model)
+    : null;
+  const scenarioWirePass = scenario !== "lineage-recovery"
+    ? differingPaths.length === 0
+    : recovery?.candidate_preserves_complete_replay === true &&
+      recovery?.baseline_has_duplicate_prepend === true;
+  const commitMaturity = scenario === "commit-maturity"
+    ? {
+      baseline: oldRun.commitMaturity,
+      fastrelay: newRun.commitMaturity
+    }
+    : null;
+  const commitMaturityPass = scenario !== "commit-maturity" ||
+    (commitMaturity?.baseline?.max_wait_ms === 0 &&
+      commitMaturity?.fastrelay?.max_wait_ms >= 100 &&
+      commitMaturity?.fastrelay?.max_wait_ms <= 500);
   const report = {
     pass: oldRun.oneInboundOnePost &&
       newRun.oneInboundOnePost &&
-      (!gateHeaders || newRun.samePrefixReachedBeforeHeaders),
+      (!gateHeaders || newRun.samePrefixReachedBeforeHeaders) &&
+      scenarioWirePass &&
+      commitMaturityPass &&
+      JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders) &&
+      identity.equal,
+    config_mode: syntheticConfig ? "synthetic-no-secret" : "copied-user-config",
+    scenario,
     model,
     concurrency,
     header_gate: gateHeaders,
     baseline: oldRun.summary,
     fastrelay: newRun.summary,
     wire_equal: differingPaths.length === 0,
+    wire_difference_expected: scenario === "lineage-recovery",
     differing_paths: differingPaths,
     differing_controls: summarizeControlDifferences(baseline, fastrelay, differingPaths),
+    lineage_recovery: recovery,
+    commit_maturity: commitMaturity,
     headers_equal: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
     baseline_headers: oldRun.upstreamHeaders,
     fastrelay_headers: newRun.upstreamHeaders,
@@ -144,11 +223,35 @@ try {
     true,
     "each isolated inbound must make exactly one upstream POST"
   );
-  assert.equal(
-    report.wire_equal,
-    true,
-    `FastRelay must preserve the ${baselineLabel} upstream wire body`
-  );
+  if (scenario === "ordinary") {
+    assert.equal(
+      report.wire_equal,
+      true,
+      `FastRelay must preserve the ${baselineLabel} upstream wire body`
+    );
+  } else if (scenario === "lineage-recovery") {
+    assert.equal(
+      report.lineage_recovery?.candidate_preserves_complete_replay,
+      true,
+      "v1.4.12 must keep a caller-supplied complete replay intact"
+    );
+    assert.equal(
+      report.lineage_recovery?.baseline_has_duplicate_prepend,
+      true,
+      `${baselineLabel} must reproduce the old duplicate-prepend control case`
+    );
+  } else {
+    assert.equal(report.wire_equal, true, "commit maturity must not change the final wire");
+    assert.equal(
+      report.commit_maturity?.baseline?.max_wait_ms,
+      0,
+      `${baselineLabel} must not claim the new post-handoff maturity wait`
+    );
+    assert.ok(
+      (report.commit_maturity?.fastrelay?.max_wait_ms ?? 0) >= 100,
+      "FastRelay must wait through the bounded post-handoff maturity window"
+    );
+  }
   assert.equal(
     report.headers_equal,
     true,
@@ -179,9 +282,11 @@ async function runIsolatedCapture({
   captured,
   model,
   concurrency,
-  gateHeaders
+  gateHeaders,
+  syntheticConfig,
+  scenario
 }) {
-  await createIsolatedConfig(configDir, upstreamPort);
+  await createIsolatedConfig(configDir, upstreamPort, syntheticConfig);
   const configText = await readFile(join(configDir, "config.toml"), "utf8");
   const localKey = extractTomlString(configText, "local_key");
   if (!localKey) throw new Error(`${label}: test config has no local_key`);
@@ -204,79 +309,135 @@ async function runIsolatedCapture({
   const gate = gateHeaders ? createHeaderGate(concurrency) : null;
   try {
     await waitForHealth(baseUrl, child, label);
+    activeMockArm = label;
+    activeMockScenario = scenario;
+    mockTurnByArm.set(label, 0);
     headerGate = gate;
-    const downstreamPromise = Promise.all(
-      Array.from({ length: concurrency }, async () => {
-        const response = await fetch(`${baseUrl}/codex/v1/responses`, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${localKey}`,
-            "content-type": "application/json",
-            accept: "text/event-stream",
-            "x-codex-turn-metadata": JSON.stringify({
-              // Every parallel inbound deliberately uses the same trusted
-              // conversation. This exercises the same-prefix hot path rather
-              // than hiding it behind unrelated-session sharding.
-              session_id: "wire-compat-session",
-              thread_id: "wire-compat-thread",
-              request_kind: "turn"
-            })
-          },
-          body: JSON.stringify({
-            model,
-            stream: true,
-            store: false,
-            max_output_tokens: 16,
-            instructions: "Wire compatibility fixture. Reply with OK only.",
-            input: [{
-              type: "message",
-              role: "user",
-              content: [{ type: "input_text", text: "fixture tail" }]
-            }]
-          }),
-          signal: AbortSignal.timeout(30_000)
-        });
-        const body = await response.text();
-        assert.equal(response.status, 200, `${label}: local proxy rejected fixture`);
-        assert.match(body, /response\.completed/u, `${label}: terminal event missing`);
-        return response.status;
-      })
-    );
+    const sendInbound = async (body) => {
+      const response = await fetch(`${baseUrl}/codex/v1/responses`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${localKey}`,
+          "content-type": "application/json",
+          accept: "text/event-stream",
+          "x-codex-turn-metadata": JSON.stringify({
+            // Every parallel inbound deliberately uses the same trusted
+            // conversation. This exercises the same-prefix hot path rather
+            // than hiding it behind unrelated-session sharding.
+            session_id: "wire-compat-session",
+            thread_id: "wire-compat-thread",
+            request_kind: "turn"
+          })
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000)
+      });
+      const responseBody = await response.text();
+      assert.equal(response.status, 200, `${label}: local proxy rejected fixture`);
+      assert.match(responseBody, /response\.completed/u, `${label}: terminal event missing`);
+      return response.status;
+    };
+    const expectedInbounds = scenario === "lineage-recovery"
+      ? 3
+      : scenario === "commit-maturity"
+        ? 2
+        : concurrency;
+    const downstreamPromise = scenario === "lineage-recovery"
+      ? (async () => [
+        await sendInbound(syntheticRecoverySeedBody(model)),
+        await sendInbound(syntheticRecoveryDeltaBody(model)),
+        await sendInbound(syntheticRecoveryCompleteReplayBody(model))
+      ])()
+      : scenario === "commit-maturity"
+        ? (async () => {
+          const first = await sendInbound(syntheticCommitMaturityBody(model));
+          await delay(COMMIT_MATURITY_PROBE_DELAY_MS);
+          const second = await sendInbound(syntheticCommitMaturityBody(model));
+          return [first, second];
+        })()
+      : Promise.all(
+        Array.from({ length: concurrency }, () => sendInbound(syntheticOrdinaryBody(model)))
+      );
     const gateResult = gate ? await gate.waitForRelease() : null;
     const downstream = await downstreamPromise;
     await waitFor(
-      () => captured.length === before + concurrency,
+      () => captured.length === before + expectedInbounds,
       5_000,
-      `${label}: expected ${concurrency} upstream POSTs`
+      `${label}: expected ${expectedInbounds} upstream POSTs`
     );
     const metrics = await getJson(`${baseUrl}/admin/metrics`);
     const upstreamRequests = captured.slice(before);
     const upstreamBody = upstreamRequests.at(-1)?.body;
     const upstreamHeaders = upstreamRequests.at(-1)?.headers ?? {};
     assert.ok(upstreamBody, `${label}: mock did not capture an upstream body`);
-    assert(
-      upstreamRequests.every((request) => JSON.stringify(request.body) === JSON.stringify(upstreamBody)),
-      `${label}: parallel inbounds produced different upstream wire bodies`
-    );
-    assert(
-      upstreamRequests.every((request) => JSON.stringify(request.headers) === JSON.stringify(upstreamHeaders)),
-      `${label}: parallel inbounds produced different upstream headers`
-    );
+    if (syntheticConfig) {
+      assert.equal(
+        typeof upstreamBody.prompt_cache_key,
+        "string",
+        `${label}: trusted synthetic Codex cache key must survive the final wire`
+      );
+    }
+    if (scenario !== "lineage-recovery") {
+      assert(
+        upstreamRequests.every((request) => JSON.stringify(request.body) === JSON.stringify(upstreamBody)),
+        `${label}: parallel inbounds produced different upstream wire bodies`
+      );
+      assert(
+        upstreamRequests.every((request) => JSON.stringify(request.headers) === JSON.stringify(upstreamHeaders)),
+        `${label}: parallel inbounds produced different upstream headers`
+      );
+    } else {
+      assert.equal(upstreamRequests.length, 3, `${label}: recovery scenario must make three POSTs`);
+      assert.equal(
+        upstreamRequests[1].body.previous_response_id,
+        undefined,
+        `${label}: recovered delta must not forward the local response id`
+      );
+      assert.equal(
+        upstreamRequests[2].body.previous_response_id,
+        undefined,
+        `${label}: complete replay must not forward the local response id`
+      );
+    }
     const generation = metrics.agent_generation ?? {};
-    const oneInboundOnePost = Number(generation.inbound_requests) === concurrency &&
-      Number(generation.generation_attempts) === concurrency &&
-      Number(metrics.upstream_requests) === concurrency &&
-      upstreamRequests.length === concurrency;
+    const oneInboundOnePost = Number(generation.inbound_requests) === expectedInbounds &&
+      Number(generation.generation_attempts) === expectedInbounds &&
+      Number(metrics.upstream_requests) === expectedInbounds &&
+      upstreamRequests.length === expectedInbounds;
+    const commitMaturity = scenario === "commit-maturity"
+      ? {
+        probe_delay_ms: COMMIT_MATURITY_PROBE_DELAY_MS,
+        max_wait_ms: Math.max(
+          0,
+          ...Array.from(metrics.recent_requests ?? []).map((request) =>
+            Number(request?.prefix_guard_wait_ms ?? 0)
+          )
+        ),
+        request_diagnostics: Array.from(metrics.recent_requests ?? []).map((request) => ({
+          input_tokens: Number(request?.input_tokens ?? 0),
+          cache_read_tokens: Number(request?.cache_read_tokens ?? 0),
+          wait_ms: Number(request?.prefix_guard_wait_ms ?? 0),
+          state_age_ms: request?.prefix_guard_state_age_ms ?? null,
+          source: request?.prefix_guard_wait_source ?? null,
+          skip_reason: request?.prefix_guard_skip_reason ?? null,
+          tail_source: request?.tail_source ?? null,
+          tail_tool_output_chars: Number(request?.tail_tool_output_chars ?? 0),
+          tail_largest_tool_output_chars: Number(request?.tail_largest_tool_output_chars ?? 0)
+        }))
+      }
+      : null;
     return {
       upstreamBody,
       upstreamHeaders,
       identityMarkers: identityMarkers(metrics.recent_requests?.[0] ?? {}),
       oneInboundOnePost,
+      commitMaturity,
       samePrefixReachedBeforeHeaders: !gate || gateResult.arrivalsBeforeRelease === concurrency,
       summary: {
         local_status: downstream[0] ?? null,
         completed_responses: downstream.length,
-        concurrency,
+        concurrency: scenario === "ordinary" ? concurrency : 1,
+        fixture_inbounds: expectedInbounds,
         same_prefix_arrivals_before_headers: gateResult?.arrivalsBeforeRelease ?? null,
         same_prefix_header_gate_reason: gateResult?.reason ?? null,
         inbound_requests: Number(generation.inbound_requests),
@@ -289,6 +450,9 @@ async function runIsolatedCapture({
     };
   } finally {
     if (headerGate === gate) headerGate = null;
+    if (activeMockArm === label) activeMockArm = null;
+    if (activeMockScenario === scenario) activeMockScenario = null;
+    mockTurnByArm.delete(label);
     gate?.release("cleanup");
     await stopChild(child, label);
   }
@@ -317,9 +481,15 @@ function compareIdentityMarkers(left, right) {
   return { equal: differingFields.length === 0, differingFields };
 }
 
-async function createIsolatedConfig(configDir, upstreamPort) {
+async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig) {
   await rm(configDir, { recursive: true, force: true });
   await mkdir(configDir, { recursive: true });
+  if (useSyntheticConfig) {
+    await writeFile(join(configDir, "config.toml"), syntheticConfigToml(upstreamPort), "utf8");
+    return;
+  }
+
+  assert.ok(sourceConfigDir, "a copied isolated configuration requires --source-config-dir");
   const sourceConfig = join(sourceConfigDir, "config.toml");
   const targetConfig = join(configDir, "config.toml");
   await copyFile(sourceConfig, targetConfig);
@@ -340,6 +510,174 @@ async function createIsolatedConfig(configDir, upstreamPort) {
     return next;
   });
   await writeFile(targetConfig, rewritten, "utf8");
+}
+
+function syntheticConfigToml(upstreamPort) {
+  // This fixture deliberately carries no user config, encrypted cache key,
+  // provider secret, or persisted capability evidence. The upstream mock only
+  // needs a non-empty placeholder Authorization value; it never records it.
+  return `host = "127.0.0.1"
+port = 18883
+proxy_auto_start = false
+proxy_mode_host = "127.0.0.1"
+proxy_mode_port = 18884
+local_key = "wire-compat-local-key"
+default_channel = "responses"
+active_provider_id = "wire-compat-provider"
+workspace_fingerprint = "wire-compat-synthetic-workspace"
+updated_at = "2026-07-29T00:00:00Z"
+
+[cache]
+mode = "prefix-prewarm"
+enabled = true
+exact_enabled = true
+semantic_enabled = true
+semantic_threshold = 0.985
+max_age_seconds = 86400
+max_entries = 16
+persist_encrypted = false
+prewarm_enabled = false
+background_prewarm_enabled = false
+
+[[route_profiles]]
+name = "responses"
+client_channel = "responses"
+upstream_channel = "responses"
+long_context_threshold = 60000
+
+[[providers]]
+id = "wire-compat-provider"
+name = "Wire Compatibility Mock"
+base_url = "http://127.0.0.1:${upstreamPort}/v1"
+channel = "responses"
+prompt_cache_retention_enabled = true
+request_body_gzip_enabled = false
+use_system_proxy = false
+api_key_encrypted = "wire-compat-upstream-placeholder"
+enabled = true
+created_at = "2026-07-29T00:00:00Z"
+updated_at = "2026-07-29T00:00:00Z"
+models = [{ id = "gpt-5.6-terra", display_name = "GPT-5.6 Terra", context_window = 353400, output_window = 32768, reasoning_effort_override_enabled = false, supports_tools = true, supports_streaming = true, enabled = true }]
+
+[[agent_injections]]
+id = "codex"
+label = "Codex"
+kind = "codex"
+enabled = true
+provider_id = "wire-compat-provider"
+model_id = "gpt-5.6-terra"
+hidden_provider_ids = []
+`;
+}
+
+function syntheticRequestBase(model, input, previousResponseId = null) {
+  const body = {
+    model,
+    stream: true,
+    store: false,
+    max_output_tokens: 16,
+    // Mirror the normal Codex FullReplay cache-affinity route without
+    // borrowing a caller value. This known synthetic value must be present on
+    // the final mock wire in synthetic-config mode.
+    prompt_cache_key: "wire-compat-client-cache-key",
+    prompt_cache_retention: "24h",
+    instructions: "Wire compatibility fixture. Reply with OK only.",
+    tools: [{
+      type: "function",
+      name: "read_fixture",
+      description: "Read a synthetic fixture only.",
+      parameters: {
+        type: "object",
+        properties: { path: { type: "string" } },
+        required: ["path"],
+        additionalProperties: false
+      }
+    }],
+    tool_choice: "auto",
+    parallel_tool_calls: true,
+    input
+  };
+  if (previousResponseId) body.previous_response_id = previousResponseId;
+  return body;
+}
+
+function syntheticOrdinaryBody(model) {
+  return syntheticRequestBase(model, [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "fixture root" }]
+    },
+    {
+      type: "function_call",
+      id: "fc-wire-compat",
+      call_id: "call-wire-compat",
+      name: "read_fixture",
+      arguments: "{\"path\":\"fixture.txt\"}"
+    },
+    {
+      type: "function_call_output",
+      call_id: "call-wire-compat",
+      output: { stdout: "synthetic fixture result\\n", exit_code: 0 }
+    },
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "fixture tail" }]
+    }
+  ]);
+}
+
+function syntheticRecoverySeedBody(model) {
+  return syntheticRequestBase(model, [
+    { type: "message", role: "user", content: "before" }
+  ]);
+}
+
+function syntheticRecoveryDeltaBody(model) {
+  return syntheticRequestBase(
+    model,
+    [{ type: "message", role: "user", content: "after" }],
+    "resp_wire_seed"
+  );
+}
+
+function syntheticRecoveryCompleteReplayBody(model) {
+  return syntheticRequestBase(
+    model,
+    [
+      {
+        type: "message",
+        role: "user",
+        // This is semantically the first user item, but the harmless metadata
+        // noise defeats old raw-JSON prefix matching. It is the exact class of
+        // local FullReplay recovery that v1.4.12 changed.
+        metadata: { trace: "synthetic-replayed-history" },
+        content: "before"
+      },
+      {
+        type: "message",
+        id: "msg_wire_seed",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "seed answer" }]
+      },
+      { type: "message", role: "user", content: "after" },
+      {
+        type: "message",
+        role: "user",
+        content: "complete history must not be prepended again"
+      }
+    ],
+    "resp_wire_followup"
+  );
+}
+
+function syntheticCommitMaturityBody(model) {
+  const body = syntheticOrdinaryBody(model);
+  const toolOutput = body.input.find((item) => item.type === "function_call_output");
+  toolOutput.output = "m".repeat(4_096);
+  return body;
 }
 
 function codexProviderId(config) {
@@ -402,13 +740,33 @@ function safeHeaders(headers) {
   return Object.fromEntries(allowed.map((name) => [name, headers[name] ?? null]));
 }
 
-function comparableProtocolHeaders(headers) {
+function comparableProtocolHeaders(headers, ignoreBodyLength = false) {
   const userAgent = String(headers["user-agent"] ?? "");
-  return {
+  const comparable = {
     ...headers,
     "user-agent": /^Atoapi\/\d+(?:\.\d+){1,3}$/u.test(userAgent)
       ? "Atoapi/<version>"
       : userAgent
+  };
+  if (ignoreBodyLength) comparable["content-length"] = "<body-length>";
+  return comparable;
+}
+
+function summarizeLineageRecovery(baseline, candidate, model) {
+  const expected = syntheticRecoveryCompleteReplayBody(model).input;
+  const baselineInput = Array.isArray(baseline?.input) ? baseline.input : [];
+  const candidateInput = Array.isArray(candidate?.input) ? candidate.input : [];
+  const candidateExpectedDifferingPaths = diffPaths(expected, candidateInput, "$.input");
+  const candidatePreservesCompleteReplay = candidateExpectedDifferingPaths.length === 0;
+  return {
+    expected_input_items: expected.length,
+    baseline_input_items: baselineInput.length,
+    candidate_input_items: candidateInput.length,
+    baseline_has_duplicate_prepend: baselineInput.length > expected.length &&
+      JSON.stringify(baselineInput) !== JSON.stringify(expected),
+    candidate_preserves_complete_replay: candidatePreservesCompleteReplay,
+    candidate_expected_differing_paths: candidateExpectedDifferingPaths,
+    final_body_bytes_delta: JSON.stringify(baseline).length - JSON.stringify(candidate).length
   };
 }
 

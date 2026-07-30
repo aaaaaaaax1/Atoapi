@@ -26,7 +26,7 @@ import type {
 } from "./GraphitePrototypeHost";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.12";
+const APP_VERSION = "v1.4.13";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -168,6 +168,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       request_body_gzip_enabled: editablePayload.request_body_gzip_enabled,
       use_system_proxy: editablePayload.use_system_proxy,
       non_sse_compact_compat_enabled: editablePayload.non_sse_compact_compat_enabled,
+      auto_compact_token_limit: editablePayload.auto_compact_token_limit ?? null,
+      auto_compact_token_limit_configured: true,
       key_pool: {
         enabled: editablePayload.key_pool?.enabled ?? existing?.key_pool?.enabled ?? editablePayload.keys.length > 0,
         strategy: editablePayload.key_pool?.strategy ?? existing?.key_pool?.strategy ?? "sequential",

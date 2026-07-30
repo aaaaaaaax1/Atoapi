@@ -142,6 +142,11 @@ pub struct AppConfig {
     pub provider_key_pools: Vec<ProviderKeyPoolConfig>,
     #[serde(default)]
     pub provider_compact_modes: Vec<ProviderCompactModeConfig>,
+    /// Per-upstream Codex auto-compaction override. It is applied only when
+    /// that upstream is the active bound Codex route; absent means preserve
+    /// Codex's own model/default behavior.
+    #[serde(default)]
+    pub provider_auto_compaction_limits: Vec<ProviderAutoCompactionConfig>,
     #[serde(default)]
     pub provider_channel_modes: Vec<ProviderChannelModeConfig>,
     /// Retired v1.4.4 session-reuse certificates are read once so loading an
@@ -203,6 +208,15 @@ pub struct ProviderInput {
     pub use_system_proxy: bool,
     #[serde(default)]
     pub non_sse_compact_compat_enabled: bool,
+    /// Positive token limit asks the bound Codex client to compact before
+    /// reaching that budget. `None` preserves the client/model default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u32>,
+    /// Keeps older API callers that do not know this field from clearing a
+    /// saved per-provider override. Current UI sends this for both set and
+    /// explicit clear operations.
+    #[serde(default)]
+    pub auto_compact_token_limit_configured: bool,
     pub api_key: Option<String>,
     #[serde(default)]
     pub key_pool: Option<ProviderKeyPoolInput>,
@@ -227,6 +241,16 @@ pub struct ProviderCompactModeConfig {
     pub provider_id: String,
     #[serde(default = "default_compact_compatibility_mode")]
     pub mode: CompactCompatibilityMode,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Stored separately from `ProviderConfig` so older provider records retain a
+/// fully compatible shape and an unset override can be removed cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAutoCompactionConfig {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_limit: Option<u32>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -845,6 +869,7 @@ pub struct PublicProvider {
     pub request_body_gzip_enabled: bool,
     pub use_system_proxy: bool,
     pub non_sse_compact_compat_enabled: bool,
+    pub auto_compact_token_limit: Option<u32>,
     #[serde(default)]
     pub cache_capabilities: Vec<ProviderCacheCapabilityConfig>,
     pub has_api_key: bool,
@@ -965,6 +990,7 @@ impl Default for AppConfig {
             agent_provider_orders: Vec::new(),
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
+            provider_auto_compaction_limits: Vec::new(),
             provider_channel_modes: Vec::new(),
             _legacy_provider_response_session_reuse: None,
             provider_cache_capabilities: Vec::new(),
@@ -1219,6 +1245,8 @@ impl AppConfig {
                     use_system_proxy: provider.use_system_proxy,
                     non_sse_compact_compat_enabled: self
                         .non_sse_compact_compat_enabled_for_provider(&provider.id),
+                    auto_compact_token_limit: self
+                        .auto_compact_token_limit_for_provider(&provider.id),
                     cache_capabilities: self.cache_capabilities_for_provider(&provider.id),
                     has_api_key: provider.api_key_encrypted.is_some(),
                     key_pool: self.public_key_pool_for_provider(&provider.id),
@@ -1451,6 +1479,14 @@ impl AppConfig {
     pub fn non_sse_compact_compat_enabled_for_provider(&self, provider_id: &str) -> bool {
         self.compact_compatibility_mode_for_provider(provider_id)
             == CompactCompatibilityMode::NonSseValidation
+    }
+
+    pub fn auto_compact_token_limit_for_provider(&self, provider_id: &str) -> Option<u32> {
+        self.provider_auto_compaction_limits
+            .iter()
+            .find(|item| item.provider_id == provider_id)
+            .and_then(|item| item.token_limit)
+            .filter(|limit| *limit > 0)
     }
 
     pub fn provider_channel_mode_for_provider(&self, provider_id: &str) -> ProviderChannelMode {
@@ -1961,6 +1997,9 @@ impl AppConfig {
         });
         let channel_mode_changed =
             self.provider_channel_mode_for_provider(&id) != input.channel_mode;
+        let auto_compact_token_limit = input.auto_compact_token_limit.filter(|limit| *limit > 0);
+        let auto_compact_token_limit_configured =
+            input.auto_compact_token_limit_configured || input.auto_compact_token_limit.is_some();
         let mut invalidate_provider_capabilities = false;
 
         if let Some(provider) = self.providers.iter_mut().find(|p| p.id == id) {
@@ -2021,6 +2060,9 @@ impl AppConfig {
                 CompactCompatibilityMode::CcSwitchFast
             },
         );
+        if auto_compact_token_limit_configured {
+            self.upsert_provider_auto_compaction_limit(&id, auto_compact_token_limit);
+        }
         self.upsert_provider_channel_mode(&id, input.channel_mode);
 
         self.updated_at = now;
@@ -2052,6 +2094,42 @@ impl AppConfig {
                 mode,
                 updated_at: now,
             });
+        }
+        self.updated_at = now;
+    }
+
+    pub fn upsert_provider_auto_compaction_limit(
+        &mut self,
+        provider_id: &str,
+        token_limit: Option<u32>,
+    ) {
+        let token_limit = token_limit.filter(|limit| *limit > 0);
+        let existing = self
+            .provider_auto_compaction_limits
+            .iter()
+            .find(|item| item.provider_id == provider_id)
+            .and_then(|item| item.token_limit);
+        if existing == token_limit {
+            return;
+        }
+        let now = Utc::now();
+        if token_limit.is_none() {
+            self.provider_auto_compaction_limits
+                .retain(|item| item.provider_id != provider_id);
+        } else if let Some(item) = self
+            .provider_auto_compaction_limits
+            .iter_mut()
+            .find(|item| item.provider_id == provider_id)
+        {
+            item.token_limit = token_limit;
+            item.updated_at = now;
+        } else {
+            self.provider_auto_compaction_limits
+                .push(ProviderAutoCompactionConfig {
+                    provider_id: provider_id.to_string(),
+                    token_limit,
+                    updated_at: now,
+                });
         }
         self.updated_at = now;
     }
@@ -3324,6 +3402,45 @@ enabled = true
     }
 
     #[test]
+    fn provider_auto_compaction_limit_round_trips_and_can_be_cleared() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(None);
+        input.auto_compact_token_limit = Some(120_000);
+        input.auto_compact_token_limit_configured = true;
+        let provider_id = config.upsert_provider(input).unwrap();
+        assert_eq!(
+            config.auto_compact_token_limit_for_provider(&provider_id),
+            Some(120_000)
+        );
+        assert_eq!(
+            config
+                .public_view(PathBuf::from("config.toml"))
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .and_then(|provider| provider.auto_compact_token_limit),
+            Some(120_000)
+        );
+
+        // A caller from an older UI/API does not know this optional field and
+        // therefore must not erase the saved override on an unrelated edit.
+        config.upsert_provider(provider_input(None)).unwrap();
+        assert_eq!(
+            config.auto_compact_token_limit_for_provider(&provider_id),
+            Some(120_000)
+        );
+
+        let mut clear = provider_input(None);
+        clear.auto_compact_token_limit = None;
+        clear.auto_compact_token_limit_configured = true;
+        config.upsert_provider(clear).unwrap();
+        assert_eq!(
+            config.auto_compact_token_limit_for_provider(&provider_id),
+            None
+        );
+    }
+
+    #[test]
     fn provider_key_pool_round_robin_skips_failed_keys() {
         let mut config = AppConfig::default();
         let provider_id = config
@@ -3872,6 +3989,8 @@ enabled = true
             request_body_gzip_enabled: false,
             use_system_proxy: false,
             non_sse_compact_compat_enabled: false,
+            auto_compact_token_limit: None,
+            auto_compact_token_limit_configured: false,
             api_key: None,
             key_pool,
             enabled: true,

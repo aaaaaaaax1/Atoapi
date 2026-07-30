@@ -1,6 +1,47 @@
 # Atoapi Current Workflow Checkpoint
 
-Last updated: 2026-07-17
+## AUTHORITATIVE RELEASE STATE - 2026-07-30
+
+- **v1.4.13 is packaged** at `G:\Atoapi\releases\v1.4.13-full-replay-waf-auto-compact-cache-continuity-20260730`; it contains the independent portable EXE and NSIS installer, both carrying file/product version `1.4.13`.
+- The running 18883 service remains **v1.4.12** at `G:\Atoapi\releases\v1.4.12-full-replay-waf-cache-continuity-20260729\Atoapi.exe`, PID 21720, started 2026-07-29 20:29:26. It was not stopped, restarted, replaced, or packaged over.
+- v1.4.13 includes the shape-aware full-replay WAF safety repair, canonical SSE `Request blocked` failure mapping, per-Provider Codex auto-compaction threshold/restore logic, and the narrowly bounded exact/high-hit prefix commit-maturity wait. It does not reintroduce the historically rejected dual-digest `static_wire_drift` candidate described below.
+- Full release verification passed: `cargo fmt --check`; focused auto-compaction, full-replay and WAF tests; the release Rust suite (`862 passed, 11 ignored`); FastRelay capacity baselines; frontend/UI/static regressions; acceptance and release-champion self-tests; and `git diff --check`.
+- Return point: install/run the separate v1.4.13 package, then compare live metrics only within the same hand-selected Provider / Key realm / model / request family and the same cold-start/compaction filters. Do not declare a cache champion from mixed cohorts.
+
+The older 2026-07-29 draft below is retained as historical evidence; this release-state block overrides its outdated “un-packaged” wording.
+
+## AUTHORITATIVE ACTIVE LINE — 2026-07-29 (read this before older history)
+
+### Current runtime and acceptance floor
+
+- Running service is **v1.4.12** at `G:\Atoapi\releases\v1.4.12-full-replay-waf-cache-continuity-20260729\Atoapi.exe`, listening on `127.0.0.1:18883`.  Do **not** stop, restart, replace, or package over this live process while source work is in progress.
+- The release gate is a strictly comparable cohort only: same build scope dimensions (provider, selected-Key realm, model, client/upstream channel, stream/request family) and the same cold-start/compaction filters.  No route switch, Key-order change, context trimming, extra upstream call, retry, or statistics redefinition is allowed to manufacture an improvement.
+- Strict verified historical floor for `agent-codex-jucodex004 / same realm / gpt-5.6-terra / Responses stream`, excluding cold starts and compactions: **v1.4.11 = 97.018269%** (`227` requests, `48,420,904` input tokens) versus **v1.4.12 = 96.026801%** (`253` requests, `31,978,237` input tokens): **-0.991468pp**.  This is a real regression signal, but not a paired same-input proof of a single code cause.  The older 98.567% hourly snapshot lacks build/realm/model provenance, so it is reference-only, not a releasable champion.
+
+### Rejected v1.4.13 cache candidate (not active source)
+
+- The dual-digest `static_wire_drift` candidate was built and isolated-tested, but it did not strictly beat the comparable baseline and one complete pair had a higher total TTFT p95.  It is **rejected** under the user-confirmed release gate.
+- On 2026-07-29 the candidate's runtime code and version bump were manually reverted with precise patches (no `git reset` or `checkout`); the active source/version is again v1.4.12.  The verifier-only improvement that separates local preparation, prefix wait, upstream TTFT, and total TTFT is retained because it changes no request behavior.
+- Latest read-only current 18883 evidence: all normal requests are `full_replay`, have one upstream attempt, `cache_avoidable_gap_tokens = 0`, and `final_scope.continuity_reset = 0`.  Large misses are either real new tail/tool output or provider cache rollback after an exact frozen predecessor; no automatic route/key change, context rewrite, retry, or second upstream request is permitted.
+
+### Active next action
+
+1. Do not package or replace the live runtime from this rejected candidate.
+2. Treat each hand-selected Provider/Key realm as its own championship line.  Before any new code change, require a falsifiable local cause with nonzero physical cached-token savings; `static_wire_drift`, real tail, and upstream rollback alone do not qualify.
+3. A new candidate may be retained only after the same-realm real raw-token ratio **strictly exceeds** its verified historical champion, with one upstream POST per inbound and no reliability or total-TTFT regression.
+
+### Unpackaged full-replay safety follow-up — 2026-07-30
+
+- The full-replay WAF memory is being narrowed from a route-wide six-hour boolean to a bounded, aggregate-only blocked-payload shape. A prior 1.76MB WAF event must not locally reject the observed 976KB / 1052-item / 280KB-tool-output request merely because the route matches; an equivalent-or-larger shape remains locally protected. No payload text, tool output, key, or response id is retained.
+- The provider editor now owns an optional `auto_compact_token_limit`: a positive token value is written to Codex as `model_auto_compact_token_limit` only while that provider is the active bound Codex route. Blank restores Codex's pre-Atoapi value/default. This is a Codex-side preemptive compact trigger, not an Atoapi hidden compact/retry, so one inbound still has at most one upstream request.
+- Existing Codex config restore state is migrated before this new root field is managed, preventing a previously user-set token limit from being erased when the provider setting is cleared or the injection is removed.
+- Current 18883 runtime remains untouched; source work is un-packaged. Verified: Rust shape-policy/WAF and auto-compaction tests, frontend static regression, TypeScript/Vite build, and formatting/diff checks. Return point: run the final combined regression set, then wait for user validation before any package/release decision.
+
+### Continuity rule
+
+- Every cache-related change must append here before packaging: **cause, exact code path, raw metric before/after, scope, test evidence, version status, and next return point**.  Do not reopen a completed item merely because it is mentioned in older historical sections below.
+
+Historical checkpoint below last updated: 2026-07-17
 
 ## 2026-07-17 Codex Body Session Metadata
 

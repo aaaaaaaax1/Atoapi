@@ -6722,6 +6722,7 @@
                 <div class="option-row"><div><b>大请求体 gzip</b><small>单次编码后发送</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="大请求体 gzip"></button></div>
                 <div class="option-row"><div><b>prompt_cache_retention</b><small>第三方支持时保留</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="prompt cache retention"></button></div>
                 <div class="option-row"><div><b>非 SSE compact 兼容</b><small>仅兼容需要的上游</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="false" aria-label="非 SSE compact 兼容"></button></div>
+                <label class="field"><span>Codex 自动压缩阈值（tokens）</span><input id="providerAutoCompactTokenLimit" type="number" min="1" step="1" inputmode="numeric" placeholder="留空：使用 Codex/模型默认" autocomplete="off" /><small>填写正数后，在使用此上游的 Codex 路由上提前触发 Codex 原生压缩；不会为同一条消息额外发送上游请求。</small></label>
                 <label class="field"><span>自定义 User-Agent</span><input value="Atoapi/next" autocomplete="off" /></label>
               </div>
             </section>

@@ -993,12 +993,15 @@ pub(super) async fn stream_upstream(
             sse_end_reason = failure_code.code().to_string();
         }
         if terminal_failure_code.is_some_and(ResponsesFailureCode::is_upstream_blocked) {
-            if let Some(scope) = full_replay_risk_scope.clone() {
+            if let (Some(scope), Some(shape)) = (
+                full_replay_risk_scope.clone(),
+                upstream_request_diagnostics.full_replay_risk_shape,
+            ) {
                 state_for_stream
                     .full_replay_risk_observations
                     .lock()
                     .await
-                    .note_blocked(scope);
+                    .note_blocked(scope, shape);
             }
         }
         let mut canonical_failure_enqueued = false;

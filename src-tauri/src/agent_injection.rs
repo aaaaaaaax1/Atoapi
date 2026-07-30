@@ -21,13 +21,14 @@ const CODEX_MODEL_CATALOG_LEGACY_FILE: &str = "atoapi-model-catalog.json";
 const CODEX_MODEL_CATALOG_FILE_PREFIX: &str = "atoapi-model-catalog-";
 const CODEX_RESTORE_STATE_FILE: &str = "atoapi-codex-restore-state.json";
 const CODEX_RESTORE_STATE_VERSION: u32 = 1;
-const CODEX_MANAGED_ROOT_FIELDS: [&str; 6] = [
+const CODEX_MANAGED_ROOT_FIELDS: [&str; 7] = [
     "model_provider",
     "model_catalog_json",
     "disable_response_storage",
     "model",
     "model_reasoning_effort",
     "model_context_window",
+    "model_auto_compact_token_limit",
 ];
 const CODEX_MANAGED_MODEL_FIELDS: [&str; 3] =
     ["model", "model_reasoning_effort", "model_context_window"];
@@ -69,6 +70,7 @@ struct InjectionContext {
     default_model: String,
     default_model_is_explicit: bool,
     model_context_window: Option<u32>,
+    auto_compact_token_limit: Option<u32>,
     codex_models: Vec<ModelConfig>,
 }
 
@@ -84,6 +86,12 @@ struct CodexRestoreState {
     target_path: PathBuf,
     target_existed: bool,
     fragment_toml: String,
+    /// v1 restore files predate some managed root keys. This explicit marker
+    /// lets an upgrade capture only a previously user-owned new field once,
+    /// rather than mistaking an Atoapi-written value for the user's original
+    /// on every later injection refresh.
+    #[serde(default)]
+    managed_root_fields: Vec<String>,
 }
 
 pub fn ensure_defaults(config: &mut AppConfig) {
@@ -319,7 +327,7 @@ fn remove_codex_config_injection(path: &Path) -> Result<()> {
     let restore_state = match load_codex_restore_state(&restore_path, path)? {
         Some(state) => state,
         None => {
-            let legacy_fragment = capture_codex_model_fragment(&doc);
+            let legacy_fragment = capture_codex_legacy_managed_fragment(&doc);
             capture_codex_restore_state(&restore_path, path, true, &legacy_fragment)?
         }
     };
@@ -434,12 +442,19 @@ fn capture_codex_restore_fragment(doc: &DocumentMut) -> DocumentMut {
     fragment
 }
 
-fn capture_codex_model_fragment(doc: &DocumentMut) -> DocumentMut {
+fn capture_codex_legacy_managed_fragment(doc: &DocumentMut) -> DocumentMut {
     let mut fragment = DocumentMut::new();
     for field in CODEX_MANAGED_MODEL_FIELDS {
         if let Some(item) = doc.as_table().get(field) {
             fragment.as_table_mut().insert(field, item.clone());
         }
+    }
+    // Older Atoapi injections never wrote this key, so on a legacy restore
+    // path any current value is caller-owned and must survive removal.
+    if let Some(item) = doc.as_table().get("model_auto_compact_token_limit") {
+        fragment
+            .as_table_mut()
+            .insert("model_auto_compact_token_limit", item.clone());
     }
     fragment
 }
@@ -455,6 +470,10 @@ fn capture_codex_restore_state(
         target_path: absolute_codex_target_path(target_path)?,
         target_existed,
         fragment_toml: capture_codex_restore_fragment(doc).to_string(),
+        managed_root_fields: CODEX_MANAGED_ROOT_FIELDS
+            .iter()
+            .map(|field| (*field).to_string())
+            .collect(),
     };
     save_codex_restore_state(state_path, &state)?;
     Ok(state)
@@ -523,6 +542,30 @@ fn restore_codex_root_fields(doc: &mut DocumentMut, fragment: &DocumentMut, fiel
             doc.as_table_mut().insert(field, original.clone());
         }
     }
+}
+
+fn migrate_codex_restore_state_for_auto_compaction(
+    state_path: &Path,
+    state: &mut CodexRestoreState,
+    live_doc: &DocumentMut,
+) -> Result<()> {
+    const FIELD: &str = "model_auto_compact_token_limit";
+    if state.managed_root_fields.iter().any(|field| field == FIELD) {
+        return Ok(());
+    }
+
+    let mut fragment = parse_codex_restore_fragment(state)?;
+    if !fragment.as_table().contains_key(FIELD) {
+        if let Some(original) = live_doc.as_table().get(FIELD) {
+            // Existing restore state means this file was managed by an older
+            // Atoapi build. That build did not own this root field, so its
+            // pre-upgrade value belongs to the user.
+            fragment.as_table_mut().insert(FIELD, original.clone());
+        }
+    }
+    state.fragment_toml = fragment.to_string();
+    state.managed_root_fields.push(FIELD.to_string());
+    save_codex_restore_state(state_path, state)
 }
 
 fn restore_codex_custom_provider(doc: &mut DocumentMut, fragment: &DocumentMut) {
@@ -746,6 +789,8 @@ impl InjectionContext {
             default_model: agent_model,
             default_model_is_explicit: explicit_model_config.is_some(),
             model_context_window: model_config.and_then(|model| model.context_window),
+            auto_compact_token_limit: provider
+                .and_then(|provider| config.auto_compact_token_limit_for_provider(&provider.id)),
             codex_models,
         }
     }
@@ -861,11 +906,11 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     };
 
     let restore_path = codex_restore_state_path(path)?;
-    let restore_state = if codex_document_has_atoapi_provider(&doc) {
+    let mut restore_state = if codex_document_has_atoapi_provider(&doc) {
         match load_codex_restore_state(&restore_path, path)? {
             Some(state) => Some(state),
             None => {
-                let legacy_fragment = capture_codex_model_fragment(&doc);
+                let legacy_fragment = capture_codex_legacy_managed_fragment(&doc);
                 Some(capture_codex_restore_state(
                     &restore_path,
                     path,
@@ -885,6 +930,9 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
             &doc,
         )?)
     };
+    if let Some(state) = restore_state.as_mut() {
+        migrate_codex_restore_state_for_auto_compaction(&restore_path, state, &doc)?;
+    }
     let restore_fragment = restore_state
         .as_ref()
         .map(parse_codex_restore_fragment)
@@ -895,6 +943,11 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["disable_response_storage"] = value(true);
     doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
+    if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
+        doc["model_auto_compact_token_limit"] = value(i64::from(limit));
+    } else if let Some(fragment) = restore_fragment.as_ref() {
+        restore_codex_root_fields(&mut doc, fragment, &["model_auto_compact_token_limit"]);
+    }
     if context.default_model_is_explicit {
         doc["model"] = value(context.default_model.as_str());
         if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
@@ -1770,6 +1823,7 @@ command = "npx"
             default_model: "gpt-test".to_string(),
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
+            auto_compact_token_limit: None,
             codex_models: vec![ModelConfig {
                 id: "vendor/gpt-custom".to_string(),
                 request_model_id: Some("gpt-custom".to_string()),
@@ -1990,6 +2044,7 @@ command = "npx"
             default_model: "gpt-test".to_string(),
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
+            auto_compact_token_limit: None,
             codex_models: Vec::new(),
         };
         write_codex_config(&path, &context).unwrap();
@@ -2060,6 +2115,112 @@ command = "npx"
             .is_some());
         assert!(!managed_catalog_path.exists());
         assert!(!restore_path.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_auto_compaction_override_is_restored_when_disabled_or_removed() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-auto-compact-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        write_text(
+            &path,
+            "model_auto_compact_token_limit = 246000\n[mcp_servers.context7]\ncommand = \"npx\"\n",
+        )
+        .unwrap();
+
+        let mut context = test_context();
+        context.auto_compact_token_limit = Some(120_000);
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit")
+                .and_then(toml::Value::as_integer),
+            Some(120_000)
+        );
+
+        context.auto_compact_token_limit = None;
+        write_codex_config(&path, &context).unwrap();
+        let restored_while_managed: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            restored_while_managed
+                .get("model_auto_compact_token_limit")
+                .and_then(toml::Value::as_integer),
+            Some(246_000)
+        );
+
+        context.auto_compact_token_limit = Some(140_000);
+        write_codex_config(&path, &context).unwrap();
+        remove_codex_config_injection(&path).unwrap();
+        let restored_after_removal: toml::Value =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            restored_after_removal
+                .get("model_auto_compact_token_limit")
+                .and_then(toml::Value::as_integer),
+            Some(246_000)
+        );
+        assert!(restored_after_removal.get("mcp_servers").is_some());
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn old_restore_state_captures_auto_compaction_before_atoapi_manages_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-auto-compact-legacy-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir).unwrap();
+        write_text(
+            &path,
+            r#"model_provider = "custom"
+model_auto_compact_token_limit = 246000
+
+[model_providers.custom]
+name = "Atoapi"
+base_url = "http://127.0.0.1:18883/codex/v1"
+wire_api = "responses"
+"#,
+        )
+        .unwrap();
+        let legacy_state = CodexRestoreState {
+            schema_version: CODEX_RESTORE_STATE_VERSION,
+            target_path: absolute_codex_target_path(&path).unwrap(),
+            target_existed: true,
+            fragment_toml: "model = \"user-model\"\n".to_string(),
+            managed_root_fields: Vec::new(),
+        };
+        let restore_path = codex_restore_state_path(&path).unwrap();
+        save_codex_restore_state(&restore_path, &legacy_state).unwrap();
+
+        let mut context = test_context();
+        context.auto_compact_token_limit = Some(120_000);
+        write_codex_config(&path, &context).unwrap();
+        context.auto_compact_token_limit = None;
+        write_codex_config(&path, &context).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit")
+                .and_then(toml::Value::as_integer),
+            Some(246_000)
+        );
+        let migrated = load_codex_restore_state(&restore_path, &path)
+            .unwrap()
+            .expect("restore state must remain present");
+        assert!(migrated
+            .managed_root_fields
+            .iter()
+            .any(|field| field == "model_auto_compact_token_limit"));
+
         fs::remove_dir_all(dir).ok();
     }
 
@@ -2320,6 +2481,7 @@ model_reasoning_effort = "max"
             default_model: "gpt-test".to_string(),
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
+            auto_compact_token_limit: None,
             codex_models: Vec::new(),
         };
 
@@ -2704,6 +2866,7 @@ model_reasoning_effort = "max"
             default_model: "gpt-test".to_string(),
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
+            auto_compact_token_limit: None,
             codex_models: Vec::new(),
         };
 
@@ -2840,6 +3003,7 @@ model_reasoning_effort = "max"
             default_model: "gpt-test".to_string(),
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
+            auto_compact_token_limit: None,
             codex_models: Vec::new(),
         }
     }

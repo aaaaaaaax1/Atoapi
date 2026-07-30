@@ -122,7 +122,7 @@ use prepared_wire_request::{
 };
 use request_plan::{OneShotRequestPlan, RequestPlan};
 use responses_full_replay_risk::{
-    evaluate_full_replay_risk, FullReplayRiskInput, FullReplayRiskSignals,
+    evaluate_full_replay_risk, BlockedFullReplayShape, FullReplayRiskInput, FullReplayRiskSignals,
 };
 pub(crate) use responses_full_replay_risk::{
     ResponsesFullReplayRiskObservations, ResponsesRouteScope,
@@ -290,6 +290,9 @@ struct UpstreamRequestDiagnostics {
     final_wire_receipt: Option<FinalWireReceipt>,
     final_scope_shadow: Option<FinalScopeShadowReceipt>,
     final_scope_waterline: Option<FinalScopeWaterlineLog>,
+    // Aggregate-only shape carried to the stream relay so a confirmed WAF
+    // event can teach the local risk gate without retaining request content.
+    full_replay_risk_shape: Option<BlockedFullReplayShape>,
     // Process-local warm-up coordination. These opaque values are never
     // persisted, logged, routed, or sent upstream.
     warm_pending_scope_digest: Option<String>,
@@ -353,6 +356,9 @@ impl UpstreamRequestDiagnostics {
         }
         if next.final_scope_waterline.is_some() {
             self.final_scope_waterline = next.final_scope_waterline.clone();
+        }
+        if next.full_replay_risk_shape.is_some() {
+            self.full_replay_risk_shape = next.full_replay_risk_shape;
         }
         if next.warm_pending_scope_digest.is_some() {
             self.warm_pending_scope_digest = next.warm_pending_scope_digest.clone();
@@ -3139,13 +3145,31 @@ async fn run_generation_for_authorized_agent(
                 affinity_identity::realm_id(&decision, &selected_provider_key),
             )
         });
-    let route_previously_blocked = match full_replay_risk_scope.as_ref() {
+    let full_replay_risk_signals = FullReplayRiskSignals {
+        input_items: tail_input_diagnostics.input_items,
+        tool_output_chars: tail_input_diagnostics.tool_output_chars,
+        largest_tool_output_chars: tail_input_diagnostics.largest_tool_output_chars,
+        tool_output_lines: tail_input_diagnostics.tool_output_lines,
+        repeated_line_chars: tail_input_diagnostics.tool_output_repeated_line_chars,
+        timestamp_like_count: tail_input_diagnostics.tool_output_timestamp_like_count,
+        path_like_count: tail_input_diagnostics.tool_output_path_like_count,
+        url_like_count: tail_input_diagnostics.tool_output_url_like_count,
+        hash_like_count: tail_input_diagnostics.tool_output_hash_like_count,
+        json_like_chars: tail_input_diagnostics.tool_output_json_like_chars,
+    };
+    let full_replay_risk_shape = full_replay_risk_scope.as_ref().map(|_| {
+        BlockedFullReplayShape::from_signals(
+            generation_envelope.request_plan().body_len() as u64,
+            full_replay_risk_signals,
+        )
+    });
+    let blocked_shape = match full_replay_risk_scope.as_ref() {
         Some(scope) => state
             .full_replay_risk_observations
             .lock()
             .await
-            .recently_blocked(scope),
-        None => false,
+            .recent_blocked_shape(scope),
+        None => None,
     };
     let full_replay_risk = evaluate_full_replay_risk(FullReplayRiskInput {
         is_responses_route: matches!(client_channel, Channel::Responses)
@@ -3157,20 +3181,10 @@ async fn run_generation_for_authorized_agent(
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty()),
         final_body_bytes: generation_envelope.request_plan().body_len() as u64,
-        route_previously_blocked,
-        signals: FullReplayRiskSignals {
-            input_items: tail_input_diagnostics.input_items,
-            tool_output_chars: tail_input_diagnostics.tool_output_chars,
-            largest_tool_output_chars: tail_input_diagnostics.largest_tool_output_chars,
-            tool_output_lines: tail_input_diagnostics.tool_output_lines,
-            repeated_line_chars: tail_input_diagnostics.tool_output_repeated_line_chars,
-            timestamp_like_count: tail_input_diagnostics.tool_output_timestamp_like_count,
-            path_like_count: tail_input_diagnostics.tool_output_path_like_count,
-            url_like_count: tail_input_diagnostics.tool_output_url_like_count,
-            hash_like_count: tail_input_diagnostics.tool_output_hash_like_count,
-            json_like_chars: tail_input_diagnostics.tool_output_json_like_chars,
-        },
+        blocked_shape,
+        signals: full_replay_risk_signals,
     });
+    upstream_request_diagnostics.full_replay_risk_shape = full_replay_risk_shape;
     // Register the inbound before a possible local rejection so Codex metrics
     // truthfully report attempt_count=0 rather than losing the request.
     let agent_policy = AttemptPolicy::Single;
@@ -4518,6 +4532,8 @@ async fn wait_for_provider_prefix_settle(
                 current_tail_is_settle_safe: !responses_current_tail_makes_avoidable_unreliable(
                     current_tail,
                 ) && !responses_tool_tail_burst(current_tail),
+                current_tail_has_commit_maturity_risk: current_tail.tool_output_chars >= 4_096
+                    || current_tail.largest_tool_output_chars >= 4_096,
                 settle_after_cold_read: state.settle_after_cold_read,
                 compaction_requested,
                 state_age,
@@ -5149,11 +5165,11 @@ fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
     _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
-    // The guard is already fail-closed: it only waits on an exact, recent
-    // high-hit prefix state or a concrete avoidable gap.
-    // Keep the user's latency contract here as the final hard ceiling instead
-    // of disabling that safe recovery path for every Responses request.
-    matches!(channel, Channel::Responses).then_some(responses_foreground_wait_cap())
+    // The controller keeps ordinary and observed-gap waits at 500ms. Responses
+    // additionally receives a one-second budget for its narrow exact/high-hit
+    // post-handoff commit-maturity branch; non-exact state, compaction,
+    // ordinary tails, and missing state cannot enter that branch.
+    matches!(channel, Channel::Responses).then_some(TokioDuration::from_secs(1))
 }
 
 fn prefix_guard_wait_effect(
@@ -18940,7 +18956,7 @@ mod tests {
         assert!(smart_hit_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
-            Some(TokioDuration::from_millis(500))
+            Some(TokioDuration::from_secs(1))
         );
     }
 
@@ -25929,9 +25945,18 @@ mod tests {
             .unwrap();
         let route_scope =
             ResponsesRouteScope::new("provider", "gpt-5.6-terra", "responses", "opaque-key-realm");
+        let blocked_shape = BlockedFullReplayShape {
+            final_body_bytes: 1_764_273,
+            input_items: 948,
+            tool_output_chars: 657_315,
+            largest_tool_output_chars: 180_000,
+            tool_output_lines: 14_871,
+            noise_indicators: 5,
+        };
         let mut upstream_diagnostics = UpstreamRequestDiagnostics::default();
         upstream_diagnostics.upstream_trace_source = Some("cf-ray".to_string());
         upstream_diagnostics.upstream_trace_id = Some("test-waf-ray-HKG".to_string());
+        upstream_diagnostics.full_replay_risk_shape = Some(blocked_shape);
         let response = stream_upstream(
             state.clone(),
             upstream,
@@ -26017,11 +26042,14 @@ mod tests {
             .recent_errors
             .iter()
             .any(|error| error.scope == "upstream_waf_blocked"));
-        assert!(state
-            .full_replay_risk_observations
-            .lock()
-            .await
-            .recently_blocked(&route_scope));
+        assert_eq!(
+            state
+                .full_replay_risk_observations
+                .lock()
+                .await
+                .recent_blocked_shape(&route_scope),
+            Some(blocked_shape)
+        );
 
         fs::remove_dir_all(config_dir).ok();
     }

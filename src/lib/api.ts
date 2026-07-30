@@ -49,6 +49,7 @@ export interface ProviderConfig {
   request_body_gzip_enabled: boolean;
   use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
+  auto_compact_token_limit?: number | null;
   cache_capabilities?: ProviderCacheCapabilityConfig[];
   has_api_key: boolean;
   key_pool?: PublicProviderKeyPool | null;
@@ -787,6 +788,8 @@ export interface ProviderInput {
   request_body_gzip_enabled: boolean;
   use_system_proxy: boolean;
   non_sse_compact_compat_enabled: boolean;
+  auto_compact_token_limit?: number | null;
+  auto_compact_token_limit_configured?: boolean;
   key_pool?: ProviderKeyPoolInput | null;
   api_key?: string;
   enabled: boolean;
@@ -1297,6 +1300,9 @@ function fallback(name: string, args?: Record<string, unknown>) {
       request_body_gzip_enabled: input.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? true,
       use_system_proxy: input.use_system_proxy ?? existing?.use_system_proxy ?? true,
       non_sse_compact_compat_enabled: input.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
+      auto_compact_token_limit: input.auto_compact_token_limit_configured || "auto_compact_token_limit" in input
+        ? input.auto_compact_token_limit ?? null
+        : existing?.auto_compact_token_limit ?? null,
       has_api_key: Boolean(input.api_key) || existing?.has_api_key || false,
       key_pool: input.key_pool
         ? previewKeyPool(input.key_pool, existing?.key_pool ?? null)
