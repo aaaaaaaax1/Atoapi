@@ -555,6 +555,9 @@ struct ToolOutputNoiseDiagnostics {
 }
 #[derive(Debug, Clone, Default)]
 struct PrefixGuardWaitDiagnostics {
+    /// Exact local wait budget consumption. `wait_ms` is retained only for
+    /// coarse external metrics and intentionally cannot drive another wait.
+    wait_duration: TokioDuration,
     wait_ms: u64,
     reason: Option<String>,
     source: Option<String>,
@@ -575,12 +578,14 @@ struct PrefixLagDiagnostics {
     input_delta_tokens: Option<u64>,
     cache_delta_tokens: Option<u64>,
     previous_gap_tokens: Option<u64>,
+    static_wire_drift_late_mutation_categories: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Default)]
 struct ProviderPrefixUsageObservation {
     gap: Option<ProviderCacheGapBreakdown>,
     previous: Option<PrefixWarmState>,
     static_wire_drift: bool,
+    static_wire_drift_late_mutation_categories: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Default)]
 struct SessionAnchorDiagnostics {
@@ -1758,6 +1763,7 @@ async fn run_responses_compact_for_authorized_agent(
         prefix_lag_input_delta_tokens: None,
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
+        static_wire_drift_late_mutation_categories: None,
         prefix_cache_instability_score: None,
         prefix_seen_bucket_tokens: None,
         prefix_state_cache_read_tokens: None,
@@ -2474,6 +2480,11 @@ async fn run_generation_for_authorized_agent(
         .get("previous_response_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    // A local response id is only useful for FullReplay recovery when the
+    // caller's input is proven to be complete history or an append-only delta.
+    // Ambiguous local lineage still gets one ordinary upstream request, but it
+    // must not publish a waterline or teach prefix state from an unproven body.
+    let mut full_replay_ambiguous_local_lineage = false;
     let stale_external_continuation = match (
         continuation_scope.as_ref(),
         incoming_previous_response_id.as_deref(),
@@ -2498,6 +2509,7 @@ async fn run_generation_for_authorized_agent(
             if let Some(recovery) =
                 full_replay_input_after_route_switch(&stale_session, request.get("input"))
             {
+                full_replay_ambiguous_local_lineage |= recovery.ambiguous_local_lineage;
                 request.insert("input".to_string(), recovery.input);
             }
             request.remove("previous_response_id");
@@ -2555,6 +2567,7 @@ async fn run_generation_for_authorized_agent(
                     full_replay_input_after_route_switch(local_head, request.get("input"))
                 {
                     let rebuilt_incremental = recovery.rebuilt_incremental;
+                    full_replay_ambiguous_local_lineage |= recovery.ambiguous_local_lineage;
                     request.insert("input".to_string(), recovery.input);
                     request.remove("previous_response_id");
                     full_replay_after_local_lineage = rebuilt_incremental;
@@ -2618,7 +2631,9 @@ async fn run_generation_for_authorized_agent(
         && matches!(decision.upstream_channel, Channel::Responses)
     {
         response_session_reuse_diagnostics.context_plan = Some(
-            if stale_external_continuation_after_route_switch {
+            if full_replay_ambiguous_local_lineage {
+                "full_replay_ambiguous_local_lineage"
+            } else if stale_external_continuation_after_route_switch {
                 "full_replay_after_route_switch"
             } else if full_replay_after_local_lineage {
                 "full_replay_after_local_lineage"
@@ -3039,6 +3054,7 @@ async fn run_generation_for_authorized_agent(
         && matches!(&active_request_channel, Channel::Responses)
         && !active_used_response_session
         && !response_session_starts_compaction_epoch
+        && !full_replay_ambiguous_local_lineage
         && matches!(&response_session_parent, LineageParent::FullReplay);
     if !final_scope_waterline_is_full_replay {
         final_scope_predecessor = final_scope_predecessor.not_full_replay();
@@ -3298,23 +3314,30 @@ async fn run_generation_for_authorized_agent(
         .filter(|receipt| receipt.eligible_for_shadow_observation)
         .map(|receipt| receipt.digest.clone());
     let warm_pending_predecessor = final_scope_predecessor.clone();
-    if let Some(claim) = {
-        let mut warm_pending = state.warm_pending.lock().await;
-        warm_pending.claim(
-            prefix_state_update_key.as_deref(),
-            upstream_request_diagnostics
-                .warm_pending_scope_digest
-                .as_deref(),
-            final_scope_waterline_is_full_replay,
-            &warm_pending_predecessor,
-        )
-    } {
-        // The ordinary 500ms exact-prefix settle may already have run earlier
-        // in preparation.  The rare giant-cold controller tops that up to a
-        // hard 2s total, never sleeps while holding state and never dispatches
-        // another upstream request.
-        let already_waited = TokioDuration::from_millis(prefix_guard_wait.wait_ms);
-        let wait = claim.wait_duration().saturating_sub(already_waited);
+    // This is a cache optimization only. Do not let a terminal settlement hold
+    // the tiny registry mutex and turn an inbound prefix wait into an unbounded
+    // queue; a busy registry fails open for this one request.
+    let warm_pending_claim = state
+        .warm_pending
+        .try_lock()
+        .ok()
+        .and_then(|mut warm_pending| {
+            warm_pending.claim(
+                prefix_state_update_key.as_deref(),
+                upstream_request_diagnostics
+                    .warm_pending_scope_digest
+                    .as_deref(),
+                final_scope_waterline_is_full_replay,
+                &warm_pending_predecessor,
+            )
+        });
+    if let Some(claim) = warm_pending_claim {
+        // Every foreground prefix wait for one inbound shares the user's hard
+        // 500ms total budget. The giant-cold observer may use only the
+        // remaining portion and never dispatches another upstream request.
+        let already_waited = prefix_guard_wait.wait_duration;
+        let remaining_budget = remaining_responses_prefix_wait_budget(already_waited);
+        let wait = claim.wait_duration().min(remaining_budget);
         // Claiming removes the entry so sibling requests never queue.  Keep
         // the claim even when its window has just expired: terminal
         // settlement must then consume it rather than mistakenly arming a
@@ -3323,20 +3346,30 @@ async fn run_generation_for_authorized_agent(
         if !wait.is_zero() {
             sleep(wait).await;
             prefix_guard_wait.wait_ms = prefix_guard_wait
-                .wait_ms
-                .saturating_add(wait.as_millis() as u64);
+                .wait_duration
+                .saturating_add(wait)
+                .as_millis() as u64;
+            prefix_guard_wait.wait_duration = prefix_guard_wait.wait_duration.saturating_add(wait);
             prefix_guard_wait.reason = Some("responses_giant_cold_prefix_warm_pending".to_string());
             prefix_guard_wait.source = Some("exact".to_string());
             prefix_guard_wait.skip_reason = None;
         }
     }
-    let mut final_scope_dispatch = begin_final_scope_waterline(
-        &state,
-        upstream_request_diagnostics.final_scope_shadow.as_ref(),
-        final_scope_waterline_is_full_replay,
-        final_scope_predecessor,
-    )
-    .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
+    // An ambiguous local lineage is deliberately outside the final-scope
+    // ledger altogether.  Do not create an observe-only ticket: even that
+    // diagnostic record would make the request look as if it participated in
+    // waterline settlement and could be mistaken for learnable evidence.
+    let mut final_scope_dispatch = (!full_replay_ambiguous_local_lineage)
+        .then(|| {
+            begin_final_scope_waterline(
+                &state,
+                upstream_request_diagnostics.final_scope_shadow.as_ref(),
+                final_scope_waterline_is_full_replay,
+                final_scope_predecessor,
+            )
+        })
+        .flatten()
+        .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
     upstream_request_diagnostics.final_wire_receipt = Some(final_wire_receipt);
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
         &active_request_channel,
@@ -4127,6 +4160,11 @@ async fn run_generation_for_authorized_agent(
         prefix_usage_record.as_ref(),
         &tail_input_diagnostics,
         final_responses_static_projection,
+        upstream_request_diagnostics
+            .final_wire_receipt
+            .as_ref()
+            .map(|receipt| receipt.wire.atoapi_mutated_static_categories.as_slice())
+            .unwrap_or_default(),
         active_used_response_session,
         retried_full_response,
         prefix_guard_wait.budget_exhausted,
@@ -4135,7 +4173,10 @@ async fn run_generation_for_authorized_agent(
         prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
         prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
         prefix_guard_wait.settled_exact_state_finished_at,
-        is_success_status && !sync_compact_diagnostic_only && !confirmed_compaction,
+        is_success_status
+            && !sync_compact_diagnostic_only
+            && !confirmed_compaction
+            && !full_replay_ambiguous_local_lineage,
     )
     .await;
     let (gap_breakdown, final_scope_rollback_reclassified) =
@@ -4157,6 +4198,9 @@ async fn run_generation_for_authorized_agent(
         .unwrap_or_default();
     if prefix_observation.static_wire_drift {
         prefix_lag.classification = Some("static_wire_drift".to_string());
+        prefix_lag.static_wire_drift_late_mutation_categories = prefix_observation
+            .static_wire_drift_late_mutation_categories
+            .clone();
     } else if final_scope_rollback_reclassified {
         prefix_lag.classification = Some("provider_waterline_rollback".to_string());
     }
@@ -4276,6 +4320,7 @@ async fn run_generation_for_authorized_agent(
         prefix_lag_input_delta_tokens: None,
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
+        static_wire_drift_late_mutation_categories: None,
         prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
         prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
@@ -4495,10 +4540,26 @@ async fn wait_for_provider_prefix_settle(
             ..PrefixGuardWaitDiagnostics::default()
         };
     }
-    let state_snapshot = {
-        // Writes hold this mutex only while updating a small in-memory map.
-        // Wait for that short critical section so ordinary contention cannot
-        // erase exact pre-request evidence.
+    let state_snapshot = if matches!(channel, Channel::Responses) {
+        // Prefix settling is an optimization. A busy bookkeeping map must not
+        // consume the caller's foreground wait budget before the actual
+        // settle window starts, so Responses fail open instead of queueing.
+        let Ok(states) = state.prefix_states.try_lock() else {
+            return PrefixGuardWaitDiagnostics {
+                skip_reason: Some("prefix_state_snapshot_busy".to_string()),
+                ..PrefixGuardWaitDiagnostics::default()
+            };
+        };
+        lookup_provider_prefix_state_with_source(
+            &states,
+            provider_prefix_key,
+            provider_prefix_family_key,
+        )
+        .map(|(source, state)| (source.to_string(), state.clone()))
+    } else {
+        // Non-Responses compatibility channels retain their established
+        // serialization behaviour; the hard 500ms aggregate applies to the
+        // Responses prefix controller only.
         let states = state.prefix_states.lock().await;
         lookup_provider_prefix_state_with_source(
             &states,
@@ -4532,8 +4593,6 @@ async fn wait_for_provider_prefix_settle(
                 current_tail_is_settle_safe: !responses_current_tail_makes_avoidable_unreliable(
                     current_tail,
                 ) && !responses_tool_tail_burst(current_tail),
-                current_tail_has_commit_maturity_risk: current_tail.tool_output_chars >= 4_096
-                    || current_tail.largest_tool_output_chars >= 4_096,
                 settle_after_cold_read: state.settle_after_cold_read,
                 compaction_requested,
                 state_age,
@@ -4564,6 +4623,7 @@ async fn wait_for_provider_prefix_settle(
             }
             sleep(policy.wait).await;
             return PrefixGuardWaitDiagnostics {
+                wait_duration: policy.wait,
                 wait_ms: policy.wait.as_millis() as u64,
                 reason: policy.reason.map(str::to_string),
                 source: Some(source),
@@ -4609,6 +4669,7 @@ async fn wait_for_provider_prefix_settle(
             }
             sleep(wait).await;
             return PrefixGuardWaitDiagnostics {
+                wait_duration: wait,
                 wait_ms: wait.as_millis() as u64,
                 reason: reason.or_else(|| Some("provider_prefix_settle".to_string())),
                 source: Some(source),
@@ -5119,6 +5180,10 @@ fn responses_foreground_wait_cap() -> TokioDuration {
     TokioDuration::from_millis(500)
 }
 
+fn remaining_responses_prefix_wait_budget(already_waited: TokioDuration) -> TokioDuration {
+    responses_foreground_wait_cap().saturating_sub(already_waited)
+}
+
 async fn settle_giant_cold_prefix_pending(
     state: &AppState,
     upstream_request_diagnostics: &UpstreamRequestDiagnostics,
@@ -5165,11 +5230,7 @@ fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
     _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
-    // The controller keeps ordinary and observed-gap waits at 500ms. Responses
-    // additionally receives a one-second budget for its narrow exact/high-hit
-    // post-handoff commit-maturity branch; non-exact state, compaction,
-    // ordinary tails, and missing state cannot enter that branch.
-    matches!(channel, Channel::Responses).then_some(TokioDuration::from_secs(1))
+    matches!(channel, Channel::Responses).then_some(responses_foreground_wait_cap())
 }
 
 fn prefix_guard_wait_effect(
@@ -5326,6 +5387,7 @@ fn prefix_lag_diagnostics_from_previous(
         input_delta_tokens: Some(input_delta),
         cache_delta_tokens: Some(cache_delta),
         previous_gap_tokens: Some(previous_gap),
+        static_wire_drift_late_mutation_categories: None,
     }
 }
 
@@ -5334,6 +5396,8 @@ fn apply_prefix_lag_diagnostics(log: &mut RequestLog, diagnostics: PrefixLagDiag
     log.prefix_lag_input_delta_tokens = diagnostics.input_delta_tokens;
     log.prefix_lag_cache_delta_tokens = diagnostics.cache_delta_tokens;
     log.prefix_lag_previous_gap_tokens = diagnostics.previous_gap_tokens;
+    log.static_wire_drift_late_mutation_categories =
+        diagnostics.static_wire_drift_late_mutation_categories;
 }
 
 /// The prefix controller must conservatively treat a dynamic tool tail as
@@ -5925,6 +5989,7 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         usage_record,
         tail_input_diagnostics,
         FinalResponsesStaticProjection::NotApplicable,
+        &[],
         used_response_session,
         retried_full_response,
         guard_budget_exhausted,
@@ -5947,6 +6012,7 @@ async fn observe_provider_prefix_usage(
     effective_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
     final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    late_atoapi_mutation_categories: &[String],
     used_response_session: bool,
     retried_full_response: bool,
     guard_budget_exhausted: bool,
@@ -5969,6 +6035,7 @@ async fn observe_provider_prefix_usage(
         next,
         learn_family,
         static_wire_drift,
+        static_wire_drift_late_mutation_categories,
         exact_settle_window_elapsed,
     ) = {
         let mut states = state.prefix_states.lock().await;
@@ -6028,6 +6095,8 @@ async fn observe_provider_prefix_usage(
         let static_wire_drift = state_observation
             .as_ref()
             .is_some_and(|observation| observation.static_wire_drift);
+        let static_wire_drift_late_mutation_categories =
+            static_wire_drift.then(|| late_atoapi_mutation_categories.to_vec());
         if let (Some(key), Some(next)) = (key, next.as_ref()) {
             states.insert(key.to_string(), next.clone());
             if let Some(alias_key) = provider_prefix_state_alias_key(key) {
@@ -6048,6 +6117,7 @@ async fn observe_provider_prefix_usage(
             next,
             learn_family,
             static_wire_drift,
+            static_wire_drift_late_mutation_categories,
             exact_settle_window_elapsed,
         )
     };
@@ -6071,6 +6141,7 @@ async fn observe_provider_prefix_usage(
         gap,
         previous: previous_best,
         static_wire_drift,
+        static_wire_drift_late_mutation_categories,
     }
 }
 
@@ -7086,6 +7157,7 @@ fn full_replay_input_after_route_switch(
         return Some(FullReplayInputRecovery {
             input: Value::Array(current_items.clone()),
             rebuilt_incremental: false,
+            ambiguous_local_lineage: false,
         });
     }
     if !response_session_incremental_input_is_proven_safe(session, current_items) {
@@ -7097,6 +7169,7 @@ fn full_replay_input_after_route_switch(
         return Some(FullReplayInputRecovery {
             input: Value::Array(current_items.clone()),
             rebuilt_incremental: false,
+            ambiguous_local_lineage: true,
         });
     }
 
@@ -7112,6 +7185,7 @@ fn full_replay_input_after_route_switch(
     Some(FullReplayInputRecovery {
         input: Value::Array(replay),
         rebuilt_incremental: true,
+        ambiguous_local_lineage: false,
     })
 }
 
@@ -7119,6 +7193,7 @@ fn full_replay_input_after_route_switch(
 struct FullReplayInputRecovery {
     input: Value,
     rebuilt_incremental: bool,
+    ambiguous_local_lineage: bool,
 }
 
 /// FullReplay recovery must compare the semantic prefix that the upstream
@@ -7171,16 +7246,37 @@ fn response_session_incremental_input_is_proven_safe(
         return false;
     }
     // Without a pending tool result, a native Responses continuation is one
-    // new message. A longer all-message sequence is indistinguishable from a
-    // caller-provided shortened full history, so preserve it rather than
-    // concatenating stale context. With pending tool outputs, allow only the
-    // exact outputs plus at most two follow-up instruction/message items.
+    // new message. A leading system/developer instruction sequence followed by
+    // exactly one user message is also an unambiguous continuation shape used
+    // by Codex. A multi-user sequence remains ambiguous and is preserved rather
+    // than concatenating stale context. With pending tool outputs, allow only
+    // the exact outputs plus at most two follow-up instruction/message items.
     if expected.is_empty() {
-        return current_items.len() == 1;
+        return current_items.len() == 1
+            || response_session_instruction_and_user_delta_is_safe(current_items);
     }
     current_items.len() <= expected.len().saturating_add(2)
         && (current_items.len() < previous_items.len()
             || current_items.len() <= expected.len().saturating_add(1))
+}
+
+fn response_session_instruction_and_user_delta_is_safe(items: &[Value]) -> bool {
+    let Some((last, leading)) = items.split_last() else {
+        return false;
+    };
+    if leading.is_empty()
+        || last.get("type").and_then(Value::as_str) != Some("message")
+        || last.get("role").and_then(Value::as_str) != Some("user")
+    {
+        return false;
+    }
+    leading.iter().all(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && matches!(
+                item.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8896,6 +8992,7 @@ fn upstream_transport_failure_log(
         prefix_lag_input_delta_tokens: None,
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
+        static_wire_drift_late_mutation_categories: None,
         prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
         prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
@@ -9103,6 +9200,7 @@ async fn cache_hit_response(
         prefix_lag_input_delta_tokens: None,
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
+        static_wire_drift_late_mutation_categories: None,
         prefix_cache_instability_score: None,
         prefix_seen_bucket_tokens: None,
         prefix_state_cache_read_tokens: None,
@@ -18956,8 +19054,25 @@ mod tests {
         assert!(smart_hit_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
-            Some(TokioDuration::from_secs(1))
+            Some(TokioDuration::from_millis(500))
         );
+        assert_eq!(
+            remaining_responses_prefix_wait_budget(TokioDuration::from_millis(300)),
+            TokioDuration::from_millis(200)
+        );
+        assert!(remaining_responses_prefix_wait_budget(TokioDuration::from_millis(500)).is_zero());
+    }
+
+    #[test]
+    fn responses_prefix_wait_budget_keeps_submillisecond_remainder_exact() {
+        let cap = responses_foreground_wait_cap();
+        let one_nanosecond = TokioDuration::from_nanos(1);
+        let already_waited = cap.saturating_sub(one_nanosecond);
+        let remaining = remaining_responses_prefix_wait_budget(already_waited);
+
+        assert_eq!(remaining, one_nanosecond);
+        assert_eq!(already_waited.as_millis(), 499);
+        assert!(already_waited.saturating_add(remaining) <= cap);
     }
 
     #[tokio::test]
@@ -19010,7 +19125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_snapshot_waits_for_the_short_state_lock_instead_of_dropping_evidence() {
+    async fn responses_prefix_snapshot_busy_fails_open_without_spending_wait_budget() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-prefix-snapshot-lock-{}",
             Uuid::new_v4().simple()
@@ -19045,16 +19160,18 @@ mod tests {
             ),
         )
         .await
-        .expect("the short runtime snapshot lock must settle promptly");
+        .expect("a busy snapshot must fail open promptly");
 
-        release.await.unwrap();
-        assert!(started.elapsed() >= TokioDuration::from_millis(15));
-        assert_eq!(wait.source.as_deref(), Some("exact"));
+        assert!(started.elapsed() < TokioDuration::from_millis(5));
+        assert_eq!(wait.source, None);
         assert_eq!(
             wait.skip_reason.as_deref(),
-            Some("local_guard_budget_exhausted")
+            Some("prefix_state_snapshot_busy")
         );
-        assert!(wait.recovery_applicable);
+        assert!(wait.wait_duration.is_zero());
+        assert_eq!(wait.wait_ms, 0);
+        assert!(!wait.recovery_applicable);
+        release.await.unwrap();
         fs::remove_dir_all(dir).ok();
     }
 
@@ -24952,6 +25069,7 @@ mod tests {
             Some(&residual),
             &TailInputDiagnostics::default(),
             FinalResponsesStaticProjection::NotApplicable,
+            &[],
             false,
             false,
             false,
@@ -24975,6 +25093,7 @@ mod tests {
             Some(&residual),
             &TailInputDiagnostics::default(),
             FinalResponsesStaticProjection::NotApplicable,
+            &[],
             false,
             false,
             false,
@@ -32078,6 +32197,7 @@ mod tests {
             Some(&next),
             Some(&gap),
             &PrefixGuardWaitDiagnostics {
+                wait_duration: TokioDuration::from_millis(78_000),
                 wait_ms: 78_000,
                 reason: Some("responses_large_tool_output_tail_guard".to_string()),
                 source: Some("exact".to_string()),
@@ -33262,6 +33382,7 @@ mod tests {
                 ..TailInputDiagnostics::default()
             },
             FinalResponsesStaticProjection::NotApplicable,
+            &[],
             false,
             false,
             false,
@@ -36039,6 +36160,43 @@ mod tests {
     }
 
     #[test]
+    fn full_replay_recovery_rebuilds_instruction_and_user_delta() {
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp_seed".to_string(),
+            input: json!([{ "type": "message", "role": "user", "content": "before" }]),
+            output_items: vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "seed answer" }]
+            })],
+            finished_at: Instant::now(),
+        };
+        let delta = json!([
+            { "type": "message", "role": "developer", "content": "continue safely" },
+            { "type": "message", "role": "user", "content": "after" }
+        ]);
+
+        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+            .expect("a local instruction plus user continuation must be rebuilt");
+        assert!(recovery.rebuilt_incremental);
+        assert_eq!(
+            recovery.input,
+            json!([
+                { "type": "message", "role": "user", "content": "before" },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "seed answer" }]
+                },
+                { "type": "message", "role": "developer", "content": "continue safely" },
+                { "type": "message", "role": "user", "content": "after" }
+            ])
+        );
+    }
+
+    #[test]
     fn full_replay_recovery_rebuilds_proven_tool_result_delta() {
         let session = ResponseSessionState {
             generation: 1,
@@ -36110,11 +36268,12 @@ mod tests {
         let recovery = full_replay_input_after_route_switch(&session, Some(&ambiguous))
             .expect("a caller-supplied history remains valid input");
         assert!(!recovery.rebuilt_incremental);
+        assert!(recovery.ambiguous_local_lineage);
         assert_eq!(recovery.input, ambiguous);
     }
 
     #[tokio::test]
-    async fn local_previous_response_id_rebuilds_only_a_proven_delta_once() {
+    async fn local_previous_response_id_rebuilds_instruction_and_user_delta_once() {
         let hits = Arc::new(AtomicUsize::new(0));
         let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let hits_for_route = hits.clone();
@@ -36228,7 +36387,10 @@ mod tests {
                     "model": "gpt-5.5",
                     "stream": true,
                     "previous_response_id": "resp_seed",
-                    "input": [{ "type": "message", "role": "user", "content": "after" }]
+                    "input": [
+                        { "type": "message", "role": "developer", "content": "continue safely" },
+                        { "type": "message", "role": "user", "content": "after" }
+                    ]
                 }))
                 .unwrap(),
             ),
@@ -36309,6 +36471,7 @@ mod tests {
                     "role": "assistant",
                     "content": [{ "type": "output_text", "text": "seed answer" }]
                 },
+                { "type": "message", "role": "developer", "content": "continue safely" },
                 { "type": "message", "role": "user", "content": "after" }
             ])
         );
@@ -36330,6 +36493,15 @@ mod tests {
         assert!(metrics.recent_requests.iter().any(|request| {
             request.response_context_plan.as_deref() == Some("full_replay_after_local_lineage")
         }));
+        let ambiguous = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.response_context_plan.as_deref()
+                    == Some("full_replay_ambiguous_local_lineage")
+            })
+            .expect("an unmatched local continuation must be visible but not learned as a prefix");
+        assert!(ambiguous.final_scope_waterline.is_none());
         fs::remove_dir_all(dir).ok();
     }
 

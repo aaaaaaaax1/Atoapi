@@ -2,6 +2,7 @@ use bytes::Bytes;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     ops::Range,
     sync::{Arc, OnceLock},
     time::Instant,
@@ -230,7 +231,13 @@ impl PreparedResponseBody {
     /// semantic body. Callers can therefore never attach bytes encoded from a
     /// different body, while late root mutations can still retain a large
     /// unchanged `input` member without cloning or re-serializing it.
-    pub(super) fn responses(body: Value) -> Self {
+    pub(super) fn responses(mut body: Value) -> Self {
+        // A native Responses request is otherwise intentionally passed through
+        // unchanged. Canonicalize only protocol-static JSON objects so equal
+        // tool/schema/control payloads cannot split an upstream prefix merely
+        // because the caller constructed nested maps in a different key order.
+        // `input`, arrays, strings, and unknown extension roots stay untouched.
+        canonicalize_responses_static_roots(&mut body);
         let wire_draft = PreparedWireDraft::from_responses_value(&body);
         Self {
             body,
@@ -257,11 +264,12 @@ impl PreparedResponseBody {
         self.wire_draft.as_ref().map(PreparedWireDraft::body_ptr)
     }
 
-    pub(super) fn set_root(&mut self, key: &str, value: Value) -> bool {
+    pub(super) fn set_root(&mut self, key: &str, mut value: Value) -> bool {
         let Some(object) = self.body.as_object_mut() else {
             self.requires_full_freeze = true;
             return false;
         };
+        canonicalize_responses_static_root(key, &mut value);
         if object.get(key) == Some(&value) {
             return false;
         }
@@ -330,7 +338,7 @@ impl PreparedResponseBody {
             requires_full_freeze,
             atoapi_injected_protocol_breakpoint,
         } = self;
-        let wire = match (channel, wire_draft, requires_full_freeze) {
+        let mut wire = match (channel, wire_draft, requires_full_freeze) {
             (Channel::Responses, Some(draft), false) => {
                 draft.freeze_tracked(&body, &changed_fields, atoapi_injected_protocol_breakpoint)
             }
@@ -340,6 +348,7 @@ impl PreparedResponseBody {
                 atoapi_injected_protocol_breakpoint,
             ),
         };
+        wire.set_atoapi_mutated_roots(&changed_fields);
         (body, wire)
     }
 
@@ -530,6 +539,74 @@ mod tests {
     }
 
     #[test]
+    fn native_responses_static_roots_are_canonical_without_touching_input() {
+        let input = json!([{
+            "type": "message",
+            "role": "user",
+            "opaque_json": "{\"second\":2,\"first\":1}",
+            "content": [{"type":"input_text","text":"caller-owned input"}]
+        }, {
+            "type": "function_call_output",
+            "call_id": "call_input_order",
+            "output": "caller-owned tool output"
+        }]);
+        let left = json!({
+            "model": "gpt-test",
+            "tools": [{
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "required": ["path"],
+                    "properties": {"path": {"type":"string", "description":"path"}}
+                }
+            }],
+            "reasoning": {"summary":"auto", "effort":"high"},
+            "metadata": {"z":"last", "a":"first"},
+            "input": input.clone(),
+            "stream": true
+        });
+        let right = json!({
+            "model": "gpt-test",
+            "tools": [{
+                "name": "read_file",
+                "parameters": {
+                    "properties": {"path": {"description":"path", "type":"string"}},
+                    "required": ["path"],
+                    "type": "object"
+                },
+                "type": "function"
+            }],
+            "reasoning": {"effort":"high", "summary":"auto"},
+            "metadata": {"a":"first", "z":"last"},
+            "input": input.clone(),
+            "stream": true
+        });
+
+        let (left_body, left_wire) =
+            PreparedResponseBody::responses(left.clone()).into_prepared_wire(&Channel::Responses);
+        let (_right_body, right_wire) =
+            PreparedResponseBody::responses(right).into_prepared_wire(&Channel::Responses);
+
+        assert_eq!(left_wire.body(), right_wire.body());
+        assert_eq!(
+            left_wire.responses_static_projection_digest(),
+            right_wire.responses_static_projection_digest()
+        );
+        assert_eq!(
+            serde_json::to_vec(&left_body["input"]).unwrap(),
+            serde_json::to_vec(&input).unwrap(),
+            "canonicalizing static roots must not rewrite caller input"
+        );
+        assert_eq!(
+            left_body["input"][0]["opaque_json"],
+            "{\"second\":2,\"first\":1}"
+        );
+        assert_eq!(left_body["input"][1]["type"], "function_call_output");
+        assert_eq!(left_body["input"][1]["output"], "caller-owned tool output");
+    }
+
+    #[test]
     fn tracked_final_mutation_recomputes_static_projection_without_reencoding_input() {
         let initial = json!({
             "model": "gpt-test",
@@ -552,6 +629,42 @@ mod tests {
         );
         assert_eq!(draft_member_encoding_count("input"), 1);
         assert_eq!(draft_member_encoding_count("prompt_cache_key"), 2);
+    }
+
+    #[test]
+    fn final_wire_reports_only_fixed_redacted_categories_for_late_mutations() {
+        let initial = json!({
+            "model": "gpt-test",
+            "prompt_cache_key": "before-secret",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"before-context"}],
+            "x_private_extension": {"credential":"before-extension-secret"}
+        });
+        let mut body = PreparedResponseBody::responses(initial);
+        assert!(body.set_root("prompt_cache_key", json!("after-secret")));
+        assert!(body.set_root("stream", json!(false)));
+        assert!(body.set_root(
+            "input",
+            json!([{"type":"message","role":"user","content":"after-context"}]),
+        ));
+        assert!(body.set_root(
+            "x_private_extension",
+            json!({"credential":"after-extension-secret"}),
+        ));
+
+        let (_, wire) = body.into_prepared_wire(&Channel::Responses);
+        let expected = vec![
+            "cache_control".to_string(),
+            "extension".to_string(),
+            "transport_controls".to_string(),
+        ];
+        assert_eq!(wire.atoapi_mutated_static_categories(), expected.as_slice());
+        let categories = wire.atoapi_mutated_static_categories().join(",");
+        assert!(!categories.contains("input"));
+        assert!(!categories.contains("x_private_extension"));
+        assert!(!categories.contains("after-secret"));
+        assert!(!categories.contains("after-context"));
+        assert!(!categories.contains("after-extension-secret"));
     }
 
     #[test]
@@ -632,6 +745,10 @@ pub(super) struct PreparedWireRequest {
     /// bytes. Appending Agent input therefore stays stable without treating an
     /// unclassified static field as equivalent.
     responses_static_projection_digest: Option<String>,
+    /// Fixed category names for top-level roots Atoapi itself changed after
+    /// the initial Responses wire draft. No values, request text, tool output,
+    /// keys, or hashes are retained here.
+    atoapi_mutated_static_categories: Vec<String>,
     protocol_breakpoint_provenance: ProtocolBreakpointProvenance,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
@@ -684,6 +801,7 @@ impl PreparedWireRequest {
             stream,
             encode_ms: encode_ms.saturating_add(finalize_started.elapsed().as_millis() as u64),
             responses_static_projection_digest,
+            atoapi_mutated_static_categories: Vec::new(),
             protocol_breakpoint_provenance: protocol_breakpoint_provenance(
                 channel,
                 body,
@@ -717,6 +835,10 @@ impl PreparedWireRequest {
         self.responses_static_projection_digest.as_deref()
     }
 
+    pub(super) fn atoapi_mutated_static_categories(&self) -> &[String] {
+        &self.atoapi_mutated_static_categories
+    }
+
     #[cfg(test)]
     pub(super) fn prompt_cache_breakpoint_present(&self) -> bool {
         self.protocol_breakpoint_provenance.is_present()
@@ -743,6 +865,89 @@ impl PreparedWireRequest {
                 .cloned()
                 .expect("a failed gzip cache set must leave an initialized value")
         }
+    }
+
+    fn set_atoapi_mutated_roots(&mut self, roots: &[String]) {
+        self.atoapi_mutated_static_categories = atoapi_static_mutation_categories(roots);
+    }
+}
+
+fn atoapi_static_mutation_categories(roots: &[String]) -> Vec<String> {
+    let mut categories = BTreeSet::new();
+    for root in roots {
+        // `input` is deliberately excluded: it is not part of the static
+        // projection and may contain sensitive conversation material. Unknown
+        // roots are coarsened so an untrusted caller cannot make a field name
+        // part of diagnostics.
+        let category = if root == "input" {
+            None
+        } else {
+            known_responses_static_root_category(root).or(Some("extension"))
+        };
+        if let Some(category) = category {
+            categories.insert(category);
+        }
+    }
+    categories.into_iter().map(str::to_owned).collect()
+}
+
+fn known_responses_static_root_category(root: &str) -> Option<&'static str> {
+    match root {
+        "model" => Some("model"),
+        "prompt_cache_key" | "prompt_cache_retention" | "prompt_cache_options" => {
+            Some("cache_control")
+        }
+        "instructions" => Some("instructions"),
+        "tools" => Some("tools"),
+        "tool_choice" | "parallel_tool_calls" => Some("tool_settings"),
+        "reasoning" | "text" | "response_format" | "temperature" | "top_p"
+        | "max_output_tokens" | "include" => Some("generation_controls"),
+        "stream" | "store" | "service_tier" | "truncation" | "previous_response_id" => {
+            Some("transport_controls")
+        }
+        "metadata" | "user" => Some("metadata"),
+        _ => None,
+    }
+}
+
+fn canonicalize_responses_static_roots(body: &mut Value) {
+    let Some(object) = body.as_object_mut() else {
+        return;
+    };
+    for (key, value) in object.iter_mut() {
+        canonicalize_responses_static_root(key, value);
+    }
+}
+
+fn canonicalize_responses_static_root(key: &str, value: &mut Value) {
+    if known_responses_static_root_category(key).is_some() {
+        canonicalize_json_object_keys(value);
+    }
+}
+
+fn canonicalize_json_object_keys(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = Map::new();
+            for key in keys {
+                if let Some(mut child) = map.remove(&key) {
+                    canonicalize_json_object_keys(&mut child);
+                    canonical.insert(key, child);
+                }
+            }
+            *map = canonical;
+        }
+        Value::Array(items) => {
+            // Array order is part of the Responses protocol and must remain
+            // byte-for-byte caller-owned; only objects inside each element are
+            // canonicalized.
+            for item in items {
+                canonicalize_json_object_keys(item);
+            }
+        }
+        _ => {}
     }
 }
 

@@ -789,6 +789,11 @@ pub struct RequestLog {
     pub prefix_lag_cache_delta_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_lag_previous_gap_tokens: Option<u64>,
+    /// Fixed categories of Atoapi's late top-level mutations when a strict
+    /// Responses static projection drifted. Values, request text, tool output,
+    /// keys, and caller-provided field names are never retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_wire_drift_late_mutation_categories: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cache_instability_score: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3039,6 +3044,7 @@ mod tests {
             prefix_lag_input_delta_tokens: None,
             prefix_lag_cache_delta_tokens: None,
             prefix_lag_previous_gap_tokens: None,
+            static_wire_drift_late_mutation_categories: None,
             prefix_cache_instability_score: None,
             prefix_seen_bucket_tokens: None,
             prefix_state_cache_read_tokens: None,

@@ -9,7 +9,7 @@ use crate::{
 };
 
 const WARM_PENDING_TTL: Duration = Duration::from_secs(22);
-const WARM_PENDING_FOLLOWUP_WAIT: Duration = Duration::from_secs(2);
+const WARM_PENDING_FOLLOWUP_WAIT: Duration = Duration::from_millis(500);
 const WARM_PENDING_MAX_FOLLOWUPS: u8 = 3;
 const WARM_PENDING_MAX_ENTRIES: usize = 64;
 

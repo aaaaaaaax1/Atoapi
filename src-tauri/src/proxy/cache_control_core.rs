@@ -66,6 +66,7 @@ pub(super) struct PreparedWireDigest {
     pub(super) wire_bytes: u64,
     pub(super) canonical_member_count: u64,
     pub(super) responses_static_projection_digest: Option<String>,
+    pub(super) atoapi_mutated_static_categories: Vec<String>,
     pub(super) outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
 
@@ -161,6 +162,7 @@ impl CacheControlPlan {
             responses_static_projection_digest: prepared
                 .responses_static_projection_digest()
                 .map(ToOwned::to_owned),
+            atoapi_mutated_static_categories: prepared.atoapi_mutated_static_categories().to_vec(),
             outbound_prefix_fingerprints: prepared.outbound_prefix_fingerprints().cloned(),
         };
 

@@ -408,6 +408,7 @@ export interface MetricsSnapshot {
     shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
     prefix_lag_classification?: string | null;
+    static_wire_drift_late_mutation_categories?: string[] | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;
@@ -513,6 +514,7 @@ export interface MetricsSnapshot {
     shadow_affinity_policy_compute_ms?: number | null;
     prefix_guard_skip_reason?: string | null;
     prefix_lag_classification?: string | null;
+    static_wire_drift_late_mutation_categories?: string[] | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;

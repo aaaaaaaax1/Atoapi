@@ -1232,6 +1232,11 @@ pub(super) async fn stream_upstream(
             } else {
                 FinalResponsesStaticProjection::NotApplicable
             };
+        let late_atoapi_mutation_categories = upstream_request_diagnostics
+            .final_wire_receipt
+            .as_ref()
+            .map(|receipt| receipt.wire.atoapi_mutated_static_categories.as_slice())
+            .unwrap_or_default();
         let prefix_observation = observe_provider_prefix_usage(
             &state_for_stream,
             prefix_state_key.as_deref(),
@@ -1240,6 +1245,7 @@ pub(super) async fn stream_upstream(
             prefix_usage_record.as_ref(),
             &tail_input_diagnostics,
             final_responses_static_projection,
+            late_atoapi_mutation_categories,
             used_response_session,
             retried_full_response,
             prefix_guard_wait.budget_exhausted,
@@ -1270,6 +1276,9 @@ pub(super) async fn stream_upstream(
             .unwrap_or_default();
         if prefix_observation.static_wire_drift {
             prefix_lag.classification = Some("static_wire_drift".to_string());
+            prefix_lag.static_wire_drift_late_mutation_categories = prefix_observation
+                .static_wire_drift_late_mutation_categories
+                .clone();
         } else if final_scope_rollback_reclassified {
             prefix_lag.classification = Some("provider_waterline_rollback".to_string());
         }
@@ -1377,6 +1386,7 @@ pub(super) async fn stream_upstream(
             prefix_lag_input_delta_tokens: None,
             prefix_lag_cache_delta_tokens: None,
             prefix_lag_previous_gap_tokens: None,
+            static_wire_drift_late_mutation_categories: None,
             prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
             prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
             prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
