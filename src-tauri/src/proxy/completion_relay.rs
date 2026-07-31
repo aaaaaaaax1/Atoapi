@@ -726,6 +726,11 @@ pub(super) async fn stream_upstream(
         let mut sse_end_reason = "upstream_eof".to_string();
         let mut stream_upstream_wait_ms = 0u64;
         let mut stream_client_backpressure_ms = 0u64;
+        // A receiver can close naturally after the terminal event has already
+        // entered the relay queue. Keep that internal flow-control condition
+        // separate from a user-visible disconnect: the latter is only true
+        // when no terminal was successfully accepted by the relay.
+        let mut downstream_receiver_closed = false;
         let mut downstream_disconnected = false;
         let mut downstream_disconnect_stage = None;
         let mut first_chunk_accepted_by_relay = false;
@@ -836,7 +841,7 @@ pub(super) async fn stream_upstream(
                 })
                 .flatten();
                 let mut accepted_by_relay = false;
-                if !downstream_disconnected {
+                if !downstream_receiver_closed {
                     let client_backpressure_started = Instant::now();
                     let permit = downstream_byte_budget
                         .clone()
@@ -853,15 +858,11 @@ pub(super) async fn stream_upstream(
                         Err(_) => true,
                     };
                     if send_failed {
-                        downstream_disconnected = true;
-                        downstream_disconnect_stage = Some(
-                            if terminal_accepted_by_relay {
-                                "after_terminal"
-                            } else {
-                                "before_terminal"
-                            }
-                            .to_string(),
-                        );
+                        downstream_receiver_closed = true;
+                        if !terminal_accepted_by_relay {
+                            downstream_disconnected = true;
+                            downstream_disconnect_stage = Some("before_terminal".to_string());
+                        }
                     } else {
                         accepted_by_relay = true;
                     }
@@ -1005,7 +1006,7 @@ pub(super) async fn stream_upstream(
             }
         }
         let mut canonical_failure_enqueued = false;
-        if !downstream_disconnected
+        if !downstream_receiver_closed
             && !terminal_verdict.success
             && matches!(client_channel, Channel::Responses)
             && matches!(decision.upstream_channel, Channel::Responses)
@@ -1038,6 +1039,7 @@ pub(super) async fn stream_upstream(
                     Err(_) => true,
                 };
                 if send_failed {
+                    downstream_receiver_closed = true;
                     downstream_disconnected = true;
                     downstream_disconnect_stage = Some("before_terminal".to_string());
                 } else {
@@ -1045,7 +1047,7 @@ pub(super) async fn stream_upstream(
                 }
             }
         }
-        if !downstream_disconnected && !terminal_verdict.success && !canonical_failure_enqueued {
+        if !downstream_receiver_closed && !terminal_verdict.success && !canonical_failure_enqueued {
             let relay_error = match terminal_verdict.failure {
                 Some(TerminalFailure::TransportErrorBeforeTerminal) => stream_transport_error
                     .unwrap_or_else(|| "upstream stream failed before completion".to_string()),

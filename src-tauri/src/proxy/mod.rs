@@ -1032,6 +1032,11 @@ async fn run_responses_compact_for_authorized_agent(
         &upstream_body,
         authorized_agent.as_deref(),
     );
+    strip_attested_codex_turn_metadata_from_native_wire(
+        &mut upstream_body,
+        native_responses_passthrough,
+        trusted_codex_metadata.as_ref(),
+    );
     if native_responses_passthrough {
         strip_provider_cache_key_fields(&mut upstream_body);
     } else {
@@ -2232,6 +2237,11 @@ async fn run_generation_for_authorized_agent(
         &identity_client_request,
         &upstream_body,
         authorized_agent.as_deref(),
+    );
+    strip_attested_codex_turn_metadata_from_native_wire(
+        &mut upstream_body,
+        native_responses_passthrough,
+        trusted_codex_metadata.as_ref(),
     );
     if native_responses_passthrough {
         strip_provider_cache_key_fields(&mut upstream_body);
@@ -8113,6 +8123,60 @@ fn codex_metadata_identity_matches(
         && left.conversation_id == right.conversation_id
         && left.session_id == right.session_id
         && left.request_kind == right.request_kind
+}
+
+/// Removes only Atoapi's attested Codex identity carrier from an untouched
+/// native Responses wire. The carrier is consumed locally before this point;
+/// forwarding it makes otherwise identical request prefixes depend on a
+/// per-turn control value that the upstream neither needs nor sees as a
+/// normal Responses field.
+///
+/// Unknown client metadata is deliberately preserved. A JSON-string carrier
+/// is removed only when it contains no sibling metadata, because rewriting a
+/// mixed caller-owned string would itself introduce a different wire shape.
+fn strip_attested_codex_turn_metadata_from_native_wire(
+    upstream_body: &mut Value,
+    native_responses_passthrough: bool,
+    trusted_metadata: Option<&TrustedCodexRequestMetadata>,
+) {
+    if !native_responses_passthrough {
+        return;
+    }
+    let Some(trusted_metadata) = trusted_metadata else {
+        return;
+    };
+    let Some(embedded_metadata) = embedded_codex_turn_metadata(upstream_body).ok().flatten() else {
+        return;
+    };
+    if !codex_metadata_identity_matches(trusted_metadata, &embedded_metadata) {
+        return;
+    }
+
+    let Some(body) = upstream_body.as_object_mut() else {
+        return;
+    };
+    match body.get_mut("client_metadata") {
+        Some(Value::Object(client_metadata)) => {
+            client_metadata.remove(X_CODEX_TURN_METADATA_HEADER);
+            if client_metadata.is_empty() {
+                body.remove("client_metadata");
+            }
+        }
+        Some(Value::String(raw)) => {
+            let carrier_is_the_only_member = serde_json::from_str::<Value>(raw)
+                .ok()
+                .and_then(|value| {
+                    value.as_object().map(|object| {
+                        object.len() == 1 && object.contains_key(X_CODEX_TURN_METADATA_HEADER)
+                    })
+                })
+                .unwrap_or(false);
+            if carrier_is_the_only_member {
+                body.remove("client_metadata");
+            }
+        }
+        _ => {}
+    }
 }
 
 fn trusted_codex_request_metadata_from_raw(
@@ -21388,6 +21452,109 @@ mod tests {
     }
 
     #[test]
+    fn attested_codex_turn_metadata_is_not_forwarded_on_native_responses_wire() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(r#"{"thread_id":"thread-a","session_id":"session-a"}"#),
+        );
+
+        let mut object_carrier = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "thread_id": "thread-a",
+                    "session_id": "session-a",
+                    "turn_nonce": "first"
+                },
+                "upstream_tag": "preserve"
+            },
+            "input": []
+        });
+        let trusted = trusted_codex_request_metadata_for_request(&headers, &object_carrier, true)
+            .expect(
+                "matching Codex identity must be attested before its private carrier is removed",
+            );
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut object_carrier,
+            true,
+            Some(&trusted),
+        );
+        assert_eq!(
+            object_carrier.pointer("/client_metadata/upstream_tag"),
+            Some(&json!("preserve"))
+        );
+        assert!(object_carrier
+            .pointer("/client_metadata/x-codex-turn-metadata")
+            .is_none());
+
+        let mut next_turn = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {
+                    "thread_id": "thread-a",
+                    "session_id": "session-a",
+                    "turn_nonce": "second"
+                },
+                "upstream_tag": "preserve"
+            },
+            "input": [{"type":"message","role":"user","content":"next"}]
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(&mut next_turn, true, Some(&trusted));
+        let first_wire = PreparedWireRequest::from_value(&Channel::Responses, &object_carrier);
+        let next_wire = PreparedWireRequest::from_value(&Channel::Responses, &next_turn);
+        assert_eq!(
+            first_wire.responses_static_projection_digest(),
+            next_wire.responses_static_projection_digest(),
+            "a private per-turn carrier must not split the final static Responses prefix"
+        );
+
+        let mut control_only_string = json!({
+            "client_metadata": r#"{"x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a"}}"#,
+            "input": []
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut control_only_string,
+            true,
+            Some(&trusted),
+        );
+        assert!(control_only_string.get("client_metadata").is_none());
+
+        let mixed_raw = r#"{"x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a"},"upstream_tag":"preserve"}"#;
+        let mut mixed_string = json!({"client_metadata": mixed_raw, "input": []});
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut mixed_string,
+            true,
+            Some(&trusted),
+        );
+        assert_eq!(
+            mixed_string.get("client_metadata").and_then(Value::as_str),
+            Some(mixed_raw),
+            "mixed caller-owned string metadata must not be reserialized"
+        );
+
+        let mut mismatched = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {"thread_id":"thread-b","session_id":"session-a"}
+            },
+            "input": []
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(&mut mismatched, true, Some(&trusted));
+        assert!(mismatched
+            .pointer("/client_metadata/x-codex-turn-metadata")
+            .is_some());
+
+        let mut non_native = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": {"thread_id":"thread-a","session_id":"session-a"}
+            },
+            "input": []
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(&mut non_native, false, Some(&trusted));
+        assert!(non_native
+            .pointer("/client_metadata/x-codex-turn-metadata")
+            .is_some());
+    }
+
+    #[test]
     fn adapter_header_identity_must_agree_with_every_forwarded_body_identity() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -28060,11 +28227,8 @@ mod tests {
 
         let request = &snapshot.recent_requests[0];
         assert_eq!(request.status, 200);
-        assert_eq!(request.downstream_disconnected, Some(true));
-        assert_eq!(
-            request.downstream_disconnect_stage.as_deref(),
-            Some("after_terminal")
-        );
+        assert_eq!(request.downstream_disconnected, Some(false));
+        assert_eq!(request.downstream_disconnect_stage, None);
         assert_eq!(request.sse_completed_event_seen, Some(true));
 
         fs::remove_dir_all(config_dir).ok();
@@ -43120,6 +43284,14 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
                 "model": "gpt-5.6-sol",
                 "stream": true,
                 "prompt_cache_key": raw_client_key,
+                "client_metadata": {
+                    "x-codex-turn-metadata": {
+                        "thread_id": "client-key-thread",
+                        "session_id": "client-key-session",
+                        "turn_nonce": "one"
+                    },
+                    "upstream_tag": "preserve"
+                },
                 "input": [{
                     "type": "message",
                     "role": "user",
@@ -43155,6 +43327,17 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
                 .and_then(Value::as_str),
             Some(raw_client_key),
             "the normal native Codex wire must preserve its stable cache placement"
+        );
+        assert!(
+            captured_bodies[0]
+                .pointer("/client_metadata/x-codex-turn-metadata")
+                .is_none(),
+            "Atoapi's attested identity carrier must not split the upstream static wire"
+        );
+        assert_eq!(
+            captured_bodies[0].pointer("/client_metadata/upstream_tag"),
+            Some(&json!("preserve")),
+            "unrelated upstream metadata must remain intact"
         );
         drop(captured_bodies);
 
