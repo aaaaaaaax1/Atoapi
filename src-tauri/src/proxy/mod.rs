@@ -4692,6 +4692,10 @@ async fn wait_for_provider_prefix_settle(
             let policy = PrefixController::before_request(PrefixControlInput {
                 source_is_exact: source == "exact",
                 recent_exact_high_hit: responses_exact_prefix_is_high_hit(&state),
+                recent_exact_warm_small_tail: responses_exact_prefix_is_warm_small_tail(
+                    &state,
+                    current_tail,
+                ),
                 avoidable_tokens,
                 fine_avoidable_tokens: state.avoidable_shortfall_tokens_128,
                 avoidable_shortfall_streak: state.avoidable_shortfall_streak,
@@ -5321,6 +5325,38 @@ fn responses_exact_prefix_is_high_hit(state: &PrefixWarmState) -> bool {
     state.input_tokens >= 32_000
         && state.cache_read_tokens >= 32_000
         && state.cache_read_tokens.saturating_mul(100) >= state.input_tokens.saturating_mul(98)
+}
+
+/// A deliberately narrow extension of `responses_exact_prefix_is_high_hit`.
+/// It does not make a weak/unstable prefix eligible: the prior state must
+/// already be 98%-warm and caught up to its own observed waterline.  It only
+/// serves small exact contexts that fall below the normal 32k input threshold
+/// yet can still lose a single 128-token cache bucket while the provider is
+/// committing the immediately preceding turn.
+fn responses_exact_prefix_is_warm_small_tail(
+    state: &PrefixWarmState,
+    current_tail: &TailInputDiagnostics,
+) -> bool {
+    const MIN_CACHED_TOKENS: u64 = 16_384;
+    const WATERLINE_SLACK_TOKENS: u64 = 128;
+    const MAX_INPUT_ITEMS: u64 = 10;
+    const MAX_MESSAGE_CHARS: u64 = 1_024;
+    const MAX_TOOL_CALL_CHARS: u64 = 4_096;
+    const MAX_TOOL_OUTPUT_CHARS: u64 = 8_192;
+
+    let seen_waterline = state.seen_bucket_tokens_128.max(state.seen_bucket_tokens);
+    state.cache_read_tokens >= MIN_CACHED_TOKENS
+        && state.cache_read_tokens.saturating_mul(100) >= state.input_tokens.saturating_mul(98)
+        && seen_waterline
+            <= state
+                .cache_read_tokens
+                .saturating_add(WATERLINE_SLACK_TOKENS)
+        && current_tail.input_items <= MAX_INPUT_ITEMS
+        && current_tail.message_chars <= MAX_MESSAGE_CHARS
+        && current_tail.tool_call_chars <= MAX_TOOL_CALL_CHARS
+        && current_tail.tool_output_chars < MAX_TOOL_OUTPUT_CHARS
+        && current_tail.largest_tool_output_chars < MAX_TOOL_OUTPUT_CHARS
+        && current_tail.tool_output_noise_hint.is_none()
 }
 
 fn prefix_exact_settle_window_elapsed(
@@ -8131,9 +8167,11 @@ fn codex_metadata_identity_matches(
 /// per-turn control value that the upstream neither needs nor sees as a
 /// normal Responses field.
 ///
-/// Unknown client metadata is deliberately preserved. A JSON-string carrier
-/// is removed only when it contains no sibling metadata, because rewriting a
-/// mixed caller-owned string would itself introduce a different wire shape.
+/// Unknown client metadata is deliberately preserved. For a JSON-string
+/// carrier with caller-owned siblings, we only remove a *leading* attested
+/// carrier member by splicing the already-valid JSON string. This preserves
+/// the sibling bytes and their order instead of reserializing opaque metadata.
+/// Any other shape remains byte-for-byte untouched.
 fn strip_attested_codex_turn_metadata_from_native_wire(
     upstream_body: &mut Value,
     native_responses_passthrough: bool,
@@ -8163,7 +8201,8 @@ fn strip_attested_codex_turn_metadata_from_native_wire(
             }
         }
         Some(Value::String(raw)) => {
-            let carrier_is_the_only_member = serde_json::from_str::<Value>(raw)
+            let raw = raw.clone();
+            let carrier_is_the_only_member = serde_json::from_str::<Value>(&raw)
                 .ok()
                 .and_then(|value| {
                     value.as_object().map(|object| {
@@ -8173,10 +8212,80 @@ fn strip_attested_codex_turn_metadata_from_native_wire(
                 .unwrap_or(false);
             if carrier_is_the_only_member {
                 body.remove("client_metadata");
+            } else if let Some(stripped) =
+                strip_leading_json_string_metadata_member(&raw, X_CODEX_TURN_METADATA_HEADER)
+            {
+                body.insert("client_metadata".to_string(), Value::String(stripped));
             }
         }
         _ => {}
     }
+}
+
+/// Removes one leading property from an already-attested JSON-object string
+/// without reserializing the caller-owned remainder. `client_metadata` is an
+/// opaque string to many compatible upstreams, so an ordinary
+/// `serde_json::to_string` rewrite would itself create a different wire shape.
+///
+/// This deliberately accepts only the unambiguous, low-risk shape:
+/// `{ <target-property>, <one-or-more-siblings> }`. The first property's
+/// decoded key must match exactly; any malformed, reordered, oversized, or
+/// otherwise unusual value returns `None` for transparent forwarding.
+fn strip_leading_json_string_metadata_member(raw: &str, target_key: &str) -> Option<String> {
+    const MAX_JSON_STRING_METADATA_BYTES: usize = 32 * 1024;
+    if raw.len() > MAX_JSON_STRING_METADATA_BYTES {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut cursor = skip_json_ascii_whitespace(bytes, 0);
+    if bytes.get(cursor) != Some(&b'{') {
+        return None;
+    }
+    let opening_brace = cursor;
+    cursor = skip_json_ascii_whitespace(bytes, cursor.saturating_add(1));
+    let (first_key, key_end) = json_string_at(raw, cursor)?;
+    if first_key != target_key {
+        return None;
+    }
+    cursor = skip_json_ascii_whitespace(bytes, key_end);
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor = skip_json_ascii_whitespace(bytes, cursor.saturating_add(1));
+    cursor = json_value_end(raw, cursor)?;
+    cursor = skip_json_ascii_whitespace(bytes, cursor);
+    if bytes.get(cursor) != Some(&b',') {
+        return None;
+    }
+
+    let mut stripped = String::with_capacity(raw.len());
+    stripped.push_str(&raw[..=opening_brace]);
+    stripped.push_str(&raw[cursor.saturating_add(1)..]);
+    let parsed = serde_json::from_str::<Value>(&stripped).ok()?;
+    let object = parsed.as_object()?;
+    (!object.is_empty() && !object.contains_key(target_key)).then_some(stripped)
+}
+
+fn skip_json_ascii_whitespace(bytes: &[u8], mut cursor: usize) -> usize {
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| matches!(*byte, b' ' | b'\n' | b'\r' | b'\t'))
+    {
+        cursor = cursor.saturating_add(1);
+    }
+    cursor
+}
+
+fn json_string_at(raw: &str, start: usize) -> Option<(String, usize)> {
+    let mut values = serde_json::Deserializer::from_str(raw.get(start..)?).into_iter::<String>();
+    let value = values.next()?.ok()?;
+    Some((value, start.saturating_add(values.byte_offset())))
+}
+
+fn json_value_end(raw: &str, start: usize) -> Option<usize> {
+    let mut values = serde_json::Deserializer::from_str(raw.get(start..)?).into_iter::<Value>();
+    values.next()?.ok()?;
+    Some(start.saturating_add(values.byte_offset()))
 }
 
 fn trusted_codex_request_metadata_from_raw(
@@ -10140,6 +10249,78 @@ async fn note_runtime_cache_capability_rejection(
                 "runtime rejection: {}",
                 truncate_log_message(error_summary)
             )),
+        );
+        changed = true;
+    }
+    if changed {
+        state.journal_config(&config);
+    }
+}
+
+/// A completed, native Codex Responses request can safely prove that the
+/// selected upstream Key realm accepts the cache-control fields that were
+/// already present on that exact final wire. This is not a probe and never
+/// adds a second upstream call: it merely turns successful normal traffic
+/// into capability evidence for later independent full-replay turns.
+///
+/// Only placement and retention are learned here. Options and breakpoint
+/// controls need their stricter effect/placement evidence and must not be
+/// promoted by passive acceptance.
+async fn note_runtime_native_cache_control_acceptance(
+    state: &AppState,
+    decision: &RouteDecision,
+    active_channel: &Channel,
+    diagnostics: &UpstreamRequestDiagnostics,
+    completed_native_full_replay: bool,
+) {
+    if !completed_native_full_replay || !matches!(active_channel, Channel::Responses) {
+        return;
+    }
+    let accepted_fields = diagnostics
+        .final_wire_receipt
+        .as_ref()
+        .map(|receipt| receipt.cache_controls.present_fields())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|field| {
+            matches!(
+                field,
+                ProviderCacheCapabilityField::PromptCacheKey
+                    | ProviderCacheCapabilityField::PromptCacheRetention
+            )
+        })
+        .collect::<Vec<_>>();
+    if accepted_fields.is_empty() {
+        return;
+    }
+
+    let mut config = state.config.write().await;
+    let mut changed = false;
+    for field in accepted_fields {
+        let status = config.cache_capability_status_for_key(
+            &decision.provider.id,
+            &decision.model,
+            active_channel,
+            diagnostics.cache_capability_key_id.as_deref(),
+            field,
+        );
+        // An Unsupported field cannot be present on this native final wire:
+        // normal forwarding strips it before dispatch. Keep that terminal
+        // state fail-closed even if a stale receipt somehow reaches here.
+        if matches!(
+            status,
+            ProviderCacheCapabilityStatus::Verified | ProviderCacheCapabilityStatus::Unsupported
+        ) {
+            continue;
+        }
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            active_channel.clone(),
+            diagnostics.cache_capability_key_id.as_deref(),
+            field,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
         );
         changed = true;
     }
@@ -20320,6 +20501,106 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn completed_native_cache_controls_passively_verify_only_the_exact_key_scope() {
+        let mut config = AppConfig::default();
+        let decision = reasoning_test_decision(None, &[]);
+        config.providers.push(decision.provider.clone());
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-passive-native-cache-controls-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let cache_plan = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        });
+        let mut body = PreparedResponseBody::responses_pending(json!({
+            "model": decision.model,
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"fixture"}]
+        }));
+        assert!(body.set_root("prompt_cache_key", json!("client-stable-key")));
+        assert!(body.set_root("prompt_cache_retention", json!("24h")));
+        let plan = FinalResponsesWirePlan::freeze(
+            &decision.provider,
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            body,
+            cache_plan,
+            None,
+        );
+        let diagnostics = UpstreamRequestDiagnostics {
+            cache_capability_key_id: Some("key-a".to_string()),
+            final_wire_receipt: Some(plan.receipt().clone()),
+            ..UpstreamRequestDiagnostics::default()
+        };
+
+        note_runtime_native_cache_control_acceptance(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &diagnostics,
+            false,
+        )
+        .await;
+        assert_eq!(
+            state.config.read().await.cache_capability_status_for_key(
+                &decision.provider.id,
+                &decision.model,
+                &Channel::Responses,
+                Some("key-a"),
+                ProviderCacheCapabilityField::PromptCacheKey,
+            ),
+            ProviderCacheCapabilityStatus::Unverified
+        );
+
+        note_runtime_native_cache_control_acceptance(
+            &state,
+            &decision,
+            &Channel::Responses,
+            &diagnostics,
+            true,
+        )
+        .await;
+        let config = state.config.read().await;
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        ] {
+            assert_eq!(
+                config.cache_capability_status_for_key(
+                    &decision.provider.id,
+                    &decision.model,
+                    &Channel::Responses,
+                    Some("key-a"),
+                    field,
+                ),
+                ProviderCacheCapabilityStatus::Verified
+            );
+            assert_eq!(
+                config.cache_capability_status_for_key(
+                    &decision.provider.id,
+                    &decision.model,
+                    &Channel::Responses,
+                    Some("key-b"),
+                    field,
+                ),
+                ProviderCacheCapabilityStatus::Unverified,
+                "passive acceptance must not leak across Key realms"
+            );
+        }
+        drop(config);
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn native_codex_generated_placement_requires_verified_field_evidence() {
         let mut config = AppConfig::default();
@@ -21518,7 +21799,7 @@ mod tests {
         );
         assert!(control_only_string.get("client_metadata").is_none());
 
-        let mixed_raw = r#"{"x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a"},"upstream_tag":"preserve"}"#;
+        let mixed_raw = r#"{ "x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a","turn_nonce":"first"},  "upstream_tag" : "preserve" }"#;
         let mut mixed_string = json!({"client_metadata": mixed_raw, "input": []});
         strip_attested_codex_turn_metadata_from_native_wire(
             &mut mixed_string,
@@ -21527,8 +21808,41 @@ mod tests {
         );
         assert_eq!(
             mixed_string.get("client_metadata").and_then(Value::as_str),
-            Some(mixed_raw),
-            "mixed caller-owned string metadata must not be reserialized"
+            Some(r#"{  "upstream_tag" : "preserve" }"#),
+            "the leading private carrier must be removed without reserializing the caller-owned sibling"
+        );
+        let mut mixed_next_turn = json!({
+            "client_metadata": r#"{ "x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a","turn_nonce":"second"},  "upstream_tag" : "preserve" }"#,
+            "input": [{"type":"message","role":"user","content":"next"}]
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut mixed_next_turn,
+            true,
+            Some(&trusted),
+        );
+        let first_mixed_wire = PreparedWireRequest::from_value(&Channel::Responses, &mixed_string);
+        let next_mixed_wire =
+            PreparedWireRequest::from_value(&Channel::Responses, &mixed_next_turn);
+        assert_eq!(
+            first_mixed_wire.responses_static_projection_digest(),
+            next_mixed_wire.responses_static_projection_digest(),
+            "a changing leading carrier in an otherwise opaque JSON string must not split the static wire"
+        );
+
+        let carrier_after_sibling = r#"{"upstream_tag":"preserve","x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a","turn_nonce":"later"}}"#;
+        let mut reordered_mixed_string =
+            json!({"client_metadata": carrier_after_sibling, "input": []});
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut reordered_mixed_string,
+            true,
+            Some(&trusted),
+        );
+        assert_eq!(
+            reordered_mixed_string
+                .get("client_metadata")
+                .and_then(Value::as_str),
+            Some(carrier_after_sibling),
+            "unusual caller-owned string ordering must stay on the transparent path"
         );
 
         let mut mismatched = json!({
@@ -33108,6 +33422,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_warm_small_tail_exact_prefix_settles_without_request_mutation_or_dispatch() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-fresh-warm-small-tail-prefix-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0fresh-warm-small-tail";
+        let mut prefix = prefix_state(20_480, 20_096, 0);
+        // This is below the normal 32k proactive floor, but its exact
+        // observed waterline is already caught up to the cached prefix.
+        prefix.seen_bucket_tokens = prefix.cache_read_tokens;
+        prefix.seen_bucket_tokens_128 = prefix.cache_read_tokens;
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), prefix);
+        let small_tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 512,
+            tool_output_chars: 256,
+            largest_tool_output_chars: 256,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        // The wait seam owns no transport or request body. A one-millisecond
+        // budget keeps this regression fast while proving the same bounded
+        // policy/reason that the production 500ms budget will use.
+        let guarded = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &small_tail,
+            false,
+            Some(TokioDuration::from_millis(1)),
+        )
+        .await;
+        assert_eq!(guarded.source.as_deref(), Some("exact"));
+        assert_eq!(
+            guarded.reason.as_deref(),
+            Some("responses_fresh_exact_small_tail_settle")
+        );
+        assert!(guarded.wait_ms > 0);
+        assert!(guarded.wait_ms <= 500);
+        assert!(guarded.budget_exhausted);
+
+        {
+            let mut states = state.prefix_states.lock().await;
+            let prefix = states.get_mut(key).unwrap();
+            prefix.finished_at = Instant::now();
+            prefix.cache_instability_score = 3;
+        }
+        let unstable = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &small_tail,
+            false,
+            Some(TokioDuration::from_millis(1)),
+        )
+        .await;
+        assert_eq!(unstable.wait_ms, 0);
+        assert_eq!(unstable.skip_reason.as_deref(), Some("no_avoidable_gap"));
+
+        {
+            let mut states = state.prefix_states.lock().await;
+            let prefix = states.get_mut(key).unwrap();
+            prefix.finished_at = Instant::now();
+            prefix.cache_instability_score = 0;
+        }
+        let tool_burst = TailInputDiagnostics {
+            tool_output_chars: 8_192,
+            largest_tool_output_chars: 8_192,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let unsafe_tail = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &tool_burst,
+            false,
+            Some(TokioDuration::from_millis(1)),
+        )
+        .await;
+        assert_eq!(unsafe_tail.wait_ms, 0);
+        assert_eq!(unsafe_tail.skip_reason.as_deref(), Some("no_avoidable_gap"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn tool_tail_burst_does_not_write_family_waterline() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -43254,6 +43666,7 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
         config.cache.mode = CacheMode::PrefixPrewarm;
         let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "client-key-cooldown-provider".to_string();
+        provider.prompt_cache_retention_enabled = true;
         config.providers = vec![provider];
         configure_test_codex_agent(&mut config, "client-key-cooldown-provider");
         let dir = std::env::temp_dir().join(format!(
@@ -43284,14 +43697,8 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
                 "model": "gpt-5.6-sol",
                 "stream": true,
                 "prompt_cache_key": raw_client_key,
-                "client_metadata": {
-                    "x-codex-turn-metadata": {
-                        "thread_id": "client-key-thread",
-                        "session_id": "client-key-session",
-                        "turn_nonce": "one"
-                    },
-                    "upstream_tag": "preserve"
-                },
+                "prompt_cache_retention": "24h",
+                "client_metadata": r#"{"x-codex-turn-metadata":{"thread_id":"client-key-thread","session_id":"client-key-session","turn_nonce":"one"},"upstream_tag":"preserve"}"#,
                 "input": [{
                     "type": "message",
                     "role": "user",
@@ -43313,31 +43720,94 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
         let _ = axum::body::to_bytes(first.into_body(), usize::MAX)
             .await
             .unwrap();
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
 
         assert_eq!(
             upstream_hits.load(Ordering::SeqCst),
             1,
             "each inbound request must create exactly one upstream POST"
         );
-        let captured_bodies = captured_bodies.lock().await;
-        assert_eq!(captured_bodies.len(), 1);
+        let captured_first = captured_bodies.lock().await;
+        assert_eq!(captured_first.len(), 1);
         assert_eq!(
-            captured_bodies[0]
+            captured_first[0]
                 .get("prompt_cache_key")
                 .and_then(Value::as_str),
             Some(raw_client_key),
             "the normal native Codex wire must preserve its stable cache placement"
         );
+        assert_eq!(
+            captured_first[0]
+                .get("client_metadata")
+                .and_then(Value::as_str),
+            Some(r#"{"upstream_tag":"preserve"}"#),
+            "the mixed JSON-string carrier must be removed without changing the caller-owned sibling"
+        );
+        drop(captured_first);
+
+        let generated_followup = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-sol",
+                "stream": true,
+                "client_metadata": r#"{"x-codex-turn-metadata":{"thread_id":"client-key-thread","session_id":"client-key-session","turn_nonce":"two"},"upstream_tag":"preserve"}"#,
+                "input": [{
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue with verified native cache controls"}]
+                }]
+            }))
+            .unwrap(),
+        );
+        let second = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            generated_followup,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
         assert!(
-            captured_bodies[0]
-                .pointer("/client_metadata/x-codex-turn-metadata")
-                .is_none(),
-            "Atoapi's attested identity carrier must not split the upstream static wire"
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
         );
         assert_eq!(
-            captured_bodies[0].pointer("/client_metadata/upstream_tag"),
-            Some(&json!("preserve")),
-            "unrelated upstream metadata must remain intact"
+            upstream_hits.load(Ordering::SeqCst),
+            2,
+            "two independent inbounds must produce exactly two upstream POSTs"
+        );
+        let captured_bodies = captured_bodies.lock().await;
+        assert_eq!(captured_bodies.len(), 2);
+        assert!(
+            captured_bodies[1]
+                .get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .is_some(),
+            "a successful client key must unlock a stable generated key for the next independent turn"
+        );
+        assert_eq!(
+            captured_bodies[1]
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str),
+            Some("24h"),
+            "a successful client retention control must unlock the matching generated retention"
+        );
+        assert_eq!(
+            captured_bodies[1]
+                .get("client_metadata")
+                .and_then(Value::as_str),
+            Some(r#"{"upstream_tag":"preserve"}"#),
+            "successive turns with changing private carriers must keep the same outgoing string metadata"
         );
         drop(captured_bodies);
 
@@ -43354,6 +43824,24 @@ data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"promp
             !metrics_json.contains(raw_client_key),
             "upstream error echoes must not reach metrics/history UI data"
         );
+        let config = state.config.read().await;
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        ] {
+            assert_eq!(
+                config.cache_capability_status_for_key(
+                    "client-key-cooldown-provider",
+                    "gpt-5.6-sol",
+                    &Channel::Responses,
+                    None,
+                    field,
+                ),
+                ProviderCacheCapabilityStatus::Verified,
+                "a completed native client control must passively verify only its accepted field"
+            );
+        }
+        drop(config);
         fs::remove_dir_all(dir).ok();
     }
 

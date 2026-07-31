@@ -30,6 +30,11 @@ pub(super) struct PrefixControlInput {
     /// Only these states may proactively consume the short settle window
     /// before the first observable bucket regression exists.
     pub recent_exact_high_hit: bool,
+    /// A smaller, already-caught-up exact prefix with a structurally small
+    /// appended tail. This is intentionally narrower than a general low-hit
+    /// recovery: it only permits the same bounded proactive settle window
+    /// when the normal 32k high-hit floor is the sole missing condition.
+    pub recent_exact_warm_small_tail: bool,
     pub avoidable_tokens: u64,
     pub fine_avoidable_tokens: u64,
     pub avoidable_shortfall_streak: u32,
@@ -177,12 +182,20 @@ impl PrefixController {
             // budget and does not send or rewrite an upstream request. A new
             // tool tail cannot invalidate the already-frozen exact prefix; it
             // only affects how a residual miss is classified afterwards.
+            let small_tail_proactive_settle = input.recent_exact_warm_small_tail
+                && input.current_tail_is_settle_safe
+                && !input.settle_after_cold_read;
             if !input.compaction_requested
-                && input.recent_exact_high_hit
+                && (input.recent_exact_high_hit || small_tail_proactive_settle)
                 && input.state_age < MAX_FOREGROUND_WAIT
                 && input.cache_instability_score <= MAX_STABLE_INSTABILITY_SCORE
             {
-                return settle_for_remaining_window(input, "responses_fresh_exact_prefix_settle");
+                let reason = if input.recent_exact_high_hit {
+                    "responses_fresh_exact_prefix_settle"
+                } else {
+                    "responses_fresh_exact_small_tail_settle"
+                };
+                return settle_for_remaining_window(input, reason);
             }
             return skip("no_avoidable_gap", false);
         }
@@ -878,6 +891,7 @@ mod tests {
         PrefixControlInput {
             source_is_exact: true,
             recent_exact_high_hit: false,
+            recent_exact_warm_small_tail: false,
             avoidable_tokens,
             fine_avoidable_tokens: avoidable_tokens,
             avoidable_shortfall_streak: 0,
@@ -936,6 +950,54 @@ mod tests {
             Some("responses_fresh_exact_prefix_settle")
         );
         assert_eq!(unsafe_tail.skip_reason, None);
+    }
+
+    #[test]
+    fn fresh_warm_small_tail_exact_prefix_settles_without_lowering_safety_gates() {
+        let decision = PrefixController::before_request(PrefixControlInput {
+            recent_exact_warm_small_tail: true,
+            state_age: Duration::from_millis(140),
+            ..input(0)
+        });
+        assert_eq!(decision.wait, Duration::from_millis(360));
+        assert_eq!(
+            decision.reason,
+            Some("responses_fresh_exact_small_tail_settle")
+        );
+        assert!(!decision.budget_exhausted);
+
+        let unstable = PrefixController::before_request(PrefixControlInput {
+            recent_exact_warm_small_tail: true,
+            cache_instability_score: MAX_STABLE_INSTABILITY_SCORE + 1,
+            ..input(0)
+        });
+        assert_eq!(unstable.wait, Duration::ZERO);
+        assert_eq!(unstable.skip_reason, Some("no_avoidable_gap"));
+
+        let unsafe_tail = PrefixController::before_request(PrefixControlInput {
+            recent_exact_warm_small_tail: true,
+            current_tail_is_settle_safe: false,
+            ..input(0)
+        });
+        assert_eq!(unsafe_tail.wait, Duration::ZERO);
+        assert_eq!(unsafe_tail.skip_reason, Some("no_avoidable_gap"));
+
+        let cold_marker = PrefixController::before_request(PrefixControlInput {
+            recent_exact_warm_small_tail: true,
+            settle_after_cold_read: true,
+            cache_instability_score: 8,
+            ..input(0)
+        });
+        assert_eq!(cold_marker.wait, Duration::ZERO);
+        assert_eq!(cold_marker.skip_reason, Some("no_avoidable_gap"));
+
+        let non_exact = PrefixController::before_request(PrefixControlInput {
+            source_is_exact: false,
+            recent_exact_warm_small_tail: true,
+            ..input(0)
+        });
+        assert_eq!(non_exact.wait, Duration::ZERO);
+        assert_eq!(non_exact.skip_reason, Some("non_exact_prefix_state"));
     }
 
     #[test]
@@ -1579,6 +1641,7 @@ mod tests {
         let decision = PrefixController::before_request(PrefixControlInput {
             source_is_exact: true,
             recent_exact_high_hit: false,
+            recent_exact_warm_small_tail: false,
             avoidable_tokens: next
                 .avoidable_shortfall_tokens
                 .max(next.avoidable_shortfall_tokens_128),

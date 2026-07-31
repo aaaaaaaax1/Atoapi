@@ -42,9 +42,69 @@ impl BoundedCacheCapture {
 #[cfg(test)]
 mod tests {
     use super::{
-        canonical_responses_failure_frame, GenericResponsesErrorFrameGate,
-        GenericResponsesErrorFrameGateEvent, TerminalFailure,
+        canonical_responses_failure_frame,
+        completed_native_full_replay_cache_control_acceptance_allowed,
+        GenericResponsesErrorFrameGate, GenericResponsesErrorFrameGateEvent, TerminalFailure,
     };
+    use crate::{config::Channel, continuation_lineage::LineageParent};
+
+    #[test]
+    fn passive_cache_control_acceptance_requires_a_completed_unambiguous_full_replay() {
+        assert!(
+            completed_native_full_replay_cache_control_acceptance_allowed(
+                true,
+                true,
+                &Channel::Responses,
+                &Channel::Responses,
+                false,
+                false,
+                false,
+                &LineageParent::FullReplay,
+                false,
+            )
+        );
+
+        // A WAF/SSE failure can retain HTTP 200, but it is not acceptance.
+        assert!(
+            !completed_native_full_replay_cache_control_acceptance_allowed(
+                false,
+                true,
+                &Channel::Responses,
+                &Channel::Responses,
+                false,
+                false,
+                false,
+                &LineageParent::FullReplay,
+                false,
+            )
+        );
+        assert!(
+            !completed_native_full_replay_cache_control_acceptance_allowed(
+                true,
+                true,
+                &Channel::Responses,
+                &Channel::Responses,
+                false,
+                false,
+                false,
+                &LineageParent::ExternalContinuation,
+                false,
+            )
+        );
+        assert!(
+            !completed_native_full_replay_cache_control_acceptance_allowed(
+                true,
+                true,
+                &Channel::Responses,
+                &Channel::Responses,
+                false,
+                false,
+                false,
+                &LineageParent::FullReplay,
+                true,
+            )
+        );
+    }
 
     #[test]
     fn canonical_failure_frame_keeps_the_upstream_summary_and_native_shape() {
@@ -503,6 +563,28 @@ fn canonical_responses_failure_frame(
         "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
     });
     Bytes::from(format!("event: response.failed\ndata: {payload}\n\n"))
+}
+
+fn completed_native_full_replay_cache_control_acceptance_allowed(
+    stream_success_for_cache: bool,
+    agent_generation: bool,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+    confirmed_compaction: bool,
+    response_session_starts_compaction_epoch: bool,
+    used_response_session: bool,
+    response_session_parent: &LineageParent,
+    suppress_local_full_replay_settlement: bool,
+) -> bool {
+    stream_success_for_cache
+        && agent_generation
+        && matches!(client_channel, Channel::Responses)
+        && matches!(upstream_channel, Channel::Responses)
+        && !confirmed_compaction
+        && !response_session_starts_compaction_epoch
+        && !used_response_session
+        && matches!(response_session_parent, LineageParent::FullReplay)
+        && !suppress_local_full_replay_settlement
 }
 
 pub(super) async fn stream_upstream(
@@ -1092,6 +1174,31 @@ pub(super) async fn stream_upstream(
                 .as_deref(),
             stream_success_for_cache,
             stream_metadata.error_summary.as_deref(),
+        )
+        .await;
+        // Passive cache-control acceptance is evidence only for a normal,
+        // completed native FullReplay turn.  A successful HTTP head is not
+        // sufficient: an SSE error/WAF event, a compaction epoch, an external
+        // continuation, or an ambiguous local lineage must never promote a
+        // capability for a later request.
+        let completed_native_full_replay_for_cache_controls =
+            completed_native_full_replay_cache_control_acceptance_allowed(
+                stream_success_for_cache,
+                agent_generation,
+                &client_channel,
+                &decision.upstream_channel,
+                confirmed_compaction,
+                response_session_starts_compaction_epoch,
+                used_response_session,
+                &response_session_parent,
+                upstream_request_diagnostics.suppress_local_full_replay_settlement,
+            );
+        note_runtime_native_cache_control_acceptance(
+            &state_for_stream,
+            &decision,
+            &decision.upstream_channel,
+            &upstream_request_diagnostics,
+            completed_native_full_replay_for_cache_controls,
         )
         .await;
         if !stream_success_for_cache {
