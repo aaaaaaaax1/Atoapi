@@ -6,7 +6,7 @@ const host = await readFile(new URL("../src/GraphitePrototypeHost.tsx", import.m
 const controlPlane = await readFile(new URL("../src/useGraphiteControlPlane.ts", import.meta.url), "utf8");
 
 const bridgeStart = host.indexOf("const bridgeSource = String.raw`");
-const bridgeEnd = host.indexOf("`;\n\nfunction createDocument", bridgeStart);
+const bridgeEnd = host.indexOf("`;\n\n// The embedded prototype", bridgeStart);
 assert.ok(bridgeStart >= 0 && bridgeEnd >= 0, "the Graphite bridge source must remain extractable");
 const bridgeDefinition = host.slice(bridgeStart, bridgeEnd + 1);
 const bridgeSource = Function(`${bridgeDefinition}; return bridgeSource;`)();

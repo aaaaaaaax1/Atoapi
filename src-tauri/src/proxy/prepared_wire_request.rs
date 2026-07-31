@@ -1,8 +1,9 @@
 use bytes::Bytes;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::{
-    collections::BTreeSet,
     ops::Range,
     sync::{Arc, OnceLock},
     time::Instant,
@@ -69,6 +70,7 @@ impl ProtocolBreakpointProvenance {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct PreparedWireMember {
     key: String,
@@ -81,6 +83,7 @@ struct PreparedWireMember {
 /// The draft owns encoded bytes, not cloned JSON values. In particular, a
 /// large `input` is serialized once and then copied from its byte range when a
 /// cache metadata field changes later in request preparation.
+#[cfg(test)]
 #[derive(Debug)]
 struct PreparedWireDraft {
     body: Bytes,
@@ -89,6 +92,7 @@ struct PreparedWireDraft {
     encode_ms: u64,
 }
 
+#[cfg(test)]
 impl PreparedWireDraft {
     fn from_responses_value(body: &Value) -> Option<Self> {
         let map = body.as_object()?;
@@ -201,6 +205,7 @@ impl PreparedWireDraft {
 #[derive(Debug)]
 pub(super) struct PreparedResponseBody {
     body: Value,
+    #[cfg(test)]
     wire_draft: Option<PreparedWireDraft>,
     changed_fields: Vec<String>,
     requires_full_freeze: bool,
@@ -218,6 +223,7 @@ impl PreparedResponseBody {
     pub(super) fn plain(body: Value) -> Self {
         Self {
             body,
+            #[cfg(test)]
             wire_draft: None,
             changed_fields: Vec::new(),
             requires_full_freeze: false,
@@ -231,6 +237,7 @@ impl PreparedResponseBody {
     /// semantic body. Callers can therefore never attach bytes encoded from a
     /// different body, while late root mutations can still retain a large
     /// unchanged `input` member without cloning or re-serializing it.
+    #[cfg(test)]
     pub(super) fn responses(mut body: Value) -> Self {
         // A native Responses request is otherwise intentionally passed through
         // unchanged. Canonicalize only protocol-static JSON objects so equal
@@ -246,6 +253,15 @@ impl PreparedResponseBody {
             requires_full_freeze: false,
             atoapi_injected_protocol_breakpoint: false,
         }
+    }
+
+    /// Own a native Responses body while its final cache-control shape is
+    /// still being decided. Static roots are canonicalized immediately, but
+    /// no draft bytes are retained; the first wire is therefore serialized
+    /// only after every ordinary cache-control mutation has settled.
+    pub(super) fn responses_pending(mut body: Value) -> Self {
+        canonicalize_responses_static_roots(&mut body);
+        Self::plain(body)
     }
 
     pub(super) fn body(&self) -> &Value {
@@ -331,25 +347,49 @@ impl PreparedResponseBody {
     }
 
     pub(super) fn into_prepared_wire(self, channel: &Channel) -> (Value, PreparedWireRequest) {
-        let Self {
-            body,
-            wire_draft,
-            changed_fields,
-            requires_full_freeze,
-            atoapi_injected_protocol_breakpoint,
-        } = self;
-        let mut wire = match (channel, wire_draft, requires_full_freeze) {
-            (Channel::Responses, Some(draft), false) => {
-                draft.freeze_tracked(&body, &changed_fields, atoapi_injected_protocol_breakpoint)
+        #[cfg(test)]
+        {
+            let had_wire_draft = self.wire_draft.is_some();
+            let Self {
+                body,
+                wire_draft,
+                changed_fields,
+                requires_full_freeze,
+                atoapi_injected_protocol_breakpoint,
+            } = self;
+            let mut wire = match (channel, wire_draft, requires_full_freeze) {
+                (Channel::Responses, Some(draft), false) => draft.freeze_tracked(
+                    &body,
+                    &changed_fields,
+                    atoapi_injected_protocol_breakpoint,
+                ),
+                _ => PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
+                    channel,
+                    &body,
+                    atoapi_injected_protocol_breakpoint,
+                ),
+            };
+            if had_wire_draft {
+                wire.set_atoapi_mutated_roots(&changed_fields);
             }
-            _ => PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
+            (body, wire)
+        }
+
+        #[cfg(not(test))]
+        {
+            let Self {
+                body,
+                changed_fields: _,
+                requires_full_freeze: _,
+                atoapi_injected_protocol_breakpoint,
+            } = self;
+            let wire = PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
                 channel,
                 &body,
                 atoapi_injected_protocol_breakpoint,
-            ),
-        };
-        wire.set_atoapi_mutated_roots(&changed_fields);
-        (body, wire)
+            );
+            (body, wire)
+        }
     }
 
     #[cfg(test)]
@@ -632,6 +672,57 @@ mod tests {
     }
 
     #[test]
+    fn pending_responses_freezes_cache_controls_before_the_first_wire_draft() {
+        let initial = json!({
+            "model": "gpt-test",
+            "input": [{"type":"message","role":"user","content":"stable"}],
+            "stream": true
+        });
+        let mut body = PreparedResponseBody::responses_pending(initial);
+        assert!(body.set_root("prompt_cache_retention", json!("24h")));
+        let (final_body, wire) = body.into_prepared_wire(&Channel::Responses);
+        let parsed: Value = serde_json::from_slice(wire.body()).unwrap();
+
+        assert_eq!(parsed, final_body);
+        assert_eq!(parsed["prompt_cache_retention"], "24h");
+        assert!(wire.atoapi_mutated_static_categories().is_empty());
+        assert!(wire.responses_static_projection_digest().is_some());
+    }
+
+    #[test]
+    fn stable_cache_controls_keep_root_and_followup_static_projections_equal() {
+        let freeze = |input: Value| {
+            let mut body = PreparedResponseBody::responses_pending(json!({
+                "model": "gpt-test",
+                "input": input,
+                "stream": true
+            }));
+            assert!(body.set_root("prompt_cache_key", json!("stable-route-key")));
+            assert!(body.set_root("prompt_cache_retention", json!("24h")));
+            body.into_prepared_wire(&Channel::Responses).1
+        };
+
+        let root = freeze(json!([{
+            "type":"message",
+            "role":"user",
+            "content":"root request"
+        }]));
+        let followup = freeze(json!([
+            {"type":"message","role":"user","content":"root request"},
+            {"type":"message","role":"assistant","content":"prior answer"},
+            {"type":"message","role":"user","content":"followup request"}
+        ]));
+
+        assert_eq!(
+            root.responses_static_projection_digest(),
+            followup.responses_static_projection_digest(),
+            "a stable cache-control policy must not split the root and follow-up cache prefix"
+        );
+        assert!(root.atoapi_mutated_static_categories().is_empty());
+        assert!(followup.atoapi_mutated_static_categories().is_empty());
+    }
+
+    #[test]
     fn final_wire_reports_only_fixed_redacted_categories_for_late_mutations() {
         let initial = json!({
             "model": "gpt-test",
@@ -867,11 +958,13 @@ impl PreparedWireRequest {
         }
     }
 
+    #[cfg(test)]
     fn set_atoapi_mutated_roots(&mut self, roots: &[String]) {
         self.atoapi_mutated_static_categories = atoapi_static_mutation_categories(roots);
     }
 }
 
+#[cfg(test)]
 fn atoapi_static_mutation_categories(roots: &[String]) -> Vec<String> {
     let mut categories = BTreeSet::new();
     for root in roots {
@@ -894,9 +987,10 @@ fn atoapi_static_mutation_categories(roots: &[String]) -> Vec<String> {
 fn known_responses_static_root_category(root: &str) -> Option<&'static str> {
     match root {
         "model" => Some("model"),
-        "prompt_cache_key" | "prompt_cache_retention" | "prompt_cache_options" => {
-            Some("cache_control")
-        }
+        "prompt_cache_key"
+        | "prompt_cache_retention"
+        | "prompt_cache_options"
+        | "prompt_cache_breakpoint" => Some("cache_control"),
         "instructions" => Some("instructions"),
         "tools" => Some("tools"),
         "tool_choice" | "parallel_tool_calls" => Some("tool_settings"),
@@ -1098,6 +1192,7 @@ fn write_json_member(
     start..output.len()
 }
 
+#[cfg(test)]
 fn write_draft_json_member(
     output: &mut Vec<u8>,
     first: &mut bool,
@@ -1108,6 +1203,7 @@ fn write_draft_json_member(
     write_json_member(output, first, key, value)
 }
 
+#[cfg(test)]
 fn write_prepared_member_bytes(
     output: &mut Vec<u8>,
     first: &mut bool,
@@ -1136,9 +1232,6 @@ fn record_draft_member_encoding(key: &str) {
         *counts.entry(key.to_string()).or_default() += 1;
     });
 }
-
-#[cfg(not(test))]
-fn record_draft_member_encoding(_key: &str) {}
 
 #[cfg(test)]
 pub(super) fn reset_draft_member_encodings() {

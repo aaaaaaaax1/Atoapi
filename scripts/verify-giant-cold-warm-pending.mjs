@@ -1,16 +1,17 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { writeIsolatedResponsesConfig } from "./isolated-responses-fixture.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
-const sourceConfigDir = resolve(String(args["source-config-dir"] ?? defaultConfigDir()));
 const executable = resolve(String(
   args.exe ?? join(repoRoot, "src-tauri", "target", "release", "atoapi.exe")
 ));
@@ -45,10 +46,7 @@ try {
   const upstreamPort = await listen(upstream);
   tempRoot = await mkdtemp(join(tmpdir(), "atoapi-giant-cold-warm-pending-"));
   const configDir = join(tempRoot, "config");
-  await createIsolatedConfig(configDir, upstreamPort);
-  const configText = await readFile(join(configDir, "config.toml"), "utf8");
-  const localKey = extractTomlString(configText, "local_key");
-  if (!localKey) throw new Error("isolated config has no local_key");
+  const { localKey } = await writeIsolatedResponsesConfig(configDir, upstreamPort, { model });
 
   const port = await freePort();
   const child = spawn(executable, [], {
@@ -134,20 +132,29 @@ try {
     const promptCacheKeys = new Set(captured.map((item) => item.body.prompt_cache_key ?? null));
     assert.equal(promptCacheKeys.size, 1, "the cache control key must remain stable across exact children");
 
-    // The root itself is immediate. Each of the three proven direct children
-    // receives the 2s total warm-up opportunity (including any legacy 500ms
-    // exact settle). After the bounded budget is exhausted, the recovered
-    // child must not inherit an additional large wait.
+    // The root itself is immediate. A Responses foreground prefix guard is
+    // intentionally capped at 500ms.  The old 1.1s threshold asserted a
+    // retired policy and made the release gate reject the current bounded
+    // implementation even when its final wire and one-shot behavior were
+    // correct.
     for (const turn of [1, 2, 3]) {
+      const diagnostic = turnDiagnostics.find((entry) => entry.turn === turn) ?? {};
+      const guardWaitMs = Number(diagnostic.prefix_guard_wait_ms ?? 0);
       assert(
-        elapsedMs[turn] >= 1_100,
-        `turn ${turn}: expected the proven giant-cold warm window, got ${elapsedMs[turn]}ms`
+        guardWaitMs >= 0 && guardWaitMs <= 500,
+        `turn ${turn}: Responses prefix guard exceeded its 500ms cap: ${guardWaitMs}ms; ${JSON.stringify(diagnostic)}`
       );
       assert(
-        elapsedMs[turn] <= 5_000,
-        `turn ${turn}: warm window exceeded the bounded policy, got ${elapsedMs[turn]}ms`
+        elapsedMs[turn] <= 1_500,
+        `turn ${turn}: bounded guard accumulated an unexpected wall delay: ${elapsedMs[turn]}ms; ${JSON.stringify(diagnostic)}`
       );
     }
+    const recoveredDiagnostic = turnDiagnostics.find((entry) => entry.turn === 4) ?? {};
+    assert.equal(
+      Number(recoveredDiagnostic.prefix_guard_wait_ms ?? 0),
+      0,
+      `recovered child inherited a stale prefix wait: ${JSON.stringify(recoveredDiagnostic)}`
+    );
     assert(
       elapsedMs[4] < 1_250,
       `recovered child inherited a stale warm delay: ${elapsedMs[4]}ms; ${JSON.stringify(turnDiagnostics)}`
@@ -257,86 +264,10 @@ function sseCompleted(id, modelId, inputTokens, cachedTokens) {
   ].join("\n");
 }
 
-async function createIsolatedConfig(configDir, upstreamPort) {
-  await rm(configDir, { recursive: true, force: true });
-  await mkdir(configDir, { recursive: true });
-  const sourceConfig = join(sourceConfigDir, "config.toml");
-  const targetConfig = join(configDir, "config.toml");
-  await copyFile(sourceConfig, targetConfig);
-  try {
-    await copyFile(join(sourceConfigDir, "cache-key.dpapi"), join(configDir, "cache-key.dpapi"));
-  } catch {
-    // The loopback fixture never needs a cache snapshot.
-  }
-  const original = await readFile(targetConfig, "utf8");
-  const providerId = codexProviderId(original);
-  if (!providerId) throw new Error("could not find the enabled Codex provider in config.toml");
-  const rewritten = rewriteProviderBlock(original, providerId, (block) => {
-    let next = replaceTomlString(block, "base_url", `http://127.0.0.1:${upstreamPort}/v1`);
-    next = replaceTomlBoolean(next, "use_system_proxy", false);
-    next = replaceTomlBoolean(next, "request_body_gzip_enabled", false);
-    return next;
-  });
-  await writeFile(targetConfig, rewritten, "utf8");
-}
-
-function codexProviderId(config) {
-  return tomlArrayBlocks(config, "agent_injections")
-    .map(({ body }) => body)
-    .find((body) => extractTomlString(body, "id") === "codex")
-    ?.match(/^provider_id\s*=\s*"([^"]+)"/mu)?.[1] ?? "";
-}
-
-function rewriteProviderBlock(config, providerId, transform) {
-  for (const block of tomlArrayBlocks(config, "providers")) {
-    if (extractTomlString(block.body, "id") === providerId) {
-      return `${config.slice(0, block.start)}${transform(block.body)}${config.slice(block.end)}`;
-    }
-  }
-  throw new Error(`provider ${providerId} was not found in config.toml`);
-}
-
-function tomlArrayBlocks(text, section) {
-  const marker = `[[${section}]]`;
-  const starts = [];
-  let offset = 0;
-  while ((offset = text.indexOf(marker, offset)) >= 0) {
-    starts.push(offset);
-    offset += marker.length;
-  }
-  return starts.map((start) => {
-    const next = text.indexOf("\n[[", start + marker.length);
-    const end = next < 0 ? text.length : next + 1;
-    return { start, end, body: text.slice(start, end) };
-  });
-}
-
-function replaceTomlString(block, key, value) {
-  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"[^"]*"`, "mu");
-  return pattern.test(block)
-    ? block.replace(pattern, `${key} = "${value}"`)
-    : `${block.trimEnd()}\n${key} = "${value}"\n`;
-}
-
-function replaceTomlBoolean(block, key, value) {
-  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(?:true|false)`, "mu");
-  return pattern.test(block)
-    ? block.replace(pattern, `${key} = ${value}`)
-    : `${block.trimEnd()}\n${key} = ${value}\n`;
-}
-
-function extractTomlString(text, key) {
-  return text.match(new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"([^"]*)"`, "mu"))?.[1] ?? "";
-}
-
 function safeHeaders(headers) {
   return Object.fromEntries([
     "accept", "content-type", "content-encoding", "content-length", "user-agent"
   ].map((name) => [name, headers[name] ?? null]));
-}
-
-function defaultConfigDir() {
-  return join(process.env.APPDATA ?? process.env.XDG_CONFIG_HOME ?? tmpdir(), "Atoapi");
 }
 
 async function listen(server) {
@@ -423,8 +354,4 @@ function parseArgs(items) {
     else parsed[key] = true;
   }
   return parsed;
-}
-
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 }

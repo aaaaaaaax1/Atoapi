@@ -1103,26 +1103,37 @@ pub(super) async fn stream_upstream(
         // The terminal event is already visible, so publish the minimal
         // in-memory lineage and waterline control state before releasing its
         // per-lineage publication fence. Slow metrics/persistence remain below.
+        let local_full_replay_settlement_allowed =
+            !upstream_request_diagnostics.suppress_local_full_replay_settlement;
         let response_session_update = if stream_success_for_cache && !confirmed_compaction {
-            let breakpoint_placement_digest = upstream_request_diagnostics
-                .final_wire_receipt
-                .as_ref()
-                .and_then(|receipt| {
-                    receipt
-                        .cache_controls
-                        .breakpoint_placement_digest()
-                        .map(ToOwned::to_owned)
-                });
-            update_response_session_with_owned_input(
-                &state_for_stream,
-                response_session_lease.as_ref(),
-                &response_session_parent,
-                full_response_input.take(),
-                breakpoint_placement_digest,
-                response_session_response_id.clone(),
-                std::mem::take(&mut stream_metadata.output_items),
-            )
-            .await
+            if local_full_replay_settlement_allowed {
+                let breakpoint_placement_digest = upstream_request_diagnostics
+                    .final_wire_receipt
+                    .as_ref()
+                    .and_then(|receipt| {
+                        receipt
+                            .cache_controls
+                            .breakpoint_placement_digest()
+                            .map(ToOwned::to_owned)
+                    });
+                update_response_session_with_owned_input(
+                    &state_for_stream,
+                    response_session_lease.as_ref(),
+                    &response_session_parent,
+                    full_response_input.take(),
+                    breakpoint_placement_digest,
+                    response_session_response_id.clone(),
+                    std::mem::take(&mut stream_metadata.output_items),
+                )
+                .await
+            } else {
+                tombstone_ambiguous_response_session(
+                    &state_for_stream,
+                    response_session_lease.as_ref(),
+                    response_session_response_id.clone(),
+                )
+                .await
+            }
         } else {
             None
         };
@@ -1254,7 +1265,9 @@ pub(super) async fn stream_upstream(
             prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
             prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
             prefix_guard_wait.settled_exact_state_finished_at,
-            stream_success_for_cache && !confirmed_compaction,
+            stream_success_for_cache
+                && !confirmed_compaction
+                && local_full_replay_settlement_allowed,
         )
         .await;
         let (gap_breakdown, final_scope_rollback_reclassified) =

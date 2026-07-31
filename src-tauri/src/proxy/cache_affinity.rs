@@ -15,6 +15,11 @@ const POST_BURST_FOLLOWUP_REQUESTS: u8 = 3;
 const POST_COMPACTION_FOLLOWUP_REQUESTS: u8 = 4;
 const POST_BURST_WINDOW_TTL_HOURS: i64 = 4;
 const POST_BURST_EVIDENCE_TTL_HOURS: i64 = 24;
+/// A rollback is evidence-scoped, not a permanent provider sentence. Keeping
+/// it beyond the evidence window can lock a realm out of later re-evaluation
+/// even after the upstream or request shape has changed.
+const POST_BURST_ROLLBACK_TTL_HOURS: i64 = POST_BURST_EVIDENCE_TTL_HOURS;
+const POST_BURST_ROLLBACK_LIMIT: usize = 1_024;
 const POST_BURST_WINDOW_LIMIT: usize = 512;
 const POST_BURST_EVIDENCE_LIMIT: usize = 1536;
 const POST_BURST_READINESS_MAX_AGE_HOURS: i64 = POST_BURST_EVIDENCE_TTL_HOURS;
@@ -292,6 +297,11 @@ pub(crate) struct PostBurstEvidenceLedger {
     pub(crate) readiness: HashMap<String, PostBurstReadiness>,
     #[serde(default)]
     pub(crate) rollbacks: HashMap<String, String>,
+    /// Persisted separately for backward compatibility with older
+    /// `HashMap<String, String>` rollback files. Legacy records without a
+    /// timestamp are intentionally treated as expired on first maintenance.
+    #[serde(default)]
+    pub(crate) rollback_recorded_at: HashMap<String, DateTime<Utc>>,
     #[serde(default)]
     pub(crate) evidence_generations: HashMap<String, u64>,
     #[serde(skip)]
@@ -811,6 +821,47 @@ fn prune_evidence_scope_state(ledger: &mut PostBurstEvidenceLedger) {
     ledger
         .evidence_scope_expiries
         .retain(|key, _| ledger.evidence_scope_latest_expiry.contains_key(key));
+    ledger
+        .rollback_recorded_at
+        .retain(|key, _| ledger.rollbacks.contains_key(key));
+}
+
+fn prune_post_burst_rollbacks(ledger: &mut PostBurstEvidenceLedger, now: DateTime<Utc>) {
+    let cutoff = now - Duration::hours(POST_BURST_ROLLBACK_TTL_HOURS);
+    let mut expired = ledger
+        .rollbacks
+        .keys()
+        .filter(|key| {
+            ledger
+                .rollback_recorded_at
+                .get(*key)
+                .is_none_or(|recorded_at| *recorded_at < cutoff)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    // Bound persisted state even if a workload continually creates distinct
+    // realms. Missing legacy timestamps sort first and are discarded before
+    // current evidence.
+    if ledger.rollbacks.len().saturating_sub(expired.len()) > POST_BURST_ROLLBACK_LIMIT {
+        let remaining = ledger
+            .rollbacks
+            .keys()
+            .filter(|key| !expired.contains(*key))
+            .map(|key| (ledger.rollback_recorded_at.get(key).copied(), key.clone()))
+            .collect::<Vec<_>>();
+        let overflow = remaining.len().saturating_sub(POST_BURST_ROLLBACK_LIMIT);
+        let mut oldest = remaining;
+        oldest.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        expired.extend(oldest.into_iter().take(overflow).map(|(_, key)| key));
+    }
+    expired.sort();
+    expired.dedup();
+    for comparison_key in expired {
+        ledger.rollbacks.remove(&comparison_key);
+        ledger.rollback_recorded_at.remove(&comparison_key);
+        ledger.readiness.remove(&comparison_key);
+        bump_evidence_generation(ledger, &comparison_key);
+    }
 }
 
 fn rebuild_assignment_age_index(store: &mut ShadowAffinityStore) {
@@ -928,6 +979,7 @@ pub(crate) fn prepare_shadow_affinity_store(store: &mut ShadowAffinityStore) {
     rebuild_active_cache_route_owners(store, now);
     rebuild_post_burst_window_age_index(&mut store.post_burst);
     rebuild_evidence_scope_index(&mut store.post_burst);
+    evict_post_burst_evidence(&mut store.post_burst, now);
     evict_assignments(store, now);
 }
 
@@ -995,6 +1047,7 @@ fn insert_post_burst_window(
 }
 
 fn evict_post_burst_evidence(ledger: &mut PostBurstEvidenceLedger, now: DateTime<Utc>) {
+    prune_post_burst_rollbacks(ledger, now);
     let expired_windows = ledger
         .windows
         .iter()
@@ -1588,6 +1641,7 @@ fn refresh_post_burst_readiness(
     candidate_variant: ShadowCacheCandidateVariant,
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
+    prune_post_burst_rollbacks(ledger, now);
     let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
     if !has_fresh_evidence_for_scope(ledger, &comparison_key, now)
         && !ledger.rollbacks.contains_key(&comparison_key)
@@ -1598,8 +1652,10 @@ fn refresh_post_burst_readiness(
     if readiness.status == PostBurstReadinessStatus::RollbackRequired {
         ledger
             .rollbacks
-            .entry(readiness.comparison_key.clone())
-            .or_insert_with(|| readiness.reason.clone());
+            .insert(readiness.comparison_key.clone(), readiness.reason.clone());
+        ledger
+            .rollback_recorded_at
+            .insert(readiness.comparison_key.clone(), now);
     }
     ledger
         .readiness
@@ -1641,6 +1697,7 @@ fn current_post_burst_readiness(
     candidate_variant: ShadowCacheCandidateVariant,
     now: DateTime<Utc>,
 ) -> PostBurstReadiness {
+    prune_post_burst_rollbacks(ledger, now);
     let comparison_key = post_burst_comparison_key_for_candidate(realm_id, lane, candidate_variant);
     let has_evidence = has_fresh_evidence_for_scope(ledger, &comparison_key, now);
     let has_rollback = ledger.rollbacks.contains_key(&comparison_key);
@@ -3900,6 +3957,10 @@ mod tests {
             two_shard_key.clone(),
             "candidate_cache_regression".to_string(),
         );
+        store
+            .post_burst
+            .rollback_recorded_at
+            .insert(two_shard_key.clone(), now + Duration::seconds(150));
         let mut provider_decision = compute_shadow_affinity(
             &mut store,
             &identity("provider-native-baseline"),
@@ -4905,6 +4966,64 @@ mod tests {
 
         assert!(store.assignments.is_empty());
         assert!(store.post_burst.windows.is_empty());
+    }
+
+    #[test]
+    fn legacy_or_expired_rollback_does_not_permanently_block_re_evaluation() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        ledger.rollbacks.insert(
+            "legacy".to_string(),
+            "candidate_cache_regression".to_string(),
+        );
+        ledger.rollbacks.insert(
+            "expired".to_string(),
+            "candidate_ttft_regression".to_string(),
+        );
+        ledger.rollback_recorded_at.insert(
+            "expired".to_string(),
+            now - Duration::hours(POST_BURST_ROLLBACK_TTL_HOURS + 1),
+        );
+        ledger.rollbacks.insert(
+            "fresh".to_string(),
+            "candidate_success_regression".to_string(),
+        );
+        ledger
+            .rollback_recorded_at
+            .insert("fresh".to_string(), now - Duration::minutes(1));
+
+        evict_post_burst_evidence(&mut ledger, now);
+
+        assert!(!ledger.rollbacks.contains_key("legacy"));
+        assert!(!ledger.rollbacks.contains_key("expired"));
+        assert!(ledger.rollbacks.contains_key("fresh"));
+        assert!(ledger.rollback_recorded_at.contains_key("fresh"));
+    }
+
+    #[test]
+    fn rollback_capacity_keeps_the_newest_evidence_only() {
+        let mut ledger = PostBurstEvidenceLedger::default();
+        let now = Utc::now();
+        for index in 0..=POST_BURST_ROLLBACK_LIMIT {
+            let key = format!("rollback-{index:04}");
+            ledger
+                .rollbacks
+                .insert(key.clone(), "candidate_cache_regression".to_string());
+            ledger
+                .rollback_recorded_at
+                .insert(key, now + Duration::seconds(index as i64));
+        }
+
+        evict_post_burst_evidence(
+            &mut ledger,
+            now + Duration::seconds(POST_BURST_ROLLBACK_LIMIT as i64 + 1),
+        );
+
+        assert_eq!(ledger.rollbacks.len(), POST_BURST_ROLLBACK_LIMIT);
+        assert!(!ledger.rollbacks.contains_key("rollback-0000"));
+        assert!(ledger
+            .rollbacks
+            .contains_key(&format!("rollback-{POST_BURST_ROLLBACK_LIMIT:04}")));
     }
 
     #[test]

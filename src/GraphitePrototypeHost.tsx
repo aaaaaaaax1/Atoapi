@@ -1,6 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import graphitePrototypeHtml from "../prototype/atoapi-graphite-ui.html?raw";
-import lucideUmdUrl from "lucide/dist/umd/lucide.min.js?url";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { command } from "./lib/api";
 import type {
   AgentInjectionConfig,
@@ -30,90 +28,16 @@ import {
   requestTransportDisplay
 } from "./lib/request-record-state";
 import { providerDisplayName, requestAgentBadge } from "./graphite/providerDisplay";
+import {
+  GRAPHITE_BRIDGE_CHANNEL,
+  type GraphiteBridgeResponse,
+  type GraphiteMessage,
+  type GraphitePrototypeHostProps
+} from "./graphite/frameProtocol";
+import { createGraphitePrototypeDocument } from "./graphite/frameDocument";
 
 // The table exposes ten 20-row pages. This does not govern lifetime metrics.
 const MAX_VISIBLE_REQUESTS = 200;
-
-export interface GraphiteProviderPayload {
-  id?: string | null;
-  name: string;
-  base_url: string;
-  models_url?: string;
-  api_key?: string;
-  custom_user_agent?: string;
-  channel: Channel;
-  channel_mode: "auto" | "manual";
-  use_system_proxy: boolean;
-  prompt_cache_retention_enabled: boolean;
-  request_body_gzip_enabled: boolean;
-  non_sse_compact_compat_enabled: boolean;
-  auto_compact_token_limit?: number | null;
-  models: Array<{
-    id: string;
-    request_model_id?: string | null;
-    context_window?: number | null;
-    reasoning_effort?: string | null;
-  }>;
-  keys: Array<{
-    id?: string;
-    alias?: string;
-    key?: string;
-    enabled: boolean;
-    priority: number;
-  }>;
-  key_pool?: {
-    enabled?: boolean;
-    strategy: "round-robin" | "priority" | "least-used" | "random" | "sequential";
-    failure_threshold: number;
-    recovery_minutes: number;
-  };
-}
-
-export interface GraphiteBridgeResponse {
-  notice?: string;
-  error?: string;
-  closeOverlay?: string;
-  payload?: Record<string, unknown>;
-}
-
-export interface GraphitePrototypeHostProps {
-  config: AppConfig | null;
-  metrics: MetricsSnapshot | null;
-  selectedAgentId: string;
-  includeColdStarts: boolean;
-  includeCompactions: boolean;
-  showDetailedErrors: boolean;
-  providerConnectionStatus: Record<string, string>;
-  metricsRefreshPolicy: "visible-1s" | "5s" | "manual";
-  proxyStatus: ProxyStatus | null;
-  networkPathDiagnostic: {
-    provider_id: string;
-    paths: Array<{
-      path: string;
-      ok: boolean;
-      elapsed_ms: number;
-      status?: number | null;
-      http_version?: string | null;
-      error?: string | null;
-    }>;
-  } | null;
-  cacheValidation: CacheValidationStatus | null;
-  appVersion: string;
-  notice?: string;
-  error?: string;
-  onBridgeAction: (
-    action: string,
-    payload: Record<string, unknown>
-  ) => Promise<GraphiteBridgeResponse | void> | GraphiteBridgeResponse | void;
-}
-
-type GraphiteMessage = {
-  channel?: string;
-  kind?: string;
-  action?: string;
-  requestId?: string;
-  payload?: Record<string, unknown>;
-};
 
 const bridgeSource = String.raw`
 (() => {
@@ -1530,34 +1454,10 @@ const bridgeSource = String.raw`
   window.parent.postMessage({ channel: CHANNEL, kind: "ready" }, "*");
 })();`;
 
-function createDocument(): string {
-  const withIds = graphitePrototypeHtml
-    .replace('<link rel="preconnect" href="https://fonts.googleapis.com" />\n', "")
-    .replace('<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />\n', "")
-    .replace('<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet" />\n', "")
-    .replace('<script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>', `<script src="${lucideUmdUrl}"></script>`)
-    .replace(
-      '<label class="field"><span>通道</span><select><option>Auto</option><option selected>Responses</option><option>Chat</option><option>Anthropic</option></select></label>',
-      '<label class="field"><span>通道</span><select id="providerChannelInput"><option value="auto">Auto</option><option value="responses" selected>Responses</option><option value="chat">Chat</option><option value="anthropic">Anthropic</option></select></label>'
-    )
-    .replace(
-      '<label class="field wide"><span>Models URL（可选）</span><input value="https://api.yunzhou.example/v1/models"',
-      '<label class="field wide"><span>Models URL（可选）</span><input id="providerModelsUrlInput" value="https://api.yunzhou.example/v1/models"'
-    )
-    .replace(
-      '<label class="field"><span>自定义 User-Agent</span><input value="Atoapi/next"',
-      '<label class="field"><span>自定义 User-Agent</span><input id="providerCustomUserAgentInput" value="Atoapi/next"'
-    )
-    .replace(
-      '<label class="field"><span>统计刷新</span><select><option>页面可见时 1 秒</option><option>5 秒</option><option>手动</option></select></label>',
-      '<label class="field"><span>统计刷新</span><select id="settingsRefreshPolicy"><option value="visible-1s">页面可见时 1 秒</option><option value="5s">5 秒</option><option value="manual">手动</option></select></label>'
-    )
-    .replace(
-      '<label class="field wide"><span>版本</span><input value="vNext UI Prototype" readonly autocomplete="off" /></label>',
-      '<label class="field wide"><span>版本</span><input id="settingsAppVersion" value="vNext UI Prototype" readonly autocomplete="off" /></label>'
-    );
-  return withIds.replace("</body>", `<script>${bridgeSource}</script></body>`);
-}
+// The embedded prototype and bridge are static build assets. Keeping one
+// immutable document avoids rebuilding the iframe source during 1s metric
+// refreshes and preserves its DOM/event state for the entire desktop session.
+const graphitePrototypeDocument = createGraphitePrototypeDocument(bridgeSource);
 
 function protoAgentId(agent: AgentInjectionConfig): string {
   return agent.kind === "proxy-mode" ? "proxy" : agent.id;
@@ -2189,18 +2089,15 @@ function buildState(
 export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [ready, setReady] = useState(false);
-  const documentSource = useMemo(() => createDocument(), [graphitePrototypeHtml, bridgeSource]);
+  const onBridgeActionRef = useRef(props.onBridgeAction);
+  onBridgeActionRef.current = props.onBridgeAction;
   const state = useMemo(
     () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.includeCompactions, props.showDetailedErrors, props.providerConnectionStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.cacheValidation, props.appVersion),
     [props.appVersion, props.cacheValidation, props.config, props.includeColdStarts, props.includeCompactions, props.metrics, props.metricsRefreshPolicy, props.networkPathDiagnostic, props.providerConnectionStatus, props.proxyStatus, props.selectedAgentId, props.showDetailedErrors]
   );
 
-  useLayoutEffect(() => {
-    setReady(false);
-  }, [documentSource]);
-
   const send = useCallback((message: Record<string, unknown>) => {
-    frameRef.current?.contentWindow?.postMessage({ channel: "atoapi.graphite.bridge.v1", ...message }, "*");
+    frameRef.current?.contentWindow?.postMessage({ channel: GRAPHITE_BRIDGE_CHANNEL, ...message }, "*");
   }, []);
 
   useEffect(() => {
@@ -2209,7 +2106,7 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<GraphiteMessage>) => {
-      if (event.source !== frameRef.current?.contentWindow || event.data?.channel !== "atoapi.graphite.bridge.v1") return;
+      if (event.source !== frameRef.current?.contentWindow || event.data?.channel !== GRAPHITE_BRIDGE_CHANNEL) return;
       if (event.data.kind === "ready") {
         setReady(true);
         return;
@@ -2267,7 +2164,7 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
           return;
         }
         try {
-          const response = await props.onBridgeAction(action, payload);
+          const response = await onBridgeActionRef.current(action, payload);
           acknowledge(response ?? undefined);
         } catch (error) {
           acknowledge({ error: String(error) });
@@ -2277,13 +2174,13 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [props, send]);
+  }, [send]);
 
   return (
     <iframe
       className="graphite-prototype-frame"
       ref={frameRef}
-      srcDoc={documentSource}
+      srcDoc={graphitePrototypeDocument}
       title="Atoapi Graphite Control Desk"
     />
   );

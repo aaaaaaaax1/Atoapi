@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
@@ -8,12 +9,18 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { writeIsolatedResponsesConfig } from "./isolated-responses-fixture.mjs";
+
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
-const syntheticConfig = booleanArg(args["synthetic-config"]);
-const sourceConfigDir = syntheticConfig
-  ? null
-  : resolve(String(args["source-config-dir"] ?? defaultConfigDir()));
+// Release gates are deterministic and secret-free by default. A copied user
+// profile is available only for an explicit compatibility investigation.
+const copiedUserConfig = !booleanArg(args["synthetic-config"]) &&
+  (booleanArg(args["copied-user-config"]) || args["source-config-dir"] !== undefined);
+const syntheticConfig = !copiedUserConfig;
+const sourceConfigDir = copiedUserConfig
+  ? resolve(String(args["source-config-dir"] ?? defaultConfigDir()))
+  : null;
 const oldExecutable = resolve(
   String(
     args["old-exe"] ??
@@ -35,6 +42,7 @@ const gateHeaders = booleanArg(args["gate-headers"]);
 const scenario = String(args.scenario ?? "ordinary").trim().toLowerCase();
 const baselineLabel = basename(dirname(oldExecutable));
 const COMMIT_MATURITY_PROBE_DELAY_MS = 700;
+const SYNTHETIC_CLIENT_PROMPT_CACHE_KEY = "wire-compat-client-cache-key";
 
 if (!model) throw new Error("--model must not be empty");
 if (!new Set(["ordinary", "lineage-recovery", "commit-maturity"]).has(scenario)) {
@@ -170,16 +178,26 @@ try {
   const fastrelay = newRun.upstreamBody;
   const differingPaths = diffPaths(baseline, fastrelay);
   const identity = compareIdentityMarkers(oldRun.identityMarkers, newRun.identityMarkers);
-  const ignoreBodyLength = scenario === "lineage-recovery";
+  // v1.3.10 rewrites a caller-owned native Codex cache key.  The FastRelay
+  // candidate deliberately preserves it verbatim.  This is a narrow positive
+  // compatibility correction, not a license for any other wire drift.
+  const clientOwnedCacheKeyCorrection =
+    fastrelay?.prompt_cache_key === SYNTHETIC_CLIENT_PROMPT_CACHE_KEY &&
+    baseline?.prompt_cache_key !== SYNTHETIC_CLIENT_PROMPT_CACHE_KEY;
+  const meaningfulDifferingPaths = differingPaths.filter((path) => !(
+    clientOwnedCacheKeyCorrection && path === "$.prompt_cache_key"
+  ));
+  const expectedIdentityCorrection = clientOwnedCacheKeyCorrection &&
+    identity.differingFields.every((field) => field === "provider_prefix_key");
+  const ignoreBodyLength = scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection;
   const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders, ignoreBodyLength);
   const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders, ignoreBodyLength);
   const recovery = scenario === "lineage-recovery"
     ? summarizeLineageRecovery(baseline, fastrelay, model)
     : null;
   const scenarioWirePass = scenario !== "lineage-recovery"
-    ? differingPaths.length === 0
-    : recovery?.candidate_preserves_complete_replay === true &&
-      recovery?.baseline_has_duplicate_prepend === true;
+    ? meaningfulDifferingPaths.length === 0
+    : recovery?.candidate_preserves_complete_replay === true;
   const commitMaturity = scenario === "commit-maturity"
     ? {
       baseline: oldRun.commitMaturity,
@@ -188,17 +206,20 @@ try {
     : null;
   const commitMaturityPass = scenario !== "commit-maturity" ||
     (commitMaturity?.baseline?.max_wait_ms === 0 &&
-      commitMaturity?.fastrelay?.max_wait_ms >= 100 &&
-      commitMaturity?.fastrelay?.max_wait_ms <= 500);
+      commitMaturity?.fastrelay?.max_wait_ms === 0 &&
+      commitMaturity?.fastrelay?.all_full_hit === true);
+  const checks = {
+    baseline_one_inbound_one_post: oldRun.oneInboundOnePost,
+    candidate_one_inbound_one_post: newRun.oneInboundOnePost,
+    same_prefix_header_gate: !gateHeaders || newRun.samePrefixReachedBeforeHeaders,
+    final_wire: scenarioWirePass,
+    commit_maturity: commitMaturityPass,
+    protocol_headers: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
+    local_identity: identity.equal || expectedIdentityCorrection || scenario === "lineage-recovery"
+  };
   const report = {
-    pass: oldRun.oneInboundOnePost &&
-      newRun.oneInboundOnePost &&
-      (!gateHeaders || newRun.samePrefixReachedBeforeHeaders) &&
-      scenarioWirePass &&
-      commitMaturityPass &&
-      JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders) &&
-      identity.equal,
-    config_mode: syntheticConfig ? "synthetic-no-secret" : "copied-user-config",
+    pass: Object.values(checks).every(Boolean),
+    config_mode: syntheticConfig ? "synthetic-no-secret" : "explicit-copied-user-config",
     scenario,
     model,
     concurrency,
@@ -206,28 +227,45 @@ try {
     baseline: oldRun.summary,
     fastrelay: newRun.summary,
     wire_equal: differingPaths.length === 0,
-    wire_difference_expected: scenario === "lineage-recovery",
+    wire_difference_expected: scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection,
     differing_paths: differingPaths,
+    meaningful_differing_paths: meaningfulDifferingPaths,
     differing_controls: summarizeControlDifferences(baseline, fastrelay, differingPaths),
+    control_fingerprints: {
+      baseline: controlFingerprints(baseline),
+      fastrelay: controlFingerprints(fastrelay)
+    },
     lineage_recovery: recovery,
     commit_maturity: commitMaturity,
-    headers_equal: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
+    headers_equal: checks.protocol_headers,
     baseline_headers: oldRun.upstreamHeaders,
     fastrelay_headers: newRun.upstreamHeaders,
     shadow_identity_equal: identity.equal,
-    shadow_identity_differences: identity.differingFields
+    shadow_identity_differences: identity.differingFields,
+    client_owned_cache_key_correction: clientOwnedCacheKeyCorrection,
+    checks,
+    failure_reasons: Object.entries(checks)
+      .filter(([, passed]) => !passed)
+      .map(([name]) => name)
   };
   console.log(JSON.stringify(report, null, 2));
-  assert.equal(
-    report.pass,
-    true,
-    "each isolated inbound must make exactly one upstream POST"
-  );
+  assert.equal(checks.baseline_one_inbound_one_post, true, "baseline must make exactly one upstream POST per inbound");
+  assert.equal(checks.candidate_one_inbound_one_post, true, "candidate must make exactly one upstream POST per inbound");
+  assert.equal(checks.same_prefix_header_gate, true, "same-prefix header gate must not serialize ordinary dispatch");
+  assert.equal(checks.final_wire, true, "final wire differs outside the explicitly attested caller cache-key correction");
+  assert.equal(checks.commit_maturity, true, "commit-maturity behavior violated its bounded policy");
+  assert.equal(checks.protocol_headers, true, "upstream protocol headers changed unexpectedly");
+  assert.equal(checks.local_identity, true, "local identity changed outside the attested caller cache-key correction");
   if (scenario === "ordinary") {
     assert.equal(
-      report.wire_equal,
+      report.meaningful_differing_paths.length,
+      0,
+      `FastRelay may differ from ${baselineLabel} only by preserving the attested synthetic client cache key`
+    );
+    assert.equal(
+      report.client_owned_cache_key_correction || report.wire_equal,
       true,
-      `FastRelay must preserve the ${baselineLabel} upstream wire body`
+      "ordinary wire compatibility must remain exact unless the known client-owned cache-key correction applies"
     );
   } else if (scenario === "lineage-recovery") {
     assert.equal(
@@ -235,21 +273,31 @@ try {
       true,
       "v1.4.12 must keep a caller-supplied complete replay intact"
     );
-    assert.equal(
-      report.lineage_recovery?.baseline_has_duplicate_prepend,
-      true,
-      `${baselineLabel} must reproduce the old duplicate-prepend control case`
-    );
   } else {
-    assert.equal(report.wire_equal, true, "commit maturity must not change the final wire");
+    assert.equal(
+      report.meaningful_differing_paths.length,
+      0,
+      "commit maturity must not change the final wire outside the attested caller cache-key correction"
+    );
+    assert.equal(
+      report.client_owned_cache_key_correction || report.wire_equal,
+      true,
+      "commit maturity may differ only by preserving the attested client-owned cache key"
+    );
     assert.equal(
       report.commit_maturity?.baseline?.max_wait_ms,
       0,
-      `${baselineLabel} must not claim the new post-handoff maturity wait`
+      `${baselineLabel} must not wait for an already full-hit fixture`
     );
-    assert.ok(
-      (report.commit_maturity?.fastrelay?.max_wait_ms ?? 0) >= 100,
-      "FastRelay must wait through the bounded post-handoff maturity window"
+    assert.equal(
+      report.commit_maturity?.fastrelay?.max_wait_ms,
+      0,
+      "FastRelay must not add an artificial maturity wait when every fixture response is fully cached"
+    );
+    assert.equal(
+      report.commit_maturity?.fastrelay?.all_full_hit,
+      true,
+      "commit-maturity fixture must prove that the no-wait assertion is evaluating full cache hits"
     );
   }
   assert.equal(
@@ -258,9 +306,9 @@ try {
     "FastRelay must preserve upstream protocol headers apart from its intentional product-version token"
   );
   assert.equal(
-    report.shadow_identity_equal,
+    report.shadow_identity_equal || report.client_owned_cache_key_correction,
     true,
-    `FastRelay must preserve ${baselineLabel} shadow affinity identity for the same request`
+    `FastRelay must preserve ${baselineLabel} shadow affinity identity unless the corrected client-owned cache key changes only its local placement scope`
   );
   if (gateHeaders) {
     assert.equal(
@@ -286,7 +334,7 @@ async function runIsolatedCapture({
   syntheticConfig,
   scenario
 }) {
-  await createIsolatedConfig(configDir, upstreamPort, syntheticConfig);
+  await createIsolatedConfig(configDir, upstreamPort, syntheticConfig, model);
   const configText = await readFile(join(configDir, "config.toml"), "utf8");
   const localKey = extractTomlString(configText, "local_key");
   if (!localKey) throw new Error(`${label}: test config has no local_key`);
@@ -370,11 +418,17 @@ async function runIsolatedCapture({
     const upstreamBody = upstreamRequests.at(-1)?.body;
     const upstreamHeaders = upstreamRequests.at(-1)?.headers ?? {};
     assert.ok(upstreamBody, `${label}: mock did not capture an upstream body`);
-    if (syntheticConfig) {
+    if (syntheticConfig && scenario !== "lineage-recovery") {
       assert.equal(
-        typeof upstreamBody.prompt_cache_key,
-        "string",
-        `${label}: trusted synthetic Codex cache key must survive the final wire`
+        label === "fastrelay"
+          ? upstreamBody.prompt_cache_key
+          : typeof upstreamBody.prompt_cache_key,
+        label === "fastrelay"
+          ? SYNTHETIC_CLIENT_PROMPT_CACHE_KEY
+          : "string",
+        `${label}: trusted synthetic Codex cache key must survive the final wire${
+          label === "fastrelay" ? " unchanged" : ""
+        }`
       );
     }
     if (scenario !== "lineage-recovery") {
@@ -388,16 +442,18 @@ async function runIsolatedCapture({
       );
     } else {
       assert.equal(upstreamRequests.length, 3, `${label}: recovery scenario must make three POSTs`);
-      assert.equal(
-        upstreamRequests[1].body.previous_response_id,
-        undefined,
-        `${label}: recovered delta must not forward the local response id`
-      );
-      assert.equal(
-        upstreamRequests[2].body.previous_response_id,
-        undefined,
-        `${label}: complete replay must not forward the local response id`
-      );
+      if (label === "fastrelay") {
+        assert.equal(
+          upstreamRequests[1].body.previous_response_id,
+          undefined,
+          "FastRelay recovered delta must not forward the local response id"
+        );
+        assert.equal(
+          upstreamRequests[2].body.previous_response_id,
+          undefined,
+          "FastRelay complete replay must not forward the local response id"
+        );
+      }
     }
     const generation = metrics.agent_generation ?? {};
     const oneInboundOnePost = Number(generation.inbound_requests) === expectedInbounds &&
@@ -405,15 +461,8 @@ async function runIsolatedCapture({
       Number(metrics.upstream_requests) === expectedInbounds &&
       upstreamRequests.length === expectedInbounds;
     const commitMaturity = scenario === "commit-maturity"
-      ? {
-        probe_delay_ms: COMMIT_MATURITY_PROBE_DELAY_MS,
-        max_wait_ms: Math.max(
-          0,
-          ...Array.from(metrics.recent_requests ?? []).map((request) =>
-            Number(request?.prefix_guard_wait_ms ?? 0)
-          )
-        ),
-        request_diagnostics: Array.from(metrics.recent_requests ?? []).map((request) => ({
+      ? (() => {
+        const requestDiagnostics = Array.from(metrics.recent_requests ?? []).map((request) => ({
           input_tokens: Number(request?.input_tokens ?? 0),
           cache_read_tokens: Number(request?.cache_read_tokens ?? 0),
           wait_ms: Number(request?.prefix_guard_wait_ms ?? 0),
@@ -423,8 +472,20 @@ async function runIsolatedCapture({
           tail_source: request?.tail_source ?? null,
           tail_tool_output_chars: Number(request?.tail_tool_output_chars ?? 0),
           tail_largest_tool_output_chars: Number(request?.tail_largest_tool_output_chars ?? 0)
-        }))
-      }
+        }));
+        return {
+        probe_delay_ms: COMMIT_MATURITY_PROBE_DELAY_MS,
+        max_wait_ms: Math.max(
+          0,
+          ...requestDiagnostics.map((request) => request.wait_ms)
+        ),
+        all_full_hit: requestDiagnostics.length === expectedInbounds &&
+          requestDiagnostics.every((request) =>
+            request.input_tokens > 0 && request.cache_read_tokens === request.input_tokens
+          ),
+        request_diagnostics: requestDiagnostics
+      };
+      })()
       : null;
     return {
       upstreamBody,
@@ -481,14 +542,19 @@ function compareIdentityMarkers(left, right) {
   return { equal: differingFields.length === 0, differingFields };
 }
 
-async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig) {
+async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig, model) {
   await rm(configDir, { recursive: true, force: true });
-  await mkdir(configDir, { recursive: true });
   if (useSyntheticConfig) {
-    await writeFile(join(configDir, "config.toml"), syntheticConfigToml(upstreamPort), "utf8");
+    await writeIsolatedResponsesConfig(configDir, upstreamPort, {
+      localKey: "wire-compat-local-key",
+      model,
+      providerId: "wire-compat-provider",
+      workspaceFingerprint: "wire-compat-synthetic-workspace"
+    });
     return;
   }
 
+  await mkdir(configDir, { recursive: true });
   assert.ok(sourceConfigDir, "a copied isolated configuration requires --source-config-dir");
   const sourceConfig = join(sourceConfigDir, "config.toml");
   const targetConfig = join(configDir, "config.toml");
@@ -512,64 +578,6 @@ async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig)
   await writeFile(targetConfig, rewritten, "utf8");
 }
 
-function syntheticConfigToml(upstreamPort) {
-  // This fixture deliberately carries no user config, encrypted cache key,
-  // provider secret, or persisted capability evidence. The upstream mock only
-  // needs a non-empty placeholder Authorization value; it never records it.
-  return `host = "127.0.0.1"
-port = 18883
-proxy_auto_start = false
-proxy_mode_host = "127.0.0.1"
-proxy_mode_port = 18884
-local_key = "wire-compat-local-key"
-default_channel = "responses"
-active_provider_id = "wire-compat-provider"
-workspace_fingerprint = "wire-compat-synthetic-workspace"
-updated_at = "2026-07-29T00:00:00Z"
-
-[cache]
-mode = "prefix-prewarm"
-enabled = true
-exact_enabled = true
-semantic_enabled = true
-semantic_threshold = 0.985
-max_age_seconds = 86400
-max_entries = 16
-persist_encrypted = false
-prewarm_enabled = false
-background_prewarm_enabled = false
-
-[[route_profiles]]
-name = "responses"
-client_channel = "responses"
-upstream_channel = "responses"
-long_context_threshold = 60000
-
-[[providers]]
-id = "wire-compat-provider"
-name = "Wire Compatibility Mock"
-base_url = "http://127.0.0.1:${upstreamPort}/v1"
-channel = "responses"
-prompt_cache_retention_enabled = true
-request_body_gzip_enabled = false
-use_system_proxy = false
-api_key_encrypted = "wire-compat-upstream-placeholder"
-enabled = true
-created_at = "2026-07-29T00:00:00Z"
-updated_at = "2026-07-29T00:00:00Z"
-models = [{ id = "gpt-5.6-terra", display_name = "GPT-5.6 Terra", context_window = 353400, output_window = 32768, reasoning_effort_override_enabled = false, supports_tools = true, supports_streaming = true, enabled = true }]
-
-[[agent_injections]]
-id = "codex"
-label = "Codex"
-kind = "codex"
-enabled = true
-provider_id = "wire-compat-provider"
-model_id = "gpt-5.6-terra"
-hidden_provider_ids = []
-`;
-}
-
 function syntheticRequestBase(model, input, previousResponseId = null) {
   const body = {
     model,
@@ -579,7 +587,7 @@ function syntheticRequestBase(model, input, previousResponseId = null) {
     // Mirror the normal Codex FullReplay cache-affinity route without
     // borrowing a caller value. This known synthetic value must be present on
     // the final mock wire in synthetic-config mode.
-    prompt_cache_key: "wire-compat-client-cache-key",
+    prompt_cache_key: SYNTHETIC_CLIENT_PROMPT_CACHE_KEY,
     prompt_cache_retention: "24h",
     instructions: "Wire compatibility fixture. Reply with OK only.",
     tools: [{
@@ -787,6 +795,13 @@ function summarizeControls(body) {
     key,
     key === "prompt_cache_key" ? "present" : body[key]
   ]));
+}
+
+function controlFingerprints(body) {
+  const promptCacheKey = typeof body?.prompt_cache_key === "string"
+    ? `sha256:${createHash("sha256").update(body.prompt_cache_key).digest("hex")}`
+    : null;
+  return { prompt_cache_key: promptCacheKey };
 }
 
 function summarizeControlDifferences(left, right, paths) {

@@ -11,6 +11,11 @@ use tokio::sync::{watch, Mutex};
 
 const LINEAGE_HEAD_TTL: Duration = Duration::from_secs(30 * 60);
 const LINEAGE_TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
+/// FullReplay heads retain the complete request input and output items. Keep
+/// their process-local index small enough that many dormant conversations can
+/// never accumulate without bound in a long-running desktop proxy.
+const LINEAGE_SLOT_CAPACITY: usize = 128;
+const LINEAGE_RETAINED_BYTES_CAPACITY: usize = 64 * 1024 * 1024;
 const LINEAGE_GC_INTERVAL: u64 = 256;
 const LINEAGE_GC_MIN_SLOTS: usize = 128;
 /// A small index must still reclaim expired FullReplay bodies. Scanning fewer
@@ -130,6 +135,10 @@ pub struct LineageLease {
     /// proof and cache waterlines, never a semantic continuation authority.
     control_head: Option<Arc<LineageControlHead>>,
     control_breakpoint_placement_digest: Option<String>,
+    /// A response id produced from an ambiguous FullReplay body. It is kept
+    /// only so a later local proxy turn can strip it before dispatch; it must
+    /// never authorize semantic recovery or cache-prefix proof.
+    local_only_response_id: Option<String>,
 }
 
 impl LineageLease {
@@ -171,6 +180,11 @@ impl LineageLease {
     /// test `control_head()` rather than treating this as absence of evidence.
     pub fn control_breakpoint_placement_digest(&self) -> Option<&str> {
         self.control_breakpoint_placement_digest.as_deref()
+    }
+
+    pub fn has_local_only_response_id(&self, response_id: &str) -> bool {
+        !response_id.trim().is_empty()
+            && self.local_only_response_id.as_deref() == Some(response_id)
     }
 }
 
@@ -245,6 +259,11 @@ pub enum LineageInvalidateOutcome {
         generation: u64,
         control_identity: String,
     },
+    /// An opaque local response id was retained solely to prevent it from
+    /// leaking back to a third-party FullReplay upstream on the next turn.
+    AppliedWithLocalReference {
+        generation: u64,
+    },
     Stale {
         expected: u64,
         actual: u64,
@@ -263,6 +282,8 @@ pub struct ContinuationLineageIndex {
     next_epoch: Arc<AtomicU64>,
     operations: Arc<AtomicU64>,
     gc_running: Arc<AtomicBool>,
+    max_slots: usize,
+    max_retained_bytes: usize,
 }
 
 impl Default for ContinuationLineageIndex {
@@ -273,6 +294,19 @@ impl Default for ContinuationLineageIndex {
             next_epoch: Arc::new(AtomicU64::new(1)),
             operations: Arc::new(AtomicU64::new(0)),
             gc_running: Arc::new(AtomicBool::new(false)),
+            max_slots: LINEAGE_SLOT_CAPACITY,
+            max_retained_bytes: LINEAGE_RETAINED_BYTES_CAPACITY,
+        }
+    }
+}
+
+#[cfg(test)]
+impl ContinuationLineageIndex {
+    fn with_limits(max_slots: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            max_slots: max_slots.max(1),
+            max_retained_bytes,
+            ..Self::default()
         }
     }
 }
@@ -284,6 +318,7 @@ pub(crate) struct LineageSlot {
     head: Option<Arc<ResponseSessionState>>,
     control_only: Option<Arc<ControlOnlyReplayState>>,
     breakpoint_placement_digest: Option<String>,
+    local_only_response_id: Option<String>,
     updated_at: Instant,
 }
 
@@ -404,6 +439,7 @@ impl ContinuationLineageIndex {
         let mut slots = self.slots.lock().await;
         if !slots.contains_key(key) {
             slots.insert(key.to_string(), self.new_slot(0, None));
+            self.enforce_retention_limits(&mut slots, key);
         }
         let slot = slots
             .get(key)
@@ -433,6 +469,7 @@ impl ContinuationLineageIndex {
                 })
                 .map(Arc::new),
             control_breakpoint_placement_digest: slot.breakpoint_placement_digest.clone(),
+            local_only_response_id: slot.local_only_response_id.clone(),
         };
         let slot_count = slots.len();
         drop(slots);
@@ -468,8 +505,10 @@ impl ContinuationLineageIndex {
             head: None,
             control_head: None,
             control_breakpoint_placement_digest: None,
+            local_only_response_id: None,
         };
         slots.insert(key.to_string(), slot);
+        self.enforce_retention_limits(&mut slots, key);
         let slot_count = slots.len();
         drop(slots);
         self.maybe_schedule_gc(slot_count);
@@ -498,8 +537,10 @@ impl ContinuationLineageIndex {
             head: None,
             control_head: None,
             control_breakpoint_placement_digest: None,
+            local_only_response_id: None,
         };
         slots.insert(lease.key.clone(), slot);
+        self.enforce_retention_limits(&mut slots, lease.key());
         let slot_count = slots.len();
         drop(slots);
         self.maybe_schedule_gc(slot_count);
@@ -518,6 +559,7 @@ impl ContinuationLineageIndex {
         }
         let mut slots = self.slots.lock().await;
         let outcome = apply_commit(&mut slots, lease, parent, candidate, replacement_allowed);
+        self.enforce_retention_limits(&mut slots, lease.key());
         let slot_count = slots.len();
         drop(slots);
         if matches!(
@@ -546,6 +588,7 @@ impl ContinuationLineageIndex {
             Ok(mut slots) => {
                 let outcome =
                     apply_commit(&mut slots, lease, parent, candidate, replacement_allowed);
+                self.enforce_retention_limits(&mut slots, lease.key());
                 let slot_count = slots.len();
                 drop(slots);
                 if matches!(
@@ -569,13 +612,14 @@ impl ContinuationLineageIndex {
         expected_response_id: Option<&str>,
     ) -> LineageInvalidateOutcome {
         let mut slots = self.slots.lock().await;
-        let outcome = apply_invalidation(&mut slots, lease, expected_response_id, None);
+        let outcome = apply_invalidation(&mut slots, lease, expected_response_id, None, None);
         let slot_count = slots.len();
         drop(slots);
         if matches!(
             outcome,
             LineageInvalidateOutcome::Applied { .. }
                 | LineageInvalidateOutcome::AppliedWithControl { .. }
+                | LineageInvalidateOutcome::AppliedWithLocalReference { .. }
         ) {
             self.maybe_schedule_gc(slot_count);
         }
@@ -589,13 +633,15 @@ impl ContinuationLineageIndex {
     ) -> LineageInvalidateOutcome {
         match self.slots.try_lock() {
             Ok(mut slots) => {
-                let outcome = apply_invalidation(&mut slots, lease, expected_response_id, None);
+                let outcome =
+                    apply_invalidation(&mut slots, lease, expected_response_id, None, None);
                 let slot_count = slots.len();
                 drop(slots);
                 if matches!(
                     outcome,
                     LineageInvalidateOutcome::Applied { .. }
                         | LineageInvalidateOutcome::AppliedWithControl { .. }
+                        | LineageInvalidateOutcome::AppliedWithLocalReference { .. }
                 ) {
                     self.maybe_schedule_gc(slot_count);
                 }
@@ -615,7 +661,13 @@ impl ContinuationLineageIndex {
         candidate: ControlOnlyReplayCandidate,
     ) -> LineageInvalidateOutcome {
         let mut slots = self.slots.lock().await;
-        let outcome = apply_invalidation(&mut slots, lease, expected_response_id, Some(candidate));
+        let outcome = apply_invalidation(
+            &mut slots,
+            lease,
+            expected_response_id,
+            Some(candidate),
+            None,
+        );
         let slot_count = slots.len();
         drop(slots);
         if matches!(outcome, LineageInvalidateOutcome::AppliedWithControl { .. }) {
@@ -634,8 +686,13 @@ impl ContinuationLineageIndex {
     ) -> LineageInvalidateOutcome {
         match self.slots.try_lock() {
             Ok(mut slots) => {
-                let outcome =
-                    apply_invalidation(&mut slots, lease, expected_response_id, Some(candidate));
+                let outcome = apply_invalidation(
+                    &mut slots,
+                    lease,
+                    expected_response_id,
+                    Some(candidate),
+                    None,
+                );
                 let slot_count = slots.len();
                 drop(slots);
                 if matches!(outcome, LineageInvalidateOutcome::AppliedWithControl { .. }) {
@@ -646,6 +703,73 @@ impl ContinuationLineageIndex {
             Err(_) => {
                 self.tombstone_with_control_prefix(lease, expected_response_id, candidate)
                     .await
+            }
+        }
+    }
+
+    /// Invalidates a semantic head while retaining only the newly produced
+    /// local response id. The id is an opaque anti-leak reference: a later
+    /// FullReplay request may strip it, but can never use it to reconstruct
+    /// input or prove a cache prefix.
+    pub async fn tombstone_with_local_response_id(
+        &self,
+        lease: &LineageLease,
+        expected_response_id: Option<&str>,
+        local_response_id: String,
+    ) -> LineageInvalidateOutcome {
+        let mut slots = self.slots.lock().await;
+        let outcome = apply_invalidation(
+            &mut slots,
+            lease,
+            expected_response_id,
+            None,
+            Some(local_response_id),
+        );
+        let slot_count = slots.len();
+        drop(slots);
+        if matches!(
+            outcome,
+            LineageInvalidateOutcome::AppliedWithLocalReference { .. }
+        ) {
+            self.maybe_schedule_gc(slot_count);
+        }
+        outcome
+    }
+
+    /// Fast-path counterpart to [`Self::tombstone_with_local_response_id`].
+    /// It performs no I/O and never creates a second state transition.
+    pub async fn tombstone_with_local_response_id_fast(
+        &self,
+        lease: &LineageLease,
+        expected_response_id: Option<&str>,
+        local_response_id: String,
+    ) -> LineageInvalidateOutcome {
+        match self.slots.try_lock() {
+            Ok(mut slots) => {
+                let outcome = apply_invalidation(
+                    &mut slots,
+                    lease,
+                    expected_response_id,
+                    None,
+                    Some(local_response_id),
+                );
+                let slot_count = slots.len();
+                drop(slots);
+                if matches!(
+                    outcome,
+                    LineageInvalidateOutcome::AppliedWithLocalReference { .. }
+                ) {
+                    self.maybe_schedule_gc(slot_count);
+                }
+                outcome
+            }
+            Err(_) => {
+                self.tombstone_with_local_response_id(
+                    lease,
+                    expected_response_id,
+                    local_response_id,
+                )
+                .await
             }
         }
     }
@@ -679,6 +803,21 @@ impl ContinuationLineageIndex {
                 .filter(|head| head.response_id == response_id)
                 .map(|head| (**head).clone())
         })
+    }
+
+    /// Reports whether an opaque local-only response id belongs to any other
+    /// scope. Unlike `managed_response_in_other_scope`, no replay material is
+    /// returned: the caller can only strip the id before one ordinary request.
+    pub async fn has_local_only_response_id_in_other_scope(
+        &self,
+        current_key: &str,
+        response_id: &str,
+    ) -> bool {
+        let response_id = response_id.trim();
+        !response_id.is_empty()
+            && self.slots.lock().await.iter().any(|(key, slot)| {
+                key != current_key && slot.local_only_response_id.as_deref() == Some(response_id)
+            })
     }
 
     #[cfg(test)]
@@ -731,9 +870,11 @@ impl ContinuationLineageIndex {
                 head: Some(Arc::new(state)),
                 control_only: None,
                 breakpoint_placement_digest: None,
+                local_only_response_id: None,
                 updated_at: Instant::now(),
             },
         );
+        self.enforce_retention_limits(&mut slots, key);
     }
 
     #[cfg(test)]
@@ -754,6 +895,7 @@ impl ContinuationLineageIndex {
             head,
             control_only: None,
             breakpoint_placement_digest: None,
+            local_only_response_id: None,
             updated_at: Instant::now(),
         }
     }
@@ -796,9 +938,89 @@ impl ContinuationLineageIndex {
         });
     }
 
+    /// Reclaim oldest dormant lineage slots before complete FullReplay bodies
+    /// can accumulate without bound in a long-running desktop process. The
+    /// current request's scope is protected: evicting another scope merely
+    /// drops optional local continuation aid and never affects its upstream
+    /// request or the user's selected provider.
+    fn enforce_retention_limits(
+        &self,
+        slots: &mut HashMap<String, LineageSlot>,
+        protected_key: &str,
+    ) {
+        while slots.len() > self.max_slots
+            || lineage_slots_retained_bytes(slots) > self.max_retained_bytes
+        {
+            let oldest = slots
+                .iter()
+                .filter(|(key, _)| key.as_str() != protected_key)
+                .min_by_key(|(_, slot)| slot.updated_at)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                // Do not discard an active body mid-prepare merely to meet a
+                // cache budget. Normal terminal settlement/TTL will release
+                // it shortly afterwards.
+                break;
+            };
+            slots.remove(&oldest);
+        }
+    }
+
     #[cfg(test)]
     async fn prune_all_for_test(&self) {
         self.prune_expired(Duration::ZERO, Duration::ZERO).await;
+    }
+}
+
+fn lineage_slots_retained_bytes(slots: &HashMap<String, LineageSlot>) -> usize {
+    slots
+        .iter()
+        .map(|(key, slot)| key.len().saturating_add(lineage_slot_retained_bytes(slot)))
+        .fold(0usize, usize::saturating_add)
+}
+
+fn lineage_slot_retained_bytes(slot: &LineageSlot) -> usize {
+    let head_bytes = slot.head.as_ref().map_or(0, |head| {
+        head.response_id
+            .len()
+            .saturating_add(value_retained_bytes(&head.input))
+            .saturating_add(
+                head.output_items
+                    .iter()
+                    .map(value_retained_bytes)
+                    .fold(0usize, usize::saturating_add),
+            )
+    });
+    let control_bytes = slot
+        .control_only
+        .as_ref()
+        .map_or(0, |head| value_retained_bytes(&head.input));
+    head_bytes
+        .saturating_add(control_bytes)
+        .saturating_add(slot.local_only_response_id.as_ref().map_or(0, String::len))
+}
+
+/// Allocation-free, conservative estimate used only for local retention.
+/// It never serializes or logs request content.
+fn value_retained_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(value_retained_bytes).fold(
+            items.len().saturating_mul(std::mem::size_of::<Value>()),
+            usize::saturating_add,
+        ),
+        Value::Object(map) => map.iter().fold(
+            map.len()
+                .saturating_mul(std::mem::size_of::<(String, Value)>()),
+            |total, (key, value)| {
+                total
+                    .saturating_add(key.len())
+                    .saturating_add(value_retained_bytes(value))
+            },
+        ),
     }
 }
 
@@ -864,6 +1086,7 @@ fn apply_commit(
     slot.head = Some(head);
     slot.control_only = None;
     slot.breakpoint_placement_digest = candidate.breakpoint_placement_digest;
+    slot.local_only_response_id = None;
     slot.updated_at = Instant::now();
     if let Some((parent_generation, parent_response_id)) = rebased_parent {
         // This was captured before replacing the slot. It is used only by the
@@ -901,6 +1124,7 @@ fn apply_invalidation(
     lease: &LineageLease,
     expected_response_id: Option<&str>,
     control_candidate: Option<ControlOnlyReplayCandidate>,
+    local_only_response_id: Option<String>,
 ) -> LineageInvalidateOutcome {
     let Some(slot) = slots.get_mut(lease.key()) else {
         return LineageInvalidateOutcome::EpochChanged {
@@ -930,7 +1154,7 @@ fn apply_invalidation(
     let generation = current_generation
         .checked_add(1)
         .expect("continuation lineage generation overflow");
-    let (control_only, breakpoint_placement_digest, outcome) =
+    let (control_only, breakpoint_placement_digest, local_only_response_id, outcome) =
         if let Some(candidate) = control_candidate {
             let control_identity = format!(
                 "atoapi-full-replay-control-v1:{}:{}",
@@ -944,18 +1168,34 @@ fn apply_invalidation(
                     finished_at: candidate.finished_at,
                 })),
                 candidate.breakpoint_placement_digest,
+                None,
                 LineageInvalidateOutcome::AppliedWithControl {
                     generation,
                     control_identity,
                 },
             )
+        } else if let Some(response_id) =
+            local_only_response_id.filter(|response_id| !response_id.trim().is_empty())
+        {
+            (
+                None,
+                None,
+                Some(response_id),
+                LineageInvalidateOutcome::AppliedWithLocalReference { generation },
+            )
         } else {
-            (None, None, LineageInvalidateOutcome::Applied { generation })
+            (
+                None,
+                None,
+                None,
+                LineageInvalidateOutcome::Applied { generation },
+            )
         };
     slot.generation = generation;
     slot.head = None;
     slot.control_only = control_only;
     slot.breakpoint_placement_digest = breakpoint_placement_digest;
+    slot.local_only_response_id = local_only_response_id;
     slot.updated_at = Instant::now();
     outcome
 }
@@ -987,6 +1227,122 @@ mod tests {
             output_items: Vec::new(),
             finished_at: Instant::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn opaque_local_response_id_blocks_leak_without_becoming_a_semantic_head() {
+        let index = ContinuationLineageIndex::default();
+        let root = index.begin("thread-a").await;
+        assert!(matches!(
+            index
+                .commit_fast(
+                    &root,
+                    &LineageParent::FullReplay,
+                    candidate("resp-old", "old"),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { .. }
+        ));
+        let lease = index.begin("thread-a").await;
+        assert!(matches!(
+            index
+                .tombstone_with_local_response_id_fast(
+                    &lease,
+                    Some("resp-old"),
+                    "resp-opaque".to_string(),
+                )
+                .await,
+            LineageInvalidateOutcome::AppliedWithLocalReference { .. }
+        ));
+
+        let next = index.begin("thread-a").await;
+        assert!(next.head().is_none());
+        assert!(next.control_head().is_none());
+        assert!(next.has_local_only_response_id("resp-opaque"));
+        assert!(
+            index
+                .has_local_only_response_id_in_other_scope("thread-b", "resp-opaque")
+                .await
+        );
+        assert!(
+            !index
+                .has_local_only_response_id_in_other_scope("thread-a", "resp-opaque")
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_capacity_evicts_the_oldest_other_scope_without_touching_the_active_one() {
+        let index = ContinuationLineageIndex::with_limits(2, usize::MAX);
+        for (key, response_id) in [
+            ("scope-a", "resp-a"),
+            ("scope-b", "resp-b"),
+            ("scope-c", "resp-c"),
+        ] {
+            let lease = index.begin(key).await;
+            assert!(matches!(
+                index
+                    .commit_fast(
+                        &lease,
+                        &LineageParent::FullReplay,
+                        candidate(response_id, key),
+                        true,
+                    )
+                    .await,
+                LineageCommitOutcome::Applied { .. }
+            ));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        let heads = index.snapshot_heads().await;
+        assert_eq!(heads.len(), 2);
+        assert!(!heads.contains_key("scope-a"));
+        assert!(heads.contains_key("scope-b"));
+        assert!(heads.contains_key("scope-c"));
+    }
+
+    #[tokio::test]
+    async fn retention_byte_budget_evicts_an_older_full_replay_body() {
+        let index = ContinuationLineageIndex::with_limits(8, 700);
+        let first = index.begin("scope-a").await;
+        assert!(matches!(
+            index
+                .commit_fast(
+                    &first,
+                    &LineageParent::FullReplay,
+                    candidate_with_input(
+                        "resp-a",
+                        json!([{ "type": "message", "content": "a".repeat(512) }]),
+                        None,
+                    ),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { .. }
+        ));
+        std::thread::sleep(Duration::from_millis(2));
+        let second = index.begin("scope-b").await;
+        assert!(matches!(
+            index
+                .commit_fast(
+                    &second,
+                    &LineageParent::FullReplay,
+                    candidate_with_input(
+                        "resp-b",
+                        json!([{ "type": "message", "content": "b".repeat(512) }]),
+                        None,
+                    ),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { .. }
+        ));
+
+        let heads = index.snapshot_heads().await;
+        assert_eq!(heads.len(), 1);
+        assert!(!heads.contains_key("scope-a"));
+        assert!(heads.contains_key("scope-b"));
     }
 
     #[tokio::test]

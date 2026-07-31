@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { writeIsolatedResponsesConfig } from "./isolated-responses-fixture.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
@@ -20,18 +22,12 @@ if (args["self-test"]) {
 const executable = resolve(
   String(args.exe ?? join(repoRoot, "src-tauri", "target", "release", "atoapi.exe"))
 );
-const sourceConfigDir = resolve(
-  String(args["source-config-dir"] ?? defaultConfigDir())
-);
 const model = String(args.model ?? "gpt-5.6-terra").trim();
 const requestedPort = boundedPort(args.port ?? 18_884, "--port");
 const tailDelayMs = boundedInteger(args["tail-delay-ms"] ?? 125, "--tail-delay-ms", 10, 5_000);
 
 if (!existsSync(executable)) {
   throw new Error(`candidate executable is missing: ${executable}`);
-}
-if (!existsSync(join(sourceConfigDir, "config.toml"))) {
-  throw new Error(`source config is missing: ${join(sourceConfigDir, "config.toml")}`);
 }
 if (!model) throw new Error("--model must not be empty");
 if (requestedPort === 18_883) {
@@ -90,16 +86,11 @@ try {
   const upstreamPort = await listen(upstream, 0);
   tempRoot = await mkdtemp(join(tmpdir(), "atoapi-terminal-handoff-"));
   const configDir = join(tempRoot, "config");
-  await createIsolatedConfig(sourceConfigDir, configDir, upstreamPort);
-  const isolatedConfigPath = join(configDir, "config.toml");
-  const isolatedCacheKeyPath = join(configDir, "cache-key.dpapi");
-  const initialConfigHash = await fileHash(isolatedConfigPath);
-  const initialCacheKeyHash = existsSync(isolatedCacheKeyPath)
-    ? await fileHash(isolatedCacheKeyPath)
-    : null;
-  const configText = await readFile(isolatedConfigPath, "utf8");
-  const localKey = extractTomlString(configText, "local_key");
-  if (!localKey) throw new Error("isolated config has no local_key");
+  const { configPath: isolatedConfigPath, localKey } = await writeIsolatedResponsesConfig(
+    configDir,
+    upstreamPort,
+    { model }
+  );
 
   const port = await freePort(requestedPort);
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -117,6 +108,10 @@ try {
     }
   });
   await waitForHealth(baseUrl, child);
+  // Startup is allowed to persist its own `proxy_auto_start` transition.  The
+  // relay gate starts its audit after health so it detects only mutation caused
+  // by the handoff traffic, not that explicit startup state change.
+  const initialConfigHash = await fileHash(isolatedConfigPath);
 
   const seedInput = [message("terminal-handoff-seed")];
   await completeRequest(baseUrl, localKey, model, seedInput);
@@ -188,13 +183,6 @@ try {
     initialConfigHash,
     "the isolated candidate must not rewrite the migrated configuration during normal startup or relay traffic"
   );
-  if (initialCacheKeyHash !== null) {
-    assert.equal(
-      await fileHash(isolatedCacheKeyPath),
-      initialCacheKeyHash,
-      "the isolated candidate must not rewrite the encrypted cache-key material"
-    );
-  }
 
   console.log(JSON.stringify({
     pass: true,
@@ -215,7 +203,7 @@ try {
     },
     config_audit: {
       isolated_config_unchanged: true,
-      isolated_cache_key_unchanged: initialCacheKeyHash !== null
+      key_pool_persistence_excluded_by_fixture: true
     }
   }, null, 2));
 } finally {
@@ -328,86 +316,12 @@ async function beginRequest(baseUrl, localKey, model, input) {
   return { completed: completedPromise, drain };
 }
 
-async function createIsolatedConfig(sourceConfigDir, targetDir, upstreamPort) {
-  await mkdir(targetDir, { recursive: true });
-  const sourceConfig = join(sourceConfigDir, "config.toml");
-  const targetConfig = join(targetDir, "config.toml");
-  await copyFile(sourceConfig, targetConfig);
-  try {
-    await copyFile(join(sourceConfigDir, "cache-key.dpapi"), join(targetDir, "cache-key.dpapi"));
-  } catch {
-    // The loopback test can use a plaintext/empty cache when no DPAPI key exists.
-  }
-  const original = await readFile(targetConfig, "utf8");
-  const providerId = codexProviderId(original);
-  if (!providerId) throw new Error("could not find the enabled Codex provider in config.toml");
-  const rewritten = rewriteProviderBlock(original, providerId, (block) => {
-    let next = replaceTomlString(block, "base_url", `http://127.0.0.1:${upstreamPort}/v1`);
-    next = replaceTomlBoolean(next, "use_system_proxy", false);
-    next = replaceTomlBoolean(next, "request_body_gzip_enabled", false);
-    return next;
-  });
-  await writeFile(targetConfig, rewritten, "utf8");
-}
-
-function codexProviderId(config) {
-  return tomlArrayBlocks(config, "agent_injections")
-    .map(({ body }) => body)
-    .find((body) => extractTomlString(body, "id") === "codex")
-    ?.match(/^provider_id\s*=\s*"([^"]+)"/mu)?.[1] ?? "";
-}
-
-function rewriteProviderBlock(config, providerId, transform) {
-  const blocks = tomlArrayBlocks(config, "providers");
-  for (const block of blocks) {
-    if (extractTomlString(block.body, "id") !== providerId) continue;
-    return `${config.slice(0, block.start)}${transform(block.body)}${config.slice(block.end)}`;
-  }
-  throw new Error(`provider ${providerId} was not found in config.toml`);
-}
-
-function tomlArrayBlocks(text, section) {
-  const marker = `[[${section}]]`;
-  const starts = [];
-  let offset = 0;
-  while ((offset = text.indexOf(marker, offset)) >= 0) {
-    starts.push(offset);
-    offset += marker.length;
-  }
-  return starts.map((start) => {
-    const next = text.indexOf("\n[[", start + marker.length);
-    const end = next < 0 ? text.length : next + 1;
-    return { start, end, body: text.slice(start, end) };
-  });
-}
-
-function replaceTomlString(block, key, value) {
-  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"[^"]*"`, "mu");
-  if (!pattern.test(block)) return `${block.trimEnd()}\n${key} = "${value}"\n`;
-  return block.replace(pattern, `${key} = "${value}"`);
-}
-
-function replaceTomlBoolean(block, key, value) {
-  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*(?:true|false)`, "mu");
-  if (!pattern.test(block)) return `${block.trimEnd()}\n${key} = ${value}\n`;
-  return block.replace(pattern, `${key} = ${value}`);
-}
-
-function extractTomlString(text, key) {
-  const pattern = new RegExp(`^${escapeRegExp(key)}\\s*=\\s*"([^"]*)"`, "mu");
-  return text.match(pattern)?.[1] ?? "";
-}
-
 function message(text) {
   return {
     type: "message",
     role: "user",
     content: [{ type: "input_text", text }]
   };
-}
-
-function defaultConfigDir() {
-  return join(process.env.APPDATA ?? process.env.XDG_CONFIG_HOME ?? tmpdir(), "Atoapi");
 }
 
 function deferred() {
@@ -549,9 +463,6 @@ function parseArgs(items) {
   return parsed;
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
-}
 
 function runSelfTest() {
   assert.equal(phaseForInput([message("terminal-handoff-seed")]), "seed");

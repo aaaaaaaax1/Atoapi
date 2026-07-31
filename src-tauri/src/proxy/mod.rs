@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::continuation_lineage::ResponseSessionState;
 use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
@@ -12,7 +14,7 @@ use crate::{
     },
     continuation_lineage::{
         ControlOnlyReplayCandidate, LineageCommitOutcome, LineageInvalidateOutcome, LineageLease,
-        LineageParent, ResponseSessionCandidate, ResponseSessionState,
+        LineageParent, ResponseSessionCandidate,
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
@@ -20,7 +22,7 @@ use crate::{
         AgentTerminalSettlement, FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore,
         MetricsTransaction, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
     },
-    state::{AppState, PrefixWarmState},
+    state::{AppState, PrefixWarmState, RuntimeAffinityEntry},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -63,8 +65,10 @@ pub(crate) mod cache_validation;
 mod codex_chat_common;
 mod completion_relay;
 mod continuation_scope;
+mod final_responses_wire_plan;
 mod final_scope_shadow;
 pub(crate) mod final_scope_waterline;
+mod full_replay_continuity;
 mod generation_envelope;
 mod json_canonical;
 mod prefix_control;
@@ -102,11 +106,14 @@ use completion_relay::{
     STREAM_RELAY_BYTE_BUDGET, STREAM_RELAY_CHANNEL_CAPACITY,
 };
 use continuation_scope::ContinuationScope;
+use final_responses_wire_plan::FinalResponsesWirePlan;
 use final_scope_shadow::{FinalScopeShadow, FinalScopeShadowInput, FinalScopeShadowReceipt};
 use final_scope_waterline::{
     PredecessorProofReceipt, PredecessorProofStatus, WaterlineControlHead, WaterlineSettlement,
     WaterlineSettlementOutcome, WaterlineTicket,
 };
+use full_replay_continuity::recover_full_replay_input;
+#[cfg(test)]
 use generation_envelope::GenerationEnvelope;
 use prefix_control::{
     FinalResponsesStaticProjection, PrefixControlInput, PrefixController, PrefixGapInput,
@@ -148,6 +155,8 @@ const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
+const RUNTIME_AFFINITY_TTL: TokioDuration = TokioDuration::from_secs(30 * 60);
+const RUNTIME_AFFINITY_LIMIT: usize = 2_048;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 // These maps are local compatibility hints, not durable routing state. Bound
@@ -164,6 +173,7 @@ const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_SECS: u64 = 15 * 60;
 const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_LIMIT: usize = 1_024;
 const REDACTED_CLIENT_PROMPT_CACHE_KEY: &str = "[redacted prompt_cache_key]";
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
+const REASONING_EFFORT_REJECTION_LIMIT: usize = 2_048;
 const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
@@ -290,6 +300,10 @@ struct UpstreamRequestDiagnostics {
     final_wire_receipt: Option<FinalWireReceipt>,
     final_scope_shadow: Option<FinalScopeShadowReceipt>,
     final_scope_waterline: Option<FinalScopeWaterlineLog>,
+    // A local response id was seen but the caller body was not a proven
+    // FullReplay continuation. The request may still be proxied once, yet it
+    // must not publish a semantic head or teach cache-prefix state.
+    suppress_local_full_replay_settlement: bool,
     // Aggregate-only shape carried to the stream relay so a confirmed WAF
     // event can teach the local risk gate without retaining request content.
     full_replay_risk_shape: Option<BlockedFullReplayShape>,
@@ -357,6 +371,7 @@ impl UpstreamRequestDiagnostics {
         if next.final_scope_waterline.is_some() {
             self.final_scope_waterline = next.final_scope_waterline.clone();
         }
+        self.suppress_local_full_replay_settlement |= next.suppress_local_full_replay_settlement;
         if next.full_replay_risk_shape.is_some() {
             self.full_replay_risk_shape = next.full_replay_risk_shape;
         }
@@ -2149,6 +2164,17 @@ async fn run_generation_for_authorized_agent(
         client_request_starts_compaction_epoch,
         trusted_codex_metadata.is_some(),
     );
+    // `prompt_cache_retention` is also part of a native Codex request's
+    // declared cache contract.  It is not an Atoapi-generated probe merely
+    // because the selected third-party route has not yet been verified.
+    // Preserve the known legal value from an attested ordinary turn; only
+    // Atoapi-owned automatic injection is capability-gated below.
+    let client_owned_prompt_cache_retention = client_owned_native_prompt_cache_retention(
+        &client_request,
+        native_responses_passthrough,
+        client_request_starts_compaction_epoch,
+        trusted_codex_metadata.is_some(),
+    );
     let (agent_log_id, agent_log_label) =
         request_agent_log_fields(&config, authorized_agent.as_deref());
     let responses_from_incremental_cross_protocol_stream = client_requested_stream
@@ -2437,6 +2463,14 @@ async fn run_generation_for_authorized_agent(
         ProviderCacheCapabilityField::PromptCacheKey,
     )
         != ProviderCacheCapabilityStatus::Unsupported;
+    let client_owned_prompt_cache_retention_provider_allowed =
+        config.cache_capability_status_for_key(
+            &decision.provider.id,
+            &decision.model,
+            &decision.upstream_channel,
+            selected_provider_key.key_id.as_deref(),
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        ) != ProviderCacheCapabilityStatus::Unsupported;
     let client_owned_prompt_cache_key_active = client_owned_prompt_cache_key_is_active(
         client_owned_prompt_cache_key.is_some(),
         client_owned_prompt_cache_key_cooling_down,
@@ -2497,7 +2531,20 @@ async fn run_generation_for_authorized_agent(
         }
         _ => None,
     };
-    let stale_external_continuation_after_route_switch = stale_external_continuation.is_some();
+    let stale_external_local_reference = match (
+        continuation_scope.as_ref(),
+        incoming_previous_response_id.as_deref(),
+    ) {
+        (Some(scope), Some(response_id)) => {
+            state
+                .continuation_lineage
+                .has_local_only_response_id_in_other_scope(&scope.anchor_key, response_id)
+                .await
+        }
+        _ => false,
+    };
+    let stale_external_continuation_after_route_switch =
+        stale_external_continuation.is_some() || stale_external_local_reference;
     if let Some(stale_session) = stale_external_continuation {
         // A local managed head carries the old provider/model/key-realm in
         // its scope. Forwarding it after a hot switch leaks an invalid remote
@@ -2506,14 +2553,23 @@ async fn run_generation_for_authorized_agent(
         // complete FullReplay history, whose Atoapi-owned marker/noise differs
         // from the stored wire. Prepending in that case duplicates history.
         if let Some(request) = upstream_body.as_object_mut() {
-            if let Some(recovery) =
-                full_replay_input_after_route_switch(&stale_session, request.get("input"))
+            if let Some(recovery) = recover_full_replay_input(&stale_session, request.get("input"))
             {
                 full_replay_ambiguous_local_lineage |= recovery.ambiguous_local_lineage;
                 request.insert("input".to_string(), recovery.input);
+            } else {
+                full_replay_ambiguous_local_lineage = true;
             }
             request.remove("previous_response_id");
         }
+    } else if stale_external_local_reference {
+        // The old route produced this id from an ambiguous FullReplay body.
+        // It has no semantic replay material, but is still an Atoapi-local id
+        // that must never leak to the manually selected upstream.
+        if let Some(request) = upstream_body.as_object_mut() {
+            request.remove("previous_response_id");
+        }
+        full_replay_ambiguous_local_lineage = true;
     }
 
     let skip_prefix_guard_for_sync_responses = responses_sync_main_skips_prefix_guard(
@@ -2563,15 +2619,27 @@ async fn run_generation_for_authorized_agent(
             upstream_body.as_object_mut(),
         ) {
             if let Some(local_head) = lease.head().filter(|head| head.response_id == response_id) {
-                if let Some(recovery) =
-                    full_replay_input_after_route_switch(local_head, request.get("input"))
+                if let Some(recovery) = recover_full_replay_input(local_head, request.get("input"))
                 {
                     let rebuilt_incremental = recovery.rebuilt_incremental;
                     full_replay_ambiguous_local_lineage |= recovery.ambiguous_local_lineage;
                     request.insert("input".to_string(), recovery.input);
-                    request.remove("previous_response_id");
                     full_replay_after_local_lineage = rebuilt_incremental;
+                } else {
+                    // This response id belongs to local FullReplay lineage and
+                    // is never legal on the third-party route. Preserve an
+                    // unrecoverable caller body unchanged, but do not leak the
+                    // stale id or let it settle local prefix evidence.
+                    full_replay_ambiguous_local_lineage = true;
                 }
+                request.remove("previous_response_id");
+            } else if lease.has_local_only_response_id(response_id) {
+                // A prior ambiguous FullReplay response made this id local to
+                // Atoapi but intentionally left no semantic session head.
+                // Strip it before the single upstream dispatch and keep this
+                // request outside prefix/session learning.
+                request.remove("previous_response_id");
+                full_replay_ambiguous_local_lineage = true;
             }
         }
     }
@@ -2613,7 +2681,7 @@ async fn run_generation_for_authorized_agent(
     let original_prepared_body = if matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
     {
-        PreparedResponseBody::responses(upstream_body)
+        PreparedResponseBody::responses_pending(upstream_body)
     } else {
         PreparedResponseBody::plain(upstream_body)
     };
@@ -2780,6 +2848,8 @@ async fn run_generation_for_authorized_agent(
         prefix_state_update_key = None;
     }
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
+    upstream_request_diagnostics.suppress_local_full_replay_settlement =
+        full_replay_ambiguous_local_lineage;
     let mut request_metric_errors = Vec::<(String, String)>::new();
     let (mut shadow_affinity_decision, shadow_affinity_lock_busy) =
         if let Some((identity, identity_elapsed)) = shadow_affinity_identity {
@@ -2847,13 +2917,21 @@ async fn run_generation_for_authorized_agent(
         ..validation_scope.clone()
     }
     .generated_prompt_cache_key_effect_scope_id();
-    let generated_prompt_cache_key_eligible = agent_generation
-        && native_responses_passthrough
-        && matches!(active_request_channel, Channel::Responses)
-        && !active_used_response_session
-        && !response_session_starts_compaction_epoch
-        && matches!(&response_session_parent, LineageParent::FullReplay)
-        && trusted_generated_cache_identity.is_some();
+    // Every third-party native Responses request is a full replay.  Do not
+    // make cache-control shape depend on whether this happens to be the root
+    // request or a later local-lineage continuation: adding a static field only
+    // on the second request creates a real upstream cache prefix split.  A
+    // verified route therefore receives the same eligible generated controls
+    // from its first ordinary request onward; compaction remains an explicit
+    // fresh epoch boundary.
+    let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
+        agent_generation,
+        native_responses_passthrough,
+        &active_request_channel,
+        active_used_response_session,
+        response_session_starts_compaction_epoch,
+        trusted_generated_cache_identity.is_some(),
+    );
     let generated_prompt_cache_key_promoted = generated_prompt_cache_key_eligible
         && config.generated_prompt_cache_key_promoted_for_scope(
             &decision.provider.id,
@@ -2897,10 +2975,10 @@ async fn run_generation_for_authorized_agent(
     } else {
         None
     };
-    // Retain the established one-shot cache placement for trusted native Codex
-    // FullReplay. Only an exact field rejection disables this selected
-    // provider/model/channel/Key scope; generic failures never silently erase
-    // the user's working cache behavior.
+    // Retain a generated placement only after the exact selected
+    // provider/model/channel/Key scope has verified that the field is safe.
+    // Unknown capability is observe-only; it must not create a new static wire
+    // form on an otherwise ordinary FullReplay request.
     let generated_prompt_cache_key_recovery_enabled = generated_prompt_cache_key_eligible
         && smart_hit_enabled(&config)
         && generated_prompt_cache_key_compatibility_allowed(
@@ -2990,7 +3068,20 @@ async fn run_generation_for_authorized_agent(
                 && controlled_probe_fields
                     .contains(&ProviderCacheCapabilityField::PromptCacheRetention)
         });
-    if generated_prompt_cache_retention_recovery_enabled {
+    let client_owned_prompt_cache_retention_active = client_owned_prompt_cache_retention.is_some()
+        && client_owned_prompt_cache_retention_provider_allowed
+        && matches!(active_request_channel, Channel::Responses);
+    if client_owned_prompt_cache_retention_active {
+        active_upstream_body.set_root(
+            "prompt_cache_retention",
+            Value::String(
+                client_owned_prompt_cache_retention
+                    .as_deref()
+                    .expect("an active native Codex cache retention must be present")
+                    .to_string(),
+            ),
+        );
+    } else if generated_prompt_cache_retention_recovery_enabled {
         cache_capability::apply_legacy_prompt_cache_retention(
             &mut active_upstream_body,
             &mut cache_control_application,
@@ -3066,18 +3157,17 @@ async fn run_generation_for_authorized_agent(
     {
         final_scope_predecessor = final_scope_predecessor.invalidate_final_input();
     }
-    let generation_envelope = GenerationEnvelope::freeze(
+    let generation_plan = FinalResponsesWirePlan::freeze(
         &decision.provider,
         active_url,
         active_request_channel.clone(),
         active_upstream_body,
-    )
-    .with_explicit_proxy_url(
+        cache_control_plan,
         config
             .upstream_proxy_url_for(decision.provider.use_system_proxy)
             .map(str::to_owned),
     );
-    let final_wire_receipt = cache_control_plan.seal(&generation_envelope);
+    let final_wire_receipt = generation_plan.receipt().clone();
     let response_session_breakpoint_placement = final_wire_receipt
         .cache_controls
         .breakpoint_placement_digest()
@@ -3149,7 +3239,7 @@ async fn run_generation_for_authorized_agent(
     // Responses wire are both final.  A safety decision here can therefore
     // stop an unsafe FullReplay before the one-shot transport seam, without
     // changing normal/delta routes or dispatching a second request.
-    apply_prepared_body_lengths(&mut diagnostics, generation_envelope.request_plan());
+    apply_prepared_body_lengths(&mut diagnostics, generation_plan.request_plan());
     let full_replay_risk_scope = (matches!(client_channel, Channel::Responses)
         && matches!(active_request_channel, Channel::Responses)
         && final_scope_waterline_is_full_replay)
@@ -3175,7 +3265,7 @@ async fn run_generation_for_authorized_agent(
     };
     let full_replay_risk_shape = full_replay_risk_scope.as_ref().map(|_| {
         BlockedFullReplayShape::from_signals(
-            generation_envelope.request_plan().body_len() as u64,
+            generation_plan.request_plan().body_len() as u64,
             full_replay_risk_signals,
         )
     });
@@ -3191,12 +3281,12 @@ async fn run_generation_for_authorized_agent(
         is_responses_route: matches!(client_channel, Channel::Responses)
             && matches!(active_request_channel, Channel::Responses),
         is_full_replay: final_scope_waterline_is_full_replay,
-        has_native_continuation: generation_envelope
+        has_native_continuation: generation_plan
             .body()
             .get("previous_response_id")
             .and_then(Value::as_str)
             .is_some_and(|value| !value.trim().is_empty()),
-        final_body_bytes: generation_envelope.request_plan().body_len() as u64,
+        final_body_bytes: generation_plan.request_plan().body_len() as u64,
         blocked_shape,
         signals: full_replay_risk_signals,
     });
@@ -3235,7 +3325,7 @@ async fn run_generation_for_authorized_agent(
             &prefix_guard_wait,
             local_prepare_ms,
             &diagnostics,
-            generation_envelope.body(),
+            generation_plan.body(),
             active_used_response_session,
             &response_session_reuse_diagnostics,
             requested_model_for_log.clone(),
@@ -3374,9 +3464,9 @@ async fn run_generation_for_authorized_agent(
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
         &active_request_channel,
         client_requested_stream,
-        generation_envelope.request_plan().body_len(),
+        generation_plan.request_plan().body_len(),
     );
-    let mut frozen_generation = generation_envelope
+    let mut frozen_generation = generation_plan
         .with_gzip_enabled(
             decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
         )
@@ -4098,16 +4188,25 @@ async fn run_generation_for_authorized_agent(
         && !confirmed_compaction
         && matches!(active_request_channel, Channel::Responses)
     {
-        update_response_session_with_id(
-            &state,
-            response_session_lease.as_ref(),
-            &response_session_parent,
-            full_response_input.as_ref(),
-            response_session_breakpoint_placement.clone(),
-            response_session_response_id.clone(),
-            response_output_items_from_bytes(&bytes),
-        )
-        .await
+        if upstream_request_diagnostics.suppress_local_full_replay_settlement {
+            tombstone_ambiguous_response_session(
+                &state,
+                response_session_lease.as_ref(),
+                response_session_response_id.clone(),
+            )
+            .await
+        } else {
+            update_response_session_with_id(
+                &state,
+                response_session_lease.as_ref(),
+                &response_session_parent,
+                full_response_input.as_ref(),
+                response_session_breakpoint_placement.clone(),
+                response_session_response_id.clone(),
+                response_output_items_from_bytes(&bytes),
+            )
+            .await
+        }
     } else {
         None
     };
@@ -6700,8 +6799,18 @@ fn provider_prefix_control_key(
 
 /// Prefix observations are local hints, so the Key realm must be selected
 /// before they are read or written. The earlier realm-neutral form is used
-/// only for sticky key selection; this v2 form prevents failover/rotation from
-/// lending one key's cache waterline to another key.
+/// only for sticky key selection; this versioned form prevents failover,
+/// rotation, and cache-policy upgrades from lending one key's waterline to
+/// another key or wire shape.
+// Bump the persisted prefix-state namespace whenever the final Responses
+// cache-control wire policy changes.  The old v2 waterline was learned before
+// capability-gated cache fields were frozen and must not be compared with the
+// new wire shape on the first request after an upgrade.
+const PROVIDER_PREFIX_STATE_KEY_VERSION: &str = "prefix-v3";
+const PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION: &str = "prefix-family-v3";
+const PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION: &str = "prefix-alias-v3";
+const PROVIDER_PREFIX_STATE_POLICY_EPOCH: &str = "cache-control-verified-v1";
+
 fn provider_prefix_control_key_for_selected_key(
     provider_prefix_key: Option<&str>,
     decision: &RouteDecision,
@@ -6712,8 +6821,10 @@ fn provider_prefix_control_key_for_selected_key(
     let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
     provider_prefix_key.map(|key| {
         format!(
-            "prefix-v2\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            PROVIDER_PREFIX_STATE_KEY_VERSION,
             key_realm,
+            PROVIDER_PREFIX_STATE_POLICY_EPOCH,
             provider_group,
             provider_prefix_model_key(decision),
             channel.label(),
@@ -6735,7 +6846,9 @@ fn provider_prefix_family_control_key_for_selected_key(
     let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
     response_session_scope_key.map(|scope| {
         format!(
-            "prefix-family-v2\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION,
+            PROVIDER_PREFIX_STATE_POLICY_EPOCH,
             key_realm,
             provider_group,
             provider_prefix_model_key(decision),
@@ -6748,10 +6861,12 @@ fn provider_prefix_family_control_key_for_selected_key(
 fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     let mut parts = control_key.split('\0');
     let first = parts.next()?;
-    let (key_realm, provider_group) = if first == "prefix-v2" {
-        (Some(parts.next()?), parts.next()?)
-    } else {
-        (None, first)
+    let (key_realm, policy_epoch, provider_group) = match first {
+        "prefix-v2" => (Some(parts.next()?), None, parts.next()?),
+        PROVIDER_PREFIX_STATE_KEY_VERSION => {
+            (Some(parts.next()?), Some(parts.next()?), parts.next()?)
+        }
+        _ => (None, None, first),
     };
     let model = parts.next()?;
     let channel = parts.next()?;
@@ -6764,16 +6879,31 @@ fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     {
         return None;
     }
-    match key_realm {
-        Some(key_realm) if !key_realm.is_empty() => Some(format!(
+    match (key_realm, policy_epoch) {
+        (Some(key_realm), Some(policy_epoch))
+            if !key_realm.is_empty() && !policy_epoch.is_empty() =>
+        {
+            Some(format!(
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION,
+                policy_epoch,
+                key_realm,
+                provider_group,
+                model,
+                channel,
+                fingerprint
+            ))
+        }
+        (Some(key_realm), None) if !key_realm.is_empty() => Some(format!(
             "prefix-alias-v2\0{}\0{}\0{}\0{}\0{}",
             key_realm, provider_group, model, channel, fingerprint
         )),
-        Some(_) => None,
-        None => Some(format!(
+        (Some(_), _) => None,
+        (None, None) => Some(format!(
             "prefix-alias\0{}\0{}\0{}\0{}",
             provider_group, model, channel, fingerprint
         )),
+        (None, Some(_)) => None,
     }
 }
 
@@ -7145,214 +7275,6 @@ fn apply_session_anchor_diagnostics(log: &mut RequestLog, diagnostics: &SessionA
     log.session_anchor_peer_count = diagnostics.peer_count;
 }
 
-fn full_replay_input_after_route_switch(
-    session: &ResponseSessionState,
-    current: Option<&Value>,
-) -> Option<FullReplayInputRecovery> {
-    let (Value::Array(previous_items), Value::Array(current_items)) = (&session.input, current?)
-    else {
-        return None;
-    };
-    if response_input_starts_with_for_full_replay_recovery(current_items, previous_items) {
-        return Some(FullReplayInputRecovery {
-            input: Value::Array(current_items.clone()),
-            rebuilt_incremental: false,
-            ambiguous_local_lineage: false,
-        });
-    }
-    if !response_session_incremental_input_is_proven_safe(session, current_items) {
-        // The old response id is local-only on a FullReplay route. When the
-        // caller's input is not provably a delta, preserving it is safer than
-        // grafting a stale local history onto a potentially complete/new
-        // conversation. This changes neither upstream selection nor the
-        // number of POSTs; the caller still gets exactly one FullReplay.
-        return Some(FullReplayInputRecovery {
-            input: Value::Array(current_items.clone()),
-            rebuilt_incremental: false,
-            ambiguous_local_lineage: true,
-        });
-    }
-
-    let mut replay = Vec::with_capacity(
-        previous_items
-            .len()
-            .saturating_add(session.output_items.len())
-            .saturating_add(current_items.len()),
-    );
-    replay.extend(previous_items.iter().cloned());
-    replay.extend(session.output_items.iter().cloned());
-    replay.extend(current_items.iter().cloned());
-    Some(FullReplayInputRecovery {
-        input: Value::Array(replay),
-        rebuilt_incremental: true,
-        ambiguous_local_lineage: false,
-    })
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct FullReplayInputRecovery {
-    input: Value,
-    rebuilt_incremental: bool,
-    ambiguous_local_lineage: bool,
-}
-
-/// FullReplay recovery must compare the semantic prefix that the upstream
-/// will receive, rather than raw client JSON. Atoapi can legally add/remove
-/// its own protocol breakpoint, and clients commonly vary trace/status/id
-/// metadata in replayed Responses items. Those fields are not permission to
-/// concatenate another copy of an already complete history.
-fn response_input_starts_with_for_full_replay_recovery(
-    current: &[Value],
-    prefix: &[Value],
-) -> bool {
-    current.len() >= prefix.len()
-        && prefix
-            .iter()
-            .zip(current.iter())
-            .all(|(expected, current)| {
-                response_input_item_equal_for_full_replay_recovery(expected, current)
-            })
-}
-
-fn response_input_item_equal_for_full_replay_recovery(left: &Value, right: &Value) -> bool {
-    if cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(left, right) {
-        return true;
-    }
-    let mut left = left.clone();
-    let mut right = right.clone();
-    strip_responses_provider_noise(&mut left);
-    strip_responses_provider_noise(&mut right);
-    cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(&left, &right)
-}
-
-/// The third-party route cannot forward a local `previous_response_id`, so it
-/// may rebuild only an input that is structurally a normal continuation:
-/// expected tool outputs followed by user/system/developer messages. All
-/// other shapes are left intact to avoid duplicating an ambiguous full replay.
-fn response_session_incremental_input_is_proven_safe(
-    session: &ResponseSessionState,
-    current_items: &[Value],
-) -> bool {
-    let Some(previous_items) = session.input.as_array() else {
-        return false;
-    };
-    if current_items.is_empty() {
-        return false;
-    }
-    let Some(expected) = expected_response_call_outputs(&session.output_items) else {
-        return false;
-    };
-    if !response_session_delta_input_is_safe(current_items, &expected) {
-        return false;
-    }
-    // Without a pending tool result, a native Responses continuation is one
-    // new message. A leading system/developer instruction sequence followed by
-    // exactly one user message is also an unambiguous continuation shape used
-    // by Codex. A multi-user sequence remains ambiguous and is preserved rather
-    // than concatenating stale context. With pending tool outputs, allow only
-    // the exact outputs plus at most two follow-up instruction/message items.
-    if expected.is_empty() {
-        return current_items.len() == 1
-            || response_session_instruction_and_user_delta_is_safe(current_items);
-    }
-    current_items.len() <= expected.len().saturating_add(2)
-        && (current_items.len() < previous_items.len()
-            || current_items.len() <= expected.len().saturating_add(1))
-}
-
-fn response_session_instruction_and_user_delta_is_safe(items: &[Value]) -> bool {
-    let Some((last, leading)) = items.split_last() else {
-        return false;
-    };
-    if leading.is_empty()
-        || last.get("type").and_then(Value::as_str) != Some("message")
-        || last.get("role").and_then(Value::as_str) != Some("user")
-    {
-        return false;
-    }
-    leading.iter().all(|item| {
-        item.get("type").and_then(Value::as_str) == Some("message")
-            && matches!(
-                item.get("role").and_then(Value::as_str),
-                Some("system" | "developer")
-            )
-    })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpectedResponseCallOutput {
-    call_id: String,
-    item_type: String,
-}
-
-fn expected_response_call_outputs(
-    output_items: &[Value],
-) -> Option<Vec<ExpectedResponseCallOutput>> {
-    let mut expected = Vec::new();
-    let mut seen_call_ids = HashSet::new();
-    for item in output_items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let Some(item_type) = object.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if !(item_type == "function_call" || item_type.ends_with("_call")) {
-            continue;
-        }
-        let call_id = object
-            .get("call_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())?;
-        if !seen_call_ids.insert(call_id.to_string()) {
-            return None;
-        }
-        expected.push(ExpectedResponseCallOutput {
-            call_id: call_id.to_string(),
-            item_type: format!("{item_type}_output"),
-        });
-    }
-    Some(expected)
-}
-
-fn response_session_delta_input_is_safe(
-    delta: &[Value],
-    expected_call_outputs: &[ExpectedResponseCallOutput],
-) -> bool {
-    let mut next_call_output = 0usize;
-    for item in delta {
-        let Some(object) = item.as_object() else {
-            return false;
-        };
-        let item_type = object
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("message");
-        if next_call_output < expected_call_outputs.len() {
-            let expected = &expected_call_outputs[next_call_output];
-            if item_type != expected.item_type
-                || object.get("call_id").and_then(Value::as_str) != Some(expected.call_id.as_str())
-            {
-                return false;
-            }
-            next_call_output += 1;
-            continue;
-        }
-        if item_type.ends_with("_call_output") {
-            return false;
-        }
-        if item_type != "message"
-            || !object
-                .get("role")
-                .and_then(Value::as_str)
-                .is_some_and(|role| matches!(role, "user" | "system" | "developer"))
-        {
-            return false;
-        }
-    }
-    next_call_output == expected_call_outputs.len()
-}
-
 fn response_input_delta_start_index(
     previous_items: &[Value],
     current_items: &[Value],
@@ -7492,6 +7414,33 @@ async fn update_response_session_with_owned_input(
     )
 }
 
+/// A successful ambiguous FullReplay must not become a semantic continuation
+/// head or cache-prefix predecessor. Retain only its response id so the next
+/// Codex turn cannot accidentally forward that Atoapi-local id upstream.
+async fn tombstone_ambiguous_response_session(
+    state: &AppState,
+    session_lease: Option<&LineageLease>,
+    response_id: Option<String>,
+) -> Option<LineageCommitOutcome> {
+    let lease = session_lease?;
+    let expected_response_id = lease.head().map(|head| head.response_id.as_str());
+    let outcome = match response_id.filter(|response_id| !response_id.trim().is_empty()) {
+        Some(response_id) => {
+            state
+                .continuation_lineage
+                .tombstone_with_local_response_id_fast(lease, expected_response_id, response_id)
+                .await
+        }
+        None => {
+            state
+                .continuation_lineage
+                .invalidate_fast(lease, expected_response_id)
+                .await
+        }
+    };
+    Some(response_session_invalidation_outcome(outcome))
+}
+
 fn response_session_invalidation_outcome(
     outcome: LineageInvalidateOutcome,
 ) -> LineageCommitOutcome {
@@ -7506,6 +7455,9 @@ fn response_session_invalidation_outcome(
             generation,
             control_identity,
         },
+        LineageInvalidateOutcome::AppliedWithLocalReference { generation } => {
+            LineageCommitOutcome::Tombstoned { generation }
+        }
         LineageInvalidateOutcome::Stale { expected, actual } => {
             LineageCommitOutcome::Stale { expected, actual }
         }
@@ -9514,6 +9466,53 @@ fn should_background_prewarm(
     false
 }
 
+fn prune_runtime_affinities(
+    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
+    protected_key: Option<&str>,
+    now: Instant,
+) {
+    affinities
+        .retain(|_, entry| now.saturating_duration_since(entry.last_used) < RUNTIME_AFFINITY_TTL);
+    while affinities.len() > RUNTIME_AFFINITY_LIMIT {
+        let oldest = affinities
+            .iter()
+            .filter(|(key, _)| Some(key.as_str()) != protected_key)
+            .min_by_key(|(_, entry)| entry.last_used)
+            .map(|(key, _)| key.clone());
+        let Some(oldest) = oldest else {
+            break;
+        };
+        affinities.remove(&oldest);
+    }
+}
+
+fn lookup_runtime_affinity(
+    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
+    key: &str,
+    now: Instant,
+) -> Option<String> {
+    prune_runtime_affinities(affinities, Some(key), now);
+    let entry = affinities.get_mut(key)?;
+    entry.last_used = now;
+    Some(entry.value.clone())
+}
+
+fn note_runtime_affinity(
+    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
+    key: String,
+    value: String,
+    now: Instant,
+) {
+    affinities.insert(
+        key.clone(),
+        RuntimeAffinityEntry {
+            value,
+            last_used: now,
+        },
+    );
+    prune_runtime_affinities(affinities, Some(&key), now);
+}
+
 async fn select_provider_api_key(
     state: &AppState,
     provider_id: &str,
@@ -9523,12 +9522,8 @@ async fn select_provider_api_key(
     let affinity_map_key = affinity_key.map(|key| provider_key_affinity_map_key(provider_id, key));
     let preferred_key_id = if exclude_key_id.is_none() {
         if let Some(map_key) = affinity_map_key.as_deref() {
-            state
-                .provider_key_affinity
-                .lock()
-                .await
-                .get(map_key)
-                .cloned()
+            let mut affinities = state.provider_key_affinity.lock().await;
+            lookup_runtime_affinity(&mut affinities, map_key, Instant::now())
         } else {
             None
         }
@@ -9549,11 +9544,8 @@ async fn select_provider_api_key(
         return Err(anyhow!("provider API key is not configured"));
     };
     if let (Some(map_key), Some(key_id)) = (affinity_map_key, selected.key_id.as_ref()) {
-        state
-            .provider_key_affinity
-            .lock()
-            .await
-            .insert(map_key, key_id.clone());
+        let mut affinities = state.provider_key_affinity.lock().await;
+        note_runtime_affinity(&mut affinities, map_key, key_id.clone(), Instant::now());
     }
     Ok(selected)
 }
@@ -10899,12 +10891,10 @@ async fn lookup_provider_route_affinity(
     affinity_key: Option<&str>,
 ) -> Option<String> {
     let key = affinity_key?;
-    let provider_id = state
-        .provider_route_affinity
-        .lock()
-        .await
-        .get(key)
-        .cloned()?;
+    let provider_id = {
+        let mut affinities = state.provider_route_affinity.lock().await;
+        lookup_runtime_affinity(&mut affinities, key, Instant::now())?
+    };
     if config
         .providers
         .iter()
@@ -10927,11 +10917,13 @@ async fn note_provider_route_affinity(
     if provider_id.trim().is_empty() {
         return;
     }
-    state
-        .provider_route_affinity
-        .lock()
-        .await
-        .insert(key.to_string(), provider_id.to_string());
+    let mut affinities = state.provider_route_affinity.lock().await;
+    note_runtime_affinity(
+        &mut affinities,
+        key.to_string(),
+        provider_id.to_string(),
+        Instant::now(),
+    );
 }
 
 async fn maybe_clear_provider_route_affinity_after_status(
@@ -10963,9 +10955,10 @@ async fn clear_provider_route_affinity(
         return;
     };
     let mut affinities = state.provider_route_affinity.lock().await;
+    prune_runtime_affinities(&mut affinities, Some(key), Instant::now());
     if affinities
         .get(key)
-        .map(|current| current == provider_id)
+        .map(|current| current.value == provider_id)
         .unwrap_or(false)
     {
         affinities.remove(key);
@@ -11504,7 +11497,7 @@ async fn rejected_reasoning_efforts(
     let now = Instant::now();
     let ttl = TokioDuration::from_secs(REASONING_EFFORT_REJECTION_COOLDOWN_SECS);
     let mut rejections = state.reasoning_effort_rejections.lock().await;
-    rejections.retain(|_, rejected_at| now.duration_since(*rejected_at) < ttl);
+    prune_reasoning_effort_rejections(&mut rejections, now, ttl);
     REASONING_EFFORT_VALUES
         .iter()
         .filter(|effort| {
@@ -11524,10 +11517,31 @@ async fn note_reasoning_effort_rejection(
     upstream_channel: &Channel,
     effort: &str,
 ) {
-    state.reasoning_effort_rejections.lock().await.insert(
+    let now = Instant::now();
+    let ttl = TokioDuration::from_secs(REASONING_EFFORT_REJECTION_COOLDOWN_SECS);
+    let mut rejections = state.reasoning_effort_rejections.lock().await;
+    prune_reasoning_effort_rejections(&mut rejections, now, ttl);
+    if rejections.len() >= REASONING_EFFORT_REJECTION_LIMIT {
+        if let Some(oldest) = rejections
+            .iter()
+            .min_by_key(|(_, rejected_at)| **rejected_at)
+            .map(|(key, _)| key.clone())
+        {
+            rejections.remove(&oldest);
+        }
+    }
+    rejections.insert(
         reasoning_effort_rejection_key(decision, upstream_channel, effort),
-        Instant::now(),
+        now,
     );
+}
+
+fn prune_reasoning_effort_rejections(
+    rejections: &mut HashMap<String, Instant>,
+    now: Instant,
+    ttl: TokioDuration,
+) {
+    rejections.retain(|_, rejected_at| now.saturating_duration_since(*rejected_at) < ttl);
 }
 
 /// Advances only the exact persisted manual override that sent the rejected
@@ -11953,9 +11967,31 @@ fn apply_candidate_prompt_cache_routing(
     }
 }
 
-/// The compatibility path is opt-out only after the exact upstream Key realm
-/// rejects the field. Unknown and transient errors must not erase the stable
-/// v1.3.x cache placement from ordinary trusted Codex traffic.
+/// A third-party native Responses route always sends complete context.  Cache
+/// controls must therefore be decided from stable route/request facts that are
+/// equally available to the root and every ordinary follow-up, never from the
+/// local lineage parent type.
+fn generated_native_full_replay_cache_controls_eligible(
+    agent_generation: bool,
+    native_responses_passthrough: bool,
+    active_request_channel: &Channel,
+    active_used_response_session: bool,
+    response_session_starts_compaction_epoch: bool,
+    has_trusted_generated_cache_identity: bool,
+) -> bool {
+    agent_generation
+        && native_responses_passthrough
+        && matches!(active_request_channel, Channel::Responses)
+        && !active_used_response_session
+        && !response_session_starts_compaction_epoch
+        && has_trusted_generated_cache_identity
+}
+
+/// A generated placement key is a cache-affecting control, not a harmless
+/// compatibility default. Unknown, unverified, and transient capability
+/// records must therefore stay observe-only; injecting the field before an
+/// exact wire/effect certificate is what caused cache-control static-wire
+/// drift on third-party FullReplay routes.
 fn generated_prompt_cache_key_compatibility_allowed(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -11968,13 +12004,12 @@ fn generated_prompt_cache_key_compatibility_allowed(
         channel,
         key_id,
         ProviderCacheCapabilityField::PromptCacheKey,
-    ) != ProviderCacheCapabilityStatus::Unsupported
+    ) == ProviderCacheCapabilityStatus::Verified
 }
 
-/// The legacy retention field follows the same trusted native FullReplay and
-/// selected-Key boundary as the generated placement key, but its field-level
-/// rejection is independent: a Key that rejects only the placement key may
-/// still retain a working `24h` control.
+/// Retention follows the same evidence gate independently of placement-key
+/// support. A provider must have an exact, current verified capability record
+/// before Atoapi adds the field to ordinary traffic.
 fn generated_prompt_cache_retention_compatibility_allowed(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -11987,7 +12022,7 @@ fn generated_prompt_cache_retention_compatibility_allowed(
         channel,
         key_id,
         ProviderCacheCapabilityField::PromptCacheRetention,
-    ) != ProviderCacheCapabilityStatus::Unsupported
+    ) == ProviderCacheCapabilityStatus::Verified
 }
 
 /// Selects the final provider cache placement without weakening Key-realm
@@ -12162,7 +12197,7 @@ fn deterministic_call_id(payload: &str, occurrence: usize) -> String {
     format!("call_apx_{}", &digest[..24])
 }
 
-fn strip_responses_provider_noise(value: &mut Value) {
+pub(super) fn strip_responses_provider_noise(value: &mut Value) {
     match value {
         Value::Object(map) => {
             for key in [
@@ -12701,6 +12736,27 @@ fn client_owned_native_prompt_cache_key_for_compact(
         .then(|| request.get("prompt_cache_key").and_then(Value::as_str))
         .flatten()
         .filter(|key| provider_prompt_cache_key_is_valid(key))
+        .map(ToOwned::to_owned)
+}
+
+/// Preserve only the documented native Responses retention value from an
+/// attested ordinary Codex turn.  Unlike generated retention, this is a
+/// caller-owned protocol field; an exact runtime rejection still records the
+/// route as unsupported for later inbounds, without retrying this one.
+fn client_owned_native_prompt_cache_retention(
+    request: &Value,
+    native_responses_passthrough: bool,
+    compaction_requested: bool,
+    trusted_codex_context: bool,
+) -> Option<String> {
+    (native_responses_passthrough && trusted_codex_context && !compaction_requested)
+        .then(|| {
+            request
+                .get("prompt_cache_retention")
+                .and_then(Value::as_str)
+        })
+        .flatten()
+        .filter(|retention| *retention == "24h")
         .map(ToOwned::to_owned)
 }
 
@@ -16864,6 +16920,7 @@ mod tests {
             local_key: None,
             hidden_provider_ids: Vec::new(),
         }];
+
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-local-sse-baseline-{}",
             Uuid::new_v4().simple()
@@ -20104,10 +20161,72 @@ mod tests {
     }
 
     #[test]
-    fn native_codex_retention_compatibility_stops_only_after_its_exact_field_rejection() {
+    fn generated_native_cache_controls_keep_the_same_root_and_followup_eligibility() {
+        let root = generated_native_full_replay_cache_controls_eligible(
+            true,
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            true,
+        );
+        let followup = generated_native_full_replay_cache_controls_eligible(
+            true,
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            true,
+        );
+
+        assert!(root);
+        assert_eq!(root, followup);
+        assert!(generated_native_full_replay_cache_controls_eligible(
+            true,
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            true,
+        ));
+        assert!(!generated_native_full_replay_cache_controls_eligible(
+            true,
+            true,
+            &Channel::Responses,
+            false,
+            true,
+            true,
+        ));
+        assert!(!generated_native_full_replay_cache_controls_eligible(
+            true,
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn native_codex_retention_compatibility_requires_verified_field_evidence() {
         let mut config = AppConfig::default();
         let decision = reasoning_test_decision(None, &[]);
 
+        assert!(!generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
         assert!(generated_prompt_cache_retention_compatibility_allowed(
             &config,
             &decision,
@@ -20129,7 +20248,50 @@ mod tests {
             &Channel::Responses,
             Some("key-a"),
         ));
-        assert!(generated_prompt_cache_retention_compatibility_allowed(
+        assert!(!generated_prompt_cache_retention_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-b"),
+        ));
+    }
+
+    #[test]
+    fn native_codex_generated_placement_requires_verified_field_evidence() {
+        let mut config = AppConfig::default();
+        let decision = reasoning_test_decision(None, &[]);
+
+        assert!(!generated_prompt_cache_key_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        assert!(generated_prompt_cache_key_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            Some("key-b"),
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Error,
+            Some("transient".to_string()),
+        );
+        assert!(!generated_prompt_cache_key_compatibility_allowed(
             &config,
             &decision,
             &Channel::Responses,
@@ -20653,6 +20815,32 @@ mod tests {
         assert_eq!(
             provider_prefix_state_alias_key(share_key).as_deref(),
             Some("prefix-alias\0https://share.example/v1\0gpt-5.5\0responses\0stable-fingerprint")
+        );
+    }
+
+    #[test]
+    fn provider_prefix_policy_epoch_isolated_from_legacy_waterline_alias() {
+        let decision = reasoning_test_decision(None, &[]);
+        let selected = SelectedProviderKey {
+            secret: "selected-key".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let v3 = provider_prefix_control_key_for_selected_key(
+            Some("stable-fingerprint"),
+            &decision,
+            &Channel::Responses,
+            &selected,
+        )
+        .expect("selected-key prefix state key");
+        assert!(v3.starts_with("prefix-v3\0"));
+        assert!(v3.contains(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
+        let alias = provider_prefix_state_alias_key(&v3).expect("v3 alias");
+        assert!(alias.starts_with("prefix-alias-v3\0"));
+        assert!(alias.contains(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
+        assert_ne!(
+            alias,
+            "prefix-alias-v2\0https://example.com/v1\0gpt-5.5\0responses\0stable-fingerprint",
+            "a cache-control policy change must not reuse a v2 persisted alias"
         );
     }
 
@@ -22326,6 +22514,35 @@ mod tests {
             ),
             None,
             "compaction must use the generated placement path"
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_retention(
+                &json!({"prompt_cache_retention": "24h"}),
+                true,
+                false,
+                true,
+            ),
+            Some("24h".to_string()),
+            "an attested native caller retention field must not be mistaken for an Atoapi probe"
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_retention(
+                &json!({"prompt_cache_retention": "invalid"}),
+                true,
+                false,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            client_owned_native_prompt_cache_retention(
+                &json!({"prompt_cache_retention": "24h"}),
+                true,
+                true,
+                true,
+            ),
+            None,
+            "compaction must begin a fresh cache-control epoch"
         );
 
         let agent_a = client_owned_prompt_cache_key_local_id(
@@ -36120,7 +36337,7 @@ mod tests {
             { "type": "message", "role": "user", "content": "after" }
         ]);
 
-        let recovery = full_replay_input_after_route_switch(&session, Some(&current))
+        let recovery = recover_full_replay_input(&session, Some(&current))
             .expect("array full history should be recoverable");
         assert!(!recovery.rebuilt_incremental);
         assert_eq!(recovery.input, current);
@@ -36142,7 +36359,7 @@ mod tests {
         };
         let delta = json!([{ "type": "message", "role": "user", "content": "after" }]);
 
-        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+        let recovery = recover_full_replay_input(&session, Some(&delta))
             .expect("a normal one-message continuation must be recoverable");
         assert!(recovery.rebuilt_incremental);
         assert_eq!(
@@ -36178,7 +36395,7 @@ mod tests {
             { "type": "message", "role": "user", "content": "after" }
         ]);
 
-        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+        let recovery = recover_full_replay_input(&session, Some(&delta))
             .expect("a local instruction plus user continuation must be rebuilt");
         assert!(recovery.rebuilt_incremental);
         assert_eq!(
@@ -36220,7 +36437,7 @@ mod tests {
             { "type": "message", "role": "user", "content": "continue" }
         ]);
 
-        let recovery = full_replay_input_after_route_switch(&session, Some(&delta))
+        let recovery = recover_full_replay_input(&session, Some(&delta))
             .expect("matching tool output plus a user message is a proven continuation");
         assert!(recovery.rebuilt_incremental);
         assert_eq!(
@@ -36265,7 +36482,7 @@ mod tests {
             { "type": "message", "role": "user", "content": "new detail" }
         ]);
 
-        let recovery = full_replay_input_after_route_switch(&session, Some(&ambiguous))
+        let recovery = recover_full_replay_input(&session, Some(&ambiguous))
             .expect("a caller-supplied history remains valid input");
         assert!(!recovery.rebuilt_incremental);
         assert!(recovery.ambiguous_local_lineage);
@@ -36273,7 +36490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_previous_response_id_rebuilds_instruction_and_user_delta_once() {
+    async fn local_previous_response_id_rebuilds_instruction_chain_and_user_delta_once() {
         let hits = Arc::new(AtomicUsize::new(0));
         let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let hits_for_route = hits.clone();
@@ -36388,6 +36605,7 @@ mod tests {
                     "stream": true,
                     "previous_response_id": "resp_seed",
                     "input": [
+                        { "type": "message", "role": "system", "content": "retain the system contract" },
                         { "type": "message", "role": "developer", "content": "continue safely" },
                         { "type": "message", "role": "user", "content": "after" }
                     ]
@@ -36436,9 +36654,26 @@ mod tests {
                 "content": "complete history must not be prepended again"
             }
         ]);
+        let prefix_state_before_ambiguous = {
+            let states = state.prefix_states.lock().await;
+            let mut snapshot = states
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.input_tokens,
+                        value.cache_read_tokens,
+                        value.seen_bucket_tokens_128,
+                        value.responses_static_projection_digest.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+            snapshot
+        };
         let complete_replay = handle_generation_for_agent(
             state.clone(),
-            headers,
+            headers.clone(),
             Bytes::from(
                 serde_json::to_vec(&json!({
                     "model": "gpt-5.5",
@@ -36457,8 +36692,32 @@ mod tests {
             .await
             .unwrap();
 
+        // The response id from the ambiguous inbound is local-only. A later
+        // Codex continuation must still make exactly one ordinary FullReplay
+        // request and must never leak that id upstream.
+        let opaque_followup = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_followup",
+                    "input": [{ "type": "message", "role": "user", "content": "fresh after opaque local id" }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(opaque_followup.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(opaque_followup.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
         let captured = captured_bodies.lock().await.clone();
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
         assert!(captured[1].get("previous_response_id").is_none());
         assert_eq!(
             captured[1]["input"],
@@ -36471,16 +36730,22 @@ mod tests {
                     "role": "assistant",
                     "content": [{ "type": "output_text", "text": "seed answer" }]
                 },
+                { "type": "message", "role": "system", "content": "retain the system contract" },
                 { "type": "message", "role": "developer", "content": "continue safely" },
                 { "type": "message", "role": "user", "content": "after" }
             ])
         );
         assert!(captured[2].get("previous_response_id").is_none());
         assert_eq!(captured[2]["input"], complete_history);
+        assert!(captured[3].get("previous_response_id").is_none());
+        assert_eq!(
+            captured[3]["input"],
+            json!([{ "type": "message", "role": "user", "content": "fresh after opaque local id" }])
+        );
         let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
             loop {
                 let snapshot = state.metrics.snapshot().await;
-                if snapshot.recent_agent_upstream_attempts.len() == 3 {
+                if snapshot.recent_agent_upstream_attempts.len() == 4 {
                     break snapshot;
                 }
                 tokio::task::yield_now().await;
@@ -36489,7 +36754,7 @@ mod tests {
         .await
         .expect("every FullReplay inbound must settle exactly once");
         assert_eq!(metrics.retries, 0);
-        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 4);
         assert!(metrics.recent_requests.iter().any(|request| {
             request.response_context_plan.as_deref() == Some("full_replay_after_local_lineage")
         }));
@@ -36502,6 +36767,31 @@ mod tests {
             })
             .expect("an unmatched local continuation must be visible but not learned as a prefix");
         assert!(ambiguous.final_scope_waterline.is_none());
+        assert!(
+            state.continuation_lineage.is_empty().await,
+            "ambiguous FullReplay must retain only opaque ids, never a semantic descendant head"
+        );
+        let prefix_state_after_ambiguous = {
+            let states = state.prefix_states.lock().await;
+            let mut snapshot = states
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.input_tokens,
+                        value.cache_read_tokens,
+                        value.seen_bucket_tokens_128,
+                        value.responses_static_projection_digest.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            snapshot.sort_by(|left, right| left.0.cmp(&right.0));
+            snapshot
+        };
+        assert_eq!(
+            prefix_state_after_ambiguous, prefix_state_before_ambiguous,
+            "ambiguous local lineage must not overwrite the learned provider prefix state"
+        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -39499,6 +39789,26 @@ mod tests {
             captured_responses_encoding.lock().await.as_deref(),
             Some("identity")
         );
+
+        // Caller-owned cache controls remain transparent before Atoapi has
+        // evidence to generate them itself. Verify generated recovery only
+        // for the independent follow-up below.
+        let mut config = state.config.write().await;
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        ] {
+            config.record_cache_capability_probe_for_key(
+                "mock-responses",
+                "gpt-5.5",
+                Channel::Responses,
+                None,
+                field,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+        }
+        drop(config);
 
         let metrics = state.metrics.snapshot().await;
         assert!(metrics.recent_requests[0]

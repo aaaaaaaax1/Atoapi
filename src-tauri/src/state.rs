@@ -52,6 +52,15 @@ struct ProxyServer {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Opaque process-local affinity used only to prefer a previously healthy
+/// route/key. It deliberately retains no request payload and expires under
+/// the proxy's bounded affinity maintenance.
+#[derive(Debug, Clone)]
+pub struct RuntimeAffinityEntry {
+    pub value: String,
+    pub last_used: Instant,
+}
+
 impl ProxyServer {
     async fn shutdown(mut self) {
         let _ = self.shutdown.send(());
@@ -103,13 +112,13 @@ pub struct AppState {
     pub client_prompt_cache_key_rejection_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
     pub continuation_lineage: ContinuationLineageIndex,
-    pub provider_route_affinity: Mutex<HashMap<String, String>>,
+    pub provider_route_affinity: Mutex<HashMap<String, RuntimeAffinityEntry>>,
     /// Last successfully planned primary model for each Agent/upstream pair.
     /// This is process-local routing context for Codex internal helper requests
     /// such as `codex-auto-review`; it is never sent back to the client or
     /// persisted as conversation state.
     pub agent_runtime_models: StdMutex<HashMap<String, String>>,
-    pub provider_key_affinity: Mutex<HashMap<String, String>>,
+    pub provider_key_affinity: Mutex<HashMap<String, RuntimeAffinityEntry>>,
     pub shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
     pub cache_validation: Mutex<CacheValidationController>,
     pub relay_tasks: DispatchTracker,
@@ -500,9 +509,14 @@ impl AppState {
     pub fn load() -> Result<Self> {
         let config_path = config_path()?;
         let config_dir = app_config_dir()?;
-        let mut config = AppConfig::load_or_create(&config_path)?;
-        agent_injection::ensure_defaults(&mut config);
-        config.save(&config_path)?;
+        let (mut config, agent_defaults_changed) = load_config_with_agent_defaults(&config_path)?;
+        // Loading a canonical config must be read-only. Rewriting it on every
+        // launch changes user-owned formatting and can create needless config
+        // journal traffic even though no setting changed. Persist only the
+        // narrow compatibility/default migration that actually changed it.
+        if agent_defaults_changed {
+            config.save(&config_path)?;
+        }
         if let Some(port) = isolated_test_listen_port() {
             config.host = "127.0.0.1".to_string();
             config.port = port;
@@ -654,9 +668,10 @@ impl AppState {
     pub async fn reload_config(&self) -> Result<PublicConfig> {
         let mut current = self.config.write().await;
         self.flush_config().await?;
-        let mut config = AppConfig::load_or_create(&self.config_path)?;
-        agent_injection::ensure_defaults(&mut config);
-        self.persist_config_snapshot(&config).await?;
+        let (config, agent_defaults_changed) = load_config_with_agent_defaults(&self.config_path)?;
+        if agent_defaults_changed {
+            self.persist_config_snapshot(&config).await?;
+        }
         let public = config.public_view(self.config_path.clone());
         *current = config;
         Ok(public)
@@ -925,6 +940,17 @@ impl AppState {
             running.store(false, Ordering::Release);
         });
     }
+}
+
+/// Loads the configuration plus the only startup-time default migration that
+/// remains valid for current installs. The boolean reports a semantic change,
+/// so callers can persist only when `ensure_defaults` added or repaired data.
+fn load_config_with_agent_defaults(path: &Path) -> Result<(AppConfig, bool)> {
+    let mut config = AppConfig::load_or_create(path)?;
+    let before_defaults = toml::to_string(&config)?;
+    agent_injection::ensure_defaults(&mut config);
+    let changed = toml::to_string(&config)? != before_defaults;
+    Ok((config, changed))
 }
 
 pub fn runtime_state_path(config_dir: &Path) -> PathBuf {
@@ -1316,6 +1342,35 @@ impl PersistedRuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_config_load_does_not_reserialize_without_a_semantic_migration() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-canonical-config-load-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        config.host = "127.0.0.1".to_string();
+        config.local_key = "canonical-config-test-key".to_string();
+        agent_injection::ensure_defaults(&mut config);
+        config.save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let (_loaded, changed) = load_config_with_agent_defaults(&path).unwrap();
+
+        assert!(
+            !changed,
+            "a canonical config must not be treated as a startup migration"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a normal load must not rewrite a user configuration file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
     use crate::proxy::cache_affinity::{
         PostBurstEvidence, PostBurstWindow, ShadowAffinityArm, ShadowAffinityAssignment,

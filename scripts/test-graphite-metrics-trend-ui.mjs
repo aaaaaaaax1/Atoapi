@@ -23,7 +23,7 @@ for (const match of html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi))
   if (match[1].trim()) new Function(match[1]);
 }
 const bridgeStart = host.indexOf("const bridgeSource = String.raw`");
-const bridgeEnd = host.indexOf("`;\n\nfunction createDocument", bridgeStart);
+const bridgeEnd = host.indexOf("`;\n\n// The embedded prototype", bridgeStart);
 assert.ok(bridgeStart >= 0 && bridgeEnd >= 0, "the Graphite bridge source must remain extractable");
 const bridgeDefinition = host.slice(bridgeStart, bridgeEnd + 1);
 const bridgeSource = Function(`${bridgeDefinition}; return bridgeSource;`)();
