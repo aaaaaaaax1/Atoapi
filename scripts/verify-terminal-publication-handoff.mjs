@@ -108,10 +108,11 @@ try {
     }
   });
   await waitForHealth(baseUrl, child);
-  // Startup is allowed to persist its own `proxy_auto_start` transition.  The
-  // relay gate starts its audit after health so it detects only mutation caused
-  // by the handoff traffic, not that explicit startup state change.
-  const initialConfigHash = await fileHash(isolatedConfigPath);
+  await waitForConfigStable(isolatedConfigPath);
+  // The first Responses success may persist a narrowly-scoped cache-capability
+  // observation. Train that one-time state before snapshotting the terminal
+  // handoff path; the parent/child relay must not rewrite config afterwards.
+  const startupConfigText = await readFile(isolatedConfigPath, "utf8");
 
   const seedInput = [message("terminal-handoff-seed")];
   await completeRequest(baseUrl, localKey, model, seedInput);
@@ -119,6 +120,16 @@ try {
     10_000,
     "seed request did not settle"
   );
+  await waitForConfigStable(isolatedConfigPath);
+  const capabilitySettledConfigText = await readFile(isolatedConfigPath, "utf8");
+  const capabilityLearning = summarizeConfigMutation(startupConfigText, capabilitySettledConfigText);
+  assert.equal(
+    capabilityLearning.changed_fields.every(isExpectedCapabilityLearningField),
+    true,
+    `seed request changed configuration outside provider cache capability evidence: ${JSON.stringify(capabilityLearning.changed_fields)}`
+  );
+  const initialConfigText = capabilitySettledConfigText;
+  const initialConfigHash = await fileHash(isolatedConfigPath);
 
   const parentInput = [...seedInput, message("terminal-handoff-parent")];
   const parent = await beginRequest(baseUrl, localKey, model, parentInput);
@@ -178,8 +189,16 @@ try {
   assert.equal(childLog.final_scope_waterline?.predecessor_proof, "exact");
   assert.equal(childLog.final_scope_waterline?.predecessor_exact, true);
   assert.equal(childLog.final_scope_waterline?.predecessor_bound, true);
+  await waitForConfigStable(isolatedConfigPath);
+  const finalConfigText = await readFile(isolatedConfigPath, "utf8");
+  const finalConfigHash = await fileHash(isolatedConfigPath);
+  if (finalConfigHash !== initialConfigHash) {
+    console.error(JSON.stringify({
+      config_audit_failure: summarizeConfigMutation(initialConfigText, finalConfigText)
+    }, null, 2));
+  }
   assert.equal(
-    await fileHash(isolatedConfigPath),
+    finalConfigHash,
     initialConfigHash,
     "the isolated candidate must not rewrite the migrated configuration during normal startup or relay traffic"
   );
@@ -203,6 +222,7 @@ try {
     },
     config_audit: {
       isolated_config_unchanged: true,
+      initial_capability_learning_only: true,
       key_pool_persistence_excluded_by_fixture: true
     }
   }, null, 2));
@@ -338,6 +358,62 @@ function array(value) {
 
 async function fileHash(path) {
   return createHash("sha256").update(await readFile(path)).digest("hex");
+}
+
+async function waitForConfigStable(path, stableSamples = 4, sampleDelayMs = 75) {
+  let previous = null;
+  let stable = 0;
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const current = await fileHash(path);
+    stable = current === previous ? stable + 1 : 0;
+    if (stable >= stableSamples) return;
+    previous = current;
+    await delay(sampleDelayMs);
+  }
+  throw new Error("isolated configuration did not settle before terminal-handoff audit");
+}
+
+function summarizeConfigMutation(before, after) {
+  const beforeLines = configLineFingerprints(before);
+  const afterLines = configLineFingerprints(after);
+  const locations = new Set([...beforeLines.keys(), ...afterLines.keys()]);
+  const changedFields = [...locations]
+    .filter((location) => beforeLines.get(location) !== afterLines.get(location))
+    .sort()
+    .slice(0, 32);
+  return {
+    before_bytes: Buffer.byteLength(before),
+    after_bytes: Buffer.byteLength(after),
+    changed_field_count: changedFields.length,
+    changed_fields: changedFields
+  };
+}
+
+function configLineFingerprints(text) {
+  const fields = new Map();
+  const occurrences = new Map();
+  let section = "root";
+  for (const rawLine of String(text).split(/\r?\n/u)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    if (/^\[\[?[^\]]+\]\]?$/u.test(line)) {
+      section = line;
+      continue;
+    }
+    const match = line.match(/^([A-Za-z0-9_-]+)\s*=/u);
+    if (!match) continue;
+    const field = `${section}.${match[1]}`;
+    const index = (occurrences.get(field) ?? 0) + 1;
+    occurrences.set(field, index);
+    fields.set(`${field}#${index}`, createHash("sha256").update(line).digest("hex"));
+  }
+  return fields;
+}
+
+function isExpectedCapabilityLearningField(field) {
+  return field === "root.updated_at#1" || field === "root.provider_cache_capabilities#1" ||
+    field.startsWith("[[provider_cache_capabilities]].");
 }
 
 async function listen(server, requestedPort) {

@@ -52,15 +52,6 @@ struct ProxyServer {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Opaque process-local affinity used only to prefer a previously healthy
-/// route/key. It deliberately retains no request payload and expires under
-/// the proxy's bounded affinity maintenance.
-#[derive(Debug, Clone)]
-pub struct RuntimeAffinityEntry {
-    pub value: String,
-    pub last_used: Instant,
-}
-
 impl ProxyServer {
     async fn shutdown(mut self) {
         let _ = self.shutdown.send(());
@@ -112,13 +103,11 @@ pub struct AppState {
     pub client_prompt_cache_key_rejection_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub reasoning_effort_rejections: Mutex<HashMap<String, std::time::Instant>>,
     pub continuation_lineage: ContinuationLineageIndex,
-    pub provider_route_affinity: Mutex<HashMap<String, RuntimeAffinityEntry>>,
     /// Last successfully planned primary model for each Agent/upstream pair.
     /// This is process-local routing context for Codex internal helper requests
     /// such as `codex-auto-review`; it is never sent back to the client or
     /// persisted as conversation state.
     pub agent_runtime_models: StdMutex<HashMap<String, String>>,
-    pub provider_key_affinity: Mutex<HashMap<String, RuntimeAffinityEntry>>,
     pub shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
     pub cache_validation: Mutex<CacheValidationController>,
     pub relay_tasks: DispatchTracker,
@@ -569,9 +558,7 @@ impl AppState {
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
-            provider_route_affinity: Mutex::new(HashMap::new()),
             agent_runtime_models: StdMutex::new(agent_runtime_models),
-            provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
             relay_tasks: DispatchTracker::default(),
@@ -623,9 +610,7 @@ impl AppState {
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
-            provider_route_affinity: Mutex::new(HashMap::new()),
             agent_runtime_models: StdMutex::new(agent_runtime_models),
-            provider_key_affinity: Mutex::new(HashMap::new()),
             shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
             relay_tasks: DispatchTracker::default(),

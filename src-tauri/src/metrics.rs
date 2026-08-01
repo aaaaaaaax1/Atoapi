@@ -2268,6 +2268,12 @@ fn metrics_history_observation(
         agent_id: agent_id.to_string(),
         provider_id: provider_id.to_string(),
         release_scope: release_cohort_scope(log, agent_id, provider_id),
+        stable_prefix_cohort_id: log
+            .shadow_affinity_cohort_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned),
         input_tokens: log.input_tokens.unwrap_or_default(),
         output_tokens: log.output_tokens.unwrap_or_default(),
         cache_read_tokens: log.cache_read_tokens.unwrap_or_default(),
@@ -3342,6 +3348,12 @@ mod tests {
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
                 include_compactions: true,
+                provider_realm_id: None,
+                model: None,
+                client_channel: None,
+                upstream_channel: None,
+                upstream_call_kind: None,
+                stable_prefix_cohort_id: None,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);
@@ -4128,6 +4140,12 @@ mod tests {
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
                 include_compactions: true,
+                provider_realm_id: None,
+                model: None,
+                client_channel: None,
+                upstream_channel: None,
+                upstream_call_kind: None,
+                stable_prefix_cohort_id: None,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);
@@ -4192,6 +4210,12 @@ mod tests {
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
                 include_compactions: true,
+                provider_realm_id: None,
+                model: None,
+                client_channel: None,
+                upstream_channel: None,
+                upstream_call_kind: None,
+                stable_prefix_cohort_id: None,
             })
             .expect("trend query should succeed");
         assert_eq!(trend.summary.successful_requests, 1);

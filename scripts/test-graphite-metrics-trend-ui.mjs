@@ -75,7 +75,13 @@ for (const field of [
   "agent_id",
   "provider_id",
   "include_cold_starts",
-  "include_compactions"
+  "include_compactions",
+  "provider_realm_id",
+  "model",
+  "client_channel",
+  "upstream_channel",
+  "upstream_call_kind",
+  "stable_prefix_cohort_id"
 ]) {
   assert.match(
     trendInput,
@@ -113,6 +119,46 @@ assert.ok(
   /if\s*\([^)]*[A-Za-z0-9_]*sequence[A-Za-z0-9_]*[^)]*[A-Za-z0-9_]*rangeKey[A-Za-z0-9_]*[^)]*\)\s*(?:\{[\s\S]{0,160})?return\b/i.test(combined) ||
     /if\s*\([^)]*[A-Za-z0-9_]*rangeKey[A-Za-z0-9_]*[^)]*[A-Za-z0-9_]*sequence[A-Za-z0-9_]*[^)]*\)\s*(?:\{[\s\S]{0,160})?return\b/i.test(combined),
   "out-of-order trend responses must be rejected by a sequence/range stale guard"
+);
+assert.match(
+  host,
+  /function exactHistoricalScope\(scope\)[\s\S]{0,640}provider_realm_id[\s\S]{0,400}upstream_call_kind/,
+  "the trend bridge must construct an opaque exact historical token-hit scope"
+);
+assert.match(
+  host,
+  /\.\.\.exactHistoricalTrendScope\(scope\)/,
+  "the release-champion request must send the selected exact token-history scope when available"
+);
+assert.match(
+  host,
+  /function exactHistoricalTrendScope\(scope\)[\s\S]{0,360}stable_prefix_cohort_id/,
+  "the trend request must add the opaque stable-prefix family when history can prove it"
+);
+assert.match(
+  host,
+  /\.\.\.exactHistoricalTrendScope\(scope\)/,
+  "the trend request must use the stricter stable-prefix history scope"
+);
+assert.match(
+  host,
+  /historicalScope:\s*exactHistoricalScopeForProvider\(scope\.providerId\)/,
+  "the selected Provider scope must come from the latest successful token-bearing request"
+);
+assert.match(
+  host,
+  /callKind === "stream" \|\| callKind === "sync"/,
+  "local cache and prewarm records must not select the historical upstream token-hit cohort"
+);
+assert.match(
+  host,
+  /const configuredModel = selectedAgent\?\.model_id\?\.trim\(\);/,
+  "the historical cohort picker must read the model currently bound to the selected Agent"
+);
+assert.match(
+  host,
+  /candidate\.model === configuredModel \|\| candidate\.requested_model === configuredModel/,
+  "the historical cohort picker must prefer the model currently bound to the selected Agent"
 );
 
 const uiElementTags = [...html.matchAll(/<[^>]+>/g)].map((match) => match[0].toLowerCase());
@@ -377,7 +423,7 @@ assert.match(
 );
 assert.match(
   api,
-  /export interface ReleaseChampionQueryInput[\s\S]{0,420}include_compactions/,
+  /export interface ReleaseChampionQueryInput[\s\S]{0,520}stable_prefix_cohort_id/,
   "the frontend API must expose the same cohort filter dimensions as the trend API"
 );
 assert.match(
@@ -387,8 +433,13 @@ assert.match(
 );
 assert.match(
   host,
-  /send\(["']load-release-champion["'][\s\S]{0,720}include_compactions/,
-  "the iframe must request a release comparison for the active Provider scope and both filters"
+  /send\(["']load-release-champion["'][\s\S]{0,820}exactHistoricalTrendScope\(scope\)/,
+  "the iframe must request a release comparison for the active token-history scope and both filters"
+);
+assert.match(
+  host,
+  /function historicalScopeKey\(scope\)[\s\S]{0,240}historicalRouteScopeKey\(scope\)/,
+  "the historical scope key must compose the route key instead of recursively calling itself"
 );
 assert.match(
   host,

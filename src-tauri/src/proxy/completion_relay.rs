@@ -604,7 +604,9 @@ pub(super) async fn stream_upstream(
     provider_prefix_key: Option<String>,
     provider_prefix_fingerprint: Option<String>,
     provider_prefix_family_key: Option<String>,
-    route_affinity_key: Option<String>,
+    // Legacy relay shape only. This value is inert and must never influence
+    // Provider, model, channel, or Key selection.
+    _route_affinity_key: Option<String>,
     config: AppConfig,
     _prefix_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     prefix_state_key: Option<String>,
@@ -1201,14 +1203,6 @@ pub(super) async fn stream_upstream(
             completed_native_full_replay_for_cache_controls,
         )
         .await;
-        if !stream_success_for_cache {
-            clear_provider_route_affinity(
-                &state_for_stream,
-                route_affinity_key.as_deref(),
-                &decision.provider.id,
-            )
-            .await;
-        }
         // The terminal event is already visible, so publish the minimal
         // in-memory lineage and waterline control state before releasing its
         // per-lineage publication fence. Slow metrics/persistence remain below.
@@ -1414,14 +1408,6 @@ pub(super) async fn stream_upstream(
                 prefix_state_key.as_deref(),
                 provider_prefix_family_key.as_deref(),
                 shadow_assignment_key.as_deref(),
-            )
-            .await;
-        }
-        if stream_success_for_cache {
-            note_provider_route_affinity(
-                &state_for_stream,
-                route_affinity_key.as_deref(),
-                &decision.provider.id,
             )
             .await;
         }

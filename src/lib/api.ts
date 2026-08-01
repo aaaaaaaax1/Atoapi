@@ -552,6 +552,13 @@ export interface MetricsTrendInput {
   provider_id?: string | null;
   include_cold_starts: boolean;
   include_compactions: boolean;
+  /** Opaque exact cohort scope from the latest successful request. */
+  provider_realm_id?: string | null;
+  model?: string | null;
+  client_channel?: string | null;
+  upstream_channel?: string | null;
+  upstream_call_kind?: string | null;
+  stable_prefix_cohort_id?: string | null;
 }
 
 export interface MetricsTrendValues {
@@ -578,6 +585,8 @@ export interface MetricsTrendSnapshot {
   end_utc: string;
   agent_id: string;
   provider_id?: string | null;
+  /** `exact_prefix_family` is one stable prefix; aggregate is legacy. */
+  scope_mode?: "exact_prefix_family" | "exact" | "provider_aggregate" | string;
   /** False when selected legacy history cannot precisely exclude compactions. */
   compaction_filter_complete?: boolean;
   summary: MetricsTrendValues;
@@ -589,6 +598,12 @@ export interface ReleaseChampionQueryInput {
   provider_id?: string | null;
   include_cold_starts: boolean;
   include_compactions: boolean;
+  provider_realm_id?: string | null;
+  model?: string | null;
+  client_channel?: string | null;
+  upstream_channel?: string | null;
+  upstream_call_kind?: string | null;
+  stable_prefix_cohort_id?: string | null;
 }
 
 export type ReleaseChampionStatus =

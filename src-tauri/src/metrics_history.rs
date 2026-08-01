@@ -37,6 +37,25 @@ pub struct MetricsTrendQueryInput {
     /// silently filtering a category they do not know about.
     #[serde(default = "default_include_compactions")]
     pub include_compactions: bool,
+    /// Optional exact historical affinity scope. When all fields are present,
+    /// trend queries never mix different Provider/Model/Key/request-family
+    /// cohorts. Legacy callers may omit these fields and receive the
+    /// explicitly labelled provider aggregate for compatibility.
+    #[serde(default)]
+    pub provider_realm_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub client_channel: Option<String>,
+    #[serde(default)]
+    pub upstream_channel: Option<String>,
+    #[serde(default)]
+    pub upstream_call_kind: Option<String>,
+    /// Optional opaque stable-prefix family. When present with the complete
+    /// route scope, the trend is limited to one comparable token-history
+    /// family instead of mixing unrelated conversation prefixes.
+    #[serde(default)]
+    pub stable_prefix_cohort_id: Option<String>,
 }
 
 fn default_include_compactions() -> bool {
@@ -95,6 +114,21 @@ pub struct ReleaseChampionQueryInput {
     pub include_cold_starts: bool,
     #[serde(default = "default_include_compactions")]
     pub include_compactions: bool,
+    #[serde(default)]
+    pub provider_realm_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub client_channel: Option<String>,
+    #[serde(default)]
+    pub upstream_channel: Option<String>,
+    #[serde(default)]
+    pub upstream_call_kind: Option<String>,
+    /// Optional opaque stable-prefix family. When supplied, a release
+    /// comparison is limited to the same historical token-hit family rather
+    /// than combining unrelated instructions/tool-schema prefixes.
+    #[serde(default)]
+    pub stable_prefix_cohort_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -164,6 +198,11 @@ pub struct MetricsTrendSnapshot {
     pub end_utc: String,
     pub agent_id: String,
     pub provider_id: Option<String>,
+    /// `exact_prefix_family` means one stable-prefix family inside an exact
+    /// route scope; `exact` means the route scope is exact but includes its
+    /// different stable prefixes;
+    /// `provider_aggregate` is the backwards-compatible mixed view.
+    pub scope_mode: String,
     /// `false` only when a selected legacy hour contains compaction traffic
     /// recorded before compaction token sub-buckets existed.  We never fake a
     /// subtraction for those old records.
@@ -181,6 +220,9 @@ pub(crate) struct MetricsHistoryObservation {
     /// affinity realm. Legacy history remains available for trends but is
     /// intentionally excluded from version-champion comparisons.
     pub release_scope: Option<ReleaseCohortScope>,
+    /// Opaque stable-prefix family from the final frozen request. It never
+    /// contains user text and is used only for historical token-hit grouping.
+    pub stable_prefix_cohort_id: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
@@ -369,6 +411,14 @@ impl ScopeCounters {
 struct HourBucket {
     #[serde(default)]
     by_agent_provider: BTreeMap<String, BTreeMap<String, ScopeCounters>>,
+    /// Exact key-safe historical scopes. This is additive so older history
+    /// remains readable and is never silently promoted into an exact scope.
+    #[serde(default)]
+    by_affinity_scope: BTreeMap<String, ScopeCounters>,
+    /// A stricter, opaque stable-prefix-family split inside an exact route
+    /// scope. Older history intentionally has no synthetic backfill.
+    #[serde(default)]
+    by_affinity_prefix_family: BTreeMap<String, ScopeCounters>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -383,6 +433,11 @@ struct ReleaseCohortRun {
 struct ReleaseCohortEntry {
     build: ReleaseBuildIdentity,
     scope: ReleaseCohortScope,
+    /// Absent only for legacy route-level cohorts or requests for which a
+    /// stable-prefix identity could not be derived. It is opaque and never
+    /// stores user text.
+    #[serde(default)]
+    stable_prefix_cohort_id: Option<String>,
     #[serde(default)]
     runs: BTreeMap<String, ReleaseCohortRun>,
     #[serde(default)]
@@ -431,21 +486,42 @@ impl PersistedMetricsHistory {
         }
 
         let counters = TrendCounters::from_observation(&observation);
-        let scope = self
-            .buckets
-            .entry(bucket_start)
-            .or_default()
+        let stable_prefix_cohort_id = observation
+            .stable_prefix_cohort_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let bucket = self.buckets.entry(bucket_start).or_default();
+        let scope = bucket
             .by_agent_provider
             .entry(agent_id.to_string())
             .or_default()
             .entry(provider_id.to_string())
             .or_default();
         scope.observe(counters, observation.cold_start, observation.compaction);
+        if let Some(release_scope) = observation.release_scope.as_ref() {
+            bucket
+                .by_affinity_scope
+                .entry(affinity_scope_id(release_scope))
+                .or_default()
+                .observe(counters, observation.cold_start, observation.compaction);
+            if let Some(stable_prefix_cohort_id) = stable_prefix_cohort_id {
+                bucket
+                    .by_affinity_prefix_family
+                    .entry(affinity_prefix_family_scope_id(
+                        release_scope,
+                        stable_prefix_cohort_id,
+                    ))
+                    .or_default()
+                    .observe(counters, observation.cold_start, observation.compaction);
+            }
+        }
         if let (Some(runtime), Some(release_scope)) = (runtime, observation.release_scope.as_ref())
         {
             self.observe_release_cohort(
                 runtime,
                 release_scope,
+                stable_prefix_cohort_id,
                 counters,
                 observation.cold_start,
                 observation.compaction,
@@ -459,18 +535,23 @@ impl PersistedMetricsHistory {
         &mut self,
         runtime: &ReleaseRuntimeIdentity,
         scope: &ReleaseCohortScope,
+        stable_prefix_cohort_id: Option<&str>,
         counters: TrendCounters,
         cold_start: bool,
         compaction: bool,
         now: DateTime<Utc>,
     ) {
-        let cohort_id = release_cohort_id(&runtime.build, scope);
+        let stable_prefix_cohort_id = stable_prefix_cohort_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let cohort_id = release_cohort_id(&runtime.build, scope, stable_prefix_cohort_id);
         let entry = self
             .release_cohorts
             .entry(cohort_id)
             .or_insert_with(|| ReleaseCohortEntry {
                 build: runtime.build.clone(),
                 scope: scope.clone(),
+                stable_prefix_cohort_id: stable_prefix_cohort_id.map(ToOwned::to_owned),
                 runs: BTreeMap::new(),
                 last_observed_at: None,
             });
@@ -506,33 +587,62 @@ impl PersistedMetricsHistory {
         end: DateTime<Utc>,
         agent_id: &str,
         provider_id: Option<&str>,
+        exact_scope: Option<&ReleaseCohortScope>,
+        stable_prefix_cohort_id: Option<&str>,
         include_cold_starts: bool,
         include_compactions: bool,
     ) -> MetricsTrendSnapshot {
         let mut summary = TrendCounters::default();
         let mut compaction_filter_complete = true;
+        let scope_id = exact_scope.map(affinity_scope_id);
+        let prefix_family_scope_id =
+            exact_scope
+                .zip(stable_prefix_cohort_id)
+                .map(|(scope, stable_prefix_cohort_id)| {
+                    affinity_prefix_family_scope_id(scope, stable_prefix_cohort_id)
+                });
+        let scope_mode = if prefix_family_scope_id.is_some() {
+            "exact_prefix_family"
+        } else if scope_id.is_some() {
+            "exact"
+        } else {
+            "provider_aggregate"
+        }
+        .to_string();
         let mut points = Vec::with_capacity(((end - start).num_hours().max(0)) as usize);
         let mut bucket_start = start.timestamp();
         while bucket_start < end.timestamp() {
             let mut counters = TrendCounters::default();
-            if let Some(agent_scopes) = self
-                .buckets
-                .get(&bucket_start)
-                .and_then(|bucket| bucket.by_agent_provider.get(agent_id))
-            {
-                if let Some(provider_id) = provider_id {
-                    if let Some(scope) = agent_scopes.get(provider_id) {
+            if let Some(bucket) = self.buckets.get(&bucket_start) {
+                if let Some(scope_id) = prefix_family_scope_id.as_deref() {
+                    if let Some(scope) = bucket.by_affinity_prefix_family.get(scope_id) {
                         let (effective, complete) =
                             effective_counters(scope, include_cold_starts, include_compactions);
                         counters.add_assign(effective);
                         compaction_filter_complete &= complete;
                     }
-                } else {
-                    for scope in agent_scopes.values() {
+                } else if let Some(scope_id) = scope_id.as_deref() {
+                    if let Some(scope) = bucket.by_affinity_scope.get(scope_id) {
                         let (effective, complete) =
                             effective_counters(scope, include_cold_starts, include_compactions);
                         counters.add_assign(effective);
                         compaction_filter_complete &= complete;
+                    }
+                } else if let Some(agent_scopes) = bucket.by_agent_provider.get(agent_id) {
+                    if let Some(provider_id) = provider_id {
+                        if let Some(scope) = agent_scopes.get(provider_id) {
+                            let (effective, complete) =
+                                effective_counters(scope, include_cold_starts, include_compactions);
+                            counters.add_assign(effective);
+                            compaction_filter_complete &= complete;
+                        }
+                    } else {
+                        for scope in agent_scopes.values() {
+                            let (effective, complete) =
+                                effective_counters(scope, include_cold_starts, include_compactions);
+                            counters.add_assign(effective);
+                            compaction_filter_complete &= complete;
+                        }
                     }
                 }
             }
@@ -549,6 +659,7 @@ impl PersistedMetricsHistory {
             end_utc: timestamp_to_rfc3339(end.timestamp()),
             agent_id: agent_id.to_string(),
             provider_id: provider_id.map(str::to_string),
+            scope_mode,
             compaction_filter_complete,
             summary: summary.into_values(),
             points,
@@ -569,6 +680,18 @@ impl PersistedMetricsHistory {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let requested_exact_scope = exact_scope_from_query(
+            agent_id,
+            provider_id,
+            input.provider_realm_id.as_deref(),
+            input.model.as_deref(),
+            input.client_channel.as_deref(),
+            input.upstream_channel.as_deref(),
+            input.upstream_call_kind.as_deref(),
+        );
+        let requested_stable_prefix_cohort_id = requested_exact_scope
+            .as_ref()
+            .and_then(|_| optional_scope_part(input.stable_prefix_cohort_id.as_deref()));
         let Some(runtime) = runtime else {
             return Ok(empty_release_champion(
                 ReleaseChampionStatus::AwaitingCurrentCohort,
@@ -578,25 +701,49 @@ impl PersistedMetricsHistory {
         let process_started_at = runtime
             .process_started_at
             .to_rfc3339_opts(SecondsFormat::Secs, true);
-        let mut current: Option<(&ReleaseCohortEntry, &ReleaseCohortRun)> = None;
+        let mut current_candidates: Vec<(&ReleaseCohortEntry, &ReleaseCohortRun)> = Vec::new();
         for entry in self.release_cohorts.values() {
             if entry.build != runtime.build
                 || entry.scope.agent_id != agent_id
                 || provider_id.is_some_and(|provider_id| entry.scope.provider_id != provider_id)
+                || requested_exact_scope
+                    .as_ref()
+                    .is_some_and(|requested| !scope_matches_query(&entry.scope, requested))
+                || requested_stable_prefix_cohort_id
+                    .as_ref()
+                    .is_some_and(|requested| {
+                        entry.stable_prefix_cohort_id.as_deref() != Some(requested.as_str())
+                    })
             {
                 continue;
             }
             let Some(run) = entry.runs.get(&process_started_at) else {
                 continue;
             };
-            let replace = match current {
-                Some((_, existing)) => run.last_observed_at > existing.last_observed_at,
-                None => true,
-            };
-            if replace {
-                current = Some((entry, run));
+            current_candidates.push((entry, run));
+        }
+        if requested_exact_scope.is_none() || requested_stable_prefix_cohort_id.is_none() {
+            let mut distinct_scopes: Vec<(&ReleaseCohortScope, Option<&str>)> = Vec::new();
+            for (entry, _) in &current_candidates {
+                let stable_prefix = entry.stable_prefix_cohort_id.as_deref();
+                if !distinct_scopes
+                    .iter()
+                    .any(|(scope, prefix)| *scope == &entry.scope && *prefix == stable_prefix)
+                {
+                    distinct_scopes.push((&entry.scope, stable_prefix));
+                }
+            }
+            if distinct_scopes.len() > 1 {
+                return Ok(empty_release_champion(
+                    ReleaseChampionStatus::IncompleteFilter,
+                    "当前运行包含多个 token-history 亲和 scope；必须提供同一 Key realm、模型、请求族与稳定前缀，不能任取最新 scope"
+                        .to_string(),
+                ));
             }
         }
+        let current = current_candidates
+            .into_iter()
+            .max_by_key(|(_, run)| run.last_observed_at);
         let Some((current_entry, current_run)) = current else {
             let reason = if self.release_cohorts.is_empty() {
                 "历史记录未带版本 cohort；从本版本开始积累可比样本".to_string()
@@ -638,7 +785,10 @@ impl PersistedMetricsHistory {
 
         let mut champion: Option<ReleaseCohortSummary> = None;
         for entry in self.release_cohorts.values() {
-            if entry.build == runtime.build || entry.scope != current_entry.scope {
+            if entry.build == runtime.build
+                || entry.scope != current_entry.scope
+                || entry.stable_prefix_cohort_id != current_entry.stable_prefix_cohort_id
+            {
                 continue;
             }
             let combined = combined_release_counters(entry);
@@ -677,8 +827,9 @@ impl PersistedMetricsHistory {
                 } else {
                     ReleaseChampionStatus::NoComparableChampion
                 },
-                reason: "未找到同 Provider、同 Key realm、同模型、同请求族的历史 build 冠军"
-                    .to_string(),
+                reason:
+                    "未找到同 Provider、同 Key realm、同模型、同请求族、同稳定前缀的历史 build 冠军"
+                        .to_string(),
                 current: Some(current_summary),
                 champion: None,
                 delta_cache_hit_rate: None,
@@ -698,7 +849,7 @@ impl PersistedMetricsHistory {
         Ok(ReleaseChampionSnapshot {
             status,
             reason:
-                "当前与冠军使用相同的 Provider、Key realm、模型和请求族；统计未伪造冷启动或压缩"
+                "当前与冠军使用相同的 Provider、Key realm、模型、请求族和稳定前缀；统计未伪造冷启动或压缩"
                     .to_string(),
             current: Some(current_summary),
             champion: Some(champion),
@@ -778,13 +929,49 @@ fn release_summary_beats(
         .is_gt()
 }
 
-fn release_cohort_id(build: &ReleaseBuildIdentity, scope: &ReleaseCohortScope) -> String {
+fn release_cohort_id(
+    build: &ReleaseBuildIdentity,
+    scope: &ReleaseCohortScope,
+    stable_prefix_cohort_id: Option<&str>,
+) -> String {
     let mut hasher = Sha256::new();
-    for part in [
-        "atoapi-release-cohort-v1",
+    let mut parts = vec![
+        if stable_prefix_cohort_id.is_some() {
+            "atoapi-release-cohort-v2"
+        } else {
+            // Preserve the existing v1 identity for a legacy route-level
+            // cohort. It remains readable, but is never silently promoted
+            // into a stable-prefix comparison.
+            "atoapi-release-cohort-v1"
+        },
         build.app_version.as_str(),
         build.git_commit.as_str(),
         build.executable_sha256.as_str(),
+        scope.agent_id.as_str(),
+        scope.provider_id.as_str(),
+        scope.provider_realm_id.as_str(),
+        scope.model.as_str(),
+        scope.client_channel.as_str(),
+        scope.upstream_channel.as_str(),
+        scope.upstream_call_kind.as_str(),
+    ];
+    if let Some(stable_prefix_cohort_id) = stable_prefix_cohort_id {
+        parts.push(stable_prefix_cohort_id);
+    }
+    for part in parts {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// A stable, opaque key for the exact historical hit cohort. It deliberately
+/// includes the selected Key realm and request family, but never stores raw
+/// URLs, credentials, or user content.
+fn affinity_scope_id(scope: &ReleaseCohortScope) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "atoapi-history-affinity-scope-v1",
         scope.agent_id.as_str(),
         scope.provider_id.as_str(),
         scope.provider_realm_id.as_str(),
@@ -797,6 +984,59 @@ fn release_cohort_id(build: &ReleaseBuildIdentity, scope: &ReleaseCohortScope) -
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn affinity_prefix_family_scope_id(
+    scope: &ReleaseCohortScope,
+    stable_prefix_cohort_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        "atoapi-history-affinity-prefix-family-v1",
+        scope.agent_id.as_str(),
+        scope.provider_id.as_str(),
+        scope.provider_realm_id.as_str(),
+        scope.model.as_str(),
+        scope.client_channel.as_str(),
+        scope.upstream_channel.as_str(),
+        scope.upstream_call_kind.as_str(),
+        stable_prefix_cohort_id,
+    ] {
+        hasher.update(part.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn optional_scope_part(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn exact_scope_from_query(
+    agent_id: &str,
+    provider_id: Option<&str>,
+    provider_realm_id: Option<&str>,
+    model: Option<&str>,
+    client_channel: Option<&str>,
+    upstream_channel: Option<&str>,
+    upstream_call_kind: Option<&str>,
+) -> Option<ReleaseCohortScope> {
+    Some(ReleaseCohortScope {
+        agent_id: agent_id.to_string(),
+        provider_id: optional_scope_part(provider_id)?,
+        provider_realm_id: optional_scope_part(provider_realm_id)?,
+        model: optional_scope_part(model)?,
+        client_channel: optional_scope_part(client_channel)?,
+        upstream_channel: optional_scope_part(upstream_channel)?,
+        upstream_call_kind: optional_scope_part(upstream_call_kind)?,
+    })
+}
+
+fn scope_matches_query(scope: &ReleaseCohortScope, requested: &ReleaseCohortScope) -> bool {
+    scope == requested
 }
 
 fn current_executable_sha256() -> String {
@@ -1000,6 +1240,18 @@ impl MetricsHistory {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let exact_scope = exact_scope_from_query(
+            agent_id,
+            provider_id,
+            input.provider_realm_id.as_deref(),
+            input.model.as_deref(),
+            input.client_channel.as_deref(),
+            input.upstream_channel.as_deref(),
+            input.upstream_call_kind.as_deref(),
+        );
+        let stable_prefix_cohort_id = exact_scope
+            .as_ref()
+            .and_then(|_| optional_scope_part(input.stable_prefix_cohort_id.as_deref()));
         Ok(self
             .state
             .lock()
@@ -1009,6 +1261,8 @@ impl MetricsHistory {
                 end,
                 agent_id,
                 provider_id,
+                exact_scope.as_ref(),
+                stable_prefix_cohort_id.as_deref(),
                 input.include_cold_starts,
                 input.include_compactions,
             ))
@@ -1178,6 +1432,7 @@ mod tests {
             agent_id: "codex".to_string(),
             provider_id: provider_id.to_string(),
             release_scope: None,
+            stable_prefix_cohort_id: None,
             input_tokens: 1_000,
             output_tokens: 25,
             cache_read_tokens: 900,
@@ -1203,6 +1458,12 @@ mod tests {
             provider_id: provider_id.map(str::to_string),
             include_cold_starts,
             include_compactions: true,
+            provider_realm_id: None,
+            model: None,
+            client_channel: None,
+            upstream_channel: None,
+            upstream_call_kind: None,
+            stable_prefix_cohort_id: None,
         }
     }
 
@@ -1252,6 +1513,7 @@ mod tests {
                 upstream_channel: "responses".to_string(),
                 upstream_call_kind: "stream".to_string(),
             }),
+            stable_prefix_cohort_id: None,
             input_tokens: 20_000,
             output_tokens: 25,
             cache_read_tokens,
@@ -1342,6 +1604,12 @@ mod tests {
                     provider_id: Some("provider-a".to_string()),
                     include_cold_starts: true,
                     include_compactions: true,
+                    provider_realm_id: Some("realm-a".to_string()),
+                    model: Some("gpt-test".to_string()),
+                    client_channel: Some("responses".to_string()),
+                    upstream_channel: Some("responses".to_string()),
+                    upstream_call_kind: Some("stream".to_string()),
+                    stable_prefix_cohort_id: None,
                 },
             )
             .expect("the release cohort query must be valid");
@@ -1375,6 +1643,144 @@ mod tests {
     }
 
     #[test]
+    fn exact_trend_scope_never_mixes_key_realms_or_request_families() {
+        let start = hour_now() - Duration::hours(1);
+        let history = MetricsHistory::in_memory();
+
+        history.observe(release_observation(start, "realm-a", 19_800));
+        history.observe(release_observation(
+            start + Duration::minutes(1),
+            "realm-other",
+            20_000,
+        ));
+        let mut sync = release_observation(start + Duration::minutes(2), "realm-a", 10_000);
+        sync.release_scope
+            .as_mut()
+            .expect("release fixture has an exact scope")
+            .upstream_call_kind = "sync".to_string();
+        history.observe(sync);
+
+        let provider_aggregate = history
+            .query(query(
+                start,
+                start + Duration::hours(1),
+                Some("provider-a"),
+                true,
+            ))
+            .expect("provider aggregate query must remain available");
+        assert_eq!(provider_aggregate.scope_mode, "provider_aggregate");
+        assert_eq!(provider_aggregate.summary.successful_requests, 3);
+
+        let mut exact_input = query(start, start + Duration::hours(1), Some("provider-a"), true);
+        exact_input.provider_realm_id = Some("realm-a".to_string());
+        exact_input.model = Some("gpt-test".to_string());
+        exact_input.client_channel = Some("responses".to_string());
+        exact_input.upstream_channel = Some("responses".to_string());
+        exact_input.upstream_call_kind = Some("stream".to_string());
+        let exact = history
+            .query(exact_input)
+            .expect("exact historical query must be valid");
+
+        assert_eq!(exact.scope_mode, "exact");
+        assert_eq!(exact.summary.successful_requests, 1);
+        assert_eq!(exact.summary.input_tokens, 20_000);
+        assert_eq!(exact.summary.cache_read_tokens, 19_800);
+    }
+
+    #[test]
+    fn exact_prefix_family_trend_never_mixes_unrelated_stable_prefixes() {
+        let start = hour_now() - Duration::hours(1);
+        let history = MetricsHistory::in_memory();
+        let mut family_a = release_observation(start, "realm-a", 19_800);
+        family_a.stable_prefix_cohort_id = Some("stable-family-a".to_string());
+        history.observe(family_a);
+        let mut family_b = release_observation(start + Duration::minutes(1), "realm-a", 12_000);
+        family_b.stable_prefix_cohort_id = Some("stable-family-b".to_string());
+        history.observe(family_b);
+
+        let mut exact_input = query(start, start + Duration::hours(1), Some("provider-a"), true);
+        exact_input.provider_realm_id = Some("realm-a".to_string());
+        exact_input.model = Some("gpt-test".to_string());
+        exact_input.client_channel = Some("responses".to_string());
+        exact_input.upstream_channel = Some("responses".to_string());
+        exact_input.upstream_call_kind = Some("stream".to_string());
+        exact_input.stable_prefix_cohort_id = Some("stable-family-a".to_string());
+        let exact = history
+            .query(exact_input)
+            .expect("exact stable-prefix family query must be valid");
+
+        assert_eq!(exact.scope_mode, "exact_prefix_family");
+        assert_eq!(exact.summary.successful_requests, 1);
+        assert_eq!(exact.summary.input_tokens, 20_000);
+        assert_eq!(exact.summary.cache_read_tokens, 19_800);
+    }
+
+    #[test]
+    fn release_champion_never_mixes_stable_prefix_token_history_families() {
+        let start = hour_now() - Duration::hours(1);
+        let champion_runtime =
+            release_runtime("1.4.16", "commit-champion", "c".repeat(64).as_str(), start);
+        let candidate_runtime = release_runtime(
+            "1.4.18",
+            "commit-candidate",
+            "d".repeat(64).as_str(),
+            start + Duration::minutes(10),
+        );
+        let mut history = PersistedMetricsHistory::default();
+
+        for index in 0..10 {
+            let at = start + Duration::seconds(index);
+            let mut family_a = release_observation(at, "realm-a", 19_200);
+            family_a.stable_prefix_cohort_id = Some("stable-family-a".to_string());
+            assert!(history.observe(family_a, Some(&champion_runtime), at));
+
+            // This unrelated stable prefix is better, but it must not raise
+            // the apparent champion for family A.
+            let mut family_b = release_observation(at, "realm-a", 20_000);
+            family_b.stable_prefix_cohort_id = Some("stable-family-b".to_string());
+            assert!(history.observe(family_b, Some(&champion_runtime), at));
+        }
+        for index in 0..10 {
+            let at = candidate_runtime.process_started_at + Duration::seconds(index);
+            let mut family_a = release_observation(at, "realm-a", 19_400);
+            family_a.stable_prefix_cohort_id = Some("stable-family-a".to_string());
+            assert!(history.observe(family_a, Some(&candidate_runtime), at));
+        }
+
+        let comparison = history
+            .release_champion(
+                Some(&candidate_runtime),
+                &ReleaseChampionQueryInput {
+                    agent_id: "codex".to_string(),
+                    provider_id: Some("provider-a".to_string()),
+                    include_cold_starts: true,
+                    include_compactions: true,
+                    provider_realm_id: Some("realm-a".to_string()),
+                    model: Some("gpt-test".to_string()),
+                    client_channel: Some("responses".to_string()),
+                    upstream_channel: Some("responses".to_string()),
+                    upstream_call_kind: Some("stream".to_string()),
+                    stable_prefix_cohort_id: Some("stable-family-a".to_string()),
+                },
+            )
+            .expect("stable-prefix champion query must be valid");
+
+        assert_eq!(comparison.status, ReleaseChampionStatus::Improving);
+        assert!(comparison
+            .delta_cache_hit_rate
+            .is_some_and(|delta| delta > 0.0));
+        assert_eq!(
+            comparison
+                .champion
+                .as_ref()
+                .expect("same stable-prefix champion must exist")
+                .values
+                .cache_hit_rate,
+            0.96
+        );
+    }
+
+    #[test]
     fn release_champion_fails_closed_for_unattributed_legacy_history() {
         let start = hour_now();
         let runtime = release_runtime("1.4.10", "commit", &"c".repeat(64), start);
@@ -1389,6 +1795,12 @@ mod tests {
                     provider_id: Some("provider-a".to_string()),
                     include_cold_starts: true,
                     include_compactions: true,
+                    provider_realm_id: None,
+                    model: None,
+                    client_channel: None,
+                    upstream_channel: None,
+                    upstream_call_kind: None,
+                    stable_prefix_cohort_id: None,
                 },
             )
             .expect("legacy history must remain readable");
@@ -1521,6 +1933,8 @@ mod tests {
             start + Duration::hours(1),
             "codex",
             None,
+            None,
+            None,
             true,
             false,
         );
@@ -1543,6 +1957,8 @@ mod tests {
             start,
             start + Duration::hours(1),
             "codex",
+            None,
+            None,
             None,
             true,
             false,
@@ -1681,6 +2097,12 @@ mod tests {
                 provider_id: Some("provider-a".to_string()),
                 include_cold_starts: true,
                 include_compactions: true,
+                provider_realm_id: Some("realm-a".to_string()),
+                model: Some("gpt-test".to_string()),
+                client_channel: Some("responses".to_string()),
+                upstream_channel: Some("responses".to_string()),
+                upstream_call_kind: Some("stream".to_string()),
+                stable_prefix_cohort_id: None,
             })
             .unwrap();
         assert_eq!(comparison.status, ReleaseChampionStatus::Regressed);

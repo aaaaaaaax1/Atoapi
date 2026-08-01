@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createServer } from "node:http";
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -39,14 +39,18 @@ const newExecutable = resolve(
 const model = String(args.model ?? "gpt-5.6-terra").trim();
 const concurrency = boundedPositiveInteger(args.concurrency ?? 1, "--concurrency", 32);
 const gateHeaders = booleanArg(args["gate-headers"]);
+const generatedControls = booleanArg(args["generated-controls"]);
+const sequentialToolOutputChars = args["tool-output-chars"] === undefined
+  ? 0
+  : boundedPositiveInteger(args["tool-output-chars"], "--tool-output-chars", 512_000);
 const scenario = String(args.scenario ?? "ordinary").trim().toLowerCase();
 const baselineLabel = basename(dirname(oldExecutable));
 const COMMIT_MATURITY_PROBE_DELAY_MS = 700;
 const SYNTHETIC_CLIENT_PROMPT_CACHE_KEY = "wire-compat-client-cache-key";
 
 if (!model) throw new Error("--model must not be empty");
-if (!new Set(["ordinary", "lineage-recovery", "commit-maturity"]).has(scenario)) {
-  throw new Error("--scenario must be ordinary, lineage-recovery, or commit-maturity");
+if (!new Set(["ordinary", "lineage-recovery", "commit-maturity", "sequential-full-replay"]).has(scenario)) {
+  throw new Error("--scenario must be ordinary, lineage-recovery, commit-maturity, or sequential-full-replay");
 }
 if (!existsSync(oldExecutable)) {
   throw new Error(`wire baseline executable is missing: ${oldExecutable}`);
@@ -54,6 +58,7 @@ if (!existsSync(oldExecutable)) {
 if (!existsSync(newExecutable)) {
   throw new Error(`FastRelay executable is missing: ${newExecutable}`);
 }
+await assertCandidateExecutableIsFresh(newExecutable, repoRoot);
 if (gateHeaders && concurrency < 2) {
   throw new Error("--gate-headers requires --concurrency of at least 2");
 }
@@ -98,6 +103,7 @@ try {
     captured.push({
       arm,
       body: parsed,
+      rawWire: rawWireFingerprint(body),
       requestKind: String(request.headers["x-atoapi-request-kind"] ?? ""),
       headers: safeHeaders(request.headers)
     });
@@ -159,6 +165,8 @@ try {
     concurrency,
     gateHeaders,
     syntheticConfig,
+    generatedControls,
+    sequentialToolOutputChars,
     scenario
   });
   const newRun = await runIsolatedCapture({
@@ -171,6 +179,8 @@ try {
     concurrency,
     gateHeaders,
     syntheticConfig,
+    generatedControls,
+    sequentialToolOutputChars,
     scenario
   });
 
@@ -184,20 +194,37 @@ try {
   const clientOwnedCacheKeyCorrection =
     fastrelay?.prompt_cache_key === SYNTHETIC_CLIENT_PROMPT_CACHE_KEY &&
     baseline?.prompt_cache_key !== SYNTHETIC_CLIENT_PROMPT_CACHE_KEY;
-  const meaningfulDifferingPaths = differingPaths.filter((path) => !(
-    clientOwnedCacheKeyCorrection && path === "$.prompt_cache_key"
-  ));
   const expectedIdentityCorrection = clientOwnedCacheKeyCorrection &&
     identity.differingFields.every((field) => field === "provider_prefix_key");
-  const ignoreBodyLength = scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection;
-  const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders, ignoreBodyLength);
-  const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders, ignoreBodyLength);
   const recovery = scenario === "lineage-recovery"
     ? summarizeLineageRecovery(baseline, fastrelay, model)
     : null;
-  const scenarioWirePass = scenario !== "lineage-recovery"
-    ? meaningfulDifferingPaths.length === 0
-    : recovery?.candidate_preserves_complete_replay === true;
+  const sequentialFullReplay = scenario === "sequential-full-replay"
+    ? {
+      baseline: summarizeSequentialFullReplay(oldRun.upstreamRequests),
+      fastrelay: summarizeSequentialFullReplay(newRun.upstreamRequests)
+    }
+    : null;
+  const rawSequenceEqual = sameRawWireSequence(oldRun.upstreamRequests, newRun.upstreamRequests);
+  const rawInputSequenceEqual = sameRawInputSequence(oldRun.upstreamRequests, newRun.upstreamRequests);
+  const sequentialMetadataCorrection = scenario === "sequential-full-replay" &&
+    sequentialFullReplay?.fastrelay?.pass === true &&
+    rawInputSequenceEqual &&
+    sequentialFullReplay?.baseline?.static_wire_stable === false;
+  const meaningfulDifferingPaths = differingPaths.filter((path) => !(
+    (clientOwnedCacheKeyCorrection && path === "$.prompt_cache_key") ||
+    (sequentialMetadataCorrection && path === "$.client_metadata")
+  ));
+  const rawWirePass = clientOwnedCacheKeyCorrection || rawSequenceEqual || sequentialMetadataCorrection;
+  const scenarioWirePass = scenario === "lineage-recovery"
+    ? recovery?.candidate_preserves_complete_replay === true
+    : scenario === "sequential-full-replay"
+      ? sequentialMetadataCorrection && meaningfulDifferingPaths.length === 0
+      : meaningfulDifferingPaths.length === 0 && rawWirePass;
+  const ignoreBodyLength = scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection ||
+    sequentialMetadataCorrection;
+  const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders, ignoreBodyLength);
+  const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders, ignoreBodyLength);
   const commitMaturity = scenario === "commit-maturity"
     ? {
       baseline: oldRun.commitMaturity,
@@ -213,6 +240,8 @@ try {
     candidate_one_inbound_one_post: newRun.oneInboundOnePost,
     same_prefix_header_gate: !gateHeaders || newRun.samePrefixReachedBeforeHeaders,
     final_wire: scenarioWirePass,
+    sequential_full_replay: scenario !== "sequential-full-replay" ||
+      sequentialFullReplay?.fastrelay?.pass === true,
     commit_maturity: commitMaturityPass,
     protocol_headers: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
     local_identity: identity.equal || expectedIdentityCorrection || scenario === "lineage-recovery"
@@ -224,10 +253,12 @@ try {
     model,
     concurrency,
     header_gate: gateHeaders,
+    generated_controls_fixture: generatedControls,
     baseline: oldRun.summary,
     fastrelay: newRun.summary,
     wire_equal: differingPaths.length === 0,
-    wire_difference_expected: scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection,
+    wire_difference_expected: scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection ||
+      sequentialMetadataCorrection,
     differing_paths: differingPaths,
     meaningful_differing_paths: meaningfulDifferingPaths,
     differing_controls: summarizeControlDifferences(baseline, fastrelay, differingPaths),
@@ -235,7 +266,14 @@ try {
       baseline: controlFingerprints(baseline),
       fastrelay: controlFingerprints(fastrelay)
     },
+    raw_wire: {
+      sequence_equal: rawSequenceEqual,
+      input_sequence_equal: rawInputSequenceEqual,
+      baseline: rawWireSummary(oldRun.upstreamRequests),
+      fastrelay: rawWireSummary(newRun.upstreamRequests)
+    },
     lineage_recovery: recovery,
+    sequential_full_replay: sequentialFullReplay,
     commit_maturity: commitMaturity,
     headers_equal: checks.protocol_headers,
     baseline_headers: oldRun.upstreamHeaders,
@@ -243,6 +281,7 @@ try {
     shadow_identity_equal: identity.equal,
     shadow_identity_differences: identity.differingFields,
     client_owned_cache_key_correction: clientOwnedCacheKeyCorrection,
+    sequential_metadata_correction: sequentialMetadataCorrection,
     checks,
     failure_reasons: Object.entries(checks)
       .filter(([, passed]) => !passed)
@@ -253,6 +292,7 @@ try {
   assert.equal(checks.candidate_one_inbound_one_post, true, "candidate must make exactly one upstream POST per inbound");
   assert.equal(checks.same_prefix_header_gate, true, "same-prefix header gate must not serialize ordinary dispatch");
   assert.equal(checks.final_wire, true, "final wire differs outside the explicitly attested caller cache-key correction");
+  assert.equal(checks.sequential_full_replay, true, "sequential full replay did not retain a stable byte-level prefix");
   assert.equal(checks.commit_maturity, true, "commit-maturity behavior violated its bounded policy");
   assert.equal(checks.protocol_headers, true, "upstream protocol headers changed unexpectedly");
   assert.equal(checks.local_identity, true, "local identity changed outside the attested caller cache-key correction");
@@ -273,7 +313,7 @@ try {
       true,
       "v1.4.12 must keep a caller-supplied complete replay intact"
     );
-  } else {
+  } else if (scenario === "commit-maturity") {
     assert.equal(
       report.meaningful_differing_paths.length,
       0,
@@ -298,6 +338,27 @@ try {
       report.commit_maturity?.fastrelay?.all_full_hit,
       true,
       "commit-maturity fixture must prove that the no-wait assertion is evaluating full cache hits"
+    );
+  } else {
+    assert.equal(
+      report.sequential_full_replay?.fastrelay?.raw_input_append_only,
+      true,
+      "FastRelay sequential full replay must append to the exact previous input wire"
+    );
+    assert.equal(
+      report.sequential_full_replay?.fastrelay?.static_wire_stable,
+      true,
+      "FastRelay sequential full replay must keep the non-input raw wire stable"
+    );
+    assert.equal(
+      report.sequential_full_replay?.fastrelay?.client_metadata_stripped,
+      true,
+      "FastRelay must strip the changing attested client metadata carrier from every sequential wire"
+    );
+    assert.equal(
+      report.sequential_full_replay?.fastrelay?.no_previous_response_id,
+      true,
+      "FastRelay full replay must not forward previous_response_id"
     );
   }
   assert.equal(
@@ -332,6 +393,8 @@ async function runIsolatedCapture({
   concurrency,
   gateHeaders,
   syntheticConfig,
+  generatedControls,
+  sequentialToolOutputChars,
   scenario
 }) {
   await createIsolatedConfig(configDir, upstreamPort, syntheticConfig, model);
@@ -389,23 +452,37 @@ async function runIsolatedCapture({
       ? 3
       : scenario === "commit-maturity"
         ? 2
+        : scenario === "sequential-full-replay"
+          ? 4
         : concurrency;
     const downstreamPromise = scenario === "lineage-recovery"
       ? (async () => [
-        await sendInbound(syntheticRecoverySeedBody(model)),
-        await sendInbound(syntheticRecoveryDeltaBody(model)),
-        await sendInbound(syntheticRecoveryCompleteReplayBody(model))
+        await sendInbound(syntheticRecoverySeedBody(model, generatedControls)),
+        await sendInbound(syntheticRecoveryDeltaBody(model, generatedControls)),
+        await sendInbound(syntheticRecoveryCompleteReplayBody(model, generatedControls))
       ])()
       : scenario === "commit-maturity"
         ? (async () => {
-          const first = await sendInbound(syntheticCommitMaturityBody(model));
+          const first = await sendInbound(syntheticCommitMaturityBody(model, generatedControls));
           await delay(COMMIT_MATURITY_PROBE_DELAY_MS);
-          const second = await sendInbound(syntheticCommitMaturityBody(model));
+          const second = await sendInbound(syntheticCommitMaturityBody(model, generatedControls));
           return [first, second];
         })()
-      : Promise.all(
-        Array.from({ length: concurrency }, () => sendInbound(syntheticOrdinaryBody(model)))
-      );
+        : scenario === "sequential-full-replay"
+          ? (async () => {
+            const results = [];
+            for (const body of syntheticSequentialFullReplayBodies(
+              model,
+              generatedControls,
+              sequentialToolOutputChars
+            )) {
+              results.push(await sendInbound(body));
+            }
+            return results;
+          })()
+        : Promise.all(
+          Array.from({ length: concurrency }, () => sendInbound(syntheticOrdinaryBody(model, generatedControls)))
+        );
     const gateResult = gate ? await gate.waitForRelease() : null;
     const downstream = await downstreamPromise;
     await waitFor(
@@ -419,28 +496,30 @@ async function runIsolatedCapture({
     const upstreamHeaders = upstreamRequests.at(-1)?.headers ?? {};
     assert.ok(upstreamBody, `${label}: mock did not capture an upstream body`);
     if (syntheticConfig && scenario !== "lineage-recovery") {
-      assert.equal(
-        label === "fastrelay"
-          ? upstreamBody.prompt_cache_key
-          : typeof upstreamBody.prompt_cache_key,
-        label === "fastrelay"
-          ? SYNTHETIC_CLIENT_PROMPT_CACHE_KEY
-          : "string",
-        `${label}: trusted synthetic Codex cache key must survive the final wire${
-          label === "fastrelay" ? " unchanged" : ""
-        }`
-      );
+      assert.equal(typeof upstreamBody.prompt_cache_key, "string", `${label}: final wire must retain a cache placement key`);
+      assert.equal(upstreamBody.prompt_cache_retention, "24h", `${label}: final wire must retain cache retention`);
+      // v1.3.10 rewrites caller-owned native placement keys.  The candidate
+      // intentionally corrects that behavior, so only it is required to
+      // preserve the synthetic caller key verbatim.  The cross-version diff
+      // below explicitly permits this single, positive correction.
+      if (!generatedControls && label === "fastrelay") {
+        assert.equal(
+          upstreamBody.prompt_cache_key,
+          SYNTHETIC_CLIENT_PROMPT_CACHE_KEY,
+          `${label}: caller-owned synthetic cache key must survive unchanged`
+        );
+      }
     }
-    if (scenario !== "lineage-recovery") {
+    if (scenario === "ordinary" || scenario === "commit-maturity") {
       assert(
-        upstreamRequests.every((request) => JSON.stringify(request.body) === JSON.stringify(upstreamBody)),
-        `${label}: parallel inbounds produced different upstream wire bodies`
+        upstreamRequests.every((request) => request.rawWire.body_sha256 === upstreamRequests[0].rawWire.body_sha256),
+        `${label}: parallel inbounds produced different raw upstream wire bodies`
       );
       assert(
         upstreamRequests.every((request) => JSON.stringify(request.headers) === JSON.stringify(upstreamHeaders)),
         `${label}: parallel inbounds produced different upstream headers`
       );
-    } else {
+    } else if (scenario === "lineage-recovery") {
       assert.equal(upstreamRequests.length, 3, `${label}: recovery scenario must make three POSTs`);
       if (label === "fastrelay") {
         assert.equal(
@@ -454,6 +533,8 @@ async function runIsolatedCapture({
           "FastRelay complete replay must not forward the local response id"
         );
       }
+    } else {
+      assert.equal(upstreamRequests.length, 4, `${label}: sequential full replay must make four POSTs`);
     }
     const generation = metrics.agent_generation ?? {};
     const oneInboundOnePost = Number(generation.inbound_requests) === expectedInbounds &&
@@ -490,6 +571,7 @@ async function runIsolatedCapture({
     return {
       upstreamBody,
       upstreamHeaders,
+      upstreamRequests,
       identityMarkers: identityMarkers(metrics.recent_requests?.[0] ?? {}),
       oneInboundOnePost,
       commitMaturity,
@@ -499,6 +581,9 @@ async function runIsolatedCapture({
         completed_responses: downstream.length,
         concurrency: scenario === "ordinary" ? concurrency : 1,
         fixture_inbounds: expectedInbounds,
+        sequential_tool_output_chars: scenario === "sequential-full-replay"
+          ? sequentialToolOutputChars
+          : 0,
         same_prefix_arrivals_before_headers: gateResult?.arrivalsBeforeRelease ?? null,
         same_prefix_header_gate_reason: gateResult?.reason ?? null,
         inbound_requests: Number(generation.inbound_requests),
@@ -578,17 +663,12 @@ async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig,
   await writeFile(targetConfig, rewritten, "utf8");
 }
 
-function syntheticRequestBase(model, input, previousResponseId = null) {
+function syntheticRequestBase(model, input, previousResponseId = null, generatedControls = false) {
   const body = {
     model,
     stream: true,
     store: false,
     max_output_tokens: 16,
-    // Mirror the normal Codex FullReplay cache-affinity route without
-    // borrowing a caller value. This known synthetic value must be present on
-    // the final mock wire in synthetic-config mode.
-    prompt_cache_key: SYNTHETIC_CLIENT_PROMPT_CACHE_KEY,
-    prompt_cache_retention: "24h",
     instructions: "Wire compatibility fixture. Reply with OK only.",
     tools: [{
       type: "function",
@@ -605,11 +685,17 @@ function syntheticRequestBase(model, input, previousResponseId = null) {
     parallel_tool_calls: true,
     input
   };
+  if (!generatedControls) {
+    // Mirror a caller-owned Codex FullReplay cache-affinity route. This known
+    // synthetic value must survive unchanged on the final mock wire.
+    body.prompt_cache_key = SYNTHETIC_CLIENT_PROMPT_CACHE_KEY;
+    body.prompt_cache_retention = "24h";
+  }
   if (previousResponseId) body.previous_response_id = previousResponseId;
   return body;
 }
 
-function syntheticOrdinaryBody(model) {
+function syntheticOrdinaryBody(model, generatedControls = false) {
   return syntheticRequestBase(model, [
     {
       type: "message",
@@ -633,24 +719,25 @@ function syntheticOrdinaryBody(model) {
       role: "user",
       content: [{ type: "input_text", text: "fixture tail" }]
     }
-  ]);
+  ], null, generatedControls);
 }
 
-function syntheticRecoverySeedBody(model) {
+function syntheticRecoverySeedBody(model, generatedControls = false) {
   return syntheticRequestBase(model, [
     { type: "message", role: "user", content: "before" }
-  ]);
+  ], null, generatedControls);
 }
 
-function syntheticRecoveryDeltaBody(model) {
+function syntheticRecoveryDeltaBody(model, generatedControls = false) {
   return syntheticRequestBase(
     model,
     [{ type: "message", role: "user", content: "after" }],
-    "resp_wire_seed"
+    "resp_wire_seed",
+    generatedControls
   );
 }
 
-function syntheticRecoveryCompleteReplayBody(model) {
+function syntheticRecoveryCompleteReplayBody(model, generatedControls = false) {
   return syntheticRequestBase(
     model,
     [
@@ -677,15 +764,70 @@ function syntheticRecoveryCompleteReplayBody(model) {
         content: "complete history must not be prepended again"
       }
     ],
-    "resp_wire_followup"
+    "resp_wire_followup",
+    generatedControls
   );
 }
 
-function syntheticCommitMaturityBody(model) {
-  const body = syntheticOrdinaryBody(model);
+function syntheticCommitMaturityBody(model, generatedControls = false) {
+  const body = syntheticOrdinaryBody(model, generatedControls);
   const toolOutput = body.input.find((item) => item.type === "function_call_output");
   toolOutput.output = "m".repeat(4_096);
   return body;
+}
+
+function syntheticSequentialFullReplayBodies(
+  model,
+  generatedControls = false,
+  toolOutputChars = 0
+) {
+  const input = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "sequential full replay root" }]
+    },
+    {
+      type: "function_call",
+      id: "fc-sequential-wire",
+      call_id: "call-sequential-wire",
+      name: "read_fixture",
+      arguments: "{\"path\":\"sequential.txt\"}"
+    },
+    {
+      type: "function_call_output",
+      call_id: "call-sequential-wire",
+      output: toolOutputChars > 0
+        ? "x".repeat(toolOutputChars)
+        : { stdout: "sequential fixture result\\n", exit_code: 0 }
+    }
+  ];
+  const positions = ["first", "middle", "last", "middle"];
+  const bodies = [];
+  for (let turn = 0; turn < positions.length; turn += 1) {
+    const body = syntheticRequestBase(model, input.map((item) => structuredClone(item)), null, generatedControls);
+    body.client_metadata = syntheticClientMetadataCarrier(positions[turn], turn);
+    bodies.push(body);
+    input.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `sequential full replay tail ${turn}` }]
+    });
+  }
+  return bodies;
+}
+
+function syntheticClientMetadataCarrier(position, turn) {
+  const turnMetadata = JSON.stringify({
+    session_id: "wire-compat-session",
+    thread_id: "wire-compat-thread",
+    request_kind: "turn",
+    turn_nonce: `synthetic-sequential-${turn}`
+  });
+  const carrier = `\"x-codex-turn-metadata\":${turnMetadata}`;
+  if (position === "first") return `{${carrier},\"alpha\":\"a\",\"beta\":\"b\"}`;
+  if (position === "last") return `{\"alpha\":\"a\",\"beta\":\"b\",${carrier}}`;
+  return `{\"alpha\":\"a\",${carrier},\"beta\":\"b\"}`;
 }
 
 function codexProviderId(config) {
@@ -776,6 +918,63 @@ function summarizeLineageRecovery(baseline, candidate, model) {
     candidate_expected_differing_paths: candidateExpectedDifferingPaths,
     final_body_bytes_delta: JSON.stringify(baseline).length - JSON.stringify(candidate).length
   };
+}
+
+function summarizeSequentialFullReplay(requests) {
+  const expectedClientMetadata = '{"alpha":"a","beta":"b"}';
+  const wires = requests.map((request) => request.rawWire);
+  const previousInputIdsAbsent = requests.every((request) => request.body.previous_response_id === undefined);
+  const clientMetadataStripped = requests.every(
+    (request) => request.body.client_metadata === expectedClientMetadata
+  );
+  const rawInputAppendOnly = wires.slice(1).every((wire, index) => {
+    const previous = wires[index].input_inner;
+    return wire.input_inner.startsWith(`${previous},`);
+  });
+  const inputItemsAppendOnly = requests.slice(1).every(
+    (request, index) => Array.isArray(request.body.input) &&
+      request.body.input.length === requests[index].body.input.length + 1
+  );
+  const staticWireStable = wires.length > 0 && wires.every((wire) =>
+    wire.static_before_input_sha256 === wires[0].static_before_input_sha256 &&
+    wire.static_after_input_sha256 === wires[0].static_after_input_sha256
+  );
+  const onePostPerInbound = requests.length === 4;
+  return {
+    pass: onePostPerInbound && rawInputAppendOnly && inputItemsAppendOnly &&
+      staticWireStable && clientMetadataStripped && previousInputIdsAbsent,
+    turns: requests.length,
+    raw_input_append_only: rawInputAppendOnly,
+    input_items_append_only: inputItemsAppendOnly,
+    static_wire_stable: staticWireStable,
+    client_metadata_stripped: clientMetadataStripped,
+    no_previous_response_id: previousInputIdsAbsent,
+    one_post_per_inbound: onePostPerInbound,
+    wires: rawWireSummary(requests)
+  };
+}
+
+function sameRawWireSequence(left, right) {
+  return left.length === right.length && left.every(
+    (request, index) => request.rawWire.body_sha256 === right[index]?.rawWire.body_sha256
+  );
+}
+
+function sameRawInputSequence(left, right) {
+  return left.length === right.length && left.every(
+    (request, index) => request.rawWire.input_sha256 === right[index]?.rawWire.input_sha256
+  );
+}
+
+function rawWireSummary(requests) {
+  return requests.map((request) => ({
+    body_bytes: request.rawWire.body_bytes,
+    body_sha256: request.rawWire.body_sha256,
+    input_bytes: request.rawWire.input_bytes,
+    input_sha256: request.rawWire.input_sha256,
+    static_before_input_sha256: request.rawWire.static_before_input_sha256,
+    static_after_input_sha256: request.rawWire.static_after_input_sha256
+  }));
 }
 
 function summarizeControls(body) {
@@ -872,6 +1071,66 @@ async function readRequestBody(request) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
+function rawWireFingerprint(body) {
+  const input = rawTopLevelArray(body, "input");
+  return {
+    body_bytes: Buffer.byteLength(body),
+    body_sha256: sha256(body),
+    input_bytes: Buffer.byteLength(input.value),
+    input_sha256: sha256(input.value),
+    static_before_input_sha256: sha256(input.before),
+    static_after_input_sha256: sha256(input.after),
+    // The fixture is synthetic and this field never reaches output. Keeping it
+    // only in-memory lets the regression assert byte-level append-only input.
+    input_inner: input.value.slice(1, -1)
+  };
+}
+
+function rawTopLevelArray(body, field) {
+  const marker = `"${field}":`;
+  const markerIndex = body.indexOf(marker);
+  if (markerIndex < 0) throw new Error(`mock request has no top-level ${field} field`);
+  let start = markerIndex + marker.length;
+  while (/\s/u.test(body[start] ?? "")) start += 1;
+  if (body[start] !== "[") throw new Error(`mock request ${field} field is not an array`);
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < body.length; index += 1) {
+    const char = body[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+    } else if (char === "[") {
+      depth += 1;
+    } else if (char === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        const end = index + 1;
+        return {
+          before: body.slice(0, start),
+          value: body.slice(start, end),
+          after: body.slice(end)
+        };
+      }
+    }
+  }
+  throw new Error(`mock request ${field} array is unterminated`);
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 async function getJson(url) {
   const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
@@ -955,6 +1214,53 @@ function processIsAlive(pid) {
 
 function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
+}
+
+async function assertCandidateExecutableIsFresh(executable, root) {
+  if (await executableIsFresh(executable, root)) return;
+  throw new Error(
+    `candidate executable is stale for this source tree: ${executable}; build it before running wire compatibility so a stale artifact cannot produce a misleading result`
+  );
+}
+
+async function executableIsFresh(executable, root) {
+  if (!existsSync(executable)) return false;
+  const [binary, newestSource] = await Promise.all([
+    stat(executable),
+    newestRelevantRustSourceMtime(root)
+  ]);
+  return binary.mtimeMs >= newestSource;
+}
+
+async function newestRelevantRustSourceMtime(root) {
+  const sources = [
+    join(root, "src-tauri", "src"),
+    join(root, "src-tauri", "Cargo.toml"),
+    join(root, "src-tauri", "Cargo.lock")
+  ];
+  let newest = 0;
+  for (const source of sources) {
+    if (!existsSync(source)) continue;
+    const info = await stat(source);
+    newest = Math.max(
+      newest,
+      info.isDirectory() ? await newestRustSourceMtime(source) : info.mtimeMs
+    );
+  }
+  return newest;
+}
+
+async function newestRustSourceMtime(root) {
+  let newest = 0;
+  for (const entry of await readdir(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      newest = Math.max(newest, await newestRustSourceMtime(path));
+    } else if (entry.isFile() && entry.name.endsWith(".rs")) {
+      newest = Math.max(newest, (await stat(path)).mtimeMs);
+    }
+  }
+  return newest;
 }
 
 function parseArgs(items) {

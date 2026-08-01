@@ -131,6 +131,15 @@ try {
     }
     const promptCacheKeys = new Set(captured.map((item) => item.body.prompt_cache_key ?? null));
     assert.equal(promptCacheKeys.size, 1, "the cache control key must remain stable across exact children");
+    assert.equal(
+      typeof captured[0].body.prompt_cache_key,
+      "string",
+      "a trusted native FullReplay must retain its generated cache placement from the root request"
+    );
+    assert(
+      captured.every((item) => item.body.prompt_cache_retention === "24h"),
+      "a retention-enabled trusted native FullReplay must keep the champion-compatible retention field"
+    );
 
     // The root itself is immediate. A Responses foreground prefix guard is
     // intentionally capped at 500ms.  The old 1.1s threshold asserted a

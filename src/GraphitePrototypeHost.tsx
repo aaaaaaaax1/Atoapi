@@ -138,6 +138,47 @@ const bridgeSource = String.raw`
 
   const trendController = () => window.__atoapiTrend;
 
+  function exactHistoricalScope(scope) {
+    const candidate = scope?.historicalScope;
+    if (!candidate) return {};
+    const fields = [
+      "provider_realm_id",
+      "model",
+      "client_channel",
+      "upstream_channel",
+      "upstream_call_kind"
+    ];
+    if (!fields.every((field) => String(candidate[field] || "").trim())) return {};
+    return Object.fromEntries(fields.map((field) => [field, String(candidate[field]).trim()]));
+  }
+
+  function exactHistoricalTrendScope(scope) {
+    const exact = exactHistoricalScope(scope);
+    const stablePrefix = String(scope?.historicalScope?.stable_prefix_cohort_id || "").trim();
+    return stablePrefix && Object.keys(exact).length
+      ? { ...exact, stable_prefix_cohort_id: stablePrefix }
+      : exact;
+  }
+
+  function historicalRouteScopeKey(scope) {
+    const exact = exactHistoricalScope(scope);
+    return [
+      exact.provider_realm_id || "aggregate",
+      exact.model || "",
+      exact.client_channel || "",
+      exact.upstream_channel || "",
+      exact.upstream_call_kind || ""
+    ].join("/");
+  }
+
+  function historicalScopeKey(scope) {
+    const exact = exactHistoricalTrendScope(scope);
+    return [
+      historicalRouteScopeKey(scope),
+      exact.stable_prefix_cohort_id || ""
+    ].join("/");
+  }
+
   function syncTrendController(loadWhenChanged = false) {
     const controller = trendController();
     if (!controller) return;
@@ -147,6 +188,7 @@ const bridgeSource = String.raw`
     const contextKey = [
       agent?.sourceId || agent?.id || "",
       scope?.id || "all",
+      historicalRouteScopeKey(scope),
       metricState.includeColdStarts !== false ? "cold-in" : "cold-out",
       metricState.includeCompactions !== false ? "compact-in" : "compact-out"
     ].join("|");
@@ -164,6 +206,7 @@ const bridgeSource = String.raw`
     return [
       agent?.sourceId || agent?.id || "",
       scope?.providerId || "all",
+      historicalRouteScopeKey(scope),
       metricState.includeColdStarts !== false ? "cold-in" : "cold-out",
       metricState.includeCompactions !== false ? "compact-in" : "compact-out"
     ].join("|");
@@ -184,7 +227,8 @@ const bridgeSource = String.raw`
         agent_id: agent?.sourceId || agent?.id || "",
         provider_id: scope?.providerId || null,
         include_cold_starts: metricState.includeColdStarts !== false,
-        include_compactions: metricState.includeCompactions !== false
+        include_compactions: metricState.includeCompactions !== false,
+        ...exactHistoricalTrendScope(scope)
       }
     });
   }
@@ -202,7 +246,8 @@ const bridgeSource = String.raw`
         agent_id: agent?.sourceId || agent?.id || "",
         provider_id: scope?.providerId || null,
         include_cold_starts: metricState.includeColdStarts !== false,
-        include_compactions: metricState.includeCompactions !== false
+        include_compactions: metricState.includeCompactions !== false,
+        ...exactHistoricalTrendScope(scope)
       }
     });
   });
@@ -1948,6 +1993,35 @@ function buildState(
       (includeCompactions || !requestIsConfirmedCompaction(request))
     );
   };
+  const exactHistoricalScopeForProvider = (providerId: string | null) => {
+    if (!providerId) return null;
+    const configuredModel = selectedAgent?.model_id?.trim();
+    const isEligible = (candidate: MetricsSnapshot["recent_requests"][number]) => {
+      const realm = candidate.shadow_affinity_realm_id?.trim();
+      const callKind = candidate.upstream_call_kind?.trim();
+      return Boolean(
+        realm &&
+        candidate.model?.trim() &&
+        candidate.client_channel?.trim() &&
+        candidate.upstream_channel?.trim() &&
+        (callKind === "stream" || callKind === "sync")
+      );
+    };
+    const candidates = successfulForScope(providerId);
+    const request = candidates.find((candidate) =>
+      isEligible(candidate) && (!configuredModel ||
+        candidate.model === configuredModel || candidate.requested_model === configuredModel)
+    ) ?? candidates.find(isEligible);
+    if (!request) return null;
+    return {
+      provider_realm_id: request.shadow_affinity_realm_id!.trim(),
+      model: request.model.trim(),
+      client_channel: request.client_channel.trim(),
+      upstream_channel: request.upstream_channel.trim(),
+      upstream_call_kind: request.upstream_call_kind!.trim(),
+      stable_prefix_cohort_id: request.shadow_affinity_cohort_id?.trim() || null
+    };
+  };
   const metricForScope = (providerId: string | null) => {
     const failures = failedRequestSource.filter((request) => isForProvider(request, providerId));
     const aggregate = trafficForAgentScope(
@@ -2050,7 +2124,10 @@ function buildState(
   const metricsState = {
     scopes: requestScopes.map((scope) => ({
       ...scope,
-      ...metricForScope(scope.providerId)
+      ...metricForScope(scope.providerId),
+      // The opaque scope comes from a real successful request. It is used only
+      // to ask history for the same token-hit cohort; it never changes routing.
+      historicalScope: exactHistoricalScopeForProvider(scope.providerId)
     })),
     cacheEnabled: config?.cache.enabled ?? false,
     includeColdStarts,

@@ -22,7 +22,7 @@ use crate::{
         AgentTerminalSettlement, FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore,
         MetricsTransaction, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
     },
-    state::{AppState, PrefixWarmState, RuntimeAffinityEntry},
+    state::{AppState, PrefixWarmState},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -155,8 +155,6 @@ const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
-const RUNTIME_AFFINITY_TTL: TokioDuration = TokioDuration::from_secs(30 * 60);
-const RUNTIME_AFFINITY_LIMIT: usize = 2_048;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 // These maps are local compatibility hints, not durable routing state. Bound
@@ -2079,20 +2077,6 @@ async fn run_generation_for_authorized_agent(
         &client_request,
         authorized_agent.as_deref(),
     );
-    let route_is_agent_bound = route_is_agent_provider_bound(
-        &config,
-        &client_request,
-        &client_channel,
-        authorized_agent.as_deref(),
-    );
-    let (route_affinity_key, route_affinity_provider_id) = provider_route_affinity_for_request(
-        &state,
-        &config,
-        &client_request,
-        &client_channel,
-        route_is_agent_bound,
-    )
-    .await;
     let mut decision = match decide_route_with_runtime_model(
         &config,
         &client_request,
@@ -2110,21 +2094,16 @@ async fn run_generation_for_authorized_agent(
             return json_error(status, &err);
         }
     };
+    // Retained only for the relay's legacy parameter shape. It is always
+    // `None`: historical token-hit affinity is measurement-only and never
+    // substitutes the user's selected Provider, model, channel, or Key.
+    let route_affinity_key: Option<String> = None;
     note_agent_runtime_model_for_primary_request(
         &state,
         &client_request,
         authorized_agent.as_deref(),
         &decision,
     );
-    if !route_is_agent_bound {
-        decision = apply_provider_route_affinity(
-            &config,
-            decision,
-            &client_request,
-            &client_channel,
-            route_affinity_provider_id.as_deref(),
-        );
-    }
     let codex_responses_chat_compat = should_preempt_codex_responses_via_chat(
         &config,
         forced_agent_id,
@@ -3536,12 +3515,6 @@ async fn run_generation_for_authorized_agent(
     let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
-            clear_provider_route_affinity(
-                &state,
-                route_affinity_key.as_deref(),
-                &decision.provider.id,
-            )
-            .await;
             upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                 .take()
                 .and_then(|guard| guard.finish(None, false, false, None, None));
@@ -3852,12 +3825,6 @@ async fn run_generation_for_authorized_agent(
         {
             Ok(outcome) => outcome,
             Err(err) => {
-                clear_provider_route_affinity(
-                    &state,
-                    route_affinity_key.as_deref(),
-                    &decision.provider.id,
-                )
-                .await;
                 upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                     .take()
                     .and_then(|guard| guard.finish(None, false, false, None, None));
@@ -4131,19 +4098,6 @@ async fn run_generation_for_authorized_agent(
         key_error_summary.as_deref(),
     )
     .await;
-    if is_success_status {
-        note_provider_route_affinity(&state, route_affinity_key.as_deref(), &decision.provider.id)
-            .await;
-    } else {
-        maybe_clear_provider_route_affinity_after_status(
-            &state,
-            route_affinity_key.as_deref(),
-            &decision.provider.id,
-            status,
-            key_error_summary.as_deref(),
-        )
-        .await;
-    }
     let sync_compact_diagnostic_only =
         skip_prefix_guard_for_sync_responses || active_responses_non_stream_chat_compat;
     let anthropic_usage_bytes = if matches!(client_channel, Channel::Responses)
@@ -4815,6 +4769,7 @@ async fn wait_for_provider_prefix_settle(
     }
 }
 
+#[cfg(test)]
 fn is_provider_health_failure_status(status: StatusCode) -> bool {
     matches!(
         status,
@@ -6953,6 +6908,40 @@ fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     }
 }
 
+/// v1.4.12's exact prefix state used the same Provider/Model/Channel/Key
+/// realm and stable prefix fingerprint as the current namespace.  The v3
+/// namespace was introduced for a cache-control policy experiment that is no
+/// longer active, so an absent v3 state may safely read the old exact state.
+/// This is a read fallback only; successful settlement writes the current v3
+/// key and never mutates the legacy record.
+fn champion_v2_control_key_for_current_scope(control_key: &str) -> Option<String> {
+    let mut parts = control_key.split('\0');
+    if parts.next()? != PROVIDER_PREFIX_STATE_KEY_VERSION {
+        return None;
+    }
+    let key_realm = parts.next()?;
+    let policy_epoch = parts.next()?;
+    if policy_epoch != PROVIDER_PREFIX_STATE_POLICY_EPOCH {
+        return None;
+    }
+    let provider_group = parts.next()?;
+    let model = parts.next()?;
+    let channel = parts.next()?;
+    let fingerprint = parts.next()?;
+    if parts.next().is_some()
+        || key_realm.is_empty()
+        || provider_group.is_empty()
+        || model.is_empty()
+        || channel.is_empty()
+        || fingerprint.is_empty()
+    {
+        return None;
+    }
+    Some(format!(
+        "prefix-v2\0{key_realm}\0{provider_group}\0{model}\0{channel}\0{fingerprint}"
+    ))
+}
+
 fn provider_prefix_provider_group(decision: &RouteDecision) -> String {
     let base_url = decision
         .provider
@@ -6977,7 +6966,14 @@ fn lookup_provider_prefix_state<'a>(
 ) -> Option<&'a PrefixWarmState> {
     let exact = states.get(key);
     let alias = provider_prefix_state_alias_key(key).and_then(|alias| states.get(&alias));
-    stronger_prefix_state(exact, alias)
+    stronger_prefix_state(exact, alias).or_else(|| {
+        champion_v2_control_key_for_current_scope(key).and_then(|legacy_key| {
+            let legacy_exact = states.get(&legacy_key);
+            let legacy_alias =
+                provider_prefix_state_alias_key(&legacy_key).and_then(|alias| states.get(&alias));
+            stronger_prefix_state(legacy_exact, legacy_alias)
+        })
+    })
 }
 
 fn lookup_provider_prefix_state_with_source<'a>(
@@ -6990,7 +6986,15 @@ fn lookup_provider_prefix_state_with_source<'a>(
         let alias = provider_prefix_state_alias_key(key)
             .and_then(|alias| states.get(&alias))
             .map(|state| ("shared-responses", state));
-        stronger_prefix_state_with_source(exact, alias)
+        stronger_prefix_state_with_source(exact, alias).or_else(|| {
+            champion_v2_control_key_for_current_scope(key).and_then(|legacy_key| {
+                let legacy_exact = states.get(&legacy_key).map(|state| ("exact", state));
+                let legacy_alias = provider_prefix_state_alias_key(&legacy_key)
+                    .and_then(|alias| states.get(&alias))
+                    .map(|state| ("shared-responses", state));
+                stronger_prefix_state_with_source(legacy_exact, legacy_alias)
+            })
+        })
     });
     stronger_prefix_state_with_source(
         direct,
@@ -8213,7 +8217,7 @@ fn strip_attested_codex_turn_metadata_from_native_wire(
             if carrier_is_the_only_member {
                 body.remove("client_metadata");
             } else if let Some(stripped) =
-                strip_leading_json_string_metadata_member(&raw, X_CODEX_TURN_METADATA_HEADER)
+                strip_json_string_metadata_member(&raw, X_CODEX_TURN_METADATA_HEADER)
             {
                 body.insert("client_metadata".to_string(), Value::String(stripped));
             }
@@ -8222,45 +8226,94 @@ fn strip_attested_codex_turn_metadata_from_native_wire(
     }
 }
 
-/// Removes one leading property from an already-attested JSON-object string
+/// Removes one already-attested top-level property from a JSON-object string
 /// without reserializing the caller-owned remainder. `client_metadata` is an
 /// opaque string to many compatible upstreams, so an ordinary
 /// `serde_json::to_string` rewrite would itself create a different wire shape.
 ///
-/// This deliberately accepts only the unambiguous, low-risk shape:
-/// `{ <target-property>, <one-or-more-siblings> }`. The first property's
-/// decoded key must match exactly; any malformed, reordered, oversized, or
-/// otherwise unusual value returns `None` for transparent forwarding.
-fn strip_leading_json_string_metadata_member(raw: &str, target_key: &str) -> Option<String> {
+/// The target may be first, middle, or last. The byte splice preserves every
+/// sibling's original representation and order. Malformed, duplicate-target,
+/// oversized, or otherwise ambiguous input stays on the transparent path.
+fn strip_json_string_metadata_member(raw: &str, target_key: &str) -> Option<String> {
     const MAX_JSON_STRING_METADATA_BYTES: usize = 32 * 1024;
     if raw.len() > MAX_JSON_STRING_METADATA_BYTES {
         return None;
     }
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    let object = parsed.as_object()?;
+    if object.len() < 2 || !object.contains_key(target_key) {
+        return None;
+    }
+
     let bytes = raw.as_bytes();
     let mut cursor = skip_json_ascii_whitespace(bytes, 0);
     if bytes.get(cursor) != Some(&b'{') {
         return None;
     }
-    let opening_brace = cursor;
-    cursor = skip_json_ascii_whitespace(bytes, cursor.saturating_add(1));
-    let (first_key, key_end) = json_string_at(raw, cursor)?;
-    if first_key != target_key {
+    cursor = cursor.saturating_add(1);
+
+    let mut previous_comma = None;
+    let mut target_span = None;
+    let mut target_count = 0_usize;
+    let mut member_count = 0_usize;
+    loop {
+        let member_span_start = cursor;
+        cursor = skip_json_ascii_whitespace(bytes, cursor);
+        if bytes.get(cursor) == Some(&b'}') {
+            cursor = cursor.saturating_add(1);
+            break;
+        }
+        let (key, key_end) = json_string_at(raw, cursor)?;
+        cursor = skip_json_ascii_whitespace(bytes, key_end);
+        if bytes.get(cursor) != Some(&b':') {
+            return None;
+        }
+        cursor = skip_json_ascii_whitespace(bytes, cursor.saturating_add(1));
+        let value_end = json_value_end(raw, cursor)?;
+        cursor = skip_json_ascii_whitespace(bytes, value_end);
+        let delimiter = *bytes.get(cursor)?;
+        let trailing_comma = match delimiter {
+            b',' => Some(cursor),
+            b'}' => None,
+            _ => return None,
+        };
+        member_count = member_count.saturating_add(1);
+        if key == target_key {
+            target_count = target_count.saturating_add(1);
+            target_span = Some((member_span_start, value_end, previous_comma, trailing_comma));
+        }
+        match delimiter {
+            b',' => {
+                previous_comma = Some(cursor);
+                cursor = cursor.saturating_add(1);
+            }
+            b'}' => {
+                cursor = cursor.saturating_add(1);
+                break;
+            }
+            _ => unreachable!("delimiter was validated above"),
+        }
+    }
+    if skip_json_ascii_whitespace(bytes, cursor) != bytes.len()
+        || member_count < 2
+        || target_count != 1
+    {
         return None;
     }
-    cursor = skip_json_ascii_whitespace(bytes, key_end);
-    if bytes.get(cursor) != Some(&b':') {
-        return None;
-    }
-    cursor = skip_json_ascii_whitespace(bytes, cursor.saturating_add(1));
-    cursor = json_value_end(raw, cursor)?;
-    cursor = skip_json_ascii_whitespace(bytes, cursor);
-    if bytes.get(cursor) != Some(&b',') {
+
+    let (member_start, value_end, previous_comma, trailing_comma) = target_span?;
+    let (remove_start, remove_end) = if let Some(trailing_comma) = trailing_comma {
+        (member_start, trailing_comma.saturating_add(1))
+    } else {
+        (previous_comma?, value_end)
+    };
+    if remove_start >= remove_end || remove_end > raw.len() {
         return None;
     }
 
     let mut stripped = String::with_capacity(raw.len());
-    stripped.push_str(&raw[..=opening_brace]);
-    stripped.push_str(&raw[cursor.saturating_add(1)..]);
+    stripped.push_str(&raw[..remove_start]);
+    stripped.push_str(&raw[remove_end..]);
     let parsed = serde_json::from_str::<Value>(&stripped).ok()?;
     let object = parsed.as_object()?;
     (!object.is_empty() && !object.contains_key(target_key)).then_some(stripped)
@@ -9639,87 +9692,25 @@ fn should_background_prewarm(
     false
 }
 
-fn prune_runtime_affinities(
-    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
-    protected_key: Option<&str>,
-    now: Instant,
-) {
-    affinities
-        .retain(|_, entry| now.saturating_duration_since(entry.last_used) < RUNTIME_AFFINITY_TTL);
-    while affinities.len() > RUNTIME_AFFINITY_LIMIT {
-        let oldest = affinities
-            .iter()
-            .filter(|(key, _)| Some(key.as_str()) != protected_key)
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, _)| key.clone());
-        let Some(oldest) = oldest else {
-            break;
-        };
-        affinities.remove(&oldest);
-    }
-}
-
-fn lookup_runtime_affinity(
-    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
-    key: &str,
-    now: Instant,
-) -> Option<String> {
-    prune_runtime_affinities(affinities, Some(key), now);
-    let entry = affinities.get_mut(key)?;
-    entry.last_used = now;
-    Some(entry.value.clone())
-}
-
-fn note_runtime_affinity(
-    affinities: &mut HashMap<String, RuntimeAffinityEntry>,
-    key: String,
-    value: String,
-    now: Instant,
-) {
-    affinities.insert(
-        key.clone(),
-        RuntimeAffinityEntry {
-            value,
-            last_used: now,
-        },
-    );
-    prune_runtime_affinities(affinities, Some(&key), now);
-}
-
 async fn select_provider_api_key(
     state: &AppState,
     provider_id: &str,
     exclude_key_id: Option<&str>,
-    affinity_key: Option<&str>,
+    _affinity_key: Option<&str>,
 ) -> Result<SelectedProviderKey> {
-    let affinity_map_key = affinity_key.map(|key| provider_key_affinity_map_key(provider_id, key));
-    let preferred_key_id = if exclude_key_id.is_none() {
-        if let Some(map_key) = affinity_map_key.as_deref() {
-            let mut affinities = state.provider_key_affinity.lock().await;
-            lookup_runtime_affinity(&mut affinities, map_key, Instant::now())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // Cache affinity is deliberately not a Key-selection policy.  Every
+    // healthy Key remains governed by the user's configured pool strategy and
+    // order; only an explicit exclusion (for example quota exhaustion) may
+    // move the next request past a Key.
     let selected = {
         let mut config = state.config.write().await;
         config
-            .select_provider_key_for_request(
-                provider_id,
-                preferred_key_id.as_deref(),
-                exclude_key_id,
-            )
+            .select_provider_key_for_request(provider_id, None, exclude_key_id)
             .with_context(|| format!("failed to select provider key for {provider_id}"))?
     };
     let Some(selected) = selected else {
         return Err(anyhow!("provider API key is not configured"));
     };
-    if let (Some(map_key), Some(key_id)) = (affinity_map_key, selected.key_id.as_ref()) {
-        let mut affinities = state.provider_key_affinity.lock().await;
-        note_runtime_affinity(&mut affinities, map_key, key_id.clone(), Instant::now());
-    }
     Ok(selected)
 }
 
@@ -9736,10 +9727,6 @@ fn provider_key_configuration_error_message(error: &anyhow::Error) -> Option<&'s
     } else {
         None
     }
-}
-
-fn provider_key_affinity_map_key(provider_id: &str, affinity_key: &str) -> String {
-    format!("{provider_id}\0{affinity_key}")
 }
 
 async fn note_selected_provider_key_status(
@@ -11060,211 +11047,6 @@ fn agent_for_local_key<'a>(config: &'a AppConfig, key: &str) -> Option<&'a Agent
     })
 }
 
-fn route_is_agent_provider_bound(
-    config: &AppConfig,
-    _request: &Value,
-    _client_channel: &Channel,
-    authorized_agent_id: Option<&str>,
-) -> bool {
-    authorized_agent_id
-        .and_then(|agent_id| {
-            config
-                .agent_injections
-                .iter()
-                .find(|agent| agent.id == agent_id && agent.enabled)
-        })
-        .is_some()
-}
-
-async fn provider_route_affinity_for_request(
-    state: &AppState,
-    config: &AppConfig,
-    request: &Value,
-    client_channel: &Channel,
-    route_is_agent_bound: bool,
-) -> (Option<String>, Option<String>) {
-    if route_is_agent_bound {
-        // Agent routes are isolated from global provider affinity. Generating a
-        // key here used to let settlement write an Agent route into the global
-        // affinity map, where a later ordinary request could inherit it.
-        return (None, None);
-    }
-
-    let key = provider_route_affinity_key(config, request, client_channel);
-    let provider_id = lookup_provider_route_affinity(state, config, key.as_deref()).await;
-    (key, provider_id)
-}
-
-fn provider_route_affinity_key(
-    config: &AppConfig,
-    request: &Value,
-    client_channel: &Channel,
-) -> Option<String> {
-    if !matches!(client_channel, Channel::Responses) {
-        return None;
-    }
-
-    let mut material = request.clone();
-    strip_provider_cache_key_fields(&mut material);
-    canonicalize_responses_instruction_shape(&mut material);
-    strip_response_session_volatile_fields(&mut material);
-    strip_dynamic_invocation_fields(&mut material);
-    trim_response_session_input_to_anchor(&mut material);
-    stabilize_responses_provider_prefix(&mut material);
-    canonicalize_object_keys(&mut material, "$.provider_route_affinity_key");
-
-    let model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .unwrap_or("*");
-    let mut hasher = Sha256::new();
-    hasher.update(config.workspace_fingerprint.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(client_channel.label().as_bytes());
-    hasher.update(b"\0");
-    hasher.update(model.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(serialize_responses_body_for_provider_prefix(&material).as_bytes());
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-async fn lookup_provider_route_affinity(
-    state: &AppState,
-    config: &AppConfig,
-    affinity_key: Option<&str>,
-) -> Option<String> {
-    let key = affinity_key?;
-    let provider_id = {
-        let mut affinities = state.provider_route_affinity.lock().await;
-        lookup_runtime_affinity(&mut affinities, key, Instant::now())?
-    };
-    if config
-        .providers
-        .iter()
-        .any(|provider| provider.id == provider_id && provider.enabled)
-    {
-        return Some(provider_id);
-    }
-    state.provider_route_affinity.lock().await.remove(key);
-    None
-}
-
-async fn note_provider_route_affinity(
-    state: &AppState,
-    affinity_key: Option<&str>,
-    provider_id: &str,
-) {
-    let Some(key) = affinity_key else {
-        return;
-    };
-    if provider_id.trim().is_empty() {
-        return;
-    }
-    let mut affinities = state.provider_route_affinity.lock().await;
-    note_runtime_affinity(
-        &mut affinities,
-        key.to_string(),
-        provider_id.to_string(),
-        Instant::now(),
-    );
-}
-
-async fn maybe_clear_provider_route_affinity_after_status(
-    state: &AppState,
-    affinity_key: Option<&str>,
-    provider_id: &str,
-    status: u16,
-    error_summary: Option<&str>,
-) {
-    let Ok(status_code) = StatusCode::from_u16(status) else {
-        return;
-    };
-    if is_provider_health_failure_status(status_code)
-        || is_provider_key_failure_status(status_code)
-        || error_summary
-            .map(is_provider_key_failure_message)
-            .unwrap_or(false)
-    {
-        clear_provider_route_affinity(state, affinity_key, provider_id).await;
-    }
-}
-
-async fn clear_provider_route_affinity(
-    state: &AppState,
-    affinity_key: Option<&str>,
-    provider_id: &str,
-) {
-    let Some(key) = affinity_key else {
-        return;
-    };
-    let mut affinities = state.provider_route_affinity.lock().await;
-    prune_runtime_affinities(&mut affinities, Some(key), Instant::now());
-    if affinities
-        .get(key)
-        .map(|current| current.value == provider_id)
-        .unwrap_or(false)
-    {
-        affinities.remove(key);
-    }
-}
-
-fn apply_provider_route_affinity(
-    config: &AppConfig,
-    decision: RouteDecision,
-    request: &Value,
-    client_channel: &Channel,
-    preferred_provider_id: Option<&str>,
-) -> RouteDecision {
-    if !matches!(client_channel, Channel::Responses) {
-        return decision;
-    }
-    let Some(preferred_provider_id) = preferred_provider_id else {
-        return decision;
-    };
-    if preferred_provider_id == decision.provider.id {
-        return decision;
-    }
-    let Some(provider) = config
-        .providers
-        .iter()
-        .find(|provider| provider.id == preferred_provider_id && provider.enabled)
-    else {
-        return decision;
-    };
-
-    let requested_model = request
-        .get("model")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    let model = if let Some(requested_model) = requested_model {
-        if let Some(model) = resolve_provider_model_id(provider, requested_model) {
-            model
-        } else {
-            return decision;
-        }
-    } else if let Some(model) = resolve_provider_model_id(provider, &decision.model) {
-        model
-    } else if let Some(model) = provider
-        .models
-        .iter()
-        .find(|model| model.enabled)
-        .map(|model| model.id.clone())
-    {
-        model
-    } else {
-        return decision;
-    };
-
-    RouteDecision {
-        upstream_channel: effective_upstream_channel_for_provider(config, provider, client_channel),
-        provider: provider.clone(),
-        model,
-    }
-}
-
 fn decide_route(
     config: &AppConfig,
     request: &Value,
@@ -12232,11 +12014,13 @@ fn generated_native_full_replay_cache_controls_eligible(
         && has_trusted_generated_cache_identity
 }
 
-/// A generated placement key is a cache-affecting control, not a harmless
-/// compatibility default. Unknown, unverified, and transient capability
-/// records must therefore stay observe-only; injecting the field before an
-/// exact wire/effect certificate is what caused cache-control static-wire
-/// drift on third-party FullReplay routes.
+/// Keep the champion-compatible native FullReplay placement shape until the
+/// exact selected-Key realm proves that it rejects the field. Requiring a
+/// prior `Verified` record would be circular: an unverified normal request
+/// would omit the field, leaving no successful final wire from which passive
+/// acceptance can ever establish that record. Root and follow-up eligibility
+/// is already identical, so this restores the stable field without reopening
+/// the historical second-turn static-wire split.
 fn generated_prompt_cache_key_compatibility_allowed(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -12249,12 +12033,13 @@ fn generated_prompt_cache_key_compatibility_allowed(
         channel,
         key_id,
         ProviderCacheCapabilityField::PromptCacheKey,
-    ) == ProviderCacheCapabilityStatus::Verified
+    ) != ProviderCacheCapabilityStatus::Unsupported
 }
 
-/// Retention follows the same evidence gate independently of placement-key
-/// support. A provider must have an exact, current verified capability record
-/// before Atoapi adds the field to ordinary traffic.
+/// Retention follows the same exact-rejection rule independently of placement
+/// support. A field-specific rejection disables only this provider/model/
+/// channel/Key realm; unknown or transient state must not silently remove the
+/// champion-compatible normal wire.
 fn generated_prompt_cache_retention_compatibility_allowed(
     config: &AppConfig,
     decision: &RouteDecision,
@@ -12267,7 +12052,7 @@ fn generated_prompt_cache_retention_compatibility_allowed(
         channel,
         key_id,
         ProviderCacheCapabilityField::PromptCacheRetention,
-    ) == ProviderCacheCapabilityStatus::Verified
+    ) != ProviderCacheCapabilityStatus::Unsupported
 }
 
 /// Selects the final provider cache placement without weakening Key-realm
@@ -16338,6 +16123,7 @@ fn provider_cache_bucket_max_128(input_tokens: u64) -> u64 {
     (input_tokens / 128) * 128
 }
 
+#[cfg(test)]
 fn strip_response_session_volatile_fields(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -20453,11 +20239,11 @@ mod tests {
     }
 
     #[test]
-    fn native_codex_retention_compatibility_requires_verified_field_evidence() {
+    fn native_codex_retention_compatibility_is_opt_out_only_after_exact_rejection() {
         let mut config = AppConfig::default();
         let decision = reasoning_test_decision(None, &[]);
 
-        assert!(!generated_prompt_cache_retention_compatibility_allowed(
+        assert!(generated_prompt_cache_retention_compatibility_allowed(
             &config,
             &decision,
             &Channel::Responses,
@@ -20493,7 +20279,7 @@ mod tests {
             &Channel::Responses,
             Some("key-a"),
         ));
-        assert!(!generated_prompt_cache_retention_compatibility_allowed(
+        assert!(generated_prompt_cache_retention_compatibility_allowed(
             &config,
             &decision,
             &Channel::Responses,
@@ -20602,11 +20388,11 @@ mod tests {
     }
 
     #[test]
-    fn native_codex_generated_placement_requires_verified_field_evidence() {
+    fn native_codex_generated_placement_is_opt_out_only_after_exact_rejection() {
         let mut config = AppConfig::default();
         let decision = reasoning_test_decision(None, &[]);
 
-        assert!(!generated_prompt_cache_key_compatibility_allowed(
+        assert!(generated_prompt_cache_key_compatibility_allowed(
             &config,
             &decision,
             &Channel::Responses,
@@ -20636,12 +20422,124 @@ mod tests {
             ProviderCacheCapabilityStatus::Error,
             Some("transient".to_string()),
         );
-        assert!(!generated_prompt_cache_key_compatibility_allowed(
+        assert!(generated_prompt_cache_key_compatibility_allowed(
             &config,
             &decision,
             &Channel::Responses,
             Some("key-b"),
         ));
+        config.record_cache_capability_probe_for_key(
+            &decision.provider.id,
+            &decision.model,
+            Channel::Responses,
+            Some("key-a"),
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Unsupported,
+            Some("field rejected".to_string()),
+        );
+        assert!(!generated_prompt_cache_key_compatibility_allowed(
+            &config,
+            &decision,
+            &Channel::Responses,
+            Some("key-a"),
+        ));
+    }
+
+    #[test]
+    fn generated_full_replay_controls_keep_one_final_static_wire_until_exact_rejection() {
+        fn final_wire_for_status(
+            status: ProviderCacheCapabilityStatus,
+        ) -> (Option<String>, Option<String>, String) {
+            let mut config = AppConfig::default();
+            let mut decision = reasoning_test_decision(None, &[]);
+            decision.provider.prompt_cache_retention_enabled = true;
+            for field in [
+                ProviderCacheCapabilityField::PromptCacheKey,
+                ProviderCacheCapabilityField::PromptCacheRetention,
+            ] {
+                config.record_cache_capability_probe_for_key(
+                    &decision.provider.id,
+                    &decision.model,
+                    Channel::Responses,
+                    Some("key-a"),
+                    field,
+                    status.clone(),
+                    (status == ProviderCacheCapabilityStatus::Error)
+                        .then(|| "transient".to_string()),
+                );
+            }
+            let mut body = PreparedResponseBody::responses_pending(json!({
+                "model": decision.model,
+                "stream": true,
+                "input": [{"type":"message","role":"user","content":"stable"}]
+            }));
+            let mut application = cache_capability::CacheControlApplicationReceipt::default();
+            if generated_prompt_cache_key_compatibility_allowed(
+                &config,
+                &decision,
+                &Channel::Responses,
+                Some("key-a"),
+            ) {
+                assert!(cache_capability::apply_generated_prompt_cache_key(
+                    &mut body,
+                    "stable-generated-placement",
+                    &mut application,
+                ));
+            }
+            if generated_prompt_cache_retention_compatibility_allowed(
+                &config,
+                &decision,
+                &Channel::Responses,
+                Some("key-a"),
+            ) {
+                assert!(cache_capability::apply_legacy_prompt_cache_retention(
+                    &mut body,
+                    &mut application,
+                ));
+            }
+            let plan = FinalResponsesWirePlan::freeze(
+                &decision.provider,
+                "https://example.test/v1/responses",
+                Channel::Responses,
+                body,
+                CacheControlCore::plan(CacheControlPlanInput {
+                    action_scope: None,
+                    active_channel: &Channel::Responses,
+                    context_mode: CacheContextMode::FullReplay,
+                    lineage_epoch: None,
+                }),
+                None,
+            );
+            (
+                plan.body()
+                    .get("prompt_cache_key")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                plan.body()
+                    .get("prompt_cache_retention")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                plan.receipt()
+                    .wire
+                    .responses_static_projection_digest
+                    .clone()
+                    .expect("the final native Responses wire must retain a static digest"),
+            )
+        }
+
+        let unverified = final_wire_for_status(ProviderCacheCapabilityStatus::Unverified);
+        let verified = final_wire_for_status(ProviderCacheCapabilityStatus::Verified);
+        let transient_error = final_wire_for_status(ProviderCacheCapabilityStatus::Error);
+        for observed in [&unverified, &verified, &transient_error] {
+            assert_eq!(observed.0.as_deref(), Some("stable-generated-placement"));
+            assert_eq!(observed.1.as_deref(), Some("24h"));
+            assert_eq!(observed.2, unverified.2);
+        }
+
+        let rejected = final_wire_for_status(ProviderCacheCapabilityStatus::Unsupported);
+        assert!(rejected.0.is_none());
+        assert!(rejected.1.is_none());
+        assert_ne!(rejected.2, unverified.2);
     }
 
     #[test]
@@ -20766,10 +20664,7 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(crate::ATOAPI_USER_AGENT)
         );
-        assert_eq!(
-            crate::ATOAPI_USER_AGENT,
-            concat!("Atoapi/", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(crate::ATOAPI_USER_AGENT, "Atoapi/1.4.12");
         assert_eq!(
             provider_prefix_fingerprint(&body, &Channel::Responses),
             cache_identity
@@ -21186,6 +21081,46 @@ mod tests {
             alias,
             "prefix-alias-v2\0https://example.com/v1\0gpt-5.5\0responses\0stable-fingerprint",
             "a cache-control policy change must not reuse a v2 persisted alias"
+        );
+    }
+
+    #[test]
+    fn v3_prefix_lookup_reuses_exact_v2_champion_state_when_current_scope_is_missing() {
+        let decision = reasoning_test_decision(None, &[]);
+        let selected = SelectedProviderKey {
+            secret: "selected-key".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let v3 = provider_prefix_control_key_for_selected_key(
+            Some("stable-fingerprint"),
+            &decision,
+            &Channel::Responses,
+            &selected,
+        )
+        .expect("selected-key v3 prefix state key");
+        let mut parts = v3.split('\0');
+        assert_eq!(parts.next(), Some("prefix-v3"));
+        let key_realm = parts.next().expect("v3 key realm");
+        assert_eq!(parts.next(), Some(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
+        let provider_group = parts.next().expect("v3 provider group");
+        let model = parts.next().expect("v3 model");
+        let channel = parts.next().expect("v3 channel");
+        let fingerprint = parts.next().expect("v3 prefix fingerprint");
+        assert!(parts.next().is_none());
+        let v2 =
+            format!("prefix-v2\0{key_realm}\0{provider_group}\0{model}\0{channel}\0{fingerprint}");
+        let expected = prefix_state(128_000, 127_872, 128);
+        let mut states = HashMap::new();
+        states.insert(v2, expected.clone());
+
+        let (source, observed) = lookup_provider_prefix_state_with_source(&states, Some(&v3), None)
+            .expect("the champion-compatible exact v2 state must survive the v3 upgrade");
+
+        assert_eq!(source, "exact");
+        assert_eq!(observed.cache_read_tokens, expected.cache_read_tokens);
+        assert_eq!(
+            observed.seen_bucket_tokens_128,
+            expected.seen_bucket_tokens_128
         );
     }
 
@@ -21841,8 +21776,26 @@ mod tests {
             reordered_mixed_string
                 .get("client_metadata")
                 .and_then(Value::as_str),
-            Some(carrier_after_sibling),
-            "unusual caller-owned string ordering must stay on the transparent path"
+            Some(r#"{"upstream_tag":"preserve"}"#),
+            "an attested private carrier after a caller-owned sibling must be removed without reserializing that sibling"
+        );
+        let mut reordered_next_turn = json!({
+            "client_metadata": r#"{"upstream_tag":"preserve","x-codex-turn-metadata":{"thread_id":"thread-a","session_id":"session-a","turn_nonce":"later-next"}}"#,
+            "input": [{"type":"message","role":"user","content":"next"}]
+        });
+        strip_attested_codex_turn_metadata_from_native_wire(
+            &mut reordered_next_turn,
+            true,
+            Some(&trusted),
+        );
+        let first_reordered_wire =
+            PreparedWireRequest::from_value(&Channel::Responses, &reordered_mixed_string);
+        let next_reordered_wire =
+            PreparedWireRequest::from_value(&Channel::Responses, &reordered_next_turn);
+        assert_eq!(
+            first_reordered_wire.responses_static_projection_digest(),
+            next_reordered_wire.responses_static_projection_digest(),
+            "a changing non-leading private carrier must not split the final static Responses prefix"
         );
 
         let mut mismatched = json!({
@@ -21866,6 +21819,48 @@ mod tests {
         assert!(non_native
             .pointer("/client_metadata/x-codex-turn-metadata")
             .is_some());
+    }
+
+    #[test]
+    fn json_string_metadata_splicer_removes_only_one_unambiguous_top_level_carrier() {
+        let target = X_CODEX_TURN_METADATA_HEADER;
+        assert_eq!(
+            strip_json_string_metadata_member(
+                r#"{ "x-codex-turn-metadata":{"turn_nonce":"one"},  "upstream_tag" : "preserve" }"#,
+                target,
+            ),
+            Some(r#"{  "upstream_tag" : "preserve" }"#.to_string())
+        );
+        assert_eq!(
+            strip_json_string_metadata_member(
+                r#"{"first":"keep","x-codex-turn-metadata":{"turn_nonce":"one"},"last":"keep"}"#,
+                target,
+            ),
+            Some(r#"{"first":"keep","last":"keep"}"#.to_string())
+        );
+        assert_eq!(
+            strip_json_string_metadata_member(
+                r#"{"first":"keep","x-codex-turn-metadata":{"turn_nonce":"one"}}"#,
+                target,
+            ),
+            Some(r#"{"first":"keep"}"#.to_string())
+        );
+        assert!(
+            strip_json_string_metadata_member(
+                r#"{"x-codex-turn-metadata":{"turn_nonce":"one"},"keep":true,"x-codex-turn-metadata":{"turn_nonce":"two"}}"#,
+                target,
+            )
+            .is_none(),
+            "duplicate control keys are ambiguous and must be forwarded unchanged"
+        );
+        assert!(
+            strip_json_string_metadata_member(
+                r#"{"keep":{"x-codex-turn-metadata":{"turn_nonce":"one"}},"other":true}"#,
+                target,
+            )
+            .is_none(),
+            "only a top-level private carrier is eligible"
+        );
     }
 
     #[test]
@@ -23346,7 +23341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_affinity_reuses_previous_responses_provider_for_same_anchor() {
+    async fn manual_responses_selection_is_never_overridden_by_history() {
         let mut config = AppConfig::default();
         config.workspace_fingerprint = "workspace-route-affinity".to_string();
         config.providers = vec![
@@ -23417,47 +23412,12 @@ mod tests {
                 { "type": "message", "role": "assistant", "content": "dynamic tail" }
             ]
         });
-        let appended = json!({
-            "model": "gpt-5.5",
-            "input": [
-                { "type": "message", "role": "user", "content": "stable conversation anchor" },
-                { "type": "message", "role": "assistant", "content": "dynamic tail" },
-                { "type": "message", "role": "user", "content": "next turn" }
-            ]
-        });
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-route-affinity-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config.clone(), dir.join("config.toml"), cache).unwrap();
-        let affinity_key = provider_route_affinity_key(&config, &request, &Channel::Responses)
-            .expect("responses request should have route affinity key");
-        assert_eq!(
-            provider_route_affinity_key(&config, &appended, &Channel::Responses).as_deref(),
-            Some(affinity_key.as_str())
-        );
-        note_provider_route_affinity(&state, Some(&affinity_key), "ls").await;
-
         let initial_decision = decide_route(&config, &request, &Channel::Responses, None).unwrap();
         assert_eq!(initial_decision.provider.id, "bizd");
-        let preferred_provider =
-            lookup_provider_route_affinity(&state, &config, Some(&affinity_key)).await;
-        let affinity_decision = apply_provider_route_affinity(
-            &config,
-            initial_decision,
-            &request,
-            &Channel::Responses,
-            preferred_provider.as_deref(),
-        );
-
-        assert_eq!(affinity_decision.provider.id, "ls");
-        assert_eq!(affinity_decision.model, "gpt-5.5");
-        fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test]
-    async fn route_affinity_does_not_override_agent_bound_provider() {
+    async fn agent_bound_provider_is_never_overridden_by_history() {
         let mut config = AppConfig::default();
         config.providers = vec![
             ProviderConfig {
@@ -23533,44 +23493,7 @@ mod tests {
         });
 
         let decision = decide_route(&config, &request, &Channel::Responses, Some("codex")).unwrap();
-        assert!(route_is_agent_provider_bound(
-            &config,
-            &request,
-            &Channel::Responses,
-            Some("codex")
-        ));
-        let dir = std::env::temp_dir().join(format!(
-            "atoapi-bound-route-affinity-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config.clone(), dir.join("config.toml"), cache).unwrap();
-        let (affinity_key, preferred_provider) = provider_route_affinity_for_request(
-            &state,
-            &config,
-            &request,
-            &Channel::Responses,
-            true,
-        )
-        .await;
-        assert!(affinity_key.is_none());
-        assert!(preferred_provider.is_none());
-        let final_decision =
-            if route_is_agent_provider_bound(&config, &request, &Channel::Responses, Some("codex"))
-            {
-                decision
-            } else {
-                apply_provider_route_affinity(
-                    &config,
-                    decision,
-                    &request,
-                    &Channel::Responses,
-                    Some("ls"),
-                )
-            };
-
-        assert_eq!(final_decision.provider.id, "bizd");
-        fs::remove_dir_all(dir).ok();
+        assert_eq!(decision.provider.id, "bizd");
     }
 
     #[test]
@@ -39021,7 +38944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_compact_reuses_the_normal_full_replay_key_affinity() {
+    async fn codex_compact_follows_user_key_pool_order_without_historical_affinity() {
         let normal_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let compact_authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
         let normal_hits = Arc::new(AtomicUsize::new(0));
@@ -39101,7 +39024,7 @@ mod tests {
         config.provider_key_pools = vec![crate::config::ProviderKeyPoolConfig {
             provider_id: provider_id.to_string(),
             enabled: true,
-            strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+            strategy: crate::config::KeyLoadBalanceStrategy::RoundRobin,
             failure_threshold: 1,
             recovery_minutes: 5,
             next_index: 0,
@@ -39206,8 +39129,8 @@ mod tests {
         );
         assert_eq!(
             compact_authorizations.lock().await.as_slice(),
-            ["Bearer secret-a"],
-            "compaction must retain the normal FullReplay key affinity instead of rotating"
+            ["Bearer secret-b"],
+            "compaction must follow the user-selected Key-pool order instead of restoring a historical Key"
         );
         let metrics = state.metrics.snapshot().await;
         assert_eq!(metrics.upstream_requests, 2);

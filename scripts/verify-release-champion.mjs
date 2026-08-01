@@ -37,7 +37,7 @@ if (booleanArg(args.help) || booleanArg(args.h)) {
 }
 
 if (booleanArg(args["self-test"])) {
-  runSelfTest();
+  await runSelfTest();
   process.exit(0);
 }
 
@@ -78,7 +78,6 @@ async function runLiveComparison(options) {
   const championExe = resolve(String(options["champion-exe"]));
   const candidateExe = resolve(String(options["candidate-exe"]));
   const sourceConfigDir = resolve(String(options["source-config-dir"]));
-  const configPath = join(sourceConfigDir, "config.toml");
   const model = String(options.model).trim();
   const keyRealmHash = validateOpaqueHash(options["key-realm-hash"], "--key-realm-hash");
   const scenario = normalizeScenario(options.scenario ?? "full-replay");
@@ -117,7 +116,20 @@ async function runLiveComparison(options) {
     1_024,
     200_000
   );
+  const seedContextChars = boundedInteger(
+    options["seed-context-chars"] ?? 0,
+    "--seed-context-chars",
+    0,
+    512_000
+  );
   const toolChars = boundedInteger(options["tool-chars"] ?? 32_768, "--tool-chars", 1_024, 512_000);
+  const toolCalls = boundedInteger(options["tool-calls"] ?? 1, "--tool-calls", 1, 8);
+  const toolOutputShape = normalizeToolOutputShape(options["tool-output-shape"] ?? "flat");
+  // A repeated payload gives a later pair an upstream-warmed context and can
+  // make a version look better or worse purely because of run order. New live
+  // comparisons are therefore diverse by default. Reuse is explicit and only
+  // appropriate for a narrowly scoped deterministic repro.
+  const freshFixturePerPair = resolveFreshFixturePerPair(options);
   const turnDelayMs = boundedInteger(
     options["turn-delay-ms"] ?? 0,
     "--turn-delay-ms",
@@ -136,111 +148,161 @@ async function runLiveComparison(options) {
     0,
     120_000
   );
+  const maxFullBucketRegressionRequests = boundedInteger(
+    options["max-full-bucket-regression-requests"] ?? 0,
+    "--max-full-bucket-regression-requests",
+    0,
+    pairs * turns
+  );
+  const sharedUpstreamUserAgent = optionalUpstreamUserAgent(options["upstream-user-agent"]);
+  const championUpstreamUserAgent = optionalUpstreamUserAgent(
+    options["champion-upstream-user-agent"]
+  ) ?? sharedUpstreamUserAgent;
+  const candidateUpstreamUserAgent = optionalUpstreamUserAgent(
+    options["candidate-upstream-user-agent"]
+  ) ?? sharedUpstreamUserAgent;
   const keepRunDir = booleanArg(options["keep-run-dir"]);
-  const configText = await readRequiredText(configPath, "source config.toml");
-  if (!extractTomlString(configText, "local_key")) {
-    throw new FailClosedError(
-      "missing_local_key",
-      "source config.toml has no local_key; live verification cannot authenticate safely"
+  const sourceSnapshot = await snapshotLiveConfig(sourceConfigDir);
+  try {
+    const configText = await readRequiredText(
+      join(sourceSnapshot.configDir, "config.toml"),
+      "snapshotted source config.toml"
     );
-  }
-  const configProviderId = codexProviderId(configText);
-  if (!configProviderId) {
-    throw new FailClosedError(
-      "missing_codex_provider",
-      "source config has no Codex agent injection provider_id"
-    );
-  }
-  const providerId = String(options["provider-id"] ?? configProviderId).trim();
-  if (!providerId || providerId !== configProviderId) {
-    throw new FailClosedError(
-      "provider_scope_mismatch",
-      "--provider-id must match the Codex provider_id in the copied source config"
-    );
-  }
-  if (!model) {
-    throw new FailClosedError("invalid_model", "--model must not be empty");
-  }
-  await assertFile(championExe, "--champion-exe");
-  await assertFile(candidateExe, "--candidate-exe");
-
-  const runId = String(options["run-id"] ?? randomUUID()).trim();
-  if (!runId) throw new FailClosedError("invalid_run_id", "--run-id must not be empty");
-
-  const cohort = {
-    provider_id: providerId,
-    model,
-    key_realm_hash: keyRealmHash,
-    request_family: requestFamily
-  };
-  const settings = {
-    scenario,
-    pairs,
-    turns,
-    max_output_tokens: maxOutputTokens,
-    stable_instruction_chars: stableInstructionChars,
-    tool_chars: toolChars,
-    turn_delay_ms: turnDelayMs,
-    require_candidate_guarded_requests: requireCandidateGuardedRequests,
-    client_prompt_cache_key: Boolean(options["prompt-cache-key-prefix"]),
-    max_ttft_regression_ms: maxTtftRegressionMs
-  };
-  const artifacts = {
-    champion: await executableArtifact(championExe),
-    candidate: await executableArtifact(candidateExe)
-  };
-  const armRuns = { champion: [], candidate: [] };
-  const orderedPairs = [];
-
-  for (let pair = 0; pair < pairs; pair += 1) {
-    // Alternating order removes the deterministic "first lane warmed later"
-    // bias without ever sharing a lane between old and new executables.
-    const order = pair % 2 === 0 ? ["champion", "candidate"] : ["candidate", "champion"];
-    orderedPairs.push(order);
-    for (const arm of order) {
-      const executable = arm === "champion" ? championExe : candidateExe;
-      const lane = sha256Parts([
-        "release-champion-lane-v1",
-        runId,
-        keyRealmHash,
-        requestFamily,
-        pair,
-        arm
-      ]);
-      const result = await runIsolatedDynamicArm({
-        arm,
-        executable,
-        sourceConfigDir,
-        configProviderId,
-        cohort,
-        settings,
-        requestedPort,
-        runId,
-        pair,
-        lane,
-        promptCacheKeyPrefix: options["prompt-cache-key-prefix"],
-        keepRunDir
-      });
-      armRuns[arm].push(result);
+    if (!extractTomlString(configText, "local_key")) {
+      throw new FailClosedError(
+        "missing_local_key",
+        "source config.toml has no local_key; live verification cannot authenticate safely"
+      );
     }
-  }
+    const configProviderId = codexProviderId(configText);
+    if (!configProviderId) {
+      throw new FailClosedError(
+        "missing_codex_provider",
+        "source config has no Codex agent injection provider_id"
+      );
+    }
+    const providerId = String(options["provider-id"] ?? configProviderId).trim();
+    if (!providerId || providerId !== configProviderId) {
+      throw new FailClosedError(
+        "provider_scope_mismatch",
+        "--provider-id must match the Codex provider_id in the snapshotted source config"
+      );
+    }
+    if (!model) {
+      throw new FailClosedError("invalid_model", "--model must not be empty");
+    }
+    await assertFile(championExe, "--champion-exe");
+    await assertFile(candidateExe, "--candidate-exe");
 
-  const champion = aggregateArm("champion", cohort, artifacts.champion, armRuns.champion);
-  const candidate = aggregateArm("candidate", cohort, artifacts.candidate, armRuns.candidate);
-  const comparison = compareArmResults(champion, candidate, maxTtftRegressionMs);
-  return {
-    schema: SCHEMA,
-    kind: "release-champion-comparison",
-    mode: "live-isolated",
-    pass: comparison.pass,
-    run_id: runId,
-    cohort,
-    settings,
-    pair_order: orderedPairs,
-    champion,
-    candidate,
-    comparison
-  };
+    const runId = String(options["run-id"] ?? randomUUID()).trim();
+    if (!runId) throw new FailClosedError("invalid_run_id", "--run-id must not be empty");
+
+    const cohort = {
+      provider_id: providerId,
+      model,
+      key_realm_hash: keyRealmHash,
+      request_family: requestFamily
+    };
+    const settings = {
+      scenario,
+      pairs,
+      turns,
+      max_output_tokens: maxOutputTokens,
+      stable_instruction_chars: stableInstructionChars,
+      seed_context_chars: seedContextChars,
+      tool_chars: toolChars,
+      tool_calls: toolCalls,
+      tool_output_shape: toolOutputShape,
+      fresh_fixture_per_pair: freshFixturePerPair,
+      turn_delay_ms: turnDelayMs,
+      require_candidate_guarded_requests: requireCandidateGuardedRequests,
+      client_prompt_cache_key: Boolean(options["prompt-cache-key-prefix"]),
+      max_ttft_regression_ms: maxTtftRegressionMs,
+      max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
+      champion_upstream_user_agent: championUpstreamUserAgent,
+      candidate_upstream_user_agent: candidateUpstreamUserAgent
+    };
+    const artifacts = {
+      champion: await executableArtifact(championExe),
+      candidate: await executableArtifact(candidateExe)
+    };
+    const armRuns = { champion: [], candidate: [] };
+    const orderedPairs = [];
+
+    for (let pair = 0; pair < pairs; pair += 1) {
+      // Alternating order removes the deterministic "first lane warmed later"
+      // bias without ever sharing a lane between old and new executables.
+      const order = pair % 2 === 0 ? ["champion", "candidate"] : ["candidate", "champion"];
+      orderedPairs.push(order);
+      const fixtureFamily = freshFixturePerPair
+        ? `fixture-${sha256Parts([
+          "release-champion-fixture-v2",
+          runId,
+          requestFamily,
+          scenario,
+          stableInstructionChars,
+          seedContextChars,
+          toolChars,
+          toolOutputShape,
+          pair
+        ]).slice(0, 16)}`
+        : null;
+      for (const arm of order) {
+        const executable = arm === "champion" ? championExe : candidateExe;
+        const lane = sha256Parts([
+          "release-champion-lane-v1",
+          runId,
+          keyRealmHash,
+          requestFamily,
+          pair,
+          arm
+        ]);
+        const result = await runIsolatedDynamicArm({
+          arm,
+          executable,
+          sourceConfigDir: sourceSnapshot.configDir,
+          configProviderId,
+          cohort,
+          settings,
+          requestedPort,
+          runId,
+          pair,
+          lane,
+          fixtureFamily,
+          promptCacheKeyPrefix: options["prompt-cache-key-prefix"],
+          upstreamUserAgent: arm === "champion"
+            ? championUpstreamUserAgent
+            : candidateUpstreamUserAgent,
+          keepRunDir
+        });
+        armRuns[arm].push(result);
+      }
+    }
+
+    const champion = aggregateArm("champion", cohort, artifacts.champion, armRuns.champion);
+    const candidate = aggregateArm("candidate", cohort, artifacts.candidate, armRuns.candidate);
+    const comparison = compareArmResults(
+      champion,
+      candidate,
+      maxTtftRegressionMs,
+      maxFullBucketRegressionRequests
+    );
+    return {
+      schema: SCHEMA,
+      kind: "release-champion-comparison",
+      mode: "live-isolated",
+      pass: comparison.pass,
+      run_id: runId,
+      cohort,
+      settings,
+      pair_order: orderedPairs,
+      champion,
+      candidate,
+      comparison
+    };
+  } finally {
+    await rm(sourceSnapshot.root, { recursive: true, force: true });
+  }
 }
 
 async function runIsolatedDynamicArm(spec) {
@@ -248,7 +310,10 @@ async function runIsolatedDynamicArm(spec) {
   const configDir = join(tempRoot, "config");
   let runtime = null;
   try {
-    await copyIsolatedConfig(spec.sourceConfigDir, configDir);
+    await copyIsolatedConfig(spec.sourceConfigDir, configDir, {
+      providerId: spec.configProviderId,
+      upstreamUserAgent: spec.upstreamUserAgent
+    });
     runtime = await startIsolatedRuntime({
       executable: spec.executable,
       configDir,
@@ -264,6 +329,7 @@ async function runIsolatedDynamicArm(spec) {
       pair: spec.pair,
       runId: spec.runId,
       lane: spec.lane,
+      fixtureFamily: spec.fixtureFamily,
       cohort: spec.cohort,
       settings: spec.settings,
       expectedProviderId: spec.configProviderId,
@@ -286,13 +352,23 @@ async function runIsolatedDynamicArm(spec) {
 }
 
 async function exerciseScenario(spec) {
+  const fixtureFamily = spec.fixtureFamily ?? null;
   const state = {
-    input: [message("Release champion seed. Reply with OK only.")],
+    input: [message(buildSeedContext(spec.settings.seed_context_chars, fixtureFamily))],
     compactionSeen: false
   };
-  const sessionId = `release-champion-${spec.arm}-${spec.pair}-${spec.lane.slice(0, 12)}`;
-  const threadId = `release-champion-thread-${spec.pair}-${spec.lane.slice(12, 24)}`;
-  const stableInstructions = buildStableInstructions(spec.settings.stable_instruction_chars);
+  // These identifiers are part of the caller's logical conversation, not an
+  // isolation lane. A version comparison must replay the same conversation
+  // identity through both temporary processes; otherwise a session-scoped
+  // native cache key can manufacture a false version regression. The runtime
+  // lane remains arm-specific and is never exposed in the request body.
+  const conversationIdentity = releaseFixtureConversationIdentity(spec.pair, fixtureFamily);
+  const sessionId = conversationIdentity.session_id;
+  const threadId = conversationIdentity.thread_id;
+  const stableInstructions = buildStableInstructions(
+    spec.settings.stable_instruction_chars,
+    fixtureFamily
+  );
   const requests = [];
   let fatal = null;
 
@@ -301,14 +377,18 @@ async function exerciseScenario(spec) {
     let phase = turn === 0 ? "seed" : `followup-${turn}`;
     const toolTailMaturityTurn = spec.settings.scenario === "tool-tail-maturity" && turn === 2;
     if (turn > 0 && (spec.settings.scenario === "tool-burst" && turn === 1 || toolTailMaturityTurn)) {
-      const callId = `call_${spec.lane.slice(0, 20)}`;
+      // The arm-specific lane isolates each runtime's cache placement, but it
+      // must never leak into the fixture input. Otherwise champion and
+      // candidate replay different function-call histories and the paired
+      // hit/TTFT comparison is no longer meaningful.
       state.input.push(
-        { type: "function_call", call_id: callId, name: "read_release_fixture", arguments: "{}" },
-        {
-          type: "function_call_output",
-          call_id: callId,
-          output: buildToolOutput(spec.settings.tool_chars)
-        },
+        ...buildToolFixtureItems({
+          pair: spec.pair,
+          fixtureFamily,
+          targetChars: spec.settings.tool_chars,
+          shape: spec.settings.tool_output_shape,
+          calls: spec.settings.tool_calls
+        }),
         message("Use the completed tool output. Reply with OK only.")
       );
       phase = toolTailMaturityTurn ? "tool-tail-maturity" : "tool-burst";
@@ -472,15 +552,46 @@ async function sendOneInbound(spec) {
     observed_realm_id: observedRealmId || null,
     provider_id: metric?.provider_id ?? null,
     model: metric?.model ?? null,
+    // These fields are bounded diagnostics only: they contain no request
+    // body, tool text, credential, or cache-key value.  Retain them per
+    // request so a large aggregate new-tail gap can be traced to one phase
+    // without rerunning the arm blind.
+    provider_prefix_fingerprint: metric?.provider_prefix_fingerprint ?? null,
+    outbound_prefix_fingerprints: metric?.outbound_prefix_fingerprints ?? null,
+    prefix_lag_classification: metric?.prefix_lag_classification ?? null,
+    prefix_lag_input_delta_tokens: number(metric?.prefix_lag_input_delta_tokens),
+    prefix_lag_cache_delta_tokens: number(metric?.prefix_lag_cache_delta_tokens),
+    prefix_lag_previous_gap_tokens: number(metric?.prefix_lag_previous_gap_tokens),
+    prefix_cache_instability_score: number(metric?.prefix_cache_instability_score),
+    prefix_state_cache_read_tokens: number(metric?.prefix_state_cache_read_tokens),
     input_tokens: number(metric?.input_tokens),
     cache_read_tokens: number(metric?.cache_read_tokens),
     cache_avoidable_gap_tokens: number(metric?.cache_avoidable_gap_tokens),
     cache_new_tail_gap_tokens: number(metric?.cache_new_tail_gap_tokens),
+    cache_provider_unstable_gap_tokens: number(metric?.cache_provider_unstable_gap_tokens),
     cache_shortfall_tokens: number(metric?.cache_shortfall_tokens),
+    tail_input_items: number(metric?.tail_input_items),
+    tail_message_chars: number(metric?.tail_message_chars),
+    tail_tool_call_chars: number(metric?.tail_tool_call_chars),
+    tail_tool_output_chars: number(metric?.tail_tool_output_chars),
+    tail_largest_tool_output_chars: number(metric?.tail_largest_tool_output_chars),
+    tail_tool_output_lines: number(metric?.tail_tool_output_lines),
+    tail_tool_output_repeated_line_chars: number(metric?.tail_tool_output_repeated_line_chars),
+    tail_tool_output_timestamp_like_count: number(metric?.tail_tool_output_timestamp_like_count),
+    tail_tool_output_path_like_count: number(metric?.tail_tool_output_path_like_count),
+    tail_tool_output_url_like_count: number(metric?.tail_tool_output_url_like_count),
+    tail_tool_output_hash_like_count: number(metric?.tail_tool_output_hash_like_count),
+    tail_tool_output_json_like_chars: number(metric?.tail_tool_output_json_like_chars),
+    tail_tool_output_noise_hint: metric?.tail_tool_output_noise_hint ?? null,
     // Keep the local and upstream portions separate in the release evidence.
     // This is diagnostic only: the release gate below still evaluates total
     // TTFT, so an upstream regression cannot be silently reclassified away.
     prefix_guard_wait_ms: number(metric?.prefix_guard_wait_ms),
+    prefix_guard_wait_reason: metric?.prefix_guard_wait_reason ?? null,
+    prefix_guard_wait_source: metric?.prefix_guard_wait_source ?? null,
+    prefix_guard_skip_reason: metric?.prefix_guard_skip_reason ?? null,
+    static_wire_drift_late_mutation_categories:
+      metric?.static_wire_drift_late_mutation_categories ?? null,
     local_prepare_ms: number(metric?.local_prepare_ms),
     upstream_ttft_ms: number(metric?.upstream_ttft_ms),
     ttft_ms: number(metric?.ttft_ms),
@@ -741,11 +852,20 @@ function aggregateArm(arm, cohort, executable, runs) {
   };
 }
 
-function compareArmResults(champion, candidate, maxTtftRegressionMs) {
+function compareArmResults(
+  champion,
+  candidate,
+  maxTtftRegressionMs,
+  maxFullBucketRegressionRequests = 0
+) {
   const cohortMatches = sameCohort(champion.cohort, candidate.cohort);
   const observedRealmMatches = champion.metrics.observed_realm_ids.length === 1 &&
     candidate.metrics.observed_realm_ids.length === 1 &&
     champion.metrics.observed_realm_ids[0] === candidate.metrics.observed_realm_ids[0];
+  const fullBucketRequestDelta =
+    candidate.metrics.full_bucket_requests - champion.metrics.full_bucket_requests;
+  const fullBucketDenominatorsMatch =
+    candidate.metrics.full_bucket_denominator === champion.metrics.full_bucket_denominator;
   const checks = {
     champion_valid: champion.pass,
     candidate_valid: candidate.pass,
@@ -759,6 +879,8 @@ function compareArmResults(champion, candidate, maxTtftRegressionMs) {
       candidate.metrics.warm_stable_prefix_hit_rate >= champion.metrics.warm_stable_prefix_hit_rate,
     candidate_full_bucket_rate_not_lower:
       candidate.metrics.full_bucket_rate >= champion.metrics.full_bucket_rate,
+    candidate_full_bucket_count_within_tolerance:
+      fullBucketDenominatorsMatch && fullBucketRequestDelta >= -maxFullBucketRegressionRequests,
     candidate_avoidable_gap_zero: candidate.metrics.avoidable_gap_tokens === 0,
     candidate_all_sse_completed:
       candidate.metrics.successful_sse_requests === candidate.metrics.requests && candidate.metrics.requests > 0,
@@ -767,8 +889,42 @@ function compareArmResults(champion, candidate, maxTtftRegressionMs) {
     candidate_ttft_p95_not_regressed:
       candidate.metrics.ttft_p95_ms <= champion.metrics.ttft_p95_ms + maxTtftRegressionMs
   };
+  const gatingChecks = { ...checks };
+  // This is retained as a strict, visible diagnostic. When an explicit
+  // request-count tolerance is supplied, a same-binary calibration has shown
+  // the threshold's upstream variance; use the calibrated count gate instead
+  // of rejecting an otherwise token-superior candidate on one stochastic arm.
+  if (maxFullBucketRegressionRequests > 0) {
+    delete gatingChecks.candidate_full_bucket_rate_not_lower;
+  }
+  const cacheCheckNames = [
+    "champion_valid",
+    "candidate_valid",
+    "cohort_matches",
+    "observed_key_realm_matches",
+    "candidate_raw_token_hit_not_lower",
+    "candidate_cache_128_hit_not_lower",
+    "candidate_warm_stable_prefix_hit_not_lower",
+    "candidate_full_bucket_rate_not_lower",
+    "candidate_full_bucket_count_within_tolerance",
+    "candidate_avoidable_gap_zero",
+    "candidate_all_sse_completed",
+    "candidate_one_attempt_one_main_post"
+  ];
+  if (maxFullBucketRegressionRequests > 0) {
+    const index = cacheCheckNames.indexOf("candidate_full_bucket_rate_not_lower");
+    if (index >= 0) cacheCheckNames.splice(index, 1);
+  }
+  // Cache behavior and end-to-end latency are intentionally reported as
+  // separate verdicts. The latter includes remote provider TTFT variance;
+  // hiding a cache regression behind a fast upstream, or vice versa, would
+  // make the release evidence misleading.
+  const cachePass = cacheCheckNames.every((name) => checks[name] === true);
+  const latencyPass = checks.candidate_ttft_p95_not_regressed;
   return {
-    pass: Object.values(checks).every(Boolean),
+    pass: Object.values(gatingChecks).every(Boolean),
+    cache_pass: cachePass,
+    latency_pass: latencyPass,
     checks,
     deltas: {
       raw_token_hit_rate: candidate.metrics.raw_token_hit_rate - champion.metrics.raw_token_hit_rate,
@@ -776,8 +932,13 @@ function compareArmResults(champion, candidate, maxTtftRegressionMs) {
       warm_stable_prefix_hit_rate:
         candidate.metrics.warm_stable_prefix_hit_rate - champion.metrics.warm_stable_prefix_hit_rate,
       full_bucket_rate: candidate.metrics.full_bucket_rate - champion.metrics.full_bucket_rate,
+      full_bucket_requests: fullBucketRequestDelta,
       avoidable_gap_tokens:
         candidate.metrics.avoidable_gap_tokens - champion.metrics.avoidable_gap_tokens,
+      local_proxy_overhead_p95_ms:
+        candidate.metrics.local_proxy_overhead_p95_ms - champion.metrics.local_proxy_overhead_p95_ms,
+      upstream_ttft_p95_ms:
+        candidate.metrics.upstream_ttft_p95_ms - champion.metrics.upstream_ttft_p95_ms,
       ttft_p95_ms: candidate.metrics.ttft_p95_ms - champion.metrics.ttft_p95_ms
     }
   };
@@ -813,7 +974,18 @@ async function compareOfflineArtifacts(options) {
     0,
     120_000
   );
-  const comparison = compareArmResults(champion, candidate, maxTtftRegressionMs);
+  const maxFullBucketRegressionRequests = boundedInteger(
+    options["max-full-bucket-regression-requests"] ?? 0,
+    "--max-full-bucket-regression-requests",
+    0,
+    Math.max(champion.metrics.full_bucket_denominator, candidate.metrics.full_bucket_denominator)
+  );
+  const comparison = compareArmResults(
+    champion,
+    candidate,
+    maxTtftRegressionMs,
+    maxFullBucketRegressionRequests
+  );
   return {
     schema: SCHEMA,
     kind: "release-champion-comparison",
@@ -822,7 +994,11 @@ async function compareOfflineArtifacts(options) {
     cohort: champion.cohort,
     champion,
     candidate,
-    comparison
+    comparison,
+    settings: {
+      max_ttft_regression_ms: maxTtftRegressionMs,
+      max_full_bucket_regression_requests: maxFullBucketRegressionRequests
+    }
   };
 }
 
@@ -883,15 +1059,85 @@ function validateDynamicRun(value, expectedArm) {
   return value;
 }
 
-async function copyIsolatedConfig(sourceConfigDir, targetConfigDir) {
+/// Captures the mutable user config exactly once before the first arm starts.
+/// A live Atoapi session may legitimately switch its hand-selected Provider
+/// while this long-running verifier is active. Each arm must therefore clone
+/// the same sealed input, rather than observing a different routing cohort.
+async function snapshotLiveConfig(sourceConfigDir) {
+  const sourceConfig = join(sourceConfigDir, "config.toml");
+  const configText = await readRequiredText(sourceConfig, "source config.toml");
+  const root = await mkdtemp(join(tmpdir(), "atoapi-release-champion-source-"));
+  const configDir = join(root, "config");
+  try {
+    await mkdir(configDir, { recursive: true });
+    await writeFile(join(configDir, "config.toml"), configText, "utf8");
+    const sourceKey = join(sourceConfigDir, "cache-key.dpapi");
+    if (await fileExists(sourceKey)) {
+      await copyFile(sourceKey, join(configDir, basename(sourceKey)));
+    }
+    return { root, configDir };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function copyIsolatedConfig(
+  sourceConfigDir,
+  targetConfigDir,
+  { providerId = "", upstreamUserAgent = null } = {}
+) {
   const sourceConfig = join(sourceConfigDir, "config.toml");
   await assertFile(sourceConfig, "source config.toml");
   await mkdir(targetConfigDir, { recursive: true });
-  await copyFile(sourceConfig, join(targetConfigDir, "config.toml"));
+  const targetConfig = join(targetConfigDir, "config.toml");
+  await copyFile(sourceConfig, targetConfig);
+  if (upstreamUserAgent) {
+    if (!providerId) {
+      throw new FailClosedError(
+        "missing_provider_for_user_agent_probe",
+        "--upstream-user-agent requires the current Codex Provider binding"
+      );
+    }
+    const original = await readRequiredText(targetConfig, "isolated config.toml");
+    await writeFile(
+      targetConfig,
+      replaceProviderTomlString(original, providerId, "custom_user_agent", upstreamUserAgent),
+      "utf8"
+    );
+  }
   const sourceKey = join(sourceConfigDir, "cache-key.dpapi");
   if (await fileExists(sourceKey)) {
     await copyFile(sourceKey, join(targetConfigDir, basename(sourceKey)));
   }
+}
+
+function replaceProviderTomlString(configText, providerId, key, value) {
+  const marker = "[[providers]]";
+  const starts = [];
+  let offset = 0;
+  while ((offset = configText.indexOf(marker, offset)) >= 0) {
+    starts.push(offset);
+    offset += marker.length;
+  }
+  for (const start of starts) {
+    const next = configText.indexOf("\n[[", start + marker.length);
+    const end = next < 0 ? configText.length : next + 1;
+    const block = configText.slice(start, end);
+    if (extractTomlString(block, "id") !== providerId) continue;
+    const escapedKey = escapeRegExp(key);
+    const escapedValue = value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"');
+    const field = new RegExp(`^${escapedKey}\\s*=\\s*"[^"]*"\\s*$`, "mu");
+    const replacement = `${key} = "${escapedValue}"`;
+    const rewritten = field.test(block)
+      ? block.replace(field, replacement)
+      : `${block.trimEnd()}\n${replacement}\n`;
+    return `${configText.slice(0, start)}${rewritten}${configText.slice(end)}`;
+  }
+  throw new FailClosedError(
+    "provider_not_found_for_user_agent_probe",
+    "current Codex Provider was not found in the copied isolated config"
+  );
 }
 
 async function startIsolatedRuntime({ executable, configDir, requestedPort }) {
@@ -999,18 +1245,109 @@ function message(text) {
   };
 }
 
-function buildStableInstructions(targetChars) {
+function buildSeedContext(targetChars, fixtureFamily = null) {
+  const fixturePrefix = fixtureFamily ? `[fixture ${fixtureFamily}] ` : "";
+  if (targetChars <= 0) {
+    return `${fixturePrefix}Release champion seed. Reply with OK only.`;
+  }
+  const sections = [
+    "Architecture notes: preserve established behavior and append only new facts.",
+    "Repository inventory: keep prior decisions, tool outcomes, and constraints in order.",
+    "Validation record: report only evidence-backed conclusions without rewriting history.",
+    "Continuation rule: retain stable context verbatim and answer the newest request."
+  ];
+  let output = fixturePrefix;
+  for (let index = 0; output.length < targetChars; index += 1) {
+    output += `\n[section ${index + 1}] ${sections[index % sections.length]}`;
+  }
+  return output.slice(0, targetChars);
+}
+
+function buildStableInstructions(targetChars, fixtureFamily = null) {
   // The lane belongs only in the opaque prompt cache key. Keeping the body
-  // identical across arms makes raw upstream token telemetry comparable.
-  const prefix = "Release-cache validation fixture. Preserve the supplied history. ";
+  // identical across arms makes raw upstream token telemetry comparable. A
+  // pair-scoped fixture may vary across pairs, but never across the two arms
+  // inside one pair, so stale upstream context cannot warm a later pair.
+  const prefix = fixtureFamily
+    ? `Release-cache validation fixture ${fixtureFamily}. Preserve the supplied history. `
+    : "Release-cache validation fixture. Preserve the supplied history. ";
   const unit = "Follow the existing instructions exactly; reply with OK only when asked. ";
   return (prefix + unit.repeat(Math.ceil(Math.max(0, targetChars - prefix.length) / unit.length)))
     .slice(0, targetChars);
 }
 
-function buildToolOutput(targetChars) {
-  const unit = "tool-output: stable release validation data; ";
+function buildToolFixtureItems({ pair, fixtureFamily = null, targetChars, shape, calls }) {
+  const items = [];
+  let remainingChars = targetChars;
+  for (let index = 0; index < calls; index += 1) {
+    const remainingCalls = calls - index;
+    const chars = Math.floor(remainingChars / remainingCalls);
+    remainingChars -= chars;
+    const callId = releaseFixtureCallId(pair, fixtureFamily, index, calls);
+    items.push(
+      {
+        type: "function_call",
+        call_id: callId,
+        name: "read_release_fixture",
+        arguments: calls > 1 ? JSON.stringify({ part: index + 1, total_parts: calls }) : "{}"
+      },
+      {
+        type: "function_call_output",
+        call_id: callId,
+        output: buildToolOutput(chars, shape, fixtureFamily, index, calls)
+      }
+    );
+  }
+  return items;
+}
+
+function buildToolOutput(targetChars, shape, fixtureFamily = null, partIndex = 0, partCount = 1) {
+  const partLabel = partCount > 1 ? ` tool_part=${partIndex + 1}/${partCount}` : "";
+  if (shape === "structured") {
+    let output = "";
+    for (let index = 0; output.length < targetChars; index += 1) {
+      const record = {
+        fixture: "structured-tool-output",
+        index,
+        status: index % 5 === 0 ? "changed" : "unchanged",
+        path: `fixture/module-${index % 37}/item-${index}.json`,
+        values: [index % 11, (index * 7) % 101, "stable"]
+      };
+      if (fixtureFamily) record.fixture_family = fixtureFamily;
+      if (partCount > 1) record.tool_part = partIndex + 1;
+      output += JSON.stringify(record) + "\n";
+    }
+    return output.slice(0, targetChars);
+  }
+  if (shape === "noisy") {
+    let output = "";
+    for (let index = 0; output.length < targetChars; index += 1) {
+      const day = String(index % 28 + 1).padStart(2, "0");
+      const stamp = `2026-01-${day}T12:${String(index % 60).padStart(2, "0")}:00Z`;
+      const hash = String(index.toString(16)).padStart(16, "0");
+      const family = fixtureFamily ? ` fixture_family=${fixtureFamily}` : "";
+      output += `${stamp} INFO fixture${family}${partLabel} path=/workspace/fixture/${index % 53}/file-${index}.ts hash=${hash} payload={"line":${index},"state":"ok"}\n`;
+    }
+    return output.slice(0, targetChars);
+  }
+  const unit = fixtureFamily
+    ? `tool-output [${fixtureFamily}]${partLabel}: stable release validation data; `
+    : `tool-output${partLabel}: stable release validation data; `;
   return unit.repeat(Math.ceil(targetChars / unit.length)).slice(0, targetChars);
+}
+
+function releaseFixtureCallId(pair, fixtureFamily = null, partIndex = 0, partCount = 1) {
+  const family = fixtureFamily ? `_${safeSegment(fixtureFamily)}` : "";
+  const part = partCount > 1 ? `_part_${partIndex + 1}` : "";
+  return `call_release_fixture${family}_pair_${Number(pair)}${part}`;
+}
+
+function releaseFixtureConversationIdentity(pair, fixtureFamily = null) {
+  const family = fixtureFamily ? safeSegment(fixtureFamily) : `pair-${Number(pair)}`;
+  return {
+    session_id: `release-champion-session-${family}`,
+    thread_id: `release-champion-thread-${family}`
+  };
 }
 
 function extractCompactionItems(responseText) {
@@ -1073,6 +1410,15 @@ function normalizeScenario(value) {
   return new Set(["full-replay", "tool-burst", "tool-tail-maturity", "compacted-anchor"]).has(normalized)
     ? normalized
     : null;
+}
+
+function normalizeToolOutputShape(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  if (new Set(["flat", "structured", "noisy"]).has(normalized)) return normalized;
+  throw new FailClosedError(
+    "invalid_tool_output_shape",
+    "--tool-output-shape must be flat, structured, or noisy"
+  );
 }
 
 function codexProviderId(configText) {
@@ -1231,6 +1577,18 @@ function validateOpaqueHash(value, label) {
   return normalized;
 }
 
+function optionalUpstreamUserAgent(value) {
+  if (value === undefined) return null;
+  const normalized = String(value).trim();
+  if (!normalized || normalized.length > 256 || /[\r\n]/u.test(normalized)) {
+    throw new FailClosedError(
+      "invalid_upstream_user_agent",
+      "--upstream-user-agent must be a non-empty single-line value up to 256 characters"
+    );
+  }
+  return normalized;
+}
+
 function boundedInteger(value, label, minimum, maximum) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
@@ -1259,6 +1617,17 @@ function parseArgs(items) {
 
 function booleanArg(value) {
   return value === true || new Set(["1", "true", "on", "yes"]).has(String(value).toLowerCase());
+}
+
+function resolveFreshFixturePerPair(options) {
+  const reuseFixtureAcrossPairs = booleanArg(options["reuse-fixture-across-pairs"]);
+  if (reuseFixtureAcrossPairs && booleanArg(options["fresh-fixture-per-pair"])) {
+    throw new FailClosedError(
+      "conflicting_fixture_reuse_flags",
+      "--fresh-fixture-per-pair and --reuse-fixture-across-pairs cannot be used together"
+    );
+  }
+  return !reuseFixtureAcrossPairs;
 }
 
 function ratio(numerator, denominator) {
@@ -1343,7 +1712,12 @@ function printUsage() {
     --champion-exe <old.exe> --candidate-exe <new.exe> \\
     --source-config-dir <Atoapi-config-dir> --model <model> \\
     --key-realm-hash <opaque-hash> [--provider-id <id>] \\
-    [--scenario full-replay|tool-burst|tool-tail-maturity|compacted-anchor] [--pairs 2] [--turns 6]
+    [--scenario full-replay|tool-burst|tool-tail-maturity|compacted-anchor] [--pairs 2] [--turns 6] \\
+    [--seed-context-chars <0-512000>] [--tool-calls <1-8>] [--tool-output-shape flat|structured|noisy] \\
+    [--reuse-fixture-across-pairs] \\
+    [--max-full-bucket-regression-requests <calibrated-count>] \\
+    [--upstream-user-agent <test-only-stable-value>] \\
+    [--champion-upstream-user-agent <value>] [--candidate-upstream-user-agent <value>]
 
 Offline comparison (does not start any process):
   node scripts/verify-release-champion.mjs \\
@@ -1353,21 +1727,106 @@ Safety:
   --live is required before an upstream-backed isolated run.  Missing config,
   usage, terminal SSE, key-realm evidence, or one-attempt/one-POST evidence
   fails closed.  The script only starts temporary isolated ports; it never
-  sends signals to the existing 18883 process.`);
+  sends signals to the existing 18883 process.  Each pair uses a fresh fixture
+  by default; --reuse-fixture-across-pairs is an explicit deterministic-repro
+  override.`);
 }
 
-function runSelfTest() {
+async function runSelfTest() {
   assert.deepEqual(parseArgs(["--pairs=2", "--live", "--model", "m"]), {
     pairs: "2",
     live: true,
     model: "m"
   });
+  assert.equal(resolveFreshFixturePerPair({}), true);
+  assert.equal(resolveFreshFixturePerPair({ "reuse-fixture-across-pairs": true }), false);
+  assert.throws(
+    () => resolveFreshFixturePerPair({
+      "fresh-fixture-per-pair": true,
+      "reuse-fixture-across-pairs": true
+    }),
+    /cannot be used together/u
+  );
   assert.equal(cacheableInputTokens128(1_023), 0);
   assert.equal(cacheableInputTokens128(1_024), 1_024);
   assert.equal(cacheableInputTokens128(1_151), 1_024);
   assert.equal(cacheableInputTokens128(1_152), 1_152);
   assert.equal(normalizeScenario("tool_burst"), "tool-burst");
   assert.equal(normalizeScenario("tool_tail_maturity"), "tool-tail-maturity");
+  assert.equal(normalizeToolOutputShape("structured"), "structured");
+  assert.equal(normalizeToolOutputShape("noisy"), "noisy");
+  assert.equal(buildSeedContext(128).length, 128);
+  for (const shape of ["flat", "structured", "noisy"]) {
+    assert.equal(buildToolOutput(4096, shape).length, 4096);
+  }
+  assert.equal(releaseFixtureCallId(2), "call_release_fixture_pair_2");
+  const pairFixtureA = "fixture-pair-a";
+  const pairFixtureB = "fixture-pair-b";
+  assert.equal(
+    buildSeedContext(128, pairFixtureA),
+    buildSeedContext(128, pairFixtureA),
+    "both arms in one pair must receive identical seed context"
+  );
+  assert.notEqual(
+    buildSeedContext(128, pairFixtureA),
+    buildSeedContext(128, pairFixtureB),
+    "fresh fixtures must split seed context across pairs"
+  );
+  assert.equal(
+    buildStableInstructions(1024, pairFixtureA),
+    buildStableInstructions(1024, pairFixtureA),
+    "both arms in one pair must receive identical stable instructions"
+  );
+  assert.notEqual(
+    buildStableInstructions(1024, pairFixtureA),
+    buildStableInstructions(1024, pairFixtureB),
+    "fresh fixtures must split stable instructions across pairs"
+  );
+  for (const shape of ["flat", "structured", "noisy"]) {
+    assert.equal(
+      buildToolOutput(4096, shape, pairFixtureA),
+      buildToolOutput(4096, shape, pairFixtureA),
+      `both arms in one pair must receive identical ${shape} tool output`
+    );
+    assert.notEqual(
+      buildToolOutput(4096, shape, pairFixtureA),
+      buildToolOutput(4096, shape, pairFixtureB),
+      `fresh fixtures must split ${shape} tool output across pairs`
+    );
+  }
+  assert.equal(
+    releaseFixtureCallId(2, pairFixtureA),
+    releaseFixtureCallId(2, pairFixtureA),
+    "both arms in one pair must use the same tool call id"
+  );
+  assert.notEqual(
+    releaseFixtureCallId(2, pairFixtureA),
+    releaseFixtureCallId(3, pairFixtureB),
+    "fresh fixtures must split tool call ids across pairs"
+  );
+  const multiToolItems = buildToolFixtureItems({
+    pair: 2,
+    fixtureFamily: pairFixtureA,
+    targetChars: 4096,
+    shape: "noisy",
+    calls: 4
+  });
+  assert.equal(multiToolItems.length, 8);
+  const multiToolOutputs = multiToolItems
+    .filter((item) => item.type === "function_call_output")
+    .map((item) => item.output);
+  assert.equal(multiToolOutputs.reduce((sum, output) => sum + output.length, 0), 4096);
+  assert.equal(new Set(multiToolItems.map((item) => item.call_id)).size, 4);
+  assert.deepEqual(
+    releaseFixtureConversationIdentity(2, pairFixtureA),
+    releaseFixtureConversationIdentity(2, pairFixtureA),
+    "both arms in one pair must replay the same logical conversation identity"
+  );
+  assert.notDeepEqual(
+    releaseFixtureConversationIdentity(2, pairFixtureA),
+    releaseFixtureConversationIdentity(3, pairFixtureB),
+    "fresh fixtures must isolate conversation identities across pairs"
+  );
   assert.equal(requestFamilyForScenario("full-replay"), "codex-responses-full-replay");
   const cohort = {
     provider_id: "provider-a",
@@ -1412,6 +1871,27 @@ function runSelfTest() {
   });
   assert.equal(compareArmResults(valid("champion", 0.9), valid("candidate", 0.9), 0).pass, true);
   assert.equal(compareArmResults(valid("champion", 0.9), valid("candidate", 0.89), 0).pass, false);
+  const cacheWinsButRemoteTtftVaries = valid("candidate", 0.9);
+  cacheWinsButRemoteTtftVaries.metrics.ttft_p95_ms = 125;
+  const splitVerdict = compareArmResults(
+    valid("champion", 0.9),
+    cacheWinsButRemoteTtftVaries,
+    0
+  );
+  assert.equal(splitVerdict.pass, false);
+  assert.equal(splitVerdict.cache_pass, true);
+  assert.equal(splitVerdict.latency_pass, false);
+  const oneFullBucketBehind = valid("candidate", 0.9);
+  oneFullBucketBehind.metrics.full_bucket_requests = 2;
+  oneFullBucketBehind.metrics.full_bucket_rate = 0.5;
+  assert.equal(
+    compareArmResults(valid("champion", 0.9), oneFullBucketBehind, 0).pass,
+    false
+  );
+  assert.equal(
+    compareArmResults(valid("champion", 0.9), oneFullBucketBehind, 0, 1).pass,
+    true
+  );
   const mismatched = valid("candidate", 0.9);
   mismatched.cohort = { ...cohort, model: "other" };
   assert.equal(compareArmResults(valid("champion", 0.9), mismatched, 0).pass, false);
@@ -1443,5 +1923,25 @@ function runSelfTest() {
   ]);
   assert.equal(aggregate.pass, true);
   assert.equal(generatedPromptCacheKey("test", "lane").startsWith("atoapi-"), true);
+  const sourceRoot = await mkdtemp(join(tmpdir(), "atoapi-release-champion-self-test-"));
+  let snapshot = null;
+  try {
+    await writeFile(join(sourceRoot, "config.toml"), 'local_key = "before"\n', "utf8");
+    await writeFile(join(sourceRoot, "cache-key.dpapi"), "before-key", "utf8");
+    snapshot = await snapshotLiveConfig(sourceRoot);
+    await writeFile(join(sourceRoot, "config.toml"), 'local_key = "after"\n', "utf8");
+    await writeFile(join(sourceRoot, "cache-key.dpapi"), "after-key", "utf8");
+    assert.equal(
+      await readRequiredText(join(snapshot.configDir, "config.toml"), "snapshotted self-test config"),
+      'local_key = "before"\n'
+    );
+    assert.equal(
+      await readRequiredText(join(snapshot.configDir, "cache-key.dpapi"), "snapshotted self-test key"),
+      "before-key"
+    );
+  } finally {
+    if (snapshot) await rm(snapshot.root, { recursive: true, force: true });
+    await rm(sourceRoot, { recursive: true, force: true });
+  }
   console.log(JSON.stringify({ schema: SCHEMA, self_test: "passed" }));
 }
