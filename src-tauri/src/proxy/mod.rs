@@ -86,6 +86,7 @@ mod streaming_responses_anthropic;
 mod streaming_responses_chat;
 mod transform_codex_chat;
 mod transport;
+mod upstream_affinity;
 mod warm_pending;
 #[cfg(test)]
 mod wire_fixture_tests;
@@ -144,6 +145,8 @@ use settlement_pipeline::{
     AgentOwnerSettlementGuard,
 };
 pub(crate) use transport::TransportClients;
+use upstream_affinity::UpstreamAffinityScope;
+pub(crate) use upstream_affinity::UpstreamCacheAffinity;
 use warm_pending::WarmPendingClaim;
 pub(crate) use warm_pending::WarmPendingRegistry;
 #[cfg(test)]
@@ -287,6 +290,13 @@ struct UpstreamRequestDiagnostics {
     gzip_attempted: bool,
     gzip_fallback_used: bool,
     gzip_skipped_cold_stream: bool,
+    // Boolean-only relay signal. The opaque upstream cookie value never leaves
+    // the process-local affinity store.
+    upstream_affinity_injected: bool,
+    // The response head taught a recognized placement cookie. A 2xx head is
+    // not a successful Response settlement: an SSE/JSON terminal failure must
+    // discard this just-learned hint before a later inbound can inherit it.
+    upstream_affinity_learned: bool,
     sent_body_bytes: u64,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
     sent_cache_capability_fields: Vec<ProviderCacheCapabilityField>,
@@ -336,6 +346,8 @@ impl UpstreamRequestDiagnostics {
         self.gzip_encode_ms += next.gzip_encode_ms;
         self.gzip_fallback_used |= next.gzip_fallback_used;
         self.gzip_skipped_cold_stream |= next.gzip_skipped_cold_stream;
+        self.upstream_affinity_injected |= next.upstream_affinity_injected;
+        self.upstream_affinity_learned |= next.upstream_affinity_learned;
         self.sent_body_bytes = next.sent_body_bytes;
         self.outbound_prefix_fingerprints = next.outbound_prefix_fingerprints.clone();
         if !next.sent_cache_capability_fields.is_empty() {
@@ -380,6 +392,36 @@ impl UpstreamRequestDiagnostics {
             self.warm_pending_claim = next.warm_pending_claim.clone();
         }
     }
+
+    fn should_clear_upstream_affinity_after_failed_settlement(&self) -> bool {
+        self.upstream_affinity_injected || self.upstream_affinity_learned
+    }
+}
+
+fn clear_upstream_affinity_after_failed_settlement(
+    state: &AppState,
+    response_session_key: Option<&str>,
+    diagnostics: &UpstreamRequestDiagnostics,
+) {
+    if !diagnostics.should_clear_upstream_affinity_after_failed_settlement() {
+        return;
+    }
+    let Some(scope) = response_session_key.and_then(UpstreamAffinityScope::from_anchor_key) else {
+        return;
+    };
+    if let Ok(mut affinity) = state.upstream_cache_affinity.try_lock() {
+        affinity.clear(&scope);
+    }
+}
+
+fn upstream_affinity_enabled_for_dispatch() -> bool {
+    // A third-party load-balancer cookie changes an otherwise identical
+    // request's upstream placement. Live long-replay A/Bs have not shown a
+    // stable cache benefit and did show waterline regressions on some routes.
+    // Keep the bounded cleanup/diagnostic plumbing inert rather than letting
+    // an unproven transport hint alter normal user traffic. This does not
+    // switch Provider or Key and never adds a second upstream request.
+    false
 }
 
 /// Single owner for one final-scope shadow ticket. Normal sync/stream paths
@@ -2911,8 +2953,10 @@ async fn run_generation_for_authorized_agent(
     // request or a later local-lineage continuation: adding a static field only
     // on the second request creates a real upstream cache prefix split.  A
     // verified route therefore receives the same eligible generated controls
-    // from its first ordinary request onward; compaction remains an explicit
-    // fresh epoch boundary.
+    // from its first request onward, including a compaction root. Compaction
+    // remains a fresh semantic epoch, but it is also the root that must warm
+    // the next ordinary FullReplay request; omitting a static field only on
+    // that root creates an avoidable second placement split.
     let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
         agent_generation,
         native_responses_passthrough,
@@ -3455,10 +3499,21 @@ async fn run_generation_for_authorized_agent(
         client_requested_stream,
         generation_plan.request_plan().body_len(),
     );
+    // Only an unchanged, adapter-attested route may inherit upstream
+    // load-balancer placement. Compatibility reroutes have a different final
+    // endpoint/channel and deliberately get no affinity scope.
+    let upstream_affinity_scope = (active_request_channel == decision.upstream_channel)
+        .then(|| {
+            action_scope
+                .as_ref()
+                .map(UpstreamAffinityScope::from_action_scope)
+        })
+        .flatten();
     let mut frozen_generation = generation_plan
         .with_gzip_enabled(
             decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
         )
+        .with_upstream_affinity_scope(upstream_affinity_scope)
         .into_dispatch();
     let mut request_plan = Some(frozen_generation.take_one_shot_plan());
     let active_upstream_body = frozen_generation.body();
@@ -3974,6 +4029,19 @@ async fn run_generation_for_authorized_agent(
         request_metric_errors.push(("upstream_sse_error".to_string(), error_summary));
         status = StatusCode::BAD_GATEWAY.as_u16();
         is_success_status = false;
+    }
+    // Some third-party Responses routes return HTTP 200 with a JSON/SSE error
+    // body. Treat a failed settlement after either an injected placement hint
+    // or a just-learned 2xx-head cookie exactly like an HTTP rejection: forget
+    // it only for a later inbound, never retry or alter this request.
+    if !is_success_status
+        && upstream_request_diagnostics.should_clear_upstream_affinity_after_failed_settlement()
+    {
+        clear_upstream_affinity_after_failed_settlement(
+            &state,
+            response_session_key.as_deref(),
+            &upstream_request_diagnostics,
+        );
     }
     let cache_capability_rejected_fields = (!is_success_status)
         .then(|| cache_capability_rejection_fields_from_error_bytes(settlement_bytes))
@@ -10554,7 +10622,7 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
     };
     diagnostics.attempts = 1;
     let sending_gzip = compressed_body.is_some();
-    let outbound_headers = build_upstream_request_headers(
+    let mut outbound_headers = build_upstream_request_headers(
         inbound_headers,
         api_key,
         channel,
@@ -10562,6 +10630,25 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
         plan.custom_user_agent(),
         sending_gzip,
     );
+    // A scope is present only for an adapter-attested, unchanged selected
+    // route. The value is an opaque in-memory load-balancer placement cookie;
+    // lookup uses try_lock so affinity can never delay or duplicate an
+    // upstream request. Caller-originated Cookie headers always win.
+    let affinity_scope = upstream_affinity_enabled_for_dispatch()
+        .then(|| plan.upstream_affinity_scope().cloned())
+        .flatten();
+    let injected_affinity_scope = affinity_scope.as_ref().and_then(|scope| {
+        state
+            .upstream_cache_affinity
+            .try_lock()
+            .ok()
+            .and_then(|mut affinity| {
+                affinity
+                    .inject_if_available(scope, &mut outbound_headers, Instant::now())
+                    .then(|| scope.clone())
+            })
+    });
+    diagnostics.upstream_affinity_injected = injected_affinity_scope.is_some();
     // The default direct/system-proxy paths keep their prebuilt references and
     // pay no pool lock. Only an explicitly configured proxy URL enters the
     // bounded dynamic pool, whose cloned Client preserves its connection pool.
@@ -10610,6 +10697,18 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
             let headers_ms = send_started.elapsed().as_millis() as u64;
             diagnostics.headers_ms = headers_ms;
             observe_upstream_response_timing(&mut diagnostics, &response, headers_ms);
+            if let Some(scope) = affinity_scope.as_ref() {
+                if response.status().is_success() {
+                    if let Ok(mut affinity) = state.upstream_cache_affinity.try_lock() {
+                        diagnostics.upstream_affinity_learned = affinity
+                            .learn_from_success_response(scope, response.headers(), Instant::now());
+                    }
+                } else if injected_affinity_scope.is_some() {
+                    if let Ok(mut affinity) = state.upstream_cache_affinity.try_lock() {
+                        affinity.clear(scope);
+                    }
+                }
+            }
             // Do not retry an incompatible gzip request. Learn that state for
             // the next independent inbound and preserve this original result.
             if sending_gzip && should_retry_without_gzip(response.status()) {
@@ -10631,6 +10730,11 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
             diagnostics.timing_source = None;
             diagnostics.reported_processing_ms = None;
             diagnostics.non_processing_ms = None;
+            if let Some(scope) = injected_affinity_scope.as_ref() {
+                if let Ok(mut affinity) = state.upstream_cache_affinity.try_lock() {
+                    affinity.clear(scope);
+                }
+            }
             Err(err.into())
         }
     }
@@ -12003,14 +12107,13 @@ fn generated_native_full_replay_cache_controls_eligible(
     native_responses_passthrough: bool,
     active_request_channel: &Channel,
     active_used_response_session: bool,
-    response_session_starts_compaction_epoch: bool,
+    _response_session_starts_compaction_epoch: bool,
     has_trusted_generated_cache_identity: bool,
 ) -> bool {
     agent_generation
         && native_responses_passthrough
         && matches!(active_request_channel, Channel::Responses)
         && !active_used_response_session
-        && !response_session_starts_compaction_epoch
         && has_trusted_generated_cache_identity
 }
 
@@ -20192,7 +20295,8 @@ mod tests {
     }
 
     #[test]
-    fn generated_native_cache_controls_keep_the_same_root_and_followup_eligibility() {
+    fn generated_native_cache_controls_keep_the_same_root_followup_and_compaction_root_eligibility()
+    {
         let root = generated_native_full_replay_cache_controls_eligible(
             true,
             true,
@@ -20220,7 +20324,10 @@ mod tests {
             false,
             true,
         ));
-        assert!(!generated_native_full_replay_cache_controls_eligible(
+        // A compaction starts a new semantic epoch, but is still the root of
+        // the next cache placement. Omitting the generated key here would
+        // make its ordinary child introduce a second static wire shape.
+        assert!(generated_native_full_replay_cache_controls_eligible(
             true,
             true,
             &Channel::Responses,
@@ -20236,6 +20343,14 @@ mod tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn upstream_affinity_cookie_is_disabled_for_normal_dispatch() {
+        assert!(
+            !upstream_affinity_enabled_for_dispatch(),
+            "normal traffic must not inherit an unproven third-party placement cookie"
+        );
     }
 
     #[test]
@@ -26664,12 +26779,17 @@ mod tests {
                             b"data: Request blocked\n\n",
                         ));
                     };
-                    Response::builder()
+                    let mut response = Response::builder()
                         .status(StatusCode::OK)
                         .header(header::CONTENT_TYPE, "text/event-stream")
                         .header("cf-ray", "test-waf-ray-HKG")
                         .body(Body::from_stream(stream))
-                        .unwrap()
+                        .unwrap();
+                    response.headers_mut().append(
+                        header::SET_COOKIE,
+                        HeaderValue::from_static("AWSALB=opaque-placement; Path=/; HttpOnly"),
+                    );
+                    response
                 }
             }),
         );
@@ -26693,10 +26813,21 @@ mod tests {
             tool_output_lines: 14_871,
             noise_indicators: 5,
         };
+        let affinity_scope = UpstreamAffinityScope::for_test("blocked-affinity-session");
+        let upstream_affinity_learned = state
+            .upstream_cache_affinity
+            .lock()
+            .unwrap()
+            .learn_from_success_response(&affinity_scope, upstream.headers(), Instant::now());
+        assert!(
+            upstream_affinity_learned,
+            "the HTTP 200 response head must teach the recognized placement before its SSE terminal arrives"
+        );
         let mut upstream_diagnostics = UpstreamRequestDiagnostics::default();
         upstream_diagnostics.upstream_trace_source = Some("cf-ray".to_string());
         upstream_diagnostics.upstream_trace_id = Some("test-waf-ray-HKG".to_string());
         upstream_diagnostics.full_replay_risk_shape = Some(blocked_shape);
+        upstream_diagnostics.upstream_affinity_learned = upstream_affinity_learned;
         let response = stream_upstream(
             state.clone(),
             upstream,
@@ -26722,7 +26853,7 @@ mod tests {
             AppConfig::default(),
             None,
             None,
-            None,
+            Some("blocked-affinity-session".to_string()),
             None,
             None,
             LineageParent::FullReplay,
@@ -26763,6 +26894,14 @@ mod tests {
         assert!(text.contains("atoapi_trace_id=request-blocked-trace"));
         assert!(text.contains("upstream_trace=cf-ray:test-waf-ray-HKG"));
         assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            !state
+                .upstream_cache_affinity
+                .lock()
+                .unwrap()
+                .contains(&affinity_scope),
+            "a 200 + Request blocked terminal must clear a just-learned affinity only for later inbounds"
+        );
 
         let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -37955,6 +38094,592 @@ mod tests {
         assert!(outcome.diagnostics.sent_body_bytes < outcome.diagnostics.request_body_bytes);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn upstream_affinity_cookie_is_never_replayed_after_upstream_sets_it() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-upstream-affinity-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let hits = hits_for_route.clone();
+                async move {
+                    let request_index = hits.fetch_add(1, Ordering::SeqCst);
+                    match request_index {
+                        0 => {
+                            assert!(
+                                !headers.contains_key(header::COOKIE),
+                                "the first inbound has no learned affinity"
+                            );
+                            let mut response = Json(json!({
+                                "id": "resp_affinity_first",
+                                "output": [],
+                                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                            }))
+                            .into_response();
+                            response.headers_mut().append(
+                                header::SET_COOKIE,
+                                HeaderValue::from_static(
+                                    "AWSALB=opaque-placement; Path=/; HttpOnly",
+                                ),
+                            );
+                            response
+                        }
+                        1 => {
+                            assert!(
+                                !headers.contains_key(header::COOKIE),
+                                "normal dispatch must not replay a third-party placement cookie"
+                            );
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({"error": {"message": "placement rejected"}})),
+                            )
+                                .into_response()
+                        }
+                        2 => {
+                            assert!(
+                                !headers.contains_key(header::COOKIE),
+                                "a third-party placement cookie must never survive to a later inbound"
+                            );
+                            Json(json!({
+                                "id": "resp_affinity_after_clear",
+                                "output": [],
+                                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                            }))
+                            .into_response()
+                        }
+                        _ => panic!("one inbound must issue exactly one upstream POST"),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let url = format!("http://{upstream_addr}/v1/responses");
+        let provider = test_responses_provider(url.clone());
+        let body = json!({"model": "gpt-test", "input": "ping", "stream": false});
+        let scope = UpstreamAffinityScope::for_test("trusted-session-and-selected-key-realm");
+        for expected_status in [StatusCode::OK, StatusCode::BAD_REQUEST, StatusCode::OK] {
+            let plan = RequestPlan::new(&provider, url.clone(), Channel::Responses, &body)
+                .with_upstream_affinity_scope(Some(scope.clone()));
+            let outcome = send_main_upstream_request(
+                &state,
+                "upstream-key",
+                plan.into_one_shot(),
+                &HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.response.status(), expected_status);
+            assert_eq!(outcome.diagnostics.attempts, 1);
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert!(
+            !state
+                .upstream_cache_affinity
+                .lock()
+                .unwrap()
+                .contains(&scope),
+            "disabled dispatch must not retain an upstream placement cookie"
+        );
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn upstream_affinity_cookie_from_a_200_json_error_is_never_learned() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-upstream-affinity-json-error-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_route = hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let hits = hits_for_route.clone();
+                async move {
+                    match hits.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            assert!(
+                                !headers.contains_key(header::COOKIE),
+                                "the first inbound has no learned affinity"
+                            );
+                            let mut response = Json(json!({
+                                "error": {"message": "response body rejected"}
+                            }))
+                            .into_response();
+                            response.headers_mut().append(
+                                header::SET_COOKIE,
+                                HeaderValue::from_static(
+                                    "AWSALB=opaque-json-placement; Path=/; HttpOnly",
+                                ),
+                            );
+                            response
+                        }
+                        1 => {
+                            assert!(
+                                !headers.contains_key(header::COOKIE),
+                                "a 200 JSON error must not leave a placement cookie for the next inbound"
+                            );
+                            Json(json!({
+                                "id": "resp_affinity_json_after_clear",
+                                "output": [],
+                                "usage": {"input_tokens": 1, "output_tokens": 1}
+                            }))
+                            .into_response()
+                        }
+                        _ => panic!("one inbound must issue exactly one upstream POST"),
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let url = format!("http://{upstream_addr}/v1/responses");
+        let provider = test_responses_provider(url.clone());
+        let body = json!({"model": "gpt-test", "input": "ping", "stream": false});
+        let scope_key = "trusted-session-and-selected-key-realm-json-error";
+        let scope = UpstreamAffinityScope::for_test(scope_key);
+        let first = send_main_upstream_request(
+            &state,
+            "upstream-key",
+            RequestPlan::new(&provider, url.clone(), Channel::Responses, &body)
+                .with_upstream_affinity_scope(Some(scope.clone()))
+                .into_one_shot(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.response.status(), StatusCode::OK);
+        assert_eq!(first.diagnostics.attempts, 1);
+        assert!(!first.diagnostics.upstream_affinity_injected);
+        assert!(!first.diagnostics.upstream_affinity_learned);
+        assert!(
+            !state
+                .upstream_cache_affinity
+                .lock()
+                .unwrap()
+                .contains(&scope),
+            "disabled dispatch must not learn a placement cookie from a 200 response head"
+        );
+        let first_body = first.response.bytes().await.unwrap();
+        assert!(json_body_has_error(&first_body));
+
+        let second = send_main_upstream_request(
+            &state,
+            "upstream-key",
+            RequestPlan::new(&provider, url, Channel::Responses, &body)
+                .with_upstream_affinity_scope(Some(scope))
+                .into_one_shot(),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.response.status(), StatusCode::OK);
+        assert_eq!(second.diagnostics.attempts, 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn loopback_proxy_never_replays_upstream_affinity_and_keeps_one_post_per_inbound() {
+        const INPUT_TOKENS: u64 = 250_000;
+        const WARM_CACHE_TOKENS: u64 = 249_000;
+
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    let request_index = upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        !headers.contains_key(header::COOKIE),
+                        "normal requests must never replay a third-party worker-placement cookie"
+                    );
+                    let cached_tokens = (request_index > 0)
+                        .then_some(WARM_CACHE_TOKENS)
+                        .unwrap_or_default();
+                    let mut response = Json(json!({
+                        "id": format!("resp_affinity_loopback_{request_index}"),
+                        "object": "response",
+                        "model": "gpt-5.6-terra",
+                        "status": "completed",
+                        "output": [{
+                            "type": "message",
+                            "id": format!("msg_affinity_loopback_{request_index}"),
+                            "role": "assistant",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "done",
+                                "annotations": []
+                            }]
+                        }],
+                        "usage": {
+                            "input_tokens": INPUT_TOKENS,
+                            "output_tokens": 1,
+                            "input_tokens_details": {"cached_tokens": cached_tokens}
+                        }
+                    }))
+                    .into_response();
+                    if request_index == 0 {
+                        response.headers_mut().append(
+                            header::SET_COOKIE,
+                            HeaderValue::from_static(
+                                "AWSALB=opaque-loopback-placement; Path=/; HttpOnly",
+                            ),
+                        );
+                    }
+                    response
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "affinity-loopback-local-key".to_string();
+        config.workspace_fingerprint = "affinity-loopback-workspace".to_string();
+        // Exercise the real upstream path, not Atoapi's local response cache.
+        config.cache.enabled = false;
+        config.cache.exact_enabled = false;
+        config.cache.semantic_enabled = false;
+        config.cache.prewarm_enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "affinity-loopback-provider".to_string();
+        provider.api_key_encrypted = Some("affinity-loopback-provider-key".to_string());
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "affinity-loopback-provider");
+        let codex_agent_key = agent_injection::agent_local_key(&config.local_key, "codex");
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-affinity-loopback-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_state = state.clone();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(proxy_state))
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let metadata =
+            r#"{"thread_id":"affinity-loopback-thread","session_id":"affinity-loopback-session"}"#;
+        let first_input = json!([{
+            "type": "message",
+            "role": "user",
+            "content": "first"
+        }]);
+        let mut second_items = first_input.as_array().unwrap().clone();
+        second_items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"done","annotations":[]}]
+        }));
+        second_items.push(json!({"type":"message","role":"user","content":"continue"}));
+        let mut third_items = second_items.clone();
+        third_items.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type":"output_text","text":"done","annotations":[]}]
+        }));
+        third_items.push(json!({"type":"message","role":"user","content":"continue again"}));
+        for input in [
+            first_input,
+            Value::Array(second_items),
+            Value::Array(third_items),
+        ] {
+            let response = client
+                .post(format!("http://{proxy_addr}/v1/responses"))
+                .bearer_auth(&codex_agent_key)
+                .header(X_CODEX_TURN_METADATA_HEADER, metadata)
+                .json(&json!({
+                    "model": "gpt-5.6-terra",
+                    "stream": false,
+                    "input": input
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["status"], "completed");
+        }
+
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                let matching = snapshot
+                    .recent_requests
+                    .iter()
+                    .filter(|request| {
+                        request.provider_id.as_deref() == Some("affinity-loopback-provider")
+                    })
+                    .count();
+                if matching >= 3 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("loopback affinity settlements must complete");
+        let mut cache_reads = metrics
+            .recent_requests
+            .iter()
+            .filter(|request| request.provider_id.as_deref() == Some("affinity-loopback-provider"))
+            .filter_map(|request| request.cache_read_tokens)
+            .collect::<Vec<_>>();
+        cache_reads.sort_unstable();
+        assert_eq!(cache_reads, vec![0, WARM_CACHE_TOKENS, WARM_CACHE_TOKENS]);
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+        assert!(
+            !serde_json::to_string(&metrics)
+                .unwrap()
+                .contains("opaque-loopback-placement"),
+            "upstream affinity values must never enter metrics"
+        );
+        assert!(
+            !format!("{:?}", state.upstream_cache_affinity.lock().unwrap())
+                .contains("opaque-loopback-placement"),
+            "upstream affinity values must never enter debug output"
+        );
+
+        proxy_task.abort();
+        upstream_task.abort();
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit real selected-upstream affinity smoke test; requires ATOAPI_REAL_UPSTREAM_AFFINITY_TEST=1"]
+    async fn real_selected_upstream_affinity_smoke_uses_three_single_attempt_turns() {
+        struct IsolatedProbeCleanup(std::path::PathBuf);
+
+        impl Drop for IsolatedProbeCleanup {
+            fn drop(&mut self) {
+                let Ok(resolved_probe_dir) = self.0.canonicalize() else {
+                    return;
+                };
+                if resolved_probe_dir.starts_with(std::env::temp_dir()) {
+                    fs::remove_dir_all(resolved_probe_dir).ok();
+                }
+            }
+        }
+
+        assert_eq!(
+            std::env::var("ATOAPI_REAL_UPSTREAM_AFFINITY_TEST")
+                .ok()
+                .as_deref(),
+            Some("1"),
+            "this test may call the currently selected real upstream; opt in explicitly"
+        );
+
+        let source_config = crate::config::config_path().expect("current Atoapi config path");
+        assert!(
+            source_config.exists(),
+            "the real probe needs the current selected-upstream configuration"
+        );
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-real-affinity-smoke-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&config_dir).expect("create isolated real-probe directory");
+        let _cleanup = IsolatedProbeCleanup(config_dir.clone());
+        let isolated_config = config_dir.join("config.toml");
+        fs::copy(&source_config, &isolated_config)
+            .expect("copy the encrypted selected-upstream config into the isolated probe");
+        let port_reservation = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve a loopback test port");
+        let port = port_reservation
+            .local_addr()
+            .expect("read reserved loopback port")
+            .port();
+        drop(port_reservation);
+
+        let mut config = AppConfig::load_or_create(&isolated_config)
+            .expect("load only the isolated configuration copy");
+        let codex_route = config
+            .agent_injections
+            .iter()
+            .find(|item| item.id == "codex" && item.enabled)
+            .cloned()
+            .expect("the real probe requires the currently enabled Codex route");
+        let provider_id = codex_route
+            .provider_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .expect("the enabled Codex route must have a selected provider")
+            .to_string();
+        let provider = config
+            .providers
+            .iter()
+            .find(|item| item.id == provider_id)
+            .expect("the Codex route provider must exist in the isolated copy");
+        let model = codex_route
+            .model_id
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                provider
+                    .models
+                    .iter()
+                    .find(|item| item.enabled)
+                    .map(|item| item.id.clone())
+            })
+            .or_else(|| {
+                let codex_config_path = codex_route.target_path.clone().unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .expect("locate Codex home for the selected-model fallback")
+                        .join(".codex")
+                        .join("config.toml")
+                });
+                fs::read_to_string(codex_config_path)
+                    .ok()
+                    .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+                    .and_then(|value| {
+                        value
+                            .get("model")
+                            .and_then(toml::Value::as_str)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(ToOwned::to_owned)
+                    })
+            })
+            .expect("the selected provider needs an enabled model for the real probe");
+        // Use a test-only local key on the copied config. This never changes
+        // the running 18883 service, Codex files, Provider/Key order, or the
+        // user's original configuration.
+        config.local_key = format!("atoapi-real-affinity-probe-{}", Uuid::new_v4().simple());
+        config.host = "127.0.0.1".to_string();
+        config.port = port;
+        config.proxy_mode_host = "127.0.0.1".to_string();
+        config.proxy_mode_port = port.saturating_add(1);
+        config.proxy_auto_start = false;
+        config
+            .save(&isolated_config)
+            .expect("save isolated probe config");
+        let codex_agent_key = agent_injection::agent_local_key(&config.local_key, "codex");
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                isolated_config.clone(),
+                CacheStore::load(cache_path(&config_dir)).expect("create isolated probe cache"),
+            )
+            .expect("build isolated current-upstream state"),
+        );
+        state
+            .start_proxy()
+            .await
+            .expect("start isolated probe proxy");
+
+        // Roughly 20k synthetic input tokens: sufficiently above normal cache
+        // thresholds, but contains no user context, tool output, secrets, or
+        // copied conversation material. The only tail change is the turn id.
+        let stable_prefix = (0..2_048)
+            .map(|index| {
+                format!("stable-affinity-probe-line-{index:04}: deterministic synthetic context\n")
+            })
+            .collect::<String>();
+        let client = reqwest::Client::new();
+        let metadata = r#"{"thread_id":"real-affinity-probe-thread","session_id":"real-affinity-probe-session"}"#;
+        let mut statuses = Vec::new();
+        for turn in 1..=3 {
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/codex/v1/responses"))
+                .bearer_auth(&codex_agent_key)
+                .header(X_CODEX_TURN_METADATA_HEADER, metadata)
+                .json(&json!({
+                    "model": model.as_str(),
+                    "stream": false,
+                    "instructions": stable_prefix.as_str(),
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": format!("Synthetic cache-affinity verification turn {turn}. Reply with OK.")
+                    }]
+                }))
+                .send()
+                .await
+                .expect("one isolated inbound must reach the selected real upstream");
+            statuses.push(response.status().as_u16());
+            assert!(
+                response.status().is_success(),
+                "the real probe does not retry failed upstream responses"
+            );
+        }
+
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(30), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.agent_generation.inbound_requests >= 3
+                    && snapshot.agent_generation.active_inbounds == 0
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the three real isolated inbounds must settle");
+        let affinity_learned = state.upstream_cache_affinity.lock().unwrap().len() > 0;
+        let cache_reads = metrics
+            .recent_requests
+            .iter()
+            .filter(|request| request.provider_id.as_deref() == Some(provider_id.as_str()))
+            .filter_map(|request| request.cache_read_tokens)
+            .collect::<Vec<_>>();
+        assert_eq!(metrics.agent_generation.inbound_requests, 3);
+        assert_eq!(metrics.agent_generation.generation_attempts, 3);
+        assert_eq!(metrics.agent_generation.max_attempts_per_inbound, 1);
+        assert_eq!(metrics.upstream_requests, 3);
+        eprintln!(
+            "REAL_AFFINITY_SMOKE statuses={statuses:?} affinity_learned={affinity_learned} cache_usage_records={} cached_token_samples={cache_reads:?}",
+            cache_reads.len(),
+        );
+
+        state
+            .stop_proxy()
+            .await
+            .expect("stop only the isolated probe proxy");
     }
 
     #[tokio::test]

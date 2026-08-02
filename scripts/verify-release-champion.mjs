@@ -19,6 +19,12 @@ import { fileURLToPath } from "node:url";
 // silently consume real upstream capacity or credentials; live comparison is
 // enabled only by an explicit --live plus both executable and config inputs.
 const SCHEMA = "atoapi-release-champion-v1";
+const STATIC_WIRE_FIELDS = [
+  "cache_metadata",
+  "instructions",
+  "tools_schema",
+  "pre_input_wire"
+];
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
 
@@ -84,7 +90,7 @@ async function runLiveComparison(options) {
   if (!scenario) {
     throw new FailClosedError(
       "invalid_scenario",
-      "--scenario must be full-replay, tool-burst, or compacted-anchor"
+      "--scenario must be full-replay, tool-burst, compacted-anchor, or compaction-root"
     );
   }
   const expectedFamily = requestFamilyForScenario(scenario);
@@ -96,7 +102,18 @@ async function runLiveComparison(options) {
     );
   }
   const pairs = boundedInteger(options.pairs ?? 2, "--pairs", 1, 8);
-  const turns = boundedInteger(options.turns ?? 6, "--turns", 3, 60);
+  const turns = boundedInteger(
+    options.turns ?? 6,
+    "--turns",
+    scenario === "compaction-root" ? 2 : 3,
+    60
+  );
+  if (scenario === "compaction-root" && turns !== 2) {
+    throw new FailClosedError(
+      "compaction_root_turn_count",
+      "--scenario compaction-root requires --turns 2 (seed plus compaction root)"
+    );
+  }
   const requestedPort = boundedInteger(options.port ?? 18_885, "--port", 1_024, 65_500);
   if (requestedPort === 18_883) {
     throw new FailClosedError(
@@ -124,7 +141,14 @@ async function runLiveComparison(options) {
   );
   const toolChars = boundedInteger(options["tool-chars"] ?? 32_768, "--tool-chars", 1_024, 512_000);
   const toolCalls = boundedInteger(options["tool-calls"] ?? 1, "--tool-calls", 1, 8);
-  const toolOutputShape = normalizeToolOutputShape(options["tool-output-shape"] ?? "flat");
+  const toolOutputShape = normalizeToolOutputShape(options["tool-output-shape"] ?? "natural");
+  const fixtureProfile = normalizeFixtureProfile(options["fixture-profile"] ?? "natural");
+  if (!fixtureProfile) {
+    throw new FailClosedError(
+      "invalid_fixture_profile",
+      "--fixture-profile must be natural or legacy-repeated"
+    );
+  }
   // A repeated payload gives a later pair an upstream-warmed context and can
   // make a version look better or worse purely because of run order. New live
   // comparisons are therefore diverse by default. Reuse is explicit and only
@@ -135,6 +159,12 @@ async function runLiveComparison(options) {
     "--turn-delay-ms",
     0,
     5_000
+  );
+  const pairDelayMs = boundedInteger(
+    options["pair-delay-ms"] ?? 0,
+    "--pair-delay-ms",
+    0,
+    60_000
   );
   const requireCandidateGuardedRequests = boundedInteger(
     options["require-candidate-guarded-requests"] ?? 0,
@@ -162,6 +192,17 @@ async function runLiveComparison(options) {
     options["candidate-upstream-user-agent"]
   ) ?? sharedUpstreamUserAgent;
   const keepRunDir = booleanArg(options["keep-run-dir"]);
+  const isolateUpstreamCache = booleanArg(options["isolate-upstream-cache"]);
+  const requestedReuseRuntimePerArm = booleanArg(options["reuse-runtime-per-arm"]);
+  // An isolated-cache arm must not keep a process-owned upstream connection
+  // pool across pairs. Otherwise an upstream placement can remain permanently
+  // attached to the champion/candidate role even after the metadata lane is
+  // crossed over, making a same-binary control look like a product regression.
+  const reuseRuntimePerArm = effectiveReuseRuntimePerArm(
+    requestedReuseRuntimePerArm,
+    isolateUpstreamCache
+  );
+  const pinnedKeyId = optionalOpaqueIdentifier(options["key-id"], "--key-id");
   const sourceSnapshot = await snapshotLiveConfig(sourceConfigDir);
   try {
     const configText = await readRequiredText(
@@ -191,6 +232,7 @@ async function runLiveComparison(options) {
     if (!model) {
       throw new FailClosedError("invalid_model", "--model must not be empty");
     }
+    validatePinnedKeyConfiguration(configText, providerId, pinnedKeyId);
     await assertFile(championExe, "--champion-exe");
     await assertFile(candidateExe, "--candidate-exe");
 
@@ -213,14 +255,23 @@ async function runLiveComparison(options) {
       tool_chars: toolChars,
       tool_calls: toolCalls,
       tool_output_shape: toolOutputShape,
+      fixture_profile: fixtureProfile,
       fresh_fixture_per_pair: freshFixturePerPair,
       turn_delay_ms: turnDelayMs,
+      pair_delay_ms: pairDelayMs,
       require_candidate_guarded_requests: requireCandidateGuardedRequests,
       client_prompt_cache_key: Boolean(options["prompt-cache-key-prefix"]),
       max_ttft_regression_ms: maxTtftRegressionMs,
       max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
       champion_upstream_user_agent: championUpstreamUserAgent,
-      candidate_upstream_user_agent: candidateUpstreamUserAgent
+      candidate_upstream_user_agent: candidateUpstreamUserAgent,
+      isolate_upstream_cache: isolateUpstreamCache,
+      isolation_lane_strategy: isolateUpstreamCache ? "pair-crossover-v1" : "shared-v1",
+      reuse_runtime_per_arm: reuseRuntimePerArm,
+      reuse_runtime_per_arm_requested: requestedReuseRuntimePerArm,
+      runtime_reuse_disabled_for_isolation:
+        requestedReuseRuntimePerArm && isolateUpstreamCache,
+      key_id_pinned: Boolean(pinnedKeyId)
     };
     const artifacts = {
       champion: await executableArtifact(championExe),
@@ -228,54 +279,128 @@ async function runLiveComparison(options) {
     };
     const armRuns = { champion: [], candidate: [] };
     const orderedPairs = [];
-
-    for (let pair = 0; pair < pairs; pair += 1) {
-      // Alternating order removes the deterministic "first lane warmed later"
-      // bias without ever sharing a lane between old and new executables.
-      const order = pair % 2 === 0 ? ["champion", "candidate"] : ["candidate", "champion"];
-      orderedPairs.push(order);
-      const fixtureFamily = freshFixturePerPair
-        ? `fixture-${sha256Parts([
-          "release-champion-fixture-v2",
-          runId,
-          requestFamily,
-          scenario,
-          stableInstructionChars,
-          seedContextChars,
-          toolChars,
-          toolOutputShape,
-          pair
-        ]).slice(0, 16)}`
-        : null;
-      for (const arm of order) {
-        const executable = arm === "champion" ? championExe : candidateExe;
-        const lane = sha256Parts([
-          "release-champion-lane-v1",
-          runId,
-          keyRealmHash,
-          requestFamily,
-          pair,
-          arm
-        ]);
-        const result = await runIsolatedDynamicArm({
-          arm,
-          executable,
+    const interleavedTurnOrders = [];
+    let abortedAfterPair = null;
+    let persistentArmRuntimes = null;
+    try {
+      if (reuseRuntimePerArm) {
+        persistentArmRuntimes = await startPersistentIsolatedArmRuntimes({
+          championExe,
+          candidateExe,
           sourceConfigDir: sourceSnapshot.configDir,
           configProviderId,
-          cohort,
-          settings,
           requestedPort,
-          runId,
-          pair,
-          lane,
-          fixtureFamily,
-          promptCacheKeyPrefix: options["prompt-cache-key-prefix"],
-          upstreamUserAgent: arm === "champion"
-            ? championUpstreamUserAgent
-            : candidateUpstreamUserAgent,
+          championUpstreamUserAgent,
+          candidateUpstreamUserAgent,
+          pinnedKeyId,
           keepRunDir
         });
-        armRuns[arm].push(result);
+      }
+
+      for (let pair = 0; pair < pairs; pair += 1) {
+        const fixtureFamily = freshFixturePerPair
+          ? `fixture-${sha256Parts([
+            "release-champion-fixture-v3",
+            runId,
+            requestFamily,
+            scenario,
+            stableInstructionChars,
+            seedContextChars,
+            toolChars,
+            toolOutputShape,
+            fixtureProfile,
+            pair
+          ]).slice(0, 16)}`
+          : null;
+        const armSpecFor = (arm) => {
+          const executable = arm === "champion" ? championExe : candidateExe;
+          // Isolated cache lanes must not remain permanently assigned to one
+          // executable. A session-scoped upstream placement can have a
+          // different cache waterline, so alternate which arm owns lane A/B
+          // for every pair while keeping the two arms separate within a pair.
+          const isolationLane = isolateUpstreamCache
+            ? isolationLaneForPair(pair, arm)
+            : null;
+          const lane = sha256Parts([
+            "release-champion-lane-v2",
+            runId,
+            keyRealmHash,
+            requestFamily,
+            pair,
+            isolationLane ?? arm
+          ]);
+          return {
+            arm,
+            executable,
+            sourceConfigDir: sourceSnapshot.configDir,
+            configProviderId,
+            cohort,
+            settings,
+            requestedPort,
+            runId,
+            pair,
+            lane,
+            isolationLane,
+            fixtureFamily,
+            promptCacheKeyPrefix: options["prompt-cache-key-prefix"],
+            upstreamUserAgent: arm === "champion"
+              ? championUpstreamUserAgent
+              : candidateUpstreamUserAgent,
+            pinnedKeyId,
+            keepRunDir
+          };
+        };
+        let pairResult;
+        if (persistentArmRuntimes) {
+          // Alternating whole arms is not enough when a selected upstream has
+          // a short capacity window: the second arm otherwise receives a full
+          // burst after the first. Interleave each matching turn and rotate the
+          // first sender every turn, while retaining isolated local runtimes.
+          const result = await runInterleavedDynamicPair({
+            champion: {
+              ...armSpecFor("champion"),
+              runtime: persistentArmRuntimes.champion.runtime
+            },
+            candidate: {
+              ...armSpecFor("candidate"),
+              runtime: persistentArmRuntimes.candidate.runtime
+            }
+          });
+          orderedPairs.push(result.turn_order[0] ?? interleavedTurnOrder(pair, 0));
+          interleavedTurnOrders.push(result.turn_order);
+          armRuns.champion.push(result.champion);
+          armRuns.candidate.push(result.candidate);
+          pairResult = result;
+        } else {
+          // The one-runtime-per-arm fallback retains the previous pair-level
+          // alternation, because the two isolated processes do not coexist.
+          const order = interleavedTurnOrder(pair, 0);
+          orderedPairs.push(order);
+          const results = {};
+          for (const arm of order) {
+            const armSpec = armSpecFor(arm);
+            const result = await runIsolatedDynamicArm(armSpec);
+            armRuns[arm].push(result);
+            results[arm] = result;
+          }
+          pairResult = results;
+        }
+        // A release comparison is already invalid after either arm fails. Do
+        // not convert a single third-party rejection into a burst of fresh
+        // test traffic; future verification starts from a fresh, explicit run.
+        if (comparisonPairInvalid(pairResult)) {
+          abortedAfterPair = pair;
+          break;
+        }
+        if (pair + 1 < pairs && pairDelayMs > 0) {
+          await delay(pairDelayMs);
+        }
+      }
+    } finally {
+      if (persistentArmRuntimes) {
+        await Promise.all(Object.entries(persistentArmRuntimes).map(([arm, workspace]) =>
+          disposeIsolatedRuntimeWorkspace(workspace, `${arm} persistent isolated runtime`, keepRunDir)
+        ));
       }
     }
 
@@ -290,12 +415,14 @@ async function runLiveComparison(options) {
     return {
       schema: SCHEMA,
       kind: "release-champion-comparison",
-      mode: "live-isolated",
+      mode: reuseRuntimePerArm ? "live-isolated-reused-runtime" : "live-isolated",
       pass: comparison.pass,
       run_id: runId,
       cohort,
       settings,
       pair_order: orderedPairs,
+      turn_order: reuseRuntimePerArm ? interleavedTurnOrders : null,
+      aborted_after_pair: abortedAfterPair,
       champion,
       candidate,
       comparison
@@ -306,25 +433,42 @@ async function runLiveComparison(options) {
 }
 
 async function runIsolatedDynamicArm(spec) {
-  const tempRoot = await mkdtemp(join(tmpdir(), `atoapi-release-champion-${safeSegment(spec.arm)}-`));
-  const configDir = join(tempRoot, "config");
-  let runtime = null;
+  let workspace = null;
   try {
-    await copyIsolatedConfig(spec.sourceConfigDir, configDir, {
-      providerId: spec.configProviderId,
-      upstreamUserAgent: spec.upstreamUserAgent
+    workspace = await startIsolatedRuntimeWorkspace(spec);
+    return await runDynamicArmOnRuntime({ ...spec, runtime: workspace.runtime });
+  } finally {
+    if (workspace) {
+      await disposeIsolatedRuntimeWorkspace(
+        workspace,
+        `${spec.arm} isolated runtime`,
+        spec.keepRunDir
+      );
+    }
+  }
+}
+
+async function runDynamicArmOnRuntime(spec) {
+  try {
+    return await exerciseScenario(await prepareDynamicArmSpec(spec));
+  } catch (error) {
+    return failedDynamicRun({
+      arm: spec.arm,
+      pair: spec.pair,
+      cohort: spec.cohort,
+      executable: await executableArtifact(spec.executable),
+      reason: safeErrorMessage(error)
     });
-    runtime = await startIsolatedRuntime({
-      executable: spec.executable,
-      configDir,
-      requestedPort: spec.requestedPort
-    });
-    const executable = await executableArtifact(spec.executable);
-    const promptCacheKey = spec.promptCacheKeyPrefix
-      ? generatedPromptCacheKey(spec.promptCacheKeyPrefix, spec.lane)
-      : null;
-    const run = await exerciseScenario({
-      runtime,
+  }
+}
+
+async function prepareDynamicArmSpec(spec) {
+  const executable = await executableArtifact(spec.executable);
+  const promptCacheKey = spec.promptCacheKeyPrefix
+    ? generatedPromptCacheKey(spec.promptCacheKeyPrefix, spec.lane)
+    : null;
+  return {
+      runtime: spec.runtime,
       arm: spec.arm,
       pair: spec.pair,
       runId: spec.runId,
@@ -335,44 +479,115 @@ async function runIsolatedDynamicArm(spec) {
       expectedProviderId: spec.configProviderId,
       promptCacheKey,
       executable
-    });
-    return run;
+  };
+}
+
+async function startPersistentIsolatedArmRuntimes(spec) {
+  const workspaces = {};
+  try {
+    for (const arm of ["champion", "candidate"]) {
+      workspaces[arm] = await startIsolatedRuntimeWorkspace({
+        arm,
+        executable: arm === "champion" ? spec.championExe : spec.candidateExe,
+        sourceConfigDir: spec.sourceConfigDir,
+        configProviderId: spec.configProviderId,
+        upstreamUserAgent: arm === "champion"
+          ? spec.championUpstreamUserAgent
+          : spec.candidateUpstreamUserAgent,
+        pinnedKeyId: spec.pinnedKeyId,
+        requestedPort: spec.requestedPort,
+        keepRunDir: spec.keepRunDir
+      });
+    }
+    return workspaces;
   } catch (error) {
-    return failedDynamicRun({
-      arm: spec.arm,
-      pair: spec.pair,
-      cohort: spec.cohort,
-      executable: await executableArtifact(spec.executable),
-      reason: safeErrorMessage(error)
-    });
-  } finally {
-    if (runtime) await stopChild(runtime.child, `${spec.arm} isolated runtime`);
-    if (!spec.keepRunDir) await rm(tempRoot, { recursive: true, force: true });
+    await Promise.all(Object.entries(workspaces).map(([arm, workspace]) =>
+      disposeIsolatedRuntimeWorkspace(workspace, `${arm} persistent isolated startup`, spec.keepRunDir)
+    ));
+    throw error;
   }
 }
 
+async function startIsolatedRuntimeWorkspace(spec) {
+  const tempRoot = await mkdtemp(join(tmpdir(), `atoapi-release-champion-${safeSegment(spec.arm)}-`));
+  const configDir = join(tempRoot, "config");
+  let runtime = null;
+  try {
+    await copyIsolatedConfig(spec.sourceConfigDir, configDir, {
+      providerId: spec.configProviderId,
+      upstreamUserAgent: spec.upstreamUserAgent,
+      pinnedKeyId: spec.pinnedKeyId
+    });
+    runtime = await startIsolatedRuntime({
+      executable: spec.executable,
+      configDir,
+      requestedPort: spec.requestedPort
+    });
+    return { tempRoot, runtime };
+  } catch (error) {
+    if (runtime) await stopChild(runtime.child, `${spec.arm} isolated startup`);
+    await rm(tempRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function disposeIsolatedRuntimeWorkspace(workspace, label, keepRunDir) {
+  if (!workspace) return;
+  if (workspace.runtime) await stopChild(workspace.runtime.child, label);
+  if (!keepRunDir) await rm(workspace.tempRoot, { recursive: true, force: true });
+}
+
 async function exerciseScenario(spec) {
+  const cursor = createScenarioCursor(spec);
+  for (let turn = 0; turn < spec.settings.turns; turn += 1) {
+    await advanceScenarioCursor(cursor, turn);
+    if (cursor.fatal) break;
+    if (turn + 1 < spec.settings.turns && spec.settings.turn_delay_ms > 0) {
+      await delay(spec.settings.turn_delay_ms);
+    }
+  }
+  return finalizeScenarioCursor(cursor);
+}
+
+function createScenarioCursor(spec) {
   const fixtureFamily = spec.fixtureFamily ?? null;
-  const state = {
-    input: [message(buildSeedContext(spec.settings.seed_context_chars, fixtureFamily))],
-    compactionSeen: false
-  };
-  // These identifiers are part of the caller's logical conversation, not an
-  // isolation lane. A version comparison must replay the same conversation
-  // identity through both temporary processes; otherwise a session-scoped
-  // native cache key can manufacture a false version regression. The runtime
-  // lane remains arm-specific and is never exposed in the request body.
-  const conversationIdentity = releaseFixtureConversationIdentity(spec.pair, fixtureFamily);
-  const sessionId = conversationIdentity.session_id;
-  const threadId = conversationIdentity.thread_id;
+  // A standard version comparison replays the same conversation identity.
+  // A placement-key A/B can explicitly isolate metadata-only identities so
+  // one arm cannot warm the other's session-scoped upstream placement. The
+  // identity headers are stripped before the native upstream body is sent.
+  const conversationIdentity = releaseFixtureConversationIdentity(
+    spec.pair,
+    fixtureFamily,
+    spec.isolationLane
+  );
   const stableInstructions = buildStableInstructions(
     spec.settings.stable_instruction_chars,
-    fixtureFamily
+    fixtureFamily,
+    spec.settings.fixture_profile
   );
-  const requests = [];
-  let fatal = null;
+  return {
+    spec,
+    fixtureFamily,
+    state: {
+      input: [message(buildSeedContext(
+        spec.settings.seed_context_chars,
+        fixtureFamily,
+        spec.settings.fixture_profile
+      ))],
+      compactionSeen: false
+    },
+    sessionId: conversationIdentity.session_id,
+    threadId: conversationIdentity.thread_id,
+    stableInstructions,
+    requests: [],
+    fatal: null
+  };
+}
 
-  for (let turn = 0; turn < spec.settings.turns; turn += 1) {
+async function advanceScenarioCursor(cursor, turn) {
+  if (cursor.fatal) return false;
+  const { spec, fixtureFamily, state } = cursor;
+  try {
     let requestKind = "turn";
     let phase = turn === 0 ? "seed" : `followup-${turn}`;
     const toolTailMaturityTurn = spec.settings.scenario === "tool-tail-maturity" && turn === 2;
@@ -392,7 +607,12 @@ async function exerciseScenario(spec) {
         message("Use the completed tool output. Reply with OK only.")
       );
       phase = toolTailMaturityTurn ? "tool-tail-maturity" : "tool-burst";
-    } else if (turn > 0 && spec.settings.scenario === "compacted-anchor" && turn === 1) {
+    } else if (
+      turn > 0 &&
+      (spec.settings.scenario === "compacted-anchor" ||
+        spec.settings.scenario === "compaction-root") &&
+      turn === 1
+    ) {
       state.input.push({ type: "compaction_trigger" });
       requestKind = "compaction";
       phase = "compaction";
@@ -402,36 +622,45 @@ async function exerciseScenario(spec) {
 
     const record = await sendOneInbound({
       runtime: spec.runtime,
-      sessionId,
-      threadId,
+      sessionId: cursor.sessionId,
+      threadId: cursor.threadId,
       cohort: spec.cohort,
       input: state.input,
-      instructions: stableInstructions,
+      instructions: cursor.stableInstructions,
       maxOutputTokens: spec.settings.max_output_tokens,
       requestKind,
       phase,
       promptCacheKey: spec.promptCacheKey
     });
-    requests.push(record);
+    cursor.requests.push(record);
     if (!record.pass) {
-      fatal = record.failure ?? "inbound verification failed";
-      break;
+      cursor.fatal = record.failure ?? "inbound verification failed";
+      return false;
     }
-    if (requestKind === "compaction") {
+    if (requestKind === "compaction" && spec.settings.scenario === "compacted-anchor") {
       const compacted = record.compacted_input;
       if (!Array.isArray(compacted) || compacted.length === 0) {
-        fatal = "compaction response did not contain a reusable compaction item";
-        break;
+        cursor.fatal = "compaction response did not contain a reusable compaction item";
+        return false;
       }
       state.input = compacted;
       state.compactionSeen = true;
+    } else if (requestKind === "compaction") {
+      // Some third-party HTTP Responses routes perform compaction internally
+      // but do not return a reusable compaction item. The root request is
+      // still a valid, independently measurable cache-placement boundary.
+      state.compactionSeen = true;
     }
-    if (turn + 1 < spec.settings.turns && spec.settings.turn_delay_ms > 0) {
-      await delay(spec.settings.turn_delay_ms);
-    }
+    return true;
+  } catch (error) {
+    cursor.fatal = `scenario_turn_error:${safeErrorMessage(error)}`;
+    return false;
   }
+}
 
-  const run = buildDynamicRun({
+function finalizeScenarioCursor(cursor) {
+  const { spec, state, requests, fatal } = cursor;
+  return buildDynamicRun({
     arm: spec.arm,
     pair: spec.pair,
     cohort: spec.cohort,
@@ -445,14 +674,88 @@ async function exerciseScenario(spec) {
     fatal,
     compactionSeen: state.compactionSeen
   });
-  return run;
+}
+
+function interleavedTurnOrder(pair, turn) {
+  return (pair + turn) % 2 === 0
+    ? ["champion", "candidate"]
+    : ["candidate", "champion"];
+}
+
+function comparisonPairInvalid(result) {
+  return result?.champion?.pass !== true || result?.candidate?.pass !== true;
+}
+
+async function runInterleavedDynamicPair(specs) {
+  const turnOrder = [];
+  let cursors = null;
+  try {
+    const [champion, candidate] = await Promise.all([
+      prepareDynamicArmSpec(specs.champion),
+      prepareDynamicArmSpec(specs.candidate)
+    ]);
+    cursors = {
+      champion: createScenarioCursor(champion),
+      candidate: createScenarioCursor(candidate)
+    };
+    const turns = champion.settings.turns;
+    for (let turn = 0; turn < turns; turn += 1) {
+      const order = interleavedTurnOrder(champion.pair, turn);
+      turnOrder.push(order);
+      let terminalFailure = false;
+      for (const arm of order) {
+        const advanced = await advanceScenarioCursor(cursors[arm], turn);
+        if (!advanced) {
+          terminalFailure = true;
+          break;
+        }
+      }
+      // A failed arm makes the pair invalid. Stop this pair rather than adding
+      // new upstream load after a known failed fresh inbound; the next pair has
+      // the opposite first sender and remains independently observable.
+      if (terminalFailure) break;
+      if (turn + 1 < turns && champion.settings.turn_delay_ms > 0) {
+        await delay(champion.settings.turn_delay_ms);
+      }
+    }
+  } catch (error) {
+    const reason = `interleaved_pair_error:${safeErrorMessage(error)}`;
+    if (cursors) {
+      for (const cursor of Object.values(cursors)) {
+        if (!cursor.fatal) cursor.fatal = reason;
+      }
+    } else {
+      return {
+        champion: failedDynamicRun({
+          arm: specs.champion.arm,
+          pair: specs.champion.pair,
+          cohort: specs.champion.cohort,
+          executable: await executableArtifact(specs.champion.executable),
+          reason
+        }),
+        candidate: failedDynamicRun({
+          arm: specs.candidate.arm,
+          pair: specs.candidate.pair,
+          cohort: specs.candidate.cohort,
+          executable: await executableArtifact(specs.candidate.executable),
+          reason
+        }),
+        turn_order: turnOrder
+      };
+    }
+  }
+  return {
+    champion: finalizeScenarioCursor(cursors.champion),
+    candidate: finalizeScenarioCursor(cursors.candidate),
+    turn_order: turnOrder
+  };
 }
 
 async function sendOneInbound(spec) {
   const before = await getJson(`${spec.runtime.baseUrl}/admin/metrics`, 10_000);
   const beforeCounters = requestCounters(before);
   const knownRawInboundIds = new Set(
-    array(before.recent_requests)
+    requestLogRows(before)
       .map((item) => String(item?.inbound_request_id ?? ""))
       .filter(Boolean)
   );
@@ -503,9 +806,11 @@ async function sendOneInbound(spec) {
   const attempts = array(after.recent_agent_upstream_attempts).filter(
     (item) => String(item?.inbound_request_id ?? "") === inboundId
   );
+  const responseFailureCode = responseErrorCode(responseText);
+  const responseFailed = responseHasNativeFailure(responseText);
   const terminal = responseStatus >= 200 && responseStatus < 300 &&
     /\bresponse\.completed\b/u.test(responseText) &&
-    !/\bresponse\.failed\b/u.test(responseText);
+    !responseFailed;
   const exactCounterDelta = counters.inbound_requests === 1 &&
     counters.generation_attempts === 1 &&
     counters.upstream_requests === 1;
@@ -525,6 +830,20 @@ async function sendOneInbound(spec) {
   const completedInput = spec.requestKind === "compaction"
     ? extractCompactionItems(responseText)
     : [];
+  const timing = {
+    prefix_guard_wait_ms: finiteNonNegativeNumber(metric?.prefix_guard_wait_ms),
+    local_prepare_ms: finiteNonNegativeNumber(metric?.local_prepare_ms),
+    upstream_headers_ms: finiteNonNegativeNumber(metric?.upstream_headers_ms),
+    upstream_first_chunk_ms: finiteNonNegativeNumber(metric?.upstream_first_chunk_ms),
+    upstream_ttft_ms: finiteNonNegativeNumber(metric?.upstream_ttft_ms),
+    ttft_ms: finiteNonNegativeNumber(metric?.ttft_ms)
+  };
+  const timingPresent = !terminal || [
+    timing.prefix_guard_wait_ms,
+    timing.local_prepare_ms,
+    timing.upstream_ttft_ms,
+    timing.ttft_ms
+  ].every((value) => value !== null);
   const checks = {
     terminal_response_completed: terminal,
     exact_counter_delta: exactCounterDelta,
@@ -534,17 +853,23 @@ async function sendOneInbound(spec) {
     provider_matches_cohort: providerMatches,
     model_matches_cohort: modelMatches,
     observed_key_realm_present: observedRealmPresent,
-    usage_present: number(metric?.input_tokens) > 0
+    usage_present: number(metric?.input_tokens) > 0,
+    timing_present: timingPresent
   };
-  const failure = transportError
-    ? "downstream transport failed"
-    : Object.entries(checks).find(([, passed]) => !passed)?.[0] ?? null;
+  const failure = inboundFailureReason({
+    transportError,
+    responseStatus,
+    responseFailureCode,
+    responseFailed,
+    checks
+  });
   return {
     phase: spec.phase,
     request_kind: spec.requestKind,
     pass: !failure,
     failure,
     http_status: responseStatus || null,
+    response_failure_code: responseFailureCode,
     elapsed_ms: Date.now() - startedAt,
     sse_completed: terminal,
     counters,
@@ -552,11 +877,17 @@ async function sendOneInbound(spec) {
     observed_realm_id: observedRealmId || null,
     provider_id: metric?.provider_id ?? null,
     model: metric?.model ?? null,
+    sse_end_reason: metric?.sse_end_reason ?? null,
     // These fields are bounded diagnostics only: they contain no request
     // body, tool text, credential, or cache-key value.  Retain them per
     // request so a large aggregate new-tail gap can be traced to one phase
     // without rerunning the arm blind.
     provider_prefix_fingerprint: metric?.provider_prefix_fingerprint ?? null,
+    // The value itself is never retained in release evidence. This boolean
+    // distinguishes an Atoapi-generated placement from an omitted field,
+    // including at a compaction root.
+    provider_prefix_key_present:
+      typeof metric?.provider_prefix_key === "string" && metric.provider_prefix_key.length > 0,
     outbound_prefix_fingerprints: metric?.outbound_prefix_fingerprints ?? null,
     prefix_lag_classification: metric?.prefix_lag_classification ?? null,
     prefix_lag_input_delta_tokens: number(metric?.prefix_lag_input_delta_tokens),
@@ -586,15 +917,17 @@ async function sendOneInbound(spec) {
     // Keep the local and upstream portions separate in the release evidence.
     // This is diagnostic only: the release gate below still evaluates total
     // TTFT, so an upstream regression cannot be silently reclassified away.
-    prefix_guard_wait_ms: number(metric?.prefix_guard_wait_ms),
+    prefix_guard_wait_ms: timing.prefix_guard_wait_ms,
     prefix_guard_wait_reason: metric?.prefix_guard_wait_reason ?? null,
     prefix_guard_wait_source: metric?.prefix_guard_wait_source ?? null,
     prefix_guard_skip_reason: metric?.prefix_guard_skip_reason ?? null,
     static_wire_drift_late_mutation_categories:
       metric?.static_wire_drift_late_mutation_categories ?? null,
-    local_prepare_ms: number(metric?.local_prepare_ms),
-    upstream_ttft_ms: number(metric?.upstream_ttft_ms),
-    ttft_ms: number(metric?.ttft_ms),
+    local_prepare_ms: timing.local_prepare_ms,
+    upstream_headers_ms: timing.upstream_headers_ms,
+    upstream_first_chunk_ms: timing.upstream_first_chunk_ms,
+    upstream_ttft_ms: timing.upstream_ttft_ms,
+    ttft_ms: timing.ttft_ms,
     upstream_attempt_index: metric?.upstream_attempt_index ?? null,
     upstream_attempt_total: metric?.upstream_attempt_total ?? null,
     outcome_attempt_count: outcome?.attempt_count ?? null,
@@ -611,7 +944,7 @@ async function waitForSettledInbound({ baseUrl, beforeCounters, knownRawInboundI
   do {
     latest = await getJson(`${baseUrl}/admin/metrics`, 5_000);
     const counters = requestCounters(latest);
-    const hasNewRequest = array(latest.recent_requests).some((item) => {
+    const hasNewRequest = requestLogRows(latest).some((item) => {
       const id = String(item?.inbound_request_id ?? "");
       return id && !knownRawInboundIds.has(id);
     });
@@ -629,10 +962,100 @@ async function waitForSettledInbound({ baseUrl, beforeCounters, knownRawInboundI
 }
 
 function selectNewRequestLog(metrics, knownRawInboundIds) {
-  return array(metrics?.recent_requests).find((item) => {
+  return requestLogRows(metrics).find((item) => {
     const id = String(item?.inbound_request_id ?? "");
     return id && !knownRawInboundIds.has(id);
   }) ?? null;
+}
+
+function requestLogRows(metrics) {
+  return [
+    ...array(metrics?.recent_requests),
+    ...array(metrics?.recent_failed_requests)
+  ];
+}
+
+function responseErrorCode(responseText) {
+  const text = String(responseText ?? "");
+  const responseFailed = text.indexOf("response.failed");
+  const failedPayload = responseFailed >= 0
+    ? text.slice(responseFailed, responseFailed + 1_024)
+    : text.match(/"error"\s*:\s*\{[^}]{0,1024}\}/u)?.[0] ?? "";
+  const match = failedPayload.match(/"(?:code|type)"\s*:\s*"([A-Za-z0-9._-]{1,96})"/u);
+  return match?.[1] ?? null;
+}
+
+function responseHasNativeFailure(responseText) {
+  const text = String(responseText ?? "");
+  return /(?:^|\n)event:\s*response\.failed\b/u.test(text) ||
+    /"type"\s*:\s*"response\.failed"/u.test(text);
+}
+
+function inboundFailureReason({
+  transportError,
+  responseStatus,
+  responseFailureCode,
+  responseFailed,
+  checks
+}) {
+  if (transportError) return "downstream_transport_failed";
+  if (!(responseStatus >= 200 && responseStatus < 300)) {
+    const suffix = responseFailureCode ? `:${responseFailureCode}` : "";
+    return `http_status_${responseStatus || 0}${suffix}`;
+  }
+  if (responseFailed) {
+    return `response_failed:${responseFailureCode ?? "unknown"}`;
+  }
+  return Object.entries(checks).find(([, passed]) => !passed)?.[0] ?? null;
+}
+
+// Static request members must remain stable while a semantic epoch is being
+// replayed. A compaction request starts a new epoch by definition, so it is a
+// legal boundary at which the baseline is reset. Only bounded hashes and
+// field names are retained; no request body or user content is inspected.
+function staticWireContinuity(requests) {
+  const drift = new Set();
+  let missing = false;
+  let baseline = null;
+  let boundaries = 0;
+
+  for (const request of requests) {
+    const epochBoundary = request.request_kind === "compaction" || request.phase === "compaction";
+    if (!epochBoundary && request.prefix_lag_classification === "static_wire_drift") {
+      drift.add("server_static_wire_drift");
+    }
+    if (!epochBoundary && array(request.static_wire_drift_late_mutation_categories).length > 0) {
+      drift.add("late_mutation");
+    }
+    const fingerprints = request?.outbound_prefix_fingerprints;
+    if (!fingerprints || STATIC_WIRE_FIELDS.some((field) => !fingerprints[field])) {
+      missing = true;
+      baseline = null;
+      continue;
+    }
+
+    if (epochBoundary) {
+      baseline = null;
+      boundaries += 1;
+    }
+
+    const current = Object.fromEntries(
+      STATIC_WIRE_FIELDS.map((field) => [field, fingerprints[field]])
+    );
+    if (baseline) {
+      for (const field of STATIC_WIRE_FIELDS) {
+        if (current[field] !== baseline[field]) drift.add(field);
+      }
+    }
+    baseline = current;
+  }
+
+  return {
+    pass: requests.length > 0 && !missing && drift.size === 0,
+    drift_categories: [...drift].sort(),
+    missing,
+    epoch_boundaries: boundaries
+  };
 }
 
 function buildDynamicRun(input) {
@@ -672,6 +1095,8 @@ function buildDynamicRun(input) {
     (item) => item.checks?.provider_matches_cohort && item.checks?.model_matches_cohort
   );
   const usageCoverage = requests.length === 0 ? 0 : comparable.length / requests.length;
+  const timing = timingSummary(comparable);
+  const staticWire = staticWireContinuity(requests);
   const metrics = {
     requests: requests.length,
     successful_sse_requests: requests.filter((item) => item.sse_completed).length,
@@ -692,12 +1117,7 @@ function buildDynamicRun(input) {
     new_tail_gap_tokens: sum(comparable, "cache_new_tail_gap_tokens"),
     shortfall_tokens: sum(comparable, "cache_shortfall_tokens"),
     guarded_requests: comparable.filter((item) => number(item.prefix_guard_wait_ms) > 0).length,
-    local_proxy_overhead_p95_ms: percentile(
-      comparable.map((item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)),
-      95
-    ),
-    upstream_ttft_p95_ms: percentile(comparable.map((item) => item.upstream_ttft_ms), 95),
-    ttft_p95_ms: percentile(comparable.map((item) => item.ttft_ms), 95),
+    ...timing,
     usage_coverage: usageCoverage,
     observed_realm_ids: observedRealms
   };
@@ -707,14 +1127,18 @@ function buildDynamicRun(input) {
     every_inbound_one_attempt_one_main_post: allSingle,
     cohort_bound_on_every_request: allCohortBound,
     complete_usage_coverage: usageCoverage === 1,
+    complete_timing_coverage: metrics.timing_complete_requests === comparable.length,
     input_usage_present: inputTokens > 0,
     cacheable_128_evidence_present: cacheableTokens > 0,
     warm_stable_prefix_evidence_present: warmCacheableTokens > 0,
+    static_wire_continuity: staticWire.pass,
     one_observed_key_realm: observedRealms.length === 1,
     avoidable_gap_zero: metrics.avoidable_gap_tokens === 0,
     required_guarded_requests:
       metrics.guarded_requests >= number(input.minimumGuardedRequests),
-    compaction_observed: input.scenario !== "compacted-anchor" || input.compactionSeen === true
+    compaction_observed:
+      !new Set(["compacted-anchor", "compaction-root"]).has(input.scenario) ||
+      input.compactionSeen === true
   };
   return {
     schema: SCHEMA,
@@ -728,6 +1152,7 @@ function buildDynamicRun(input) {
     prompt_cache_key_used: input.promptCacheKeyUsed,
     fatal: input.fatal ?? null,
     metrics,
+    static_wire_continuity: staticWire,
     checks,
     requests: requests.map(stripCompactedInput)
   };
@@ -755,8 +1180,10 @@ function failedDynamicRun({ arm, pair, cohort, executable, reason }) {
       input_usage_present: false,
       cacheable_128_evidence_present: false,
       warm_stable_prefix_evidence_present: false,
+      static_wire_continuity: false,
       one_observed_key_realm: false,
       avoidable_gap_zero: false,
+      complete_timing_coverage: false,
       compaction_observed: false
     },
     requests: []
@@ -812,15 +1239,7 @@ function aggregateArm(arm, cohort, executable, runs) {
   metrics.cacheable_request_count = cacheableRows.length;
   metrics.full_bucket_denominator = cacheableRows.length;
   const comparableRows = retainedRequests.filter((item) => number(item.input_tokens) > 0);
-  metrics.local_proxy_overhead_p95_ms = percentile(
-    comparableRows.map((item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)),
-    95
-  );
-  metrics.upstream_ttft_p95_ms = percentile(
-    comparableRows.map((item) => number(item.upstream_ttft_ms)),
-    95
-  );
-  metrics.ttft_p95_ms = percentile(comparableRows.map((item) => number(item.ttft_ms)), 95);
+  Object.assign(metrics, timingSummary(comparableRows));
   metrics.usage_coverage = normalized.length > 0 && normalized.every(
     (run) => number(run.metrics?.usage_coverage) === 1
   ) ? 1 : 0;
@@ -834,9 +1253,13 @@ function aggregateArm(arm, cohort, executable, runs) {
       (run) => run.checks?.every_inbound_one_attempt_one_main_post === true
     ),
     avoidable_gap_zero: metrics.avoidable_gap_tokens === 0,
+    complete_timing_coverage: metrics.timing_complete_requests === comparableRows.length,
     input_usage_present: metrics.input_tokens > 0,
     cacheable_128_evidence_present: metrics.cacheable_tokens_128 > 0,
     warm_stable_prefix_evidence_present: metrics.warm_stable_prefix_tokens_128 > 0,
+    static_wire_continuity: normalized.length > 0 && normalized.every(
+      (run) => run.checks?.static_wire_continuity === true
+    ),
     full_bucket_denominator_present: metrics.full_bucket_denominator > 0
   };
   return {
@@ -866,6 +1289,18 @@ function compareArmResults(
     candidate.metrics.full_bucket_requests - champion.metrics.full_bucket_requests;
   const fullBucketDenominatorsMatch =
     candidate.metrics.full_bucket_denominator === champion.metrics.full_bucket_denominator;
+  const fullBucketCountWithinTolerance =
+    fullBucketDenominatorsMatch && fullBucketRequestDelta >= -maxFullBucketRegressionRequests;
+  // A full-bucket request is a useful discrete signal, but it must not veto a
+  // demonstrably better aggregate cache result merely because one request
+  // crossed a 128-token boundary differently. Keep the loss visible; admit it
+  // only when all continuous hit measures strictly improve and total shortfall
+  // does not grow.
+  const aggregateTokenHitStrictlyImproves =
+    candidate.metrics.raw_token_hit_rate > champion.metrics.raw_token_hit_rate &&
+    candidate.metrics.cache_128_hit_rate > champion.metrics.cache_128_hit_rate &&
+    candidate.metrics.warm_stable_prefix_hit_rate > champion.metrics.warm_stable_prefix_hit_rate &&
+    candidate.metrics.shortfall_tokens <= champion.metrics.shortfall_tokens;
   const checks = {
     champion_valid: champion.pass,
     candidate_valid: candidate.pass,
@@ -879,24 +1314,24 @@ function compareArmResults(
       candidate.metrics.warm_stable_prefix_hit_rate >= champion.metrics.warm_stable_prefix_hit_rate,
     candidate_full_bucket_rate_not_lower:
       candidate.metrics.full_bucket_rate >= champion.metrics.full_bucket_rate,
-    candidate_full_bucket_count_within_tolerance:
-      fullBucketDenominatorsMatch && fullBucketRequestDelta >= -maxFullBucketRegressionRequests,
+    candidate_full_bucket_count_within_tolerance: fullBucketCountWithinTolerance,
+    candidate_full_bucket_loss_explained_by_token_gain: aggregateTokenHitStrictlyImproves,
+    candidate_full_bucket_gate:
+      fullBucketCountWithinTolerance || aggregateTokenHitStrictlyImproves,
     candidate_avoidable_gap_zero: candidate.metrics.avoidable_gap_tokens === 0,
     candidate_all_sse_completed:
       candidate.metrics.successful_sse_requests === candidate.metrics.requests && candidate.metrics.requests > 0,
     candidate_one_attempt_one_main_post:
       candidate.checks.every_inbound_one_attempt_one_main_post === true,
+    candidate_local_proxy_overhead_p95_not_regressed:
+      candidate.metrics.local_proxy_overhead_p95_ms <= champion.metrics.local_proxy_overhead_p95_ms,
     candidate_ttft_p95_not_regressed:
       candidate.metrics.ttft_p95_ms <= champion.metrics.ttft_p95_ms + maxTtftRegressionMs
   };
   const gatingChecks = { ...checks };
-  // This is retained as a strict, visible diagnostic. When an explicit
-  // request-count tolerance is supplied, a same-binary calibration has shown
-  // the threshold's upstream variance; use the calibrated count gate instead
-  // of rejecting an otherwise token-superior candidate on one stochastic arm.
-  if (maxFullBucketRegressionRequests > 0) {
-    delete gatingChecks.candidate_full_bucket_rate_not_lower;
-  }
+  delete gatingChecks.candidate_full_bucket_rate_not_lower;
+  delete gatingChecks.candidate_full_bucket_count_within_tolerance;
+  delete gatingChecks.candidate_full_bucket_loss_explained_by_token_gain;
   const cacheCheckNames = [
     "champion_valid",
     "candidate_valid",
@@ -905,25 +1340,22 @@ function compareArmResults(
     "candidate_raw_token_hit_not_lower",
     "candidate_cache_128_hit_not_lower",
     "candidate_warm_stable_prefix_hit_not_lower",
-    "candidate_full_bucket_rate_not_lower",
-    "candidate_full_bucket_count_within_tolerance",
+    "candidate_full_bucket_gate",
     "candidate_avoidable_gap_zero",
     "candidate_all_sse_completed",
     "candidate_one_attempt_one_main_post"
   ];
-  if (maxFullBucketRegressionRequests > 0) {
-    const index = cacheCheckNames.indexOf("candidate_full_bucket_rate_not_lower");
-    if (index >= 0) cacheCheckNames.splice(index, 1);
-  }
   // Cache behavior and end-to-end latency are intentionally reported as
   // separate verdicts. The latter includes remote provider TTFT variance;
   // hiding a cache regression behind a fast upstream, or vice versa, would
   // make the release evidence misleading.
   const cachePass = cacheCheckNames.every((name) => checks[name] === true);
+  const localLatencyPass = checks.candidate_local_proxy_overhead_p95_not_regressed;
   const latencyPass = checks.candidate_ttft_p95_not_regressed;
   return {
     pass: Object.values(gatingChecks).every(Boolean),
     cache_pass: cachePass,
+    local_latency_pass: localLatencyPass,
     latency_pass: latencyPass,
     checks,
     deltas: {
@@ -1085,13 +1517,14 @@ async function snapshotLiveConfig(sourceConfigDir) {
 async function copyIsolatedConfig(
   sourceConfigDir,
   targetConfigDir,
-  { providerId = "", upstreamUserAgent = null } = {}
+  { providerId = "", upstreamUserAgent = null, pinnedKeyId = null } = {}
 ) {
   const sourceConfig = join(sourceConfigDir, "config.toml");
   await assertFile(sourceConfig, "source config.toml");
   await mkdir(targetConfigDir, { recursive: true });
   const targetConfig = join(targetConfigDir, "config.toml");
   await copyFile(sourceConfig, targetConfig);
+  let rewrittenConfig = await readRequiredText(targetConfig, "isolated config.toml");
   if (upstreamUserAgent) {
     if (!providerId) {
       throw new FailClosedError(
@@ -1099,12 +1532,18 @@ async function copyIsolatedConfig(
         "--upstream-user-agent requires the current Codex Provider binding"
       );
     }
-    const original = await readRequiredText(targetConfig, "isolated config.toml");
-    await writeFile(
-      targetConfig,
-      replaceProviderTomlString(original, providerId, "custom_user_agent", upstreamUserAgent),
-      "utf8"
+    rewrittenConfig = replaceProviderTomlString(
+      rewrittenConfig,
+      providerId,
+      "custom_user_agent",
+      upstreamUserAgent
     );
+  }
+  if (pinnedKeyId) {
+    rewrittenConfig = pinProviderKeyInToml(rewrittenConfig, providerId, pinnedKeyId);
+  }
+  if (rewrittenConfig !== await readRequiredText(targetConfig, "isolated config.toml")) {
+    await writeFile(targetConfig, rewrittenConfig, "utf8");
   }
   const sourceKey = join(sourceConfigDir, "cache-key.dpapi");
   if (await fileExists(sourceKey)) {
@@ -1140,7 +1579,145 @@ function replaceProviderTomlString(configText, providerId, key, value) {
   );
 }
 
-async function startIsolatedRuntime({ executable, configDir, requestedPort }) {
+function optionalOpaqueIdentifier(value, label) {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).trim();
+  if (!normalized || normalized.length > 128 || !/^[A-Za-z0-9._:-]+$/u.test(normalized)) {
+    throw new FailClosedError(
+      "invalid_opaque_identifier",
+      `${label} must be a non-empty opaque identifier up to 128 safe characters`
+    );
+  }
+  return normalized;
+}
+
+function extractTomlBoolean(text, key) {
+  const escaped = escapeRegExp(key);
+  const value = text.match(new RegExp(`^${escaped}\\s*=\\s*(true|false)`, "mu"))?.[1];
+  return value === undefined ? null : value === "true";
+}
+
+function extractTomlValuePresent(text, key) {
+  const escaped = escapeRegExp(key);
+  return new RegExp(`^${escaped}\\s*=\\s*(?:"[^"]*"|[^\\r\\n]+)`, "mu").test(text);
+}
+
+function tomlArrayBlocksWithOffsets(text, section) {
+  const marker = `[[${section}]]`;
+  const starts = [];
+  let offset = 0;
+  while ((offset = text.indexOf(marker, offset)) >= 0) {
+    const lineStart = offset === 0 || text[offset - 1] === "\n";
+    if (lineStart) starts.push(offset);
+    offset += marker.length;
+  }
+  return starts.map((start) => {
+    const next = text.indexOf("\n[[", start + marker.length);
+    const end = next < 0 ? text.length : next + 1;
+    return { start, end, body: text.slice(start, end) };
+  });
+}
+
+function providerKeyPoolContext(configText, providerId) {
+  const pools = tomlArrayBlocksWithOffsets(configText, "provider_key_pools")
+    .filter((block) => extractTomlString(block.body, "provider_id") === providerId);
+  if (pools.length === 0) return null;
+  if (pools.length !== 1) {
+    throw new FailClosedError(
+      "ambiguous_provider_key_pool",
+      "isolated key pin requires exactly one provider key pool"
+    );
+  }
+  const pool = pools[0];
+  const nextPool = tomlArrayBlocksWithOffsets(configText, "provider_key_pools")
+    .map((block) => block.start)
+    .filter((start) => start > pool.start)
+    .sort((left, right) => left - right)[0] ?? configText.length;
+  const keys = tomlArrayBlocksWithOffsets(configText, "provider_key_pools.keys")
+    .filter((block) => block.start > pool.start && block.start < nextPool);
+  return { pool, keys };
+}
+
+function validatePinnedKeyConfiguration(configText, providerId, pinnedKeyId) {
+  const context = providerKeyPoolContext(configText, providerId);
+  if (!context) {
+    if (pinnedKeyId) {
+      throw new FailClosedError(
+        "pinned_key_pool_missing",
+        "--key-id requires an enabled Provider Key pool for the selected Codex Provider"
+      );
+    }
+    return;
+  }
+  const poolEnabled = extractTomlBoolean(context.pool.body, "enabled");
+  if (poolEnabled !== true) {
+    if (pinnedKeyId) {
+      throw new FailClosedError(
+        "pinned_key_pool_disabled",
+        "--key-id requires the selected Provider Key pool to be enabled"
+      );
+    }
+    return;
+  }
+  if (!pinnedKeyId) {
+    throw new FailClosedError(
+      "key_pin_required_for_pool",
+      "multi-Key live verification requires explicit --key-id; no Key is selected implicitly"
+    );
+  }
+  const target = context.keys.find((block) => extractTomlString(block.body, "id") === pinnedKeyId);
+  if (!target || !extractTomlValuePresent(target.body, "key_encrypted")) {
+    throw new FailClosedError(
+      "pinned_key_not_found",
+      "the explicit --key-id is not a saved Key in the selected Provider Key pool"
+    );
+  }
+}
+
+function replaceTomlBooleanField(block, key, value) {
+  const escaped = escapeRegExp(key);
+  const field = new RegExp(`^${escaped}[\\t ]*=[\\t ]*(?:true|false)[\\t ]*$`, "mu");
+  const replacement = `${key} = ${value ? "true" : "false"}`;
+  return field.test(block)
+    ? block.replace(field, replacement)
+    : `${block.trimEnd()}\n${replacement}\n`;
+}
+
+function removeTomlField(block, key) {
+  const escaped = escapeRegExp(key);
+  return block.replace(new RegExp(`^${escaped}\\s*=.*(?:\\r?\\n|$)`, "gmu"), "");
+}
+
+function pinProviderKeyInToml(configText, providerId, pinnedKeyId) {
+  const context = providerKeyPoolContext(configText, providerId);
+  if (!context) {
+    throw new FailClosedError(
+      "pinned_key_pool_missing",
+      "cannot pin a Key without the selected Provider Key pool"
+    );
+  }
+  const target = context.keys.find((block) => extractTomlString(block.body, "id") === pinnedKeyId);
+  if (!target || !extractTomlValuePresent(target.body, "key_encrypted")) {
+    throw new FailClosedError(
+      "pinned_key_not_found",
+      "the explicit --key-id is not a saved Key in the selected Provider Key pool"
+    );
+  }
+  let rewritten = configText;
+  for (const block of [...context.keys].sort((left, right) => right.start - left.start)) {
+    const isTarget = extractTomlString(block.body, "id") === pinnedKeyId;
+    let body = replaceTomlBooleanField(block.body, "enabled", isTarget);
+    if (isTarget) body = removeTomlField(body, "disabled_until");
+    rewritten = `${rewritten.slice(0, block.start)}${body}${rewritten.slice(block.end)}`;
+  }
+  return rewritten;
+}
+
+async function startIsolatedRuntime({
+  executable,
+  configDir,
+  requestedPort
+}) {
   const config = await readRequiredText(join(configDir, "config.toml"), "isolated config.toml");
   const localKey = extractTomlString(config, "local_key");
   if (!localKey) {
@@ -1203,6 +1780,36 @@ function cacheableInputTokens128(inputTokens) {
     : 1_024 + Math.floor((inputTokens - 1_024) / 128) * 128;
 }
 
+function timingSummary(rows) {
+  const comparable = array(rows);
+  const compaction = comparable.filter((item) => item.phase === "compaction");
+  const p95 = (items, project, empty = 0) => {
+    const values = items.map(project).filter((value) => Number.isFinite(value) && value >= 0);
+    return values.length === items.length && values.length > 0 ? percentile(values, 95) : empty;
+  };
+  return {
+    timing_complete_requests: comparable.filter((item) => item.checks?.timing_present).length,
+    local_proxy_overhead_p95_ms: p95(
+      comparable,
+      (item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)
+    ),
+    upstream_ttft_p95_ms: p95(comparable, (item) => item.upstream_ttft_ms),
+    ttft_p95_ms: p95(comparable, (item) => item.ttft_ms),
+    compaction_request_count: compaction.length,
+    compaction_local_proxy_overhead_p95_ms: p95(
+      compaction,
+      (item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms),
+      null
+    ),
+    compaction_upstream_ttft_p95_ms: p95(
+      compaction,
+      (item) => item.upstream_ttft_ms,
+      null
+    ),
+    compaction_ttft_p95_ms: p95(compaction, (item) => item.ttft_ms, null)
+  };
+}
+
 function emptyMetrics() {
   return {
     requests: 0,
@@ -1224,9 +1831,14 @@ function emptyMetrics() {
     new_tail_gap_tokens: 0,
     shortfall_tokens: 0,
     guarded_requests: 0,
+    timing_complete_requests: 0,
     local_proxy_overhead_p95_ms: 0,
     upstream_ttft_p95_ms: 0,
     ttft_p95_ms: 0,
+    compaction_request_count: 0,
+    compaction_local_proxy_overhead_p95_ms: null,
+    compaction_upstream_ttft_p95_ms: null,
+    compaction_ttft_p95_ms: null,
     usage_coverage: 0,
     observed_realm_ids: []
   };
@@ -1245,10 +1857,13 @@ function message(text) {
   };
 }
 
-function buildSeedContext(targetChars, fixtureFamily = null) {
+function buildSeedContext(targetChars, fixtureFamily = null, profile = "natural") {
   const fixturePrefix = fixtureFamily ? `[fixture ${fixtureFamily}] ` : "";
   if (targetChars <= 0) {
     return `${fixturePrefix}Release champion seed. Reply with OK only.`;
+  }
+  if (profile !== "legacy-repeated") {
+    return buildNaturalFixtureText(targetChars, fixtureFamily, "history");
   }
   const sections = [
     "Architecture notes: preserve established behavior and append only new facts.",
@@ -1263,17 +1878,77 @@ function buildSeedContext(targetChars, fixtureFamily = null) {
   return output.slice(0, targetChars);
 }
 
-function buildStableInstructions(targetChars, fixtureFamily = null) {
+function buildStableInstructions(targetChars, fixtureFamily = null, profile = "natural") {
   // The lane belongs only in the opaque prompt cache key. Keeping the body
   // identical across arms makes raw upstream token telemetry comparable. A
   // pair-scoped fixture may vary across pairs, but never across the two arms
   // inside one pair, so stale upstream context cannot warm a later pair.
+  if (profile !== "legacy-repeated") {
+    return buildNaturalFixtureText(targetChars, fixtureFamily, "instruction");
+  }
   const prefix = fixtureFamily
     ? `Release-cache validation fixture ${fixtureFamily}. Preserve the supplied history. `
     : "Release-cache validation fixture. Preserve the supplied history. ";
   const unit = "Follow the existing instructions exactly; reply with OK only when asked. ";
   return (prefix + unit.repeat(Math.ceil(Math.max(0, targetChars - prefix.length) / unit.length)))
     .slice(0, targetChars);
+}
+
+// The default live fixture deliberately avoids repeated long sentences,
+// timestamp/path/hash noise, and user-derived text. It is deterministic and
+// equal across both arms of one pair, while each record has a unique ordinal
+// so generic WAF/replay heuristics do not mistake the benchmark for a repeated
+// payload flood. It changes only verifier input, never Atoapi user traffic.
+function buildNaturalFixtureText(targetChars, fixtureFamily, kind) {
+  const label = fixtureFamily
+    ? `Release validation fixture ${fixtureFamily}. `
+    : "Release validation fixture. ";
+  const subjects = [
+    "The design record",
+    "The implementation note",
+    "The review summary",
+    "The compatibility statement",
+    "The test observation",
+    "The operating constraint",
+    "The interface contract",
+    "The continuation boundary"
+  ];
+  const predicates = [
+    "keeps confirmed behavior intact before new work is appended",
+    "preserves the established order of facts and decisions",
+    "requires the latest request to be evaluated against prior context",
+    "keeps tool results associated with their completed calls",
+    "separates stable context from the newest input",
+    "avoids changing route or key selection implicitly",
+    "records only evidence that is relevant to the active task",
+    "retains the existing response contract without reinterpretation"
+  ];
+  const closing = kind === "history"
+    ? "This history entry remains available to the next turn."
+    : kind === "tool"
+      ? "This completed tool record remains available to later reasoning."
+      : "Apply this instruction while answering only the newest request.";
+  let output = label;
+  for (let index = 0; output.length < targetChars; index += 1) {
+    const ordinal = String(index + 1).padStart(6, "0");
+    const subject = subjects[(index * 5 + 1) % subjects.length];
+    const predicate = predicates[(index * 3 + 2) % predicates.length];
+    output += `\nRecord ${ordinal}: ${subject} ${predicate}. ${closing}`;
+  }
+  return output.slice(0, targetChars);
+}
+
+function fixtureLineStats(text) {
+  const counts = new Map();
+  for (const line of String(text ?? "").split(/\r?\n/u)) {
+    if (!line) continue;
+    counts.set(line, (counts.get(line) ?? 0) + 1);
+  }
+  return {
+    line_count: [...counts.values()].reduce((total, count) => total + count, 0),
+    unique_line_count: counts.size,
+    max_repeated_line_count: Math.max(0, ...counts.values())
+  };
 }
 
 function buildToolFixtureItems({ pair, fixtureFamily = null, targetChars, shape, calls }) {
@@ -1303,6 +1978,12 @@ function buildToolFixtureItems({ pair, fixtureFamily = null, targetChars, shape,
 
 function buildToolOutput(targetChars, shape, fixtureFamily = null, partIndex = 0, partCount = 1) {
   const partLabel = partCount > 1 ? ` tool_part=${partIndex + 1}/${partCount}` : "";
+  if (shape === "natural") {
+    const scopedFixture = fixtureFamily
+      ? `${fixtureFamily}-tool-${partIndex + 1}`
+      : `tool-${partIndex + 1}`;
+    return buildNaturalFixtureText(targetChars, scopedFixture, "tool");
+  }
   if (shape === "structured") {
     let output = "";
     for (let index = 0; output.length < targetChars; index += 1) {
@@ -1342,11 +2023,26 @@ function releaseFixtureCallId(pair, fixtureFamily = null, partIndex = 0, partCou
   return `call_release_fixture${family}_pair_${Number(pair)}${part}`;
 }
 
-function releaseFixtureConversationIdentity(pair, fixtureFamily = null) {
+function effectiveReuseRuntimePerArm(requested, isolateUpstreamCache) {
+  return Boolean(requested) && !Boolean(isolateUpstreamCache);
+}
+
+function isolationLaneForPair(pair, arm) {
+  if (arm !== "champion" && arm !== "candidate") {
+    throw new FailClosedError("invalid_arm", "isolation lane requires champion or candidate arm");
+  }
+  const championGetsLaneA = Number(pair) % 2 === 0;
+  return (arm === "champion") === championGetsLaneA ? "lane-a" : "lane-b";
+}
+
+function releaseFixtureConversationIdentity(pair, fixtureFamily = null, isolationLane = null) {
   const family = fixtureFamily ? safeSegment(fixtureFamily) : `pair-${Number(pair)}`;
+  const identityFamily = isolationLane
+    ? `${family}-${safeSegment(isolationLane)}`
+    : family;
   return {
-    session_id: `release-champion-session-${family}`,
-    thread_id: `release-champion-thread-${family}`
+    session_id: `release-champion-session-${identityFamily}`,
+    thread_id: `release-champion-thread-${identityFamily}`
   };
 }
 
@@ -1369,12 +2065,14 @@ function extractCompactionItems(responseText) {
     }
     for (const child of Object.values(value)) collect(child);
   };
-  for (const block of String(responseText).split(/\r?\n\r?\n/u)) {
-    const payload = block
-      .split(/\r?\n/u)
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trim())
-      .join("\n");
+  // Third-party SSE relays do not consistently preserve blank event
+  // separators. Parse each data line independently so an otherwise valid
+  // compaction item is not discarded merely because frames were coalesced.
+  for (const line of String(responseText).split(/\r?\n/u)) {
+    const trimmed = line.trimStart();
+    const payload = trimmed.startsWith("data:")
+      ? trimmed.slice(5).trim()
+      : "";
     if (!payload || payload === "[DONE]") continue;
     try {
       collect(JSON.parse(payload));
@@ -1401,24 +2099,38 @@ function requestFamilyForScenario(scenario) {
     "full-replay": "codex-responses-full-replay",
     "tool-burst": "codex-responses-tool-burst",
     "tool-tail-maturity": "codex-responses-tool-burst",
-    "compacted-anchor": "codex-responses-compacted-anchor"
+    "compacted-anchor": "codex-responses-compacted-anchor",
+    "compaction-root": "codex-responses-compaction-root"
   }[scenario];
 }
 
 function normalizeScenario(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  return new Set(["full-replay", "tool-burst", "tool-tail-maturity", "compacted-anchor"]).has(normalized)
+  return new Set([
+    "full-replay",
+    "tool-burst",
+    "tool-tail-maturity",
+    "compacted-anchor",
+    "compaction-root"
+  ]).has(normalized)
     ? normalized
     : null;
 }
 
 function normalizeToolOutputShape(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  if (new Set(["flat", "structured", "noisy"]).has(normalized)) return normalized;
+  if (new Set(["natural", "flat", "structured", "noisy"]).has(normalized)) return normalized;
   throw new FailClosedError(
     "invalid_tool_output_shape",
-    "--tool-output-shape must be flat, structured, or noisy"
+    "--tool-output-shape must be natural, flat, structured, or noisy"
   );
+}
+
+function normalizeFixtureProfile(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  return new Set(["natural", "legacy-repeated"]).has(normalized)
+    ? normalized
+    : null;
 }
 
 function codexProviderId(configText) {
@@ -1634,6 +2346,11 @@ function ratio(numerator, denominator) {
   return denominator > 0 ? numerator / denominator : 0;
 }
 
+function finiteNonNegativeNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
 function number(value) {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -1712,9 +2429,13 @@ function printUsage() {
     --champion-exe <old.exe> --candidate-exe <new.exe> \\
     --source-config-dir <Atoapi-config-dir> --model <model> \\
     --key-realm-hash <opaque-hash> [--provider-id <id>] \\
-    [--scenario full-replay|tool-burst|tool-tail-maturity|compacted-anchor] [--pairs 2] [--turns 6] \\
-    [--seed-context-chars <0-512000>] [--tool-calls <1-8>] [--tool-output-shape flat|structured|noisy] \\
+    [--scenario full-replay|tool-burst|tool-tail-maturity|compacted-anchor|compaction-root] [--pairs 2] [--turns 6] \\
+    [--seed-context-chars <0-512000>] [--fixture-profile natural|legacy-repeated] \\
+    [--tool-calls <1-8>] [--tool-output-shape natural|flat|structured|noisy] \\
+    [--turn-delay-ms <0-5000>] [--pair-delay-ms <0-60000>] \\
     [--reuse-fixture-across-pairs] \\
+    [--isolate-upstream-cache] \\
+    [--reuse-runtime-per-arm] \\
     [--max-full-bucket-regression-requests <calibrated-count>] \\
     [--upstream-user-agent <test-only-stable-value>] \\
     [--champion-upstream-user-agent <value>] [--candidate-upstream-user-agent <value>]
@@ -1729,7 +2450,17 @@ Safety:
   fails closed.  The script only starts temporary isolated ports; it never
   sends signals to the existing 18883 process.  Each pair uses a fresh fixture
   by default; --reuse-fixture-across-pairs is an explicit deterministic-repro
-  override.`);
+  override. --isolate-upstream-cache gives the two arms distinct metadata-only
+  session identities, preventing generated placement-key cache sharing; it
+  also forces fresh isolated processes per pair so an arm-owned connection
+  pool cannot bias the cache-placement result.
+  --reuse-runtime-per-arm keeps one isolated process per arm across fresh
+  pairs only when upstream-cache isolation is off.
+  --fixture-profile natural is the default: an equal-length, deterministic,
+  non-repeated synthetic context. legacy-repeated exists only to reproduce
+  older fixture behavior; neither profile uses user context or changes Atoapi.
+  --pair-delay-ms is test-only pacing between fresh pairs; it never changes a
+  request body, retries an inbound, or touches the running service.`);
 }
 
 async function runSelfTest() {
@@ -1738,6 +2469,8 @@ async function runSelfTest() {
     live: true,
     model: "m"
   });
+  assert.equal(booleanArg(parseArgs(["--reuse-runtime-per-arm"])["reuse-runtime-per-arm"]), true);
+  assert.equal(boundedInteger("60000", "--pair-delay-ms", 0, 60_000), 60_000);
   assert.equal(resolveFreshFixturePerPair({}), true);
   assert.equal(resolveFreshFixturePerPair({ "reuse-fixture-across-pairs": true }), false);
   assert.throws(
@@ -1753,15 +2486,134 @@ async function runSelfTest() {
   assert.equal(cacheableInputTokens128(1_152), 1_152);
   assert.equal(normalizeScenario("tool_burst"), "tool-burst");
   assert.equal(normalizeScenario("tool_tail_maturity"), "tool-tail-maturity");
+  assert.equal(normalizeScenario("compaction_root"), "compaction-root");
   assert.equal(normalizeToolOutputShape("structured"), "structured");
   assert.equal(normalizeToolOutputShape("noisy"), "noisy");
+  assert.equal(normalizeToolOutputShape("natural"), "natural");
+  assert.equal(normalizeFixtureProfile("natural"), "natural");
+  assert.equal(normalizeFixtureProfile("legacy_repeated"), "legacy-repeated");
+  assert.equal(normalizeFixtureProfile("unknown"), null);
+  assert.deepEqual(
+    [0, 1, 2, 3].map((turn) => interleavedTurnOrder(0, turn)),
+    [
+      ["champion", "candidate"],
+      ["candidate", "champion"],
+      ["champion", "candidate"],
+      ["candidate", "champion"]
+    ],
+    "persistent live comparisons must rotate the first sender every matching turn"
+  );
+  assert.deepEqual(
+    interleavedTurnOrder(1, 0),
+    ["candidate", "champion"],
+    "the next pair must start from the opposite sender"
+  );
+  assert.equal(
+    comparisonPairInvalid({ champion: { pass: true }, candidate: { pass: true } }),
+    false,
+    "a fully valid pair may proceed to the next fresh fixture"
+  );
+  assert.equal(
+    comparisonPairInvalid({ champion: { pass: true }, candidate: { pass: false } }),
+    true,
+    "one invalid arm must stop a live comparison before it creates more test traffic"
+  );
+  const failedInboundMetric = { inbound_request_id: "failed-inbound" };
+  assert.equal(
+    requestLogRows({
+      recent_requests: [{ inbound_request_id: "completed-inbound" }],
+      recent_failed_requests: [failedInboundMetric]
+    }).length,
+    2,
+    "release evidence must keep terminally failed inbounds visible"
+  );
+  assert.equal(
+    selectNewRequestLog(
+      { recent_requests: [], recent_failed_requests: [failedInboundMetric] },
+      new Set()
+    ),
+    failedInboundMetric,
+    "a failed inbound must be selected from the failed-request ledger"
+  );
+  assert.equal(
+    responseErrorCode('event: response.failed\ndata: {"code":"upstream_waf_blocked"}\n\n'),
+    "upstream_waf_blocked",
+    "release evidence must retain only a bounded failure category"
+  );
+  assert.equal(
+    responseErrorCode('event: response.created\ndata: {"type":"response.created"}\n\n'),
+    null,
+    "ordinary Responses event types must never be misclassified as failures"
+  );
+  assert.equal(
+    inboundFailureReason({
+      transportError: null,
+      responseStatus: 503,
+      responseFailureCode: "new_api_error",
+      responseFailed: true,
+      checks: { terminal_response_completed: false }
+    }),
+    "http_status_503:new_api_error",
+    "an HTTP rejection must not be mislabeled as a missing Responses terminal"
+  );
+  assert.equal(
+    inboundFailureReason({
+      transportError: null,
+      responseStatus: 200,
+      responseFailureCode: "upstream_waf_blocked",
+      responseFailed: true,
+      checks: { terminal_response_completed: false }
+    }),
+    "response_failed:upstream_waf_blocked",
+    "a native failed terminal must retain its bounded failure category"
+  );
+  assert.equal(
+    inboundFailureReason({
+      transportError: null,
+      responseStatus: 200,
+      responseFailureCode: null,
+      responseFailed: false,
+      checks: { terminal_response_completed: true }
+    }),
+    null,
+    "a completed Responses stream must remain accepted"
+  );
   assert.equal(buildSeedContext(128).length, 128);
-  for (const shape of ["flat", "structured", "noisy"]) {
-    assert.equal(buildToolOutput(4096, shape).length, 4096);
-  }
-  assert.equal(releaseFixtureCallId(2), "call_release_fixture_pair_2");
   const pairFixtureA = "fixture-pair-a";
   const pairFixtureB = "fixture-pair-b";
+  const naturalFixture = buildStableInstructions(32_768, pairFixtureA, "natural");
+  const naturalFixtureStats = fixtureLineStats(naturalFixture);
+  assert.equal(naturalFixture.length, 32_768);
+  assert.equal(
+    naturalFixtureStats.line_count,
+    naturalFixtureStats.unique_line_count,
+    "the default fixture must not contain repeated full lines"
+  );
+  assert.equal(
+    naturalFixtureStats.max_repeated_line_count,
+    1,
+    "the default fixture must avoid a repeated-line WAF signature"
+  );
+  assert.notEqual(
+    buildStableInstructions(4096, pairFixtureA, "natural"),
+    buildStableInstructions(4096, pairFixtureB, "natural"),
+    "fresh fixtures must remain pair-specific in the natural profile"
+  );
+  assert.equal(
+    buildStableInstructions(4096, pairFixtureA, "natural"),
+    buildStableInstructions(4096, pairFixtureA, "natural"),
+    "the natural fixture must remain byte-stable within a pair"
+  );
+  for (const shape of ["natural", "flat", "structured", "noisy"]) {
+    assert.equal(buildToolOutput(4096, shape).length, 4096);
+  }
+  const naturalToolStats = fixtureLineStats(buildToolOutput(16_384, "natural", pairFixtureA));
+  assert.equal(
+    naturalToolStats.line_count,
+    naturalToolStats.unique_line_count,
+    "the default tool fixture must not contain repeated full lines"
+  );
+  assert.equal(releaseFixtureCallId(2), "call_release_fixture_pair_2");
   assert.equal(
     buildSeedContext(128, pairFixtureA),
     buildSeedContext(128, pairFixtureA),
@@ -1782,7 +2634,7 @@ async function runSelfTest() {
     buildStableInstructions(1024, pairFixtureB),
     "fresh fixtures must split stable instructions across pairs"
   );
-  for (const shape of ["flat", "structured", "noisy"]) {
+  for (const shape of ["natural", "flat", "structured", "noisy"]) {
     assert.equal(
       buildToolOutput(4096, shape, pairFixtureA),
       buildToolOutput(4096, shape, pairFixtureA),
@@ -1817,6 +2669,13 @@ async function runSelfTest() {
     .map((item) => item.output);
   assert.equal(multiToolOutputs.reduce((sum, output) => sum + output.length, 0), 4096);
   assert.equal(new Set(multiToolItems.map((item) => item.call_id)).size, 4);
+  assert.equal(effectiveReuseRuntimePerArm(true, false), true);
+  assert.equal(effectiveReuseRuntimePerArm(true, true), false);
+  assert.equal(effectiveReuseRuntimePerArm(false, true), false);
+  assert.equal(isolationLaneForPair(0, "champion"), "lane-a");
+  assert.equal(isolationLaneForPair(0, "candidate"), "lane-b");
+  assert.equal(isolationLaneForPair(1, "champion"), "lane-b");
+  assert.equal(isolationLaneForPair(1, "candidate"), "lane-a");
   assert.deepEqual(
     releaseFixtureConversationIdentity(2, pairFixtureA),
     releaseFixtureConversationIdentity(2, pairFixtureA),
@@ -1827,6 +2686,76 @@ async function runSelfTest() {
     releaseFixtureConversationIdentity(3, pairFixtureB),
     "fresh fixtures must isolate conversation identities across pairs"
   );
+  assert.notDeepEqual(
+    releaseFixtureConversationIdentity(2, pairFixtureA, "champion"),
+    releaseFixtureConversationIdentity(2, pairFixtureA, "candidate"),
+    "isolated cache lanes must not share a generated placement identity"
+  );
+  const stableWire = {
+    cache_metadata: "sha256-128:cache-a",
+    instructions: "sha256-128:instructions-a",
+    tools_schema: "sha256-128:tools-a",
+    pre_input_wire: "sha256-128:pre-a"
+  };
+  const changedEpochWire = {
+    cache_metadata: "sha256-128:cache-b",
+    instructions: "sha256-128:instructions-b",
+    tools_schema: "sha256-128:tools-a",
+    pre_input_wire: "sha256-128:pre-b"
+  };
+  assert.equal(
+    staticWireContinuity([
+      { phase: "seed", request_kind: "turn", outbound_prefix_fingerprints: stableWire },
+      { phase: "followup-1", request_kind: "turn", outbound_prefix_fingerprints: stableWire }
+    ]).pass,
+    true,
+    "ordinary full replay must keep its static wire stable"
+  );
+  assert.equal(
+    staticWireContinuity([
+      { phase: "seed", request_kind: "turn", outbound_prefix_fingerprints: stableWire },
+      { phase: "compaction", request_kind: "compaction", outbound_prefix_fingerprints: changedEpochWire },
+      { phase: "followup-1", request_kind: "turn", outbound_prefix_fingerprints: changedEpochWire }
+    ]).pass,
+    true,
+    "compaction is a legal static-wire epoch boundary"
+  );
+  assert.equal(
+    staticWireContinuity([
+      { phase: "seed", request_kind: "turn", outbound_prefix_fingerprints: stableWire },
+      {
+        phase: "followup-1",
+        request_kind: "turn",
+        outbound_prefix_fingerprints: { ...stableWire, tools_schema: "sha256-128:tools-drift" }
+      }
+    ]).pass,
+    false,
+    "ordinary static-wire drift must fail closed"
+  );
+  const keyPoolToml = [
+    '[[provider_key_pools]]',
+    'provider_id = "provider-a"',
+    'enabled = true',
+    '[[provider_key_pools.keys]]',
+    'id = "key-a"',
+    'key_encrypted = "encrypted-a"',
+    'enabled = true',
+    '[[provider_key_pools.keys]]',
+    'id = "key-b"',
+    'key_encrypted = "encrypted-b"',
+    'enabled = false',
+    'disabled_until = 2099-01-01T00:00:00Z',
+    ''
+  ].join("\n");
+  assert.throws(
+    () => validatePinnedKeyConfiguration(keyPoolToml, "provider-a", null),
+    (error) => error?.code === "key_pin_required_for_pool"
+  );
+  const pinnedKeyPoolToml = pinProviderKeyInToml(keyPoolToml, "provider-a", "key-b");
+  const pinnedContext = providerKeyPoolContext(pinnedKeyPoolToml, "provider-a");
+  assert.equal(extractTomlBoolean(pinnedContext.keys[0].body, "enabled"), false);
+  assert.equal(extractTomlBoolean(pinnedContext.keys[1].body, "enabled"), true);
+  assert.equal(extractTomlValuePresent(pinnedContext.keys[1].body, "disabled_until"), false);
   assert.equal(requestFamilyForScenario("full-replay"), "codex-responses-full-replay");
   const cohort = {
     provider_id: "provider-a",
@@ -1861,12 +2790,15 @@ async function runSelfTest() {
       avoidable_gap_tokens: 0,
       new_tail_gap_tokens: 0,
       shortfall_tokens: 0,
+      local_proxy_overhead_p95_ms: 0,
+      upstream_ttft_p95_ms: 100,
       ttft_p95_ms: 100,
       usage_coverage: 1,
       observed_realm_ids: ["observed-realm"]
     },
     checks: {
-      every_inbound_one_attempt_one_main_post: true
+      every_inbound_one_attempt_one_main_post: true,
+      static_wire_continuity: true
     }
   });
   assert.equal(compareArmResults(valid("champion", 0.9), valid("candidate", 0.9), 0).pass, true);
@@ -1892,6 +2824,18 @@ async function runSelfTest() {
     compareArmResults(valid("champion", 0.9), oneFullBucketBehind, 0, 1).pass,
     true
   );
+  const tokenSuperiorButOneFullBucketBehind = valid("candidate", 0.91);
+  tokenSuperiorButOneFullBucketBehind.metrics.full_bucket_requests = 2;
+  tokenSuperiorButOneFullBucketBehind.metrics.full_bucket_rate = 0.5;
+  const tokenSuperiorVerdict = compareArmResults(
+    valid("champion", 0.9),
+    tokenSuperiorButOneFullBucketBehind,
+    0
+  );
+  assert.equal(tokenSuperiorVerdict.pass, true);
+  assert.equal(tokenSuperiorVerdict.cache_pass, true);
+  assert.equal(tokenSuperiorVerdict.checks.candidate_full_bucket_rate_not_lower, false);
+  assert.equal(tokenSuperiorVerdict.checks.candidate_full_bucket_loss_explained_by_token_gain, true);
   const mismatched = valid("candidate", 0.9);
   mismatched.cohort = { ...cohort, model: "other" };
   assert.equal(compareArmResults(valid("champion", 0.9), mismatched, 0).pass, false);
@@ -1906,17 +2850,37 @@ async function runSelfTest() {
           phase: "seed",
           input_tokens: 1024,
           cache_read_tokens: 900,
+          outbound_prefix_fingerprints: stableWire,
           sse_completed: true,
           observed_realm_id: "observed-realm",
-          checks: { per_inbound_one_attempt_one_post: true, exact_counter_delta: true }
+          prefix_guard_wait_ms: 0,
+          local_prepare_ms: 1,
+          upstream_ttft_ms: 80,
+          ttft_ms: 80,
+          checks: {
+            per_inbound_one_attempt_one_post: true,
+            exact_counter_delta: true,
+            timing_present: true,
+            static_wire_continuity: true
+          }
         },
         {
           phase: "followup-1",
           input_tokens: 1152,
           cache_read_tokens: 1152,
+          outbound_prefix_fingerprints: stableWire,
           sse_completed: true,
           observed_realm_id: "observed-realm",
-          checks: { per_inbound_one_attempt_one_post: true, exact_counter_delta: true }
+          prefix_guard_wait_ms: 0,
+          local_prepare_ms: 1,
+          upstream_ttft_ms: 90,
+          ttft_ms: 90,
+          checks: {
+            per_inbound_one_attempt_one_post: true,
+            exact_counter_delta: true,
+            timing_present: true,
+            static_wire_continuity: true
+          }
         }
       ]
     }

@@ -1077,6 +1077,19 @@ pub(super) async fn stream_upstream(
         } else if let Some(failure_code) = terminal_failure_code {
             sse_end_reason = failure_code.code().to_string();
         }
+        // A 2xx response head can still end as an upstream SSE/WAF failure.
+        // If this exact request injected or just learned a placement cookie,
+        // drop the process-local hint for future inbounds. Never retry,
+        // reroute, or inspect/store the cookie value here.
+        if !terminal_verdict.success
+            && upstream_request_diagnostics.should_clear_upstream_affinity_after_failed_settlement()
+        {
+            clear_upstream_affinity_after_failed_settlement(
+                &state_for_stream,
+                response_session_key.as_deref(),
+                &upstream_request_diagnostics,
+            );
+        }
         if terminal_failure_code.is_some_and(ResponsesFailureCode::is_upstream_blocked) {
             if let (Some(scope), Some(shape)) = (
                 full_replay_risk_scope.clone(),

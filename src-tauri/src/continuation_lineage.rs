@@ -796,7 +796,20 @@ impl ContinuationLineageIndex {
         if response_id.is_empty() {
             return None;
         }
-        self.slots.lock().await.iter().find_map(|(key, slot)| {
+        let slots = self.slots.lock().await;
+        // Response ids are upstream-owned and may collide across independent
+        // routes. A current-scope head or local-only marker therefore wins
+        // before looking for a stale copy elsewhere; otherwise an old route's
+        // replay material could be spliced into the active route.
+        if slots.get(current_key).is_some_and(|slot| {
+            slot.head
+                .as_ref()
+                .is_some_and(|head| head.response_id == response_id)
+                || slot.local_only_response_id.as_deref() == Some(response_id)
+        }) {
+            return None;
+        }
+        slots.iter().find_map(|(key, slot)| {
             (key != current_key)
                 .then(|| slot.head.as_ref())
                 .flatten()
@@ -814,10 +827,21 @@ impl ContinuationLineageIndex {
         response_id: &str,
     ) -> bool {
         let response_id = response_id.trim();
-        !response_id.is_empty()
-            && self.slots.lock().await.iter().any(|(key, slot)| {
-                key != current_key && slot.local_only_response_id.as_deref() == Some(response_id)
-            })
+        if response_id.is_empty() {
+            return false;
+        }
+        let slots = self.slots.lock().await;
+        if slots.get(current_key).is_some_and(|slot| {
+            slot.head
+                .as_ref()
+                .is_some_and(|head| head.response_id == response_id)
+                || slot.local_only_response_id.as_deref() == Some(response_id)
+        }) {
+            return false;
+        }
+        slots.iter().any(|(key, slot)| {
+            key != current_key && slot.local_only_response_id.as_deref() == Some(response_id)
+        })
     }
 
     #[cfg(test)]
@@ -1269,6 +1293,69 @@ mod tests {
             !index
                 .has_local_only_response_id_in_other_scope("thread-a", "resp-opaque")
                 .await
+        );
+    }
+
+    #[tokio::test]
+    async fn current_scope_response_id_wins_over_a_colliding_old_scope() {
+        let index = ContinuationLineageIndex::default();
+        let old = index.begin("old-route").await;
+        assert!(matches!(
+            index
+                .commit_fast(
+                    &old,
+                    &LineageParent::FullReplay,
+                    candidate("resp-shared", "old route history"),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { .. }
+        ));
+        let current = index.begin("current-route").await;
+        assert!(matches!(
+            index
+                .commit_fast(
+                    &current,
+                    &LineageParent::FullReplay,
+                    candidate("resp-shared", "current route history"),
+                    true,
+                )
+                .await,
+            LineageCommitOutcome::Applied { .. }
+        ));
+
+        assert!(
+            index
+                .managed_response_in_other_scope("current-route", "resp-shared")
+                .await
+                .is_none(),
+            "a response id owned by the current scope must never recover replay material from an old route"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_scope_local_only_id_wins_over_a_colliding_old_scope() {
+        let index = ContinuationLineageIndex::default();
+        let old = index.begin("old-route").await;
+        assert!(matches!(
+            index
+                .tombstone_with_local_response_id_fast(&old, None, "resp-shared".to_string(),)
+                .await,
+            LineageInvalidateOutcome::AppliedWithLocalReference { .. }
+        ));
+        let current = index.begin("current-route").await;
+        assert!(matches!(
+            index
+                .tombstone_with_local_response_id_fast(&current, None, "resp-shared".to_string(),)
+                .await,
+            LineageInvalidateOutcome::AppliedWithLocalReference { .. }
+        ));
+
+        assert!(
+            !index
+                .has_local_only_response_id_in_other_scope("current-route", "resp-shared")
+                .await,
+            "a local-only id owned by the current scope must not be misclassified as stale from an old route"
         );
     }
 

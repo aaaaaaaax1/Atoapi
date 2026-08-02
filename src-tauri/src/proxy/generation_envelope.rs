@@ -5,6 +5,7 @@ use crate::config::{Channel, ProviderConfig};
 use super::{
     prepared_wire_request::PreparedResponseBody,
     request_plan::{OneShotRequestPlan, RequestPlan},
+    upstream_affinity::UpstreamAffinityScope,
 };
 
 /// Binds the final semantic request body to the single frozen wire request.
@@ -56,6 +57,14 @@ impl GenerationEnvelope {
 
     pub(super) fn with_explicit_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.request_plan = self.request_plan.with_explicit_proxy_url(proxy_url);
+        self
+    }
+
+    pub(super) fn with_upstream_affinity_scope(
+        mut self,
+        scope: Option<UpstreamAffinityScope>,
+    ) -> Self {
+        self.request_plan = self.request_plan.with_upstream_affinity_scope(scope);
         self
     }
 

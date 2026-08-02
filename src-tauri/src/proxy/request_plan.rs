@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::config::{Channel, ProviderConfig};
 
-use super::prepared_wire_request::PreparedWireRequest;
+use super::{prepared_wire_request::PreparedWireRequest, upstream_affinity::UpstreamAffinityScope};
 
 #[derive(Debug)]
 pub(super) struct RequestPlan {
@@ -12,6 +12,7 @@ pub(super) struct RequestPlan {
     explicit_proxy_url: Option<String>,
     custom_user_agent: Option<String>,
     request_body_gzip_enabled: bool,
+    upstream_affinity_scope: Option<UpstreamAffinityScope>,
     wire: PreparedWireRequest,
 }
 
@@ -46,6 +47,7 @@ impl RequestPlan {
             explicit_proxy_url: None,
             custom_user_agent: provider.custom_user_agent.clone(),
             request_body_gzip_enabled: provider.request_body_gzip_enabled,
+            upstream_affinity_scope: None,
             wire,
         }
     }
@@ -57,6 +59,17 @@ impl RequestPlan {
 
     pub(super) fn with_explicit_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.explicit_proxy_url = self.use_system_proxy.then_some(proxy_url).flatten();
+        self
+    }
+
+    /// Carries only an opaque, trusted, process-scoped transport affinity
+    /// scope. The upstream affinity value itself remains in AppState and never
+    /// enters this frozen request, its JSON wire, logs, or persistence.
+    pub(super) fn with_upstream_affinity_scope(
+        mut self,
+        scope: Option<UpstreamAffinityScope>,
+    ) -> Self {
+        self.upstream_affinity_scope = scope;
         self
     }
 
@@ -88,6 +101,10 @@ impl RequestPlan {
 
     pub(super) fn request_body_gzip_enabled(&self) -> bool {
         self.request_body_gzip_enabled
+    }
+
+    pub(super) fn upstream_affinity_scope(&self) -> Option<&UpstreamAffinityScope> {
+        self.upstream_affinity_scope.as_ref()
     }
 
     pub(super) fn wire(&self) -> &PreparedWireRequest {
@@ -122,6 +139,10 @@ impl OneShotRequestPlan {
 
     pub(super) fn request_body_gzip_enabled(&self) -> bool {
         self.plan.request_body_gzip_enabled()
+    }
+
+    pub(super) fn upstream_affinity_scope(&self) -> Option<&UpstreamAffinityScope> {
+        self.plan.upstream_affinity_scope()
     }
 
     pub(super) fn wire(&self) -> &PreparedWireRequest {

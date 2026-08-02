@@ -35,7 +35,7 @@ use crate::{
         cache_validation::CacheValidationController,
         final_scope_waterline::{FinalScopeObservationRegistry, FinalScopeWaterlineLedger},
         DispatchDrainOutcome, DispatchTracker, ResponsesFullReplayRiskObservations,
-        TransportClients, WarmPendingRegistry,
+        TransportClients, UpstreamCacheAffinity, WarmPendingRegistry,
     },
 };
 
@@ -96,6 +96,10 @@ pub struct AppState {
     /// Responses FullReplay payload after HTTP headers.  Values are opaque
     /// route scopes only; no request body, tool output, or Key is retained.
     pub full_replay_risk_observations: Mutex<ResponsesFullReplayRiskObservations>,
+    /// Process-only upstream load-balancer placement state. It is bounded and
+    /// intentionally excluded from config, metrics, runtime journals, and
+    /// downstream responses because its values are opaque upstream cookies.
+    pub upstream_cache_affinity: StdMutex<UpstreamCacheAffinity>,
     /// Process-local, opaque cooldowns for caller-provided native Responses
     /// placement keys rejected by an upstream. These must never be persisted:
     /// a caller key is wire-only data and a new process gets one fresh chance
@@ -555,6 +559,7 @@ impl AppState {
             full_replay_risk_observations: Mutex::new(
                 ResponsesFullReplayRiskObservations::default(),
             ),
+            upstream_cache_affinity: StdMutex::new(UpstreamCacheAffinity::default()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
@@ -607,6 +612,7 @@ impl AppState {
             full_replay_risk_observations: Mutex::new(
                 ResponsesFullReplayRiskObservations::default(),
             ),
+            upstream_cache_affinity: StdMutex::new(UpstreamCacheAffinity::default()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,

@@ -26,7 +26,7 @@ import type {
 } from "./graphite/frameProtocol";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.19";
+const APP_VERSION = "v1.4.20";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 

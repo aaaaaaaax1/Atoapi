@@ -7,6 +7,7 @@ use super::{
     generation_envelope::{FrozenGenerationDispatch, GenerationEnvelope},
     prepared_wire_request::PreparedResponseBody,
     request_plan::RequestPlan,
+    upstream_affinity::UpstreamAffinityScope,
 };
 
 /// The only production seam allowed to turn a prepared Responses body into
@@ -55,6 +56,14 @@ impl FinalResponsesWirePlan {
         self
     }
 
+    pub(super) fn with_upstream_affinity_scope(
+        mut self,
+        scope: Option<UpstreamAffinityScope>,
+    ) -> Self {
+        self.envelope = self.envelope.with_upstream_affinity_scope(scope);
+        self
+    }
+
     pub(super) fn into_dispatch(self) -> FrozenGenerationDispatch {
         self.envelope.into_dispatch()
     }
@@ -71,6 +80,7 @@ mod tests {
         proxy::{
             action_scope::{ActionScopeInput, CompositeActionScope},
             cache_control_core::{CacheContextMode, CacheControlCore, CacheControlPlanInput},
+            upstream_affinity::UpstreamAffinityScope,
         },
     };
 
@@ -159,5 +169,40 @@ mod tests {
 
         let mut dispatch = plan.with_gzip_enabled(true).into_dispatch();
         assert!(dispatch.take_one_shot_plan().request_body_gzip_enabled());
+    }
+
+    #[test]
+    fn affinity_scope_crosses_the_frozen_plan_without_touching_the_responses_wire() {
+        let body = PreparedResponseBody::responses_pending(json!({
+            "model": "gpt-test",
+            "input": [{"type":"message","role":"user","content":"stable"}],
+            "stream": true
+        }));
+        let cache_plan = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        });
+        let scope = UpstreamAffinityScope::for_test("opaque-trusted-session-scope");
+        let plan = FinalResponsesWirePlan::freeze(
+            &provider(),
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            body,
+            cache_plan,
+            None,
+        )
+        .with_upstream_affinity_scope(Some(scope));
+
+        let expected_wire = plan.request_plan().wire().body().to_vec();
+        let mut dispatch = plan.into_dispatch();
+        let one_shot = dispatch.take_one_shot_plan();
+        assert_eq!(one_shot.wire().body().as_ref(), expected_wire.as_slice());
+        assert!(one_shot.upstream_affinity_scope().is_some());
+        assert!(
+            !format!("{one_shot:?}").contains("opaque-trusted-session-scope"),
+            "opaque transport scope must not leak through Debug output"
+        );
     }
 }
