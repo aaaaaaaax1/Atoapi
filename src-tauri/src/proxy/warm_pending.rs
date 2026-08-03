@@ -12,7 +12,6 @@ const WARM_PENDING_TTL: Duration = Duration::from_secs(22);
 const WARM_PENDING_FOLLOWUP_WAIT: Duration = Duration::from_millis(500);
 const WARM_PENDING_MAX_FOLLOWUPS: u8 = 3;
 const WARM_PENDING_MAX_ENTRIES: usize = 64;
-const MATERIAL_NO_GAIN_BACKOFF: Duration = Duration::from_secs(22);
 
 /// The immutable fact that made an exact successor worth holding briefly.
 ///
@@ -31,8 +30,8 @@ impl PendingMaturityKind {
             // genuinely cold giant root.  Keep the existing bounded chain.
             Self::GiantColdRoot => WARM_PENDING_MAX_FOLLOWUPS,
             // A normal tool tail is a different case: wait once for its exact
-            // child, then fail open.  Repeated no-gain waits must not become a
-            // user-visible latency tax.
+            // child, then fail open. A later tool result has a different
+            // exact predecessor and therefore earns its own one-shot window.
             Self::MaterialToolTail => 1,
         }
     }
@@ -66,24 +65,12 @@ impl PendingMaturityKind {
 #[derive(Debug, Default)]
 pub(crate) struct WarmPendingRegistry {
     entries: HashMap<String, WarmPendingEntry>,
-    /// A material tail only receives its first short wait when the exact
-    /// final-scope ledger showed a real predecessor shortfall. If that child
-    /// does not recover any of it, stop paying another foreground delay for
-    /// this scope until the tiny process-local window expires.
-    material_no_gain_until: HashMap<String, Instant>,
     next_nonce: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MaterialMaturityEvidence {
-    cache_read_tokens: u64,
-    avoidable_tokens_128: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PendingMaturity {
     kind: PendingMaturityKind,
-    material_evidence: Option<MaterialMaturityEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +80,6 @@ struct WarmPendingEntry {
     ready_at: Instant,
     remaining_followups: u8,
     kind: PendingMaturityKind,
-    material_evidence: Option<MaterialMaturityEvidence>,
     nonce: u64,
 }
 
@@ -109,7 +95,6 @@ pub(super) struct WarmPendingClaim {
     ready_at: Instant,
     remaining_after_claim: u8,
     kind: PendingMaturityKind,
-    material_evidence: Option<MaterialMaturityEvidence>,
 }
 
 impl WarmPendingClaim {
@@ -150,7 +135,6 @@ impl WarmPendingRegistry {
             ready_at: entry.ready_at,
             remaining_after_claim: entry.remaining_followups.saturating_sub(1),
             kind: entry.kind,
-            material_evidence: entry.material_evidence,
         })
     }
 
@@ -210,21 +194,9 @@ impl WarmPendingRegistry {
             return;
         };
 
-        let claim_recovered = claim
-            .filter(|claim| claim.kind == PendingMaturityKind::MaterialToolTail)
-            .is_none_or(|claim| material_claim_recovered(claim, final_scope));
-        if !claim_recovered {
-            self.suppress_material_no_gain(key.clone(), now);
-        }
-
         let Some(maturity) = pending_maturity(raw_usage, tail, final_scope) else {
             return;
         };
-        if maturity.kind == PendingMaturityKind::MaterialToolTail
-            && (!claim_recovered || self.material_no_gain_active(&key, now))
-        {
-            return;
-        }
         let (deadline_at, ready_at, remaining_followups) = match claim {
             Some(claim) => {
                 // A giant root remains one bounded chain.  A newly produced
@@ -296,7 +268,6 @@ impl WarmPendingRegistry {
                 ready_at,
                 remaining_followups,
                 kind: maturity.kind,
-                material_evidence: maturity.material_evidence,
                 nonce: self.next_nonce,
             },
         );
@@ -305,26 +276,6 @@ impl WarmPendingRegistry {
     fn purge_expired(&mut self) {
         let now = Instant::now();
         self.entries.retain(|_, entry| entry.deadline_at > now);
-        self.material_no_gain_until
-            .retain(|_, expires_at| *expires_at > now);
-    }
-
-    fn material_no_gain_active(&self, key: &str, now: Instant) -> bool {
-        self.material_no_gain_until
-            .get(key)
-            .is_some_and(|expires_at| *expires_at > now)
-    }
-
-    fn suppress_material_no_gain(&mut self, key: String, now: Instant) {
-        if !self.material_no_gain_until.contains_key(&key)
-            && self.material_no_gain_until.len() >= WARM_PENDING_MAX_ENTRIES
-        {
-            // A suppression is only a latency optimization. Do not evict an
-            // unrelated scope to remember another one.
-            return;
-        }
-        self.material_no_gain_until
-            .insert(key, now + MATERIAL_NO_GAIN_BACKOFF);
     }
 
     #[cfg(test)]
@@ -377,14 +328,10 @@ fn pending_maturity(
     if giant_cold_read(raw_usage) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::GiantColdRoot,
-            material_evidence: None,
         })
-    } else if let Some(material_evidence) =
-        material_tail_maturity_evidence(raw_usage, tail, final_scope)
-    {
+    } else if material_tool_tail_has_exact_shortfall(raw_usage, tail, final_scope) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::MaterialToolTail,
-            material_evidence: Some(material_evidence),
         })
     } else {
         None
@@ -395,12 +342,14 @@ fn pending_maturity(
 /// size alone never proves that waiting helps. Arm a material-tail window only
 /// when the exact final-scope settlement proves an older prefix bucket was
 /// still absent. This is aggregate upstream usage evidence only.
-fn material_tail_maturity_evidence(
+fn material_tool_tail_has_exact_shortfall(
     raw_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
     final_scope: &FinalScopeWaterlineLog,
-) -> Option<MaterialMaturityEvidence> {
-    let record = raw_usage?;
+) -> bool {
+    let Some(record) = raw_usage else {
+        return false;
+    };
     if !material_tool_tail(Some(record), tail)
         || !final_scope.predecessor_exact
         || !final_scope.predecessor_bound
@@ -408,31 +357,9 @@ fn material_tail_maturity_evidence(
         || final_scope.candidate_avoidable_tokens_128 < 128
         || final_scope.raw_cache_read_tokens != record.cache_read_tokens
     {
-        return None;
+        return false;
     }
-    Some(MaterialMaturityEvidence {
-        cache_read_tokens: record.cache_read_tokens,
-        avoidable_tokens_128: final_scope.candidate_avoidable_tokens_128,
-    })
-}
-
-/// The claimed child demonstrates benefit only when raw upstream cache usage
-/// moved forward by a real cache bucket or its exact predecessor shortfall
-/// decreased. A new tool tail cannot turn an unchanged result into a positive
-/// signal, which prevents repeated 500ms waits on a provider that does not
-/// materialise these prefixes promptly.
-fn material_claim_recovered(
-    claim: &WarmPendingClaim,
-    final_scope: &FinalScopeWaterlineLog,
-) -> bool {
-    let Some(previous) = claim.material_evidence else {
-        return true;
-    };
-    final_scope.predecessor_exact
-        && final_scope.predecessor_bound
-        && !final_scope.continuity_reset
-        && (final_scope.raw_cache_read_tokens >= previous.cache_read_tokens.saturating_add(128)
-            || final_scope.candidate_avoidable_tokens_128 < previous.avoidable_tokens_128)
+    true
 }
 
 #[cfg(test)]
@@ -620,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn material_tool_tail_waits_once_for_its_exact_child_then_fails_open() {
+    fn a_no_gain_material_tail_does_not_suppress_a_new_material_tail() {
         let mut registry = WarmPendingRegistry::default();
         let prefix = "realm\0provider\0model\0responses\0control";
         let scope = "final-scope";
@@ -682,13 +609,13 @@ mod tests {
         assert!(
             registry
                 .claim(Some(prefix), Some(scope), true, &exact(child))
-                .is_none(),
-            "a no-gain material child must suppress another foreground wait for this scope"
+                .is_some(),
+            "a new material tail has a new exact predecessor and must receive its own one-shot maturity window"
         );
     }
 
     #[test]
-    fn material_tool_tail_rearms_only_after_the_claimed_child_recovers_cache() {
+    fn a_recovered_material_child_can_arm_the_next_tool_tail() {
         let mut registry = WarmPendingRegistry::default();
         let prefix = "realm\0provider\0model\0responses\0control";
         let scope = "final-scope";
@@ -729,7 +656,7 @@ mod tests {
             registry
                 .claim(Some(prefix), Some(scope), true, &exact(child))
                 .is_some(),
-            "a new material tail may wait again only after the prior exact child showed a real cache recovery"
+            "a new material tail may arm its own direct-child maturity window"
         );
     }
 
@@ -793,7 +720,6 @@ mod tests {
             ready_at: Instant::now() - Duration::from_millis(1),
             remaining_after_claim: 2,
             kind: PendingMaturityKind::GiantColdRoot,
-            material_evidence: None,
         };
 
         registry.settle(

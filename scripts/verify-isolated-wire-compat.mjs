@@ -49,8 +49,16 @@ const COMMIT_MATURITY_PROBE_DELAY_MS = 700;
 const SYNTHETIC_CLIENT_PROMPT_CACHE_KEY = "wire-compat-client-cache-key";
 
 if (!model) throw new Error("--model must not be empty");
-if (!new Set(["ordinary", "lineage-recovery", "commit-maturity", "sequential-full-replay"]).has(scenario)) {
-  throw new Error("--scenario must be ordinary, lineage-recovery, commit-maturity, or sequential-full-replay");
+if (!new Set([
+  "ordinary",
+  "lineage-recovery",
+  "commit-maturity",
+  "sequential-full-replay",
+  "regenerated-tool-ids"
+]).has(scenario)) {
+  throw new Error(
+    "--scenario must be ordinary, lineage-recovery, commit-maturity, sequential-full-replay, or regenerated-tool-ids"
+  );
 }
 if (!existsSync(oldExecutable)) {
   throw new Error(`wire baseline executable is missing: ${oldExecutable}`);
@@ -223,12 +231,20 @@ try {
       fastrelay: summarizeSequentialFullReplay(newRun.upstreamRequests)
     }
     : null;
+  const regeneratedToolIds = scenario === "regenerated-tool-ids"
+    ? {
+      baseline: summarizeRegeneratedToolIds(oldRun.upstreamRequests),
+      fastrelay: summarizeRegeneratedToolIds(newRun.upstreamRequests)
+    }
+    : null;
   const rawSequenceEqual = sameRawWireSequence(oldRun.upstreamRequests, newRun.upstreamRequests);
   const rawInputSequenceEqual = sameRawInputSequence(oldRun.upstreamRequests, newRun.upstreamRequests);
   const sequentialMetadataCorrection = scenario === "sequential-full-replay" &&
     sequentialFullReplay?.fastrelay?.pass === true &&
     rawInputSequenceEqual &&
     sequentialFullReplay?.baseline?.static_wire_stable === false;
+  const regeneratedToolIdCorrection = scenario === "regenerated-tool-ids" &&
+    regeneratedToolIds?.fastrelay?.pass === true;
   const meaningfulDifferingPaths = differingPaths.filter((path) => !(
     (clientOwnedCacheKeyCorrection && path === "$.prompt_cache_key") ||
     (sequentialMetadataCorrection && path === "$.client_metadata")
@@ -238,9 +254,11 @@ try {
     ? recovery?.candidate_preserves_complete_replay === true
     : scenario === "sequential-full-replay"
       ? sequentialMetadataCorrection && meaningfulDifferingPaths.length === 0
+      : scenario === "regenerated-tool-ids"
+        ? regeneratedToolIdCorrection
       : meaningfulDifferingPaths.length === 0 && rawWirePass;
   const ignoreBodyLength = scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection ||
-    sequentialMetadataCorrection;
+    sequentialMetadataCorrection || regeneratedToolIdCorrection;
   const baselineComparableHeaders = comparableProtocolHeaders(oldRun.upstreamHeaders, ignoreBodyLength);
   const fastrelayComparableHeaders = comparableProtocolHeaders(newRun.upstreamHeaders, ignoreBodyLength);
   const commitMaturity = scenario === "commit-maturity"
@@ -260,6 +278,8 @@ try {
     final_wire: scenarioWirePass,
     sequential_full_replay: scenario !== "sequential-full-replay" ||
       sequentialFullReplay?.fastrelay?.pass === true,
+    regenerated_tool_ids: scenario !== "regenerated-tool-ids" ||
+      regeneratedToolIds?.fastrelay?.pass === true,
     commit_maturity: commitMaturityPass,
     protocol_headers: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
     local_identity: identity.equal || expectedIdentityCorrection || scenario === "lineage-recovery"
@@ -276,7 +296,7 @@ try {
     fastrelay: newRun.summary,
     wire_equal: differingPaths.length === 0,
     wire_difference_expected: scenario === "lineage-recovery" || clientOwnedCacheKeyCorrection ||
-      sequentialMetadataCorrection,
+      sequentialMetadataCorrection || regeneratedToolIdCorrection,
     differing_paths: differingPaths,
     meaningful_differing_paths: meaningfulDifferingPaths,
     differing_controls: summarizeControlDifferences(baseline, fastrelay, differingPaths),
@@ -292,6 +312,7 @@ try {
     },
     lineage_recovery: recovery,
     sequential_full_replay: sequentialFullReplay,
+    regenerated_tool_ids: regeneratedToolIds,
     commit_maturity: commitMaturity,
     headers_equal: checks.protocol_headers,
     baseline_headers: oldRun.upstreamHeaders,
@@ -302,6 +323,7 @@ try {
     fastrelay_shadow_observation: shadowObservationClass(newRun.identityMarkers),
     client_owned_cache_key_correction: clientOwnedCacheKeyCorrection,
     sequential_metadata_correction: sequentialMetadataCorrection,
+    regenerated_tool_id_correction: regeneratedToolIdCorrection,
     checks,
     failure_reasons: Object.entries(checks)
       .filter(([, passed]) => !passed)
@@ -313,6 +335,7 @@ try {
   assert.equal(checks.same_prefix_header_gate, true, "same-prefix header gate must not serialize ordinary dispatch");
   assert.equal(checks.final_wire, true, "final wire differs outside the explicitly attested caller cache-key correction");
   assert.equal(checks.sequential_full_replay, true, "sequential full replay did not retain a stable byte-level prefix");
+  assert.equal(checks.regenerated_tool_ids, true, "regenerated Codex tool ids did not retain the prior wire prefix");
   assert.equal(checks.commit_maturity, true, "commit-maturity behavior violated its bounded policy");
   assert.equal(checks.protocol_headers, true, "upstream protocol headers changed unexpectedly");
   assert.equal(checks.local_identity, true, "local identity changed outside the attested caller cache-key correction");
@@ -358,6 +381,27 @@ try {
       report.commit_maturity?.fastrelay?.all_full_hit,
       true,
       "commit-maturity fixture must prove that the no-wait assertion is evaluating full cache hits"
+    );
+  } else if (scenario === "regenerated-tool-ids") {
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.exact_prior_prefix,
+      true,
+      "FastRelay must restore regenerated tool call ids to the exact prior input prefix"
+    );
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.raw_input_append_only,
+      true,
+      "FastRelay must make the second regenerated-id replay a raw append-only input wire"
+    );
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.tool_outputs_unchanged,
+      true,
+      "FastRelay must not rewrite tool result values while rebinding call ids"
+    );
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.no_previous_response_id,
+      true,
+      "FastRelay regenerated-id full replay must not forward previous_response_id"
     );
   } else {
     assert.equal(
@@ -472,6 +516,8 @@ async function runIsolatedCapture({
       ? 3
       : scenario === "commit-maturity"
         ? 2
+        : scenario === "regenerated-tool-ids"
+          ? 2
         : scenario === "sequential-full-replay"
           ? 4
         : concurrency;
@@ -488,6 +534,18 @@ async function runIsolatedCapture({
           const second = await sendInbound(syntheticCommitMaturityBody(model, generatedControls));
           return [first, second];
         })()
+        : scenario === "regenerated-tool-ids"
+          ? (async () => {
+            const results = [];
+            for (const body of syntheticRegeneratedToolIdBodies(
+              model,
+              generatedControls,
+              sequentialToolOutputChars
+            )) {
+              results.push(await sendInbound(body));
+            }
+            return results;
+          })()
         : scenario === "sequential-full-replay"
           ? (async () => {
             const results = [];
@@ -553,6 +611,8 @@ async function runIsolatedCapture({
           "FastRelay complete replay must not forward the local response id"
         );
       }
+    } else if (scenario === "regenerated-tool-ids") {
+      assert.equal(upstreamRequests.length, 2, `${label}: regenerated-id replay must make two POSTs`);
     } else {
       assert.equal(upstreamRequests.length, 4, `${label}: sequential full replay must make four POSTs`);
     }
@@ -846,6 +906,64 @@ function syntheticSequentialFullReplayBodies(
   return bodies;
 }
 
+function syntheticRegeneratedToolIdBodies(
+  model,
+  generatedControls = false,
+  toolOutputChars = 0
+) {
+  const stableHistory = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "regenerated tool id root" }]
+    },
+    {
+      type: "function_call",
+      id: "fc-regenerated-wire",
+      status: "completed",
+      call_id: "call-regenerated-prior",
+      name: "read_fixture",
+      arguments: "{\"path\":\"regenerated.txt\"}"
+    },
+    {
+      type: "function_call_output",
+      id: "fco-regenerated-wire",
+      status: "completed",
+      call_id: "call-regenerated-prior",
+      output: toolOutputChars > 0
+        ? {
+          stdout: "r".repeat(toolOutputChars),
+          stderr: "",
+          exit_code: 0
+        }
+        : {
+          stdout: "regenerated fixture result\\n",
+          stderr: "",
+          exit_code: 0
+        }
+    }
+  ];
+  const first = syntheticRequestBase(
+    model,
+    stableHistory.map((item) => structuredClone(item)),
+    null,
+    generatedControls
+  );
+  const replay = stableHistory.map((item) => structuredClone(item));
+  // Codex can replay the same settled exchange with a fresh opaque id. The
+  // candidate must bind this closed pair back to the exact prior wire before
+  // its single upstream POST, then append only the genuine new user tail.
+  replay[1].call_id = "call-regenerated-fresh";
+  replay[2].call_id = "call-regenerated-fresh";
+  replay.push({
+    type: "message",
+    role: "user",
+    content: [{ type: "input_text", text: "regenerated tool id real tail" }]
+  });
+  const second = syntheticRequestBase(model, replay, null, generatedControls);
+  return [first, second];
+}
+
 function syntheticClientMetadataCarrier(position, turn) {
   const turnMetadata = JSON.stringify({
     session_id: "wire-compat-session",
@@ -979,6 +1097,54 @@ function summarizeSequentialFullReplay(requests) {
     client_metadata_stripped: clientMetadataStripped,
     no_previous_response_id: previousInputIdsAbsent,
     one_post_per_inbound: onePostPerInbound,
+    wires: rawWireSummary(requests)
+  };
+}
+
+function summarizeRegeneratedToolIds(requests) {
+  if (requests.length !== 2) {
+    return {
+      pass: false,
+      turns: requests.length,
+      reason: "expected_exactly_two_turns"
+    };
+  }
+  const [first, second] = requests;
+  const firstInput = Array.isArray(first.body?.input) ? first.body.input : [];
+  const secondInput = Array.isArray(second.body?.input) ? second.body.input : [];
+  const secondPrefix = secondInput.slice(0, firstInput.length);
+  const exactPriorPrefix = JSON.stringify(secondPrefix) === JSON.stringify(firstInput);
+  const rawInputAppendOnly = second.rawWire.input_inner.startsWith(`${first.rawWire.input_inner},`);
+  const inputItemsAppendOnly = secondInput.length === firstInput.length + 1;
+  const toolOutputsUnchanged = JSON.stringify(
+    secondPrefix
+      .filter((item) => item?.type === "function_call_output")
+      .map((item) => item.output)
+  ) === JSON.stringify(
+    firstInput
+      .filter((item) => item?.type === "function_call_output")
+      .map((item) => item.output)
+  );
+  const noPreviousResponseId = requests.every(
+    (request) => request.body?.previous_response_id === undefined
+  );
+  const onePostPerInbound = requests.length === 2;
+  return {
+    pass: onePostPerInbound && exactPriorPrefix && rawInputAppendOnly &&
+      inputItemsAppendOnly && toolOutputsUnchanged && noPreviousResponseId,
+    turns: requests.length,
+    exact_prior_prefix: exactPriorPrefix,
+    raw_input_append_only: rawInputAppendOnly,
+    input_items_append_only: inputItemsAppendOnly,
+    tool_outputs_unchanged: toolOutputsUnchanged,
+    no_previous_response_id: noPreviousResponseId,
+    one_post_per_inbound: onePostPerInbound,
+    first_prefix_call_ids: firstInput
+      .filter((item) => item?.type === "function_call" || item?.type === "function_call_output")
+      .map((item) => item.call_id ?? null),
+    second_prefix_call_ids: secondPrefix
+      .filter((item) => item?.type === "function_call" || item?.type === "function_call_output")
+      .map((item) => item.call_id ?? null),
     wires: rawWireSummary(requests)
   };
 }

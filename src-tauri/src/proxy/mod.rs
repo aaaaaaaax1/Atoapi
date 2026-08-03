@@ -2683,6 +2683,30 @@ async fn run_generation_for_authorized_agent(
         .get("previous_response_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
+    // Codex can replay an already-sent tool exchange with newly allocated
+    // opaque call ids.  On a proven local FullReplay successor, bind only a
+    // closed, byte-equivalent tool graph back to the exact prior ids.  This
+    // keeps the actual upstream prefix stable without rewriting a first turn,
+    // an external continuation, compaction, ambiguous recovery, user text or
+    // any tool result value.
+    if native_responses_passthrough
+        && trusted_codex_metadata.is_some()
+        && incoming_previous_response_id.is_none()
+        && !full_replay_ambiguous_local_lineage
+        && !stale_external_continuation_after_route_switch
+        && !response_session_starts_compaction_epoch
+    {
+        if let Some(previous_input) = response_session_snapshot_lease
+            .as_ref()
+            .and_then(|lease| lease.control_head())
+            .map(|head| head.input())
+        {
+            rebind_native_codex_replayed_tool_ids_to_predecessor(
+                &mut upstream_body,
+                previous_input,
+            );
+        }
+    }
     let full_response_input = upstream_body.get("input").cloned();
     let tail_input_analysis = analyze_tail_input_for_session(
         &decision.upstream_channel,
@@ -12612,6 +12636,168 @@ fn stabilize_responses_tool_call_ids(value: &mut Value) {
     if !call_ids.is_empty() {
         replace_responses_call_id_refs(value, &call_ids);
     }
+}
+
+/// Rebind fresh Codex call ids only when the current request is a proven
+/// append-only replay of a prior local wire and every affected top-level tool
+/// item is identical except for its root `call_id`.  Unknown/nested link
+/// fields, duplicate ids, missing outputs or any content drift fail open.
+fn rebind_native_codex_replayed_tool_ids_to_predecessor(
+    request: &mut Value,
+    previous_input: &Value,
+) -> bool {
+    let Some(previous_items) = previous_input.as_array() else {
+        return false;
+    };
+    let Some(current_items) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if previous_items.is_empty() || previous_items.len() >= current_items.len() {
+        return false;
+    }
+
+    // `current call id -> (previous exact call id, seen call/output count)`.
+    // A result may be rebound only after its matching function call was
+    // proven at the same prefix position.
+    let mut pairs = HashMap::<String, (String, u8)>::new();
+    let mut prior_call_ids = HashSet::<String>::new();
+    let mut changed_item_indexes = HashSet::new();
+    for (index, (previous, current)) in previous_items.iter().zip(current_items.iter()).enumerate()
+    {
+        if previous == current {
+            continue;
+        }
+        let previous_type = previous.get("type").and_then(Value::as_str);
+        let current_type = current.get("type").and_then(Value::as_str);
+        if previous_type != current_type
+            || !matches!(
+                previous_type,
+                Some("function_call") | Some("function_call_output")
+            )
+            || native_codex_item_has_unsafe_tool_link(previous)
+            || native_codex_item_has_unsafe_tool_link(current)
+            || !native_codex_items_equal_ignoring_root_call_id(previous, current)
+        {
+            return false;
+        }
+        let Some(prior_call_id) = native_codex_root_call_id(previous) else {
+            return false;
+        };
+        let Some(current_call_id) = native_codex_root_call_id(current) else {
+            return false;
+        };
+
+        match previous_type {
+            Some("function_call") => {
+                if pairs.contains_key(current_call_id)
+                    || !prior_call_ids.insert(prior_call_id.to_string())
+                {
+                    return false;
+                }
+                pairs.insert(current_call_id.to_string(), (prior_call_id.to_string(), 1));
+            }
+            Some("function_call_output") => {
+                let Some((expected_prior_call_id, count)) = pairs.get_mut(current_call_id) else {
+                    return false;
+                };
+                if expected_prior_call_id != prior_call_id || *count != 1 {
+                    return false;
+                }
+                *count = 2;
+            }
+            _ => return false,
+        }
+        changed_item_indexes.insert(index);
+    }
+
+    if pairs.is_empty()
+        || pairs.values().any(|(_, count)| *count != 2)
+        // A fresh id must never shadow an unchanged pair, a new tail item, or
+        // another unproven reference. The intent would be ambiguous, so
+        // preserve the caller's exact wire.
+        || current_items.iter().enumerate().any(|(index, item)| {
+            !changed_item_indexes.contains(&index)
+                && native_codex_item_references_rebound_call_id(item, &pairs)
+        })
+    {
+        return false;
+    }
+
+    for index in changed_item_indexes {
+        let Some(item) = current_items.get_mut(index) else {
+            return false;
+        };
+        let Some(item) = item.as_object_mut() else {
+            return false;
+        };
+        let Some(current_call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some((prior_call_id, _)) = pairs.get(current_call_id) {
+            item.insert("call_id".to_string(), Value::String(prior_call_id.clone()));
+        }
+    }
+    true
+}
+
+fn native_codex_root_call_id(item: &Value) -> Option<&str> {
+    item.get("call_id").and_then(Value::as_str)
+}
+
+fn native_codex_items_equal_ignoring_root_call_id(left: &Value, right: &Value) -> bool {
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
+        return false;
+    };
+    let left_len = left
+        .len()
+        .saturating_sub(usize::from(left.contains_key("call_id")));
+    let right_len = right
+        .len()
+        .saturating_sub(usize::from(right.contains_key("call_id")));
+    left_len == right_len
+        && left
+            .iter()
+            .filter(|(key, _)| key.as_str() != "call_id")
+            .all(|(key, value)| right.get(key) == Some(value))
+}
+
+fn native_codex_item_has_unsafe_tool_link(item: &Value) -> bool {
+    fn visit(value: &Value, root: bool) -> bool {
+        match value {
+            Value::Object(map) => map.iter().any(|(key, child)| {
+                key == "tool_call_id" || (key == "call_id" && !root) || visit(child, false)
+            }),
+            Value::Array(items) => items.iter().any(|item| visit(item, false)),
+            _ => false,
+        }
+    }
+
+    visit(item, true)
+}
+
+/// Returns true only when a caller-owned item references a regenerated id we
+/// would otherwise replace in the proven prefix.  This is intentionally
+/// narrower than a schema validator: unknown payloads remain untouched unless
+/// they create an ambiguous `call_id` relationship.
+fn native_codex_item_references_rebound_call_id(
+    item: &Value,
+    rebound_pairs: &HashMap<String, (String, u8)>,
+) -> bool {
+    fn visit(value: &Value, rebound_pairs: &HashMap<String, (String, u8)>) -> bool {
+        match value {
+            Value::Object(map) => map.iter().any(|(key, child)| {
+                ((key == "call_id" || key == "tool_call_id")
+                    && child
+                        .as_str()
+                        .is_some_and(|call_id| rebound_pairs.contains_key(call_id)))
+                    || visit(child, rebound_pairs)
+            }),
+            Value::Array(items) => items.iter().any(|item| visit(item, rebound_pairs)),
+            _ => false,
+        }
+    }
+
+    visit(item, rebound_pairs)
 }
 
 fn assign_deterministic_function_call_ids(
@@ -23394,6 +23580,235 @@ mod tests {
             request.pointer("/input/0/call_id").and_then(Value::as_str),
             Some("call_from_previous_response")
         );
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebinds_proven_pairs_without_rewriting_results() {
+        let previous = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call-first",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }, {
+                "type": "function_call_output",
+                "call_id": "call-first",
+                "output": {"z": 2, "a": [2, 1], "raw": "{\"b\":2,\"a\":1}"}
+            }]
+        });
+        let mut replay = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "call-reallocated",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }, {
+                "type": "function_call_output",
+                "call_id": "call-reallocated",
+                "output": {"z": 2, "a": [2, 1], "raw": "{\"b\":2,\"a\":1}"}
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "one real new tail"
+            }]
+        });
+
+        assert!(rebind_native_codex_replayed_tool_ids_to_predecessor(
+            &mut replay,
+            &previous["input"]
+        ));
+
+        let replay_prefix = &replay["input"].as_array().unwrap()[..2];
+        assert_eq!(
+            serde_json::to_vec(&previous["input"]).unwrap(),
+            serde_json::to_vec(replay_prefix).unwrap(),
+            "same logical tool history must have one stable wire encoding"
+        );
+        assert_eq!(
+            replay.pointer("/input/0/call_id"),
+            replay.pointer("/input/1/call_id")
+        );
+        assert_eq!(
+            replay
+                .pointer("/input/1/output/raw")
+                .and_then(Value::as_str),
+            Some("{\"b\":2,\"a\":1}")
+        );
+        assert_eq!(replay.pointer("/input/1/output/a"), Some(&json!([2, 1])));
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebind_fails_open_for_unpaired_external_tool_output() {
+        let mut request = json!({
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call_from_external_response",
+                "output": "caller-owned result"
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "new tail"
+            }]
+        });
+        let previous = json!([{
+            "type": "function_call_output",
+            "call_id": "call_from_external_response",
+            "output": "caller-owned result"
+        }]);
+
+        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
+            &mut request,
+            &previous
+        ));
+
+        assert_eq!(
+            request.pointer("/input/0/call_id").and_then(Value::as_str),
+            Some("call_from_external_response")
+        );
+        assert_eq!(
+            request.pointer("/input/0/output").and_then(Value::as_str),
+            Some("caller-owned result")
+        );
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebind_leaves_plain_history_byte_identical() {
+        let previous = json!([{
+            "type": "message",
+            "role": "user",
+            "content": {"z": 2, "a": 1}
+        }]);
+        let mut request = json!({
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": {"z": 2, "a": 1}
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "new tail"
+            }]
+        });
+        let before = serde_json::to_vec(&request["input"]).unwrap();
+
+        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
+            &mut request,
+            &previous
+        ));
+        assert_eq!(serde_json::to_vec(&request["input"]).unwrap(), before);
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebind_fails_open_for_additional_tool_reference() {
+        let previous = json!([
+            {
+                "type": "function_call",
+                "call_id": "call-old",
+                "tool_call_id": "vendor-link",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-old",
+                "output": "stable result"
+            }
+        ]);
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-new",
+                    "tool_call_id": "vendor-link",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-new",
+                    "output": "stable result"
+                },
+                {"type": "message", "role": "user", "content": "new tail"}
+            ]
+        });
+
+        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
+            &mut request,
+            &previous
+        ));
+        assert_eq!(
+            request.pointer("/input/0/call_id").and_then(Value::as_str),
+            Some("call-new")
+        );
+        assert_eq!(
+            request.pointer("/input/1/call_id").and_then(Value::as_str),
+            Some("call-new")
+        );
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebind_fails_open_when_regenerated_id_shadows_unchanged_pair() {
+        let previous = json!([
+            {
+                "type": "function_call",
+                "call_id": "call-a",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-a",
+                "output": "first result"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call-b",
+                "name": "run_command",
+                "arguments": "{\"command\":\"cargo test\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-b",
+                "output": "second result"
+            }
+        ]);
+        // The second logical pair was regenerated to the same opaque id as
+        // the already unchanged first pair.  Atoapi must leave this ambiguous
+        // caller-owned replay untouched instead of remapping either pair.
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call-a",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-a",
+                    "output": "first result"
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call-a",
+                    "name": "run_command",
+                    "arguments": "{\"command\":\"cargo test\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-a",
+                    "output": "second result"
+                },
+                {"type": "message", "role": "user", "content": "new tail"}
+            ]
+        });
+        let before = serde_json::to_vec(&request["input"]).unwrap();
+
+        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
+            &mut request,
+            &previous
+        ));
+        assert_eq!(serde_json::to_vec(&request["input"]).unwrap(), before);
     }
 
     #[test]
@@ -41599,6 +42014,14 @@ mod tests {
             .unwrap();
 
         let mut second_items = first_input.as_array().unwrap().clone();
+        // Codex can replay the same completed tool history with freshly
+        // allocated opaque call ids.  The function call and its result still
+        // describe the same logical tool exchange, so that reallocation must
+        // not split the frozen full-replay prefix sent upstream.
+        second_items[1]["call_id"] = json!("call-success-regenerated");
+        second_items[2]["call_id"] = json!("call-success-regenerated");
+        second_items[3]["call_id"] = json!("call-failure-regenerated");
+        second_items[4]["call_id"] = json!("call-failure-regenerated");
         second_items.push(json!({
             "type": "message",
             "role": "user",
