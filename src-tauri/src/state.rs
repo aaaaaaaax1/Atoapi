@@ -76,6 +76,11 @@ pub struct AppState {
     pub transport_clients: TransportClients,
     pub prefix_locks: Mutex<PrefixLockRegistry>,
     pub prefix_states: Arc<Mutex<HashMap<String, PrefixWarmState>>>,
+    /// Process-local, final-parent-scope maturity evidence for native
+    /// FullReplay. Broad prefix telemetry remains separately persisted for
+    /// diagnostics, but it can never overwrite a different conversation's
+    /// readiness state.
+    pub prefix_maturity_scopes: Mutex<PrefixMaturityScopeRegistry>,
     prefix_state_maintenance_operations: AtomicU64,
     prefix_state_maintenance_running: Arc<AtomicBool>,
     /// Observe-only, final-wire-scoped cache evidence. It is deliberately
@@ -252,6 +257,71 @@ pub struct PrefixWarmState {
     pub responses_static_projection_digest: Option<String>,
 }
 
+/// Bounded process-only maturity slots keyed by the broad provider prefix and
+/// an attested final parent scope (route/key realm/session/lineage epoch, but
+/// not the frozen static projection). This lets A→B→A session interleaving
+/// preserve A's exact readiness while still allowing a true static-wire change
+/// inside A to be observed and reset.
+#[derive(Debug, Default)]
+pub struct PrefixMaturityScopeRegistry {
+    entries: HashMap<String, PrefixWarmState>,
+}
+
+impl PrefixMaturityScopeRegistry {
+    pub fn get(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+    ) -> Option<PrefixWarmState> {
+        let key = maturity_scope_entry_key(prefix_control_key, parent_scope_digest);
+        let expired = self
+            .entries
+            .get(&key)
+            .is_some_and(|state| state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL);
+        if expired {
+            self.entries.remove(&key);
+            return None;
+        }
+        self.entries.get(&key).cloned()
+    }
+
+    pub fn insert(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        state: PrefixWarmState,
+    ) {
+        let key = maturity_scope_entry_key(prefix_control_key, parent_scope_digest);
+        if !self.entries.contains_key(&key) && self.entries.len() >= PREFIX_MATURITY_SCOPE_LIMIT {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, state)| state.finished_at)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, state);
+    }
+
+    pub fn remove(&mut self, prefix_control_key: &str, parent_scope_digest: &str) {
+        self.entries.remove(&maturity_scope_entry_key(
+            prefix_control_key,
+            parent_scope_digest,
+        ));
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn maturity_scope_entry_key(prefix_control_key: &str, parent_scope_digest: &str) -> String {
+    format!("{prefix_control_key}\0{parent_scope_digest}")
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PersistedRuntimeState {
     #[serde(default)]
@@ -300,6 +370,27 @@ fn capture_runtime_state(
     prefix_states: &Mutex<HashMap<String, PrefixWarmState>>,
     shadow_affinity: &Mutex<ShadowAffinityStore>,
 ) -> RuntimeStateMaps {
+    const PARALLEL_SNAPSHOT_THRESHOLD: usize = 1_024;
+    let prefix_state_count = prefix_states.blocking_lock().len();
+    if prefix_state_count >= PARALLEL_SNAPSHOT_THRESHOLD {
+        // These maps are independent best-effort persistence state. At the
+        // large bounded sizes used by long-running sessions, clone them in
+        // parallel to reduce the background writer's wall-clock lock hold.
+        // Smaller snapshots stay on the single-thread path to avoid creating
+        // worker threads for ordinary use.
+        return std::thread::scope(|scope| {
+            let prefix_snapshot = scope.spawn(|| prefix_states.blocking_lock().clone());
+            let affinity_snapshot = scope.spawn(|| shadow_affinity.blocking_lock().clone());
+            RuntimeStateMaps {
+                prefix_states: prefix_snapshot
+                    .join()
+                    .expect("prefix runtime snapshot worker must not panic"),
+                shadow_affinity: affinity_snapshot
+                    .join()
+                    .expect("shadow-affinity runtime snapshot worker must not panic"),
+            }
+        });
+    }
     RuntimeStateMaps {
         prefix_states: prefix_states.blocking_lock().clone(),
         shadow_affinity: shadow_affinity.blocking_lock().clone(),
@@ -409,7 +500,7 @@ impl RuntimeStateJournal {
     ) -> Self {
         Self::new_with_job(metrics, move || {
             let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
-            save_runtime_state(&path, &snapshot.prefix_states, &snapshot.shadow_affinity)
+            save_runtime_snapshot(&path, snapshot)
         })
     }
 
@@ -496,6 +587,7 @@ impl RuntimeStateJournal {
 
 const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
 const PREFIX_RUNTIME_STATE_LIMIT: usize = 8_192;
+const PREFIX_MATURITY_SCOPE_LIMIT: usize = 1_024;
 const PREFIX_RUNTIME_STATE_MAINTENANCE_INTERVAL: u64 = 128;
 
 impl AppState {
@@ -546,6 +638,7 @@ impl AppState {
             transport_clients: TransportClients::new(crate::ATOAPI_USER_AGENT)?,
             prefix_locks: Mutex::new(PrefixLockRegistry::default()),
             prefix_states,
+            prefix_maturity_scopes: Mutex::new(PrefixMaturityScopeRegistry::default()),
             prefix_state_maintenance_operations: AtomicU64::new(0),
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
@@ -599,6 +692,7 @@ impl AppState {
             transport_clients: TransportClients::new("AtoapiTest/0.1")?,
             prefix_locks: Mutex::new(PrefixLockRegistry::default()),
             prefix_states,
+            prefix_maturity_scopes: Mutex::new(PrefixMaturityScopeRegistry::default()),
             prefix_state_maintenance_operations: AtomicU64::new(0),
             prefix_state_maintenance_running: Arc::new(AtomicBool::new(false)),
             final_scope_waterlines: StdMutex::new(FinalScopeWaterlineLedger::default()),
@@ -1166,15 +1260,29 @@ fn trim_prefix_runtime_states(prefix_states: &mut HashMap<String, PrefixWarmStat
     }
 }
 
+#[cfg(test)]
 fn save_runtime_state(
     path: &Path,
     prefix_states: &HashMap<String, PrefixWarmState>,
     shadow_affinity: &ShadowAffinityStore,
 ) -> Result<()> {
+    save_persisted_runtime_state(
+        path,
+        PersistedRuntimeState::from_runtime(prefix_states, shadow_affinity),
+    )
+}
+
+/// The background writer already owns a detached runtime snapshot. Consume it
+/// directly instead of cloning both full maps a second time while preparing
+/// the persisted representation.
+fn save_runtime_snapshot(path: &Path, snapshot: RuntimeStateMaps) -> Result<()> {
+    save_persisted_runtime_state(path, PersistedRuntimeState::from_snapshot(snapshot))
+}
+
+fn save_persisted_runtime_state(path: &Path, persisted: PersistedRuntimeState) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let persisted = PersistedRuntimeState::from_runtime(prefix_states, shadow_affinity);
     let raw = serde_json::to_string_pretty(&persisted)?;
     let backup_path = runtime_state_backup_path(path);
     if let Ok(previous) = fs::read(path) {
@@ -1240,18 +1348,26 @@ fn sync_runtime_state_parent(_parent: &Path) -> Result<()> {
 }
 
 impl PersistedRuntimeState {
+    #[cfg(test)]
     fn from_runtime(
         prefix_states: &HashMap<String, PrefixWarmState>,
         shadow_affinity: &ShadowAffinityStore,
     ) -> Self {
+        Self::from_snapshot(RuntimeStateMaps {
+            prefix_states: prefix_states.clone(),
+            shadow_affinity: shadow_affinity.clone(),
+        })
+    }
+
+    fn from_snapshot(snapshot: RuntimeStateMaps) -> Self {
         let now = Utc::now();
-        let mut prefix_states = prefix_states.clone();
+        let mut prefix_states = snapshot.prefix_states;
         trim_prefix_runtime_states(&mut prefix_states);
         let prefix_states = prefix_states
-            .iter()
+            .into_iter()
             .map(|(key, state)| {
                 (
-                    key.clone(),
+                    key,
                     PersistedPrefixWarmState {
                         saved_at: now,
                         input_tokens: state.input_tokens,
@@ -1267,10 +1383,9 @@ impl PersistedRuntimeState {
                         cache_instability_score: state.cache_instability_score,
                         tail_tool_output_chars: state.tail_tool_output_chars,
                         tail_largest_tool_output_chars: state.tail_largest_tool_output_chars,
-                        tail_tool_output_noise_hint: state.tail_tool_output_noise_hint.clone(),
+                        tail_tool_output_noise_hint: state.tail_tool_output_noise_hint,
                         responses_static_projection_digest: state
-                            .responses_static_projection_digest
-                            .clone(),
+                            .responses_static_projection_digest,
                     },
                 )
             })
@@ -1279,7 +1394,7 @@ impl PersistedRuntimeState {
             prefix_states,
             _legacy_response_sessions: serde_json::Value::Null,
             _legacy_response_session_error_cooldowns: serde_json::Value::Null,
-            shadow_affinity: shadow_affinity.clone(),
+            shadow_affinity: snapshot.shadow_affinity,
         }
     }
 
@@ -1580,9 +1695,13 @@ mod tests {
 
         const FULL_SHADOW_ASSIGNMENTS: usize = 4_096;
         const FULL_POST_BURST_EVIDENCE: usize = 1_536;
+        const RUNTIME_SNAPSHOT_WARMUP_SAMPLES: usize = 5;
+        const RUNTIME_SNAPSHOT_SAMPLE_COUNT: usize = 101;
         // This runs on the background persistence worker, not on an inbound
-        // request path.  A 12ms p95 keeps the full-capacity snapshot bounded
-        // while allowing normal Windows scheduler variance around 10ms.
+        // request path. A 12ms steady-state p95 keeps the full-capacity
+        // snapshot bounded. Five warmups avoid sampling allocator cold-start
+        // work; 101 measured samples make the Windows p95 estimate stable
+        // without relaxing that budget.
         const RUNTIME_SNAPSHOT_P95_BUDGET_US: u128 = 12_000;
         let prefix_states = Mutex::new(HashMap::new());
         let shadow_affinity = Mutex::new(ShadowAffinityStore::default());
@@ -1656,15 +1775,22 @@ mod tests {
             }
         }
 
-        let mut samples = Vec::new();
-        for _ in 0..21 {
+        for _ in 0..RUNTIME_SNAPSHOT_WARMUP_SAMPLES {
+            black_box(capture_runtime_state(&prefix_states, &shadow_affinity));
+        }
+        let mut samples = Vec::with_capacity(RUNTIME_SNAPSHOT_SAMPLE_COUNT);
+        for _ in 0..RUNTIME_SNAPSHOT_SAMPLE_COUNT {
             let started = Instant::now();
             let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
             black_box(snapshot);
             samples.push(started.elapsed().as_micros());
         }
         samples.sort_unstable();
-        let p95_index = ((samples.len() - 1) * 95).div_ceil(100);
+        let p95_index = samples
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1);
         let p95_us = samples[p95_index];
         println!(
             "fastrelay_runtime_snapshot prefixes={PREFIX_RUNTIME_STATE_LIMIT} assignments={FULL_SHADOW_ASSIGNMENTS} evidence={FULL_POST_BURST_EVIDENCE} p95_us={p95_us} samples_us={samples:?}",
@@ -2079,28 +2205,35 @@ mod tests {
             CacheStore::load(dir.join("cache.bin")).unwrap(),
         )
         .unwrap();
-        state.prefix_states.lock().await.insert(
-            "prefix-a".to_string(),
-            PrefixWarmState {
-                finished_at: Instant::now(),
-                input_tokens: 170_000,
-                cache_read_tokens: 166_912,
-                shortfall_tokens: 3_072,
-                seen_bucket_tokens: 166_912,
-                avoidable_shortfall_tokens: 0,
-                avoidable_shortfall_streak: 0,
-                shortfall_tokens_128: 3_072,
-                seen_bucket_tokens_128: 166_912,
-                avoidable_shortfall_tokens_128: 0,
-                small_gap_recovery_streak: 0,
-                recent_clean_tiny_gap_streak: 2,
-                cache_instability_score: 0,
-                settle_after_cold_read: false,
-                tail_tool_output_chars: 0,
-                tail_largest_tool_output_chars: 0,
-                tail_tool_output_noise_hint: None,
-                responses_static_projection_digest: Some("static-projection-a".to_string()),
-            },
+        let persisted_prefix = PrefixWarmState {
+            finished_at: Instant::now(),
+            input_tokens: 170_000,
+            cache_read_tokens: 166_912,
+            shortfall_tokens: 3_072,
+            seen_bucket_tokens: 166_912,
+            avoidable_shortfall_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            shortfall_tokens_128: 3_072,
+            seen_bucket_tokens_128: 166_912,
+            avoidable_shortfall_tokens_128: 0,
+            small_gap_recovery_streak: 0,
+            recent_clean_tiny_gap_streak: 2,
+            cache_instability_score: 0,
+            settle_after_cold_read: false,
+            tail_tool_output_chars: 0,
+            tail_largest_tool_output_chars: 0,
+            tail_tool_output_noise_hint: None,
+            responses_static_projection_digest: Some("static-projection-a".to_string()),
+        };
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert("prefix-a".to_string(), persisted_prefix.clone());
+        state.prefix_maturity_scopes.lock().await.insert(
+            "prefix-a",
+            "maturity-parent-process-only",
+            persisted_prefix,
         );
         state
             .continuation_lineage
@@ -2208,6 +2341,10 @@ mod tests {
         assert!(
             !raw.contains("response_session_error_cooldowns"),
             "retired session-reuse cooldowns must not be persisted"
+        );
+        assert!(
+            !raw.contains("maturity-parent-process-only"),
+            "final-scope maturity evidence is valid only for this process"
         );
         let loaded = load_runtime_state(&state.runtime_state_path).unwrap();
 

@@ -409,6 +409,7 @@ export interface MetricsSnapshot {
     prefix_guard_skip_reason?: string | null;
     prefix_lag_classification?: string | null;
     static_wire_drift_late_mutation_categories?: string[] | null;
+    static_wire_drift_transition?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;
@@ -515,6 +516,7 @@ export interface MetricsSnapshot {
     prefix_guard_skip_reason?: string | null;
     prefix_lag_classification?: string | null;
     static_wire_drift_late_mutation_categories?: string[] | null;
+    static_wire_drift_transition?: string | null;
     response_session_reused?: boolean | null;
     response_session_candidate_count?: number | null;
     response_session_skip_reason?: string | null;

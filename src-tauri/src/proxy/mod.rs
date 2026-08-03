@@ -634,6 +634,7 @@ struct PrefixLagDiagnostics {
     cache_delta_tokens: Option<u64>,
     previous_gap_tokens: Option<u64>,
     static_wire_drift_late_mutation_categories: Option<Vec<String>>,
+    static_wire_drift_transition: Option<String>,
 }
 #[derive(Debug, Clone, Default)]
 struct ProviderPrefixUsageObservation {
@@ -641,6 +642,7 @@ struct ProviderPrefixUsageObservation {
     previous: Option<PrefixWarmState>,
     static_wire_drift: bool,
     static_wire_drift_late_mutation_categories: Option<Vec<String>>,
+    static_wire_drift_transition: Option<String>,
 }
 #[derive(Debug, Clone, Default)]
 struct SessionAnchorDiagnostics {
@@ -1824,6 +1826,7 @@ async fn run_responses_compact_for_authorized_agent(
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
         static_wire_drift_late_mutation_categories: None,
+        static_wire_drift_transition: None,
         prefix_cache_instability_score: None,
         prefix_seen_bucket_tokens: None,
         prefix_state_cache_read_tokens: None,
@@ -2747,22 +2750,13 @@ async fn run_generation_for_authorized_agent(
         );
     }
     let local_prepare_ms = started.elapsed().as_millis() as u64;
-    let mut prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
-        wait_for_provider_prefix_settle(
-            &state,
-            &decision.upstream_channel,
-            provider_prefix_control_key.as_deref(),
-            provider_prefix_family_key.as_deref(),
-            &tail_input_diagnostics,
-            response_session_starts_compaction_epoch,
-            prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
-        )
-        .await
-    } else {
-        PrefixGuardWaitDiagnostics {
-            skip_reason: prefix_guard_skip_reason.map(str::to_string),
-            ..PrefixGuardWaitDiagnostics::default()
-        }
+    // Prefix maturity can only be decided from the final frozen Responses
+    // wire.  Keep the diagnostic shell here so local risk rejection remains
+    // immediate; the actual bounded wait is performed after `freeze()` and
+    // the safety gate below, before the one-shot dispatch is consumed.
+    let mut prefix_guard_wait = PrefixGuardWaitDiagnostics {
+        skip_reason: prefix_guard_skip_reason.map(str::to_string),
+        ..PrefixGuardWaitDiagnostics::default()
     };
     let response_session_parent = if !response_session_compaction_parent_matched
         || (client_supplied_previous_response_id.is_some()
@@ -3174,12 +3168,14 @@ async fn run_generation_for_authorized_agent(
                 .clone()
                 .expect("a forwarded client key remains available for in-memory redaction")
         });
-    let final_scope_waterline_is_full_replay = native_responses_passthrough
-        && matches!(&active_request_channel, Channel::Responses)
-        && !active_used_response_session
-        && !response_session_starts_compaction_epoch
-        && !full_replay_ambiguous_local_lineage
-        && matches!(&response_session_parent, LineageParent::FullReplay);
+    let final_scope_waterline_is_full_replay = native_final_scope_full_replay(
+        native_responses_passthrough,
+        &active_request_channel,
+        active_used_response_session,
+        response_session_starts_compaction_epoch,
+        full_replay_ambiguous_local_lineage,
+        &response_session_parent,
+    );
     if !final_scope_waterline_is_full_replay {
         final_scope_predecessor = final_scope_predecessor.not_full_replay();
     } else if !active_upstream_body.preserves_initial_root("input")
@@ -3342,6 +3338,20 @@ async fn run_generation_for_authorized_agent(
         assert!(began, "a fresh Agent inbound id must begin exactly once");
     }
     if let Some(rejection) = full_replay_risk {
+        // This request never reaches a safe terminal settlement.  Retire only
+        // its exact process-local maturity receipt so a manual compact/new
+        // continuation starts from a clean local baseline rather than keeping
+        // an old FullReplay wait alive.
+        if final_scope_waterline_is_full_replay {
+            retire_native_maturity_scope(
+                &state,
+                provider_prefix_control_key.as_deref(),
+                final_maturity_parent_scope_digest(
+                    upstream_request_diagnostics.final_scope_shadow.as_ref(),
+                ),
+            )
+            .await;
+        }
         let diagnostic = rejection.diagnostic_summary();
         let client_message = format!(
             "full-replay context payload is unsafe for this upstream route; {diagnostic}; compact this conversation or start a new clean continuation"
@@ -3431,6 +3441,48 @@ async fn run_generation_for_authorized_agent(
         }
         return response;
     }
+    let final_responses_static_projection =
+        if native_responses_passthrough && matches!(&active_request_channel, Channel::Responses) {
+            FinalResponsesStaticProjection::Observed(
+                final_wire_receipt
+                    .wire
+                    .responses_static_projection_digest
+                    .as_deref(),
+            )
+        } else {
+            FinalResponsesStaticProjection::NotApplicable
+        };
+    // Native Responses maturity is scoped to the final attested action,
+    // frozen static wire, and lineage epoch.  A matching provider cache key
+    // alone is deliberately insufficient: it can be shared by unrelated
+    // conversations and must never add a foreground wait to them.
+    let final_maturity_parent_scope_digest = final_scope_waterline_is_full_replay
+        .then(|| {
+            final_maturity_parent_scope_digest(
+                upstream_request_diagnostics.final_scope_shadow.as_ref(),
+            )
+            .map(ToOwned::to_owned)
+        })
+        .flatten();
+    prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
+        wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &decision.upstream_channel,
+            provider_prefix_control_key.as_deref(),
+            provider_prefix_family_key.as_deref(),
+            &tail_input_diagnostics,
+            response_session_starts_compaction_epoch,
+            prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
+            final_responses_static_projection,
+            final_maturity_parent_scope_digest.as_deref(),
+        )
+        .await
+    } else {
+        PrefixGuardWaitDiagnostics {
+            skip_reason: prefix_guard_skip_reason.map(str::to_string),
+            ..PrefixGuardWaitDiagnostics::default()
+        }
+    };
     upstream_request_diagnostics.warm_pending_scope_digest = upstream_request_diagnostics
         .final_scope_shadow
         .as_ref()
@@ -3461,6 +3513,7 @@ async fn run_generation_for_authorized_agent(
         let already_waited = prefix_guard_wait.wait_duration;
         let remaining_budget = remaining_responses_prefix_wait_budget(already_waited);
         let wait = claim.wait_duration().min(remaining_budget);
+        let wait_reason = claim.wait_reason();
         // Claiming removes the entry so sibling requests never queue.  Keep
         // the claim even when its window has just expired: terminal
         // settlement must then consume it rather than mistakenly arming a
@@ -3473,7 +3526,7 @@ async fn run_generation_for_authorized_agent(
                 .saturating_add(wait)
                 .as_millis() as u64;
             prefix_guard_wait.wait_duration = prefix_guard_wait.wait_duration.saturating_add(wait);
-            prefix_guard_wait.reason = Some("responses_giant_cold_prefix_warm_pending".to_string());
+            prefix_guard_wait.reason = Some(wait_reason.to_string());
             prefix_guard_wait.source = Some("exact".to_string());
             prefix_guard_wait.skip_reason = None;
         }
@@ -4262,12 +4315,13 @@ async fn run_generation_for_authorized_agent(
                 rebased_from_head,
             )
         });
-    settle_giant_cold_prefix_pending(
+    settle_full_replay_maturity_pending(
         &state,
         &upstream_request_diagnostics,
         prefix_state_update_key.as_deref(),
         warm_pending_committed_head.as_ref(),
         usage_record.as_ref(),
+        &tail_input_diagnostics,
         is_success_status,
         confirmed_compaction,
     )
@@ -4291,6 +4345,11 @@ async fn run_generation_for_authorized_agent(
         prefix_usage_record.as_ref(),
         &tail_input_diagnostics,
         final_responses_static_projection,
+        final_maturity_parent_scope_digest.as_deref(),
+        settled_final_maturity_parent_scope_digest(
+            upstream_request_diagnostics.final_scope_shadow.as_ref(),
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+        ),
         upstream_request_diagnostics
             .final_wire_receipt
             .as_ref()
@@ -4327,11 +4386,17 @@ async fn run_generation_for_authorized_agent(
             )
         })
         .unwrap_or_default();
+    constrain_tail_lag_to_final_scope(
+        &mut prefix_lag,
+        upstream_request_diagnostics.final_scope_waterline.as_ref(),
+    );
     if prefix_observation.static_wire_drift {
         prefix_lag.classification = Some("static_wire_drift".to_string());
         prefix_lag.static_wire_drift_late_mutation_categories = prefix_observation
             .static_wire_drift_late_mutation_categories
             .clone();
+        prefix_lag.static_wire_drift_transition =
+            prefix_observation.static_wire_drift_transition.clone();
     } else if final_scope_rollback_reclassified {
         prefix_lag.classification = Some("provider_waterline_rollback".to_string());
     }
@@ -4452,6 +4517,7 @@ async fn run_generation_for_authorized_agent(
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
         static_wire_drift_late_mutation_categories: None,
+        static_wire_drift_transition: None,
         prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
         prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
@@ -4656,6 +4722,7 @@ async fn acquire_provider_prefix_guard(
     Some(lock.lock_owned().await)
 }
 
+#[cfg(test)]
 async fn wait_for_provider_prefix_settle(
     state: &AppState,
     channel: &Channel,
@@ -4665,6 +4732,35 @@ async fn wait_for_provider_prefix_settle(
     compaction_requested: bool,
     max_wait: Option<TokioDuration>,
 ) -> PrefixGuardWaitDiagnostics {
+    wait_for_provider_prefix_settle_on_final_wire(
+        state,
+        channel,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        current_tail,
+        compaction_requested,
+        max_wait,
+        FinalResponsesStaticProjection::NotApplicable,
+        None,
+    )
+    .await
+}
+
+/// Uses prefix maturity evidence only after the native Responses body has been
+/// frozen.  This prevents a draft-era prefix state from delaying a request
+/// whose final static wire shape belongs to a different cache namespace.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_provider_prefix_settle_on_final_wire(
+    state: &AppState,
+    channel: &Channel,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    current_tail: &TailInputDiagnostics,
+    compaction_requested: bool,
+    max_wait: Option<TokioDuration>,
+    final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    final_maturity_parent_scope_digest: Option<&str>,
+) -> PrefixGuardWaitDiagnostics {
     if provider_prefix_key.is_none() && provider_prefix_family_key.is_none() {
         return PrefixGuardWaitDiagnostics {
             skip_reason: Some("no_provider_prefix_key".to_string()),
@@ -4672,21 +4768,48 @@ async fn wait_for_provider_prefix_settle(
         };
     }
     let state_snapshot = if matches!(channel, Channel::Responses) {
-        // Prefix settling is an optimization. A busy bookkeeping map must not
-        // consume the caller's foreground wait budget before the actual
-        // settle window starts, so Responses fail open instead of queueing.
-        let Ok(states) = state.prefix_states.try_lock() else {
-            return PrefixGuardWaitDiagnostics {
-                skip_reason: Some("prefix_state_snapshot_busy".to_string()),
-                ..PrefixGuardWaitDiagnostics::default()
+        if matches!(
+            final_responses_static_projection,
+            FinalResponsesStaticProjection::Observed(_)
+        ) {
+            let Some(prefix_control_key) = provider_prefix_key else {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("no_provider_prefix_key".to_string()),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
             };
-        };
-        lookup_provider_prefix_state_with_source(
-            &states,
-            provider_prefix_key,
-            provider_prefix_family_key,
-        )
-        .map(|(source, state)| (source.to_string(), state.clone()))
+            let Some(parent_scope_digest) = final_maturity_parent_scope_digest else {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("final_maturity_scope_unavailable".to_string()),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            };
+            let Ok(mut scopes) = state.prefix_maturity_scopes.try_lock() else {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("prefix_maturity_scope_snapshot_busy".to_string()),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            };
+            scopes
+                .get(prefix_control_key, parent_scope_digest)
+                .map(|state| ("exact".to_string(), state))
+        } else {
+            // Prefix settling is an optimization. A busy bookkeeping map must not
+            // consume the caller's foreground wait budget before the actual
+            // settle window starts, so Responses fail open instead of queueing.
+            let Ok(states) = state.prefix_states.try_lock() else {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("prefix_state_snapshot_busy".to_string()),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            };
+            lookup_provider_prefix_state_with_source(
+                &states,
+                provider_prefix_key,
+                provider_prefix_family_key,
+            )
+            .map(|(source, state)| (source.to_string(), state.clone()))
+        }
     } else {
         // Non-Responses compatibility channels retain their established
         // serialization behaviour; the hard 500ms aggregate applies to the
@@ -4708,6 +4831,20 @@ async fn wait_for_provider_prefix_settle(
         let state_cache_read_tokens = state.cache_read_tokens;
 
         if matches!(channel, Channel::Responses) {
+            if !PrefixController::final_static_projection_compatible(
+                &state,
+                final_responses_static_projection,
+            ) {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("final_static_projection_changed".to_string()),
+                    source: Some(source),
+                    state_age_ms: Some(state_age_ms),
+                    cache_instability_score: Some(cache_instability_score),
+                    seen_bucket_tokens: Some(seen_bucket_tokens),
+                    state_cache_read_tokens: Some(state_cache_read_tokens),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            }
             let avoidable_tokens = state
                 .avoidable_shortfall_tokens_128
                 .max(state.avoidable_shortfall_tokens);
@@ -5320,12 +5457,13 @@ fn remaining_responses_prefix_wait_budget(already_waited: TokioDuration) -> Toki
     responses_foreground_wait_cap().saturating_sub(already_waited)
 }
 
-async fn settle_giant_cold_prefix_pending(
+async fn settle_full_replay_maturity_pending(
     state: &AppState,
     upstream_request_diagnostics: &UpstreamRequestDiagnostics,
     prefix_control_key: Option<&str>,
     committed_head: Option<&WaterlineControlHead>,
     raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
     upstream_succeeded: bool,
     confirmed_compaction: bool,
 ) {
@@ -5339,6 +5477,7 @@ async fn settle_giant_cold_prefix_pending(
         upstream_request_diagnostics.final_scope_waterline.as_ref(),
         committed_head,
         raw_usage,
+        tail,
         upstream_succeeded,
         confirmed_compaction,
     );
@@ -5556,6 +5695,28 @@ fn prefix_lag_diagnostics_from_previous(
         cache_delta_tokens: Some(cache_delta),
         previous_gap_tokens: Some(previous_gap),
         static_wire_drift_late_mutation_categories: None,
+        static_wire_drift_transition: None,
+    }
+}
+
+/// Prefix-state aliases and family hints are useful for local recovery, but a
+/// `tail_lag_*` diagnosis is only evidence about one exact final wire when the
+/// final-scope ledger bound that exact predecessor.  Keep token accounting
+/// unchanged; this simply stops a broad hint from masquerading as proof of an
+/// upstream maturity failure for a different sibling/shape.
+fn constrain_tail_lag_to_final_scope(
+    diagnostics: &mut PrefixLagDiagnostics,
+    final_scope: Option<&FinalScopeWaterlineLog>,
+) {
+    let tail_lag = matches!(
+        diagnostics.classification.as_deref(),
+        Some("tail_lag_previous_not_caught") | Some("tail_lag_caught_previous_but_opened_new")
+    );
+    let exact_bound = final_scope.is_some_and(|scope| {
+        scope.outcome == "settled" && scope.predecessor_exact && scope.predecessor_bound
+    });
+    if tail_lag && !exact_bound {
+        diagnostics.classification = Some("tail_lag_unverified_scope".to_string());
     }
 }
 
@@ -5566,6 +5727,7 @@ fn apply_prefix_lag_diagnostics(log: &mut RequestLog, diagnostics: PrefixLagDiag
     log.prefix_lag_previous_gap_tokens = diagnostics.previous_gap_tokens;
     log.static_wire_drift_late_mutation_categories =
         diagnostics.static_wire_drift_late_mutation_categories;
+    log.static_wire_drift_transition = diagnostics.static_wire_drift_transition;
 }
 
 /// The prefix controller must conservatively treat a dynamic tool tail as
@@ -6017,6 +6179,74 @@ fn begin_final_scope_waterline(
     ticket
 }
 
+/// The final-scope waterline and maturity registry are valid only for an
+/// untouched native Responses FullReplay.  Delta, compaction, ambiguous
+/// lineage, and cross-protocol paths retain their own normal behaviour and
+/// must never consume a FullReplay maturity wait.
+fn native_final_scope_full_replay(
+    native_responses_passthrough: bool,
+    active_request_channel: &Channel,
+    used_response_session: bool,
+    starts_compaction_epoch: bool,
+    ambiguous_local_lineage: bool,
+    response_session_parent: &LineageParent,
+) -> bool {
+    native_responses_passthrough
+        && matches!(active_request_channel, Channel::Responses)
+        && !used_response_session
+        && !starts_compaction_epoch
+        && !ambiguous_local_lineage
+        && matches!(response_session_parent, LineageParent::FullReplay)
+}
+
+/// Removes only the current process-local FullReplay maturity evidence.  This
+/// is used for local rejections before dispatch and terminal paths that cannot
+/// establish a safe successor; it never touches a sibling conversation under
+/// the same provider/model/Key prefix.
+async fn retire_native_maturity_scope(
+    state: &AppState,
+    provider_prefix_key: Option<&str>,
+    parent_scope_digest: Option<&str>,
+) {
+    if let (Some(prefix_control_key), Some(parent_scope_digest)) =
+        (provider_prefix_key, parent_scope_digest)
+    {
+        state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .remove(prefix_control_key, parent_scope_digest);
+    }
+}
+
+/// Returns a process-local parent-scope binding only after the same attested
+/// final wire settled successfully. Unlike the full final-scope digest, this
+/// excludes the static projection so a genuine static-wire transition inside
+/// one trusted session can be observed and reset rather than hidden.
+fn settled_final_maturity_parent_scope_digest<'a>(
+    receipt: Option<&'a FinalScopeShadowReceipt>,
+    final_scope: Option<&FinalScopeWaterlineLog>,
+) -> Option<&'a str> {
+    let receipt = receipt?;
+    final_scope
+        .filter(|scope| {
+            scope.outcome == "settled"
+                && scope.sent_prediction_eligible
+                && !scope.continuity_reset
+                && matches!(scope.predecessor_proof.as_str(), "root" | "exact")
+                && scope.scope_digest == receipt.digest
+        })
+        .and_then(|_| final_maturity_parent_scope_digest(Some(receipt)))
+        .filter(|digest| !digest.is_empty())
+}
+
+fn final_maturity_parent_scope_digest(receipt: Option<&FinalScopeShadowReceipt>) -> Option<&str> {
+    receipt
+        .filter(|receipt| receipt.eligible_for_shadow_observation)
+        .and_then(|receipt| receipt.maturity_parent_digest.as_deref())
+        .filter(|digest| !digest.is_empty())
+}
+
 fn settle_final_scope_waterline(
     state: &AppState,
     ticket: &WaterlineTicket,
@@ -6157,6 +6387,8 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         usage_record,
         tail_input_diagnostics,
         FinalResponsesStaticProjection::NotApplicable,
+        None,
+        None,
         &[],
         used_response_session,
         retried_full_response,
@@ -6180,6 +6412,13 @@ async fn observe_provider_prefix_usage(
     effective_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
     final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    // The current attested parent scope is available before the terminal
+    // settlement verdict and selects or invalidates only this conversation's
+    // process-local state.
+    current_maturity_parent_scope_digest: Option<&str>,
+    // Only a parent scope promoted by successful exact final-scope settlement
+    // can be written back as future maturity evidence.
+    settled_maturity_parent_scope_digest: Option<&str>,
     late_atoapi_mutation_categories: &[String],
     used_response_session: bool,
     retried_full_response: bool,
@@ -6191,7 +6430,35 @@ async fn observe_provider_prefix_usage(
     settled_exact_state_finished_at: Option<Instant>,
     learn_state: bool,
 ) -> ProviderPrefixUsageObservation {
+    let native_responses_scope = matches!(
+        final_responses_static_projection,
+        FinalResponsesStaticProjection::Observed(_)
+    );
+    let scoped_previous = if native_responses_scope {
+        match (provider_prefix_key, current_maturity_parent_scope_digest) {
+            (Some(prefix_control_key), Some(parent_scope_digest)) => state
+                .prefix_maturity_scopes
+                .lock()
+                .await
+                .get(prefix_control_key, parent_scope_digest),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let Some(raw) = raw_usage else {
+        // A native Responses failure, a lineage rejection, or a terminal path
+        // without usable usage must not leave a maturity receipt behind for a
+        // later turn.  We do not touch another parent scope sharing the same
+        // provider/key prefix.
+        if native_responses_scope {
+            retire_native_maturity_scope(
+                state,
+                provider_prefix_key,
+                current_maturity_parent_scope_digest,
+            )
+            .await;
+        }
         let mut states = state.prefix_states.lock().await;
         clear_recent_clean_tiny_gap_evidence(&mut states, provider_prefix_key);
         return ProviderPrefixUsageObservation::default();
@@ -6204,13 +6471,30 @@ async fn observe_provider_prefix_usage(
         learn_family,
         static_wire_drift,
         static_wire_drift_late_mutation_categories,
+        static_wire_drift_transition,
         exact_settle_window_elapsed,
     ) = {
         let mut states = state.prefix_states.lock().await;
         let key = provider_prefix_key;
-        let previous_exact = key.and_then(|key| states.get(key).cloned());
-        let previous_best = key.and_then(|key| lookup_provider_prefix_state(&states, key).cloned());
-        let previous_family = provider_prefix_family_key.and_then(|key| states.get(key).cloned());
+        let broad_previous_exact = key.and_then(|key| states.get(key).cloned());
+        let broad_previous_best =
+            key.and_then(|key| lookup_provider_prefix_state(&states, key).cloned());
+        let broad_previous_family =
+            provider_prefix_family_key.and_then(|key| states.get(key).cloned());
+        // Native FullReplay may share a broad provider/model/key prefix across
+        // unrelated conversations.  Its cache gap and maturity logic must use
+        // only the parent-scoped receipt.  The broad state below remains
+        // aggregate telemetry and is deliberately never evidence for a native
+        // continuation.
+        let (previous_exact, previous_best, previous_family) = if native_responses_scope {
+            (scoped_previous.clone(), scoped_previous.clone(), None)
+        } else {
+            (
+                broad_previous_exact,
+                broad_previous_best,
+                broad_previous_family,
+            )
+        };
         let completed_exact_settle = guard_source_is_exact && exact_settle_window_elapsed;
         let exact_settle_window_elapsed = completed_exact_settle
             && settled_exact_state_finished_at.is_some_and(|finished_at| {
@@ -6238,10 +6522,21 @@ async fn observe_provider_prefix_usage(
             });
         let exact_settle_window_elapsed =
             exact_settle_window_elapsed || exact_settle_replaced_by_newer_state;
+        // An alias/family state can help classify an aggregate provider gap,
+        // but it is not evidence that this final native Responses wire is a
+        // continuation of that state. In particular, a different attested
+        // session can share a broad prefix alias while having a different
+        // frozen static projection. Learn a new exact state from that wire;
+        // never call it static drift or inherit its waterline.
+        let previous_for_state_observation = if native_responses_scope {
+            previous_exact.as_ref()
+        } else {
+            previous_best.as_ref()
+        };
         let state_observation = if learn_state {
             effective_usage.map(|usage| {
                 PrefixController::observe(PrefixStateInput {
-                    previous: previous_best.as_ref(),
+                    previous: previous_for_state_observation,
                     usage,
                     tail,
                     used_response_session,
@@ -6265,6 +6560,8 @@ async fn observe_provider_prefix_usage(
             .is_some_and(|observation| observation.static_wire_drift);
         let static_wire_drift_late_mutation_categories =
             static_wire_drift.then(|| late_atoapi_mutation_categories.to_vec());
+        let static_wire_drift_transition = static_wire_drift
+            .then(|| static_wire_drift_transition(late_atoapi_mutation_categories).to_string());
         if let (Some(key), Some(next)) = (key, next.as_ref()) {
             states.insert(key.to_string(), next.clone());
             if let Some(alias_key) = provider_prefix_state_alias_key(key) {
@@ -6286,9 +6583,39 @@ async fn observe_provider_prefix_usage(
             learn_family,
             static_wire_drift,
             static_wire_drift_late_mutation_categories,
+            static_wire_drift_transition,
             exact_settle_window_elapsed,
         )
     };
+    if native_responses_scope {
+        let maturity_write_target = match (
+            provider_prefix_key,
+            current_maturity_parent_scope_digest,
+            settled_maturity_parent_scope_digest,
+        ) {
+            (Some(prefix_control_key), Some(current_parent), Some(settled_parent))
+                if current_parent == settled_parent =>
+            {
+                Some((prefix_control_key, settled_parent))
+            }
+            _ => None,
+        };
+        let mut scopes = state.prefix_maturity_scopes.lock().await;
+        if let (Some((prefix_control_key, parent_scope_digest)), Some(next)) =
+            (maturity_write_target, next.as_ref())
+        {
+            // `next` was produced with the same settled parent, so the
+            // compatibility check used by the pre-dispatch wait remains
+            // exact even when another conversation shares this provider key.
+            scopes.insert(prefix_control_key, parent_scope_digest, next.clone());
+        } else if let (Some(prefix_control_key), Some(parent_scope_digest)) =
+            (provider_prefix_key, current_maturity_parent_scope_digest)
+        {
+            // Compaction, lineage rejection, unsafe terminal paths, and
+            // unsuccessful observations must retire only their own scope.
+            scopes.remove(prefix_control_key, parent_scope_digest);
+        }
+    }
     let gap = Some(PrefixController::classify_gap(PrefixGapInput {
         previous_exact: previous_exact.as_ref(),
         previous_best: previous_best.as_ref(),
@@ -6310,6 +6637,30 @@ async fn observe_provider_prefix_usage(
         previous: previous_best,
         static_wire_drift,
         static_wire_drift_late_mutation_categories,
+        static_wire_drift_transition,
+    }
+}
+
+/// Returns a fixed, non-sensitive explanation for a cross-request frozen
+/// static-wire transition.  Empty late-mutation categories are meaningful: the
+/// normal pending-body path first freezes only after all local controls are
+/// applied, so a previous-wire mismatch must not be reported as an empty or
+/// mysterious local mutation list.
+fn static_wire_drift_transition(categories: &[String]) -> &'static str {
+    if categories.is_empty() {
+        "frozen_static_projection_changed"
+    } else if categories
+        .iter()
+        .any(|category| category == "cache_control")
+    {
+        "cache_control_shape_changed"
+    } else if categories
+        .iter()
+        .any(|category| category == "transport_controls")
+    {
+        "transport_static_shape_changed"
+    } else {
+        "late_atoapi_static_mutation"
     }
 }
 
@@ -9239,6 +9590,7 @@ fn upstream_transport_failure_log(
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
         static_wire_drift_late_mutation_categories: None,
+        static_wire_drift_transition: None,
         prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
         prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
@@ -9447,6 +9799,7 @@ async fn cache_hit_response(
         prefix_lag_cache_delta_tokens: None,
         prefix_lag_previous_gap_tokens: None,
         static_wire_drift_late_mutation_categories: None,
+        static_wire_drift_transition: None,
         prefix_cache_instability_score: None,
         prefix_seen_bucket_tokens: None,
         prefix_state_cache_read_tokens: None,
@@ -16488,6 +16841,7 @@ mod tests {
         FinalScopeShadowReceipt {
             version: 5,
             digest: digest.to_string(),
+            maturity_parent_digest: Some(format!("parent-{digest}")),
             eligible_for_shadow_observation: true,
             missing_attested_scope: false,
             missing_final_wire_static_projection: false,
@@ -16495,6 +16849,66 @@ mod tests {
             unsupported_evidence_version: false,
             ambiguous_breakpoint_placement: false,
         }
+    }
+
+    #[test]
+    fn native_final_scope_maturity_is_full_replay_only() {
+        assert!(native_final_scope_full_replay(
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            false,
+            &LineageParent::FullReplay,
+        ));
+        assert!(!native_final_scope_full_replay(
+            true,
+            &Channel::Responses,
+            true,
+            false,
+            false,
+            &LineageParent::FullReplay,
+        ));
+        assert!(!native_final_scope_full_replay(
+            true,
+            &Channel::Responses,
+            false,
+            true,
+            false,
+            &LineageParent::FullReplay,
+        ));
+        assert!(!native_final_scope_full_replay(
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            true,
+            &LineageParent::FullReplay,
+        ));
+        assert!(!native_final_scope_full_replay(
+            true,
+            &Channel::Responses,
+            false,
+            false,
+            false,
+            &LineageParent::ExternalContinuation,
+        ));
+        assert!(!native_final_scope_full_replay(
+            false,
+            &Channel::Responses,
+            false,
+            false,
+            false,
+            &LineageParent::FullReplay,
+        ));
+        assert!(!native_final_scope_full_replay(
+            true,
+            &Channel::Chat,
+            false,
+            false,
+            false,
+            &LineageParent::FullReplay,
+        ));
     }
 
     async fn wait_for_final_scope_outcome(state: &AppState, outcome: &str, target: u64) {
@@ -18298,6 +18712,19 @@ mod tests {
             tail_tool_output_noise_hint: None,
             responses_static_projection_digest: None,
         }
+    }
+
+    async fn seed_native_maturity_scope(
+        state: &AppState,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        prefix: PrefixWarmState,
+    ) {
+        state.prefix_maturity_scopes.lock().await.insert(
+            prefix_control_key,
+            parent_scope_digest,
+            prefix,
+        );
     }
 
     #[test]
@@ -25805,6 +26232,8 @@ mod tests {
             Some(&residual),
             &TailInputDiagnostics::default(),
             FinalResponsesStaticProjection::NotApplicable,
+            None,
+            None,
             &[],
             false,
             false,
@@ -25829,6 +26258,8 @@ mod tests {
             Some(&residual),
             &TailInputDiagnostics::default(),
             FinalResponsesStaticProjection::NotApplicable,
+            None,
+            None,
             &[],
             false,
             false,
@@ -33439,6 +33870,543 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_static_projection_mismatch_never_inherits_a_prefix_wait() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-frozen-static-projection-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0frozen-static-shape";
+        let mut prior = prefix_state(64_512, 63_872, 0);
+        prior.responses_static_projection_digest = Some("prior-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "current-final-scope", prior).await;
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("current-static-shape")),
+            Some("current-final-scope"),
+        )
+        .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(
+            guard.skip_reason.as_deref(),
+            Some("final_static_projection_changed")
+        );
+        assert_eq!(guard.source.as_deref(), Some("exact"));
+        assert_eq!(
+            static_wire_drift_transition(&[]),
+            "frozen_static_projection_changed"
+        );
+        assert_eq!(
+            static_wire_drift_transition(&["cache_control".to_string()]),
+            "cache_control_shape_changed"
+        );
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn matching_static_wire_from_another_final_scope_never_inherits_a_prefix_wait() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-maturity-scope-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0same-static-other-session";
+        let mut prior = prefix_state(64_512, 63_872, 512);
+        prior.responses_static_projection_digest = Some("same-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "trusted-session-a", prior).await;
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+            FinalResponsesStaticProjection::Observed(Some("same-static-shape")),
+            Some("trusted-session-b"),
+        )
+        .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(guard.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert!(guard.source.is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn native_maturity_wait_never_falls_back_to_broad_prefix_state() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-maturity-no-broad-fallback-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0no-broad-fallback";
+        let mut broad = prefix_state(64_512, 63_872, 512);
+        broad.responses_static_projection_digest = Some("same-static-shape".to_string());
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), broad);
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+            FinalResponsesStaticProjection::Observed(Some("same-static-shape")),
+            Some("trusted-session-a"),
+        )
+        .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(guard.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert!(guard.source.is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn matching_final_scope_keeps_the_existing_bounded_prefix_wait() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-maturity-scope-match-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0same-final-session";
+        let mut prior = prefix_state(64_512, 63_872, 512);
+        prior.responses_static_projection_digest = Some("same-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "trusted-session-a", prior).await;
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("same-static-shape")),
+            Some("trusted-session-a"),
+        )
+        .await;
+
+        assert!(guard.wait_ms > 0);
+        assert!(guard.wait_ms <= 1);
+        assert_eq!(guard.source.as_deref(), Some("exact"));
+        assert!(guard.skip_reason.is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_exact_state_from_another_final_scope_seeds_a_new_baseline() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-maturity-state-isolation-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0same-prefix";
+        let mut stale = prefix_state(100_000, 99_840, 0);
+        stale.responses_static_projection_digest = Some("old-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "trusted-session-a", stale).await;
+        let usage = UsageRecord {
+            input_tokens: 101_024,
+            cache_read_tokens: 99_840,
+            ..UsageRecord::default()
+        };
+
+        let observed = observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("new-static-shape")),
+            Some("trusted-session-b"),
+            Some("trusted-session-b"),
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            true,
+        )
+        .await;
+
+        assert!(
+            !observed.static_wire_drift,
+            "a different attested session is a fresh baseline, not static drift"
+        );
+        let learned = state
+            .prefix_states
+            .lock()
+            .await
+            .get(key)
+            .cloned()
+            .expect("the current exact scope must be learned independently");
+        assert_eq!(
+            learned.responses_static_projection_digest.as_deref(),
+            Some("new-static-shape")
+        );
+        assert_eq!(learned.cache_instability_score, 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn same_parent_static_wire_drift_is_visible_and_does_not_inherit_a_wait() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-static-drift-parent-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0static-drift";
+        let parent = "trusted-session-a";
+        let mut prior = prefix_state(100_000, 99_840, 0);
+        prior.responses_static_projection_digest = Some("static-a".to_string());
+        seed_native_maturity_scope(&state, key, parent, prior).await;
+
+        let guard_before = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("static-b")),
+            Some(parent),
+        )
+        .await;
+        assert_eq!(guard_before.wait_ms, 0);
+        assert_eq!(
+            guard_before.skip_reason.as_deref(),
+            Some("final_static_projection_changed")
+        );
+        assert_eq!(guard_before.source.as_deref(), Some("exact"));
+
+        let usage = UsageRecord {
+            input_tokens: 101_024,
+            cache_read_tokens: 99_840,
+            ..UsageRecord::default()
+        };
+        let observed = observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("static-b")),
+            Some(parent),
+            Some(parent),
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            true,
+        )
+        .await;
+        assert!(observed.static_wire_drift);
+        assert_eq!(
+            observed.static_wire_drift_transition.as_deref(),
+            Some("frozen_static_projection_changed")
+        );
+
+        let learned = state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .get(key, parent)
+            .expect("the new static wire must replace only this parent scope");
+        assert_eq!(
+            learned.responses_static_projection_digest.as_deref(),
+            Some("static-b")
+        );
+        let guard_after = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("static-b")),
+            Some(parent),
+        )
+        .await;
+        assert!(guard_after.wait_ms > 0);
+        assert_eq!(guard_after.source.as_deref(), Some("exact"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn native_maturity_registry_keeps_a_to_b_to_a_scopes_independent() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-a-b-a-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0interleave";
+        let mut scope_a = prefix_state(64_512, 63_872, 0);
+        scope_a.responses_static_projection_digest = Some("shared-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "scope-a", scope_a).await;
+
+        let a_initial = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("shared-static-shape")),
+            Some("scope-a"),
+        )
+        .await;
+        assert!(a_initial.wait_ms > 0);
+
+        let b_cold = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("shared-static-shape")),
+            Some("scope-b"),
+        )
+        .await;
+        assert_eq!(b_cold.wait_ms, 0);
+        assert_eq!(b_cold.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert!(b_cold.source.is_none());
+
+        let mut scope_b = prefix_state(65_024, 64_512, 0);
+        scope_b.responses_static_projection_digest = Some("shared-static-shape".to_string());
+        seed_native_maturity_scope(&state, key, "scope-b", scope_b).await;
+
+        let a_return = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("shared-static-shape")),
+            Some("scope-a"),
+        )
+        .await;
+        assert!(a_return.wait_ms > 0);
+        assert_eq!(a_return.source.as_deref(), Some("exact"));
+        assert_eq!(state.prefix_maturity_scopes.lock().await.len(), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn rejected_native_lineage_retires_only_its_own_maturity_scope() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-reject-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0reject";
+        let mut scope_a = prefix_state(64_512, 63_872, 0);
+        scope_a.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, "scope-a", scope_a).await;
+        let mut scope_b = prefix_state(64_512, 63_872, 0);
+        scope_b.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, "scope-b", scope_b).await;
+
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let observed = observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some("scope-a"),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            false,
+        )
+        .await;
+        assert!(observed.previous.is_some());
+
+        let a_after_rejection = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some("scope-a"),
+        )
+        .await;
+        assert_eq!(a_after_rejection.wait_ms, 0);
+        assert_eq!(
+            a_after_rejection.skip_reason.as_deref(),
+            Some("no_prefix_state")
+        );
+        assert!(a_after_rejection.source.is_none());
+
+        let b_still_mature = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some("scope-b"),
+        )
+        .await;
+        assert!(b_still_mature.wait_ms > 0);
+        assert_eq!(b_still_mature.source.as_deref(), Some("exact"));
+        assert_eq!(state.prefix_maturity_scopes.lock().await.len(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn local_full_replay_rejection_retires_only_its_own_maturity_scope() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-local-reject-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0local-reject";
+        let mut scope_a = prefix_state(64_512, 63_872, 0);
+        scope_a.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, "scope-a", scope_a).await;
+        let mut scope_b = prefix_state(64_512, 63_872, 0);
+        scope_b.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, "scope-b", scope_b).await;
+
+        retire_native_maturity_scope(&state, Some(key), Some("scope-a")).await;
+
+        let a_after_local_rejection = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some("scope-a"),
+        )
+        .await;
+        assert_eq!(a_after_local_rejection.wait_ms, 0);
+        assert_eq!(
+            a_after_local_rejection.skip_reason.as_deref(),
+            Some("no_prefix_state")
+        );
+
+        let b_still_mature = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some("scope-b"),
+        )
+        .await;
+        assert!(b_still_mature.wait_ms > 0);
+        assert_eq!(b_still_mature.source.as_deref(), Some("exact"));
+        assert_eq!(state.prefix_maturity_scopes.lock().await.len(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tail_lag_requires_an_exact_bound_final_scope() {
+        let mut unbound = PrefixLagDiagnostics {
+            classification: Some("tail_lag_previous_not_caught".to_string()),
+            ..PrefixLagDiagnostics::default()
+        };
+        constrain_tail_lag_to_final_scope(&mut unbound, None);
+        assert_eq!(
+            unbound.classification.as_deref(),
+            Some("tail_lag_unverified_scope")
+        );
+
+        let mut exact = PrefixLagDiagnostics {
+            classification: Some("tail_lag_previous_not_caught".to_string()),
+            ..PrefixLagDiagnostics::default()
+        };
+        let scope = FinalScopeWaterlineLog {
+            outcome: "settled".to_string(),
+            predecessor_exact: true,
+            predecessor_bound: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+        constrain_tail_lag_to_final_scope(&mut exact, Some(&scope));
+        assert_eq!(
+            exact.classification.as_deref(),
+            Some("tail_lag_previous_not_caught")
+        );
+    }
+
+    #[tokio::test]
     async fn fresh_high_hit_exact_prefix_settles_before_first_visible_gap() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -34237,6 +35205,8 @@ mod tests {
                 ..TailInputDiagnostics::default()
             },
             FinalResponsesStaticProjection::NotApplicable,
+            None,
+            None,
             &[],
             false,
             false,

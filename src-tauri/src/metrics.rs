@@ -794,6 +794,12 @@ pub struct RequestLog {
     /// keys, and caller-provided field names are never retained.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_wire_drift_late_mutation_categories: Option<Vec<String>>,
+    /// Fixed, cross-request explanation for a frozen Responses static-wire
+    /// transition.  This is distinct from late mutation categories: a normal
+    /// first freeze has no late mutation yet can still differ from the prior
+    /// final wire.  It never contains request content or caller field names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_wire_drift_transition: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix_cache_instability_score: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3051,6 +3057,7 @@ mod tests {
             prefix_lag_cache_delta_tokens: None,
             prefix_lag_previous_gap_tokens: None,
             static_wire_drift_late_mutation_categories: None,
+            static_wire_drift_transition: None,
             prefix_cache_instability_score: None,
             prefix_seen_bucket_tokens: None,
             prefix_state_cache_read_tokens: None,

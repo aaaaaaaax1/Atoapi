@@ -135,6 +135,25 @@ struct GapEvidence {
 }
 
 impl PrefixController {
+    /// A pre-dispatch maturity hint is usable only when it belongs to the
+    /// frozen Responses wire that will actually be sent. The caller resolves
+    /// a maturity state only from the exact parent-scope registry entry;
+    /// persisted legacy states without a final projection deliberately fail
+    /// closed, so waiting on them can neither improve the current request nor
+    /// prove a cache gap.
+    pub fn final_static_projection_compatible(
+        state: &PrefixWarmState,
+        projection: FinalResponsesStaticProjection<'_>,
+    ) -> bool {
+        match projection {
+            FinalResponsesStaticProjection::NotApplicable => true,
+            FinalResponsesStaticProjection::Observed(Some(current)) => {
+                state.responses_static_projection_digest.as_deref() == Some(current)
+            }
+            FinalResponsesStaticProjection::Observed(None) => false,
+        }
+    }
+
     pub fn before_request(input: PrefixControlInput) -> PrefixControlDecision {
         if !input.source_is_exact {
             return skip("non_exact_prefix_state", false);

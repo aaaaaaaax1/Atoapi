@@ -21,6 +21,11 @@ pub(super) struct FinalScopeShadowInput<'a> {
 pub(super) struct FinalScopeShadowReceipt {
     pub(super) version: u8,
     pub(super) digest: String,
+    /// Opaque parent scope for process-local maturity state. It intentionally
+    /// excludes every frozen static-wire field so the same trusted
+    /// session/lineage can detect a real static change rather than being
+    /// mistaken for an unrelated conversation.
+    pub(super) maturity_parent_digest: Option<String>,
     /// This receipt may feed observe-only waterlines. It is deliberately not
     /// a promotion certificate: a future controller must also prove exact
     /// predecessor/input-prefix continuity for the current request.
@@ -83,6 +88,19 @@ impl FinalScopeShadow {
             .lineage_epoch
             .map(|epoch| epoch.to_string())
             .unwrap_or_else(|| "none".to_string());
+        let maturity_parent_digest =
+            (!missing_attested_scope && !missing_lineage_epoch && !unsupported_evidence_version)
+                .then(|| {
+                    hash_parts(&[
+                        "final-prefix-maturity-parent-v1",
+                        &scope_version,
+                        scope_digest.unwrap_or("unscoped"),
+                        key_realm.unwrap_or("unscoped-key"),
+                        &semantic_version,
+                        &input.final_wire.semantic.context_mode,
+                        &lineage_epoch,
+                    ])
+                });
         let digest = hash_parts(&[
             "final-prefix-scope-shadow-v6",
             &scope_version,
@@ -100,6 +118,7 @@ impl FinalScopeShadow {
         Some(FinalScopeShadowReceipt {
             version: FINAL_SCOPE_SHADOW_VERSION,
             digest,
+            maturity_parent_digest,
             eligible_for_shadow_observation: !missing_attested_scope
                 && !missing_final_wire_static_projection
                 && !missing_lineage_epoch
@@ -254,6 +273,10 @@ mod tests {
     fn final_scope_splits_actual_realm_cache_and_context_dimensions() {
         let baseline_receipt = receipt();
         let baseline = FinalScopeShadow::derive(input(&baseline_receipt)).unwrap();
+        let baseline_parent = baseline
+            .maturity_parent_digest
+            .as_deref()
+            .expect("complete receipt must derive a maturity parent");
 
         let mut changed_realm = receipt();
         changed_realm.scope.key_realm_digest = Some("realm-b".to_string());
@@ -262,6 +285,13 @@ mod tests {
             FinalScopeShadow::derive(input(&changed_realm))
                 .unwrap()
                 .digest
+        );
+        assert_ne!(
+            Some(baseline_parent),
+            FinalScopeShadow::derive(input(&changed_realm))
+                .unwrap()
+                .maturity_parent_digest
+                .as_deref()
         );
 
         let mut changed_cache = receipt();
@@ -272,6 +302,14 @@ mod tests {
                 .unwrap()
                 .digest
         );
+        assert_eq!(
+            Some(baseline_parent),
+            FinalScopeShadow::derive(input(&changed_cache))
+                .unwrap()
+                .maturity_parent_digest
+                .as_deref(),
+            "cache-control shape is frozen wire, not a new trusted session/epoch"
+        );
 
         let mut changed_context = receipt();
         changed_context.semantic.context_mode = "verified_native_delta".to_string();
@@ -281,6 +319,13 @@ mod tests {
                 .unwrap()
                 .digest
         );
+        assert_ne!(
+            Some(baseline_parent),
+            FinalScopeShadow::derive(input(&changed_context))
+                .unwrap()
+                .maturity_parent_digest
+                .as_deref()
+        );
 
         let mut changed_epoch = receipt();
         changed_epoch.semantic.lineage_epoch = Some(4);
@@ -289,6 +334,13 @@ mod tests {
             FinalScopeShadow::derive(input(&changed_epoch))
                 .unwrap()
                 .digest
+        );
+        assert_ne!(
+            Some(baseline_parent),
+            FinalScopeShadow::derive(input(&changed_epoch))
+                .unwrap()
+                .maturity_parent_digest
+                .as_deref()
         );
 
         let mut changed_static_projection = receipt();
@@ -300,6 +352,14 @@ mod tests {
             FinalScopeShadow::derive(input(&changed_static_projection))
                 .unwrap()
                 .digest
+        );
+        assert_eq!(
+            Some(baseline_parent),
+            FinalScopeShadow::derive(input(&changed_static_projection))
+                .unwrap()
+                .maturity_parent_digest
+                .as_deref(),
+            "static wire must change the final digest without turning the same trusted session/epoch into a new parent"
         );
     }
 

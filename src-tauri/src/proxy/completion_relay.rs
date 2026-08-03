@@ -1275,12 +1275,13 @@ pub(super) async fn stream_upstream(
                     rebased_from_head,
                 )
             });
-        settle_giant_cold_prefix_pending(
+        settle_full_replay_maturity_pending(
             &state_for_stream,
             &upstream_request_diagnostics,
             prefix_state_key.as_deref(),
             warm_pending_committed_head.as_ref(),
             raw_final_scope_usage,
+            &tail_input_diagnostics,
             stream_success_for_cache,
             confirmed_compaction,
         )
@@ -1364,6 +1365,30 @@ pub(super) async fn stream_upstream(
             .as_ref()
             .map(|receipt| receipt.wire.atoapi_mutated_static_categories.as_slice())
             .unwrap_or_default();
+        let stream_final_scope_is_full_replay = native_final_scope_full_replay(
+            matches!(client_channel, Channel::Responses)
+                && matches!(decision.upstream_channel, Channel::Responses),
+            &decision.upstream_channel,
+            used_response_session,
+            response_session_starts_compaction_epoch,
+            upstream_request_diagnostics.suppress_local_full_replay_settlement,
+            &response_session_parent,
+        );
+        let current_maturity_parent_scope_digest = stream_final_scope_is_full_replay
+            .then(|| {
+                final_maturity_parent_scope_digest(
+                    upstream_request_diagnostics.final_scope_shadow.as_ref(),
+                )
+            })
+            .flatten();
+        let settled_maturity_parent_scope_digest = stream_final_scope_is_full_replay
+            .then(|| {
+                settled_final_maturity_parent_scope_digest(
+                    upstream_request_diagnostics.final_scope_shadow.as_ref(),
+                    upstream_request_diagnostics.final_scope_waterline.as_ref(),
+                )
+            })
+            .flatten();
         let prefix_observation = observe_provider_prefix_usage(
             &state_for_stream,
             prefix_state_key.as_deref(),
@@ -1372,6 +1397,8 @@ pub(super) async fn stream_upstream(
             prefix_usage_record.as_ref(),
             &tail_input_diagnostics,
             final_responses_static_projection,
+            current_maturity_parent_scope_digest,
+            settled_maturity_parent_scope_digest,
             late_atoapi_mutation_categories,
             used_response_session,
             retried_full_response,
@@ -1403,11 +1430,17 @@ pub(super) async fn stream_upstream(
                 )
             })
             .unwrap_or_default();
+        constrain_tail_lag_to_final_scope(
+            &mut prefix_lag,
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+        );
         if prefix_observation.static_wire_drift {
             prefix_lag.classification = Some("static_wire_drift".to_string());
             prefix_lag.static_wire_drift_late_mutation_categories = prefix_observation
                 .static_wire_drift_late_mutation_categories
                 .clone();
+            prefix_lag.static_wire_drift_transition =
+                prefix_observation.static_wire_drift_transition.clone();
         } else if final_scope_rollback_reclassified {
             prefix_lag.classification = Some("provider_waterline_rollback".to_string());
         }
@@ -1508,6 +1541,7 @@ pub(super) async fn stream_upstream(
             prefix_lag_cache_delta_tokens: None,
             prefix_lag_previous_gap_tokens: None,
             static_wire_drift_late_mutation_categories: None,
+            static_wire_drift_transition: None,
             prefix_cache_instability_score: prefix_guard_wait.cache_instability_score,
             prefix_seen_bucket_tokens: prefix_guard_wait.seen_bucket_tokens,
             prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,

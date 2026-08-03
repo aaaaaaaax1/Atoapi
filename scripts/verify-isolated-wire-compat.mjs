@@ -194,8 +194,26 @@ try {
   const clientOwnedCacheKeyCorrection =
     fastrelay?.prompt_cache_key === SYNTHETIC_CLIENT_PROMPT_CACHE_KEY &&
     baseline?.prompt_cache_key !== SYNTHETIC_CLIENT_PROMPT_CACHE_KEY;
+  // Preserving the caller's native cache key changes the candidate's opaque
+  // local placement scope. A current FastRelay build may record that
+  // attested request as either a passive steady assignment or the documented
+  // non-blocking snapshot-lock fail-open. Neither marker changes the selected
+  // provider, Key, or final wire, so permit precisely these known three-field
+  // observation deltas and nothing broader.
+  const expectedShadowObservation =
+    (newRun.identityMarkers.shadow_affinity_lane === "steady" &&
+      newRun.identityMarkers.shadow_affinity_decision === "assigned") ||
+    (newRun.identityMarkers.shadow_affinity_lane === "transparent" &&
+      newRun.identityMarkers.shadow_affinity_decision === "snapshot_lock_busy");
   const expectedIdentityCorrection = clientOwnedCacheKeyCorrection &&
-    identity.differingFields.every((field) => field === "provider_prefix_key");
+    identity.differingFields.includes("provider_prefix_key") &&
+    identity.differingFields.every((field) => new Set([
+      "provider_prefix_key",
+      "shadow_affinity_lane",
+      "shadow_affinity_decision"
+    ]).has(field)) &&
+    newRun.identityMarkers.shadow_affinity_trusted_identity === true &&
+    expectedShadowObservation;
   const recovery = scenario === "lineage-recovery"
     ? summarizeLineageRecovery(baseline, fastrelay, model)
     : null;
@@ -280,6 +298,8 @@ try {
     fastrelay_headers: newRun.upstreamHeaders,
     shadow_identity_equal: identity.equal,
     shadow_identity_differences: identity.differingFields,
+    baseline_shadow_observation: shadowObservationClass(oldRun.identityMarkers),
+    fastrelay_shadow_observation: shadowObservationClass(newRun.identityMarkers),
     client_owned_cache_key_correction: clientOwnedCacheKeyCorrection,
     sequential_metadata_correction: sequentialMetadataCorrection,
     checks,
@@ -625,6 +645,15 @@ function compareIdentityMarkers(left, right) {
     (field) => !Object.is(left[field], right[field])
   );
   return { equal: differingFields.length === 0, differingFields };
+}
+
+function shadowObservationClass(markers) {
+  const lane = String(markers.shadow_affinity_lane ?? "");
+  const decision = String(markers.shadow_affinity_decision ?? "");
+  if (lane === "steady" && decision === "assigned") return "steady_assigned";
+  if (lane === "transparent" && decision === "snapshot_lock_busy") return "snapshot_lock_busy";
+  if (lane === "transparent" && decision === "transparent") return "transparent";
+  return "other";
 }
 
 async function createIsolatedConfig(configDir, upstreamPort, useSyntheticConfig, model) {
