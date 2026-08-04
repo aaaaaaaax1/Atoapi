@@ -3536,7 +3536,14 @@ async fn run_generation_for_authorized_agent(
         // remaining portion and never dispatches another upstream request.
         let already_waited = prefix_guard_wait.wait_duration;
         let remaining_budget = remaining_responses_prefix_wait_budget(already_waited);
-        let wait = claim.wait_duration().min(remaining_budget);
+        let wait = if claim.followup_is_settle_safe(
+            &tail_input_diagnostics,
+            response_session_starts_compaction_epoch,
+        ) {
+            claim.wait_duration().min(remaining_budget)
+        } else {
+            TokioDuration::ZERO
+        };
         let wait_reason = claim.wait_reason();
         // Claiming removes the entry so sibling requests never queue.  Keep
         // the claim even when its window has just expired: terminal
@@ -7247,13 +7254,14 @@ fn provider_prefix_control_key(
 /// rotation, and cache-policy upgrades from lending one key's waterline to
 /// another key or wire shape.
 // Bump the persisted prefix-state namespace whenever the final Responses
-// cache-control wire policy changes.  The old v2 waterline was learned before
-// capability-gated cache fields were frozen and must not be compared with the
-// new wire shape on the first request after an upgrade.
+// cache-control wire policy changes. The default upstream User-Agent now
+// follows the package version, and third-party routes may partition cache
+// waterlines by that value. Do not lend a prior release's local waterline to
+// the new User-Agent lane after an upgrade.
 const PROVIDER_PREFIX_STATE_KEY_VERSION: &str = "prefix-v3";
 const PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION: &str = "prefix-family-v3";
 const PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION: &str = "prefix-alias-v3";
-const PROVIDER_PREFIX_STATE_POLICY_EPOCH: &str = "cache-control-verified-v1";
+const PROVIDER_PREFIX_STATE_POLICY_EPOCH: &str = "cache-control-user-agent-v2";
 
 fn provider_prefix_control_key_for_selected_key(
     provider_prefix_key: Option<&str>,
@@ -7351,40 +7359,6 @@ fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     }
 }
 
-/// v1.4.12's exact prefix state used the same Provider/Model/Channel/Key
-/// realm and stable prefix fingerprint as the current namespace.  The v3
-/// namespace was introduced for a cache-control policy experiment that is no
-/// longer active, so an absent v3 state may safely read the old exact state.
-/// This is a read fallback only; successful settlement writes the current v3
-/// key and never mutates the legacy record.
-fn champion_v2_control_key_for_current_scope(control_key: &str) -> Option<String> {
-    let mut parts = control_key.split('\0');
-    if parts.next()? != PROVIDER_PREFIX_STATE_KEY_VERSION {
-        return None;
-    }
-    let key_realm = parts.next()?;
-    let policy_epoch = parts.next()?;
-    if policy_epoch != PROVIDER_PREFIX_STATE_POLICY_EPOCH {
-        return None;
-    }
-    let provider_group = parts.next()?;
-    let model = parts.next()?;
-    let channel = parts.next()?;
-    let fingerprint = parts.next()?;
-    if parts.next().is_some()
-        || key_realm.is_empty()
-        || provider_group.is_empty()
-        || model.is_empty()
-        || channel.is_empty()
-        || fingerprint.is_empty()
-    {
-        return None;
-    }
-    Some(format!(
-        "prefix-v2\0{key_realm}\0{provider_group}\0{model}\0{channel}\0{fingerprint}"
-    ))
-}
-
 fn provider_prefix_provider_group(decision: &RouteDecision) -> String {
     let base_url = decision
         .provider
@@ -7409,14 +7383,7 @@ fn lookup_provider_prefix_state<'a>(
 ) -> Option<&'a PrefixWarmState> {
     let exact = states.get(key);
     let alias = provider_prefix_state_alias_key(key).and_then(|alias| states.get(&alias));
-    stronger_prefix_state(exact, alias).or_else(|| {
-        champion_v2_control_key_for_current_scope(key).and_then(|legacy_key| {
-            let legacy_exact = states.get(&legacy_key);
-            let legacy_alias =
-                provider_prefix_state_alias_key(&legacy_key).and_then(|alias| states.get(&alias));
-            stronger_prefix_state(legacy_exact, legacy_alias)
-        })
-    })
+    stronger_prefix_state(exact, alias)
 }
 
 fn lookup_provider_prefix_state_with_source<'a>(
@@ -7429,15 +7396,7 @@ fn lookup_provider_prefix_state_with_source<'a>(
         let alias = provider_prefix_state_alias_key(key)
             .and_then(|alias| states.get(&alias))
             .map(|state| ("shared-responses", state));
-        stronger_prefix_state_with_source(exact, alias).or_else(|| {
-            champion_v2_control_key_for_current_scope(key).and_then(|legacy_key| {
-                let legacy_exact = states.get(&legacy_key).map(|state| ("exact", state));
-                let legacy_alias = provider_prefix_state_alias_key(&legacy_key)
-                    .and_then(|alias| states.get(&alias))
-                    .map(|state| ("shared-responses", state));
-                stronger_prefix_state_with_source(legacy_exact, legacy_alias)
-            })
-        })
+        stronger_prefix_state_with_source(exact, alias)
     });
     stronger_prefix_state_with_source(
         direct,
@@ -21363,7 +21322,7 @@ mod tests {
     }
 
     #[test]
-    fn default_upstream_user_agent_identifies_atoapi_without_changing_cache_identity() {
+    fn default_upstream_user_agent_identifies_the_current_atoapi_build() {
         let body = json!({
             "model": "gpt-5.6-sol",
             "prompt_cache_key": "stable-session-key",
@@ -21392,7 +21351,10 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some(crate::ATOAPI_USER_AGENT)
         );
-        assert_eq!(crate::ATOAPI_USER_AGENT, "Atoapi/1.4.12");
+        assert_eq!(
+            crate::ATOAPI_USER_AGENT,
+            concat!("Atoapi/", env!("CARGO_PKG_VERSION"))
+        );
         assert_eq!(
             provider_prefix_fingerprint(&body, &Channel::Responses),
             cache_identity
@@ -21813,7 +21775,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_prefix_lookup_reuses_exact_v2_champion_state_when_current_scope_is_missing() {
+    fn dynamic_user_agent_prefix_lookup_does_not_reuse_a_legacy_v2_waterline() {
         let decision = reasoning_test_decision(None, &[]);
         let selected = SelectedProviderKey {
             secret: "selected-key".to_string(),
@@ -21841,14 +21803,9 @@ mod tests {
         let mut states = HashMap::new();
         states.insert(v2, expected.clone());
 
-        let (source, observed) = lookup_provider_prefix_state_with_source(&states, Some(&v3), None)
-            .expect("the champion-compatible exact v2 state must survive the v3 upgrade");
-
-        assert_eq!(source, "exact");
-        assert_eq!(observed.cache_read_tokens, expected.cache_read_tokens);
-        assert_eq!(
-            observed.seen_bucket_tokens_128,
-            expected.seen_bucket_tokens_128
+        assert!(
+            lookup_provider_prefix_state_with_source(&states, Some(&v3), None).is_none(),
+            "a versioned default User-Agent may select a distinct upstream cache lane, so an old v2 waterline must not influence the new release"
         );
     }
 
@@ -28342,22 +28299,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_route_switch_drops_a_managed_previous_response_from_the_old_scope() {
+    async fn codex_route_switch_never_leaks_managed_previous_response_across_round_trip() {
         let old_hits = Arc::new(AtomicUsize::new(0));
         let new_hits = Arc::new(AtomicUsize::new(0));
+        let old_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let new_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let old_hits_for_route = old_hits.clone();
         let new_hits_for_route = new_hits.clone();
+        let old_bodies_for_route = old_bodies.clone();
         let new_bodies_for_route = new_bodies.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = Router::new()
             .route(
                 "/old/v1/responses",
-                post(move || {
+                post(move |Json(body): Json<Value>| {
                     let old_hits = old_hits_for_route.clone();
+                    let old_bodies = old_bodies_for_route.clone();
                     async move {
                         old_hits.fetch_add(1, Ordering::SeqCst);
+                        old_bodies.lock().await.push(body);
                         raw_response(
                             200,
                             "text/event-stream",
@@ -28500,7 +28461,55 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(old_hits.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state
+                    .continuation_lineage
+                    .snapshot_heads()
+                    .await
+                    .values()
+                    .any(|head| head.response_id == "resp_new_route")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the new route must publish its managed response head");
+
+        {
+            let mut live_config = state.config.write().await;
+            live_config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == "codex")
+                .unwrap()
+                .provider_id = Some("codex-old-route".to_string());
+        }
+
+        let third_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_new_route",
+                    "input": [{"type": "message", "role": "user", "content": "after return"}]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(third_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(third_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(old_hits.load(Ordering::SeqCst), 2);
         assert_eq!(new_hits.load(Ordering::SeqCst), 1);
         let new_bodies = new_bodies.lock().await.clone();
         assert_eq!(new_bodies.len(), 1);
@@ -28516,21 +28525,39 @@ mod tests {
             ]),
             "the safe hot-switch fallback must replay managed context instead of silently dropping it"
         );
+        let old_bodies = old_bodies.lock().await.clone();
+        assert_eq!(old_bodies.len(), 2);
+        assert!(
+            old_bodies[1].get("previous_response_id").is_none(),
+            "a response reference from the return route must not leak back into the original provider/model scope"
+        );
+        assert_eq!(
+            old_bodies[1]["input"],
+            json!([
+                {"type": "message", "role": "user", "content": "before switch"},
+                {"type": "message", "role": "user", "content": "after switch"},
+                {"type": "message", "role": "user", "content": "after return"}
+            ]),
+            "returning to a provider must recover only its complete managed replay, never the other route's session reference"
+        );
 
         let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let metrics = state.metrics.snapshot().await;
-                if metrics.recent_requests.len() == 2 {
+                if metrics.recent_requests.len() == 3 {
                     break metrics;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("both one-shot route requests must settle");
+        .expect("all three one-shot route requests must settle");
         assert!(metrics.recent_requests.iter().any(|request| {
             request.response_context_plan.as_deref() == Some("full_replay_after_route_switch")
         }));
+        assert_eq!(metrics.agent_generation.inbound_requests, 3);
+        assert_eq!(metrics.agent_generation.generation_attempts, 3);
+        assert_eq!(metrics.retries, 0);
 
         fs::remove_dir_all(config_dir).ok();
     }

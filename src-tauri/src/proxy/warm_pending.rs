@@ -21,6 +21,7 @@ const WARM_PENDING_MAX_ENTRIES: usize = 64;
 enum PendingMaturityKind {
     GiantColdRoot,
     MaterialToolTail,
+    ProviderWaterlineRollback,
 }
 
 impl PendingMaturityKind {
@@ -33,6 +34,9 @@ impl PendingMaturityKind {
             // child, then fail open. A later tool result has a different
             // exact predecessor and therefore earns its own one-shot window.
             Self::MaterialToolTail => 1,
+            // A proven upstream waterline rollback gets one direct successor.
+            // Persistent provider loss must fail open after that one window.
+            Self::ProviderWaterlineRollback => 1,
         }
     }
 
@@ -46,6 +50,7 @@ impl PendingMaturityKind {
             // cross the short maturation boundary.  If that child arrives
             // later, it sends immediately rather than waiting again.
             Self::MaterialToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
+            Self::ProviderWaterlineRollback => now + WARM_PENDING_FOLLOWUP_WAIT,
         }
     }
 
@@ -53,15 +58,16 @@ impl PendingMaturityKind {
         match self {
             Self::GiantColdRoot => "responses_giant_cold_prefix_warm_pending",
             Self::MaterialToolTail => "responses_material_tool_tail_maturity_pending",
+            Self::ProviderWaterlineRollback => "responses_provider_waterline_rollback_pending",
         }
     }
 }
 
-/// A process-local, one-shot maturity gate for a giant cold FullReplay root or
-/// a material tool tail. It never changes a frozen request, provider, Key,
-/// route, or number of upstream dispatches; it only gives a proven direct
-/// child a bounded opportunity to arrive after the provider finishes warming
-/// that exact prefix.
+/// A process-local, one-shot maturity gate for a giant cold FullReplay root,
+/// a material tool tail, or a proven provider waterline rollback. It never
+/// changes a frozen request, provider, Key, route, or number of upstream
+/// dispatches; it only gives a proven direct child a bounded opportunity to
+/// arrive after the provider finishes warming that exact prefix.
 #[derive(Debug, Default)]
 pub(crate) struct WarmPendingRegistry {
     entries: HashMap<String, WarmPendingEntry>,
@@ -106,6 +112,23 @@ impl WarmPendingClaim {
 
     pub(super) fn wait_reason(&self) -> &'static str {
         self.kind.wait_reason()
+    }
+
+    /// A proven provider rollback belongs to the exact predecessor, but a
+    /// large or noisy direct child still has its own real new tail. Do not add
+    /// latency to that child merely to chase a prior cache waterline.
+    pub(super) fn followup_is_settle_safe(
+        &self,
+        tail: &TailInputDiagnostics,
+        compaction_requested: bool,
+    ) -> bool {
+        match self.kind {
+            PendingMaturityKind::MaterialToolTail
+            | PendingMaturityKind::ProviderWaterlineRollback => {
+                !compaction_requested && direct_followup_is_settle_safe(tail)
+            }
+            PendingMaturityKind::GiantColdRoot => true,
+        }
     }
 }
 
@@ -329,20 +352,53 @@ fn pending_maturity(
         Some(PendingMaturity {
             kind: PendingMaturityKind::GiantColdRoot,
         })
-    } else if material_tool_tail_has_exact_shortfall(raw_usage, tail, final_scope) {
+    } else if material_tool_tail_has_exact_predecessor(raw_usage, tail, final_scope) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::MaterialToolTail,
+        })
+    } else if provider_waterline_rollback(raw_usage, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ProviderWaterlineRollback,
         })
     } else {
         None
     }
 }
 
-/// A large tool result is newly appended context on its own request, so its
-/// size alone never proves that waiting helps. Arm a material-tail window only
-/// when the exact final-scope settlement proves an older prefix bucket was
-/// still absent. This is aggregate upstream usage evidence only.
-fn material_tool_tail_has_exact_shortfall(
+/// The final-scope ledger is the only accepted source for this maturity hint.
+/// A raw partial cache read alone could be a genuine new tail; a rollback
+/// amount with exact, bound, non-reset lineage proves that portion belonged to
+/// the already-settled upstream prefix.
+fn provider_waterline_rollback(
+    raw_usage: Option<&UsageRecord>,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    let Some(record) = raw_usage else {
+        return false;
+    };
+    record.input_tokens >= 16_384
+        && record.cache_read_tokens > 0
+        && final_scope.predecessor_exact
+        && final_scope.predecessor_bound
+        && !final_scope.continuity_reset
+        && final_scope.rollback_tokens_128 >= 128
+        && final_scope.raw_cache_read_tokens == record.cache_read_tokens
+}
+
+fn direct_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    tail.input_items <= 10
+        && tail.message_chars <= 1_024
+        && tail.tool_call_chars <= 4_096
+        && tail.tool_output_chars < 8_000
+        && tail.largest_tool_output_chars < 8_000
+        && tail.tool_output_noise_hint.is_none()
+}
+
+/// A material tool result is new context on its own request, but its exact
+/// direct successor can arrive before the provider indexes that settled
+/// prefix. Require the final-scope proof and a still-unsettled sent bucket;
+/// the claim itself only waits for a small, quiet direct child.
+fn material_tool_tail_has_exact_predecessor(
     raw_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
     final_scope: &FinalScopeWaterlineLog,
@@ -354,8 +410,8 @@ fn material_tool_tail_has_exact_shortfall(
         || !final_scope.predecessor_exact
         || !final_scope.predecessor_bound
         || final_scope.continuity_reset
-        || final_scope.candidate_avoidable_tokens_128 < 128
         || final_scope.raw_cache_read_tokens != record.cache_read_tokens
+        || final_scope.sent_prefix_bucket_tokens_128 <= final_scope.settled_prefix_bucket_tokens_128
     {
         return false;
     }
@@ -410,6 +466,20 @@ mod tests {
         FinalScopeWaterlineLog {
             raw_cache_read_tokens,
             candidate_avoidable_tokens_128,
+            sent_prefix_bucket_tokens_128: raw_cache_read_tokens.saturating_add(128),
+            settled_prefix_bucket_tokens_128: raw_cache_read_tokens,
+            ..exact_log(scope)
+        }
+    }
+
+    fn exact_rollback_log(
+        scope: &str,
+        raw_cache_read_tokens: u64,
+        rollback_tokens_128: u64,
+    ) -> FinalScopeWaterlineLog {
+        FinalScopeWaterlineLog {
+            raw_cache_read_tokens,
+            rollback_tokens_128,
             ..exact_log(scope)
         }
     }
@@ -661,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn material_tool_tail_without_exact_shortfall_never_arms() {
+    fn exact_material_tool_tail_arms_a_safe_direct_child_without_prior_gap() {
         let mut registry = WarmPendingRegistry::default();
         let prefix = "realm\0provider\0model\0responses\0control";
         let scope = "final-scope";
@@ -677,7 +747,157 @@ mod tests {
             true,
             false,
         );
-        assert_eq!(registry.len(), 0);
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("an exact material tool tail must give its safe direct child one bounded maturation window even when the prior gap was zero");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_material_tool_tail_maturity_pending"
+        );
+        assert!(claim.followup_is_settle_safe(&TailInputDiagnostics::default(), false));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    tool_output_chars: 8_000,
+                    largest_tool_output_chars: 8_000,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a new material or noisy child must retain immediate dispatch"
+        );
+    }
+
+    #[test]
+    fn exact_provider_waterline_rollback_arms_one_safe_direct_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let rollback = UsageRecord {
+            input_tokens: 211_840,
+            cache_read_tokens: 180_992,
+            ..UsageRecord::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_rollback_log(
+                scope,
+                rollback.cache_read_tokens,
+                30_720,
+            )),
+            Some(&root),
+            Some(&rollback),
+            &TailInputDiagnostics::default(),
+            true,
+            false,
+        );
+        assert_eq!(registry.len(), 1);
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("only the exact direct child may use a proven rollback window");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_provider_waterline_rollback_pending"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        assert!(claim.followup_is_settle_safe(&TailInputDiagnostics::default(), false));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 3,
+                    tool_output_chars: 8_000,
+                    largest_tool_output_chars: 8_000,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a material new tool tail must keep its immediate-send behavior"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(&TailInputDiagnostics::default(), true),
+            "compaction already owns its independent maturity boundary"
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .is_none(),
+            "the provider-rollback window is one-shot and cannot queue siblings"
+        );
+    }
+
+    #[test]
+    fn provider_waterline_maturity_requires_exact_bound_non_reset_evidence() {
+        let rollback = UsageRecord {
+            input_tokens: 211_840,
+            cache_read_tokens: 180_992,
+            ..UsageRecord::default()
+        };
+        let exact = exact_rollback_log("scope", rollback.cache_read_tokens, 30_720);
+        assert!(provider_waterline_rollback(Some(&rollback), &exact));
+
+        let mut unbound = exact.clone();
+        unbound.predecessor_bound = false;
+        assert!(!provider_waterline_rollback(Some(&rollback), &unbound));
+
+        let mut reset = exact.clone();
+        reset.continuity_reset = true;
+        assert!(!provider_waterline_rollback(Some(&rollback), &reset));
+
+        let mut no_rollback = exact;
+        no_rollback.rollback_tokens_128 = 0;
+        assert!(!provider_waterline_rollback(Some(&rollback), &no_rollback));
+    }
+
+    #[test]
+    fn material_tool_tail_keeps_precedence_over_a_concurrent_waterline_rollback() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let replay = warm_tool_replay();
+        let mut final_scope = exact_log_with_gap(scope, replay.cache_read_tokens, 8_192);
+        final_scope.rollback_tokens_128 = 8_192;
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&root),
+            Some(&replay),
+            &material_tool_tail(),
+            true,
+            false,
+        );
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("the material-tail maturity window must still arm");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_material_tool_tail_maturity_pending"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 3,
+                    tool_output_chars: 32_768,
+                    largest_tool_output_chars: 30_000,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a new material child must retain immediate dispatch instead of consuming latency for its predecessor"
+        );
     }
 
     #[test]

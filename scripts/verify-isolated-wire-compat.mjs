@@ -12,6 +12,12 @@ import { fileURLToPath } from "node:url";
 import { writeIsolatedResponsesConfig } from "./isolated-responses-fixture.mjs";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const candidateManifest = await readFile(join(repoRoot, "src-tauri", "Cargo.toml"), "utf8");
+const candidatePackageVersion = extractTomlString(candidateManifest, "version");
+if (!candidatePackageVersion) {
+  throw new Error("candidate Cargo package version is missing");
+}
+const expectedCandidateUserAgent = `Atoapi/${candidatePackageVersion}`;
 const args = parseArgs(process.argv.slice(2));
 // Release gates are deterministic and secret-free by default. A copied user
 // profile is available only for an explicit compatibility investigation.
@@ -54,10 +60,12 @@ if (!new Set([
   "lineage-recovery",
   "commit-maturity",
   "sequential-full-replay",
-  "regenerated-tool-ids"
+  "regenerated-tool-ids",
+  "provider-waterline-rollback",
+  "material-tool-tail-maturity"
 ]).has(scenario)) {
   throw new Error(
-    "--scenario must be ordinary, lineage-recovery, commit-maturity, sequential-full-replay, or regenerated-tool-ids"
+    "--scenario must be ordinary, lineage-recovery, commit-maturity, sequential-full-replay, regenerated-tool-ids, provider-waterline-rollback, or material-tool-tail-maturity"
   );
 }
 if (!existsSync(oldExecutable)) {
@@ -134,6 +142,7 @@ try {
         content: [{ type: "output_text", text: "seed answer" }]
       }]
       : [];
+    const usage = mockUsageForScenario(activeMockScenario, turn);
     response.end([
       "event: response.output_text.delta",
       'data: {"type":"response.output_text.delta","delta":"OK"}',
@@ -147,10 +156,10 @@ try {
           status: "completed",
           output,
           usage: {
-            input_tokens: activeMockScenario === "commit-maturity" ? 32768 : 4096,
+            input_tokens: usage.inputTokens,
             output_tokens: 1,
             input_tokens_details: {
-              cached_tokens: activeMockScenario === "commit-maturity" ? 32768 : 3968
+              cached_tokens: usage.cachedTokens
             }
           }
         }
@@ -250,10 +259,16 @@ try {
     (sequentialMetadataCorrection && path === "$.client_metadata")
   ));
   const rawWirePass = clientOwnedCacheKeyCorrection || rawSequenceEqual || sequentialMetadataCorrection;
+  // A stable baseline is already the expected outcome: the candidate must
+  // preserve it, but it does not need to claim a metadata correction. The
+  // previous gate treated that no-op comparison as a failure and made a
+  // healthy v1.4.22-vs-v1.4.22 replay look regressed.
+  const sequentialWirePreserved = scenario === "sequential-full-replay" &&
+    rawSequenceEqual && meaningfulDifferingPaths.length === 0;
   const scenarioWirePass = scenario === "lineage-recovery"
     ? recovery?.candidate_preserves_complete_replay === true
     : scenario === "sequential-full-replay"
-      ? sequentialMetadataCorrection && meaningfulDifferingPaths.length === 0
+      ? sequentialMetadataCorrection || sequentialWirePreserved
       : scenario === "regenerated-tool-ids"
         ? regeneratedToolIdCorrection
       : meaningfulDifferingPaths.length === 0 && rawWirePass;
@@ -271,6 +286,22 @@ try {
     (commitMaturity?.baseline?.max_wait_ms === 0 &&
       commitMaturity?.fastrelay?.max_wait_ms === 0 &&
       commitMaturity?.fastrelay?.all_full_hit === true);
+  const providerWaterlineMaturity = scenario === "provider-waterline-rollback"
+    ? {
+      baseline: oldRun.providerWaterlineMaturity,
+      fastrelay: newRun.providerWaterlineMaturity
+    }
+    : null;
+  const providerWaterlineMaturityPass = scenario !== "provider-waterline-rollback" ||
+    providerWaterlineMaturity?.fastrelay?.pass === true;
+  const materialToolTailMaturity = scenario === "material-tool-tail-maturity"
+    ? {
+      baseline: oldRun.materialToolTailMaturity,
+      fastrelay: newRun.materialToolTailMaturity
+    }
+    : null;
+  const materialToolTailMaturityPass = scenario !== "material-tool-tail-maturity" ||
+    materialToolTailMaturity?.fastrelay?.pass === true;
   const checks = {
     baseline_one_inbound_one_post: oldRun.oneInboundOnePost,
     candidate_one_inbound_one_post: newRun.oneInboundOnePost,
@@ -281,6 +312,10 @@ try {
     regenerated_tool_ids: scenario !== "regenerated-tool-ids" ||
       regeneratedToolIds?.fastrelay?.pass === true,
     commit_maturity: commitMaturityPass,
+    provider_waterline_maturity: providerWaterlineMaturityPass,
+    material_tool_tail_maturity: materialToolTailMaturityPass,
+    candidate_user_agent_version:
+      String(newRun.upstreamHeaders["user-agent"] ?? "") === expectedCandidateUserAgent,
     protocol_headers: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
     local_identity: identity.equal || expectedIdentityCorrection || scenario === "lineage-recovery"
   };
@@ -314,6 +349,10 @@ try {
     sequential_full_replay: sequentialFullReplay,
     regenerated_tool_ids: regeneratedToolIds,
     commit_maturity: commitMaturity,
+    provider_waterline_maturity: providerWaterlineMaturity,
+    material_tool_tail_maturity: materialToolTailMaturity,
+    expected_candidate_user_agent: expectedCandidateUserAgent,
+    candidate_user_agent: newRun.upstreamHeaders["user-agent"] ?? null,
     headers_equal: checks.protocol_headers,
     baseline_headers: oldRun.upstreamHeaders,
     fastrelay_headers: newRun.upstreamHeaders,
@@ -337,6 +376,21 @@ try {
   assert.equal(checks.sequential_full_replay, true, "sequential full replay did not retain a stable byte-level prefix");
   assert.equal(checks.regenerated_tool_ids, true, "regenerated Codex tool ids did not retain the prior wire prefix");
   assert.equal(checks.commit_maturity, true, "commit-maturity behavior violated its bounded policy");
+  assert.equal(
+    checks.provider_waterline_maturity,
+    true,
+    "proven provider waterline rollback did not receive one bounded safe-child maturity window"
+  );
+  assert.equal(
+    checks.material_tool_tail_maturity,
+    true,
+    "an exact material tool tail did not give its safe direct child one bounded maturity window"
+  );
+  assert.equal(
+    checks.candidate_user_agent_version,
+    true,
+    `candidate default User-Agent must match its Cargo package version (${expectedCandidateUserAgent})`
+  );
   assert.equal(checks.protocol_headers, true, "upstream protocol headers changed unexpectedly");
   assert.equal(checks.local_identity, true, "local identity changed outside the attested caller cache-key correction");
   if (scenario === "ordinary") {
@@ -403,6 +457,28 @@ try {
       true,
       "FastRelay regenerated-id full replay must not forward previous_response_id"
     );
+  } else if (scenario === "provider-waterline-rollback") {
+    assert.equal(
+      report.provider_waterline_maturity?.fastrelay?.rollback_observed,
+      true,
+      "rollback fixture must prove the final-scope ledger observed a provider waterline rollback"
+    );
+    assert.equal(
+      report.provider_waterline_maturity?.fastrelay?.one_safe_child_wait,
+      true,
+      "only the direct safe child may receive the new bounded rollback maturity wait"
+    );
+  } else if (scenario === "material-tool-tail-maturity") {
+    assert.equal(
+      report.material_tool_tail_maturity?.fastrelay?.material_tail_observed,
+      true,
+      "fixture must prove that the predecessor carried a material tool tail"
+    );
+    assert.equal(
+      report.material_tool_tail_maturity?.fastrelay?.one_safe_child_wait,
+      true,
+      "only the safe direct child may receive the new bounded material-tail maturity wait"
+    );
   } else {
     assert.equal(
       report.sequential_full_replay?.fastrelay?.raw_input_append_only,
@@ -445,6 +521,23 @@ try {
 } finally {
   if (upstream) await closeServer(upstream);
   if (tempRoot) await rm(tempRoot, { recursive: true, force: true });
+}
+
+function mockUsageForScenario(activeScenario, turn) {
+  if (activeScenario === "commit-maturity") {
+    return { inputTokens: 32_768, cachedTokens: 32_768 };
+  }
+  if (activeScenario === "provider-waterline-rollback") {
+    const inputTokens = 65_536 + Math.max(0, turn - 1) * 128;
+    const cachedTokens = turn === 2 ? 32_768 : 65_024;
+    return { inputTokens, cachedTokens };
+  }
+  if (activeScenario === "material-tool-tail-maturity") {
+    if (turn === 1) return { inputTokens: 65_536, cachedTokens: 65_536 };
+    if (turn === 2) return { inputTokens: 73_728, cachedTokens: 65_536 };
+    return { inputTokens: 73_856, cachedTokens: 73_216 };
+  }
+  return { inputTokens: 4_096, cachedTokens: 3_968 };
 }
 
 async function runIsolatedCapture({
@@ -518,9 +611,13 @@ async function runIsolatedCapture({
         ? 2
         : scenario === "regenerated-tool-ids"
           ? 2
-        : scenario === "sequential-full-replay"
-          ? 4
-        : concurrency;
+          : scenario === "provider-waterline-rollback"
+            ? 3
+          : scenario === "material-tool-tail-maturity"
+            ? 3
+          : scenario === "sequential-full-replay"
+            ? 4
+            : concurrency;
     const downstreamPromise = scenario === "lineage-recovery"
       ? (async () => [
         await sendInbound(syntheticRecoverySeedBody(model, generatedControls)),
@@ -546,8 +643,24 @@ async function runIsolatedCapture({
             }
             return results;
           })()
-        : scenario === "sequential-full-replay"
-          ? (async () => {
+          : scenario === "provider-waterline-rollback"
+            ? (async () => {
+              const results = [];
+              for (const body of syntheticProviderWaterlineRollbackBodies(model, generatedControls)) {
+                results.push(await sendInbound(body));
+              }
+              return results;
+            })()
+          : scenario === "material-tool-tail-maturity"
+            ? (async () => {
+              const results = [];
+              for (const body of syntheticMaterialToolTailMaturityBodies(model, generatedControls)) {
+                results.push(await sendInbound(body));
+              }
+              return results;
+            })()
+          : scenario === "sequential-full-replay"
+            ? (async () => {
             const results = [];
             for (const body of syntheticSequentialFullReplayBodies(
               model,
@@ -613,6 +726,10 @@ async function runIsolatedCapture({
       }
     } else if (scenario === "regenerated-tool-ids") {
       assert.equal(upstreamRequests.length, 2, `${label}: regenerated-id replay must make two POSTs`);
+    } else if (scenario === "provider-waterline-rollback") {
+      assert.equal(upstreamRequests.length, 3, `${label}: rollback fixture must make three POSTs`);
+    } else if (scenario === "material-tool-tail-maturity") {
+      assert.equal(upstreamRequests.length, 3, `${label}: material-tail fixture must make three POSTs`);
     } else {
       assert.equal(upstreamRequests.length, 4, `${label}: sequential full replay must make four POSTs`);
     }
@@ -648,6 +765,12 @@ async function runIsolatedCapture({
       };
       })()
       : null;
+    const providerWaterlineMaturity = scenario === "provider-waterline-rollback"
+      ? summarizeProviderWaterlineMaturity(metrics.recent_requests, expectedInbounds)
+      : null;
+    const materialToolTailMaturity = scenario === "material-tool-tail-maturity"
+      ? summarizeMaterialToolTailMaturity(metrics.recent_requests, expectedInbounds)
+      : null;
     return {
       upstreamBody,
       upstreamHeaders,
@@ -655,6 +778,8 @@ async function runIsolatedCapture({
       identityMarkers: identityMarkers(metrics.recent_requests?.[0] ?? {}),
       oneInboundOnePost,
       commitMaturity,
+      providerWaterlineMaturity,
+      materialToolTailMaturity,
       samePrefixReachedBeforeHeaders: !gate || gateResult.arrivalsBeforeRelease === concurrency,
       summary: {
         local_status: downstream[0] ?? null,
@@ -863,6 +988,69 @@ function syntheticCommitMaturityBody(model, generatedControls = false) {
   const toolOutput = body.input.find((item) => item.type === "function_call_output");
   toolOutput.output = "m".repeat(4_096);
   return body;
+}
+
+function syntheticProviderWaterlineRollbackBodies(model, generatedControls = false) {
+  const input = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "rollback maturity root" }]
+    }
+  ];
+  const bodies = [];
+  for (let turn = 0; turn < 3; turn += 1) {
+    bodies.push(syntheticRequestBase(
+      model,
+      input.map((item) => structuredClone(item)),
+      null,
+      generatedControls
+    ));
+    input.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: `rollback maturity tail ${turn}` }]
+    });
+  }
+  return bodies;
+}
+
+function syntheticMaterialToolTailMaturityBodies(model, generatedControls = false) {
+  const root = [
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "material-tail maturity root" }]
+    }
+  ];
+  const material = [
+    ...root.map((item) => structuredClone(item)),
+    {
+      type: "function_call",
+      id: "fc-material-tail",
+      call_id: "call-material-tail",
+      name: "read_fixture",
+      arguments: "{\"path\":\"material-tail.txt\"}"
+    },
+    {
+      type: "function_call_output",
+      call_id: "call-material-tail",
+      output: "m".repeat(32_768)
+    }
+  ];
+  const child = [
+    ...material.map((item) => structuredClone(item)),
+    {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "safe direct child" }]
+    }
+  ];
+  return [
+    syntheticRequestBase(model, root, null, generatedControls),
+    syntheticRequestBase(model, material, null, generatedControls),
+    syntheticRequestBase(model, child, null, generatedControls)
+  ];
 }
 
 function syntheticSequentialFullReplayBodies(
@@ -1098,6 +1286,86 @@ function summarizeSequentialFullReplay(requests) {
     no_previous_response_id: previousInputIdsAbsent,
     one_post_per_inbound: onePostPerInbound,
     wires: rawWireSummary(requests)
+  };
+}
+
+function summarizeProviderWaterlineMaturity(requests, expectedInbounds) {
+  const diagnostics = Array.from(requests ?? []).map((request) => ({
+    input_tokens: Number(request?.input_tokens ?? 0),
+    cache_read_tokens: Number(request?.cache_read_tokens ?? 0),
+    wait_ms: Number(request?.prefix_guard_wait_ms ?? 0),
+    wait_reason: request?.prefix_guard_wait_reason ?? null,
+    wait_source: request?.prefix_guard_wait_source ?? null,
+    skip_reason: request?.prefix_guard_skip_reason ?? null,
+    tail_input_items: Number(request?.tail_input_items ?? 0),
+    tail_message_chars: Number(request?.tail_message_chars ?? 0),
+    tail_tool_output_chars: Number(request?.tail_tool_output_chars ?? 0),
+    final_scope_outcome: request?.final_scope_waterline?.outcome ?? null,
+    final_scope_exact: request?.final_scope_waterline?.predecessor_exact ?? false,
+    final_scope_bound: request?.final_scope_waterline?.predecessor_bound ?? false,
+    final_scope_rollback_tokens_128: Number(
+      request?.final_scope_waterline?.rollback_tokens_128 ?? 0
+    )
+  }));
+  const rollbackObserved = diagnostics.some((request) =>
+    request.final_scope_outcome === "settled" &&
+    request.final_scope_exact === true &&
+    request.final_scope_bound === true &&
+    request.final_scope_rollback_tokens_128 >= 128
+  );
+  const rollbackWaits = diagnostics.filter((request) =>
+    request.wait_reason === "responses_provider_waterline_rollback_pending" &&
+    request.wait_source === "exact" && request.wait_ms > 0 && request.wait_ms <= 500
+  );
+  const oneSafeChildWait = rollbackWaits.length === 1;
+  return {
+    pass: diagnostics.length === expectedInbounds && rollbackObserved && oneSafeChildWait,
+    rollback_observed: rollbackObserved,
+    one_safe_child_wait: oneSafeChildWait,
+    rollback_wait_count: rollbackWaits.length,
+    max_wait_ms: Math.max(0, ...diagnostics.map((request) => request.wait_ms)),
+    request_diagnostics: diagnostics
+  };
+}
+
+function summarizeMaterialToolTailMaturity(requests, expectedInbounds) {
+  const diagnostics = Array.from(requests ?? []).map((request) => ({
+    input_tokens: Number(request?.input_tokens ?? 0),
+    cache_read_tokens: Number(request?.cache_read_tokens ?? 0),
+    wait_ms: Number(request?.prefix_guard_wait_ms ?? 0),
+    wait_reason: request?.prefix_guard_wait_reason ?? null,
+    wait_source: request?.prefix_guard_wait_source ?? null,
+    tail_input_items: Number(request?.tail_input_items ?? 0),
+    tail_message_chars: Number(request?.tail_message_chars ?? 0),
+    tail_tool_output_chars: Number(request?.tail_tool_output_chars ?? 0),
+    tail_noise: request?.tail_tool_output_noise_hint ?? null,
+    final_scope_outcome: request?.final_scope_waterline?.outcome ?? null,
+    final_scope_exact: request?.final_scope_waterline?.predecessor_exact ?? false,
+    final_scope_bound: request?.final_scope_waterline?.predecessor_bound ?? false,
+    final_scope_candidate_avoidable_tokens_128: Number(
+      request?.final_scope_waterline?.candidate_avoidable_tokens_128 ?? 0
+    )
+  }));
+  const materialTailObserved = diagnostics.some((request) =>
+    request.tail_tool_output_chars >= 8_192 &&
+    request.final_scope_outcome === "settled" &&
+    request.final_scope_exact === true &&
+    request.final_scope_bound === true &&
+    request.final_scope_candidate_avoidable_tokens_128 === 0
+  );
+  const waits = diagnostics.filter((request) =>
+    request.wait_reason === "responses_material_tool_tail_maturity_pending" &&
+    request.wait_source === "exact" && request.wait_ms > 0 && request.wait_ms <= 500 &&
+    request.tail_tool_output_chars < 8_000 && request.tail_noise == null
+  );
+  const oneSafeChildWait = waits.length === 1;
+  return {
+    pass: diagnostics.length === expectedInbounds && materialTailObserved && oneSafeChildWait,
+    material_tail_observed: materialTailObserved,
+    one_safe_child_wait: oneSafeChildWait,
+    material_tail_wait_count: waits.length,
+    max_wait_ms: Math.max(0, ...diagnostics.map((request) => request.wait_ms)),
+    request_diagnostics: diagnostics
   };
 }
 

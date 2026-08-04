@@ -11,14 +11,11 @@ mod persistence;
 mod proxy;
 mod state;
 
-/// Stable upstream compatibility identity.
+/// Default upstream product identity.
 ///
-/// Some third-party Responses routes partition prompt caches by `User-Agent`.
-/// The build version belongs in local diagnostics, not this request identity:
-/// changing it on every Atoapi release creates an avoidable cold cache lane.
-/// Advance this value only through an explicit compatibility migration. A
+/// Keep this aligned with the executable's actual Cargo package version. A
 /// Provider's user-configured `custom_user_agent` still takes precedence.
-pub(crate) const ATOAPI_USER_AGENT: &str = "Atoapi/1.4.12";
+pub(crate) const ATOAPI_USER_AGENT: &str = concat!("Atoapi/", env!("CARGO_PKG_VERSION"));
 
 use admin::{
     add_or_update_model, add_or_update_provider, apply_agent_injection,

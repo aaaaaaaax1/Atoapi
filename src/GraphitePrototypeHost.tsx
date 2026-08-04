@@ -1350,10 +1350,16 @@ const bridgeSource = String.raw`
       const statusDetail = request.statusDetail
         ? '<small>' + escape(request.statusDetail) + '</small>'
         : '';
-      const cacheTailDetail = "新 " + requestTokens(request.cacheNewTailGapTokens) +
-        (Number(request.cacheAvoidableGapTokens || 0) > 0
-          ? " · 可 " + requestTokens(request.cacheAvoidableGapTokens)
-          : "");
+      const cacheTailSegments = [
+        "新 " + requestTokens(request.cacheNewTailGapTokens),
+        Number(request.cacheAvoidableGapTokens || 0) > 0
+          ? "可 " + requestTokens(request.cacheAvoidableGapTokens)
+          : "",
+        Number(request.cacheProviderUnstableGapTokens || 0) > 0
+          ? "水位 " + requestTokens(request.cacheProviderUnstableGapTokens)
+          : ""
+      ].filter(Boolean);
+      const cacheTailDetail = cacheTailSegments.join(" · ");
       return '<article class="request-row status-' + escape(rowTone) + (request.failed ? ' failed' : '') + '" tabindex="0" data-request-id="' + escape(request.id) + '">' +
         '<div class="request-identity" title="' + escape(request.provider + " · " + request.agentLabel) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span>' + escape(request.time) + '</span></div>' +
         '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><div class="request-model-stack"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div></div>' +
@@ -1544,6 +1550,7 @@ type RequestCacheTailDisplay = {
   shortfallTokens: number;
   newTailTokens: number;
   avoidableTokens: number;
+  providerUnstableTokens: number;
 };
 
 function wholeTokenCount(value?: number | null): number {
@@ -1589,11 +1596,17 @@ function cacheTailDisplayForRequest(
     // Provider instability is intentionally not presented as a new user tail.
     // The remaining 128-aligned shortfall is the only safe "new" display.
     newTailTokens: shortfallTokens - avoidableTokens - providerUnstableTokens,
-    avoidableTokens
+    avoidableTokens,
+    providerUnstableTokens
   };
 }
 
-function cacheGapDetail(shortfall: number, avoidable: number, newTail: number): string {
+function cacheGapDetail(
+  shortfall: number,
+  avoidable: number,
+  newTail: number,
+  providerUnstable: number
+): string {
   const segments: string[] = [];
   const append = (label: string, value: number) => {
     const safe = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
@@ -1602,6 +1615,7 @@ function cacheGapDetail(shortfall: number, avoidable: number, newTail: number): 
   append("缺", shortfall);
   append("可", avoidable);
   append("新", newTail);
+  append("水位", providerUnstable);
   return segments.length > 0 ? segments.join(" · ") : "满桶";
 }
 
@@ -1921,12 +1935,14 @@ function buildState(
       cacheShortfallTokens: cacheTailDisplay.shortfallTokens,
       cacheAvoidableGapTokens: cacheTailDisplay.avoidableTokens,
       cacheNewTailGapTokens: cacheTailDisplay.newTailTokens,
+      cacheProviderUnstableGapTokens: cacheTailDisplay.providerUnstableTokens,
       reasoning: request.effective_reasoning_effort ?? request.configured_reasoning_effort ?? request.agent_reasoning_effort ?? "—",
       ratio,
       detail: cacheGapDetail(
-        request.cache_shortfall_tokens ?? 0,
-        request.cache_avoidable_gap_tokens ?? 0,
-        request.cache_new_tail_gap_tokens ?? 0
+        cacheTailDisplay.shortfallTokens,
+        cacheTailDisplay.avoidableTokens,
+        cacheTailDisplay.newTailTokens,
+        cacheTailDisplay.providerUnstableTokens
       ),
       errorDetail: request.status >= 400 || request.cache_status === "error"
         ? `上游返回 HTTP ${request.status || "错误"}`

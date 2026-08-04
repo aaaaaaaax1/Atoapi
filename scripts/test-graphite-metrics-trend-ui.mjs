@@ -358,8 +358,8 @@ assert.match(
 );
 assert.match(
   host,
-  /const cacheTailDetail = "新 " \+ requestTokens\(request\.cacheNewTailGapTokens\)[\s\S]{0,220}Number\(request\.cacheAvoidableGapTokens \|\| 0\) > 0/,
-  "the request hit cell must always show the new tail and conditionally include a nonzero avoidable gap"
+  /const cacheTailSegments = \[[\s\S]{0,420}"新 " \+ requestTokens\(request\.cacheNewTailGapTokens\)[\s\S]{0,420}cacheProviderUnstableGapTokens[\s\S]{0,220}"水位 "/,
+  "the request hit cell must always show the new tail and surface a nonzero provider waterline rollback on the same line"
 );
 assert.match(
   host,
@@ -385,6 +385,16 @@ assert.match(
   host,
   /cacheNewTailGapTokens: cacheTailDisplay\.newTailTokens,/,
   "only the request-row projection may derive 128-token values from existing raw usage; no backend history rewrite is required"
+);
+assert.match(
+  host,
+  /cacheProviderUnstableGapTokens: cacheTailDisplay\.providerUnstableTokens,/,
+  "the request-row projection must retain the 128-token provider-waterline attribution instead of hiding it"
+);
+assert.match(
+  host,
+  /function cacheGapDetail\([\s\S]{0,720}append\([^,]+, providerUnstable\)/,
+  "request detail must use the same waterline attribution as the compact row"
 );
 assert.doesNotMatch(
   host,
