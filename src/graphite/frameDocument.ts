@@ -24,8 +24,8 @@ export function createGraphitePrototypeDocument(bridgeSource: string): string {
       '<label class="field wide"><span>Models URL（可选）</span><input id="providerModelsUrlInput" value="https://api.yunzhou.example/v1/models"'
     )
     .replace(
-      '<label class="field"><span>自定义 User-Agent</span><input value="Atoapi/next"',
-      '<label class="field"><span>自定义 User-Agent</span><input id="providerCustomUserAgentInput" value="Atoapi/next"'
+      '<label class="field"><span>自定义 User-Agent</span><input placeholder="留空：自动使用当前 Atoapi 版本"',
+      '<label class="field"><span>自定义 User-Agent</span><input id="providerCustomUserAgentInput" placeholder="留空：自动使用当前 Atoapi 版本"'
     )
     .replace(
       '<label class="field"><span>统计刷新</span><select><option>页面可见时 1 秒</option><option>5 秒</option><option>手动</option></select></label>',

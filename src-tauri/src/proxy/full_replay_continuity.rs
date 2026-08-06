@@ -21,6 +21,102 @@ pub(super) struct FullReplayInputRecovery {
     pub(super) ambiguous_local_lineage: bool,
 }
 
+/// A capability-gated native Responses continuation may omit an already
+/// accepted semantic prefix only when it can prove that the new FullReplay
+/// literally contains the previous input followed by the prior response
+/// output, and that the final static request shape has not changed.  This is
+/// deliberately stricter than ordinary FullReplay recovery: a mismatch falls
+/// back to the untouched full body rather than risking a semantic delta.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct NativeWebsocketDelta {
+    pub(super) previous_response_id: String,
+    pub(super) input: Value,
+}
+
+pub(super) fn native_websocket_delta_from_full_replay(
+    session: &ResponseSessionState,
+    current: Option<&Value>,
+    current_static_projection_digest: Option<&str>,
+) -> Option<NativeWebsocketDelta> {
+    let previous_response_id = session.response_id.trim();
+    if previous_response_id.is_empty()
+        || !session.output_items_complete
+        || session.static_projection_digest.as_deref()? != current_static_projection_digest?
+    {
+        return None;
+    }
+    let (Value::Array(previous_input), Value::Array(current_input)) = (&session.input, current?)
+    else {
+        return None;
+    };
+    if current_input.len()
+        <= previous_input
+            .len()
+            .saturating_add(session.output_items.len())
+        || !native_delta_input_starts_with_exact_prefix(current_input, previous_input)
+    {
+        return None;
+    }
+    let output_start = previous_input.len();
+    let output_end = output_start.saturating_add(session.output_items.len());
+    if output_end > current_input.len()
+        || !session
+            .output_items
+            .iter()
+            .zip(&current_input[output_start..output_end])
+            .all(|(expected, actual)| expected == actual)
+    {
+        return None;
+    }
+    let delta = current_input[output_end..].to_vec();
+    native_delta_suffix_is_safe(session, &delta).then(|| NativeWebsocketDelta {
+        previous_response_id: previous_response_id.to_string(),
+        input: Value::Array(delta),
+    })
+}
+
+fn native_delta_input_starts_with_exact_prefix(current: &[Value], prefix: &[Value]) -> bool {
+    current.len() >= prefix.len()
+        && prefix.iter().zip(current.iter()).all(|(expected, actual)| {
+            cache_capability::responses_input_item_equal_ignoring_protocol_breakpoint(
+                expected, actual,
+            )
+        })
+}
+
+fn native_delta_suffix_is_safe(session: &ResponseSessionState, delta: &[Value]) -> bool {
+    let Some(expected_outputs) = expected_response_call_outputs(&session.output_items) else {
+        return false;
+    };
+    if delta.len() < expected_outputs.len() {
+        return false;
+    }
+    for (item, expected) in delta.iter().zip(&expected_outputs) {
+        if item.get("type").and_then(Value::as_str) != Some(expected.item_type.as_str())
+            || item.get("call_id").and_then(Value::as_str) != Some(expected.call_id.as_str())
+        {
+            return false;
+        }
+    }
+    let suffix = &delta[expected_outputs.len()..];
+    suffix.is_empty() || native_delta_instruction_and_user_suffix_is_safe(suffix)
+}
+
+fn native_delta_instruction_and_user_suffix_is_safe(items: &[Value]) -> bool {
+    let Some((last, leading)) = items.split_last() else {
+        return false;
+    };
+    last.get("type").and_then(Value::as_str) == Some("message")
+        && last.get("role").and_then(Value::as_str) == Some("user")
+        && leading.iter().all(|item| {
+            item.get("type").and_then(Value::as_str) == Some("message")
+                && matches!(
+                    item.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+        })
+}
+
 /// Returns a semantic FullReplay input only when `current` is a Responses
 /// item array. A missing or scalar input is intentionally unrecoverable: the
 /// caller must keep its original body but discard the local-only response id.
@@ -222,6 +318,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_seed".to_string(),
+            static_projection_digest: Some("static-shape".to_string()),
+            output_items_complete: true,
             input: json!([{"type":"message","role":"user","content":"before"}]),
             output_items: vec![json!({
                 "type":"message",
@@ -253,5 +351,46 @@ mod tests {
     fn leaves_missing_or_scalar_input_unrecoverable() {
         assert!(recover_full_replay_input(&session(), None).is_none());
         assert!(recover_full_replay_input(&session(), Some(&json!("not-an-array"))).is_none());
+    }
+
+    #[test]
+    fn native_websocket_delta_requires_exact_input_output_and_static_shape() {
+        let session = session();
+        let current = json!([
+            {"type":"message","role":"user","content":"before"},
+            {
+                "type":"message",
+                "role":"assistant",
+                "content":[{"type":"output_text","text":"seed answer"}]
+            },
+            {"type":"message","role":"user","content":"after"}
+        ]);
+
+        let delta =
+            native_websocket_delta_from_full_replay(&session, Some(&current), Some("static-shape"))
+                .expect("exact full replay should produce a native delta");
+        assert_eq!(delta.previous_response_id, "resp_seed");
+        assert_eq!(
+            delta.input,
+            json!([{"type":"message","role":"user","content":"after"}])
+        );
+
+        assert!(native_websocket_delta_from_full_replay(
+            &session,
+            Some(&current),
+            Some("different-static-shape"),
+        )
+        .is_none());
+
+        let missing_output = json!([
+            {"type":"message","role":"user","content":"before"},
+            {"type":"message","role":"user","content":"after"}
+        ]);
+        assert!(native_websocket_delta_from_full_replay(
+            &session,
+            Some(&missing_output),
+            Some("static-shape"),
+        )
+        .is_none());
     }
 }

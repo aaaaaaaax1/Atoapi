@@ -115,6 +115,57 @@ export interface ProviderKeyTestResult {
   models_count: number;
 }
 
+export type ProviderHealthProbeMode =
+  | "responses_streaming"
+  | "chat_streaming"
+  | "chat_json"
+  | "responses_json";
+
+export type ProviderHealthProbeTarget =
+  | "current"
+  | "all_enabled"
+  | "selected";
+
+export interface ProviderHealthProbeInput {
+  provider_id: string;
+  key_ids?: string[];
+  target?: ProviderHealthProbeTarget;
+  model: string;
+  mode: ProviderHealthProbeMode;
+  prompt?: string | null;
+}
+
+export interface ProviderHealthProbeKeyResult {
+  key_id?: string | null;
+  ok: boolean;
+  status?: number | null;
+  elapsed_ms: number;
+  first_response_ms?: number | null;
+  http_version?: string | null;
+  message: string;
+  response_preview?: string | null;
+}
+
+export interface ProviderHealthProbeResult {
+  provider_id: string;
+  model: string;
+  mode: ProviderHealthProbeMode;
+  target: ProviderHealthProbeTarget;
+  elapsed_ms: number;
+  results: ProviderHealthProbeKeyResult[];
+}
+
+export interface ProviderBalanceProbeResult {
+  provider_id: string;
+  key_id?: string | null;
+  supported: boolean;
+  ok: boolean;
+  status?: number | null;
+  elapsed_ms: number;
+  balance?: string | null;
+  message: string;
+}
+
 export interface ProviderConnectionPathTestResult {
   provider_id?: string | null;
   key_id?: string | null;
@@ -1153,6 +1204,54 @@ function fallback(name: string, args?: Record<string, unknown>) {
   if (name === "fetch_provider_models") {
     const input = args?.input as FetchModelsInput | undefined;
     return inferPreviewModels(input?.base_url ?? "", input?.channel ?? "anthropic");
+  }
+  if (name === "fetch_provider_health_models") {
+    const providerId = String(args?.providerId ?? args?.provider_id ?? "");
+    const provider = fallbackConfig.providers.find((item) => item.id === providerId);
+    return provider?.models.length
+      ? provider.models
+      : inferPreviewModels(provider?.base_url ?? "", provider?.channel ?? "responses");
+  }
+  if (name === "probe_provider_health") {
+    const input = args?.input as ProviderHealthProbeInput | undefined;
+    const provider = fallbackConfig.providers.find((item) => item.id === input?.provider_id);
+    const enabled = (provider?.key_pool?.keys ?? []).filter((key) => key.enabled);
+    const selected = input?.target === "current"
+      ? enabled.slice(0, 1)
+      : input?.target === "selected" || input?.key_ids?.length
+        ? enabled.filter((key) => input?.key_ids?.includes(key.id))
+        : enabled;
+    const keys = selected.length ? selected : [{ id: "connection-key", alias: "连接信息 Key", enabled: Boolean(provider?.has_api_key) }];
+    return {
+      provider_id: input?.provider_id ?? "",
+      model: input?.model ?? "",
+      mode: input?.mode ?? "responses_streaming",
+      target: input?.target ?? "all_enabled",
+      elapsed_ms: 118,
+      results: keys.map((key, index) => ({
+        key_id: key.id === "connection-key" ? null : key.id,
+        ok: key.enabled !== false,
+        status: key.enabled === false ? 401 : 200,
+        elapsed_ms: 88 + index * 17,
+        first_response_ms: 54 + index * 13,
+        http_version: "HTTP/2.0",
+        message: key.enabled === false ? "HTTP 401" : "stream_completed",
+        response_preview: key.enabled === false ? null : "hi"
+      }))
+    } satisfies ProviderHealthProbeResult;
+  }
+  if (name === "probe_provider_balance") {
+    const providerId = String(args?.providerId ?? args?.provider_id ?? "");
+    return {
+      provider_id: providerId,
+      key_id: null,
+      supported: true,
+      ok: true,
+      status: 200,
+      elapsed_ms: 92,
+      balance: "0.10",
+      message: "balance_received:v1_usage"
+    } satisfies ProviderBalanceProbeResult;
   }
   if (name === "test_provider_key") {
     const input = args?.input as { provider_id?: string; key_id?: string; api_key?: string; base_url?: string; channel?: Channel } | undefined;

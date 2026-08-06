@@ -60,6 +60,12 @@ fn default_new_key_pool_strategy() -> KeyLoadBalanceStrategy {
     KeyLoadBalanceStrategy::Sequential
 }
 
+// v1.4.12 exposed this as a built-in default rather than a user-authored
+// provider override.  Leaving it persisted pins later releases to an old
+// upstream User-Agent/cache lane.  Migrate only this exact historical value;
+// all other custom User-Agents remain user-owned and untouched.
+const LEGACY_STATIC_DEFAULT_USER_AGENT: &str = "Atoapi/1.4.12";
+
 fn key_failure_exhausts_account_capacity(message: &str) -> bool {
     let normalized = message.to_lowercase();
     [
@@ -1022,6 +1028,16 @@ impl AppConfig {
                 .with_context(|| format!("failed to parse {}", path.display()))?;
             let mut changed = false;
             config.cache.normalize_fast_forwarding_hit_policy();
+            if config.normalize_legacy_static_default_user_agents() {
+                changed = true;
+            }
+            // v1.4.25 replaces manually configured balance URLs with bounded
+            // built-in protocol profiles. The field is intentionally no
+            // longer part of `AppConfig`, so the next canonical save removes
+            // only this retired configuration section.
+            if raw.contains("provider_balance_probe_configs") {
+                changed = true;
+            }
             if config
                 ._legacy_provider_response_session_reuse
                 .take()
@@ -1097,6 +1113,35 @@ impl AppConfig {
         let raw = toml::to_string_pretty(self)?;
         fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
         Ok(())
+    }
+
+    fn normalize_legacy_static_default_user_agents(&mut self) -> bool {
+        let now = Utc::now();
+        let mut affected_provider_ids = Vec::new();
+        for provider in &mut self.providers {
+            let is_legacy_default = provider
+                .custom_user_agent
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| value == LEGACY_STATIC_DEFAULT_USER_AGENT);
+            if !is_legacy_default {
+                continue;
+            }
+            provider.custom_user_agent = None;
+            provider.updated_at = now;
+            affected_provider_ids.push(provider.id.clone());
+        }
+        if affected_provider_ids.is_empty() {
+            return false;
+        }
+        for provider_id in affected_provider_ids {
+            // The effective upstream identity changed. Existing per-route
+            // capability evidence must be re-observed rather than silently
+            // being applied across cache lanes.
+            self.clear_cache_capabilities_for_provider(&provider_id);
+        }
+        self.updated_at = now;
+        true
     }
 
     /// Remove route and presentation references that can no longer be selected
@@ -2770,6 +2815,50 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
+    fn legacy_static_default_user_agent_migrates_without_touching_custom_values() {
+        let mut config = AppConfig::default();
+        let provider_id = config.upsert_provider(provider_input(None)).unwrap();
+        let provider = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .unwrap();
+        provider.custom_user_agent = Some(LEGACY_STATIC_DEFAULT_USER_AGENT.to_string());
+        let mut custom = provider.clone();
+        custom.id = "custom-user-agent".to_string();
+        custom.custom_user_agent = Some("codex.1.147.26".to_string());
+        config.providers.push(custom);
+        config.record_cache_capability_probe(
+            &provider_id,
+            "gpt-5.6-terra",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+
+        assert!(config.normalize_legacy_static_default_user_agents());
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .and_then(|provider| provider.custom_user_agent.as_deref()),
+            None
+        );
+        assert_eq!(
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == "custom-user-agent")
+                .and_then(|provider| provider.custom_user_agent.as_deref()),
+            Some("codex.1.147.26")
+        );
+        assert!(config.provider_cache_capabilities.is_empty());
+        assert!(!config.normalize_legacy_static_default_user_agents());
+    }
+
+    #[test]
     fn cache_capability_records_round_trip_and_remain_field_scoped() {
         let mut config = AppConfig::default();
         config.record_cache_capability_probe(
@@ -3971,6 +4060,32 @@ enabled = true
         let persisted = fs::read_to_string(&path).unwrap();
         assert!(!persisted.contains("removed-provider"));
         assert!(!persisted.contains("removed-agent"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn loading_a_legacy_manual_balance_url_cleans_only_the_retired_section() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-retired-balance-config-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        AppConfig::default().save(&path).unwrap();
+        let mut raw = fs::read_to_string(&path).unwrap();
+        raw.push_str(
+            "\n[[provider_balance_probe_configs]]\nprovider_id = \"legacy\"\nendpoint_url = \"https://legacy.example/balance\"\nupdated_at = \"2026-08-05T00:00:00Z\"\n",
+        );
+        fs::write(&path, raw).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert!(loaded.providers.is_empty());
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(
+            !persisted.contains("provider_balance_probe_configs"),
+            "the deprecated manual endpoint must be removed on the first v1.4.25 load"
+        );
+        assert!(!persisted.contains("legacy.example/balance"));
         fs::remove_dir_all(dir).ok();
     }
 

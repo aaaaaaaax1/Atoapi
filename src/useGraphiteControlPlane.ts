@@ -11,9 +11,12 @@ import {
   type FetchModelsInput,
   type MetricsSnapshot,
   type ModelConfig,
-  type ProviderConfig,
-  type ProviderCacheCapabilityProbeResult,
-  type ProviderConnectionPathTestResult,
+    type ProviderConfig,
+    type ProviderBalanceProbeResult,
+    type ProviderCacheCapabilityProbeResult,
+    type ProviderConnectionPathTestResult,
+    type ProviderHealthProbeInput,
+    type ProviderHealthProbeResult,
   type ProviderInput,
   type ProviderKeyTestResult,
   type ProviderNetworkPathDiagnosticResult,
@@ -26,7 +29,7 @@ import type {
 } from "./graphite/frameProtocol";
 import { providerBelongsToAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.23";
+const APP_VERSION = "v1.4.25";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 
@@ -43,6 +46,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
   const [includeCompactions, setIncludeCompactions] = useState(true);
   const [showDetailedErrors, setShowDetailedErrors] = useState(false);
   const [providerConnectionStatus, setProviderConnectionStatus] = useState<Record<string, string>>({});
+  const [providerBalanceStatus, setProviderBalanceStatus] = useState<Record<string, ProviderBalanceProbeResult>>({});
   const [metricsRefreshPolicy, setMetricsRefreshPolicy] = useState<MetricsRefreshPolicy>("visible-1s");
   const [proxyStatus, setProxyStatus] = useState<ProxyStatus | null>(null);
   const [networkPathDiagnostic, setNetworkPathDiagnostic] =
@@ -456,6 +460,69 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         payload: { models: models.map((item) => ({ id: item.id })) }
       };
     }
+    if (action === "fetch-health-probe-models") {
+      const providerId = text("providerId");
+      if (!providerId) throw new Error("请先保存上游，再获取测活模型");
+      const models = await command<ModelConfig[]>("fetch_provider_health_models", {
+        providerId,
+        provider_id: providerId
+      });
+      return {
+        notice: models.length ? `已获取 ${models.length} 个模型` : "未返回模型列表",
+        payload: { healthProbeModels: models.map((item) => ({ id: item.id })) }
+      };
+    }
+    if (action === "run-health-probe") {
+      const providerId = text("providerId");
+      const modelId = text("modelId");
+      const mode = text("mode") as ProviderHealthProbeInput["mode"];
+      const target = text("target") as ProviderHealthProbeInput["target"];
+      const keyIds = Array.isArray(payload.keyIds)
+        ? payload.keyIds.map((keyId) => String(keyId).trim()).filter(Boolean)
+        : [];
+      if (!providerId) throw new Error("请先保存上游，再执行测活");
+      if (!modelId) throw new Error("请选择测活模型");
+      if (![
+        "responses_streaming",
+        "chat_streaming",
+        "chat_json",
+        "responses_json"
+      ].includes(mode)) {
+        throw new Error("测活请求形态无效");
+      }
+      const result = await command<ProviderHealthProbeResult>("probe_provider_health", {
+        input: {
+          provider_id: providerId,
+          key_ids: keyIds,
+          target: ["current", "all_enabled", "selected"].includes(target ?? "") ? target : "current",
+          model: modelId,
+          mode,
+          prompt: text("prompt") || "hi"
+        } satisfies ProviderHealthProbeInput
+      });
+      const passed = result.results.filter((item) => item.ok).length;
+      return {
+        notice: `${passed}/${result.results.length} 个 Key 测活通过`,
+        payload: { healthProbe: result }
+      };
+    }
+    if (action === "probe-provider-balance") {
+      const providerId = text("providerId");
+      if (!providerId) throw new Error("未找到待探测余额的上游");
+      const result = await command<ProviderBalanceProbeResult>("probe_provider_balance", {
+        providerId,
+        provider_id: providerId
+      });
+      setProviderBalanceStatus((current) => ({ ...current, [providerId]: result }));
+      return {
+        notice: result.ok
+          ? `余额：${result.balance ?? "已获取"}`
+          : result.supported
+            ? `余额探测未通过：${result.message}`
+            : "该上游未识别到通用余额 API",
+        payload: { balanceProbe: result }
+      };
+    }
     if (action === "test-provider") {
       const draft = providerPayload();
       const providerId = text("providerId") || draft.id || "";
@@ -673,6 +740,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     includeCompactions,
     showDetailedErrors,
     providerConnectionStatus,
+    providerBalanceStatus,
     metricsRefreshPolicy,
     proxyStatus,
     networkPathDiagnostic,

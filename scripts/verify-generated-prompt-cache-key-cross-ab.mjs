@@ -26,6 +26,7 @@ const sourceConfigDir = resolve(String(args["source-config-dir"] ?? defaultConfi
 const executable = resolve(String(args.exe ?? join(repoRoot, "src-tauri", "target", "debug", `atoapi${extension}`)));
 const providerId = requiredString(args["provider-id"], "--provider-id");
 const model = requiredString(args.model, "--model");
+const controlField = normalizeControlField(args.field ?? "prompt-cache-key");
 const turns = boundedInteger(args.turns ?? 20, "--turns", 20, 60);
 const fixtureLines = boundedInteger(args.lines ?? 2200, "--lines", 2200, 10_000);
 const portStart = boundedInteger(args.port ?? 64_940, "--port", 1_024, 65_400);
@@ -51,7 +52,7 @@ try {
   const baselineConfigDir = join(root, "baseline");
   const candidateConfigDir = join(root, "candidate");
   await materializeConfig(source, baselineConfigDir, "unsupported");
-  await materializeConfig(source, candidateConfigDir, null);
+  await materializeConfig(source, candidateConfigDir, "verified");
 
   baselineRuntime = await startRuntime("baseline", baselineConfigDir, portStart, source.localKey);
   candidateRuntime = await startRuntime("candidate", candidateConfigDir, portStart + 1, source.localKey);
@@ -79,6 +80,7 @@ try {
     comparison: {
       provider_id: providerId,
       model,
+      control_field: controlField,
       request_family: "responses-full-replay",
       turns_per_arm: turns,
       stable_prefix_lines: fixtureLines,
@@ -120,10 +122,17 @@ async function snapshotSourceConfig(directory) {
   const configText = await readRequiredText(configPath, "source config.toml");
   const localKey = extractTomlString(configText, "local_key");
   if (!localKey) throw new Error("source config.toml has no local_key");
+  const route = codexAgentRoute(configText);
+  if (!route?.enabled || route.provider_id !== providerId) {
+    throw new Error("source config Codex route does not match the hand-selected Provider");
+  }
+  if (route.model_id && route.model_id !== model) {
+    throw new Error("source config Codex model does not match the requested model");
+  }
   const blocks = tomlArrayBlocks(configText, "provider_cache_capabilities");
   const matches = blocks.filter((block) => capabilityMatches(block.body));
   if (matches.length !== 1) {
-    throw new Error("expected exactly one matching prompt-cache-key capability record");
+    throw new Error(`expected exactly one matching ${controlField} capability record`);
   }
   if (extractTomlString(matches[0].body, "status") !== "verified") {
     throw new Error("candidate capability must be verified before a cross A/B run");
@@ -136,35 +145,46 @@ async function snapshotSourceConfig(directory) {
   };
 }
 
-async function materializeConfig(source, directory, baselineStatus) {
+async function materializeConfig(source, directory, targetStatus) {
   await mkdir(directory, { recursive: true });
-  const configText = baselineStatus
-    ? rewriteCapabilityStatus(source.configText, baselineStatus)
-    : source.configText;
+  const configText = rewriteCapabilityScope(source.configText, targetStatus);
   await writeFile(join(directory, "config.toml"), configText, "utf8");
   if (source.keyPath) {
     await copyFile(source.keyPath, join(directory, basename(source.keyPath)));
   }
 }
 
-function rewriteCapabilityStatus(configText, status) {
+function rewriteCapabilityScope(configText, targetStatus) {
   const blocks = tomlArrayBlocks(configText, "provider_cache_capabilities");
-  const target = blocks.filter((block) => capabilityMatches(block.body));
-  if (target.length !== 1) throw new Error("matching capability record changed while creating baseline");
-  const block = target[0];
-  const statusLine = /^status\s*=\s*"[^"]*"\s*$/mu;
-  const rewritten = statusLine.test(block.body)
-    ? block.body.replace(statusLine, `status = "${status}"`)
-    : `${block.body.trimEnd()}\nstatus = "${status}"\n`;
-  return `${configText.slice(0, block.start)}${rewritten}${configText.slice(block.end)}`;
+  const scoped = blocks.filter((block) => capabilityScopeMatches(block.body));
+  const targets = scoped.filter((block) => capabilityMatches(block.body));
+  if (targets.length !== 1) throw new Error("matching capability record changed while creating an isolated probe");
+  let rewrittenConfig = configText;
+  for (const block of [...scoped].sort((left, right) => right.start - left.start)) {
+    const status = capabilityMatches(block.body) ? targetStatus : "unsupported";
+    let body = replaceCapabilityString(block.body, "status", status);
+    body = replaceCapabilityString(body, "effect_status", "unverified");
+    rewrittenConfig = `${rewrittenConfig.slice(0, block.start)}${body}${rewrittenConfig.slice(block.end)}`;
+  }
+  return rewrittenConfig;
 }
 
-function capabilityMatches(body) {
+function capabilityScopeMatches(body) {
   return extractTomlString(body, "provider_id") === providerId &&
     extractTomlString(body, "model_id") === model &&
     extractTomlString(body, "channel") === "responses" &&
-    extractTomlString(body, "field") === "prompt-cache-key" &&
     !extractTomlString(body, "key_id");
+}
+
+function capabilityMatches(body) {
+  return capabilityScopeMatches(body) && extractTomlString(body, "field") === controlField;
+}
+
+function replaceCapabilityString(block, key, value) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\[\]\\]/gu, "\\$&");
+  const field = new RegExp(`^${escapedKey}\\s*=\\s*"[^"]*"\\s*$`, "mu");
+  const replacement = `${key} = "${value}"`;
+  return field.test(block) ? block.replace(field, replacement) : `${block.trimEnd()}\n${replacement}\n`;
 }
 
 async function startRuntime(label, configDir, requestedPort, localKey) {
@@ -269,6 +289,14 @@ async function sendTurn(arm, turn) {
   const providerMatches = String(metric?.provider_id ?? "") === providerId && String(metric?.model ?? "") === model;
   const realm = String(metric?.shadow_affinity_realm_id ?? "");
   const prefixKeyPresent = typeof metric?.provider_prefix_key === "string" && metric.provider_prefix_key.length > 0;
+  const validationCandidateApplied = metric?.shadow_affinity_decision === "validation_candidate_applied";
+  // The generated prompt-cache-key compatibility path can apply the field
+  // without opening the shadow validation controller. For this field, the
+  // final provider-prefix key witness is the authoritative wire-level proof;
+  // the shadow decision remains a separate diagnostic.
+  const candidateControlFieldWirePresent = controlField === "prompt-cache-key"
+    ? prefixKeyPresent
+    : validationCandidateApplied;
   const record = {
     completed,
     single_attempt: singleAttempt,
@@ -281,6 +309,8 @@ async function sendTurn(arm, turn) {
     provider_matches: providerMatches,
     realm_id: realm,
     prefix_key_present: prefixKeyPresent,
+    validation_candidate_applied: validationCandidateApplied,
+    candidate_control_field_wire_present: candidateControlFieldWirePresent,
     downstream_disconnected: Boolean(metric?.downstream_disconnected),
     status: Number(metric?.status),
     failure_class: failureClass
@@ -364,6 +394,11 @@ function summarizeArm(arm) {
     all_full_replay: records.every((item) => item.full_replay),
     all_provider_matches: records.every((item) => item.provider_matches),
     all_completed: records.every((item) => item.completed),
+    all_validation_candidate_applied: records.every((item) => item.validation_candidate_applied),
+    all_candidate_control_field_wire_present: records.every(
+      (item) => item.candidate_control_field_wire_present
+    ),
+    no_validation_candidate_applied: records.every((item) => !item.validation_candidate_applied),
     all_prefix_key_present: records.every((item) => item.prefix_key_present),
     no_prefix_key_present: records.every((item) => !item.prefix_key_present),
     realm_count: realms.length
@@ -404,8 +439,13 @@ function buildChecks({ baseline, candidate, baselineSummary, candidateSummary })
     selected_provider_model_unchanged: baselineSummary.all_provider_matches && candidateSummary.all_provider_matches,
     one_key_realm_per_arm: baselineSummary.realm_count === 1 && candidateSummary.realm_count === 1,
     same_key_realm_across_arms: realmSet.size === 1,
-    baseline_has_no_generated_prompt_cache_key: baselineSummary.no_prefix_key_present,
-    candidate_has_generated_prompt_cache_key: candidateSummary.all_prefix_key_present,
+    baseline_did_not_apply_control_field: baselineSummary.no_validation_candidate_applied,
+    candidate_applied_control_field: controlField === "prompt-cache-key"
+      ? candidateSummary.all_candidate_control_field_wire_present
+      : candidateSummary.all_validation_candidate_applied,
+    prompt_cache_key_wire_shape: controlField !== "prompt-cache-key" || (
+      baselineSummary.no_prefix_key_present && candidateSummary.all_prefix_key_present
+    ),
     no_downstream_disconnect: allRecords.every((item) => !item.downstream_disconnected),
     no_local_avoidable_gap: baselineSummary.cache_avoidable_gap_tokens === 0 && candidateSummary.cache_avoidable_gap_tokens === 0
   };
@@ -470,6 +510,23 @@ function tomlArrayBlocks(text, section) {
 function extractTomlString(text, key) {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
   return text.match(new RegExp(`^${escaped}\\s*=\\s*"([^"]*)"`, "mu"))?.[1] ?? "";
+}
+
+function extractTomlBoolean(text, key) {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return text.match(new RegExp(`^${escaped}\\s*=\\s*(true|false)`, "mu"))?.[1] === "true";
+}
+
+function codexAgentRoute(configText) {
+  const block = tomlArrayBlocks(configText, "agent_injections")
+    .map((item) => item.body)
+    .find((item) => extractTomlString(item, "id") === "codex");
+  if (!block) return null;
+  return {
+    provider_id: extractTomlString(block, "provider_id"),
+    model_id: extractTomlString(block, "model_id"),
+    enabled: extractTomlBoolean(block, "enabled")
+  };
 }
 
 async function findAvailablePort(start) {
@@ -637,7 +694,14 @@ function printUsage() {
   console.log([
     "Usage:",
     "  node scripts/verify-generated-prompt-cache-key-cross-ab.mjs \\",
-    "    --provider-id <id> --model <id> [--exe <atoapi.exe>] [--source-config-dir <dir>]",
-    "Runs isolated baseline(unsupported) versus candidate(verified) configurations."
+    "    --provider-id <id> --model <id> [--field prompt-cache-key|prompt-cache-retention] \\",
+    "    [--exe <atoapi.exe>] [--source-config-dir <dir>]",
+    "Runs isolated baseline(unsupported) versus candidate(verified) configurations for one field."
   ].join("\n"));
+}
+
+function normalizeControlField(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  if (normalized === "prompt-cache-key" || normalized === "prompt-cache-retention") return normalized;
+  throw new Error("--field must be prompt-cache-key or prompt-cache-retention");
 }

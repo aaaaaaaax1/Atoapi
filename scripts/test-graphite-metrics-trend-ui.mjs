@@ -358,8 +358,8 @@ assert.match(
 );
 assert.match(
   host,
-  /const cacheTailSegments = \[[\s\S]{0,420}"新 " \+ requestTokens\(request\.cacheNewTailGapTokens\)[\s\S]{0,420}cacheProviderUnstableGapTokens[\s\S]{0,220}"水位 "/,
-  "the request hit cell must always show the new tail and surface a nonzero provider waterline rollback on the same line"
+  /const cacheShortfallTokens = Number\(request\.cacheShortfallTokens \|\| 0\);[\s\S]{0,420}"缺口 " \+ requestTokens\(cacheShortfallTokens\)[\s\S]{0,260}cacheNewTailTokens > 0 \? "新 " \+ requestTokens\(cacheNewTailTokens\)/,
+  "the request hit cell must show the numeric shortfall and append the new-tail amount when present"
 );
 assert.match(
   host,

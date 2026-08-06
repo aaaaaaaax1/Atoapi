@@ -1232,12 +1232,23 @@ pub(super) async fn stream_upstream(
                             .breakpoint_placement_digest()
                             .map(ToOwned::to_owned)
                     });
+                let static_projection_digest = upstream_request_diagnostics
+                    .final_wire_receipt
+                    .as_ref()
+                    .and_then(|receipt| {
+                        receipt
+                            .wire
+                            .responses_cache_maturity_static_projection_digest
+                            .clone()
+                    });
                 update_response_session_with_owned_input(
                     &state_for_stream,
                     response_session_lease.as_ref(),
                     &response_session_parent,
                     full_response_input.take(),
                     breakpoint_placement_digest,
+                    static_projection_digest,
+                    stream_metadata.output_items_complete,
                     response_session_response_id.clone(),
                     std::mem::take(&mut stream_metadata.output_items),
                 )
@@ -1258,6 +1269,7 @@ pub(super) async fn stream_upstream(
             response_session_update.as_ref(),
             response_session_response_id.as_deref(),
         );
+        let committed_final_scope_head = committed_head.is_some();
         let warm_pending_committed_head = committed_head.clone();
         let rebased_from_head = rebased_waterline_control_head(
             response_session_lease.as_ref(),
@@ -1354,7 +1366,10 @@ pub(super) async fn stream_upstream(
                         .final_wire_receipt
                         .as_ref()
                         .and_then(|receipt| {
-                            receipt.wire.responses_static_projection_digest.as_deref()
+                            receipt
+                                .wire
+                                .responses_cache_maturity_static_projection_digest
+                                .as_deref()
                         }),
                 )
             } else {
@@ -1408,6 +1423,32 @@ pub(super) async fn stream_upstream(
             prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
             prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
             prefix_guard_wait.settled_exact_state_finished_at,
+            preserve_native_maturity_scope_after_non_authoritative_settlement(
+                response_session_update.as_ref(),
+                upstream_request_diagnostics.final_scope_waterline.as_ref(),
+                usage_record.as_ref(),
+            ) || preserve_native_maturity_scope_after_begin_lock_busy(
+                upstream_request_diagnostics.final_scope_begin_lock_busy,
+                upstream_request_diagnostics.final_scope_begin_maturity_eligible,
+                confirmed_compaction,
+                response_session_starts_compaction_epoch,
+                local_full_replay_settlement_allowed,
+                committed_final_scope_head,
+            ) || preserve_native_maturity_scope_after_capacity_full(
+                upstream_request_diagnostics.final_scope_waterline.as_ref(),
+                usage_record.as_ref(),
+                confirmed_compaction,
+                response_session_starts_compaction_epoch,
+                local_full_replay_settlement_allowed,
+                committed_final_scope_head,
+            ) || preserve_native_maturity_scope_after_no_usage_terminal(
+                upstream_request_diagnostics.final_scope_waterline.as_ref(),
+                usage_record.as_ref(),
+                confirmed_compaction,
+                response_session_starts_compaction_epoch,
+                local_full_replay_settlement_allowed,
+                committed_final_scope_head,
+            ),
             stream_success_for_cache
                 && !confirmed_compaction
                 && local_full_replay_settlement_allowed,
@@ -1441,6 +1482,11 @@ pub(super) async fn stream_upstream(
                 .clone();
             prefix_lag.static_wire_drift_transition =
                 prefix_observation.static_wire_drift_transition.clone();
+        } else if prefix_observation.static_anchor_cold {
+            // A sibling's existence proves only a static cache-namespace
+            // change. It is not an Atoapi wire mutation and cannot be
+            // rendered as user tail or an avoidable local cache miss.
+            prefix_lag.classification = Some("static_anchor_cold".to_string());
         } else if final_scope_rollback_reclassified {
             prefix_lag.classification = Some("provider_waterline_rollback".to_string());
         }

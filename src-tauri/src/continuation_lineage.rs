@@ -33,6 +33,15 @@ pub struct ResponseSessionState {
     #[allow(dead_code)]
     pub parent_generation: Option<u64>,
     pub response_id: String,
+    /// Digest of the final non-input Responses wire shape that created this
+    /// response. A native continuation is safe only when the next request
+    /// presents the same static shape; the opaque digest never contains the
+    /// request body or a credential.
+    pub static_projection_digest: Option<String>,
+    /// `true` only when the terminal response explicitly carried its complete
+    /// output item array. Incremental `output_item.done` observations alone
+    /// are useful for diagnostics but never authorize an upstream delta.
+    pub output_items_complete: bool,
     pub input: Value,
     pub output_items: Vec<Value>,
     pub finished_at: Instant,
@@ -100,6 +109,11 @@ pub struct ResponseSessionCandidate {
     /// Final-wire metadata is kept next to, not inside, the semantic input.
     /// It is never a substitute for the original full replay input.
     pub breakpoint_placement_digest: Option<String>,
+    /// Final non-input Responses wire shape for the semantic head. Keep this
+    /// next to the replay material so a future native delta cannot cross a
+    /// tools/instructions/cache-control shape change.
+    pub static_projection_digest: Option<String>,
+    pub output_items_complete: bool,
     pub input: Value,
     pub output_items: Vec<Value>,
     pub finished_at: Instant,
@@ -1102,6 +1116,8 @@ fn apply_commit(
         generation,
         parent_generation,
         response_id: candidate.response_id,
+        static_projection_digest: candidate.static_projection_digest,
+        output_items_complete: candidate.output_items_complete,
         input: candidate.input,
         output_items: candidate.output_items,
         finished_at: candidate.finished_at,
@@ -1233,6 +1249,8 @@ mod tests {
         ResponseSessionCandidate {
             response_id: response_id.to_string(),
             breakpoint_placement_digest: None,
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([{"type":"message","role":"user","content":input}]),
             output_items: Vec::new(),
             finished_at: Instant::now(),
@@ -1247,6 +1265,8 @@ mod tests {
         ResponseSessionCandidate {
             response_id: response_id.to_string(),
             breakpoint_placement_digest: breakpoint_placement_digest.map(ToOwned::to_owned),
+            static_projection_digest: None,
+            output_items_complete: false,
             input,
             output_items: Vec::new(),
             finished_at: Instant::now(),
@@ -1556,6 +1576,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-base".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: base.clone(),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -1622,6 +1644,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-base".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: base,
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -1857,6 +1881,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-expired".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{"type":"message","role":"user","content":"expired"}]),
                     output_items: Vec::new(),
                     finished_at: Instant::now()

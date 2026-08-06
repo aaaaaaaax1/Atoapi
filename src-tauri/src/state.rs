@@ -257,11 +257,23 @@ pub struct PrefixWarmState {
     pub responses_static_projection_digest: Option<String>,
 }
 
-/// Bounded process-only maturity slots keyed by the broad provider prefix and
-/// an attested final parent scope (route/key realm/session/lineage epoch, but
-/// not the frozen static projection). This lets A→B→A session interleaving
-/// preserve A's exact readiness while still allowing a true static-wire change
-/// inside A to be observed and reset.
+impl PrefixWarmState {
+    /// A prefix snapshot is cache-quality evidence only while it is inside
+    /// the same bounded lifetime used by runtime-state maintenance.  Callers
+    /// on the request path must not let a stale exact/alias/family snapshot
+    /// win merely because background trimming has not reached its 128-request
+    /// maintenance interval yet.
+    pub(crate) fn is_live(&self) -> bool {
+        self.finished_at.elapsed() <= PREFIX_RUNTIME_STATE_TTL
+    }
+}
+
+/// Bounded process-only maturity slots keyed by the broad provider prefix, an
+/// attested final parent scope, and the frozen static projection. A native
+/// FullReplay may alternate between several real static wire shapes inside one
+/// session (for example, different tool schemas). Those shapes are separate
+/// upstream cache namespaces: B must not use A's maturity, but B must not
+/// erase the previously verified A slot either.
 #[derive(Debug, Default)]
 pub struct PrefixMaturityScopeRegistry {
     entries: HashMap<String, PrefixWarmState>,
@@ -272,8 +284,13 @@ impl PrefixMaturityScopeRegistry {
         &mut self,
         prefix_control_key: &str,
         parent_scope_digest: &str,
+        static_projection_digest: Option<&str>,
     ) -> Option<PrefixWarmState> {
-        let key = maturity_scope_entry_key(prefix_control_key, parent_scope_digest);
+        let key = maturity_scope_entry_key(
+            prefix_control_key,
+            parent_scope_digest,
+            static_projection_digest,
+        );
         let expired = self
             .entries
             .get(&key)
@@ -285,13 +302,67 @@ impl PrefixMaturityScopeRegistry {
         self.entries.get(&key).cloned()
     }
 
+    /// Reports whether this exact trusted parent already has a different live
+    /// static Responses shape. This is deliberately only a sibling-presence
+    /// signal: callers must never read its maturity, cache waterline, or wait
+    /// budget as if it belonged to the current frozen wire.
+    pub fn has_live_static_sibling(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        static_projection_digest: Option<&str>,
+    ) -> bool {
+        let parent_key = maturity_scope_parent_key(prefix_control_key, parent_scope_digest);
+        let current_key = maturity_scope_entry_key(
+            prefix_control_key,
+            parent_scope_digest,
+            static_projection_digest,
+        );
+        let expired = self
+            .entries
+            .iter()
+            .filter(|(entry_key, state)| {
+                entry_key.starts_with(&parent_key)
+                    && state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL
+            })
+            .map(|(entry_key, _)| entry_key.clone())
+            .collect::<Vec<_>>();
+        for entry_key in expired {
+            self.entries.remove(&entry_key);
+        }
+        self.entries
+            .keys()
+            .any(|entry_key| entry_key.starts_with(&parent_key) && entry_key != &current_key)
+    }
+
     pub fn insert(
         &mut self,
         prefix_control_key: &str,
         parent_scope_digest: &str,
         state: PrefixWarmState,
     ) {
-        let key = maturity_scope_entry_key(prefix_control_key, parent_scope_digest);
+        let parent_key = maturity_scope_parent_key(prefix_control_key, parent_scope_digest);
+        let key = maturity_scope_entry_key(
+            prefix_control_key,
+            parent_scope_digest,
+            state.responses_static_projection_digest.as_deref(),
+        );
+        if !self.entries.contains_key(&key) {
+            let mut siblings = self
+                .entries
+                .iter()
+                .filter(|(entry_key, _)| entry_key.starts_with(&parent_key))
+                .map(|(entry_key, entry_state)| (entry_key.clone(), entry_state.finished_at))
+                .collect::<Vec<_>>();
+            siblings.sort_unstable_by_key(|(_, finished_at)| *finished_at);
+            let overflow = siblings
+                .len()
+                .saturating_add(1)
+                .saturating_sub(PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT);
+            for (oldest, _) in siblings.into_iter().take(overflow) {
+                self.entries.remove(&oldest);
+            }
+        }
         if !self.entries.contains_key(&key) && self.entries.len() >= PREFIX_MATURITY_SCOPE_LIMIT {
             let oldest = self
                 .entries
@@ -305,10 +376,16 @@ impl PrefixMaturityScopeRegistry {
         self.entries.insert(key, state);
     }
 
-    pub fn remove(&mut self, prefix_control_key: &str, parent_scope_digest: &str) {
+    pub fn remove(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        static_projection_digest: Option<&str>,
+    ) {
         self.entries.remove(&maturity_scope_entry_key(
             prefix_control_key,
             parent_scope_digest,
+            static_projection_digest,
         ));
     }
 
@@ -318,8 +395,20 @@ impl PrefixMaturityScopeRegistry {
     }
 }
 
-fn maturity_scope_entry_key(prefix_control_key: &str, parent_scope_digest: &str) -> String {
-    format!("{prefix_control_key}\0{parent_scope_digest}")
+fn maturity_scope_parent_key(prefix_control_key: &str, parent_scope_digest: &str) -> String {
+    format!("{prefix_control_key}\0{parent_scope_digest}\0")
+}
+
+fn maturity_scope_entry_key(
+    prefix_control_key: &str,
+    parent_scope_digest: &str,
+    static_projection_digest: Option<&str>,
+) -> String {
+    format!(
+        "{}{}",
+        maturity_scope_parent_key(prefix_control_key, parent_scope_digest),
+        static_projection_digest.unwrap_or(MATURITY_SCOPE_UNPROJECTABLE_STATIC_VARIANT)
+    )
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -585,9 +674,19 @@ impl RuntimeStateJournal {
     }
 }
 
-const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(20 * 60);
+// A 20-minute local expiry was shorter than the upstream's proven retention
+// and created a real state break after an idle gap (the live champion
+// comparison observed a 21-minute gap). Keep the digest/waterline metadata for
+// a bounded two-hour window; no user payload is retained here.
+const PREFIX_RUNTIME_STATE_TTL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 const PREFIX_RUNTIME_STATE_LIMIT: usize = 8_192;
 const PREFIX_MATURITY_SCOPE_LIMIT: usize = 1_024;
+/// A single attested conversation can legitimately alternate between a small
+/// number of static Responses shapes. Keep those exact cache namespaces
+/// separate without allowing a changing tool schema to consume the global
+/// maturity registry.
+const PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT: usize = 4;
+const MATURITY_SCOPE_UNPROJECTABLE_STATIC_VARIANT: &str = "<unprojectable>";
 const PREFIX_RUNTIME_STATE_MAINTENANCE_INTERVAL: u64 = 128;
 
 impl AppState {
@@ -1513,6 +1612,61 @@ mod tests {
         }
     }
 
+    #[test]
+    fn maturity_scope_registry_keeps_bounded_static_variants_per_parent() {
+        let now = Instant::now();
+        let mut registry = PrefixMaturityScopeRegistry::default();
+        for index in 0..=PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT {
+            let mut state = prefix_state_at(
+                now.checked_sub(StdDuration::from_secs(
+                    (PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT - index) as u64,
+                ))
+                .unwrap_or(now),
+            );
+            state.responses_static_projection_digest = Some(format!("static-{index}"));
+            registry.insert("prefix", "parent", state);
+        }
+
+        assert_eq!(
+            registry.len(),
+            PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT,
+            "one parent must not consume unbounded maturity slots"
+        );
+        assert!(
+            registry.get("prefix", "parent", Some("static-0")).is_none(),
+            "the oldest sibling must be evicted first"
+        );
+        assert!(
+            registry
+                .get(
+                    "prefix",
+                    "parent",
+                    Some(&format!(
+                        "static-{PREFIX_MATURITY_SCOPE_STATIC_VARIANT_LIMIT}"
+                    )),
+                )
+                .is_some(),
+            "the newest sibling must remain reusable"
+        );
+    }
+
+    #[test]
+    fn maturity_scope_registry_removes_only_the_target_static_sibling() {
+        let now = Instant::now();
+        let mut registry = PrefixMaturityScopeRegistry::default();
+        let mut static_a = prefix_state_at(now);
+        static_a.responses_static_projection_digest = Some("static-a".to_string());
+        registry.insert("prefix", "parent", static_a);
+        let mut static_b = prefix_state_at(now);
+        static_b.responses_static_projection_digest = Some("static-b".to_string());
+        registry.insert("prefix", "parent", static_b);
+
+        registry.remove("prefix", "parent", Some("static-b"));
+
+        assert!(registry.get("prefix", "parent", Some("static-a")).is_some());
+        assert!(registry.get("prefix", "parent", Some("static-b")).is_none());
+    }
+
     #[tokio::test]
     async fn exit_shutdown_releases_both_ports_without_disabling_auto_start() {
         let dir =
@@ -2243,6 +2397,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp_sensitive_123".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{
                         "type": "function_call_output",
                         "call_id": "call-sensitive",
@@ -2574,6 +2730,27 @@ mod tests {
         assert!(!loaded.prefix_states.contains_key("expired-prefix"));
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn prefix_runtime_state_retains_a_twenty_one_minute_idle_gap() {
+        assert!(PREFIX_RUNTIME_STATE_TTL >= StdDuration::from_secs(2 * 60 * 60));
+        let now = Instant::now();
+        let mut states = HashMap::new();
+        states.insert(
+            "champion-gap-prefix".to_string(),
+            prefix_state_at(
+                now.checked_sub(StdDuration::from_secs(21 * 60))
+                    .unwrap_or(now),
+            ),
+        );
+
+        trim_prefix_runtime_states(&mut states);
+
+        assert!(
+            states.contains_key("champion-gap-prefix"),
+            "a 21-minute idle gap must not erase the reusable prefix ledger"
+        );
     }
 
     #[test]

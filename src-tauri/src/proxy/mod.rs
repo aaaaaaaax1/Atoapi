@@ -308,6 +308,15 @@ struct UpstreamRequestDiagnostics {
     final_wire_receipt: Option<FinalWireReceipt>,
     final_scope_shadow: Option<FinalScopeShadowReceipt>,
     final_scope_waterline: Option<FinalScopeWaterlineLog>,
+    // `begin` is deliberately non-blocking.  Retain the narrow fact that its
+    // shadow-only ledger lock was busy so a later successful terminal does
+    // not mistake missing local measurement for evidence that an older exact
+    // maturity receipt became unsafe.
+    final_scope_begin_lock_busy: bool,
+    // Captured before dispatch, after the final wire and predecessor proof are
+    // frozen.  This is a boolean only: no input, response id, or scope digest
+    // is carried into the stream relay.
+    final_scope_begin_maturity_eligible: bool,
     // A local response id was seen but the caller body was not a proven
     // FullReplay continuation. The request may still be proxied once, yet it
     // must not publish a semantic head or teach cache-prefix state.
@@ -381,6 +390,8 @@ impl UpstreamRequestDiagnostics {
         if next.final_scope_waterline.is_some() {
             self.final_scope_waterline = next.final_scope_waterline.clone();
         }
+        self.final_scope_begin_lock_busy |= next.final_scope_begin_lock_busy;
+        self.final_scope_begin_maturity_eligible |= next.final_scope_begin_maturity_eligible;
         self.suppress_local_full_replay_settlement |= next.suppress_local_full_replay_settlement;
         if next.full_replay_risk_shape.is_some() {
             self.full_replay_risk_shape = next.full_replay_risk_shape;
@@ -430,6 +441,17 @@ fn upstream_affinity_enabled_for_dispatch() -> bool {
 struct FinalScopeDispatchGuard {
     state: Arc<AppState>,
     ticket: Option<WaterlineTicket>,
+}
+
+/// A `begin` lock miss is intentionally fail-open for the request itself, but
+/// it is still distinguishable from normal ineligibility at terminal time.
+/// Keeping that distinction prevents a successful native FullReplay from
+/// deleting a previously verified exact maturity state only because a local
+/// shadow mutex was briefly contended.
+#[derive(Debug)]
+struct FinalScopeBeginResult {
+    ticket: Option<WaterlineTicket>,
+    lock_busy: bool,
 }
 
 impl FinalScopeDispatchGuard {
@@ -641,6 +663,11 @@ struct ProviderPrefixUsageObservation {
     gap: Option<ProviderCacheGapBreakdown>,
     previous: Option<PrefixWarmState>,
     static_wire_drift: bool,
+    /// The request is a new static cache namespace under an otherwise exact
+    /// trusted parent. It may use the fact that a sibling exists only to avoid
+    /// mislabeling the sibling root's raw cold read as user tail; it cannot
+    /// inherit the sibling's maturity or waterline.
+    static_anchor_cold: bool,
     static_wire_drift_late_mutation_categories: Option<Vec<String>>,
     static_wire_drift_transition: Option<String>,
 }
@@ -3373,6 +3400,10 @@ async fn run_generation_for_authorized_agent(
                 final_maturity_parent_scope_digest(
                     upstream_request_diagnostics.final_scope_shadow.as_ref(),
                 ),
+                final_wire_receipt
+                    .wire
+                    .responses_cache_maturity_static_projection_digest
+                    .as_deref(),
             )
             .await;
         }
@@ -3465,17 +3496,23 @@ async fn run_generation_for_authorized_agent(
         }
         return response;
     }
-    let final_responses_static_projection =
-        if native_responses_passthrough && matches!(&active_request_channel, Channel::Responses) {
-            FinalResponsesStaticProjection::Observed(
-                final_wire_receipt
-                    .wire
-                    .responses_static_projection_digest
-                    .as_deref(),
-            )
-        } else {
-            FinalResponsesStaticProjection::NotApplicable
-        };
+    let final_responses_static_projection = final_responses_maturity_projection(
+        native_responses_passthrough && matches!(&active_request_channel, Channel::Responses),
+        Some(&final_wire_receipt),
+    );
+    // A native Responses request that is deliberately outside the safe
+    // FullReplay maturity domain (for example compaction) must not borrow a
+    // broad provider state. Keep the existing no-wait behavior, but expose why
+    // the exact maturity scope is intentionally unavailable instead of
+    // reporting it as an unexplained missing scope.
+    let final_maturity_scope_skip_reason = final_maturity_scope_skip_reason(
+        native_responses_passthrough,
+        &active_request_channel,
+        final_scope_waterline_is_full_replay,
+        active_used_response_session,
+        response_session_starts_compaction_epoch,
+        full_replay_ambiguous_local_lineage,
+    );
     // Native Responses maturity is scoped to the final attested action,
     // frozen static wire, and lineage epoch.  A matching provider cache key
     // alone is deliberately insufficient: it can be shared by unrelated
@@ -3489,7 +3526,7 @@ async fn run_generation_for_authorized_agent(
         })
         .flatten();
     prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
-        wait_for_provider_prefix_settle_on_final_wire(
+        wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
             &state,
             &decision.upstream_channel,
             provider_prefix_control_key.as_deref(),
@@ -3499,6 +3536,7 @@ async fn run_generation_for_authorized_agent(
             prefix_guard_wait_budget_for_channel(&decision.upstream_channel, started.elapsed()),
             final_responses_static_projection,
             final_maturity_parent_scope_digest.as_deref(),
+            final_maturity_scope_skip_reason,
         )
         .await
     } else {
@@ -3566,16 +3604,26 @@ async fn run_generation_for_authorized_agent(
     // ledger altogether.  Do not create an observe-only ticket: even that
     // diagnostic record would make the request look as if it participated in
     // waterline settlement and could be mistaken for learnable evidence.
-    let mut final_scope_dispatch = (!full_replay_ambiguous_local_lineage)
-        .then(|| {
-            begin_final_scope_waterline(
-                &state,
-                upstream_request_diagnostics.final_scope_shadow.as_ref(),
-                final_scope_waterline_is_full_replay,
-                final_scope_predecessor,
-            )
-        })
-        .flatten()
+    upstream_request_diagnostics.final_scope_begin_maturity_eligible =
+        final_scope_waterline_is_full_replay
+            && upstream_request_diagnostics
+                .final_scope_shadow
+                .as_ref()
+                .is_some_and(|receipt| receipt.eligible_for_shadow_observation)
+            && final_scope_predecessor_is_maturity_safe(&final_scope_predecessor);
+    let final_scope_begin = (!full_replay_ambiguous_local_lineage).then(|| {
+        begin_final_scope_waterline_with_status(
+            &state,
+            upstream_request_diagnostics.final_scope_shadow.as_ref(),
+            final_scope_waterline_is_full_replay,
+            final_scope_predecessor,
+        )
+    });
+    upstream_request_diagnostics.final_scope_begin_lock_busy = final_scope_begin
+        .as_ref()
+        .is_some_and(|result| result.lock_busy);
+    let mut final_scope_dispatch = final_scope_begin
+        .and_then(|result| result.ticket)
         .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
     upstream_request_diagnostics.final_wire_receipt = Some(final_wire_receipt);
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
@@ -4318,6 +4366,16 @@ async fn run_generation_for_authorized_agent(
                 &response_session_parent,
                 full_response_input.as_ref(),
                 response_session_breakpoint_placement.clone(),
+                upstream_request_diagnostics
+                    .final_wire_receipt
+                    .as_ref()
+                    .and_then(|receipt| {
+                        receipt
+                            .wire
+                            .responses_cache_maturity_static_projection_digest
+                            .clone()
+                    }),
+                response_output_items_are_complete_from_bytes(&bytes),
                 response_session_response_id.clone(),
                 response_output_items_from_bytes(&bytes),
             )
@@ -4331,6 +4389,7 @@ async fn run_generation_for_authorized_agent(
         response_session_update.as_ref(),
         response_session_response_id.as_deref(),
     );
+    let committed_final_scope_head = committed_head.is_some();
     let warm_pending_committed_head = committed_head.clone();
     let rebased_from_head = rebased_waterline_control_head(
         response_session_lease.as_ref(),
@@ -4357,17 +4416,10 @@ async fn run_generation_for_authorized_agent(
         confirmed_compaction,
     )
     .await;
-    let final_responses_static_projection = if matches!(active_request_channel, Channel::Responses)
-    {
-        FinalResponsesStaticProjection::Observed(
-            upstream_request_diagnostics
-                .final_wire_receipt
-                .as_ref()
-                .and_then(|receipt| receipt.wire.responses_static_projection_digest.as_deref()),
-        )
-    } else {
-        FinalResponsesStaticProjection::NotApplicable
-    };
+    let final_responses_static_projection = final_responses_maturity_projection(
+        matches!(active_request_channel, Channel::Responses),
+        upstream_request_diagnostics.final_wire_receipt.as_ref(),
+    );
     let prefix_observation = observe_provider_prefix_usage(
         &state,
         prefix_state_update_key.as_deref(),
@@ -4394,6 +4446,35 @@ async fn run_generation_for_authorized_agent(
         prefix_guard_wait.source.as_deref() == Some("exact") && prefix_guard_wait.wait_ms > 0,
         prefix_guard_wait.exact_settle_window_elapsed && !confirmed_compaction,
         prefix_guard_wait.settled_exact_state_finished_at,
+        preserve_native_maturity_scope_after_non_authoritative_settlement(
+            response_session_update.as_ref(),
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+            usage_record.as_ref(),
+        ) || preserve_native_maturity_scope_after_begin_lock_busy(
+            upstream_request_diagnostics.final_scope_begin_lock_busy,
+            upstream_request_diagnostics.final_scope_begin_maturity_eligible,
+            confirmed_compaction,
+            response_session_starts_compaction_epoch,
+            !full_replay_ambiguous_local_lineage
+                && !upstream_request_diagnostics.suppress_local_full_replay_settlement,
+            committed_final_scope_head,
+        ) || preserve_native_maturity_scope_after_capacity_full(
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+            usage_record.as_ref(),
+            confirmed_compaction,
+            response_session_starts_compaction_epoch,
+            !full_replay_ambiguous_local_lineage
+                && !upstream_request_diagnostics.suppress_local_full_replay_settlement,
+            committed_final_scope_head,
+        ) || preserve_native_maturity_scope_after_no_usage_terminal(
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
+            usage_record.as_ref(),
+            confirmed_compaction,
+            response_session_starts_compaction_epoch,
+            !full_replay_ambiguous_local_lineage
+                && !upstream_request_diagnostics.suppress_local_full_replay_settlement,
+            committed_final_scope_head,
+        ),
         is_success_status
             && !sync_compact_diagnostic_only
             && !confirmed_compaction
@@ -4428,6 +4509,11 @@ async fn run_generation_for_authorized_agent(
             .clone();
         prefix_lag.static_wire_drift_transition =
             prefix_observation.static_wire_drift_transition.clone();
+    } else if prefix_observation.static_anchor_cold {
+        // A sibling's existence proves only a static cache-namespace change.
+        // It is not an Atoapi wire mutation and it must not be rendered as a
+        // user tail or an avoidable local cache miss.
+        prefix_lag.classification = Some("static_anchor_cold".to_string());
     } else if final_scope_rollback_reclassified {
         prefix_lag.classification = Some("provider_waterline_rollback".to_string());
     }
@@ -4733,6 +4819,54 @@ async fn run_generation_for_authorized_agent(
     client_response.unwrap_or_else(|| Response::new(Body::empty()))
 }
 
+/// Returns the semantic static witness used only for the bounded FullReplay
+/// prefix-maturity guard. The exact frozen wire remains independently bound to
+/// the final-scope waterline, so delivery metadata can no longer suppress a
+/// safe local wait without ever relaxing model-visible static fields.
+fn final_responses_maturity_projection(
+    is_native_responses_wire: bool,
+    final_wire_receipt: Option<&FinalWireReceipt>,
+) -> FinalResponsesStaticProjection<'_> {
+    if !is_native_responses_wire {
+        return FinalResponsesStaticProjection::NotApplicable;
+    }
+    FinalResponsesStaticProjection::Observed(final_wire_receipt.and_then(|receipt| {
+        receipt
+            .wire
+            .responses_cache_maturity_static_projection_digest
+            .as_deref()
+    }))
+}
+
+/// Explains why a native Responses request intentionally has no FullReplay
+/// maturity scope. This is diagnostic-only: the request still skips the
+/// foreground wait and never falls back to a broad provider prefix state.
+fn final_maturity_scope_skip_reason(
+    native_responses_passthrough: bool,
+    active_request_channel: &Channel,
+    final_scope_waterline_is_full_replay: bool,
+    active_used_response_session: bool,
+    response_session_starts_compaction_epoch: bool,
+    full_replay_ambiguous_local_lineage: bool,
+) -> Option<&'static str> {
+    if !native_responses_passthrough
+        || !matches!(active_request_channel, Channel::Responses)
+        || final_scope_waterline_is_full_replay
+    {
+        return None;
+    }
+
+    Some(if response_session_starts_compaction_epoch {
+        "maturity_not_applicable_compaction"
+    } else if active_used_response_session {
+        "maturity_not_applicable_native_continuation"
+    } else if full_replay_ambiguous_local_lineage {
+        "maturity_not_applicable_ambiguous_lineage"
+    } else {
+        "maturity_not_applicable_non_full_replay"
+    })
+}
+
 async fn acquire_provider_prefix_guard(
     state: &AppState,
     channel: &Channel,
@@ -4792,6 +4926,38 @@ async fn wait_for_provider_prefix_settle_on_final_wire(
     final_responses_static_projection: FinalResponsesStaticProjection<'_>,
     final_maturity_parent_scope_digest: Option<&str>,
 ) -> PrefixGuardWaitDiagnostics {
+    wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
+        state,
+        channel,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        current_tail,
+        compaction_requested,
+        max_wait,
+        final_responses_static_projection,
+        final_maturity_parent_scope_digest,
+        None,
+    )
+    .await
+}
+
+/// The optional reason is supplied only for native Responses paths that are
+/// known not to be safe FullReplay successors. Keeping this as a separate
+/// wrapper preserves the strict exact-scope behavior used by all existing
+/// callers and tests.
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
+    state: &AppState,
+    channel: &Channel,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    current_tail: &TailInputDiagnostics,
+    compaction_requested: bool,
+    max_wait: Option<TokioDuration>,
+    final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    final_maturity_parent_scope_digest: Option<&str>,
+    final_maturity_scope_skip_reason: Option<&'static str>,
+) -> PrefixGuardWaitDiagnostics {
     if provider_prefix_key.is_none() && provider_prefix_family_key.is_none() {
         return PrefixGuardWaitDiagnostics {
             skip_reason: Some("no_provider_prefix_key".to_string()),
@@ -4811,7 +4977,11 @@ async fn wait_for_provider_prefix_settle_on_final_wire(
             };
             let Some(parent_scope_digest) = final_maturity_parent_scope_digest else {
                 return PrefixGuardWaitDiagnostics {
-                    skip_reason: Some("final_maturity_scope_unavailable".to_string()),
+                    skip_reason: Some(
+                        final_maturity_scope_skip_reason
+                            .unwrap_or("final_maturity_scope_unavailable")
+                            .to_string(),
+                    ),
                     ..PrefixGuardWaitDiagnostics::default()
                 };
             };
@@ -4821,8 +4991,20 @@ async fn wait_for_provider_prefix_settle_on_final_wire(
                     ..PrefixGuardWaitDiagnostics::default()
                 };
             };
+            let FinalResponsesStaticProjection::Observed(static_projection_digest) =
+                final_responses_static_projection
+            else {
+                return PrefixGuardWaitDiagnostics {
+                    skip_reason: Some("final_static_projection_unavailable".to_string()),
+                    ..PrefixGuardWaitDiagnostics::default()
+                };
+            };
             scopes
-                .get(prefix_control_key, parent_scope_digest)
+                .get(
+                    prefix_control_key,
+                    parent_scope_digest,
+                    static_projection_digest,
+                )
                 .map(|state| ("exact".to_string(), state))
         } else {
             // Prefix settling is an optimization. A busy bookkeeping map must not
@@ -6163,15 +6345,18 @@ async fn update_provider_prefix_state(
     .await
 }
 
-fn begin_final_scope_waterline(
+fn begin_final_scope_waterline_with_status(
     state: &AppState,
     receipt: Option<&FinalScopeShadowReceipt>,
     sent_prediction_eligible: bool,
     predecessor: PredecessorProofReceipt,
-) -> Option<WaterlineTicket> {
+) -> FinalScopeBeginResult {
     let Some(receipt) = receipt else {
         state.final_scope_observations.record_outcome("no_receipt");
-        return None;
+        return FinalScopeBeginResult {
+            ticket: None,
+            lock_busy: false,
+        };
     };
     if !receipt.eligible_for_shadow_observation {
         let outcome = if receipt.missing_attested_scope {
@@ -6188,7 +6373,10 @@ fn begin_final_scope_waterline(
             "ineligible"
         };
         state.final_scope_observations.record_outcome(outcome);
-        return None;
+        return FinalScopeBeginResult {
+            ticket: None,
+            lock_busy: false,
+        };
     }
     // This ledger is intentionally best-effort. It is shadow-only, so a
     // contended lock must never add latency to the frozen one-shot request.
@@ -6196,7 +6384,10 @@ fn begin_final_scope_waterline(
         state
             .final_scope_observations
             .record_outcome("begin_lock_busy");
-        return None;
+        return FinalScopeBeginResult {
+            ticket: None,
+            lock_busy: true,
+        };
     };
     let ticket =
         ledger.try_begin_with_proof(&receipt.digest, true, sent_prediction_eligible, predecessor);
@@ -6207,7 +6398,20 @@ fn begin_final_scope_waterline(
         } else {
             "ineligible"
         });
-    ticket
+    FinalScopeBeginResult {
+        ticket,
+        lock_busy: false,
+    }
+}
+
+fn begin_final_scope_waterline(
+    state: &AppState,
+    receipt: Option<&FinalScopeShadowReceipt>,
+    sent_prediction_eligible: bool,
+    predecessor: PredecessorProofReceipt,
+) -> Option<WaterlineTicket> {
+    begin_final_scope_waterline_with_status(state, receipt, sent_prediction_eligible, predecessor)
+        .ticket
 }
 
 /// The final-scope waterline and maturity registry are valid only for an
@@ -6230,23 +6434,28 @@ fn native_final_scope_full_replay(
         && matches!(response_session_parent, LineageParent::FullReplay)
 }
 
-/// Removes only the current process-local FullReplay maturity evidence.  This
-/// is used for local rejections before dispatch and terminal paths that cannot
-/// establish a safe successor; it never touches a sibling conversation under
-/// the same provider/model/Key prefix.
+fn final_scope_predecessor_is_maturity_safe(predecessor: &PredecessorProofReceipt) -> bool {
+    predecessor.is_maturity_safe()
+}
+
+/// Removes only the current process-local FullReplay maturity sibling. This is
+/// used for local rejections before dispatch and terminal paths that cannot
+/// establish a safe successor; it never touches another conversation or a
+/// different frozen static wire under the same parent scope.
 async fn retire_native_maturity_scope(
     state: &AppState,
     provider_prefix_key: Option<&str>,
     parent_scope_digest: Option<&str>,
+    static_projection_digest: Option<&str>,
 ) {
     if let (Some(prefix_control_key), Some(parent_scope_digest)) =
         (provider_prefix_key, parent_scope_digest)
     {
-        state
-            .prefix_maturity_scopes
-            .lock()
-            .await
-            .remove(prefix_control_key, parent_scope_digest);
+        state.prefix_maturity_scopes.lock().await.remove(
+            prefix_control_key,
+            parent_scope_digest,
+            static_projection_digest,
+        );
     }
 }
 
@@ -6269,6 +6478,120 @@ fn settled_final_maturity_parent_scope_digest<'a>(
         })
         .and_then(|_| final_maturity_parent_scope_digest(Some(receipt)))
         .filter(|digest| !digest.is_empty())
+}
+
+/// A non-authoritative terminal must not erase a winner's existing maturity
+/// evidence for the same parent scope. A stale concurrent sibling cannot
+/// publish a new receipt, and a `settle_lock_busy` outcome means Atoapi's
+/// local shadow ledger did not observe the terminal at all. Neither says that
+/// the already-verified upstream cache receipt became unsafe. Keep this
+/// narrower than generic failure handling: missing input, compaction, epoch
+/// change, unsafe predecessor proof, and ordinary lineage rejection retain
+/// the normal retirement behaviour.
+fn preserve_native_maturity_scope_after_non_authoritative_settlement(
+    response_session_update: Option<&LineageCommitOutcome>,
+    final_scope: Option<&FinalScopeWaterlineLog>,
+    raw_usage: Option<&UsageRecord>,
+) -> bool {
+    let Some(scope) = final_scope else {
+        return false;
+    };
+    if raw_usage.is_none()
+        || !scope.sent_prediction_eligible
+        || scope.continuity_reset
+        || !matches!(scope.predecessor_proof.as_str(), "root" | "exact")
+    {
+        return false;
+    }
+
+    match scope.outcome.as_str() {
+        // The final-scope lock is only a best-effort local measurement. A
+        // lock miss does not invalidate the current exact winner and must not
+        // turn its next successor into `no_prefix_state`.
+        "settle_lock_busy" => true,
+        // A stale sibling lost the lineage CAS, so it cannot replace or retire
+        // the winner's receipt. Generic lineage rejection remains unsafe.
+        "lineage_rejected" | "stale_generation" => matches!(
+            response_session_update,
+            Some(LineageCommitOutcome::Stale { .. })
+        ),
+        _ => false,
+    }
+}
+
+/// A `begin_lock_busy` result means the local, shadow-only waterline ledger
+/// never acquired a ticket.  A normal successful FullReplay therefore cannot
+/// publish new maturity, but it also must not delete an already-verified
+/// winner for the same parent scope, even when the upstream terminal omitted
+/// usage. All eligibility facts are frozen before dispatch; compaction,
+/// ambiguous lineage and unsafe predecessor proofs remain fail-closed.
+fn preserve_native_maturity_scope_after_begin_lock_busy(
+    begin_lock_busy: bool,
+    begin_maturity_eligible: bool,
+    confirmed_compaction: bool,
+    starts_compaction_epoch: bool,
+    local_full_replay_settlement_allowed: bool,
+    committed_final_scope_head: bool,
+) -> bool {
+    begin_lock_busy
+        && begin_maturity_eligible
+        && !confirmed_compaction
+        && !starts_compaction_epoch
+        && local_full_replay_settlement_allowed
+        && committed_final_scope_head
+}
+
+/// A full final-scope ledger can be at capacity even though the upstream
+/// request itself completed safely. Capacity exhaustion is local shadow
+/// bookkeeping loss, not evidence that the already verified exact upstream
+/// cache winner became invalid. Preserve only the current exact, committed
+/// FullReplay scope; never promote this request or retain an unsafe branch.
+fn preserve_native_maturity_scope_after_capacity_full(
+    final_scope: Option<&FinalScopeWaterlineLog>,
+    raw_usage: Option<&UsageRecord>,
+    confirmed_compaction: bool,
+    starts_compaction_epoch: bool,
+    local_full_replay_settlement_allowed: bool,
+    committed_final_scope_head: bool,
+) -> bool {
+    raw_usage.is_some()
+        && !confirmed_compaction
+        && !starts_compaction_epoch
+        && local_full_replay_settlement_allowed
+        && committed_final_scope_head
+        && final_scope.is_some_and(|scope| {
+            scope.outcome == "capacity_full"
+                && scope.sent_prediction_eligible
+                && !scope.continuity_reset
+                && matches!(scope.predecessor_proof.as_str(), "root" | "exact")
+        })
+}
+
+/// A terminal without raw usage cannot establish a new cache waterline.  It
+/// also must not erase a previously verified winner receipt merely because
+/// the upstream omitted usage or disconnected before completion.  This only
+/// preserves the existing receipt; it never writes, refreshes, or expands it.
+/// Compaction, a new compaction epoch, ambiguous local lineage, and unsafe
+/// parent proof still retire the scope normally.
+fn preserve_native_maturity_scope_after_no_usage_terminal(
+    final_scope: Option<&FinalScopeWaterlineLog>,
+    raw_usage: Option<&UsageRecord>,
+    confirmed_compaction: bool,
+    starts_compaction_epoch: bool,
+    local_full_replay_settlement_allowed: bool,
+    committed_final_scope_head: bool,
+) -> bool {
+    raw_usage.is_none()
+        && !confirmed_compaction
+        && !starts_compaction_epoch
+        && local_full_replay_settlement_allowed
+        && final_scope.is_some_and(|scope| {
+            (matches!(scope.outcome.as_str(), "failed" | "missing_usage")
+                || (scope.outcome == "settle_lock_busy" && committed_final_scope_head))
+                && scope.sent_prediction_eligible
+                && !scope.continuity_reset
+                && matches!(scope.predecessor_proof.as_str(), "root" | "exact")
+        })
 }
 
 fn final_maturity_parent_scope_digest(receipt: Option<&FinalScopeShadowReceipt>) -> Option<&str> {
@@ -6429,6 +6752,7 @@ async fn update_provider_prefix_state_with_tail_and_guard(
         false,
         false,
         None,
+        false,
         true,
     )
     .await;
@@ -6459,34 +6783,55 @@ async fn observe_provider_prefix_usage(
     guard_source_is_exact: bool,
     exact_settle_window_elapsed: bool,
     settled_exact_state_finished_at: Option<Instant>,
+    // A verified non-authoritative terminal (late sibling, local ledger lock
+    // miss, or safe no-usage terminal) may not replace or retire the winner's
+    // state. This is `false` for compaction, epoch changes, unsafe local
+    // terminals, and ordinary lineage rejection.
+    preserve_existing_native_maturity_scope: bool,
     learn_state: bool,
 ) -> ProviderPrefixUsageObservation {
     let native_responses_scope = matches!(
         final_responses_static_projection,
         FinalResponsesStaticProjection::Observed(_)
     );
-    let scoped_previous = if native_responses_scope {
+    let current_maturity_static_projection_digest = match final_responses_static_projection {
+        FinalResponsesStaticProjection::Observed(digest) => digest,
+        FinalResponsesStaticProjection::NotApplicable => None,
+    };
+    let (scoped_previous, unseen_static_anchor) = if native_responses_scope {
         match (provider_prefix_key, current_maturity_parent_scope_digest) {
-            (Some(prefix_control_key), Some(parent_scope_digest)) => state
-                .prefix_maturity_scopes
-                .lock()
-                .await
-                .get(prefix_control_key, parent_scope_digest),
-            _ => None,
+            (Some(prefix_control_key), Some(parent_scope_digest)) => {
+                let mut scopes = state.prefix_maturity_scopes.lock().await;
+                let previous = scopes.get(
+                    prefix_control_key,
+                    parent_scope_digest,
+                    current_maturity_static_projection_digest,
+                );
+                let sibling_exists = previous.is_none()
+                    && current_maturity_static_projection_digest.is_some()
+                    && scopes.has_live_static_sibling(
+                        prefix_control_key,
+                        parent_scope_digest,
+                        current_maturity_static_projection_digest,
+                    );
+                (previous, sibling_exists)
+            }
+            _ => (None, false),
         }
     } else {
-        None
+        (None, false)
     };
     let Some(raw) = raw_usage else {
-        // A native Responses failure, a lineage rejection, or a terminal path
-        // without usable usage must not leave a maturity receipt behind for a
-        // later turn.  We do not touch another parent scope sharing the same
-        // provider/key prefix.
-        if native_responses_scope {
+        // A no-usage terminal cannot learn or refresh maturity. A caller may
+        // nevertheless prove that this was a transient/missing-usage result
+        // for an otherwise valid FullReplay scope; in that narrow case keep
+        // the old winner receipt until its original TTL expires.
+        if native_responses_scope && !preserve_existing_native_maturity_scope {
             retire_native_maturity_scope(
                 state,
                 provider_prefix_key,
                 current_maturity_parent_scope_digest,
+                current_maturity_static_projection_digest,
             )
             .await;
         }
@@ -6494,6 +6839,11 @@ async fn observe_provider_prefix_usage(
         clear_recent_clean_tiny_gap_evidence(&mut states, provider_prefix_key);
         return ProviderPrefixUsageObservation::default();
     };
+    // A same-parent sibling proves only that this is a newly seen static cache
+    // namespace. Preserve the upstream's raw shortfall, but keep it out of
+    // user-tail and locally-avoidable attribution. Do not expose the signal
+    // when the new root already hit cleanly.
+    let static_anchor_cold = unseen_static_anchor && provider_cache_shortfall(raw) > 0;
     let (
         previous_exact,
         previous_best,
@@ -6642,9 +6992,20 @@ async fn observe_provider_prefix_usage(
         } else if let (Some(prefix_control_key), Some(parent_scope_digest)) =
             (provider_prefix_key, current_maturity_parent_scope_digest)
         {
-            // Compaction, lineage rejection, unsafe terminal paths, and
-            // unsuccessful observations must retire only their own scope.
-            scopes.remove(prefix_control_key, parent_scope_digest);
+            // A stale sibling or a local final-ledger lock miss has no
+            // authority to replace the winner's receipt. Deleting that receipt
+            // would turn the winner's next exact successor into
+            // `no_prefix_state`.
+            if !preserve_existing_native_maturity_scope {
+                // Compaction, unsafe terminal paths, epoch changes, and
+                // ordinary lineage rejection must still retire only their own
+                // frozen static sibling.
+                scopes.remove(
+                    prefix_control_key,
+                    parent_scope_digest,
+                    current_maturity_static_projection_digest,
+                );
+            }
         }
     }
     let gap = Some(PrefixController::classify_gap(PrefixGapInput {
@@ -6657,7 +7018,7 @@ async fn observe_provider_prefix_usage(
         pre_request_avoidable_tokens,
         recovery_applicable,
         exact_settle_window_elapsed,
-        static_wire_drift,
+        static_wire_drift: static_wire_drift || static_anchor_cold,
     }));
     if next.is_some() || learn_family {
         state.journal_runtime_state();
@@ -6667,6 +7028,7 @@ async fn observe_provider_prefix_usage(
         gap,
         previous: previous_best,
         static_wire_drift,
+        static_anchor_cold,
         static_wire_drift_late_mutation_categories,
         static_wire_drift_transition,
     }
@@ -7254,14 +7616,14 @@ fn provider_prefix_control_key(
 /// rotation, and cache-policy upgrades from lending one key's waterline to
 /// another key or wire shape.
 // Bump the persisted prefix-state namespace whenever the final Responses
-// cache-control wire policy changes. The default upstream User-Agent now
-// follows the package version, and third-party routes may partition cache
-// waterlines by that value. Do not lend a prior release's local waterline to
-// the new User-Agent lane after an upgrade.
-const PROVIDER_PREFIX_STATE_KEY_VERSION: &str = "prefix-v3";
-const PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION: &str = "prefix-family-v3";
-const PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION: &str = "prefix-alias-v3";
-const PROVIDER_PREFIX_STATE_POLICY_EPOCH: &str = "cache-control-user-agent-v2";
+// cache-control wire policy or the cache identity inputs change. The default
+// upstream User-Agent follows the package version, and a provider override is
+// also part of the exact upstream cache lane. Do not lend a prior UA lane's
+// local waterline to the current one after an upgrade or override change.
+const PROVIDER_PREFIX_STATE_KEY_VERSION: &str = "prefix-v4";
+const PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION: &str = "prefix-family-v4";
+const PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION: &str = "prefix-alias-v4";
+const PROVIDER_PREFIX_STATE_POLICY_EPOCH: &str = "cache-control-user-agent-v3";
 
 fn provider_prefix_control_key_for_selected_key(
     provider_prefix_key: Option<&str>,
@@ -7271,12 +7633,14 @@ fn provider_prefix_control_key_for_selected_key(
 ) -> Option<String> {
     let provider_group = provider_prefix_provider_group(decision);
     let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
+    let user_agent_scope = upstream_user_agent_scope_digest(decision);
     provider_prefix_key.map(|key| {
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             PROVIDER_PREFIX_STATE_KEY_VERSION,
             key_realm,
             PROVIDER_PREFIX_STATE_POLICY_EPOCH,
+            user_agent_scope,
             provider_group,
             provider_prefix_model_key(decision),
             channel.label(),
@@ -7296,12 +7660,14 @@ fn provider_prefix_family_control_key_for_selected_key(
     }
     let provider_group = provider_prefix_provider_group(decision);
     let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
+    let user_agent_scope = upstream_user_agent_scope_digest(decision);
     response_session_scope_key.map(|scope| {
         format!(
-            "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             PROVIDER_PREFIX_FAMILY_STATE_KEY_VERSION,
             PROVIDER_PREFIX_STATE_POLICY_EPOCH,
             key_realm,
+            user_agent_scope,
             provider_group,
             provider_prefix_model_key(decision),
             channel.label(),
@@ -7313,12 +7679,21 @@ fn provider_prefix_family_control_key_for_selected_key(
 fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     let mut parts = control_key.split('\0');
     let first = parts.next()?;
-    let (key_realm, policy_epoch, provider_group) = match first {
-        "prefix-v2" => (Some(parts.next()?), None, parts.next()?),
-        PROVIDER_PREFIX_STATE_KEY_VERSION => {
-            (Some(parts.next()?), Some(parts.next()?), parts.next()?)
-        }
-        _ => (None, None, first),
+    let (key_realm, policy_epoch, user_agent_scope, provider_group) = match first {
+        "prefix-v2" => (Some(parts.next()?), None, None, parts.next()?),
+        "prefix-v3" => (
+            Some(parts.next()?),
+            Some(parts.next()?),
+            None,
+            parts.next()?,
+        ),
+        PROVIDER_PREFIX_STATE_KEY_VERSION => (
+            Some(parts.next()?),
+            Some(parts.next()?),
+            Some(parts.next()?),
+            parts.next()?,
+        ),
+        _ => (None, None, None, first),
     };
     let model = parts.next()?;
     let channel = parts.next()?;
@@ -7331,31 +7706,42 @@ fn provider_prefix_state_alias_key(control_key: &str) -> Option<String> {
     {
         return None;
     }
-    match (key_realm, policy_epoch) {
-        (Some(key_realm), Some(policy_epoch))
-            if !key_realm.is_empty() && !policy_epoch.is_empty() =>
+    match (key_realm, policy_epoch, user_agent_scope) {
+        (Some(key_realm), Some(policy_epoch), Some(user_agent_scope))
+            if !key_realm.is_empty()
+                && !policy_epoch.is_empty()
+                && !user_agent_scope.is_empty() =>
         {
             Some(format!(
-                "{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
                 PROVIDER_PREFIX_STATE_ALIAS_KEY_VERSION,
                 policy_epoch,
                 key_realm,
+                user_agent_scope,
                 provider_group,
                 model,
                 channel,
                 fingerprint
             ))
         }
-        (Some(key_realm), None) if !key_realm.is_empty() => Some(format!(
+        (Some(key_realm), Some(policy_epoch), None)
+            if !key_realm.is_empty() && !policy_epoch.is_empty() =>
+        {
+            Some(format!(
+                "prefix-alias-v3\0{}\0{}\0{}\0{}\0{}\0{}",
+                policy_epoch, key_realm, provider_group, model, channel, fingerprint
+            ))
+        }
+        (Some(key_realm), None, None) if !key_realm.is_empty() => Some(format!(
             "prefix-alias-v2\0{}\0{}\0{}\0{}\0{}",
             key_realm, provider_group, model, channel, fingerprint
         )),
-        (Some(_), _) => None,
-        (None, None) => Some(format!(
+        (Some(_), _, _) => None,
+        (None, None, None) => Some(format!(
             "prefix-alias\0{}\0{}\0{}\0{}",
             provider_group, model, channel, fingerprint
         )),
-        (None, Some(_)) => None,
+        (None, _, _) => None,
     }
 }
 
@@ -7381,8 +7767,10 @@ fn lookup_provider_prefix_state<'a>(
     states: &'a HashMap<String, PrefixWarmState>,
     key: &str,
 ) -> Option<&'a PrefixWarmState> {
-    let exact = states.get(key);
-    let alias = provider_prefix_state_alias_key(key).and_then(|alias| states.get(&alias));
+    let exact = states.get(key).filter(|state| state.is_live());
+    let alias = provider_prefix_state_alias_key(key)
+        .and_then(|alias| states.get(&alias))
+        .filter(|state| state.is_live());
     stronger_prefix_state(exact, alias)
 }
 
@@ -7392,16 +7780,22 @@ fn lookup_provider_prefix_state_with_source<'a>(
     provider_prefix_family_key: Option<&str>,
 ) -> Option<(&'static str, &'a PrefixWarmState)> {
     let direct = provider_prefix_key.and_then(|key| {
-        let exact = states.get(key).map(|state| ("exact", state));
+        let exact = states
+            .get(key)
+            .filter(|state| state.is_live())
+            .map(|state| ("exact", state));
         let alias = provider_prefix_state_alias_key(key)
             .and_then(|alias| states.get(&alias))
+            .filter(|state| state.is_live())
             .map(|state| ("shared-responses", state));
         stronger_prefix_state_with_source(exact, alias)
     });
     stronger_prefix_state_with_source(
         direct,
         provider_prefix_family_key
-            .and_then(|key| states.get(key).map(|state| ("session-sibling", state))),
+            .and_then(|key| states.get(key))
+            .filter(|state| state.is_live())
+            .map(|state| ("session-sibling", state)),
     )
 }
 
@@ -7793,6 +8187,8 @@ async fn update_response_session_with_id(
     parent: &LineageParent,
     full_response_input: Option<&Value>,
     breakpoint_placement_digest: Option<String>,
+    static_projection_digest: Option<String>,
+    output_items_complete: bool,
     response_id: Option<String>,
     output_items: Vec<Value>,
 ) -> Option<LineageCommitOutcome> {
@@ -7802,6 +8198,8 @@ async fn update_response_session_with_id(
         parent,
         full_response_input.cloned(),
         breakpoint_placement_digest,
+        static_projection_digest,
+        output_items_complete,
         response_id,
         output_items,
     )
@@ -7814,6 +8212,8 @@ async fn update_response_session_with_owned_input(
     parent: &LineageParent,
     full_response_input: Option<Value>,
     breakpoint_placement_digest: Option<String>,
+    static_projection_digest: Option<String>,
+    output_items_complete: bool,
     response_id: Option<String>,
     output_items: Vec<Value>,
 ) -> Option<LineageCommitOutcome> {
@@ -7854,6 +8254,8 @@ async fn update_response_session_with_owned_input(
     let candidate = ResponseSessionCandidate {
         response_id,
         breakpoint_placement_digest,
+        static_projection_digest,
+        output_items_complete,
         input,
         output_items,
         finished_at: Instant::now(),
@@ -8043,6 +8445,22 @@ fn response_output_items_from_bytes(bytes: &[u8]) -> Vec<Value> {
     let mut stream = ResponsesStreamState::default();
     stream.ingest(bytes);
     stream.finish().output_items
+}
+
+/// A delta continuation needs stronger evidence than an incremental stream
+/// trace: only an explicit terminal `output` array proves that the exact
+/// server-side response items are available for the next prefix comparison.
+/// An empty terminal array is still complete; a missing array is not.
+fn response_output_items_are_complete_from_bytes(bytes: &[u8]) -> bool {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        return value
+            .get("output")
+            .or_else(|| value.pointer("/response/output"))
+            .is_some_and(Value::is_array);
+    }
+    let mut stream = ResponsesStreamState::default();
+    stream.ingest(bytes);
+    stream.finish().output_items_complete
 }
 
 fn response_output_items_from_value(value: &Value) -> Vec<Value> {
@@ -10827,11 +11245,7 @@ fn build_upstream_request_headers(
     if let Ok(value) = HeaderValue::from_str(api_key) {
         outbound.insert("x-api-key", value);
     }
-    let user_agent = custom_user_agent
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| HeaderValue::from_str(value).ok())
-        .unwrap_or_else(|| HeaderValue::from_static(crate::ATOAPI_USER_AGENT));
+    let user_agent = effective_upstream_user_agent(custom_user_agent);
     outbound.insert(header::USER_AGENT, user_agent);
     if stream {
         outbound.insert(
@@ -10850,6 +11264,50 @@ fn build_upstream_request_headers(
         outbound.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
     }
     outbound
+}
+
+/// Builds the exact upstream-facing header set for a management-only probe.
+/// It deliberately starts from an empty inbound header map, so a probe cannot
+/// inherit client credentials or request-specific state, while still matching
+/// the normal relay's authentication, User-Agent, stream negotiation and
+/// content-encoding policy for the selected upstream route.
+pub(crate) fn build_management_probe_headers(
+    api_key: &str,
+    channel: &Channel,
+    stream: bool,
+    custom_user_agent: Option<&str>,
+) -> HeaderMap {
+    build_upstream_request_headers(
+        &HeaderMap::new(),
+        api_key,
+        channel,
+        stream,
+        custom_user_agent,
+        false,
+    )
+}
+
+/// Resolve the exact User-Agent value which reaches the upstream.  The same
+/// resolution is used by prefix-state scoping so a versioned default or a
+/// provider override cannot accidentally inherit cache maturity from another
+/// upstream cache lane.
+fn effective_upstream_user_agent(custom_user_agent: Option<&str>) -> HeaderValue {
+    custom_user_agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| HeaderValue::from_str(value).ok())
+        .unwrap_or_else(|| HeaderValue::from_static(crate::ATOAPI_USER_AGENT))
+}
+
+/// Stable, non-reversible local identity for the exact User-Agent sent to an
+/// upstream.  Some third-party caches partition by it, while custom values
+/// may be user-specific, so persist only a domain-separated digest.
+fn upstream_user_agent_scope_digest(decision: &RouteDecision) -> String {
+    let user_agent = effective_upstream_user_agent(decision.provider.custom_user_agent.as_deref());
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-upstream-user-agent-scope-v1\0");
+    hasher.update(user_agent.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn upstream_header_is_blocked(name: &str) -> bool {
@@ -16928,6 +17386,12 @@ mod tests {
     use crate::{
         cache::{cache_path, CacheStore},
         config::ModelConfig,
+        proxy::{
+            cache_control_core::{
+                ActionScopeReceipt, FinalCacheControls, PreparedWireDigest, SemanticLineageDigest,
+            },
+            prepared_wire_request::ProtocolBreakpointProvenance,
+        },
         state::AppState,
     };
     use axum::http::HeaderValue;
@@ -16938,6 +17402,7 @@ mod tests {
             atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
+        time::Duration as StdDuration,
     };
     use tokio::net::TcpListener;
 
@@ -17054,6 +17519,72 @@ mod tests {
             false,
             &LineageParent::FullReplay,
         ));
+    }
+
+    #[test]
+    fn native_maturity_skip_reason_is_explicit_for_non_full_replay_paths() {
+        assert_eq!(
+            final_maturity_scope_skip_reason(true, &Channel::Responses, false, false, true, false,),
+            Some("maturity_not_applicable_compaction")
+        );
+        assert_eq!(
+            final_maturity_scope_skip_reason(true, &Channel::Responses, false, true, false, false,),
+            Some("maturity_not_applicable_native_continuation")
+        );
+        assert_eq!(
+            final_maturity_scope_skip_reason(true, &Channel::Responses, false, false, false, true,),
+            Some("maturity_not_applicable_ambiguous_lineage")
+        );
+        assert_eq!(
+            final_maturity_scope_skip_reason(true, &Channel::Responses, true, false, false, false,),
+            None
+        );
+        assert_eq!(
+            final_maturity_scope_skip_reason(false, &Channel::Responses, false, false, true, false,),
+            None
+        );
+    }
+
+    #[test]
+    fn native_maturity_projection_uses_the_semantic_static_witness() {
+        let receipt = FinalWireReceipt {
+            scope: ActionScopeReceipt {
+                version: 1,
+                scope_digest: Some("scope".to_string()),
+                channel: "responses".to_string(),
+                key_realm_digest: Some("realm".to_string()),
+                trusted_identity_source: Some("adapter-header".to_string()),
+            },
+            semantic: SemanticLineageDigest {
+                version: 2,
+                context_mode: "full_replay".to_string(),
+                lineage_epoch: Some(1),
+            },
+            wire: PreparedWireDigest {
+                version: 2,
+                wire_bytes: 0,
+                canonical_member_count: 0,
+                responses_static_projection_digest: Some("exact-final-wire".to_string()),
+                responses_cache_maturity_static_projection_digest: Some(
+                    "semantic-maturity-wire".to_string(),
+                ),
+                atoapi_mutated_static_categories: Vec::new(),
+                outbound_prefix_fingerprints: None,
+            },
+            cache_controls: FinalCacheControls {
+                present_field_mask: 0,
+                breakpoint_provenance: ProtocolBreakpointProvenance::Absent,
+            },
+        };
+
+        assert_eq!(
+            final_responses_maturity_projection(true, Some(&receipt)),
+            FinalResponsesStaticProjection::Observed(Some("semantic-maturity-wire"))
+        );
+        assert_eq!(
+            final_responses_maturity_projection(false, Some(&receipt)),
+            FinalResponsesStaticProjection::NotApplicable
+        );
     }
 
     async fn wait_for_final_scope_outcome(state: &AppState, outcome: &str, target: u64) {
@@ -21362,6 +21893,42 @@ mod tests {
     }
 
     #[test]
+    fn management_probe_headers_match_the_normal_stream_protocol_identity() {
+        let headers =
+            build_management_probe_headers("real-upstream-key", &Channel::Responses, true, None);
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer real-upstream-key")
+        );
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("real-upstream-key")
+        );
+        assert_eq!(
+            headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok()),
+            Some(crate::ATOAPI_USER_AGENT)
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+    }
+
+    #[test]
     fn upstream_headers_apply_provider_user_agent_override() {
         let mut inbound = HeaderMap::new();
         inbound.insert(
@@ -21749,23 +22316,62 @@ mod tests {
     }
 
     #[test]
+    fn expired_alias_cannot_override_a_live_exact_prefix_state() {
+        let exact_key =
+            "prefix-v4\0realm\0cache-control-user-agent-v3\0ua\0https://share.example/v1\0gpt-5.5\0responses\0exact";
+        let alias_key = provider_prefix_state_alias_key(exact_key).expect("alias key");
+        let mut live_exact = prefix_state(64_000, 63_872, 128);
+        live_exact.finished_at = Instant::now();
+        let mut stale_alias = prefix_state(200_000, 199_936, 64);
+        stale_alias.finished_at = Instant::now()
+            .checked_sub(StdDuration::from_secs(2 * 60 * 60 + 1))
+            .expect("stale instant");
+
+        let mut states = HashMap::new();
+        states.insert(exact_key.to_string(), live_exact.clone());
+        states.insert(alias_key, stale_alias);
+
+        let (source, selected) =
+            lookup_provider_prefix_state_with_source(&states, Some(exact_key), None)
+                .expect("the live exact state remains usable");
+        assert_eq!(source, "exact");
+        assert_eq!(selected.input_tokens, live_exact.input_tokens);
+    }
+
+    #[test]
+    fn expired_family_state_is_not_used_when_exact_state_is_missing() {
+        let family_key =
+            "prefix-family-v4\0cache-control-user-agent-v3\0realm\0ua\0https://share.example/v1\0gpt-5.5\0responses\0family";
+        let mut stale_family = prefix_state(200_000, 199_936, 64);
+        stale_family.finished_at = Instant::now()
+            .checked_sub(StdDuration::from_secs(2 * 60 * 60 + 1))
+            .expect("stale instant");
+        let mut states = HashMap::new();
+        states.insert(family_key.to_string(), stale_family);
+
+        assert!(
+            lookup_provider_prefix_state_with_source(&states, None, Some(family_key)).is_none()
+        );
+    }
+
+    #[test]
     fn provider_prefix_policy_epoch_isolated_from_legacy_waterline_alias() {
         let decision = reasoning_test_decision(None, &[]);
         let selected = SelectedProviderKey {
             secret: "selected-key".to_string(),
             key_id: Some("key-a".to_string()),
         };
-        let v3 = provider_prefix_control_key_for_selected_key(
+        let v4 = provider_prefix_control_key_for_selected_key(
             Some("stable-fingerprint"),
             &decision,
             &Channel::Responses,
             &selected,
         )
         .expect("selected-key prefix state key");
-        assert!(v3.starts_with("prefix-v3\0"));
-        assert!(v3.contains(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
-        let alias = provider_prefix_state_alias_key(&v3).expect("v3 alias");
-        assert!(alias.starts_with("prefix-alias-v3\0"));
+        assert!(v4.starts_with("prefix-v4\0"));
+        assert!(v4.contains(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
+        let alias = provider_prefix_state_alias_key(&v4).expect("v4 alias");
+        assert!(alias.starts_with("prefix-alias-v4\0"));
         assert!(alias.contains(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
         assert_ne!(
             alias,
@@ -21781,21 +22387,22 @@ mod tests {
             secret: "selected-key".to_string(),
             key_id: Some("key-a".to_string()),
         };
-        let v3 = provider_prefix_control_key_for_selected_key(
+        let v4 = provider_prefix_control_key_for_selected_key(
             Some("stable-fingerprint"),
             &decision,
             &Channel::Responses,
             &selected,
         )
-        .expect("selected-key v3 prefix state key");
-        let mut parts = v3.split('\0');
-        assert_eq!(parts.next(), Some("prefix-v3"));
-        let key_realm = parts.next().expect("v3 key realm");
+        .expect("selected-key v4 prefix state key");
+        let mut parts = v4.split('\0');
+        assert_eq!(parts.next(), Some("prefix-v4"));
+        let key_realm = parts.next().expect("v4 key realm");
         assert_eq!(parts.next(), Some(PROVIDER_PREFIX_STATE_POLICY_EPOCH));
-        let provider_group = parts.next().expect("v3 provider group");
-        let model = parts.next().expect("v3 model");
-        let channel = parts.next().expect("v3 channel");
-        let fingerprint = parts.next().expect("v3 prefix fingerprint");
+        let user_agent_scope = parts.next().expect("v4 User-Agent scope");
+        let provider_group = parts.next().expect("v4 provider group");
+        let model = parts.next().expect("v4 model");
+        let channel = parts.next().expect("v4 channel");
+        let fingerprint = parts.next().expect("v4 prefix fingerprint");
         assert!(parts.next().is_none());
         let v2 =
             format!("prefix-v2\0{key_realm}\0{provider_group}\0{model}\0{channel}\0{fingerprint}");
@@ -21804,9 +22411,63 @@ mod tests {
         states.insert(v2, expected.clone());
 
         assert!(
-            lookup_provider_prefix_state_with_source(&states, Some(&v3), None).is_none(),
+            lookup_provider_prefix_state_with_source(&states, Some(&v4), None).is_none(),
             "a versioned default User-Agent may select a distinct upstream cache lane, so an old v2 waterline must not influence the new release"
         );
+        assert_eq!(user_agent_scope.len(), 64);
+    }
+
+    #[test]
+    fn prefix_state_scope_changes_with_the_effective_upstream_user_agent() {
+        let decision = reasoning_test_decision(None, &[]);
+        let selected = SelectedProviderKey {
+            secret: "selected-key".to_string(),
+            key_id: Some("key-a".to_string()),
+        };
+        let default_key = provider_prefix_control_key_for_selected_key(
+            Some("stable-fingerprint"),
+            &decision,
+            &Channel::Responses,
+            &selected,
+        )
+        .expect("default User-Agent prefix state key");
+
+        let mut overridden = decision.clone();
+        overridden.provider.custom_user_agent = Some("Provider-Compatible/2.0".to_string());
+        let override_key = provider_prefix_control_key_for_selected_key(
+            Some("stable-fingerprint"),
+            &overridden,
+            &Channel::Responses,
+            &selected,
+        )
+        .expect("custom User-Agent prefix state key");
+
+        assert_ne!(
+            default_key, override_key,
+            "changing the actual upstream User-Agent must not reuse a prior cache lane"
+        );
+        assert_ne!(
+            provider_prefix_state_alias_key(&default_key),
+            provider_prefix_state_alias_key(&override_key),
+            "aliases must retain the effective User-Agent partition"
+        );
+        assert_ne!(
+            provider_prefix_family_control_key_for_selected_key(
+                Some("stable-session"),
+                &decision,
+                &Channel::Responses,
+                &selected,
+            ),
+            provider_prefix_family_control_key_for_selected_key(
+                Some("stable-session"),
+                &overridden,
+                &Channel::Responses,
+                &selected,
+            ),
+            "family maturity state must retain the effective User-Agent partition"
+        );
+        assert!(!default_key.contains(crate::ATOAPI_USER_AGENT));
+        assert!(!override_key.contains("Provider-Compatible/2.0"));
     }
 
     #[test]
@@ -21856,6 +22517,8 @@ mod tests {
                     ResponseSessionCandidate {
                         response_id: "resp-breakpoint".to_string(),
                         breakpoint_placement_digest: Some("v1:stable-first-block".to_string()),
+                        static_projection_digest: None,
+                        output_items_complete: false,
                         input: original_input.clone(),
                         output_items: Vec::new(),
                         finished_at: Instant::now(),
@@ -22716,6 +23379,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-local".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{"type":"message","role":"user","content":"local"}]),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -22732,6 +23397,8 @@ mod tests {
                 &LineageParent::ExternalContinuation,
                 Some(&external_input),
                 None,
+                None,
+                false,
                 Some("resp-external".to_string()),
                 Vec::new(),
             )
@@ -22765,6 +23432,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-old".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{"type":"message","role":"user","content":"old"}]),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -22793,6 +23462,8 @@ mod tests {
             &LineageParent::FullReplay,
             Some(&next_input),
             None,
+            None,
+            false,
             None,
             Vec::new(),
         )
@@ -22867,6 +23538,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp-root".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{"type":"message","role":"user","content":"root"}]),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -22891,6 +23564,8 @@ mod tests {
                 &LineageParent::FullReplay,
                 Some(&newer_input),
                 None,
+                None,
+                false,
                 Some("resp-new".to_string()),
                 Vec::new(),
             )
@@ -26405,7 +27080,27 @@ mod tests {
         let states = state.prefix_states.lock().await;
         assert!(states
             .get("small-context-cold-prefix")
-            .is_some_and(|state| state.settle_after_cold_read));
+            .is_some_and(|state| !state.settle_after_cold_read));
+
+        // The cold-read marker remains diagnostic only for a small prefix:
+        // an ordinary successor must not inherit the 500ms foreground wait.
+        let decision = PrefixController::before_request(PrefixControlInput {
+            source_is_exact: true,
+            recent_exact_high_hit: false,
+            recent_exact_warm_small_tail: false,
+            avoidable_tokens: 0,
+            fine_avoidable_tokens: 0,
+            avoidable_shortfall_streak: 0,
+            cache_instability_score: 3,
+            tiny_instability_recovery_safe: false,
+            current_tail_is_settle_safe: true,
+            settle_after_cold_read: false,
+            compaction_requested: false,
+            state_age: std::time::Duration::from_millis(100),
+            request_budget: std::time::Duration::from_millis(500),
+        });
+        assert_eq!(decision.wait, std::time::Duration::ZERO);
+        assert_eq!(decision.skip_reason, Some("no_avoidable_gap"));
 
         fs::remove_dir_all(dir).ok();
     }
@@ -26616,6 +27311,7 @@ mod tests {
             false,
             Some(settled_at),
             false,
+            false,
         )
         .await;
         let partial_gap = partial.gap.expect("partial settle must classify a gap");
@@ -26641,6 +27337,7 @@ mod tests {
             true,
             true,
             Some(settled_at),
+            false,
             false,
         )
         .await;
@@ -28138,6 +28835,1538 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incomplete_sse_keeps_existing_full_replay_maturity_for_the_next_inbound() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let hits = upstream_hits_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let body = match attempt {
+                        // Establish a native FullReplay maturity receipt for
+                        // the attested session before exercising the failed
+                        // terminal path below.
+                        0 => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_maturity_seed\",\"object\":\"response\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"seed\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_maturity_seed\",\"status\":\"completed\",\"usage\":{\"input_tokens\":65536,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":65024}}}}\n\n"
+                        ),
+                        // HTTP succeeds, but the upstream ends the SSE body
+                        // without a terminal frame or usage. The relay must
+                        // publish response.failed while retaining the prior
+                        // winner receipt for this same trusted scope.
+                        1 => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_maturity_incomplete\",\"object\":\"response\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+                        ),
+                        _ => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_maturity_successor\",\"object\":\"response\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"successor\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_maturity_successor\",\"status\":\"completed\",\"usage\":{\"input_tokens\":66048,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":65536}}}}\n\n"
+                        ),
+                    };
+                    raw_response(200, "text/event-stream", body.as_bytes().to_vec())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "incomplete-maturity-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-incomplete-maturity-e2e-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"maturity-e2e-session\",\"thread_id\":\"maturity-e2e-thread\",\"conversation_id\":\"maturity-e2e-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let request = |turn: &str| {
+            let input = match turn {
+                "seed" => json!([
+                    {"type": "message", "role": "developer", "content": "stable instructions"},
+                    {"type": "message", "role": "user", "content": "seed"}
+                ]),
+                "incomplete" => json!([
+                    {"type": "message", "role": "developer", "content": "stable instructions"},
+                    {"type": "message", "role": "user", "content": "seed"},
+                    {"type": "message", "role": "user", "content": "incomplete"}
+                ]),
+                _ => json!([
+                    {"type": "message", "role": "developer", "content": "stable instructions"},
+                    {"type": "message", "role": "user", "content": "seed"},
+                    {"type": "message", "role": "user", "content": "incomplete"},
+                    {"type": "message", "role": "user", "content": "successor"}
+                ]),
+            };
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "input": input
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request("seed"),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first_body).contains("response.completed"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+        assert_eq!(
+            state.prefix_maturity_scopes.lock().await.len(),
+            1,
+            "the completed seed must establish one exact maturity scope"
+        );
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request("incomplete"),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_text = String::from_utf8_lossy(&second_body);
+        assert_eq!(second_text.matches("event: response.failed").count(), 1);
+        assert!(second_text.contains("\"code\":\"upstream_incomplete_eof\""));
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            2,
+            "the failed inbound must still make exactly one upstream request"
+        );
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+        let after_failed = state.metrics.snapshot().await;
+        assert_eq!(after_failed.recent_failed_requests.len(), 1);
+        assert_eq!(
+            after_failed.recent_failed_requests[0].downstream_disconnected,
+            Some(false)
+        );
+        assert_eq!(
+            after_failed.recent_failed_requests[0]
+                .sse_end_reason
+                .as_deref(),
+            Some("upstream_incomplete_eof")
+        );
+        assert_eq!(
+            state.prefix_maturity_scopes.lock().await.len(),
+            1,
+            "a no-usage SSE failure must retain the existing winner scope"
+        );
+
+        let third = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            // The failed inbound never becomes a continuation head. A user
+            // retry therefore replays the same complete input that failed,
+            // rather than appending a second uncommitted tail to it.
+            request("incomplete"),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        let third_body = axum::body::to_bytes(third.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&third_body).contains("response.completed"));
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            3,
+            "three inbounds must result in exactly three upstream requests"
+        );
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 2 && metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the successor stream settlement must be recorded");
+        assert_eq!(metrics.total_requests, 3);
+        assert_eq!(metrics.upstream_requests, 3);
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.inbound_requests, 3);
+        assert_eq!(metrics.agent_generation.generation_attempts, 3);
+        assert_eq!(metrics.agent_generation.failed_inbounds, 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+        let successor = metrics
+            .recent_requests
+            .first()
+            .expect("the third completed inbound must be recorded");
+        assert_eq!(
+            successor.prefix_guard_wait_source.as_deref(),
+            Some("exact"),
+            "the post-failure successor must still see the seed's exact maturity receipt"
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn large_http_full_replay_keeps_maturity_across_delivery_metadata_without_delta() {
+        // This is deliberately a plain local HTTP `/v1/responses` server,
+        // not a WebSocket or `previous_response_id` path. The 512 KiB stable
+        // instructions make the frozen FullReplay body large enough to catch
+        // a delivery-metadata digest split without reaching the unsafe-body
+        // gate. All content is synthetic and stays inside this test process.
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let observed_full_replay = Arc::new(AtomicBool::new(true));
+        let observed_full_replay_for_route = observed_full_replay.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let hits = upstream_hits_for_route.clone();
+                let observed_full_replay = observed_full_replay_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let request = serde_json::from_slice::<Value>(&body).ok();
+                    let expected_input_items = match attempt {
+                        0 => 2,
+                        _ => 3,
+                    };
+                    let is_full_replay = request.as_ref().is_some_and(|request| {
+                        request.get("previous_response_id").is_none()
+                            && request
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .is_some_and(|input| input.len() == expected_input_items)
+                            && request
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .is_some_and(|instructions| instructions.len() == 512 * 1024)
+                    });
+                    if !is_full_replay {
+                        observed_full_replay.store(false, Ordering::SeqCst);
+                    }
+
+                    let response = match attempt {
+                        0 => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_large_seed\",\"object\":\"response\"}}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_large_seed\",\"status\":\"completed\",\"usage\":{\"input_tokens\":131072,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":130560}}}}\n\n"
+                        ),
+                        1 => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_large_incomplete\",\"object\":\"response\"}}\n\n",
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+                        ),
+                        _ => concat!(
+                            "event: response.created\n",
+                            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_large_retry\",\"object\":\"response\"}}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_large_retry\",\"status\":\"completed\",\"usage\":{\"input_tokens\":131328,\"output_tokens\":1,\"input_tokens_details\":{\"cached_tokens\":131072}}}}\n\n"
+                        ),
+                    };
+                    raw_response(200, "text/event-stream", response.as_bytes().to_vec())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "large-http-full-replay-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-large-http-full-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"large-http-session\",\"thread_id\":\"large-http-thread\",\"conversation_id\":\"large-http-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let stable_instructions = "s".repeat(512 * 1024);
+        let request = |delivery_nonce: &str, include_retry_turn: bool| {
+            let mut input = vec![
+                json!({"type": "message", "role": "developer", "content": "stable instructions"}),
+                json!({"type": "message", "role": "user", "content": "seed"}),
+            ];
+            if include_retry_turn {
+                input.push(json!({"type": "message", "role": "user", "content": "retry"}));
+            }
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "user": format!("delivery-user-{delivery_nonce}"),
+                    "metadata": {"delivery_nonce": delivery_nonce},
+                    "instructions": stable_instructions,
+                    "input": input,
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request("first", false),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        )
+        .contains("response.completed"));
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        let second = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            request("second", true),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&second_body).contains("response.failed"));
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        // Retry the same complete history with another delivery-only shape.
+        // The failed middle attempt must not create a delta head or discard the
+        // mature FullReplay receipt established by the first HTTP response.
+        let third = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            request("third", true),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(third.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(
+            &axum::body::to_bytes(third.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        )
+        .contains("response.completed"));
+        assert!(
+            state
+                .relay_tasks
+                .wait_for_idle(std::time::Duration::from_secs(2))
+                .await
+        );
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+        assert!(
+            observed_full_replay.load(Ordering::SeqCst),
+            "all three HTTP requests must stay full replay without previous_response_id"
+        );
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 2 && metrics.recent_failed_requests.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("large full replay terminals must settle");
+        assert_eq!(metrics.agent_generation.inbound_requests, 3);
+        assert_eq!(metrics.agent_generation.generation_attempts, 3);
+        assert_eq!(metrics.upstream_requests, 3);
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+        assert!(metrics
+            .recent_requests
+            .iter()
+            .any(|request| { request.prefix_guard_wait_source.as_deref() == Some("exact") }));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn megabyte_full_replay_attributes_only_controlled_dynamic_tails() {
+        // One megabyte of synthetic stable material is about a quarter of the
+        // configured 300k-token window, so this exercises a genuinely large
+        // HTTP body without pretending that a one-million-token request is
+        // safe. Every inbound is still a normal single upstream POST.
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let observed_full_replay = Arc::new(AtomicBool::new(true));
+        let observed_full_replay_for_route = observed_full_replay.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let hits = upstream_hits_for_route.clone();
+                let observed_full_replay = observed_full_replay_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let request = serde_json::from_slice::<Value>(&body).ok();
+                    let expected_input_items = [2, 2, 3, 4, 3]
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or_default();
+                    let is_full_replay = request.as_ref().is_some_and(|request| {
+                        request.get("previous_response_id").is_none()
+                            && request
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .is_some_and(|input| input.len() == expected_input_items)
+                            && request
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .is_some_and(|instructions| instructions.len() == 1_000_000)
+                    });
+                    if !is_full_replay {
+                        observed_full_replay.store(false, Ordering::SeqCst);
+                    }
+                    let (response_id, input_tokens, cached_tokens) = match attempt {
+                        // Seed and delivery-only replay have exactly the same
+                        // semantic input and the same 128-token bucket tail.
+                        0 | 1 => ("resp_megabyte_base", 249_984, 249_856),
+                        // Controlled short and large semantic additions.
+                        2 => ("resp_megabyte_short", 250_624, 249_856),
+                        3 => ("resp_megabyte_large", 260_352, 249_856),
+                        // A different sibling from the same stable base must
+                        // not inherit the preceding large tail as its own.
+                        _ => ("resp_megabyte_alternate", 251_008, 249_856),
+                    };
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response"},
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": cached_tokens},
+                            },
+                        },
+                    });
+                    let response = format!(
+                        "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                        serde_json::to_string(&created).unwrap(),
+                        serde_json::to_string(&completed).unwrap(),
+                    );
+                    raw_response(200, "text/event-stream", response.into_bytes())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "megabyte-full-replay-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-megabyte-full-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"megabyte-session\",\"thread_id\":\"megabyte-thread\",\"conversation_id\":\"megabyte-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let stable_instructions = "s".repeat(1_000_000);
+        let request = |delivery_nonce: &str, shape: &str| {
+            let mut input = vec![
+                json!({"type": "message", "role": "developer", "content": "stable instructions"}),
+                json!({"type": "message", "role": "user", "content": "seed"}),
+            ];
+            match shape {
+                "short" => input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "m".repeat(2_000),
+                })),
+                "large" => {
+                    input.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": "m".repeat(2_000),
+                    }));
+                    input.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": "l".repeat(40_000),
+                    }));
+                }
+                "alternate" => input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "a".repeat(4_000),
+                })),
+                _ => {}
+            }
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "user": format!("delivery-user-{delivery_nonce}"),
+                    "metadata": {"delivery_nonce": delivery_nonce},
+                    "instructions": stable_instructions,
+                    "input": input,
+                }))
+                .unwrap(),
+            )
+        };
+        for (delivery_nonce, shape) in [
+            ("seed", "base"),
+            ("delivery-only", "base"),
+            ("short-tail", "short"),
+            ("large-tail", "large"),
+            ("alternate-tail", "alternate"),
+        ] {
+            let response = handle_generation_for_agent(
+                state.clone(),
+                headers.clone(),
+                request(delivery_nonce, shape),
+                Channel::Responses,
+                Some("codex"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            )
+            .contains("response.completed"));
+            assert!(
+                state
+                    .relay_tasks
+                    .wait_for_idle(std::time::Duration::from_secs(2))
+                    .await
+            );
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 5);
+        assert!(
+            observed_full_replay.load(Ordering::SeqCst),
+            "all variants must remain one-shot HTTP FullReplay requests"
+        );
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 5 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all megabyte full replay terminals must settle");
+        assert_eq!(metrics.agent_generation.inbound_requests, 5);
+        assert_eq!(metrics.agent_generation.generation_attempts, 5);
+        assert_eq!(metrics.upstream_requests, 5);
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+
+        let delivery_only = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.input_tokens == Some(249_984)
+                    && request.prefix_guard_wait_source.as_deref() == Some("exact")
+            })
+            .expect("delivery-only replay must see the exact mature scope");
+        assert_eq!(delivery_only.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(delivery_only.cache_avoidable_gap_tokens, Some(0));
+
+        let short_tail = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(250_624))
+            .expect("short controlled tail must be logged");
+        assert_eq!(short_tail.cache_new_tail_gap_tokens, Some(512));
+        assert_eq!(short_tail.cache_avoidable_gap_tokens, Some(0));
+        assert_eq!(short_tail.cache_provider_unstable_gap_tokens, Some(0));
+
+        let large_tail = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(260_352))
+            .expect("large controlled tail must be logged");
+        assert_eq!(large_tail.cache_new_tail_gap_tokens, Some(10_240));
+        assert_eq!(large_tail.cache_avoidable_gap_tokens, Some(0));
+
+        let alternate_tail = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(251_008))
+            .expect("alternate sibling tail must be logged");
+        assert_eq!(alternate_tail.cache_new_tail_gap_tokens, Some(1_024));
+        assert_eq!(alternate_tail.cache_avoidable_gap_tokens, Some(0));
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn megabyte_full_replay_static_anchor_change_starts_an_independent_cold_root() {
+        // A changed static root (here, one controlled instruction byte) must
+        // never consume the preceding root's maturity or waterline. Its cold
+        // read remains visible in raw usage, but cannot be called user tail or
+        // an avoidable local gap. A later delivery-only replay must still
+        // recover A's sibling state after B has settled.
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let observed_full_replay = Arc::new(AtomicBool::new(true));
+        let observed_full_replay_for_route = observed_full_replay.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let hits = upstream_hits_for_route.clone();
+                let observed_full_replay = observed_full_replay_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let request = serde_json::from_slice::<Value>(&body).ok();
+                    let expected_instruction_suffix = [b'a', b'b', b'b', b'a']
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or_default();
+                    let is_full_replay = request.as_ref().is_some_and(|request| {
+                        request.get("previous_response_id").is_none()
+                            && request
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .is_some_and(|input| input.len() == 2)
+                            && request
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .is_some_and(|instructions| {
+                                    instructions.len() == 1_000_000
+                                        && instructions
+                                            .as_bytes()
+                                            .last()
+                                            .copied()
+                                            == Some(expected_instruction_suffix)
+                                })
+                    });
+                    if !is_full_replay {
+                        observed_full_replay.store(false, Ordering::SeqCst);
+                    }
+                    let (response_id, cached_tokens, output_tokens) = match attempt {
+                        0 => ("resp_static_anchor_a", 249_856, 1),
+                        // This is intentionally a full cold read. The second
+                        // static root has no permission to borrow A's state.
+                        1 => ("resp_static_anchor_b_cold", 0, 2),
+                        2 => ("resp_static_anchor_b_warm", 249_856, 3),
+                        _ => ("resp_static_anchor_a_return", 249_856, 4),
+                    };
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response"},
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": 249_984,
+                                "output_tokens": output_tokens,
+                                "input_tokens_details": {"cached_tokens": cached_tokens},
+                            },
+                        },
+                    });
+                    let response = format!(
+                        "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                        serde_json::to_string(&created).unwrap(),
+                        serde_json::to_string(&completed).unwrap(),
+                    );
+                    raw_response(200, "text/event-stream", response.into_bytes())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "megabyte-static-anchor-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-megabyte-static-anchor-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"megabyte-static-session\",\"thread_id\":\"megabyte-static-thread\",\"conversation_id\":\"megabyte-static-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let mut static_a = "s".repeat(999_999);
+        static_a.push('a');
+        let mut static_b = "s".repeat(999_999);
+        static_b.push('b');
+        let request = |_request_label: &str, instructions: &str| {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    // Keep all delivery fields fixed in this test: B differs
+                    // from A in exactly one static semantic byte.
+                    "user": "static-anchor-user",
+                    "metadata": {"fixture": "static-anchor"},
+                    "instructions": instructions,
+                    "input": [
+                        {"type": "message", "role": "developer", "content": "stable instructions"},
+                        {"type": "message", "role": "user", "content": "seed"},
+                    ],
+                }))
+                .unwrap(),
+            )
+        };
+        for (delivery_nonce, instructions) in [
+            ("anchor-a", static_a.as_str()),
+            ("anchor-b-cold", static_b.as_str()),
+            ("anchor-b-delivery", static_b.as_str()),
+            ("anchor-a-return", static_a.as_str()),
+        ] {
+            let response = handle_generation_for_agent(
+                state.clone(),
+                headers.clone(),
+                request(delivery_nonce, instructions),
+                Channel::Responses,
+                Some("codex"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            )
+            .contains("response.completed"));
+            assert!(
+                state
+                    .relay_tasks
+                    .wait_for_idle(std::time::Duration::from_secs(2))
+                    .await
+            );
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 4);
+        assert!(
+            observed_full_replay.load(Ordering::SeqCst),
+            "every static-anchor variant must remain one-shot HTTP FullReplay"
+        );
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 4 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all static-anchor terminals must settle");
+        assert_eq!(metrics.agent_generation.inbound_requests, 4);
+        assert_eq!(metrics.agent_generation.generation_attempts, 4);
+        assert_eq!(metrics.upstream_requests, 4);
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+
+        let static_b_cold = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.output_tokens == Some(2) && request.cache_read_tokens == Some(0)
+            })
+            .expect("the changed static root must retain its cold raw usage");
+        assert!(static_b_cold.prefix_guard_wait_source.is_none());
+        assert_eq!(
+            static_b_cold.prefix_guard_skip_reason.as_deref(),
+            Some("no_prefix_state"),
+            "B cannot borrow A's maturity slot"
+        );
+        assert_eq!(static_b_cold.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(static_b_cold.cache_avoidable_gap_tokens, Some(0));
+        assert_eq!(static_b_cold.cache_provider_unstable_gap_tokens, Some(0));
+        assert_eq!(
+            static_b_cold.prefix_lag_classification.as_deref(),
+            Some("static_anchor_cold")
+        );
+        assert!(
+            static_b_cold.cache_shortfall_tokens.unwrap_or_default() > 0,
+            "neutral attribution must not hide the genuine new-root raw shortfall"
+        );
+        let static_b_scope = static_b_cold
+            .final_scope_waterline
+            .as_ref()
+            .expect("B must have a final-scope observation");
+        assert_eq!(static_b_scope.prior_observed_cache_read_tokens, 0);
+        assert_eq!(static_b_scope.prior_sent_prefix_bucket_tokens_128, 0);
+        assert_eq!(static_b_scope.prior_settled_prefix_bucket_tokens_128, 0);
+
+        let static_b_delivery = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.output_tokens == Some(3) && request.cache_read_tokens == Some(249_856)
+            })
+            .expect("the first B successor must retain its high raw cache read");
+        assert!(static_b_delivery.prefix_guard_wait_source.is_none());
+        assert_eq!(
+            static_b_delivery.prefix_guard_skip_reason.as_deref(),
+            Some("no_prefix_state"),
+            "a cold B root is not mature enough to borrow an exact wait yet"
+        );
+        assert_eq!(static_b_delivery.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(static_b_delivery.cache_avoidable_gap_tokens, Some(0));
+
+        let static_a_return = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.output_tokens == Some(4)
+                    && request.cache_read_tokens == Some(249_856)
+                    && request.prefix_guard_wait_source.as_deref() == Some("exact")
+            })
+            .expect("A must retain its mature sibling slot after B settles");
+        assert_eq!(static_a_return.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(static_a_return.cache_avoidable_gap_tokens, Some(0));
+        let static_a_scope = static_a_return
+            .final_scope_waterline
+            .as_ref()
+            .expect("A return must have a final-scope observation");
+        assert_ne!(
+            static_b_scope.scope_digest, static_a_scope.scope_digest,
+            "B may not reuse A's frozen final-scope waterline"
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn megabyte_full_replay_does_not_recount_cached_tool_output_as_a_new_tail() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let observed_full_replay = Arc::new(AtomicBool::new(true));
+        let observed_full_replay_for_route = observed_full_replay.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let hits = upstream_hits_for_route.clone();
+                let observed_full_replay = observed_full_replay_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let request = serde_json::from_slice::<Value>(&body).ok();
+                    let expected_input_items = [2, 3, 4, 4, 5]
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or_default();
+                    let is_full_replay = request.as_ref().is_some_and(|request| {
+                        request.get("previous_response_id").is_none()
+                            && request
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .is_some_and(|input| input.len() == expected_input_items)
+                            && request
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .is_some_and(|instructions| instructions.len() == 1_000_000)
+                            && (attempt < 2
+                                || request
+                                    .pointer("/input/3/output")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|output| output.len() == 40_000))
+                    });
+                    if !is_full_replay {
+                        observed_full_replay.store(false, Ordering::SeqCst);
+                    }
+                    let (response_id, input_tokens, cached_tokens) = match attempt {
+                        0 => ("resp_tool_base", 249_984, 249_856),
+                        1 => ("resp_tool_call", 250_112, 249_856),
+                        2 => ("resp_tool_output", 260_352, 249_856),
+                        3 => ("resp_tool_delivery", 260_352, 260_096),
+                        _ => ("resp_tool_after", 260_864, 260_096),
+                    };
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response"},
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": cached_tokens},
+                            },
+                        },
+                    });
+                    let response = format!(
+                        "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                        serde_json::to_string(&created).unwrap(),
+                        serde_json::to_string(&completed).unwrap(),
+                    );
+                    raw_response(200, "text/event-stream", response.into_bytes())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "megabyte-tool-tail-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-megabyte-tool-tail-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"megabyte-tool-session\",\"thread_id\":\"megabyte-tool-thread\",\"conversation_id\":\"megabyte-tool-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let stable_instructions = "s".repeat(1_000_000);
+        let mut tool_output = String::new();
+        while tool_output.len() < 40_000 {
+            tool_output.push_str(
+                "tool_result path=C:/synthetic/src/main.rs timestamp=2026-08-05T00:00:00Z hash=0123456789abcdef0123456789abcdef status=ok\n",
+            );
+        }
+        tool_output.truncate(40_000);
+        let request = |delivery_nonce: &str, shape: &str| {
+            let mut input = vec![
+                json!({"type": "message", "role": "developer", "content": "stable instructions"}),
+                json!({"type": "message", "role": "user", "content": "seed"}),
+            ];
+            if shape != "base" {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": "call_read",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"C:/synthetic/src/main.rs\"}",
+                }));
+            }
+            if matches!(shape, "tool-output" | "delivery-only" | "after-tool") {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": "call_read",
+                    "output": tool_output.as_str(),
+                }));
+            }
+            if shape == "after-tool" {
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "continue after the tool result",
+                }));
+            }
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "user": format!("delivery-user-{delivery_nonce}"),
+                    "metadata": {"delivery_nonce": delivery_nonce},
+                    "instructions": stable_instructions.as_str(),
+                    "input": input,
+                }))
+                .unwrap(),
+            )
+        };
+        for (delivery_nonce, shape) in [
+            ("base", "base"),
+            ("tool-call", "tool-call"),
+            ("tool-output", "tool-output"),
+            ("delivery-only", "delivery-only"),
+            ("after-tool", "after-tool"),
+        ] {
+            let response = handle_generation_for_agent(
+                state.clone(),
+                headers.clone(),
+                request(delivery_nonce, shape),
+                Channel::Responses,
+                Some("codex"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            )
+            .contains("response.completed"));
+            assert!(
+                state
+                    .relay_tasks
+                    .wait_for_idle(std::time::Duration::from_secs(2))
+                    .await
+            );
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 5);
+        assert!(
+            observed_full_replay.load(Ordering::SeqCst),
+            "all tool-history variants must remain one-shot HTTP FullReplay requests"
+        );
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 5 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all megabyte tool-history terminals must settle");
+        assert_eq!(metrics.agent_generation.inbound_requests, 5);
+        assert_eq!(metrics.agent_generation.generation_attempts, 5);
+        assert_eq!(metrics.upstream_requests, 5);
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+
+        let tool_call = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(250_112))
+            .expect("tool-call turn must be logged");
+        assert_eq!(tool_call.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(tool_call.cache_avoidable_gap_tokens, Some(0));
+        assert!(tool_call.tail_tool_call_chars.unwrap_or_default() > 0);
+
+        let tool_output_turn = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.input_tokens == Some(260_352) && request.cache_read_tokens == Some(249_856)
+            })
+            .expect("tool-output turn must be logged");
+        assert_eq!(tool_output_turn.cache_new_tail_gap_tokens, Some(10_240));
+        assert_eq!(tool_output_turn.cache_avoidable_gap_tokens, Some(0));
+        assert_eq!(tool_output_turn.tail_tool_output_chars, Some(40_000));
+        assert!(
+            tool_output_turn
+                .tail_tool_output_path_like_count
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(tool_output_turn
+            .tail_tool_output_noise_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains("path_like")));
+
+        let delivery_only = metrics
+            .recent_requests
+            .iter()
+            .find(|request| {
+                request.input_tokens == Some(260_352) && request.cache_read_tokens == Some(260_096)
+            })
+            .expect("delivery-only tool replay must be logged");
+        assert_eq!(delivery_only.cache_new_tail_gap_tokens, Some(0));
+        assert_eq!(delivery_only.cache_avoidable_gap_tokens, Some(0));
+
+        let after_tool = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(260_864))
+            .expect("post-tool user tail must be logged");
+        assert_eq!(after_tool.cache_new_tail_gap_tokens, Some(512));
+        assert_eq!(after_tool.cache_avoidable_gap_tokens, Some(0));
+        assert_eq!(after_tool.tail_tool_output_chars, Some(0));
+        assert!(after_tool.tail_message_chars.unwrap_or_default() > 0);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn small_tool_tail_direct_child_stays_immediate_without_extra_post() {
+        // Two balanced live cohorts found no aggregate cache gain from holding
+        // a one-character tool tail locally. Keep this edge on the immediate
+        // path while preserving the one-shot FullReplay and terminal metrics.
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let observed_full_replay = Arc::new(AtomicBool::new(true));
+        let observed_full_replay_for_route = observed_full_replay.clone();
+        let tool_tail_received_at = Arc::new(std::sync::Mutex::new(None));
+        let tool_tail_received_at_for_route = tool_tail_received_at.clone();
+        let quiet_child_elapsed = Arc::new(std::sync::Mutex::new(None));
+        let quiet_child_elapsed_for_route = quiet_child_elapsed.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |body: Bytes| {
+                let hits = upstream_hits_for_route.clone();
+                let observed_full_replay = observed_full_replay_for_route.clone();
+                let tool_tail_received_at = tool_tail_received_at_for_route.clone();
+                let quiet_child_elapsed = quiet_child_elapsed_for_route.clone();
+                async move {
+                    let attempt = hits.fetch_add(1, Ordering::SeqCst);
+                    let request = serde_json::from_slice::<Value>(&body).ok();
+                    let expected_input_items = [2, 4, 5].get(attempt).copied().unwrap_or_default();
+                    let is_full_replay = request.as_ref().is_some_and(|request| {
+                        request.get("previous_response_id").is_none()
+                            && request
+                                .get("input")
+                                .and_then(Value::as_array)
+                                .is_some_and(|input| input.len() == expected_input_items)
+                            && request
+                                .get("instructions")
+                                .and_then(Value::as_str)
+                                .is_some_and(|instructions| instructions.len() == 1_000_000)
+                    });
+                    if !is_full_replay {
+                        observed_full_replay.store(false, Ordering::SeqCst);
+                    }
+
+                    let (response_id, input_tokens, cached_tokens) = match attempt {
+                        0 => ("resp_small_tool_base", 249_984, 249_472),
+                        1 => {
+                            *tool_tail_received_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(std::time::Instant::now());
+                            ("resp_small_tool_tail", 251_264, 249_472)
+                        }
+                        _ => {
+                            let elapsed = tool_tail_received_at
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .as_ref()
+                                .map(std::time::Instant::elapsed)
+                                .unwrap_or_default();
+                            *quiet_child_elapsed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(elapsed);
+                            ("resp_small_tool_child", 251_392, 251_264)
+                        }
+                    };
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": response_id, "object": "response"},
+                    });
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": response_id,
+                            "status": "completed",
+                            "usage": {
+                                "input_tokens": input_tokens,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": cached_tokens},
+                            },
+                        },
+                    });
+                    let response = format!(
+                        "event: response.created\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
+                        serde_json::to_string(&created).unwrap(),
+                        serde_json::to_string(&completed).unwrap(),
+                    );
+                    raw_response(200, "text/event-stream", response.into_bytes())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "small-tool-maturity-provider";
+        let model_id = "gpt-5.5";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.cache = crate::config::CacheConfig::smart_max_hit();
+        // Keep the older generic prefix controller out of this fixture. The
+        // one-character tool edge must remain on the immediate path.
+        config.cache.mode = CacheMode::PassiveWarm;
+        config.providers[0].models = vec![ModelConfig {
+            id: model_id.to_string(),
+            request_model_id: None,
+            display_name: model_id.to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-small-tool-maturity-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = {
+            let mut headers = test_local_auth_headers();
+            headers.insert(
+                X_CODEX_TURN_METADATA_HEADER,
+                HeaderValue::from_static(
+                    "{\"session_id\":\"small-tool-session\",\"thread_id\":\"small-tool-thread\",\"conversation_id\":\"small-tool-conversation\",\"request_kind\":\"turn\"}",
+                ),
+            );
+            headers
+        };
+        let stable_instructions = "s".repeat(1_000_000);
+        // Exercise the lowest observed tool-result boundary without inflating
+        // it into a larger synthetic case.
+        let small_tool_output = "x";
+        let request = |shape: &str| {
+            let mut input = vec![
+                json!({"type": "message", "role": "developer", "content": "stable"}),
+                json!({"type": "message", "role": "user", "content": "seed"}),
+            ];
+            if shape != "base" {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": "call_small",
+                    "name": "small_tool",
+                    "arguments": "{}",
+                }));
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": "call_small",
+                    "output": small_tool_output,
+                }));
+            }
+            if shape == "quiet-child" {
+                input.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": "continue",
+                }));
+            }
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": model_id,
+                    "stream": true,
+                    "store": false,
+                    "user": "small-tool-user",
+                    "metadata": {"fixture": "small-tool-maturity"},
+                    "instructions": stable_instructions.as_str(),
+                    "input": input,
+                }))
+                .unwrap(),
+            )
+        };
+        for shape in ["base", "tool-output", "quiet-child"] {
+            let response = handle_generation_for_agent(
+                state.clone(),
+                headers.clone(),
+                request(shape),
+                Channel::Responses,
+                Some("codex"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(String::from_utf8_lossy(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+            )
+            .contains("response.completed"));
+            assert!(
+                state
+                    .relay_tasks
+                    .wait_for_idle(std::time::Duration::from_secs(2))
+                    .await
+            );
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 3);
+        assert!(
+            observed_full_replay.load(Ordering::SeqCst),
+            "the immediate path must retain one-shot HTTP FullReplay"
+        );
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_requests.len() == 3 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all small-tool terminals must settle");
+        assert_eq!(metrics.agent_generation.inbound_requests, 3);
+        assert_eq!(metrics.agent_generation.generation_attempts, 3);
+        assert_eq!(metrics.upstream_requests, 3);
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_inbound_outcomes
+            .iter()
+            .all(|outcome| outcome.attempt_count == 1));
+
+        let tool_output = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(251_264))
+            .expect("small tool output must be logged");
+        assert_eq!(tool_output.tail_tool_output_chars, Some(1));
+        let quiet_child = metrics
+            .recent_requests
+            .iter()
+            .find(|request| request.input_tokens == Some(251_392))
+            .expect("quiet direct child must be logged");
+        assert_eq!(quiet_child.prefix_guard_wait_reason, None);
+        assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
+        assert_eq!(quiet_child.cache_read_tokens, Some(251_264));
+        assert_eq!(quiet_child.tail_tool_output_chars, Some(0));
+        let child_elapsed = quiet_child_elapsed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("mock must observe the direct child");
+        assert!(
+            child_elapsed < TokioDuration::from_millis(350),
+            "a one-character tool child must not receive an unproven local wait"
+        );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
     async fn forbidden_response_isolates_only_the_failed_key_and_uses_the_next_key() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let upstream_hits_for_route = upstream_hits.clone();
@@ -28591,6 +30820,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp_before_compaction".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([{"type":"message","role":"user","content":"old history"}]),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -32687,6 +34918,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp_old".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: json!([
                         { "type": "message", "role": "user", "content": "anchor" },
                         { "type": "message", "role": "assistant", "content": "covered" }
@@ -32745,6 +34978,8 @@ mod tests {
                     generation: 4,
                     parent_generation: Some(3),
                     response_id: "resp-proof".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: previous_input.clone(),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -32833,6 +35068,8 @@ mod tests {
                     generation: 7,
                     parent_generation: Some(6),
                     response_id: "resp-stable".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: previous_input.clone(),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),
@@ -34339,11 +36576,8 @@ mod tests {
         .await;
 
         assert_eq!(guard.wait_ms, 0);
-        assert_eq!(
-            guard.skip_reason.as_deref(),
-            Some("final_static_projection_changed")
-        );
-        assert_eq!(guard.source.as_deref(), Some("exact"));
+        assert_eq!(guard.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert!(guard.source.is_none());
         assert_eq!(
             static_wire_drift_transition(&[]),
             "frozen_static_projection_changed"
@@ -34427,6 +36661,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_full_replay_maturity_skip_is_explicit_and_never_uses_broad_state() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-maturity-not-applicable-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\0gpt-5.5\0responses\0compaction-no-broad-fallback";
+        let mut broad = prefix_state(64_512, 63_872, 512);
+        broad.responses_static_projection_digest = Some("same-static-shape".to_string());
+        state
+            .prefix_states
+            .lock()
+            .await
+            .insert(key.to_string(), broad);
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            true,
+            Some(responses_foreground_wait_cap()),
+            FinalResponsesStaticProjection::Observed(Some("same-static-shape")),
+            None,
+            Some("maturity_not_applicable_compaction"),
+        )
+        .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(
+            guard.skip_reason.as_deref(),
+            Some("maturity_not_applicable_compaction")
+        );
+        assert!(guard.source.is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn matching_final_scope_keeps_the_existing_bounded_prefix_wait() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -34498,6 +36773,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             true,
         )
         .await;
@@ -34522,7 +36798,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_parent_static_wire_drift_is_visible_and_does_not_inherit_a_wait() {
+    async fn same_parent_static_wire_variants_keep_independent_maturity_slots() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-static-drift-parent-{}",
@@ -34549,11 +36825,8 @@ mod tests {
         )
         .await;
         assert_eq!(guard_before.wait_ms, 0);
-        assert_eq!(
-            guard_before.skip_reason.as_deref(),
-            Some("final_static_projection_changed")
-        );
-        assert_eq!(guard_before.source.as_deref(), Some("exact"));
+        assert_eq!(guard_before.skip_reason.as_deref(), Some("no_prefix_state"));
+        assert!(guard_before.source.is_none());
 
         let usage = UsageRecord {
             input_tokens: 101_024,
@@ -34579,24 +36852,29 @@ mod tests {
             false,
             false,
             None,
+            false,
             true,
         )
         .await;
-        assert!(observed.static_wire_drift);
-        assert_eq!(
-            observed.static_wire_drift_transition.as_deref(),
-            Some("frozen_static_projection_changed")
+        assert!(
+            !observed.static_wire_drift,
+            "B must create its own baseline rather than observe through A"
         );
 
         let learned = state
             .prefix_maturity_scopes
             .lock()
             .await
-            .get(key, parent)
-            .expect("the new static wire must replace only this parent scope");
+            .get(key, parent, Some("static-b"))
+            .expect("the new static wire must publish its own maturity state");
         assert_eq!(
             learned.responses_static_projection_digest.as_deref(),
             Some("static-b")
+        );
+        assert_eq!(
+            state.prefix_maturity_scopes.lock().await.len(),
+            2,
+            "A and B must remain independent bounded maturity siblings"
         );
         let guard_after = wait_for_provider_prefix_settle_on_final_wire(
             &state,
@@ -34612,6 +36890,27 @@ mod tests {
         .await;
         assert!(guard_after.wait_ms > 0);
         assert_eq!(guard_after.source.as_deref(), Some("exact"));
+
+        // A static shape is an exact cache namespace, not a reason to discard
+        // a previously verified sibling. Returning to A must recover A's
+        // mature receipt without lending B's waterline to it.
+        let guard_a_return = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("static-a")),
+            Some(parent),
+        )
+        .await;
+        assert!(
+            guard_a_return.wait_ms > 0,
+            "A must retain its mature sibling slot after B settles"
+        );
+        assert_eq!(guard_a_return.source.as_deref(), Some("exact"));
         fs::remove_dir_all(dir).ok();
     }
 
@@ -34723,6 +37022,7 @@ mod tests {
             false,
             None,
             false,
+            false,
         )
         .await;
         assert!(observed.previous.is_some());
@@ -34765,6 +37065,700 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_same_parent_lineage_rejection_keeps_winner_maturity_scope() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-late-sibling-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0late-sibling";
+        let parent = "shared-parent";
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+
+        // The winner settles the exact frozen wire and publishes maturity.
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+            Some(parent),
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+        )
+        .await;
+
+        // A concurrent sibling reaches a successful terminal result after the
+        // winner, but its lineage CAS is rejected. It has usable telemetry yet
+        // must not retire the winner's same-parent maturity receipt.
+        let stale_sibling = LineageCommitOutcome::Stale {
+            expected: 7,
+            actual: 8,
+        };
+        let stale_scope = FinalScopeWaterlineLog {
+            // This is the shape emitted by the real late sibling path: the
+            // lineage CAS is stale while the final-scope ticket still has a
+            // root predecessor proof.  It must not retire the winner's
+            // already-settled maturity state.
+            outcome: "stale_generation".to_string(),
+            predecessor_proof: "root".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+        let preserve_winner = preserve_native_maturity_scope_after_non_authoritative_settlement(
+            Some(&stale_sibling),
+            Some(&stale_scope),
+            Some(&usage),
+        );
+        assert!(preserve_winner);
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            preserve_winner,
+            true,
+        )
+        .await;
+
+        let successor = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+        )
+        .await;
+        assert!(successor.wait_ms > 0);
+        assert_eq!(successor.source.as_deref(), Some("exact"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn settle_lock_busy_keeps_existing_maturity_scope() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-settle-lock-busy-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0settle-lock-busy";
+        let parent = "shared-parent";
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let mut winner = prefix_state(65_024, 64_512, 0);
+        winner.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, parent, winner).await;
+
+        // Lock contention is local telemetry loss, not evidence that the
+        // previous exact upstream cache receipt became unsafe. The successful
+        // lineage result and raw usage make this a non-authoritative terminal
+        // for the current scope.
+        let applied = LineageCommitOutcome::Applied { generation: 8 };
+        let lock_busy_scope = FinalScopeWaterlineLog {
+            outcome: "settle_lock_busy".to_string(),
+            predecessor_proof: "exact".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+        let preserve_winner = preserve_native_maturity_scope_after_non_authoritative_settlement(
+            Some(&applied),
+            Some(&lock_busy_scope),
+            Some(&usage),
+        );
+        assert!(
+            preserve_winner,
+            "a local final-waterline lock miss must not retire the old winner"
+        );
+
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            preserve_winner,
+            true,
+        )
+        .await;
+
+        let successor = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+        )
+        .await;
+        assert!(successor.wait_ms > 0);
+        assert_eq!(successor.source.as_deref(), Some("exact"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn begin_lock_busy_keeps_existing_maturity_scope_without_creating_one() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-begin-lock-busy-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0begin-lock-busy";
+        let parent = "shared-parent";
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let mut winner = prefix_state(65_024, 64_512, 0);
+        winner.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, parent, winner).await;
+
+        // Hold only the shadow ledger. The normal request path must still
+        // dispatch once, but terminal handling needs to know this was a local
+        // measurement miss rather than ordinary final-scope ineligibility.
+        let receipt = eligible_final_scope_receipt("begin-lock-busy-scope");
+        let predecessor = PredecessorProofReceipt::root(81, 1);
+        assert!(final_scope_predecessor_is_maturity_safe(&predecessor));
+        let ledger_guard = state.final_scope_waterlines.lock().unwrap();
+        let begin =
+            begin_final_scope_waterline_with_status(&state, Some(&receipt), true, predecessor);
+        drop(ledger_guard);
+        assert!(begin.ticket.is_none());
+        assert!(begin.lock_busy);
+
+        let preserve_winner = preserve_native_maturity_scope_after_begin_lock_busy(
+            begin.lock_busy,
+            true,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert!(preserve_winner);
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            preserve_winner,
+            true,
+        )
+        .await;
+
+        let successor = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+        )
+        .await;
+        assert!(successor.wait_ms > 0);
+        assert_eq!(successor.source.as_deref(), Some("exact"));
+
+        // A lock miss preserves a prior winner only. It must never promote
+        // this request's raw usage into a new maturity scope.
+        let absent_key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0begin-lock-absent";
+        let absent_parent = "absent-parent";
+        observe_provider_prefix_usage(
+            &state,
+            Some(absent_key),
+            None,
+            Some(&usage),
+            Some(&usage),
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(absent_parent),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            preserve_winner,
+            true,
+        )
+        .await;
+        assert!(state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .get(absent_key, absent_parent, Some("stable-wire"))
+            .is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn begin_lock_busy_maturity_preservation_fails_closed_for_unsafe_terminals() {
+        assert!(preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, false, false, true, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            false, true, false, false, true, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            true, false, false, false, true, true,
+        ));
+        assert!(preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, false, false, true, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, true, false, true, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, false, true, true, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, false, false, false, true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_begin_lock_busy(
+            true, true, false, false, true, false,
+        ));
+    }
+
+    #[test]
+    fn capacity_full_maturity_preservation_is_exact_and_fail_closed() {
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let mut scope = FinalScopeWaterlineLog {
+            outcome: "capacity_full".to_string(),
+            predecessor_proof: "exact".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+
+        assert!(preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            false,
+        ));
+        assert!(!preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        scope.continuity_reset = true;
+        assert!(!preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            true,
+        ));
+        scope.continuity_reset = false;
+        scope.predecessor_proof = "parent_mismatch".to_string();
+        assert!(!preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            true,
+        ));
+        scope.predecessor_proof = "exact".to_string();
+        scope.outcome = "settle_lock_busy".to_string();
+        assert!(!preserve_native_maturity_scope_after_capacity_full(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            true,
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_usage_settle_lock_busy_keeps_existing_maturity_scope_when_committed() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-maturity-no-usage-terminal-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0no-usage-terminal";
+        let parent = "shared-parent";
+        let mut winner = prefix_state(65_024, 64_512, 0);
+        winner.responses_static_projection_digest = Some("stable-wire".to_string());
+        seed_native_maturity_scope(&state, key, parent, winner).await;
+        let before = state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .get(key, parent, Some("stable-wire"))
+            .expect("the winner receipt must be seeded");
+        let terminal_scope = FinalScopeWaterlineLog {
+            outcome: "settle_lock_busy".to_string(),
+            predecessor_proof: "exact".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+        let preserve_winner = preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&terminal_scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert!(preserve_winner);
+
+        // A locally contended final-scope ledger can have no raw usage at all.
+        // It must not fabricate a new state, but the caller's already-verified
+        // winner receipt remains safe to use until its normal TTL expires.
+        observe_provider_prefix_usage(
+            &state,
+            Some(key),
+            None,
+            None,
+            None,
+            &TailInputDiagnostics::default(),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+            None,
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            false,
+            false,
+            None,
+            preserve_winner,
+            false,
+        )
+        .await;
+
+        let after = state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .get(key, parent, Some("stable-wire"))
+            .expect("a no-usage terminal must not erase the prior winner");
+        assert_eq!(after.finished_at, before.finished_at);
+
+        let successor = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some("stable-wire")),
+            Some(parent),
+        )
+        .await;
+        assert!(successor.wait_ms > 0);
+        assert_eq!(successor.source.as_deref(), Some("exact"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stale_sibling_maturity_preservation_fails_closed_for_unsafe_states() {
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let stale = LineageCommitOutcome::Stale {
+            expected: 7,
+            actual: 8,
+        };
+
+        let mut scope = FinalScopeWaterlineLog {
+            outcome: "stale_generation".to_string(),
+            predecessor_proof: "root".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+
+        assert!(
+            preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&stale),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        scope.continuity_reset = true;
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&stale),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        scope.continuity_reset = false;
+        scope.predecessor_proof = "parent_mismatch".to_string();
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&stale),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        scope.predecessor_proof = "root".to_string();
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&stale),
+                Some(&scope),
+                None,
+            )
+        );
+
+        scope.outcome = "settled".to_string();
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&stale),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        let applied = LineageCommitOutcome::Applied { generation: 8 };
+        scope.outcome = "settle_lock_busy".to_string();
+        scope.predecessor_proof = "exact".to_string();
+        assert!(
+            preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&applied),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        scope.continuity_reset = true;
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&applied),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+
+        scope.continuity_reset = false;
+        scope.predecessor_proof = "parent_mismatch".to_string();
+        assert!(
+            !preserve_native_maturity_scope_after_non_authoritative_settlement(
+                Some(&applied),
+                Some(&scope),
+                Some(&usage),
+            )
+        );
+    }
+
+    #[test]
+    fn no_usage_terminal_maturity_preservation_fails_closed_for_unsafe_states() {
+        let usage = UsageRecord {
+            input_tokens: 65_024,
+            cache_read_tokens: 64_512,
+            ..UsageRecord::default()
+        };
+        let mut scope = FinalScopeWaterlineLog {
+            outcome: "failed".to_string(),
+            predecessor_proof: "root".to_string(),
+            sent_prediction_eligible: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+
+        assert!(preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        scope.outcome = "missing_usage".to_string();
+        assert!(preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        scope.outcome = "settle_lock_busy".to_string();
+        assert!(preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            false,
+        ));
+
+        scope.outcome = "failed".to_string();
+        scope.continuity_reset = true;
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        scope.continuity_reset = false;
+        scope.predecessor_proof = "parent_mismatch".to_string();
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            true,
+            true,
+        ));
+
+        scope.predecessor_proof = "root".to_string();
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            Some(&usage),
+            false,
+            false,
+            true,
+            true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            true,
+            false,
+            true,
+            true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            true,
+            true,
+            true,
+        ));
+        assert!(!preserve_native_maturity_scope_after_no_usage_terminal(
+            Some(&scope),
+            None,
+            false,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[tokio::test]
     async fn local_full_replay_rejection_retires_only_its_own_maturity_scope() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -34781,7 +37775,7 @@ mod tests {
         scope_b.responses_static_projection_digest = Some("stable-wire".to_string());
         seed_native_maturity_scope(&state, key, "scope-b", scope_b).await;
 
-        retire_native_maturity_scope(&state, Some(key), Some("scope-a")).await;
+        retire_native_maturity_scope(&state, Some(key), Some("scope-a"), Some("stable-wire")).await;
 
         let a_after_local_rejection = wait_for_provider_prefix_settle_on_final_wire(
             &state,
@@ -34987,6 +37981,57 @@ mod tests {
         .await;
         assert_eq!(unsafe_tail.wait_ms, 0);
         assert_eq!(unsafe_tail.skip_reason.as_deref(), Some("no_avoidable_gap"));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn small_context_cold_read_does_not_wait_on_the_actual_prefix_settle_seam() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-small-cold-read-settle-seam-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let key = "share\\0gpt-5.5\\0responses\\0small-cold-read-seam";
+        let warm = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 16_000,
+            output_tokens: 1,
+            cache_read_tokens: 15_872,
+            cache_creation_tokens: 0,
+        };
+        update_provider_prefix_state(&state, Some(key), Some(&warm), false, false).await;
+
+        let cold_read = UsageRecord {
+            provider: "share".to_string(),
+            model: "gpt-5.5".to_string(),
+            input_tokens: 16_384,
+            output_tokens: 1,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        update_provider_prefix_state(&state, Some(key), Some(&cold_read), false, false).await;
+
+        let guard = wait_for_provider_prefix_settle(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &TailInputDiagnostics::default(),
+            false,
+            Some(responses_foreground_wait_cap()),
+        )
+        .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_ne!(
+            guard.reason.as_deref(),
+            Some("responses_recent_cold_read_settle")
+        );
+        assert_eq!(guard.skip_reason.as_deref(), Some("no_avoidable_gap"));
 
         fs::remove_dir_all(dir).ok();
     }
@@ -35658,6 +38703,7 @@ mod tests {
             false,
             false,
             None,
+            false,
             false,
         )
         .await;
@@ -38351,6 +41397,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_seed".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([{
                 "type": "message",
                 "role": "user",
@@ -38399,6 +41447,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_seed".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([{ "type": "message", "role": "user", "content": "before" }]),
             output_items: vec![json!({
                 "type": "message",
@@ -38432,6 +41482,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_seed".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([{ "type": "message", "role": "user", "content": "before" }]),
             output_items: vec![json!({
                 "type": "message",
@@ -38469,6 +41521,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_tool".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([{ "type": "message", "role": "user", "content": "inspect" }]),
             output_items: vec![json!({
                 "type": "function_call",
@@ -38516,6 +41570,8 @@ mod tests {
             generation: 1,
             parent_generation: None,
             response_id: "resp_seed".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
             input: json!([
                 { "type": "message", "role": "user", "content": "before" },
                 { "type": "message", "role": "user", "content": "old detail" }
@@ -38927,6 +41983,7 @@ mod tests {
         config.workspace_fingerprint = "workspace-test".to_string();
         let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "verified-third-party".to_string();
+        provider.prompt_cache_retention_enabled = true;
         provider.models = vec![ModelConfig {
             id: "gpt-5.5".to_string(),
             request_model_id: None,
@@ -39173,6 +42230,25 @@ mod tests {
                 wire.as_slice(),
                 serialize_responses_body_bytes_for_provider_prefix(body).as_slice(),
                 "attempt {} must be the final canonical frozen Responses wire",
+                attempt + 1
+            );
+        }
+        let stable_cache_key = captured[0]
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .expect("a native HTTP FullReplay must keep its generated cache placement")
+            .to_string();
+        for (attempt, body) in captured.iter().enumerate() {
+            assert_eq!(
+                body.get("prompt_cache_key").and_then(Value::as_str),
+                Some(stable_cache_key.as_str()),
+                "HTTP FullReplay attempt {} must preserve the same selected-realm cache placement even without an upstream delta",
+                attempt + 1
+            );
+            assert_eq!(
+                body.get("prompt_cache_retention").and_then(Value::as_str),
+                Some("24h"),
+                "HTTP FullReplay attempt {} must preserve the user-enabled retention control",
                 attempt + 1
             );
         }
@@ -41754,6 +44830,8 @@ mod tests {
                     generation: 1,
                     parent_generation: None,
                     response_id: "resp_old".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: false,
                     input: initial_input.clone(),
                     output_items: Vec::new(),
                     finished_at: Instant::now(),

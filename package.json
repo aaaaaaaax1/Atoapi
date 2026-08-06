@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.4.23",
+  "version": "1.4.25",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,6 +16,7 @@
     "test:key-pool-ui": "node scripts/test-graphite-key-pool-ui.mjs",
     "test:provider-auto-compaction-ui": "node scripts/test-provider-auto-compaction-ui.mjs",
     "test:provider-connection-path-ui": "node scripts/test-provider-connection-path-ui.mjs",
+    "test:provider-health-probe-ui": "node scripts/test-provider-health-probe-ui.mjs",
     "test:graphite-frame-protocol": "node scripts/test-graphite-frame-protocol.mjs",
     "test:isolated-wire-compat": "node scripts/verify-isolated-wire-compat.mjs",
     "test:isolated-wire-stress": "node scripts/verify-isolated-wire-compat.mjs --concurrency=12",

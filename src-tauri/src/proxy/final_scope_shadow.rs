@@ -174,6 +174,9 @@ mod tests {
                 wire_bytes: 1,
                 canonical_member_count: 1,
                 responses_static_projection_digest: Some("static-projection-a".to_string()),
+                responses_cache_maturity_static_projection_digest: Some(
+                    "continuation-static-projection-a".to_string(),
+                ),
                 atoapi_mutated_static_categories: Vec::new(),
                 outbound_prefix_fingerprints: None::<ResponsesWirePrefixFingerprints>,
             },

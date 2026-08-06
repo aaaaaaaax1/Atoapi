@@ -394,8 +394,14 @@ impl PrefixController {
         }
 
         let small_context_cold_read = small_context_cold_read_after_warm(input.previous, record);
-        let prefix_break_after_warm = small_context_cold_read
-            || provider_prefix_break_after_warm_state(input.previous, record)
+        // A small-context cold read is provider instability evidence, but it
+        // is not a useful maturity boundary. Waiting 500ms on the next
+        // ordinary request was measured to recover only a few tokens while
+        // adding visible latency. Keep the state transition for diagnosis,
+        // but reserve the foreground settle marker for a material prefix
+        // break, giant history, or a repeated giant cold read.
+        let prefix_break_after_warm =
+            provider_prefix_break_after_warm_state(input.previous, record)
                 && (record.input_tokens >= 32_000 || responses_tool_tail_burst(input.tail));
         let huge_dynamic_history_cold_read =
             responses_huge_dynamic_history_cold_read(record, input.tail);
@@ -407,7 +413,8 @@ impl PrefixController {
                 record,
                 input.retried_full_response,
             );
-        if prefix_break_after_warm
+        if small_context_cold_read
+            || prefix_break_after_warm
             || weak_full_retry_after_session_delta
             || huge_dynamic_history_cold_read
             || repeated_giant_cold_read
@@ -426,7 +433,9 @@ impl PrefixController {
                 small_gap_recovery_streak: 0,
                 recent_clean_tiny_gap_streak: 0,
                 cache_instability_score: 0,
-                settle_after_cold_read: true,
+                settle_after_cold_read: prefix_break_after_warm
+                    || huge_dynamic_history_cold_read
+                    || repeated_giant_cold_read,
                 tail_tool_output_chars: input.tail.tool_output_chars,
                 tail_largest_tool_output_chars: input.tail.largest_tool_output_chars,
                 tail_tool_output_noise_hint: input.tail.tool_output_noise_hint.clone(),

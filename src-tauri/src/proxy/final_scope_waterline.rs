@@ -17,7 +17,10 @@ use crate::metrics::{FinalScopeWaterlineLog, UsageRecord};
 pub(super) const FINAL_SCOPE_WATERLINE_BUCKET_TOKENS: u64 = 128;
 
 const DEFAULT_MAX_SCOPES: usize = 1_024;
-const DEFAULT_ENTRY_TTL: Duration = Duration::from_secs(15 * 60);
+// Keep final-wire waterlines through the same bounded idle window as the
+// prefix runtime ledger. This prevents a 21-minute idle gap from turning an
+// otherwise exact successor into a fresh no-prefix state.
+const DEFAULT_ENTRY_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 const FINAL_SCOPE_RECLAIM_BUDGET: usize = 8;
 
 const FINAL_SCOPE_PREDECESSOR_PROOF_VERSION: u8 = 1;
@@ -252,6 +255,14 @@ impl PredecessorProofReceipt {
         self.version == FINAL_SCOPE_PREDECESSOR_PROOF_VERSION
             && self.status == PredecessorProofStatus::Exact
             && self.head.is_some()
+    }
+
+    pub(super) fn is_maturity_safe(&self) -> bool {
+        self.version == FINAL_SCOPE_PREDECESSOR_PROOF_VERSION
+            && matches!(
+                self.status,
+                PredecessorProofStatus::Root | PredecessorProofStatus::Exact
+            )
     }
 }
 
@@ -1089,6 +1100,64 @@ mod tests {
         assert_eq!(state.dispatch_seq, older.dispatch_seq);
         assert_eq!(state.observed_cache_read_tokens, 1_024);
         assert_eq!(state.settled_prefix_bucket_tokens_128, 1_024);
+    }
+
+    #[test]
+    fn default_ledger_retains_exact_waterline_through_a_twenty_one_minute_idle_gap() {
+        let now = Instant::now();
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let first = ledger
+            .try_begin_at("idle-gap-scope", true, true, now)
+            .expect("initial ticket");
+        ledger
+            .settle_at(
+                &first,
+                WaterlineSettlement::successful(&usage(65_536, 65_024)),
+                now,
+            )
+            .expect("initial usage settles");
+
+        let successor = ledger
+            .try_begin_at(
+                "idle-gap-scope",
+                true,
+                true,
+                now + Duration::from_secs(21 * 60),
+            )
+            .expect("a two-hour ledger retains this exact scope");
+
+        assert!(successor.prior_waterlines.is_some());
+        assert!(successor.prior_settlement_age_ms.unwrap_or_default() >= 21 * 60 * 1_000);
+    }
+
+    #[test]
+    fn default_ledger_expires_an_idle_scope_after_its_two_hour_bound() {
+        let now = Instant::now();
+        let mut ledger = FinalScopeWaterlineLedger::default();
+        let first = ledger
+            .try_begin_at("expired-idle-scope", true, true, now)
+            .expect("initial ticket");
+        ledger
+            .settle_at(
+                &first,
+                WaterlineSettlement::successful(&usage(65_536, 65_024)),
+                now,
+            )
+            .expect("initial usage settles");
+
+        let successor = ledger
+            .try_begin_at(
+                "expired-idle-scope",
+                true,
+                true,
+                now + DEFAULT_ENTRY_TTL + Duration::from_millis(1),
+            )
+            .expect("a new ticket remains dispatchable after expiry");
+
+        assert!(
+            successor.prior_waterlines.is_none(),
+            "the bounded ledger must not retain a stale full-replay waterline indefinitely"
+        );
     }
 
     #[test]

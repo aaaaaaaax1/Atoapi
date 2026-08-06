@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -39,6 +39,9 @@ type CommandResult<T> = Result<T, String>;
 const ERROR_BODY_MAX_CHARS: usize = 512;
 const PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
 const KEY_POOL_HEALTH_CONCURRENCY: usize = 4;
+const PROVIDER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+const PROVIDER_HEALTH_PROBE_PREVIEW_MAX_CHARS: usize = 160;
 const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/api/claudecode",
     "/api/anthropic",
@@ -107,6 +110,132 @@ pub struct ProviderKeyTestResult {
     pub ok: bool,
     pub message: String,
     pub models_count: usize,
+}
+
+/// Explicit management-only probe variants. These use the standard upstream
+/// request shapes without entering the normal relay, routing, or cache path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthProbeMode {
+    ResponsesStreaming,
+    ChatStreaming,
+    ChatJson,
+    ResponsesJson,
+}
+
+impl ProviderHealthProbeMode {
+    fn is_streaming(&self) -> bool {
+        matches!(self, Self::ResponsesStreaming | Self::ChatStreaming)
+    }
+
+    fn endpoint_channel(&self) -> Channel {
+        match self {
+            Self::ResponsesStreaming | Self::ResponsesJson => Channel::Responses,
+            Self::ChatStreaming | Self::ChatJson => Channel::Chat,
+        }
+    }
+}
+
+/// Which saved Key set an explicit management-only health probe may use.
+/// `Current` mirrors the next normal relay selection on a configuration clone,
+/// so it never advances the live Key-pool cursor or counters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthProbeTarget {
+    Current,
+    AllEnabled,
+    Selected,
+}
+
+impl Default for ProviderHealthProbeTarget {
+    fn default() -> Self {
+        // Preserve the previous command contract for callers that have not yet
+        // sent an explicit target. The provider-card UI now always sends
+        // `current` instead.
+        Self::AllEnabled
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthProbeInput {
+    pub provider_id: String,
+    /// Used only with `selected`; the explicit target owns empty-list meaning.
+    #[serde(default)]
+    pub key_ids: Vec<String>,
+    #[serde(default)]
+    pub target: ProviderHealthProbeTarget,
+    pub model: String,
+    pub mode: ProviderHealthProbeMode,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthProbeResult {
+    pub provider_id: String,
+    pub model: String,
+    pub mode: ProviderHealthProbeMode,
+    pub target: ProviderHealthProbeTarget,
+    pub elapsed_ms: u64,
+    pub results: Vec<ProviderHealthProbeKeyResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderHealthProbeKeyResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_response_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_version: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_preview: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBalanceProbeResult {
+    pub provider_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+    /// `false` means none of the bounded built-in protocol profiles exposed a
+    /// recognizable balance response. It is never a claim of zero balance.
+    pub supported: bool,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    pub elapsed_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+    pub message: String,
+}
+
+/// Built-in, read-only balance API shapes. These are protocol profiles, not
+/// provider-name branches: the selected base URL determines the candidate
+/// route and the JSON schema determines whether it is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderBalanceProbeProfile {
+    Sub2Usage,
+    NewApiTokenUsage,
+}
+
+impl ProviderBalanceProbeProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sub2Usage => "v1_usage",
+            Self::NewApiTokenUsage => "new_api_token_usage",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProviderBalanceProbeCandidate {
+    profile: ProviderBalanceProbeProfile,
+    endpoint: String,
 }
 
 /// Result of an editor-triggered connection test. Both direct and system
@@ -391,6 +520,16 @@ fn clone_provider_for_agent_config(
                 compact_mode.provider_id = cloned_id.clone();
                 compact_mode.updated_at = now;
                 config.provider_compact_modes.push(compact_mode);
+            }
+            if let Some(mut auto_compaction) = config
+                .provider_auto_compaction_limits
+                .iter()
+                .find(|item| item.provider_id == source_provider.id)
+                .cloned()
+            {
+                auto_compaction.provider_id = cloned_id.clone();
+                auto_compaction.updated_at = now;
+                config.provider_auto_compaction_limits.push(auto_compaction);
             }
             if let Some(mut channel_mode) = config
                 .provider_channel_modes
@@ -946,6 +1085,9 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
         .provider_compact_modes
         .retain(|item| item.provider_id != provider_id);
     config
+        .provider_auto_compaction_limits
+        .retain(|item| item.provider_id != provider_id);
+    config
         .provider_channel_modes
         .retain(|item| item.provider_id != provider_id);
     config
@@ -1104,6 +1246,109 @@ pub async fn test_provider_key_pool(
         .map_err(to_command_error)
 }
 
+/// Fetches models with the exact non-mutating Key selection used by the health
+/// modal. It intentionally does not fall back to the legacy connection-info
+/// Key when a Key pool is enabled.
+#[tauri::command]
+pub async fn fetch_provider_health_models(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<Vec<ModelConfig>> {
+    let input = health_probe_current_key_input_for_provider(state.inner(), provider_id.trim())
+        .await
+        .map_err(to_command_error)?;
+    let secret = input
+        .api_key
+        .as_deref()
+        .ok_or_else(|| "provider API key is not configured".to_string())?;
+    let client = state
+        .control_plane_upstream_client(input.use_system_proxy)
+        .await
+        .map_err(to_command_error)?;
+    fetch_models_from_upstream_with_options(
+        &client,
+        &input.base_url,
+        input.channel.clone(),
+        Some(secret),
+        input.is_full_url,
+        input.models_url.as_deref(),
+        input.custom_user_agent.as_deref(),
+    )
+    .await
+    .map_err(to_command_error)
+}
+
+/// Sends one explicit, bounded management probe per selected Key. These calls
+/// never enter normal relay routing and never mutate pool cursors, counters,
+/// health state, proxy settings, or cache state.
+#[tauri::command]
+pub async fn probe_provider_health(
+    state: State<'_, Arc<AppState>>,
+    input: ProviderHealthProbeInput,
+) -> CommandResult<ProviderHealthProbeResult> {
+    probe_provider_health_inner(state.inner(), input)
+        .await
+        .map_err(to_command_error)
+}
+
+async fn probe_provider_health_inner(
+    state: &AppState,
+    input: ProviderHealthProbeInput,
+) -> Result<ProviderHealthProbeResult> {
+    let provider_id = input.provider_id.trim().to_string();
+    let model = input.model.trim().to_string();
+    if provider_id.is_empty() {
+        return Err(anyhow!("provider id is required"));
+    }
+    if model.is_empty() {
+        return Err(anyhow!("请选择要测活的模型"));
+    }
+    let prompt = normalize_health_probe_prompt(input.prompt)?;
+    let target = input.target.clone();
+    let key_inputs =
+        health_probe_inputs_for_target(state, &provider_id, &target, &input.key_ids).await?;
+    let started = Instant::now();
+    let mode = input.mode.clone();
+    let mut outcomes = stream::iter(key_inputs.into_iter().enumerate().map(
+        |(index, key_input)| {
+            let state = state;
+            let model = model.clone();
+            let prompt = prompt.clone();
+            let mode = mode.clone();
+            async move {
+                let result =
+                    probe_provider_health_key(&state, key_input, &model, &mode, &prompt).await;
+                (index, result)
+            }
+        },
+    ))
+    .buffer_unordered(KEY_POOL_HEALTH_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    outcomes.sort_by_key(|(index, _)| *index);
+    Ok(ProviderHealthProbeResult {
+        provider_id,
+        model,
+        mode,
+        target,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        results: outcomes.into_iter().map(|(_, result)| result).collect(),
+    })
+}
+
+/// Balance probing is capability-driven: the request is sent only to a URL the
+/// user explicitly configured for this provider. Unsupported endpoints never
+/// alter Key state and are never treated as a zero balance.
+#[tauri::command]
+pub async fn probe_provider_balance(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<ProviderBalanceProbeResult> {
+    probe_provider_balance_inner(state.inner(), provider_id.trim())
+        .await
+        .map_err(to_command_error)
+}
+
 async fn test_provider_key_pool_inner(
     state: &AppState,
     provider_id: &str,
@@ -1189,6 +1434,805 @@ async fn test_provider_key_pool_inner(
     state.wait_for_config_snapshot(version).await?;
 
     Ok(outcomes.into_iter().map(|(_, result)| result).collect())
+}
+
+async fn health_probe_current_key_input_for_provider(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<ProviderKeyTestInput> {
+    let config = state.config.read().await;
+    health_probe_current_key_input_from_config(&config, provider_id)
+}
+
+fn health_probe_current_key_input_from_config(
+    config: &AppConfig,
+    provider_id: &str,
+) -> Result<ProviderKeyTestInput> {
+    let provider_id = provider_id.trim();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    // Resolve on a clone so opening the health modal cannot advance a
+    // sequential/round-robin Key pool or add ordinary request counters.
+    connection_path_test_input_from_config(
+        config,
+        &ProviderKeyTestInput {
+            provider_id: Some(provider_id.to_string()),
+            key_id: None,
+            api_key: None,
+            base_url: provider.base_url,
+            models_url: provider.models_url,
+            is_full_url: provider.is_full_url,
+            custom_user_agent: provider.custom_user_agent,
+            channel: provider.channel,
+            use_system_proxy: provider.use_system_proxy,
+        },
+    )
+}
+
+async fn health_probe_inputs_for_provider(
+    state: &AppState,
+    provider_id: &str,
+    key_ids: &[String],
+) -> Result<Vec<ProviderKeyTestInput>> {
+    let config = state.config.read().await;
+    health_probe_inputs_from_config(&config, provider_id, key_ids)
+}
+
+async fn health_probe_inputs_for_target(
+    state: &AppState,
+    provider_id: &str,
+    target: &ProviderHealthProbeTarget,
+    key_ids: &[String],
+) -> Result<Vec<ProviderKeyTestInput>> {
+    match target {
+        ProviderHealthProbeTarget::Current => Ok(vec![
+            health_probe_current_key_input_for_provider(state, provider_id).await?,
+        ]),
+        ProviderHealthProbeTarget::AllEnabled => {
+            health_probe_inputs_for_provider(state, provider_id, &[]).await
+        }
+        ProviderHealthProbeTarget::Selected => {
+            if key_ids.iter().all(|key_id| key_id.trim().is_empty()) {
+                return Err(anyhow!("select at least one saved Key to probe"));
+            }
+            health_probe_inputs_for_provider(state, provider_id, key_ids).await
+        }
+    }
+}
+
+fn health_probe_inputs_from_config(
+    config: &AppConfig,
+    provider_id: &str,
+    key_ids: &[String],
+) -> Result<Vec<ProviderKeyTestInput>> {
+    let provider_id = provider_id.trim();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("provider {provider_id} was not found"))?;
+    if !provider.enabled {
+        return Err(anyhow!("provider {} is disabled", provider.name));
+    }
+    let requested = key_ids
+        .iter()
+        .map(|key_id| key_id.trim())
+        .filter(|key_id| !key_id.is_empty())
+        .collect::<HashSet<_>>();
+    let now = Utc::now();
+    if let Some(pool) = config
+        .provider_key_pools
+        .iter()
+        .find(|pool| pool.provider_id == provider_id && pool.enabled)
+    {
+        let candidates = pool
+            .keys
+            .iter()
+            .filter(|key| {
+                key.enabled
+                    && key.key_encrypted.is_some()
+                    && key.disabled_until.map(|until| until <= now).unwrap_or(true)
+            })
+            .filter(|key| requested.is_empty() || requested.contains(key.id.as_str()))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Err(anyhow!(
+                "provider key pool has no enabled saved key to probe"
+            ));
+        }
+        if !requested.is_empty() && candidates.len() != requested.len() {
+            return Err(anyhow!(
+                "one or more selected Keys are disabled, cooling down, or unavailable"
+            ));
+        }
+        return candidates
+            .into_iter()
+            .map(|key| {
+                let secret = config
+                    .provider_key_secret(provider_id, &key.id)?
+                    .ok_or_else(|| anyhow!("selected provider Key is empty"))?;
+                Ok(ProviderKeyTestInput {
+                    provider_id: Some(provider_id.to_string()),
+                    key_id: Some(key.id.clone()),
+                    api_key: Some(secret),
+                    base_url: provider.base_url.clone(),
+                    models_url: provider.models_url.clone(),
+                    is_full_url: provider.is_full_url,
+                    custom_user_agent: provider.custom_user_agent.clone(),
+                    channel: provider.channel.clone(),
+                    use_system_proxy: provider.use_system_proxy,
+                })
+            })
+            .collect();
+    }
+    if !requested.is_empty() {
+        return Err(anyhow!("this provider does not have an enabled Key pool"));
+    }
+    let secret = config
+        .provider_api_key(provider_id)?
+        .ok_or_else(|| anyhow!("provider API key is not configured"))?;
+    Ok(vec![ProviderKeyTestInput {
+        provider_id: Some(provider_id.to_string()),
+        key_id: None,
+        api_key: Some(secret),
+        base_url: provider.base_url,
+        models_url: provider.models_url,
+        is_full_url: provider.is_full_url,
+        custom_user_agent: provider.custom_user_agent,
+        channel: provider.channel,
+        use_system_proxy: provider.use_system_proxy,
+    }])
+}
+
+fn normalize_health_probe_prompt(prompt: Option<String>) -> Result<String> {
+    let prompt = prompt.unwrap_or_else(|| "hi".to_string());
+    let prompt = if prompt.trim().is_empty() {
+        "hi".to_string()
+    } else {
+        prompt
+    };
+    if prompt.chars().count() > 2_000 {
+        return Err(anyhow!("测活内容最多 2000 个字符"));
+    }
+    Ok(prompt)
+}
+
+async fn probe_provider_health_key(
+    state: &AppState,
+    input: ProviderKeyTestInput,
+    model: &str,
+    mode: &ProviderHealthProbeMode,
+    prompt: &str,
+) -> ProviderHealthProbeKeyResult {
+    let started = Instant::now();
+    let key_id = input.key_id.clone();
+    let Some(secret) = input.api_key.as_deref() else {
+        return failed_health_probe_result(key_id, started, "key_missing");
+    };
+    let endpoint = health_probe_endpoint_url(&input.base_url, &mode.endpoint_channel());
+    let Ok(endpoint) = endpoint else {
+        return failed_health_probe_result(key_id, started, "invalid_endpoint");
+    };
+    let client = match state
+        .control_plane_upstream_client(input.use_system_proxy)
+        .await
+    {
+        Ok(client) => client,
+        Err(_) => return failed_health_probe_result(key_id, started, "client_unavailable"),
+    };
+    let request_body = health_probe_request_body(mode, model, prompt);
+    // A management probe must negotiate the same upstream protocol identity
+    // as a normal relay request. In particular, several compatible gateways
+    // require `x-api-key`, SSE `Accept`, the stable User-Agent, or identity
+    // encoding before they emit their normal terminal frames.
+    let request = client
+        .post(endpoint)
+        .headers(proxy::build_management_probe_headers(
+            secret,
+            &input.channel,
+            mode.is_streaming(),
+            input.custom_user_agent.as_deref(),
+        ))
+        .json(&request_body);
+    let response = match tokio::time::timeout(PROVIDER_HEALTH_PROBE_TIMEOUT, request.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => return failed_health_probe_result(key_id, started, "transport_error"),
+        Err(_) => return failed_health_probe_result(key_id, started, "request_timeout"),
+    };
+    let status = response.status();
+    let http_version = Some(format!("{:?}", response.version()));
+    if !status.is_success() {
+        return ProviderHealthProbeKeyResult {
+            key_id,
+            ok: false,
+            status: Some(status.as_u16()),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            first_response_ms: None,
+            http_version,
+            message: format!("HTTP {}", status.as_u16()),
+            response_preview: None,
+        };
+    }
+    match read_health_probe_response(response, mode, started).await {
+        Ok(observation) => ProviderHealthProbeKeyResult {
+            key_id,
+            ok: true,
+            status: Some(status.as_u16()),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            first_response_ms: observation.first_response_ms,
+            http_version,
+            message: if mode.is_streaming() {
+                "stream_completed".to_string()
+            } else {
+                "response_received".to_string()
+            },
+            response_preview: observation.response_preview,
+        },
+        Err(code) => ProviderHealthProbeKeyResult {
+            key_id,
+            ok: false,
+            status: Some(status.as_u16()),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            first_response_ms: None,
+            http_version,
+            message: code.to_string(),
+            response_preview: None,
+        },
+    }
+}
+
+fn failed_health_probe_result(
+    key_id: Option<String>,
+    started: Instant,
+    message: &str,
+) -> ProviderHealthProbeKeyResult {
+    ProviderHealthProbeKeyResult {
+        key_id,
+        ok: false,
+        status: None,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        first_response_ms: None,
+        http_version: None,
+        message: message.to_string(),
+        response_preview: None,
+    }
+}
+
+fn health_probe_endpoint_url(base_url: &str, channel: &Channel) -> Result<String> {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(anyhow!("base URL is empty"));
+    }
+    reqwest::Url::parse(trimmed)?;
+    let endpoint = channel.endpoint_path();
+    if trimmed.ends_with(endpoint)
+        || trimmed.ends_with("/chat/completions")
+        || trimmed.ends_with("/responses")
+        || trimmed.ends_with("/messages")
+    {
+        Ok(trimmed.to_string())
+    } else if trimmed.ends_with("/v1") {
+        Ok(format!("{trimmed}{endpoint}"))
+    } else {
+        Ok(format!("{trimmed}/v1{endpoint}"))
+    }
+}
+
+fn health_probe_request_body(mode: &ProviderHealthProbeMode, model: &str, prompt: &str) -> Value {
+    match mode {
+        ProviderHealthProbeMode::ResponsesStreaming => json!({
+            "model": model,
+            "input": prompt,
+            "stream": true,
+            "store": false,
+            "max_output_tokens": 16,
+        }),
+        ProviderHealthProbeMode::ResponsesJson => json!({
+            "model": model,
+            "input": prompt,
+            "stream": false,
+            "store": false,
+            "max_output_tokens": 16,
+        }),
+        ProviderHealthProbeMode::ChatStreaming => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": true,
+            "max_tokens": 16,
+        }),
+        ProviderHealthProbeMode::ChatJson => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": false,
+            "max_tokens": 16,
+        }),
+    }
+}
+
+struct HealthProbeResponseObservation {
+    first_response_ms: Option<u64>,
+    response_preview: Option<String>,
+}
+
+async fn read_health_probe_response(
+    response: reqwest::Response,
+    mode: &ProviderHealthProbeMode,
+    started: Instant,
+) -> Result<HealthProbeResponseObservation> {
+    let mode = mode.clone();
+    tokio::time::timeout(PROVIDER_HEALTH_PROBE_TIMEOUT, async move {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        let mut first_response_ms = None;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow!("response_read_error"))?;
+            if first_response_ms.is_none() && !chunk.is_empty() {
+                first_response_ms = Some(started.elapsed().as_millis() as u64);
+            }
+            let remaining = PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES.saturating_sub(body.len());
+            if remaining == 0 {
+                return Err(anyhow!("response_too_large"));
+            }
+            let accepted = chunk.len().min(remaining);
+            body.extend_from_slice(&chunk[..accepted]);
+            let text = String::from_utf8_lossy(&body);
+            if health_probe_stream_failed(&text) {
+                return Err(anyhow!("upstream_stream_error"));
+            }
+            if mode.is_streaming() && health_probe_stream_completed(&text, &mode) {
+                return Ok(HealthProbeResponseObservation {
+                    first_response_ms,
+                    response_preview: health_probe_preview(&text),
+                });
+            }
+            if chunk.len() > accepted {
+                return Err(anyhow!("response_too_large"));
+            }
+        }
+        let text = String::from_utf8_lossy(&body);
+        if mode.is_streaming() {
+            if health_probe_stream_failed(&text) {
+                return Err(anyhow!("upstream_stream_error"));
+            }
+            if !health_probe_stream_completed(&text, &mode) {
+                return Err(anyhow!("stream_incomplete"));
+            }
+        } else if text.trim().is_empty() || health_probe_json_failed(&text) {
+            return Err(anyhow!("invalid_response"));
+        }
+        Ok(HealthProbeResponseObservation {
+            first_response_ms,
+            response_preview: health_probe_preview(&text),
+        })
+    })
+    .await
+    .map_err(|_| anyhow!("response_timeout"))?
+}
+
+fn health_probe_stream_completed(body: &str, mode: &ProviderHealthProbeMode) -> bool {
+    match mode {
+        ProviderHealthProbeMode::ResponsesStreaming => health_probe_sse_values(body).any(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind == "response.completed")
+                && !health_probe_value_failed(&value)
+        }),
+        ProviderHealthProbeMode::ChatStreaming => health_probe_sse_lines(body).any(|data| {
+            data == "[DONE]"
+                || serde_json::from_str::<Value>(data)
+                    .ok()
+                    .is_some_and(|value| {
+                        !health_probe_value_failed(&value)
+                            && health_probe_chat_finish_reason(&value)
+                    })
+        }),
+        _ => false,
+    }
+}
+
+fn health_probe_stream_failed(body: &str) -> bool {
+    health_probe_sse_values(body).any(|value| health_probe_value_failed(&value))
+}
+
+fn health_probe_json_failed(body: &str) -> bool {
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => health_probe_value_failed(&value),
+        Err(_) => true,
+    }
+}
+
+fn health_probe_sse_lines(body: &str) -> impl Iterator<Item = &str> {
+    body.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .filter(|data| !data.is_empty())
+}
+
+fn health_probe_sse_values(body: &str) -> impl Iterator<Item = Value> + '_ {
+    health_probe_sse_lines(body).filter_map(|data| serde_json::from_str::<Value>(data).ok())
+}
+
+/// Upstreams commonly include `"error": null` on a successful terminal
+/// response. Only a non-null error object, an explicit error event, or an
+/// explicit failed status is a probe failure.
+fn health_probe_value_failed(value: &Value) -> bool {
+    value
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "error" | "response.failed"))
+        || value.get("error").is_some_and(|error| !error.is_null())
+        || value
+            .pointer("/response/error")
+            .is_some_and(|error| !error.is_null())
+        || value
+            .pointer("/response/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| matches!(status, "failed" | "cancelled" | "incomplete"))
+}
+
+fn health_probe_chat_finish_reason(value: &Value) -> bool {
+    value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .is_some_and(|reason| !reason.trim().is_empty())
+        || value
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty())
+}
+
+fn health_probe_preview(body: &str) -> Option<String> {
+    let mut preview = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("data:").map(str::trim))
+        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+        .and_then(|value| health_probe_text_from_value(&value))
+        .or_else(|| {
+            serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|value| health_probe_text_from_value(&value))
+        });
+    if preview.is_none() {
+        preview = body
+            .lines()
+            .map(str::trim)
+            .find(|line| {
+                !line.is_empty() && !line.starts_with("event:") && !line.starts_with("data:")
+            })
+            .map(ToOwned::to_owned);
+    }
+    preview.and_then(|text| redact_health_probe_preview(&text))
+}
+
+fn health_probe_text_from_value(value: &Value) -> Option<String> {
+    for pointer in [
+        "/response/output/0/content/0/text",
+        "/output/0/content/0/text",
+        "/output_text",
+        "/choices/0/message/content",
+        "/choices/0/delta/content",
+        "/delta/text",
+        "/content/0/text",
+        "/content",
+    ] {
+        if let Some(text) = value.pointer(pointer).and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+    }
+    None
+}
+
+fn redact_health_probe_preview(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut output = String::new();
+    for ch in trimmed
+        .chars()
+        .take(PROVIDER_HEALTH_PROBE_PREVIEW_MAX_CHARS)
+    {
+        output.push(ch);
+    }
+    if trimmed.chars().count() > PROVIDER_HEALTH_PROBE_PREVIEW_MAX_CHARS {
+        output.push('…');
+    }
+    Some(output)
+}
+
+async fn probe_provider_balance_inner(
+    state: &AppState,
+    provider_id: &str,
+) -> Result<ProviderBalanceProbeResult> {
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        return Err(anyhow!("provider id is required"));
+    }
+    let current_key_input = {
+        let config = state.config.read().await;
+        health_probe_current_key_input_from_config(&config, provider_id)?
+    };
+    let started = Instant::now();
+    let secret = current_key_input
+        .api_key
+        .as_deref()
+        .ok_or_else(|| anyhow!("provider API key is not configured"))?;
+    let client = state
+        .control_plane_upstream_client(current_key_input.use_system_proxy)
+        .await?;
+    let candidates = balance_probe_candidates(&current_key_input.base_url)?;
+    let mut last_status = None;
+    for candidate in candidates {
+        let mut headers = proxy::build_management_probe_headers(
+            secret,
+            &current_key_input.channel,
+            false,
+            current_key_input.custom_user_agent.as_deref(),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        let request = client.get(&candidate.endpoint).headers(headers);
+        let response =
+            match tokio::time::timeout(PROVIDER_HEALTH_PROBE_TIMEOUT, request.send()).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(_)) => {
+                    return Ok(balance_probe_failure(
+                        provider_id,
+                        current_key_input.key_id,
+                        None,
+                        started,
+                        "transport_error",
+                        false,
+                    ));
+                }
+                Err(_) => {
+                    return Ok(balance_probe_failure(
+                        provider_id,
+                        current_key_input.key_id,
+                        None,
+                        started,
+                        "request_timeout",
+                        false,
+                    ));
+                }
+            };
+        let status = response.status();
+        last_status = Some(status.as_u16());
+        if !status.is_success() {
+            // A missing endpoint is the expected way to reject a generic
+            // profile. Permission, rate-limit, and server failures are real
+            // probe failures; do not create extra requests by guessing again.
+            if status.as_u16() == 404 {
+                continue;
+            }
+            return Ok(balance_probe_failure(
+                provider_id,
+                current_key_input.key_id,
+                Some(status.as_u16()),
+                started,
+                &format!("HTTP {}", status.as_u16()),
+                true,
+            ));
+        }
+        let body = read_limited_probe_body(response).await?;
+        let Some(value) = serde_json::from_slice::<Value>(&body).ok() else {
+            // A 200 HTML fallback is not a balance response. Try the next
+            // documented generic profile without recording the raw body.
+            continue;
+        };
+        if balance_response_failed(&value) {
+            return Ok(balance_probe_failure(
+                provider_id,
+                current_key_input.key_id,
+                Some(status.as_u16()),
+                started,
+                "upstream_balance_error",
+                true,
+            ));
+        }
+        if let Some(balance) = balance_display_for_profile(&value, candidate.profile) {
+            return Ok(ProviderBalanceProbeResult {
+                provider_id: provider_id.to_string(),
+                key_id: current_key_input.key_id,
+                supported: true,
+                ok: true,
+                status: Some(status.as_u16()),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                balance: Some(balance),
+                message: format!("balance_received:{}", candidate.profile.label()),
+            });
+        }
+    }
+    Ok(balance_probe_failure(
+        provider_id,
+        current_key_input.key_id,
+        last_status,
+        started,
+        "balance_api_not_detected",
+        false,
+    ))
+}
+
+fn balance_probe_failure(
+    provider_id: &str,
+    key_id: Option<String>,
+    status: Option<u16>,
+    started: Instant,
+    message: &str,
+    supported: bool,
+) -> ProviderBalanceProbeResult {
+    ProviderBalanceProbeResult {
+        provider_id: provider_id.to_string(),
+        key_id,
+        supported,
+        ok: false,
+        status,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        balance: None,
+        message: message.to_string(),
+    }
+}
+
+fn balance_probe_candidates(base_url: &str) -> Result<Vec<ProviderBalanceProbeCandidate>> {
+    let api_root = balance_probe_api_root(base_url)?;
+    let mut origin = api_root.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    let candidates = [
+        (
+            ProviderBalanceProbeProfile::Sub2Usage,
+            api_root.join("usage")?,
+        ),
+        (
+            ProviderBalanceProbeProfile::NewApiTokenUsage,
+            origin.join("api/usage/token")?,
+        ),
+    ];
+    let mut seen = HashSet::new();
+    Ok(candidates
+        .into_iter()
+        .filter_map(|(profile, endpoint)| {
+            let endpoint = endpoint.to_string();
+            seen.insert(endpoint.clone())
+                .then_some(ProviderBalanceProbeCandidate { profile, endpoint })
+        })
+        .collect())
+}
+
+fn balance_probe_api_root(base_url: &str) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(base_url.trim())?;
+    url.set_query(None);
+    url.set_fragment(None);
+    let mut segments = url
+        .path()
+        .split('/')
+        .filter(|segment| !segment.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    match segments.last().map(String::as_str) {
+        Some("responses" | "messages") => {
+            segments.pop();
+        }
+        Some("completions") if segments.iter().rev().nth(1).map(String::as_str) == Some("chat") => {
+            segments.pop();
+            segments.pop();
+        }
+        _ => {}
+    }
+    if !segments
+        .last()
+        .is_some_and(|segment| segment.eq_ignore_ascii_case("v1"))
+    {
+        segments.push("v1".to_string());
+    }
+    url.set_path(&format!("/{}{}", segments.join("/"), "/"));
+    Ok(url)
+}
+
+async fn read_limited_probe_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    tokio::time::timeout(PROVIDER_HEALTH_PROBE_TIMEOUT, async move {
+        let mut stream = response.bytes_stream();
+        let mut body = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| anyhow!("response_read_error"))?;
+            let remaining = PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES.saturating_sub(body.len());
+            if remaining == 0 || chunk.len() > remaining {
+                return Err(anyhow!("response_too_large"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    })
+    .await
+    .map_err(|_| anyhow!("response_timeout"))?
+}
+
+fn balance_response_failed(value: &Value) -> bool {
+    value.get("error").is_some_and(|error| !error.is_null())
+        || value
+            .get("success")
+            .and_then(Value::as_bool)
+            .is_some_and(|success| !success)
+}
+
+fn balance_display_for_profile(
+    value: &Value,
+    profile: ProviderBalanceProbeProfile,
+) -> Option<String> {
+    match profile {
+        // Sub2-style `GET /v1/usage`: direct balance/remaining fields are
+        // common, with compatible deployments sometimes nesting them.
+        ProviderBalanceProbeProfile::Sub2Usage => balance_display_at(
+            value,
+            &[
+                "/remaining",
+                "/balance",
+                "/quota/remaining",
+                "/data/remaining",
+                "/data/balance",
+                "/data/quota/remaining",
+            ],
+        ),
+        // New API reports unlimited status separately; numerical values are
+        // upstream quota units, so the UI must not invent a currency symbol.
+        ProviderBalanceProbeProfile::NewApiTokenUsage => {
+            if value
+                .pointer("/data/unlimited_quota")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Some("无限额度".to_string());
+            }
+            balance_display_at(
+                value,
+                &[
+                    "/data/total_available",
+                    "/data/remaining",
+                    "/data/balance",
+                    "/total_available",
+                    "/remaining",
+                    "/balance",
+                ],
+            )
+        }
+    }
+}
+
+fn balance_display_at(value: &Value, pointers: &[&str]) -> Option<String> {
+    pointers
+        .iter()
+        .find_map(|pointer| value.pointer(pointer))
+        .and_then(balance_scalar_display)
+}
+
+fn balance_scalar_display(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()
+                && trimmed.chars().count() <= 48
+                && trimmed.chars().all(|ch| {
+                    ch.is_ascii_digit()
+                        || matches!(ch, '.' | ',' | '-' | '+' | '$' | '¥' | '€' | '£' | ' ')
+                }))
+            .then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -2247,19 +3291,33 @@ fn model_list_request(
     api_key: Option<&str>,
     custom_user_agent: Option<&str>,
 ) -> reqwest::RequestBuilder {
-    let mut request = client.get(url);
+    upstream_authorized_request(client.get(url), channel, api_key, custom_user_agent)
+}
+
+fn upstream_authorized_request(
+    request: reqwest::RequestBuilder,
+    channel: &Channel,
+    api_key: Option<&str>,
+    custom_user_agent: Option<&str>,
+) -> reqwest::RequestBuilder {
     if let Some(api_key) = api_key {
-        request = request.bearer_auth(api_key);
-        if matches!(channel, Channel::Anthropic) {
-            request = request
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        }
+        return request.headers(proxy::build_management_probe_headers(
+            api_key,
+            channel,
+            false,
+            custom_user_agent,
+        ));
     }
-    if let Some(user_agent) = custom_user_agent {
-        request = request.header(reqwest::header::USER_AGENT, user_agent);
+    let user_agent = custom_user_agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(crate::ATOAPI_USER_AGENT);
+    let request = request.header(reqwest::header::USER_AGENT, user_agent);
+    if matches!(channel, Channel::Anthropic) {
+        request.header("anthropic-version", "2023-06-01")
+    } else {
+        request
     }
-    request
 }
 
 async fn fetch_models_from_upstream_with_options(
@@ -2858,6 +3916,420 @@ mod tests {
         assert_eq!(selected.api_key.as_deref(), Some("current-secret"));
         assert_eq!(selected.base_url, "https://draft.example/v1");
         assert_eq!(toml::to_string(&connection_test_snapshot).unwrap(), before);
+    }
+
+    #[test]
+    fn health_probe_model_selection_uses_a_pool_snapshot_without_advancing_it() {
+        use crate::config::{
+            KeyLoadBalanceStrategy, ProviderKeyInput, ProviderKeyPoolInput, ProviderKeyStatus,
+        };
+
+        let provider_id = "health-model-selection";
+        let mut config = AppConfig::default();
+        let mut provider = test_provider(provider_id);
+        provider.api_key_encrypted = Some("legacy-connection-secret".to_string());
+        config.providers.push(provider);
+        config
+            .upsert_provider_key_pool(
+                provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 3,
+                    recovery_minutes: 10,
+                    keys: vec![
+                        ProviderKeyInput {
+                            id: Some("saved-current-key".to_string()),
+                            alias: Some("主 Key".to_string()),
+                            key: Some("pool-current-secret".to_string()),
+                            enabled: true,
+                            priority: 5,
+                            status: ProviderKeyStatus::Healthy,
+                            total_requests: 7,
+                            successes: 7,
+                            failures: 0,
+                            last_checked_at: None,
+                            last_error: None,
+                            disabled_until: None,
+                        },
+                        ProviderKeyInput {
+                            id: Some("saved-next-key".to_string()),
+                            alias: Some("next Key".to_string()),
+                            key: Some("pool-next-secret".to_string()),
+                            enabled: true,
+                            priority: 5,
+                            status: ProviderKeyStatus::Healthy,
+                            total_requests: 8,
+                            successes: 8,
+                            failures: 0,
+                            last_checked_at: None,
+                            last_error: None,
+                            disabled_until: None,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let before = toml::to_string(&config).unwrap();
+
+        let input = health_probe_current_key_input_from_config(&config, provider_id).unwrap();
+
+        assert_eq!(input.key_id.as_deref(), Some("saved-current-key"));
+        assert_eq!(input.api_key.as_deref(), Some("pool-current-secret"));
+        let all = health_probe_inputs_from_config(&config, provider_id, &[]).unwrap();
+        assert_eq!(
+            all.iter()
+                .filter_map(|item| item.key_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["saved-current-key", "saved-next-key"],
+            "the all-Key action retains saved-list order while the card uses only Current"
+        );
+        assert_eq!(toml::to_string(&config).unwrap(), before);
+    }
+
+    #[test]
+    fn health_probe_accepts_a_successful_terminal_with_a_null_error_field() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"error\":null}}\n\n"
+        );
+        assert!(health_probe_stream_completed(
+            body,
+            &ProviderHealthProbeMode::ResponsesStreaming
+        ));
+        assert!(
+            !health_probe_stream_failed(body),
+            "a successful `error: null` terminal is not a stream error"
+        );
+        assert!(!health_probe_json_failed("{\"error\":null}"));
+    }
+
+    #[test]
+    fn built_in_balance_profiles_use_only_safe_api_roots_and_recognized_json() {
+        let candidates = balance_probe_candidates("https://upstream.example/v1/responses").unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].profile,
+            ProviderBalanceProbeProfile::Sub2Usage
+        );
+        assert_eq!(candidates[0].endpoint, "https://upstream.example/v1/usage");
+        assert_eq!(
+            candidates[1].profile,
+            ProviderBalanceProbeProfile::NewApiTokenUsage
+        );
+        assert_eq!(
+            candidates[1].endpoint,
+            "https://upstream.example/api/usage/token"
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({"balance": 0.74182673, "remaining": 0.74182673}),
+                ProviderBalanceProbeProfile::Sub2Usage,
+            )
+            .as_deref(),
+            Some("0.74182673")
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({"data": {"unlimited_quota": true}}),
+                ProviderBalanceProbeProfile::NewApiTokenUsage,
+            )
+            .as_deref(),
+            Some("无限额度")
+        );
+        assert!(balance_display_for_profile(
+            &json!({"status": "ok", "data": {"message": "no balance here"}}),
+            ProviderBalanceProbeProfile::Sub2Usage,
+        )
+        .is_none());
+        assert!(!balance_response_failed(&json!({"error": null})));
+        assert!(balance_response_failed(
+            &json!({"error": {"code": "denied"}})
+        ));
+    }
+
+    #[tokio::test]
+    async fn built_in_balance_probe_uses_the_current_key_and_stops_after_sub2_usage() {
+        use crate::config::{
+            KeyLoadBalanceStrategy, ProviderKeyInput, ProviderKeyPoolInput, ProviderKeyStatus,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let usage_requests = requests.clone();
+        let fallback_requests = requests.clone();
+        let upstream = axum::Router::new()
+            .route(
+                "/v1/usage",
+                axum::routing::get(move || {
+                    let requests = usage_requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(json!({"balance": 0.74182673, "remaining": 0.74182673}))
+                    }
+                }),
+            )
+            .route(
+                "/api/usage/token",
+                axum::routing::get(move || {
+                    let requests = fallback_requests.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "unexpected fallback",
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let provider_id = "built-in-balance";
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-built-in-balance-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut config = AppConfig::default();
+        let mut provider = test_provider(provider_id);
+        provider.base_url = format!("http://{address}/v1");
+        config.providers.push(provider);
+        config
+            .upsert_provider_key_pool(
+                provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 3,
+                    recovery_minutes: 10,
+                    keys: vec![ProviderKeyInput {
+                        id: Some("balance-current-key".to_string()),
+                        alias: Some("balance current".to_string()),
+                        key: Some("balance-probe-secret".to_string()),
+                        enabled: true,
+                        priority: 0,
+                        status: ProviderKeyStatus::Healthy,
+                        total_requests: 4,
+                        successes: 4,
+                        failures: 0,
+                        last_checked_at: None,
+                        last_error: None,
+                        disabled_until: None,
+                    }],
+                },
+            )
+            .unwrap();
+        let before = toml::to_string(&config).unwrap();
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            crate::cache::CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        let result = probe_provider_balance_inner(&state, provider_id)
+            .await
+            .unwrap();
+        assert!(result.supported);
+        assert!(result.ok);
+        assert_eq!(result.key_id.as_deref(), Some("balance-current-key"));
+        assert_eq!(result.balance.as_deref(), Some("0.74182673"));
+        assert_eq!(result.message, "balance_received:v1_usage");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a recognized Sub2 usage response must stop the bounded profile sequence"
+        );
+        assert_eq!(
+            toml::to_string(&*state.config.read().await).unwrap(),
+            before
+        );
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("balance-probe-secret"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_health_probe_checks_sse_completion_once_per_key_without_config_mutation() {
+        use crate::config::{
+            KeyLoadBalanceStrategy, ProviderKeyInput, ProviderKeyPoolInput, ProviderKeyStatus,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let requests_for_responses = requests.clone();
+        let requests_for_chat = requests.clone();
+        let upstream = axum::Router::new()
+            .route(
+                "/v1/responses",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let requests = requests_for_responses.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let model = body.get("model").and_then(Value::as_str).unwrap_or_default();
+                        if model == "blocked-model" {
+                            return (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"blocked\"}}\n\n".to_string(),
+                            );
+                        }
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"content\":[{\"text\":\"probe-response\"}]}]}}\n\n".to_string(),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let requests = requests_for_chat.clone();
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"probe-response\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
+                        )
+                    }
+                }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-health-probe-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let provider_id = "health-probe";
+        let mut config = AppConfig::default();
+        let mut provider = test_provider(provider_id);
+        provider.base_url = format!("http://{address}/v1");
+        provider.api_key_encrypted = Some("legacy-connection-secret".to_string());
+        config.providers.push(provider);
+        config
+            .upsert_provider_key_pool(
+                provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 3,
+                    recovery_minutes: 10,
+                    keys: vec![ProviderKeyInput {
+                        id: Some("probe-key".to_string()),
+                        alias: Some("测活 Key".to_string()),
+                        key: Some("probe-secret".to_string()),
+                        enabled: true,
+                        priority: 5,
+                        status: ProviderKeyStatus::Healthy,
+                        total_requests: 9,
+                        successes: 9,
+                        failures: 0,
+                        last_checked_at: None,
+                        last_error: None,
+                        disabled_until: None,
+                    }],
+                },
+            )
+            .unwrap();
+        let before = toml::to_string(&config).unwrap();
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            crate::cache::CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        let responses = probe_provider_health_inner(
+            &state,
+            ProviderHealthProbeInput {
+                provider_id: provider_id.to_string(),
+                key_ids: Vec::new(),
+                target: ProviderHealthProbeTarget::AllEnabled,
+                model: "health-model".to_string(),
+                mode: ProviderHealthProbeMode::ResponsesStreaming,
+                prompt: Some("private probe prompt".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(responses.results.len(), 1);
+        assert!(responses.results[0].ok);
+        assert_eq!(responses.results[0].key_id.as_deref(), Some("probe-key"));
+        assert_eq!(
+            responses.results[0].response_preview.as_deref(),
+            Some("probe-response")
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let serialized = serde_json::to_string(&responses).unwrap();
+        assert!(!serialized.contains("probe-secret"));
+        assert!(!serialized.contains("private probe prompt"));
+
+        let chat = probe_provider_health_inner(
+            &state,
+            ProviderHealthProbeInput {
+                provider_id: provider_id.to_string(),
+                key_ids: Vec::new(),
+                target: ProviderHealthProbeTarget::AllEnabled,
+                model: "health-model".to_string(),
+                mode: ProviderHealthProbeMode::ChatStreaming,
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(chat.results[0].ok);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+        let blocked = probe_provider_health_inner(
+            &state,
+            ProviderHealthProbeInput {
+                provider_id: provider_id.to_string(),
+                key_ids: Vec::new(),
+                target: ProviderHealthProbeTarget::AllEnabled,
+                model: "blocked-model".to_string(),
+                mode: ProviderHealthProbeMode::ResponsesStreaming,
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!blocked.results[0].ok);
+        assert_eq!(blocked.results[0].message, "upstream_stream_error");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+
+        let after = {
+            let config = state.config.read().await;
+            toml::to_string(&*config).unwrap()
+        };
+        assert_eq!(
+            after, before,
+            "explicit probes must not mutate Key routing state"
+        );
+
+        let balance = probe_provider_balance_inner(&state, provider_id)
+            .await
+            .unwrap();
+        assert!(!balance.supported);
+        assert!(!balance.ok);
+        assert_eq!(balance.message, "balance_api_not_detected");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "the health-route fixture only counts its three matching POST requests"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

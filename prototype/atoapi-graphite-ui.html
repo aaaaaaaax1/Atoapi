@@ -1061,6 +1061,171 @@
       display: block;
     }
 
+    .health-probe-dialog {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: min(760px, calc(100vw - 28px));
+      max-height: min(760px, calc(100vh - 28px));
+      transform: translate(-50%, -50%);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      overflow: hidden;
+      border: 1px solid rgba(132, 155, 238, 0.34);
+      border-radius: calc(var(--radius) + 2px);
+      background:
+        linear-gradient(130deg, rgba(122, 142, 255, 0.09), transparent 36%),
+        var(--surface);
+      box-shadow: 0 24px 86px rgba(0, 0, 0, 0.55);
+    }
+
+    .health-probe-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 20px 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .health-probe-head h2,
+    .health-probe-head p { margin: 0; }
+    .health-probe-head h2 { font-size: 15px; letter-spacing: 0.01em; }
+    .health-probe-head p { margin-top: 4px; color: var(--muted); font-size: 10px; }
+
+    .health-probe-body {
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 20px;
+    }
+
+    .health-probe-provider {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 12px;
+      align-items: center;
+      padding: 12px;
+      margin-bottom: 14px;
+      border: 1px solid rgba(118, 139, 206, 0.24);
+      border-radius: var(--radius-sm);
+      background: rgba(81, 101, 169, 0.09);
+    }
+
+    .health-probe-provider .health-probe-provider-icon {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid rgba(125, 144, 241, 0.42);
+      border-radius: 9px;
+      background: rgba(107, 129, 238, 0.16);
+      color: #b8c5ff;
+    }
+
+    .health-probe-provider b { display: block; font-size: 11px; }
+    .health-probe-provider small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; }
+
+    .health-probe-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 11px;
+    }
+
+    .health-probe-grid .field textarea {
+      min-height: 72px;
+    }
+
+    .health-probe-hint {
+      margin: 10px 0 0;
+      color: var(--faint);
+      font-size: 10px;
+      line-height: 1.55;
+    }
+
+    .health-probe-summary {
+      display: flex;
+      align-items: center;
+      min-height: 40px;
+      margin: 14px 0 0;
+      padding: 0 12px;
+      border: 1px solid rgba(104, 124, 175, 0.24);
+      border-radius: var(--radius-sm);
+      background: rgba(9, 16, 32, 0.52);
+      color: #aebce0;
+      font-size: 10px;
+    }
+
+    .health-probe-result {
+      margin-top: 12px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      background: rgba(8, 15, 30, 0.78);
+    }
+
+    .health-probe-result-head {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 38px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: #dce5ff;
+      font-size: 10px;
+      font-weight: 700;
+    }
+
+    .health-probe-result-list { display: grid; }
+
+    .health-probe-row {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      padding: 11px 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+    }
+
+    .health-probe-row:last-child { border-bottom: 0; }
+    .health-probe-icon { display: grid; place-items: center; padding-top: 1px; }
+    .health-probe-row.is-pass .health-probe-icon { color: var(--success); }
+    .health-probe-row.is-fail .health-probe-icon { color: var(--danger); }
+    .health-probe-row > div { min-width: 0; display: grid; gap: 4px; }
+    .health-probe-row b { color: var(--text); font-size: 10.5px; }
+    .health-probe-row small { color: var(--muted); font-family: "Cascadia Code", Consolas, monospace; font-size: 9.5px; line-height: 1.45; overflow-wrap: anywhere; }
+    .health-probe-row .health-probe-preview { color: #7ee1bb; font-family: inherit; }
+    .health-probe-empty { padding: 16px 12px; color: var(--muted); font-size: 10px; }
+
+    .health-probe-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 14px 20px;
+      border-top: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.014);
+    }
+
+    .balance-probe-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 20px;
+      max-width: 160px;
+      padding: 0 7px;
+      overflow: hidden;
+      border: 1px solid rgba(83, 201, 159, 0.26);
+      border-radius: 999px;
+      background: rgba(83, 201, 159, 0.07);
+      color: #9cdbbf;
+      cursor: pointer;
+      font-size: 9.5px;
+      line-height: 1;
+    }
+
+    .balance-probe-chip:hover { border-color: rgba(83, 201, 159, 0.5); background: rgba(83, 201, 159, 0.12); }
+    .balance-probe-chip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .health-probe-button { min-width: 58px; }
+
     .drawer {
       position: absolute;
       top: 0;
@@ -6706,7 +6871,7 @@
             <section class="panel" id="providerKeys" hidden>
               <div class="form-section">
                 <div class="form-section-head"><div><h3>多 Key 池</h3><p>开启后只使用此页 Key，并按负载均衡策略转发。</p></div><button class="switch" id="providerKeyPoolEnabled" type="button" role="switch" aria-checked="false" aria-label="启用多 Key 池"></button></div>
-                <div class="key-pool-actions"><button class="secondary-button" type="button" data-mock-action="全部 Key 测试通过"><i class="icon" data-lucide="flask-conical"></i>全部测试</button><button class="secondary-button" id="addKeyButton" type="button"><i class="icon" data-lucide="plus"></i>添加 Key</button></div>
+                <div class="key-pool-actions"><button class="secondary-button" id="testAllKeysHealthButton" type="button"><i class="icon" data-lucide="activity"></i>全部测活</button><button class="secondary-button" id="addKeyButton" type="button"><i class="icon" data-lucide="plus"></i>添加 Key</button></div>
                 <div class="form-grid">
                   <label class="field"><span>负载均衡</span><select><option>轮询</option><option>优先级</option><option>最低使用</option><option selected>顺序</option></select></label>
                   <label class="field"><span>失败阈值</span><input value="3" inputmode="numeric" autocomplete="off" /></label>
@@ -6723,7 +6888,7 @@
                 <div class="option-row"><div><b>prompt_cache_retention</b><small>第三方支持时保留</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="prompt cache retention"></button></div>
                 <div class="option-row"><div><b>非 SSE compact 兼容</b><small>仅兼容需要的上游</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="false" aria-label="非 SSE compact 兼容"></button></div>
                 <label class="field"><span>Codex 自动压缩阈值（tokens）</span><input id="providerAutoCompactTokenLimit" type="number" min="1" step="1" inputmode="numeric" placeholder="留空：使用 Codex/模型默认" autocomplete="off" /><small>填写正数后，在使用此上游的 Codex 路由上提前触发 Codex 原生压缩；不会为同一条消息额外发送上游请求。</small></label>
-                <label class="field"><span>自定义 User-Agent</span><input value="Atoapi/next" autocomplete="off" /></label>
+                <label class="field"><span>自定义 User-Agent</span><input placeholder="留空：自动使用当前 Atoapi 版本" autocomplete="off" /></label>
               </div>
             </section>
 
@@ -6744,6 +6909,37 @@
       <div class="drawer-body" id="requestDetailBody"></div>
       <footer class="drawer-foot"><button class="secondary-button" type="button" data-close="requestOverlay">关闭</button></footer>
     </aside>
+  </div>
+
+  <div class="overlay" id="healthProbeOverlay" aria-hidden="true">
+    <section class="health-probe-dialog" role="dialog" aria-modal="true" aria-labelledby="healthProbeTitle">
+      <header class="health-probe-head">
+        <div><h2 id="healthProbeTitle">上游测活</h2><p id="healthProbeSubtitle">选择模型和请求形态后，对启用 Key 执行一次独立测活。</p></div>
+        <button class="close-button" type="button" data-close="healthProbeOverlay" aria-label="关闭测活"><i class="icon" data-lucide="x"></i></button>
+      </header>
+      <div class="health-probe-body">
+        <div class="health-probe-provider">
+          <span class="health-probe-provider-icon"><i class="icon" data-lucide="activity"></i></span>
+          <div><b>实际请求测活</b><small>仅使用你手动选择的上游和当前代理设置；不会改路由、Key 顺序或缓存。</small></div>
+        </div>
+        <div class="health-probe-grid">
+          <label class="field"><span>选择测试模型</span><select id="healthProbeModelInput" aria-label="选择测试模型"><option value="">正在获取模型…</option></select></label>
+          <label class="field"><span>测试请求形态</span><select id="healthProbeModeInput" aria-label="测试请求形态"><option value="responses_streaming">Responses API（流式）</option><option value="chat_streaming">Chat Completions（流式）</option><option value="chat_json">Chat Completions（JSON）</option><option value="responses_json">Responses API（JSON）</option></select></label>
+          <label class="field wide"><span>测活发送内容</span><textarea id="healthProbePromptInput" aria-label="测活发送内容" spellcheck="false">hi</textarea><small>默认发送 hi。这里的内容只用于本次手动测活，不会写入正常会话、日志或 Key 配置。</small></label>
+        </div>
+        <p class="health-probe-hint">流式模式会等待标准完成帧；HTTP 200 但流内错误或未完成会明确显示为不通过。</p>
+        <div class="health-probe-summary" id="healthProbeSummary">准备就绪：每个启用 Key 只发送一次独立测活请求。</div>
+        <section class="health-probe-result" id="healthProbeResult" hidden aria-live="polite">
+          <header class="health-probe-result-head"><i class="icon" data-lucide="list-checks"></i>测活结果</header>
+          <div class="health-probe-result-list" id="healthProbeResultList"></div>
+        </section>
+      </div>
+      <footer class="health-probe-foot">
+        <button class="secondary-button" id="healthProbeRetryButton" type="button"><i class="icon" data-lucide="rotate-cw"></i>重试</button>
+        <button class="secondary-button" type="button" data-close="healthProbeOverlay">关闭</button>
+        <button class="primary-button" id="healthProbeRunButton" type="button"><i class="icon" data-lucide="activity"></i>开始测活</button>
+      </footer>
+    </section>
   </div>
 
   <div class="overlay" id="confirmOverlay" aria-hidden="true">

@@ -161,11 +161,11 @@ mod tests {
             plan.receipt().wire.wire_bytes,
             plan.request_plan().body_len() as u64
         );
-        assert!(plan
-            .receipt()
-            .wire
-            .atoapi_mutated_static_categories
-            .is_empty());
+        assert_eq!(
+            plan.receipt().wire.atoapi_mutated_static_categories,
+            vec!["cache_control".to_string()],
+            "the fixed diagnostic records Atoapi-owned cache-control roots without retaining values"
+        );
 
         let mut dispatch = plan.with_gzip_enabled(true).into_dispatch();
         assert!(dispatch.take_one_shot_plan().request_body_gzip_enabled());

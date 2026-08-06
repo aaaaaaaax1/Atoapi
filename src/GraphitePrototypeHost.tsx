@@ -73,7 +73,7 @@ const bridgeSource = String.raw`
     syncKeyPoolSecretInputs();
   };
   const pendingActions = new Map();
-  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
+  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "fetch-health-probe-models", "run-health-probe", "probe-provider-balance", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
     const requestId = "graphite-" + Date.now() + "-" + Math.random().toString(16).slice(2);
     const source = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
@@ -135,6 +135,11 @@ const bridgeSource = String.raw`
   let releaseChampionSequence = 0;
   let draggingProviderId = "";
   let keyPointerDrag = null;
+  let healthProbeProviderId = "";
+  let healthProbeKeyIds = [];
+  let healthProbeTarget = "current";
+  let healthProbeModels = [];
+  let healthProbePrompt = "hi";
 
   const trendController = () => window.__atoapiTrend;
 
@@ -684,6 +689,150 @@ const bridgeSource = String.raw`
     resultBand.hidden = false;
   }
 
+  function healthProbeModeLabel(mode) {
+    return ({
+      responses_streaming: "Responses API（流式）",
+      chat_streaming: "Chat Completions（流式）",
+      chat_json: "Chat Completions（JSON）",
+      responses_json: "Responses API（JSON）"
+    }[mode] || "Responses API（流式）");
+  }
+
+  function healthProbeKeyLabel(providerId, keyId) {
+    if (!keyId) return "连接信息 Key";
+    const key = host.state?.providerDetails?.[providerId]?.keys?.find((item) => item.id === keyId);
+    const masked = key?.preview || ("Key · …" + String(keyId).slice(-4));
+    return key?.alias ? key.alias + " · " + masked : masked;
+  }
+
+  function healthProbeSeedModels(providerId) {
+    const detail = host.state?.providerDetails?.[providerId] || {};
+    return (detail.models || []).map((item) => String(item.request_model_id || item.id || "").trim()).filter(Boolean);
+  }
+
+  function renderHealthProbeModels() {
+    const select = $bridge("#healthProbeModelInput");
+    if (!select) return;
+    const previous = select.value;
+    const candidates = [...new Set(healthProbeModels.map((item) => String(item || "").trim()).filter(Boolean))];
+    select.innerHTML = candidates.length
+      ? candidates.map((model) => '<option value="' + escape(model) + '">' + escape(model) + '</option>').join("")
+      : '<option value="">正在获取模型…</option>';
+    if (candidates.includes(previous)) select.value = previous;
+    else if (candidates.length) select.value = candidates[0];
+  }
+
+  function resetHealthProbeResult() {
+    const result = $bridge("#healthProbeResult");
+    const summary = $bridge("#healthProbeSummary");
+    if (result) result.hidden = true;
+    if (summary) summary.textContent = "准备就绪：每个启用 Key 只发送一次独立测活请求。";
+    const list = $bridge("#healthProbeResultList");
+    if (list) list.replaceChildren();
+  }
+
+  function openHealthProbe(providerId, target = "current", keyIds = []) {
+    const provider = providers.find((item) => item.id === providerId);
+    if (!provider) {
+      showToast("未找到待测活上游");
+      return;
+    }
+    healthProbeProviderId = providerId;
+    healthProbeTarget = target === "all_enabled" || target === "selected" ? target : "current";
+    healthProbeKeyIds = Array.isArray(keyIds) ? keyIds.filter(Boolean) : [];
+    healthProbeModels = healthProbeSeedModels(providerId);
+    const title = $bridge("#healthProbeTitle");
+    const subtitle = $bridge("#healthProbeSubtitle");
+    const mode = $bridge("#healthProbeModeInput");
+    const prompt = $bridge("#healthProbePromptInput");
+    if (title) title.textContent = healthProbeTarget === "current" ? "当前 Key 测活" : (healthProbeTarget === "all_enabled" ? "全部 Key 测活" : "指定 Key 测活");
+    if (subtitle) subtitle.textContent = provider.name + " · " + (healthProbeTarget === "current" ? "当前可用 Key" : (healthProbeTarget === "all_enabled" ? "全部启用 Key" : "指定 Key"));
+    if (mode) {
+      const channel = host.state?.providerDetails?.[providerId]?.channel;
+      mode.value = channel === "chat" ? "chat_streaming" : "responses_streaming";
+    }
+    if (prompt) prompt.value = healthProbePrompt || "hi";
+    renderHealthProbeModels();
+    resetHealthProbeResult();
+    openOverlay("healthProbeOverlay");
+    hydrateIcons();
+    send("fetch-health-probe-models", { providerId });
+  }
+
+  function runHealthProbe() {
+    const model = $bridge("#healthProbeModelInput")?.value.trim() || "";
+    const mode = $bridge("#healthProbeModeInput")?.value || "responses_streaming";
+    const prompt = $bridge("#healthProbePromptInput")?.value ?? "hi";
+    healthProbePrompt = prompt || "hi";
+    if (!healthProbeProviderId) {
+      showToast("请先选择上游");
+      return;
+    }
+    if (!model) {
+      showToast("请等待模型获取完成或选择模型");
+      return;
+    }
+    const summary = $bridge("#healthProbeSummary");
+    if (summary) summary.textContent = "正在测活：请求不会进入正常 Codex 转发链路。";
+    send("run-health-probe", {
+      providerId: healthProbeProviderId,
+      keyIds: healthProbeKeyIds,
+      target: healthProbeTarget,
+      modelId: model,
+      mode,
+      prompt
+    });
+  }
+
+  function applyHealthProbeModels(models) {
+    if (!Array.isArray(models)) return;
+    healthProbeModels = models.map((item) => String(item?.id || "").trim()).filter(Boolean);
+    renderHealthProbeModels();
+  }
+
+  function applyHealthProbeResult(result) {
+    if (!result || String(result.provider_id || "") !== healthProbeProviderId) return;
+    const results = Array.isArray(result.results) ? result.results : [];
+    const passed = results.filter((item) => item?.ok === true).length;
+    const summary = $bridge("#healthProbeSummary");
+    const resultPanel = $bridge("#healthProbeResult");
+    const list = $bridge("#healthProbeResultList");
+    if (summary) summary.textContent = "测活完成：" + passed + "/" + results.length + " 通过 · 总耗时 " + Number(result.elapsed_ms || 0) + "ms";
+    if (list) {
+      list.innerHTML = results.map((item) => {
+        const ok = item?.ok === true;
+        const key = healthProbeKeyLabel(healthProbeProviderId, item?.key_id);
+        const status = item?.status ? "HTTP " + item.status : "无 HTTP 状态";
+        const transport = item?.http_version ? " · " + item.http_version : "";
+        const first = Number.isFinite(Number(item?.first_response_ms)) ? " · 首响应 " + item.first_response_ms + "ms" : "";
+        const preview = item?.response_preview ? '<small class="health-probe-preview">' + escape(item.response_preview) + '</small>' : "";
+        return '<article class="health-probe-row ' + (ok ? "is-pass" : "is-fail") + '">'
+          + '<span class="health-probe-icon">' + icon(ok ? "circle-check" : "circle-x", 16) + '</span>'
+          + '<div><b>' + escape(key) + " · " + (ok ? "通过" : "不通过") + '</b><small>'
+          + escape(status + " · " + Number(item?.elapsed_ms || 0) + "ms" + transport + first + " · " + String(item?.message || ""))
+          + '</small>' + preview + '</div></article>';
+      }).join("") || '<div class="health-probe-empty">没有可测活的启用 Key。</div>';
+    }
+    if (resultPanel) resultPanel.hidden = false;
+    hydrateIcons();
+  }
+
+  function balanceProbeLabel(result) {
+    if (!result) return "余额";
+    if (result.ok && result.balance) return "余额 " + result.balance;
+    if (result.supported === false) return "余额不可查";
+    return "余额探测失败";
+  }
+
+  function applyBalanceProbe(result) {
+    if (!result?.provider_id) return;
+    const provider = providers.find((item) => item.id === result.provider_id);
+    if (!provider) return;
+    provider.balance = result;
+    renderProviders();
+    hydrateIcons();
+  }
+
   function activeRequestScope(metric) {
     const scopes = Array.isArray(metric?.scopes) ? metric.scopes : [];
     if (!scopes.length) return {
@@ -968,6 +1117,9 @@ const bridgeSource = String.raw`
       if (message.payload?.keyPoolHealth) mergeKeyPoolHealth(message.payload.keyPoolHealth);
       if (message.payload?.networkDiagnostic) applyNetworkDiagnostic(message.payload.networkDiagnostic);
       if (message.payload?.connectionTest) applyConnectionPathTest(message.payload.connectionTest);
+      if (message.payload?.healthProbeModels) applyHealthProbeModels(message.payload.healthProbeModels);
+      if (message.payload?.healthProbe) applyHealthProbeResult(message.payload.healthProbe);
+      if (message.payload?.balanceProbe) applyBalanceProbe(message.payload.balanceProbe);
       if (message.payload?.metricsTrend) {
         const trend = message.payload.metricsTrend;
         if (trend.error) trendController()?.setError(trend.error, trend.sequence, trend.rangeKey);
@@ -1153,6 +1305,16 @@ const bridgeSource = String.raw`
       openDeleteConfirm(target.dataset.deleteProvider);
       return;
     }
+    if (target.dataset.healthProbeProvider) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      openHealthProbe(target.dataset.healthProbeProvider);
+      return;
+    }
+    if (target.dataset.balanceProbe) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("probe-provider-balance", { providerId: target.dataset.balanceProbe });
+      return;
+    }
     if (target.id === "saveProviderButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("save-provider", serializeEditor()); return;
     }
@@ -1176,6 +1338,16 @@ const bridgeSource = String.raw`
     }
     if (target.id === "addKeyButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBlankKey(); return;
+    }
+    if (target.id === "testAllKeysHealthButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      const providerId = editingProviderId || selectedProviderId();
+      if (!providerId) showToast("请先保存上游，再测活 Key 池");
+      else openHealthProbe(providerId, "all_enabled");
+      return;
+    }
+    if (target.id === "healthProbeRunButton" || target.id === "healthProbeRetryButton") {
+      event.preventDefault(); event.stopImmediatePropagation(); runHealthProbe(); return;
     }
     if (target.id === "bulkAddKeysButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBulkKeysFromBridge(); return;
@@ -1269,9 +1441,10 @@ const bridgeSource = String.raw`
       '<article class="provider-row ' + (provider.active ? "active" : "") + '" data-provider-id="' + escape(provider.id) + '">' +
       '<span class="provider-mark" draggable="true" data-provider-drag="' + escape(provider.id) + '" title="拖动调整上游顺序" style="cursor:grab">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
       '<div class="provider-copy"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small></div>' +
-      '<div class="provider-meta"><div class="provider-tags"><span class="tag">' + escape(provider.channel) + '</span><span class="tag">' + (provider.mappings ? escape(provider.mappings + " 个映射") : "Agent 直传") + '</span><span class="tag">' + escape(provider.keys + " Key") + '</span></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
+      '<div class="provider-meta"><div class="provider-tags"><span class="tag">' + escape(provider.channel) + '</span>' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + '<span class="tag">' + escape(provider.keys + " Key") + '</span><button class="balance-probe-chip" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
       '<div class="provider-actions"><button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>' +
-      '<button class="icon-button" type="button" data-test-provider="' + escape(provider.id) + '" aria-label="测试 ' + escape(provider.name) + ' 连通性" title="测试连通性">' + icon("activity", 14) + '</button>' +
+      '<button class="tool-button connection-test-button" type="button" data-test-provider="' + escape(provider.id) + '" aria-label="测试 ' + escape(provider.name) + ' 连通性" title="测试当前 Key 连通性">' + icon("plug-zap", 14) + '连通</button>' +
+      '<button class="tool-button health-probe-button" type="button" data-health-probe-provider="' + escape(provider.id) + '" aria-label="测活 ' + escape(provider.name) + '" title="测活">' + icon("activity", 14) + '测活</button>' +
       '<button class="icon-button" type="button" data-edit-provider="' + escape(provider.id) + '" aria-label="编辑 ' + escape(provider.name) + '" title="编辑">' + icon("pencil", 14) + '</button>' +
       '<button class="icon-button" type="button" data-delete-provider="' + escape(provider.id) + '" aria-label="删除 ' + escape(provider.name) + '" title="删除">' + icon("trash-2", 14) + '</button></div></article>'
     ).join("") : '<div class="empty-row">当前没有上游配置</div>';
@@ -1350,16 +1523,17 @@ const bridgeSource = String.raw`
       const statusDetail = request.statusDetail
         ? '<small>' + escape(request.statusDetail) + '</small>'
         : '';
-      const cacheTailSegments = [
-        "新 " + requestTokens(request.cacheNewTailGapTokens),
-        Number(request.cacheAvoidableGapTokens || 0) > 0
-          ? "可 " + requestTokens(request.cacheAvoidableGapTokens)
-          : "",
-        Number(request.cacheProviderUnstableGapTokens || 0) > 0
-          ? "水位 " + requestTokens(request.cacheProviderUnstableGapTokens)
-          : ""
-      ].filter(Boolean);
-      const cacheTailDetail = cacheTailSegments.join(" · ");
+      const cacheShortfallTokens = Number(request.cacheShortfallTokens || 0);
+      const cacheNewTailTokens = Number(request.cacheNewTailGapTokens || 0);
+      const cacheTailSegments = cacheShortfallTokens > 0
+        ? [
+          "缺口 " + requestTokens(cacheShortfallTokens),
+          cacheNewTailTokens > 0 ? "新 " + requestTokens(cacheNewTailTokens) : ""
+        ].filter(Boolean)
+        : [];
+      const cacheTailDetail = cacheTailSegments.length
+        ? cacheTailSegments.join(" · ")
+        : "满桶";
       return '<article class="request-row status-' + escape(rowTone) + (request.failed ? ' failed' : '') + '" tabindex="0" data-request-id="' + escape(request.id) + '">' +
         '<div class="request-identity" title="' + escape(request.provider + " · " + request.agentLabel) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span>' + escape(request.time) + '</span></div>' +
         '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><div class="request-model-stack"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div></div>' +
@@ -1551,6 +1725,7 @@ type RequestCacheTailDisplay = {
   newTailTokens: number;
   avoidableTokens: number;
   providerUnstableTokens: number;
+  unclassifiedTokens: number;
 };
 
 function wholeTokenCount(value?: number | null): number {
@@ -1560,16 +1735,16 @@ function wholeTokenCount(value?: number | null): number {
 }
 
 /**
- * The request-row hint is deliberately computed in the UI from the raw
- * provider usage that is already persisted. This makes the 128-token bucket
- * visible without changing historical records or pretending that the old
- * aggregate 512-token diagnostic was rewritten.
+ * Prefer the backend's final 128-token gap classification. Earlier releases
+ * only persisted aggregate usage, so their residual remains a gap instead of
+ * being relabelled as new user context.
  */
 function cacheTailDisplayForRequest(
   request: Pick<
     MetricsSnapshot["recent_requests"][number],
     | "input_tokens"
     | "cache_read_tokens"
+    | "cache_new_tail_gap_tokens"
     | "cache_avoidable_gap_tokens"
     | "cache_provider_unstable_gap_tokens"
   >
@@ -1578,26 +1753,26 @@ function cacheTailDisplayForRequest(
   const cacheReadTokens = Math.min(wholeTokenCount(request.cache_read_tokens), inputTokens);
   const cacheableInputTokens = Math.floor(inputTokens / CACHE_DISPLAY_BUCKET_TOKENS)
     * CACHE_DISPLAY_BUCKET_TOKENS;
-  const shortfallTokens = Math.max(
+  const legacyBucketShortfallTokens = Math.max(
     0,
     cacheableInputTokens - Math.min(cacheReadTokens, cacheableInputTokens)
   );
-  const avoidableTokens = Math.min(
-    wholeTokenCount(request.cache_avoidable_gap_tokens),
-    shortfallTokens
-  );
-  const providerUnstableTokens = Math.min(
-    wholeTokenCount(request.cache_provider_unstable_gap_tokens),
-    shortfallTokens - avoidableTokens
-  );
+  const reportedNewTailTokens = wholeTokenCount(request.cache_new_tail_gap_tokens);
+  const reportedAvoidableTokens = wholeTokenCount(request.cache_avoidable_gap_tokens);
+  const reportedProviderUnstableTokens = wholeTokenCount(request.cache_provider_unstable_gap_tokens);
+  const hasBackendBreakdown = reportedNewTailTokens > 0 ||
+    reportedAvoidableTokens > 0 ||
+    reportedProviderUnstableTokens > 0;
+  const shortfallTokens = hasBackendBreakdown
+    ? reportedNewTailTokens + reportedAvoidableTokens + reportedProviderUnstableTokens
+    : legacyBucketShortfallTokens;
 
   return {
     shortfallTokens,
-    // Provider instability is intentionally not presented as a new user tail.
-    // The remaining 128-aligned shortfall is the only safe "new" display.
-    newTailTokens: shortfallTokens - avoidableTokens - providerUnstableTokens,
-    avoidableTokens,
-    providerUnstableTokens
+    newTailTokens: reportedNewTailTokens,
+    avoidableTokens: reportedAvoidableTokens,
+    providerUnstableTokens: reportedProviderUnstableTokens,
+    unclassifiedTokens: hasBackendBreakdown ? 0 : legacyBucketShortfallTokens
   };
 }
 
@@ -1744,6 +1919,7 @@ function buildState(
   includeCompactions: boolean,
   showDetailedErrors: boolean,
   providerConnectionStatus: Record<string, string>,
+  providerBalanceStatus: GraphitePrototypeHostProps["providerBalanceStatus"],
   metricsRefreshPolicy: "visible-1s" | "5s" | "manual",
   proxyStatus: ProxyStatus | null,
   networkPathDiagnostic: GraphitePrototypeHostProps["networkPathDiagnostic"],
@@ -1792,7 +1968,8 @@ function buildState(
       ? provider.key_pool.available_keys
       : (provider.has_api_key ? 1 : 0),
     active: false,
-    latency: providerConnectionStatus[provider.id] ?? "未检测"
+    latency: providerConnectionStatus[provider.id] ?? "未检测",
+    balance: providerBalanceStatus[provider.id] ?? null
   }));
   const providerDetails = Object.fromEntries(visibleProviders.map((provider) => [provider.id, {
     id: provider.id,
@@ -1829,6 +2006,7 @@ function buildState(
     keys: (provider.key_pool?.keys ?? []).map((key) => ({
       id: key.id,
       alias: key.alias ?? "",
+      preview: key.preview,
       has_saved_secret: key.has_saved_secret,
       enabled: key.enabled,
       priority: key.priority,
@@ -2185,8 +2363,8 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   const onBridgeActionRef = useRef(props.onBridgeAction);
   onBridgeActionRef.current = props.onBridgeAction;
   const state = useMemo(
-    () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.includeCompactions, props.showDetailedErrors, props.providerConnectionStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.cacheValidation, props.appVersion),
-    [props.appVersion, props.cacheValidation, props.config, props.includeColdStarts, props.includeCompactions, props.metrics, props.metricsRefreshPolicy, props.networkPathDiagnostic, props.providerConnectionStatus, props.proxyStatus, props.selectedAgentId, props.showDetailedErrors]
+    () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.includeCompactions, props.showDetailedErrors, props.providerConnectionStatus, props.providerBalanceStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.cacheValidation, props.appVersion),
+    [props.appVersion, props.cacheValidation, props.config, props.includeColdStarts, props.includeCompactions, props.metrics, props.metricsRefreshPolicy, props.networkPathDiagnostic, props.providerBalanceStatus, props.providerConnectionStatus, props.proxyStatus, props.selectedAgentId, props.showDetailedErrors]
   );
 
   const send = useCallback((message: Record<string, unknown>) => {

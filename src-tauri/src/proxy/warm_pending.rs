@@ -22,6 +22,8 @@ enum PendingMaturityKind {
     GiantColdRoot,
     MaterialToolTail,
     ProviderWaterlineRollback,
+    ExactPendingTailLag,
+    ToolCallOnlyExactPendingTailLag,
 }
 
 impl PendingMaturityKind {
@@ -37,6 +39,13 @@ impl PendingMaturityKind {
             // A proven upstream waterline rollback gets one direct successor.
             // Persistent provider loss must fail open after that one window.
             Self::ProviderWaterlineRollback => 1,
+            // An exact final-scope receipt can prove that a small portion of
+            // the immediately preceding sent prefix has not yet materialised.
+            // It is never a new waterline: only its one direct child may wait.
+            Self::ExactPendingTailLag => 1,
+            // A tool-call-only parent is a separate, one-shot proof. Tool
+            // output remains a hard semantic boundary and never uses it.
+            Self::ToolCallOnlyExactPendingTailLag => 1,
         }
     }
 
@@ -51,6 +60,8 @@ impl PendingMaturityKind {
             // later, it sends immediately rather than waiting again.
             Self::MaterialToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ProviderWaterlineRollback => now + WARM_PENDING_FOLLOWUP_WAIT,
+            Self::ExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
+            Self::ToolCallOnlyExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
         }
     }
 
@@ -59,15 +70,18 @@ impl PendingMaturityKind {
             Self::GiantColdRoot => "responses_giant_cold_prefix_warm_pending",
             Self::MaterialToolTail => "responses_material_tool_tail_maturity_pending",
             Self::ProviderWaterlineRollback => "responses_provider_waterline_rollback_pending",
+            Self::ExactPendingTailLag => "responses_exact_pending_tail_lag",
+            Self::ToolCallOnlyExactPendingTailLag => "responses_tool_call_exact_pending_tail_lag",
         }
     }
 }
 
 /// A process-local, one-shot maturity gate for a giant cold FullReplay root,
-/// a material tool tail, or a proven provider waterline rollback. It never
-/// changes a frozen request, provider, Key, route, or number of upstream
-/// dispatches; it only gives a proven direct child a bounded opportunity to
-/// arrive after the provider finishes warming that exact prefix.
+/// a material tool tail, a proven provider waterline rollback, or a small
+/// exact pending tail lag. It never changes a frozen request, provider, Key,
+/// route, or number of upstream dispatches; it only gives a proven direct
+/// child a bounded opportunity to arrive after the provider finishes warming
+/// that exact prefix.
 #[derive(Debug, Default)]
 pub(crate) struct WarmPendingRegistry {
     entries: HashMap<String, WarmPendingEntry>,
@@ -126,6 +140,10 @@ impl WarmPendingClaim {
             PendingMaturityKind::MaterialToolTail
             | PendingMaturityKind::ProviderWaterlineRollback => {
                 !compaction_requested && direct_followup_is_settle_safe(tail)
+            }
+            PendingMaturityKind::ExactPendingTailLag
+            | PendingMaturityKind::ToolCallOnlyExactPendingTailLag => {
+                !compaction_requested && exact_pending_followup_is_settle_safe(tail)
             }
             PendingMaturityKind::GiantColdRoot => true,
         }
@@ -220,6 +238,19 @@ impl WarmPendingRegistry {
         let Some(maturity) = pending_maturity(raw_usage, tail, final_scope) else {
             return;
         };
+        // Exact pending tail lag is deliberately a single direct-child
+        // opportunity. Do not turn an unfulfilled child into a repeated
+        // foreground-wait chain; a later request must fail open and carry its
+        // own ordinary evidence instead.
+        if claim.is_some_and(|claim| {
+            matches!(
+                claim.kind,
+                PendingMaturityKind::ExactPendingTailLag
+                    | PendingMaturityKind::ToolCallOnlyExactPendingTailLag
+            )
+        }) {
+            return;
+        }
         let (deadline_at, ready_at, remaining_followups) = match claim {
             Some(claim) => {
                 // A giant root remains one bounded chain.  A newly produced
@@ -360,6 +391,14 @@ fn pending_maturity(
         Some(PendingMaturity {
             kind: PendingMaturityKind::ProviderWaterlineRollback,
         })
+    } else if exact_pending_tail_lag(raw_usage, tail, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ExactPendingTailLag,
+        })
+    } else if tool_call_only_exact_pending_tail_lag(raw_usage, tail, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ToolCallOnlyExactPendingTailLag,
+        })
     } else {
         None
     }
@@ -385,6 +424,108 @@ fn provider_waterline_rollback(
         && final_scope.raw_cache_read_tokens == record.cache_read_tokens
 }
 
+/// A small residual between an exact predecessor's sent prefix and the raw
+/// upstream cache read is a possible materialisation lag, not a reason to
+/// advance a local waterline.  Keep this much narrower than generic tail-lag:
+/// both the parent and its only direct child must satisfy the existing quiet
+/// follow-up shape, and all final-scope evidence must bind the same lineage.
+fn exact_pending_tail_lag(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    exact_pending_tail_lag_evidence(raw_usage, final_scope)
+        // Tool-bearing tails have their own material-tail policy. Empirical
+        // coverage keeps even a one-character tool result on the immediate
+        // path, so this exact residual gate is deliberately message-only.
+        // The request is never rewritten; this merely avoids adding an
+        // unproven foreground wait to a semantic tool continuation.
+        && exact_pending_parent_is_settle_safe(tail)
+}
+
+/// The common evidence for a small exact materialisation residual.  The parent
+/// shape remains deliberately separate: ordinary messages and tool-call-only
+/// continuations have different semantic safety gates.
+fn exact_pending_tail_lag_evidence(
+    raw_usage: Option<&UsageRecord>,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MIN_INPUT_TOKENS: u64 = 16_384;
+    const MIN_PENDING_TOKENS_128: u64 = 128;
+    const MAX_PENDING_TOKENS_128: u64 = 2_048;
+
+    let Some(record) = raw_usage else {
+        return false;
+    };
+    let candidate = final_scope.candidate_avoidable_tokens_128;
+    record.input_tokens >= MIN_INPUT_TOKENS
+        && record.cache_read_tokens > 0
+        && final_scope.outcome == "settled"
+        && final_scope.sent_prediction_eligible
+        && final_scope.predecessor_exact
+        && final_scope.predecessor_bound
+        && !final_scope.continuity_reset
+        && final_scope.rollback_tokens_128 == 0
+        && (MIN_PENDING_TOKENS_128..=MAX_PENDING_TOKENS_128).contains(&candidate)
+        && final_scope.raw_cache_read_tokens == record.cache_read_tokens
+        && final_scope.sent_prefix_bucket_tokens_128 > final_scope.settled_prefix_bucket_tokens_128
+}
+
+/// Exact residual maturation is restricted to a small, message-only parent.
+/// Tool calls and tool outputs remain semantic boundaries: large ones use the
+/// dedicated material-tail policy, while small ones must remain immediate.
+fn exact_pending_parent_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    const MAX_INPUT_ITEMS: u64 = 6;
+    const MAX_MESSAGE_CHARS: u64 = 512;
+    let tool_bearing = tail.tool_call_chars > 0
+        || tail.tool_output_chars > 0
+        || tail.largest_tool_output_chars > 0
+        || tail.tool_output_lines > 0
+        || tail.tool_output_repeated_line_chars > 0
+        || tail.tool_output_timestamp_like_count > 0
+        || tail.tool_output_path_like_count > 0
+        || tail.tool_output_url_like_count > 0
+        || tail.tool_output_hash_like_count > 0
+        || tail.tool_output_json_like_chars > 0
+        || tail.tool_output_noise_hint.is_some()
+        || matches!(
+            tail.source.as_deref(),
+            Some("tool_output" | "tool_call" | "mixed")
+        );
+
+    tail.input_items <= MAX_INPUT_ITEMS && tail.message_chars <= MAX_MESSAGE_CHARS && !tool_bearing
+}
+
+/// A model-produced tool call can be stable semantic history before any tool
+/// result exists. Admit only that narrow shape; an output, output noise, or a
+/// mixed message tail belongs to a different boundary and must send
+/// immediately.
+fn tool_call_only_exact_pending_tail_lag(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MAX_INPUT_ITEMS: u64 = 6;
+    const MAX_TOOL_CALL_CHARS: u64 = 2_048;
+
+    exact_pending_tail_lag_evidence(raw_usage, final_scope)
+        && tail.input_items <= MAX_INPUT_ITEMS
+        && tail.message_chars == 0
+        && tail.tool_call_chars > 0
+        && tail.tool_call_chars <= MAX_TOOL_CALL_CHARS
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && matches!(tail.source.as_deref(), Some("tool_call" | "mixed"))
+}
+
 fn direct_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
     tail.input_items <= 10
         && tail.message_chars <= 1_024
@@ -392,6 +533,28 @@ fn direct_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
         && tail.tool_output_chars < 8_000
         && tail.largest_tool_output_chars < 8_000
         && tail.tool_output_noise_hint.is_none()
+}
+
+/// The exact residual gate is intentionally stricter than the generic
+/// material-tail/rollback follow-up gate. A tool-bearing child is real
+/// semantic input even when its output is tiny, so it must not inherit the
+/// message-only pending wait.
+fn exact_pending_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    tail.input_items <= 10
+        && tail.message_chars > 0
+        && tail.message_chars <= 1_024
+        && tail.tool_call_chars == 0
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && tail.source.as_deref() == Some("message")
 }
 
 /// A material tool result is new context on its own request, but its exact
@@ -467,6 +630,21 @@ mod tests {
             raw_cache_read_tokens,
             candidate_avoidable_tokens_128,
             sent_prefix_bucket_tokens_128: raw_cache_read_tokens.saturating_add(128),
+            settled_prefix_bucket_tokens_128: raw_cache_read_tokens,
+            ..exact_log(scope)
+        }
+    }
+
+    fn exact_pending_tail_lag_log(
+        scope: &str,
+        raw_cache_read_tokens: u64,
+        candidate_avoidable_tokens_128: u64,
+    ) -> FinalScopeWaterlineLog {
+        FinalScopeWaterlineLog {
+            raw_cache_read_tokens,
+            candidate_avoidable_tokens_128,
+            sent_prefix_bucket_tokens_128: raw_cache_read_tokens
+                .saturating_add(candidate_avoidable_tokens_128),
             settled_prefix_bucket_tokens_128: raw_cache_read_tokens,
             ..exact_log(scope)
         }
@@ -831,6 +1009,444 @@ mod tests {
                 .is_none(),
             "the provider-rollback window is one-shot and cannot queue siblings"
         );
+    }
+
+    #[test]
+    fn exact_pending_tail_lag_arms_only_one_quiet_direct_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let replay = UsageRecord {
+            input_tokens: 158_170,
+            cache_read_tokens: 157_056,
+            ..UsageRecord::default()
+        };
+        let quiet_parent = TailInputDiagnostics {
+            input_items: 3,
+            message_chars: 62,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                replay.cache_read_tokens,
+                512,
+            )),
+            Some(&root),
+            Some(&replay),
+            &quiet_parent,
+            true,
+            false,
+        );
+        assert_eq!(registry.len(), 1);
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("only the exact direct child may claim a proven pending tail lag");
+        assert_eq!(claim.wait_reason(), "responses_exact_pending_tail_lag");
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        let quiet_message_child = TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 8,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(claim.followup_is_settle_safe(&quiet_message_child, false));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    tool_output_chars: 8_000,
+                    largest_tool_output_chars: 8_000,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a material direct child must retain immediate dispatch"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 3,
+                    message_chars: 4,
+                    tool_output_chars: 1,
+                    largest_tool_output_chars: 1,
+                    source: Some("mixed".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "even a one-character tool child must retain immediate dispatch"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(&TailInputDiagnostics::default(), true),
+            "compaction remains outside the pending tail-lag path"
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .is_none(),
+            "the exact pending tail-lag window is one-shot and never queues a sibling"
+        );
+
+        let child = head(2);
+        registry.settle(
+            Some(&claim),
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                replay.cache_read_tokens,
+                512,
+            )),
+            Some(&child),
+            Some(&replay),
+            &TailInputDiagnostics::default(),
+            true,
+            false,
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "an exact pending tail-lag child must not restart a wait chain"
+        );
+    }
+
+    #[test]
+    fn tool_call_only_exact_pending_tail_lag_arms_one_message_child_only() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let replay = UsageRecord {
+            input_tokens: 158_170,
+            cache_read_tokens: 157_056,
+            ..UsageRecord::default()
+        };
+        let call_only_parent = TailInputDiagnostics {
+            input_items: 2,
+            tool_call_chars: 768,
+            source: Some("tool_call".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                replay.cache_read_tokens,
+                768,
+            )),
+            Some(&root),
+            Some(&replay),
+            &call_only_parent,
+            true,
+            false,
+        );
+        assert_eq!(registry.len(), 1);
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("a bounded tool-call-only parent may arm one exact message child");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_tool_call_exact_pending_tail_lag"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 12,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 2,
+                    tool_output_chars: 1,
+                    largest_tool_output_chars: 1,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "tool output must never consume the call-only maturity window"
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .is_none(),
+            "concurrent siblings must fail open rather than queue"
+        );
+
+        registry.settle(
+            Some(&claim),
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                replay.cache_read_tokens,
+                768,
+            )),
+            Some(&head(2)),
+            Some(&replay),
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 12,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "a tool-call exact pending child must not restart a wait chain"
+        );
+    }
+
+    #[test]
+    fn exact_pending_tail_lag_requires_bound_clean_non_rollback_evidence() {
+        let replay = UsageRecord {
+            input_tokens: 158_170,
+            cache_read_tokens: 157_056,
+            ..UsageRecord::default()
+        };
+        let quiet_tail = TailInputDiagnostics {
+            input_items: 3,
+            message_chars: 62,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let base = exact_pending_tail_lag_log("scope", replay.cache_read_tokens, 512);
+        assert!(exact_pending_tail_lag(Some(&replay), &quiet_tail, &base));
+
+        let mut unbound = base.clone();
+        unbound.predecessor_bound = false;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &unbound
+        ));
+
+        let mut non_exact = base.clone();
+        non_exact.predecessor_exact = false;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &non_exact
+        ));
+
+        let mut non_full_replay = base.clone();
+        non_full_replay.sent_prediction_eligible = false;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &non_full_replay
+        ));
+
+        let mut unsettled = base.clone();
+        unsettled.outcome = "failed".to_string();
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &unsettled
+        ));
+
+        let mut reset = base.clone();
+        reset.continuity_reset = true;
+        assert!(!exact_pending_tail_lag(Some(&replay), &quiet_tail, &reset));
+
+        let mut rollback = base.clone();
+        rollback.rollback_tokens_128 = 128;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &rollback
+        ));
+
+        let mut mismatch = base.clone();
+        mismatch.raw_cache_read_tokens = replay.cache_read_tokens.saturating_sub(128);
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &mismatch
+        ));
+
+        let mut too_small = base.clone();
+        too_small.candidate_avoidable_tokens_128 = 64;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &too_small
+        ));
+
+        let mut too_large = base.clone();
+        too_large.candidate_avoidable_tokens_128 = 2_176;
+        assert!(!exact_pending_tail_lag(
+            Some(&replay),
+            &quiet_tail,
+            &too_large
+        ));
+
+        let noisy_parent = TailInputDiagnostics {
+            input_items: 3,
+            tool_output_chars: 8_000,
+            largest_tool_output_chars: 8_000,
+            source: Some("tool_output".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(!exact_pending_tail_lag(Some(&replay), &noisy_parent, &base));
+
+        let small_tool_parent = TailInputDiagnostics {
+            input_items: 3,
+            tool_call_chars: 12,
+            tool_output_chars: 1_024,
+            largest_tool_output_chars: 1_024,
+            tool_output_lines: 24,
+            tool_output_timestamp_like_count: 2,
+            tool_output_path_like_count: 1,
+            tool_output_noise_hint: Some("timestamp_like,path_like".to_string()),
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            !exact_pending_tail_lag(Some(&replay), &small_tool_parent, &base),
+            "a bounded tool result must preserve the immediate-send contract"
+        );
+
+        let oversized_tool_parent = TailInputDiagnostics {
+            input_items: 3,
+            tool_output_chars: 2_049,
+            largest_tool_output_chars: 2_049,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            !exact_pending_tail_lag(Some(&replay), &oversized_tool_parent, &base),
+            "a material tool result must retain its independent immediate-send contract"
+        );
+
+        let line_heavy_parent = TailInputDiagnostics {
+            input_items: 3,
+            tool_output_chars: 1_024,
+            largest_tool_output_chars: 1_024,
+            tool_output_lines: 129,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            !exact_pending_tail_lag(Some(&replay), &line_heavy_parent, &base),
+            "line-heavy output stays on the immediate-send path"
+        );
+
+        let call_only_parent = TailInputDiagnostics {
+            input_items: 2,
+            tool_call_chars: 768,
+            source: Some("tool_call".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            tool_call_only_exact_pending_tail_lag(Some(&replay), &call_only_parent, &base),
+            "only a bounded tool-call-only parent may use the separate exact gate"
+        );
+        let tool_output_parent = TailInputDiagnostics {
+            input_items: 2,
+            tool_call_chars: 768,
+            tool_output_chars: 1,
+            largest_tool_output_chars: 1,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            !tool_call_only_exact_pending_tail_lag(Some(&replay), &tool_output_parent, &base),
+            "any tool output remains on the immediate path"
+        );
+        let oversized_call_parent = TailInputDiagnostics {
+            input_items: 2,
+            tool_call_chars: 2_049,
+            source: Some("tool_call".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(
+            !tool_call_only_exact_pending_tail_lag(Some(&replay), &oversized_call_parent, &base),
+            "large tool-call bodies do not enter the exact pending path"
+        );
+    }
+
+    #[test]
+    fn exact_pending_tail_lag_failed_or_compacted_child_never_rearms() {
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let replay = UsageRecord {
+            input_tokens: 158_170,
+            cache_read_tokens: 157_056,
+            ..UsageRecord::default()
+        };
+        let quiet_parent = TailInputDiagnostics {
+            input_items: 3,
+            message_chars: 62,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        for (upstream_succeeded, confirmed_compaction) in [(false, false), (true, true)] {
+            let mut registry = WarmPendingRegistry::default();
+            let root = head(1);
+            registry.settle(
+                None,
+                Some(prefix),
+                Some(scope),
+                Some(&exact_pending_tail_lag_log(
+                    scope,
+                    replay.cache_read_tokens,
+                    512,
+                )),
+                Some(&root),
+                Some(&replay),
+                &quiet_parent,
+                true,
+                false,
+            );
+            let claim = registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .expect("the exact parent must arm one direct child");
+
+            registry.settle(
+                Some(&claim),
+                Some(prefix),
+                Some(scope),
+                Some(&exact_pending_tail_lag_log(
+                    scope,
+                    replay.cache_read_tokens,
+                    512,
+                )),
+                Some(&head(2)),
+                Some(&replay),
+                &TailInputDiagnostics::default(),
+                upstream_succeeded,
+                confirmed_compaction,
+            );
+            assert_eq!(
+                registry.len(),
+                0,
+                "a failed or compacted exact child must not restart a foreground wait chain"
+            );
+        }
     }
 
     #[test]

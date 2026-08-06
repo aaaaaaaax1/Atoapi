@@ -1,9 +1,10 @@
 import type {
-  AppConfig,
-  CacheValidationStatus,
-  Channel,
-  MetricsSnapshot,
-  ProxyStatus
+    AppConfig,
+    CacheValidationStatus,
+    Channel,
+    MetricsSnapshot,
+    ProviderBalanceProbeResult,
+    ProxyStatus
 } from "../lib/api";
 
 /** Stable, versioned contract between the React control plane and Graphite's iframe. */
@@ -59,6 +60,7 @@ export interface GraphitePrototypeHostProps {
   includeCompactions: boolean;
   showDetailedErrors: boolean;
   providerConnectionStatus: Record<string, string>;
+  providerBalanceStatus: Record<string, ProviderBalanceProbeResult>;
   metricsRefreshPolicy: "visible-1s" | "5s" | "manual";
   proxyStatus: ProxyStatus | null;
   networkPathDiagnostic: {

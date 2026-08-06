@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-#[cfg(test)]
 use std::collections::BTreeSet;
 use std::{
     ops::Range,
@@ -349,7 +348,6 @@ impl PreparedResponseBody {
     pub(super) fn into_prepared_wire(self, channel: &Channel) -> (Value, PreparedWireRequest) {
         #[cfg(test)]
         {
-            let had_wire_draft = self.wire_draft.is_some();
             let Self {
                 body,
                 wire_draft,
@@ -369,9 +367,10 @@ impl PreparedResponseBody {
                     atoapi_injected_protocol_breakpoint,
                 ),
             };
-            if had_wire_draft {
-                wire.set_atoapi_mutated_roots(&changed_fields);
-            }
+            // The categories are an in-memory, fixed-vocabulary diagnostic.
+            // They never alter the final body; retaining them for pending
+            // production bodies makes an empty category list meaningful.
+            wire.set_atoapi_mutated_roots(&changed_fields);
             (body, wire)
         }
 
@@ -379,15 +378,19 @@ impl PreparedResponseBody {
         {
             let Self {
                 body,
-                changed_fields: _,
+                changed_fields,
                 requires_full_freeze: _,
                 atoapi_injected_protocol_breakpoint,
             } = self;
-            let wire = PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
+            let mut wire = PreparedWireRequest::from_value_with_protocol_breakpoint_witness(
                 channel,
                 &body,
                 atoapi_injected_protocol_breakpoint,
             );
+            // Production uses `responses_pending`, so the final frozen wire
+            // must carry the same redacted mutation categories as the test
+            // draft path. Only fixed category labels are retained.
+            wire.set_atoapi_mutated_roots(&changed_fields);
             (body, wire)
         }
     }
@@ -579,6 +582,71 @@ mod tests {
     }
 
     #[test]
+    fn cache_maturity_projection_ignores_delivery_metadata_but_keeps_prompt_semantics_strict() {
+        let baseline = json!({
+            "model": "gpt-test",
+            "prompt_cache_key": "cache-a",
+            "instructions": "stable instructions",
+            "tools": [{"type":"function","name":"read_file"}],
+            "reasoning": {"effort":"high"},
+            "truncation": "auto",
+            "input": [{"type":"message","role":"user","content":"anchor"}],
+            "stream": true,
+            "store": false,
+            "metadata": {"attempt":"one"},
+            "user": "caller-a",
+            "previous_response_id": "resp-a"
+        });
+        let baseline_wire = PreparedWireRequest::from_value(&Channel::Responses, &baseline);
+        let full_wire = baseline_wire
+            .responses_static_projection_digest()
+            .expect("array input has an exact wire projection");
+        let maturity_wire = baseline_wire
+            .responses_cache_maturity_static_projection_digest()
+            .expect("array input has a cache-maturity projection");
+
+        for (field, value) in [
+            ("stream", json!(false)),
+            ("store", json!(true)),
+            ("metadata", json!({"attempt":"two"})),
+            ("user", json!("caller-b")),
+            ("previous_response_id", json!("resp-b")),
+        ] {
+            let mut changed = baseline.clone();
+            changed[field] = value;
+            let changed_wire = PreparedWireRequest::from_value(&Channel::Responses, &changed);
+            assert_ne!(
+                changed_wire.responses_static_projection_digest(),
+                Some(full_wire),
+                "{field} remains part of the exact final wire"
+            );
+            assert_eq!(
+                changed_wire.responses_cache_maturity_static_projection_digest(),
+                Some(maturity_wire),
+                "{field} is delivery metadata and must not split a stable prefix maturity receipt"
+            );
+        }
+
+        for (field, value) in [
+            ("model", json!("gpt-other")),
+            ("prompt_cache_key", json!("cache-b")),
+            ("instructions", json!("changed instructions")),
+            ("tools", json!([{"type":"function","name":"write_file"}])),
+            ("reasoning", json!({"effort":"max"})),
+            ("truncation", json!("disabled")),
+        ] {
+            let mut changed = baseline.clone();
+            changed[field] = value;
+            let changed_wire = PreparedWireRequest::from_value(&Channel::Responses, &changed);
+            assert_ne!(
+                changed_wire.responses_cache_maturity_static_projection_digest(),
+                Some(maturity_wire),
+                "{field} changes prompt semantics and must keep its own maturity scope"
+            );
+        }
+    }
+
+    #[test]
     fn native_responses_static_roots_are_canonical_without_touching_input() {
         let input = json!([{
             "type": "message",
@@ -685,7 +753,11 @@ mod tests {
 
         assert_eq!(parsed, final_body);
         assert_eq!(parsed["prompt_cache_retention"], "24h");
-        assert!(wire.atoapi_mutated_static_categories().is_empty());
+        assert_eq!(
+            wire.atoapi_mutated_static_categories(),
+            ["cache_control".to_string()],
+            "the final production-equivalent wire retains only the fixed category"
+        );
         assert!(wire.responses_static_projection_digest().is_some());
     }
 
@@ -718,8 +790,14 @@ mod tests {
             followup.responses_static_projection_digest(),
             "a stable cache-control policy must not split the root and follow-up cache prefix"
         );
-        assert!(root.atoapi_mutated_static_categories().is_empty());
-        assert!(followup.atoapi_mutated_static_categories().is_empty());
+        assert_eq!(
+            root.atoapi_mutated_static_categories(),
+            ["cache_control".to_string()]
+        );
+        assert_eq!(
+            followup.atoapi_mutated_static_categories(),
+            ["cache_control".to_string()]
+        );
     }
 
     #[test]
@@ -756,6 +834,23 @@ mod tests {
         assert!(!categories.contains("after-secret"));
         assert!(!categories.contains("after-context"));
         assert!(!categories.contains("after-extension-secret"));
+    }
+
+    #[test]
+    fn pending_final_wire_keeps_redacted_mutation_categories() {
+        let mut body = PreparedResponseBody::responses_pending(json!({
+            "model": "gpt-test",
+            "stream": true,
+            "input": [{"type":"message","role":"user","content":"context"}]
+        }));
+        assert!(body.set_root("instructions", json!("stable instructions")));
+        assert!(body.set_root("x_vendor_extension", json!({"opaque": true})));
+
+        let (_, wire) = body.into_prepared_wire(&Channel::Responses);
+        assert_eq!(
+            wire.atoapi_mutated_static_categories(),
+            ["extension", "instructions"]
+        );
     }
 
     #[test]
@@ -836,6 +931,12 @@ pub(super) struct PreparedWireRequest {
     /// bytes. Appending Agent input therefore stays stable without treating an
     /// unclassified static field as equivalent.
     responses_static_projection_digest: Option<String>,
+    /// A narrower, cache-maturity-safe witness for native Responses. It ignores
+    /// per-attempt delivery/telemetry roots while retaining every model-visible
+    /// static root (including unknown extensions). It is shared by the strict
+    /// native-delta proof and the FullReplay prefix-maturity guard, is never
+    /// sent upstream, and never contains raw request text.
+    responses_cache_maturity_static_projection_digest: Option<String>,
     /// Fixed category names for top-level roots Atoapi itself changed after
     /// the initial Responses wire draft. No values, request text, tool output,
     /// keys, or hashes are retained here.
@@ -892,6 +993,8 @@ impl PreparedWireRequest {
             stream,
             encode_ms: encode_ms.saturating_add(finalize_started.elapsed().as_millis() as u64),
             responses_static_projection_digest,
+            responses_cache_maturity_static_projection_digest:
+                responses_cache_maturity_static_projection_digest(body),
             atoapi_mutated_static_categories: Vec::new(),
             protocol_breakpoint_provenance: protocol_breakpoint_provenance(
                 channel,
@@ -926,6 +1029,11 @@ impl PreparedWireRequest {
         self.responses_static_projection_digest.as_deref()
     }
 
+    pub(super) fn responses_cache_maturity_static_projection_digest(&self) -> Option<&str> {
+        self.responses_cache_maturity_static_projection_digest
+            .as_deref()
+    }
+
     pub(super) fn atoapi_mutated_static_categories(&self) -> &[String] {
         &self.atoapi_mutated_static_categories
     }
@@ -958,13 +1066,11 @@ impl PreparedWireRequest {
         }
     }
 
-    #[cfg(test)]
     fn set_atoapi_mutated_roots(&mut self, roots: &[String]) {
         self.atoapi_mutated_static_categories = atoapi_static_mutation_categories(roots);
     }
 }
 
-#[cfg(test)]
 fn atoapi_static_mutation_categories(roots: &[String]) -> Vec<String> {
     let mut categories = BTreeSet::new();
     for root in roots {
@@ -1106,6 +1212,47 @@ fn serialize_responses_body_with_static_projection(body: &Value) -> (Vec<u8>, Op
     let static_projection_digest =
         static_projection.and_then(ResponsesStaticProjectionHasher::finish);
     (output, static_projection_digest)
+}
+
+/// Hashes the static semantics that can safely share native Responses prefix
+/// maturity. `input` is the conversation payload and is excluded; per-request
+/// delivery and telemetry values are excluded so a normal Codex turn's
+/// metadata does not split its stable prefix. Every other root, including
+/// unknown extensions, remains a strict equality boundary.
+///
+/// This is not an upstream request rewrite: the exact final wire is still sent
+/// unchanged and still owns the final-scope waterline. It only decides whether
+/// a previously observed *same semantic prefix* may consume the bounded local
+/// maturity wait.
+pub(super) fn responses_cache_maturity_static_projection_digest(body: &Value) -> Option<String> {
+    let map = body.as_object()?;
+    map.get("input").is_some_and(Value::is_array).then(|| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"responses-native-continuation-static-v1\0{");
+        let mut first = true;
+        for_each_responses_wire_member(map, |key, value| {
+            if !continuation_static_member(key) {
+                return;
+            }
+            if !first {
+                hasher.update(b",");
+            }
+            first = false;
+            let mut encoded = Vec::new();
+            let mut member_first = true;
+            let _ = write_json_member(&mut encoded, &mut member_first, key, value);
+            hasher.update(encoded);
+        });
+        hasher.update(b"}");
+        format!("{:x}", hasher.finalize())
+    })
+}
+
+fn continuation_static_member(key: &str) -> bool {
+    !matches!(
+        key,
+        "input" | "previous_response_id" | "metadata" | "user" | "stream" | "store"
+    )
 }
 
 struct ResponsesStaticProjectionHasher {

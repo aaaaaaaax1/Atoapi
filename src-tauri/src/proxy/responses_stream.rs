@@ -25,6 +25,9 @@ pub(super) struct StreamSummary {
     pub usage: UsageRecord,
     pub response_id: Option<String>,
     pub output_items: Vec<Value>,
+    /// `response.completed` explicitly carried an output array. This is a
+    /// semantic continuation witness, not a request/cache statistic.
+    pub output_items_complete: bool,
     pub completed_event_seen: bool,
     pub responses_completed_event_seen: bool,
     pub message_stop_event_seen: bool,
@@ -472,6 +475,7 @@ impl ResponsesStreamState {
                 .and_then(Value::as_array)
             {
                 self.summary.output_items = items.clone();
+                self.summary.output_items_complete = true;
                 return;
             }
         }
