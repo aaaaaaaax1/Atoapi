@@ -89,23 +89,23 @@ const providerListTest = controlPlane.match(
 assert.ok(providerListTest, "the saved-provider Key-health test must remain bounded");
 assert.match(
   providerListTest,
-  /command<ProviderKeyTestResult>\("test_active_provider_key",\s*\{\s*providerId:\s*provider\.id,\s*provider_id:\s*provider\.id\s*\}\)/,
-  "the provider-list health button must use the Key the next ordinary inbound would select"
+  /command<ProviderConnectionPathTestResult>\("test_provider_connection_paths",\s*\{\s*input:\s*providerConnectionTestInput\(provider\)\s*\}\)/,
+  "the provider-list connection button must compare the saved provider's direct and system-proxy paths"
 );
 assert.doesNotMatch(
   providerListTest,
-  /test_provider_connection_paths/,
-  "the provider-list health button must not dispatch through the editor connection-key path"
+  /test_active_provider_key/,
+  "the provider-list connection button must not report the old current-Key-only result"
 );
 assert.match(
   providerListTest,
-  /payload:\s*\{ keyPoolHealth \}/,
-  "the provider-list health button must refresh the persisted Key-health state"
+  /payload:\s*\{ connectionTest: result \}/,
+  "the provider-list connection button must expose the measured path result"
 );
 assert.match(
   controlPlane,
   /if \(providerId && !\("provider" in payload\)\) \{\s*return testSavedProviderKeyHealth\(providerId\);/,
-  "a provider-list test must not accidentally take the editor connection-test path"
+  "a provider-list connection test must remain separate from the editor draft path"
 );
 
 assert.match(

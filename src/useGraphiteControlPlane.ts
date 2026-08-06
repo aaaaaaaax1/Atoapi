@@ -29,7 +29,7 @@ import type {
 } from "./graphite/frameProtocol";
 import { providerBelongsToAgent, providersForGraphiteAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.27";
+const APP_VERSION = "v1.4.28";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
@@ -542,30 +542,29 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     const provider = config?.providers.find((item) => item.id === providerId);
     if (!provider) throw new Error("未找到待测试的上游配置");
 
-    // The provider-list button is a Key-pool health test, not an editor
-    // connection test. Keep it on the exact Key ordinary traffic would choose
-    // and refresh the persisted Key health after the result.
+    // The provider-list button compares direct and system-proxy connectivity
+    // and reports the faster path, rather than only saying the current Key is usable.
     const startedAt = performance.now();
-    const activeKeyResult = await command<ProviderKeyTestResult>("test_active_provider_key", {
-      providerId: provider.id,
-      provider_id: provider.id
+    const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", {
+      input: providerConnectionTestInput(provider)
     });
     const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
-    const nextConfig = await command<AppConfig>("get_config");
-    setConfig(nextConfig);
-    const keyPoolHealth = graphiteKeyPoolHealth(nextConfig, provider.id);
+    const selectedPath = result.paths.find((path) =>
+      result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
+    );
+    const pathLabel = result.recommended_use_system_proxy ? "绯荤粺浠ｇ悊鏇村揩" : "鐩磋繛鏇村揩";
     setProviderConnectionStatus((current) => ({
       ...current,
-      [provider.id]: activeKeyResult.ok
-        ? `当前 Key 可用 · ${elapsedMs}ms`
-        : `当前 Key 失败 · ${elapsedMs}ms`
+      [provider.id]: result.ok
+        ? `${pathLabel} · ${selectedPath?.elapsed_ms ?? elapsedMs}ms`
+        : `测试失败 · ${elapsedMs}ms`
     }));
-    return activeKeyResult.ok
+    return result.ok
       ? {
-          notice: `${provider.name} 当前 Key 连通正常 · ${activeKeyResult.models_count} 个模型`,
-          payload: { keyPoolHealth }
+          notice: `${provider.name} 连通正常 · 推荐${pathLabel}${selectedPath ? ` ${selectedPath.elapsed_ms}ms${selectedPath.http_version ? ` · ${selectedPath.http_version}` : ""}` : ""}${result.models_count ? ` · ${result.models_count} 个模型` : ""}；代理开关未被修改，请手动决定。`,
+          payload: { connectionTest: result }
         }
-      : { error: activeKeyResult.message, payload: { keyPoolHealth } };
+      : { error: result.message, payload: { connectionTest: result } };
   }
 
   async function testDraftProviderConnection(

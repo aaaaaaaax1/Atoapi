@@ -15,6 +15,7 @@ new Function(bridgeSource);
 
 assert.match(html, /id="healthProbeOverlay"/, "the health probe must use a dedicated modal");
 assert.match(html, /id="healthProbePromptInput"[^>]*>hi<\/textarea>/, "the health probe prompt must default to hi");
+assert.match(html, /涓嶄細璁″叆姝ｅ父璇锋眰鍒楄〃|不写入正常请求列表/, "the health probe must be visibly isolated from normal token/cache metrics");
 assert.match(html, /最多请求 1 个输出 token/, "the health probe must advertise its one-token cold-start budget");
 assert.match(html, /value="responses_streaming"/, "Responses streaming must be selectable");
 assert.match(html, /value="chat_streaming"/, "Chat streaming must be selectable");
@@ -49,7 +50,7 @@ assert.doesNotMatch(
 
 assert.match(controlPlane, /command<ModelConfig\[\]>\("fetch_provider_health_models"/, "modal model discovery must use the pool-safe backend command");
 assert.match(controlPlane, /command<ProviderHealthProbeResult>\("probe_provider_health"/, "actual health checks must use the dedicated backend command");
-assert.match(controlPlane, /command<ProviderKeyTestResult>\("test_active_provider_key"/, "the retained connection action must test the current Key separately from model health probing");
+assert.match(controlPlane, /command<ProviderConnectionPathTestResult>\("test_provider_connection_paths"/, "the saved-provider connection action must report the faster direct or system-proxy path");
 assert.match(controlPlane, /command<ProviderBalanceProbeResult>\("probe_provider_balance"/, "balance clicks must invoke a separate explicit management action");
 assert.match(controlPlane, /const PROVIDER_BALANCE_REFRESH_MS = 15 \* 60 \* 1000;/, "provider balances must refresh every fifteen minutes");
 assert.match(controlPlane, /providerBalanceScopeFingerprint/, "balance state must be scoped to provider/key identity");

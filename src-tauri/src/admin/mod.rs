@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::{
     collections::HashSet,
     sync::Arc,
@@ -33,6 +33,8 @@ use crate::{
     },
     state::{AppState, ProxyStatus},
 };
+
+mod health_probe;
 
 type CommandResult<T> = Result<T, String>;
 
@@ -1630,25 +1632,24 @@ async fn probe_provider_health_key(
     let Some(secret) = input.api_key.as_deref() else {
         return failed_health_probe_result(key_id, started, "key_missing");
     };
-    let endpoint = health_probe_endpoint_url(&input.base_url, &mode.endpoint_channel());
+    let endpoint = health_probe::endpoint_url(&input.base_url, &mode.endpoint_channel());
     let Ok(endpoint) = endpoint else {
         return failed_health_probe_result(key_id, started, "invalid_endpoint");
     };
-    let client = match state
-        .control_plane_upstream_client(input.use_system_proxy)
-        .await
-    {
+    let explicit_proxy_url = {
+        let config = state.config.read().await;
+        config
+            .upstream_proxy_url_for(input.use_system_proxy)
+            .map(str::to_owned)
+    };
+    let client = match health_probe::client(input.use_system_proxy, explicit_proxy_url.as_deref()) {
         Ok(client) => client,
         Err(_) => return failed_health_probe_result(key_id, started, "client_unavailable"),
     };
-    let request_body = health_probe_request_body(mode, model, prompt);
-    // A management probe must negotiate the same upstream protocol identity
-    // as a normal relay request. In particular, several compatible gateways
-    // require `x-api-key`, SSE `Accept`, the stable User-Agent, or identity
-    // encoding before they emit their normal terminal frames.
+    let request_body = health_probe::request_body(mode, model, prompt);
     let request = client
         .post(endpoint)
-        .headers(proxy::build_management_probe_headers(
+        .headers(health_probe::headers(
             secret,
             &input.channel,
             mode.is_streaming(),
@@ -1716,69 +1717,6 @@ fn failed_health_probe_result(
         http_version: None,
         message: message.to_string(),
         response_preview: None,
-    }
-}
-
-fn health_probe_endpoint_url(base_url: &str, channel: &Channel) -> Result<String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(anyhow!("base URL is empty"));
-    }
-    reqwest::Url::parse(trimmed)?;
-    let endpoint = channel.endpoint_path();
-    if trimmed.ends_with(endpoint)
-        || trimmed.ends_with("/chat/completions")
-        || trimmed.ends_with("/responses")
-        || trimmed.ends_with("/messages")
-    {
-        Ok(trimmed.to_string())
-    } else if trimmed.ends_with("/v1") {
-        Ok(format!("{trimmed}{endpoint}"))
-    } else {
-        Ok(format!("{trimmed}/v1{endpoint}"))
-    }
-}
-
-fn health_probe_request_body(mode: &ProviderHealthProbeMode, model: &str, prompt: &str) -> Value {
-    match mode {
-        ProviderHealthProbeMode::ResponsesStreaming => json!({
-            "model": model,
-            // Match the Codex/New API Responses request shape: a user input
-            // item rather than the legacy shorthand string.
-            "input": [{ "role": "user", "content": prompt }],
-            "stream": true,
-            "max_output_tokens": 1,
-        }),
-        ProviderHealthProbeMode::ResponsesJson => json!({
-            "model": model,
-            "input": [{ "role": "user", "content": prompt }],
-            "stream": false,
-            "max_output_tokens": 1,
-        }),
-        ProviderHealthProbeMode::ChatStreaming => json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "stream": true,
-            "max_tokens": 1,
-        }),
-        ProviderHealthProbeMode::ChatJson => json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "stream": false,
-            "max_tokens": 1,
-        }),
-        ProviderHealthProbeMode::AnthropicStreaming => json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "stream": true,
-            "max_tokens": 1,
-        }),
-        ProviderHealthProbeMode::AnthropicJson => json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "stream": false,
-            "max_tokens": 1,
-        }),
     }
 }
 
@@ -2160,6 +2098,20 @@ async fn probe_provider_balance_inner(
                 message: format!("balance_received:{}", candidate.profile.label()),
             });
         }
+        // A recognized usage envelope without a verifiable balance is a
+        // successful probe of the endpoint, but not a balance result.  Stop
+        // here instead of guessing another route or displaying a fabricated
+        // unlimited/negative amount.
+        if balance_profile_recognized(&value, candidate.profile) {
+            return Ok(balance_probe_failure(
+                provider_id,
+                current_key_input.key_id,
+                Some(status.as_u16()),
+                started,
+                "balance_not_available",
+                false,
+            ));
+        }
     }
     Ok(balance_probe_failure(
         provider_id,
@@ -2317,21 +2269,40 @@ fn balance_display_for_profile(
                 "/remaining",
                 "/balance",
             ];
-            // New API's `unlimited_quota` is authoritative for its
-            // token-usage envelope. `total_available` can be a signed usage
-            // accounting value (including a negative number) and must not be
-            // exposed as a monetary balance when the route explicitly marks
-            // the quota unlimited.
+            // A token-usage envelope is not proof of a spendable balance.
+            // In particular, third-party gateways commonly return
+            // `unlimited_quota=true` together with large signed accounting
+            // counters.  We must not turn that into a misleading "unlimited"
+            // badge; an unknown balance is rendered as the yellow
+            // "余额未探测" state by the UI.
             if data
                 .get("unlimited_quota")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
-                return Some("无限额度".to_string());
+                return None;
             }
             // Finite New API quotas may legitimately be zero or negative;
             // preserve that value so the UI can render the depleted red state.
             balance_display_at(value, &numeric_pointers)
+        }
+    }
+}
+
+fn balance_profile_recognized(value: &Value, profile: ProviderBalanceProbeProfile) -> bool {
+    match profile {
+        ProviderBalanceProbeProfile::Sub2Usage => [
+            "/remaining",
+            "/balance",
+            "/quota/remaining",
+            "/data/remaining",
+            "/data/balance",
+            "/data/quota/remaining",
+        ]
+        .iter()
+        .any(|pointer| value.pointer(pointer).is_some()),
+        ProviderBalanceProbeProfile::NewApiTokenUsage => {
+            recognized_new_api_token_usage(value).is_some()
         }
     }
 }
@@ -4177,7 +4148,7 @@ mod tests {
 
     #[test]
     fn health_probe_responses_use_codex_style_input_items() {
-        let body = health_probe_request_body(
+        let body = health_probe::request_body(
             &ProviderHealthProbeMode::ResponsesStreaming,
             "gpt-5.6-terra",
             "hi",
@@ -4205,10 +4176,10 @@ mod tests {
     #[test]
     fn health_probe_adds_anthropic_messages_without_changing_responses_default() {
         assert_eq!(
-            health_probe_endpoint_url("https://upstream.example/v1", &Channel::Anthropic).unwrap(),
+            health_probe::endpoint_url("https://upstream.example/v1", &Channel::Anthropic).unwrap(),
             "https://upstream.example/v1/messages"
         );
-        let body = health_probe_request_body(
+        let body = health_probe::request_body(
             &ProviderHealthProbeMode::AnthropicStreaming,
             "claude-sonnet-4",
             "hi",
@@ -4273,7 +4244,7 @@ mod tests {
                 ProviderBalanceProbeProfile::NewApiTokenUsage,
             )
             .as_deref(),
-            Some("无限额度")
+            None
         );
         assert_eq!(
             balance_display_for_profile(
@@ -4288,8 +4259,21 @@ mod tests {
                 ProviderBalanceProbeProfile::NewApiTokenUsage,
             )
             .as_deref(),
-            Some("无限额度")
+            None
         );
+        assert!(balance_profile_recognized(
+            &json!({
+                "code": true,
+                "data": {
+                    "object": "token_usage",
+                    "total_available": -11378097,
+                    "total_granted": -8283,
+                    "total_used": 11369814,
+                    "unlimited_quota": true
+                }
+            }),
+            ProviderBalanceProbeProfile::NewApiTokenUsage
+        ));
         assert_eq!(
             balance_display_for_profile(
                 &json!({"balance": 0}),
@@ -4430,7 +4414,7 @@ mod tests {
         };
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4438,13 +4422,24 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_for_responses = requests.clone();
         let requests_for_chat = requests.clone();
+        let observed_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed_headers = Arc::new(Mutex::new(Vec::<axum::http::HeaderMap>::new()));
+        let bodies_for_responses = observed_bodies.clone();
+        let headers_for_responses = observed_headers.clone();
         let upstream = axum::Router::new()
             .route(
                 "/v1/responses",
-                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                axum::routing::post(move |
+                    headers: axum::http::HeaderMap,
+                    axum::Json(body): axum::Json<Value>,
+                | {
                     let requests = requests_for_responses.clone();
+                    let bodies = bodies_for_responses.clone();
+                    let observed_headers = headers_for_responses.clone();
                     async move {
                         requests.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().unwrap().push(body.clone());
+                        observed_headers.lock().unwrap().push(headers);
                         let model = body.get("model").and_then(Value::as_str).unwrap_or_default();
                         if model == "blocked-model" {
                             return (
@@ -4527,6 +4522,8 @@ mod tests {
         )
         .unwrap();
 
+        let metrics_before = serde_json::to_value(state.metrics.snapshot().await).unwrap();
+        let cache_before = state.cache.test_retained_state().await;
         let responses = probe_provider_health_inner(
             &state,
             ProviderHealthProbeInput {
@@ -4548,6 +4545,57 @@ mod tests {
             Some("probe-response")
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let first_body = observed_bodies.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(
+            first_body.pointer("/input/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            first_body
+                .pointer("/input/0/content")
+                .and_then(Value::as_str),
+            Some("private probe prompt")
+        );
+        assert_eq!(
+            first_body.get("max_output_tokens").and_then(Value::as_u64),
+            Some(1)
+        );
+        for field in [
+            "store",
+            "tools",
+            "previous_response_id",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "metadata",
+        ] {
+            assert!(
+                first_body.get(field).is_none(),
+                "unexpected health field {field}"
+            );
+        }
+        let first_headers = observed_headers.lock().unwrap().first().cloned().unwrap();
+        assert_eq!(
+            first_headers
+                .get(axum::http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            first_headers
+                .get(axum::http::header::PRAGMA)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-cache")
+        );
+        assert_eq!(
+            serde_json::to_value(state.metrics.snapshot().await).unwrap(),
+            metrics_before,
+            "a health probe must not create normal metrics, upstream-call records, or token/cache usage"
+        );
+        assert_eq!(
+            state.cache.test_retained_state().await,
+            cache_before,
+            "a health probe must not create or mutate a response-cache entry"
+        );
         let serialized = serde_json::to_string(&responses).unwrap();
         assert!(!serialized.contains("probe-secret"));
         assert!(!serialized.contains("private probe prompt"));
@@ -4601,6 +4649,16 @@ mod tests {
         assert!(!blocked.results[0].ok);
         assert_eq!(blocked.results[0].message, "upstream_stream_error");
         assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            serde_json::to_value(state.metrics.snapshot().await).unwrap(),
+            metrics_before,
+            "successful, accepted, and rejected health probes all remain outside normal metrics"
+        );
+        assert_eq!(
+            state.cache.test_retained_state().await,
+            cache_before,
+            "successful, accepted, and rejected health probes all remain outside the response cache"
+        );
 
         let after = {
             let config = state.config.read().await;

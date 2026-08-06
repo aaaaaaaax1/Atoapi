@@ -333,6 +333,16 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Test-only observation of retained cache state.  Production callers
+    /// intentionally have no enumeration API because cache contents can
+    /// contain response material; regression tests use this only to prove
+    /// management operations do not enter the response-cache path.
+    #[cfg(test)]
+    pub(crate) async fn test_retained_state(&self) -> (usize, usize) {
+        let entries = self.entries.read().await;
+        (entries.len(), self.retained_bytes.load(Ordering::Acquire))
+    }
+
     pub async fn lookup(
         &self,
         key: &str,
