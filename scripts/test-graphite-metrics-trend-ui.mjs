@@ -358,8 +358,8 @@ assert.match(
 );
 assert.match(
   host,
-  /const cacheShortfallTokens = Number\(request\.cacheShortfallTokens \|\| 0\);[\s\S]{0,420}"缺口 " \+ requestTokens\(cacheShortfallTokens\)[\s\S]{0,260}cacheNewTailTokens > 0 \? "新 " \+ requestTokens\(cacheNewTailTokens\)/,
-  "the request hit cell must show the numeric shortfall and append the new-tail amount when present"
+  /function requestCacheTailSegments\(shortfallTokens, newTailTokens\)[\s\S]{0,700}newTail > 0 && newTail === shortfall[\s\S]{0,180}return \["新 " \+ requestTokens\(newTail\)\]/,
+  "the request hit cell must collapse identical shortfall and new-tail values into one label"
 );
 assert.match(
   host,

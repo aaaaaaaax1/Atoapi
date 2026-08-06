@@ -27,11 +27,110 @@ import type {
   GraphitePrototypeHostProps,
   GraphiteProviderPayload
 } from "./graphite/frameProtocol";
-import { providerBelongsToAgent } from "./graphite/providerScope";
+import { providerBelongsToAgent, providersForGraphiteAgent } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.25";
+const APP_VERSION = "v1.4.27";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
+const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
+const PROVIDER_BALANCE_BATCH_SIZE = 4;
+const PROVIDER_CONNECTION_BATCH_SIZE = 4;
+
+function formatBalanceNotice(value: string | null | undefined): string {
+  const text = String(value ?? "").trim();
+  if (!text || text === "无限额度") return text;
+  const normalized = text.replace(/,/g, "");
+  return /^[+-]?\d+(?:\.\d+)?$/.test(normalized)
+    ? Number(normalized).toFixed(2)
+    : text;
+}
+
+/**
+ * The balance belongs to a provider/key scope, not to transient health
+ * bookkeeping.  Connection tests update key status/last_checked_at in the
+ * persisted config; those fields must not invalidate a previously measured
+ * balance.  Only routing identity and the public key snapshot participate in
+ * this fingerprint, so a replaced URL/key still clears stale quota data.
+ */
+function providerBalanceScopeFingerprint(provider: ProviderConfig): string {
+  const pool = provider.key_pool;
+  return JSON.stringify({
+    id: provider.id,
+    base_url: provider.base_url,
+    channel: provider.channel,
+    channel_mode: provider.channel_mode,
+    is_full_url: provider.is_full_url,
+    models_url: provider.models_url ?? null,
+    custom_user_agent: provider.custom_user_agent ?? null,
+    use_system_proxy: provider.use_system_proxy,
+    enabled: provider.enabled,
+    has_api_key: provider.has_api_key,
+    key_pool: pool
+      ? {
+          enabled: pool.enabled,
+          keys: pool.keys.map((key) => ({
+            id: key.id,
+            preview: key.preview,
+            enabled: key.enabled,
+            has_saved_secret: key.has_saved_secret
+          }))
+        }
+      : null
+  });
+}
+
+function providersForOpenAgents(config: AppConfig): ProviderConfig[] {
+  const openProviderIds = new Set<string>();
+  const openAgents = (config.agent_injections ?? []).filter((agent) => agent.enabled);
+  for (const agent of openAgents) {
+    const order = config.agent_provider_orders?.find((entry) => entry.agent_id === agent.id)?.provider_ids ?? [];
+    for (const provider of providersForGraphiteAgent(config.providers, agent, order)) {
+      openProviderIds.add(provider.id);
+    }
+    if (agent.provider_id) openProviderIds.add(agent.provider_id);
+  }
+  if (!openProviderIds.size && config.active_provider_id) {
+    openProviderIds.add(config.active_provider_id);
+  }
+  const candidates = config.providers.filter((provider) =>
+    provider.enabled &&
+    openProviderIds.has(provider.id) &&
+    (provider.has_api_key || (provider.key_pool?.enabled === true && provider.key_pool.available_keys > 0))
+  );
+  return candidates.length ? candidates : config.providers.filter((provider) =>
+    provider.enabled &&
+    (provider.has_api_key || (provider.key_pool?.enabled === true && provider.key_pool.available_keys > 0))
+  );
+}
+
+function providerConnectionTestInput(provider: ProviderConfig) {
+  return {
+    provider_id: provider.id,
+    key_id: null,
+    api_key: null,
+    base_url: provider.base_url,
+    models_url: provider.models_url ?? null,
+    is_full_url: provider.is_full_url,
+    custom_user_agent: provider.custom_user_agent ?? null,
+    channel: provider.channel,
+    use_system_proxy: provider.use_system_proxy
+  };
+}
+
+function providerProbeScopeSignature(config: AppConfig | null): string {
+  if (!config) return "";
+  return JSON.stringify({
+    active_provider_id: config.active_provider_id ?? null,
+    providers: config.providers.map(providerBalanceScopeFingerprint),
+    agents: (config.agent_injections ?? [])
+      .filter((agent) => agent.enabled)
+      .map((agent) => ({
+        id: agent.id,
+        provider_id: agent.provider_id ?? null,
+        provider_order: config.agent_provider_orders?.find((entry) => entry.agent_id === agent.id)?.provider_ids ?? []
+      }))
+  });
+}
 
 /**
  * The one control-plane module used by the accepted Graphite shell.
@@ -56,6 +155,12 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
   const [error, setError] = useState("");
   const reasoningFallbackSyncing = useRef(false);
   const seenReasoningFallbackFailures = useRef(new Set<string>());
+  const balanceProbeGeneration = useRef(0);
+  const balanceProbeInFlight = useRef(false);
+  const balanceProbeInFlightGeneration = useRef(0);
+  const balanceProbeScopes = useRef<Record<string, string>>({});
+  const startupConnectionProbeScope = useRef("");
+  const providerProbeScope = providerProbeScopeSignature(config);
 
   async function refreshAll() {
     setError("");
@@ -140,6 +245,114 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         : (agents.find((agent) => agent.enabled) ?? agents[0]).id
     );
   }, [config]);
+
+  useEffect(() => {
+    // A balance result belongs to the exact saved Key/config snapshot that
+    // produced it. Any config/key change invalidates the old display until a
+    // fresh probe completes; this prevents a retired Key's quota from being
+    // shown for the newly selected Key.
+    const previousScopes = balanceProbeScopes.current;
+    const nextScopes = Object.fromEntries(
+      (config?.providers ?? []).map((provider) => [provider.id, providerBalanceScopeFingerprint(provider)])
+    );
+    balanceProbeScopes.current = nextScopes;
+    balanceProbeGeneration.current += 1;
+    const generation = balanceProbeGeneration.current;
+    // Keep balances for unchanged provider/key scopes.  A connectivity/Key
+    // health test refreshes config metadata, but it does not replace the Key;
+    // clearing every row in that case made the UI briefly (and needlessly)
+    // report "余额未探测" for all upstreams.  Changed or removed scopes are
+    // pruned and will be re-probed below.
+    setProviderBalanceStatus((current) => Object.fromEntries(
+      Object.entries(current).filter(([providerId]) =>
+        nextScopes[providerId] && previousScopes[providerId] === nextScopes[providerId]
+      )
+    ));
+    if (!config) return;
+
+    let disposed = false;
+    const candidates = providersForOpenAgents(config);
+    const probeAllProviderBalances = async () => {
+      if (disposed || (balanceProbeInFlight.current && balanceProbeInFlightGeneration.current === generation)) return;
+      balanceProbeInFlight.current = true;
+      balanceProbeInFlightGeneration.current = generation;
+      try {
+        const next: Record<string, ProviderBalanceProbeResult> = {};
+        for (let offset = 0; offset < candidates.length; offset += PROVIDER_BALANCE_BATCH_SIZE) {
+          if (disposed || balanceProbeGeneration.current !== generation) return;
+          const batch = candidates.slice(offset, offset + PROVIDER_BALANCE_BATCH_SIZE);
+          const results = await Promise.all(batch.map(async (provider) => {
+            try {
+              return await command<ProviderBalanceProbeResult>("probe_provider_balance", {
+                providerId: provider.id,
+                provider_id: provider.id
+              });
+            } catch {
+              return {
+                provider_id: provider.id,
+                supported: false,
+                ok: false,
+                elapsed_ms: 0,
+                balance: null,
+                message: "balance_probe_unavailable"
+              } satisfies ProviderBalanceProbeResult;
+            }
+          }));
+          results.forEach((result) => { next[result.provider_id] = result; });
+        }
+        if (!disposed && balanceProbeGeneration.current === generation) {
+          setProviderBalanceStatus(next);
+        }
+      } finally {
+        if (balanceProbeInFlightGeneration.current === generation) {
+          balanceProbeInFlight.current = false;
+        }
+      }
+    };
+
+    const probeConnectionsOnOpen = async () => {
+      const connectionScope = `${selectedAgentId}|${candidates.map((provider) => providerBalanceScopeFingerprint(provider)).join(";")}`;
+      if (startupConnectionProbeScope.current === connectionScope) return;
+      startupConnectionProbeScope.current = connectionScope;
+      const next: Record<string, string> = {};
+      for (let offset = 0; offset < candidates.length; offset += PROVIDER_CONNECTION_BATCH_SIZE) {
+        if (disposed || balanceProbeGeneration.current !== generation) return;
+        const batch = candidates.slice(offset, offset + PROVIDER_CONNECTION_BATCH_SIZE);
+        const results = await Promise.all(batch.map(async (provider) => {
+          const startedAt = performance.now();
+          try {
+            const result = await command<ProviderConnectionPathTestResult>("test_provider_connection_paths", {
+              input: providerConnectionTestInput(provider)
+            });
+            const selectedPath = result.paths.find((path) =>
+              result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
+            );
+            const pathLabel = result.recommended_use_system_proxy ? "系统代理更快" : "直连更快";
+            return [
+              provider.id,
+              result.ok
+                ? `${pathLabel} · ${selectedPath?.elapsed_ms ?? Math.max(0, Math.round(performance.now() - startedAt))}ms`
+                : `测试失败 · ${Math.max(0, Math.round(performance.now() - startedAt))}ms`
+            ] as const;
+          } catch {
+            return [provider.id, "测试失败"] as const;
+          }
+        }));
+        results.forEach(([providerId, status]) => { next[providerId] = status; });
+        if (!disposed && balanceProbeGeneration.current === generation) {
+          setProviderConnectionStatus((current) => ({ ...current, ...next }));
+        }
+      }
+    };
+
+    void probeAllProviderBalances();
+    void probeConnectionsOnOpen();
+    const timer = window.setInterval(() => { void probeAllProviderBalances(); }, PROVIDER_BALANCE_REFRESH_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [providerProbeScope, selectedAgentId]);
 
   async function saveProviderFromGraphite(agentId: string, payload: GraphiteProviderPayload) {
     const name = payload.name.trim();
@@ -516,7 +729,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       setProviderBalanceStatus((current) => ({ ...current, [providerId]: result }));
       return {
         notice: result.ok
-          ? `余额：${result.balance ?? "已获取"}`
+          ? `余额：${formatBalanceNotice(result.balance) || "已获取"}`
           : result.supported
             ? `余额探测未通过：${result.message}`
             : "该上游未识别到通用余额 API",

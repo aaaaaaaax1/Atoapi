@@ -119,7 +119,9 @@ export type ProviderHealthProbeMode =
   | "responses_streaming"
   | "chat_streaming"
   | "chat_json"
-  | "responses_json";
+  | "responses_json"
+  | "anthropic_streaming"
+  | "anthropic_json";
 
 export type ProviderHealthProbeTarget =
   | "current"

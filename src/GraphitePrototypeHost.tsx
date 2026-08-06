@@ -804,12 +804,18 @@ const bridgeSource = String.raw`
         const key = healthProbeKeyLabel(healthProbeProviderId, item?.key_id);
         const status = item?.status ? "HTTP " + item.status : "无 HTTP 状态";
         const transport = item?.http_version ? " · " + item.http_version : "";
-        const first = Number.isFinite(Number(item?.first_response_ms)) ? " · 首响应 " + item.first_response_ms + "ms" : "";
+        const elapsed = Number(item?.elapsed_ms || 0);
+        const firstResponse = Number.isFinite(Number(item?.first_response_ms))
+          ? Number(item.first_response_ms)
+          : null;
+        const timing = "耗时 " + elapsed + "ms · 首字 " + (firstResponse == null ? "未返回" : firstResponse + "ms");
+        const detail = status + transport + " · " + String(item?.message || "");
         const preview = item?.response_preview ? '<small class="health-probe-preview">' + escape(item.response_preview) + '</small>' : "";
         return '<article class="health-probe-row ' + (ok ? "is-pass" : "is-fail") + '">'
           + '<span class="health-probe-icon">' + icon(ok ? "circle-check" : "circle-x", 16) + '</span>'
           + '<div><b>' + escape(key) + " · " + (ok ? "通过" : "不通过") + '</b><small>'
-          + escape(status + " · " + Number(item?.elapsed_ms || 0) + "ms" + transport + first + " · " + String(item?.message || ""))
+          + '<span class="health-probe-timing">' + escape(timing) + '</span><span>' + escape(detail)
+          + '</span>'
           + '</small>' + preview + '</div></article>';
       }).join("") || '<div class="health-probe-empty">没有可测活的启用 Key。</div>';
     }
@@ -818,10 +824,27 @@ const bridgeSource = String.raw`
   }
 
   function balanceProbeLabel(result) {
-    if (!result) return "余额";
-    if (result.ok && result.balance) return "余额 " + result.balance;
+    if (!result) return "余额未探测";
+    if (result.ok && result.balance) return "余额 " + balanceProbeDisplayValue(result.balance);
     if (result.supported === false) return "余额不可查";
     return "余额探测失败";
+  }
+
+  function balanceProbeDisplayValue(value) {
+    const text = String(value ?? "").trim();
+    if (!text || text === "无限额度") return text;
+    const normalized = text.replace(/,/g, "");
+    return /^[+-]?\d+(?:\.\d+)?$/.test(normalized)
+      ? Number(normalized).toFixed(2)
+      : text;
+  }
+
+  function balanceProbeTone(result) {
+    if (!result?.ok || !result.balance) return "is-unknown";
+    if (String(result.balance) === "无限额度") return "is-unlimited";
+    const numeric = Number(String(result.balance).replace(/,/g, "").match(/[+-]?\d+(?:\.\d+)?/)?.[0]);
+    if (Number.isFinite(numeric) && numeric <= 0) return "is-depleted";
+    return "is-healthy";
   }
 
   function applyBalanceProbe(result) {
@@ -1441,7 +1464,7 @@ const bridgeSource = String.raw`
       '<article class="provider-row ' + (provider.active ? "active" : "") + '" data-provider-id="' + escape(provider.id) + '">' +
       '<span class="provider-mark" draggable="true" data-provider-drag="' + escape(provider.id) + '" title="拖动调整上游顺序" style="cursor:grab">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
       '<div class="provider-copy"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small></div>' +
-      '<div class="provider-meta"><div class="provider-tags"><span class="tag">' + escape(provider.channel) + '</span>' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + '<span class="tag">' + escape(provider.keys + " Key") + '</span><button class="balance-probe-chip" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
+      '<div class="provider-meta"><div class="provider-tags">' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
       '<div class="provider-actions"><button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>' +
       '<button class="tool-button connection-test-button" type="button" data-test-provider="' + escape(provider.id) + '" aria-label="测试 ' + escape(provider.name) + ' 连通性" title="测试当前 Key 连通性">' + icon("plug-zap", 14) + '连通</button>' +
       '<button class="tool-button health-probe-button" type="button" data-health-probe-provider="' + escape(provider.id) + '" aria-label="测活 ' + escape(provider.name) + '" title="测活">' + icon("activity", 14) + '测活</button>' +
@@ -1469,6 +1492,25 @@ const bridgeSource = String.raw`
 
   function requestTokens(value) {
     return Number(value || 0).toLocaleString("en-US");
+  }
+
+  function requestCacheTailSegments(shortfallTokens, newTailTokens) {
+    const shortfall = Number.isFinite(Number(shortfallTokens))
+      ? Math.max(0, Math.floor(Number(shortfallTokens)))
+      : 0;
+    const newTail = Number.isFinite(Number(newTailTokens))
+      ? Math.max(0, Math.floor(Number(newTailTokens)))
+      : 0;
+    if (shortfall <= 0) return [];
+    // When the whole shortfall is the newly appended tail, showing both
+    // labels repeats the same number and makes the compact row look wrong.
+    if (newTail > 0 && newTail === shortfall) {
+      return ["新 " + requestTokens(newTail)];
+    }
+    return [
+      "缺口 " + requestTokens(shortfall),
+      newTail > 0 ? "新 " + requestTokens(newTail) : ""
+    ].filter(Boolean);
   }
 
   function renderRequestScopeTabs(metricState) {
@@ -1525,12 +1567,10 @@ const bridgeSource = String.raw`
         : '';
       const cacheShortfallTokens = Number(request.cacheShortfallTokens || 0);
       const cacheNewTailTokens = Number(request.cacheNewTailGapTokens || 0);
-      const cacheTailSegments = cacheShortfallTokens > 0
-        ? [
-          "缺口 " + requestTokens(cacheShortfallTokens),
-          cacheNewTailTokens > 0 ? "新 " + requestTokens(cacheNewTailTokens) : ""
-        ].filter(Boolean)
-        : [];
+      const cacheTailSegments = requestCacheTailSegments(
+        cacheShortfallTokens,
+        cacheNewTailTokens
+      );
       const cacheTailDetail = cacheTailSegments.length
         ? cacheTailSegments.join(" · ")
         : "满桶";

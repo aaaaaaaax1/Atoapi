@@ -15,12 +15,17 @@ new Function(bridgeSource);
 
 assert.match(html, /id="healthProbeOverlay"/, "the health probe must use a dedicated modal");
 assert.match(html, /id="healthProbePromptInput"[^>]*>hi<\/textarea>/, "the health probe prompt must default to hi");
+assert.match(html, /最多请求 1 个输出 token/, "the health probe must advertise its one-token cold-start budget");
 assert.match(html, /value="responses_streaming"/, "Responses streaming must be selectable");
 assert.match(html, /value="chat_streaming"/, "Chat streaming must be selectable");
 assert.match(html, /value="chat_json"/, "Chat JSON must be selectable");
 assert.match(html, /value="responses_json"/, "Responses JSON must be selectable");
+assert.match(html, /value="anthropic_streaming"/, "Anthropic streaming must be selectable");
+assert.match(html, /value="anthropic_json"/, "Anthropic JSON must be selectable");
 assert.match(html, /id="testAllKeysHealthButton"/, "multi-Key testing must open the unified health flow");
 assert.doesNotMatch(html, /providerBalanceProbeUrlInput|余额 API URL/, "balance probing must not require a manually configured URL");
+assert.match(html, /\.balance-probe-chip\.is-unknown/, "unknown balances must have a yellow visual state");
+assert.match(html, /\.balance-probe-chip\.is-depleted/, "zero or negative balances must have a red visual state");
 
 assert.match(bridgeSource, /function openHealthProbe\(providerId, target = "current", keyIds = \[\]\)/, "provider and multi-Key paths must share one target-aware modal");
 assert.match(bridgeSource, /send\("fetch-health-probe-models", \{ providerId \}\)/, "opening the modal must automatically fetch models");
@@ -30,6 +35,12 @@ assert.match(bridgeSource, /data-test-provider/, "provider rows must retain the 
 assert.match(bridgeSource, /openHealthProbe\(providerId, "all_enabled"\)/, "all-Key testing must not reuse the provider card's current-Key target");
 assert.match(bridgeSource, /data-balance-probe/, "provider rows must expose a balance probe action");
 assert.match(bridgeSource, /balanceProbeLabel\(provider\.balance\)/, "balance results must remain visible on provider rows");
+assert.match(bridgeSource, /health-probe-timing/, "health probe results must expose a dedicated timing row");
+assert.match(bridgeSource, /耗时 [\s\S]{0,120}首字/, "health probe timing row must label elapsed and first-byte timings");
+assert.match(bridgeSource, /mode\.value = channel === "chat" \? "chat_streaming" : "responses_streaming"/, "Responses remains the default health-probe shape");
+assert.match(bridgeSource, /function balanceProbeTone\(result\)[\s\S]{0,420}is-depleted/, "zero or negative balances must use the red depleted state");
+assert.match(bridgeSource, /function balanceProbeTone\(result\)[\s\S]{0,260}is-unknown/, "unknown or unmeasurable balances must use the yellow unknown state");
+assert.match(bridgeSource, /function balanceProbeDisplayValue\(value\)[\s\S]{0,260}toFixed\(2\)/, "numeric balances must be compacted to two decimal places in the UI");
 assert.doesNotMatch(
   bridgeSource.slice(bridgeSource.indexOf("renderProviders = function"), bridgeSource.indexOf("function requestTimingTone")),
   /Agent 直传/,
@@ -40,6 +51,13 @@ assert.match(controlPlane, /command<ModelConfig\[\]>\("fetch_provider_health_mod
 assert.match(controlPlane, /command<ProviderHealthProbeResult>\("probe_provider_health"/, "actual health checks must use the dedicated backend command");
 assert.match(controlPlane, /command<ProviderKeyTestResult>\("test_active_provider_key"/, "the retained connection action must test the current Key separately from model health probing");
 assert.match(controlPlane, /command<ProviderBalanceProbeResult>\("probe_provider_balance"/, "balance clicks must invoke a separate explicit management action");
+assert.match(controlPlane, /const PROVIDER_BALANCE_REFRESH_MS = 15 \* 60 \* 1000;/, "provider balances must refresh every fifteen minutes");
+assert.match(controlPlane, /providerBalanceScopeFingerprint/, "balance state must be scoped to provider/key identity");
+assert.match(controlPlane, /previousScopes\[providerId\] === nextScopes\[providerId\]/, "connection-test config refreshes must retain unchanged balances");
+assert.match(controlPlane, /probeAllProviderBalances[\s\S]{0,1800}setInterval\(\(\) => \{ void probeAllProviderBalances\(\); \}, PROVIDER_BALANCE_REFRESH_MS\)/, "the control plane must probe all enabled upstreams on the fifteen-minute timer");
+assert.match(controlPlane, /providersForOpenAgents\(config\)/, "startup probes must be limited to upstreams belonging to enabled agents");
+assert.match(controlPlane, /test_provider_connection_paths/, "startup must perform a non-mutating connectivity test");
+assert.match(controlPlane, /probeConnectionsOnOpen\(\)/, "startup connectivity probes must run alongside the initial balance probe");
 assert.doesNotMatch(controlPlane, /save_provider_balance_probe_config|balance_probe_url/, "the editor must not save a manual balance endpoint");
 assert.match(api, /export type ProviderHealthProbeMode/, "API types must describe all probe shapes");
 assert.match(api, /export type ProviderHealthProbeTarget/, "API types must describe health probe targets");

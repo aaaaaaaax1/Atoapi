@@ -40,7 +40,14 @@ const ERROR_BODY_MAX_CHARS: usize = 512;
 const PROVIDER_NETWORK_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
 const KEY_POOL_HEALTH_CONCURRENCY: usize = 4;
 const PROVIDER_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
-const PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES: usize = 16 * 1024;
+// A stream health probe only needs enough of the first upstream event to
+// establish that the route, Key and selected model were accepted. Some
+// Responses-compatible gateways put a very large opaque payload in their
+// first `response.created` event, so the old 16 KiB all-body cap falsely
+// rejected healthy routes before a usable event could be observed.
+const PROVIDER_HEALTH_PROBE_STREAM_SCAN_MAX_BYTES: usize = 128 * 1024;
+const PROVIDER_HEALTH_PROBE_JSON_MAX_BYTES: usize = 256 * 1024;
+const PROVIDER_BALANCE_PROBE_RESPONSE_MAX_BYTES: usize = 16 * 1024;
 const PROVIDER_HEALTH_PROBE_PREVIEW_MAX_CHARS: usize = 160;
 const KNOWN_COMPAT_SUFFIXES: &[&str] = &[
     "/api/claudecode",
@@ -121,17 +128,23 @@ pub enum ProviderHealthProbeMode {
     ChatStreaming,
     ChatJson,
     ResponsesJson,
+    AnthropicStreaming,
+    AnthropicJson,
 }
 
 impl ProviderHealthProbeMode {
     fn is_streaming(&self) -> bool {
-        matches!(self, Self::ResponsesStreaming | Self::ChatStreaming)
+        matches!(
+            self,
+            Self::ResponsesStreaming | Self::ChatStreaming | Self::AnthropicStreaming
+        )
     }
 
     fn endpoint_channel(&self) -> Channel {
         match self {
             Self::ResponsesStreaming | Self::ResponsesJson => Channel::Responses,
             Self::ChatStreaming | Self::ChatJson => Channel::Chat,
+            Self::AnthropicStreaming | Self::AnthropicJson => Channel::Anthropic,
         }
     }
 }
@@ -1670,7 +1683,7 @@ async fn probe_provider_health_key(
             first_response_ms: observation.first_response_ms,
             http_version,
             message: if mode.is_streaming() {
-                "stream_completed".to_string()
+                "stream_accepted".to_string()
             } else {
                 "response_received".to_string()
             },
@@ -1730,29 +1743,41 @@ fn health_probe_request_body(mode: &ProviderHealthProbeMode, model: &str, prompt
     match mode {
         ProviderHealthProbeMode::ResponsesStreaming => json!({
             "model": model,
-            "input": prompt,
+            // Match the Codex/New API Responses request shape: a user input
+            // item rather than the legacy shorthand string.
+            "input": [{ "role": "user", "content": prompt }],
             "stream": true,
-            "store": false,
-            "max_output_tokens": 16,
+            "max_output_tokens": 1,
         }),
         ProviderHealthProbeMode::ResponsesJson => json!({
             "model": model,
-            "input": prompt,
+            "input": [{ "role": "user", "content": prompt }],
             "stream": false,
-            "store": false,
-            "max_output_tokens": 16,
+            "max_output_tokens": 1,
         }),
         ProviderHealthProbeMode::ChatStreaming => json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "stream": true,
-            "max_tokens": 16,
+            "max_tokens": 1,
         }),
         ProviderHealthProbeMode::ChatJson => json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "stream": false,
-            "max_tokens": 16,
+            "max_tokens": 1,
+        }),
+        ProviderHealthProbeMode::AnthropicStreaming => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": true,
+            "max_tokens": 1,
+        }),
+        ProviderHealthProbeMode::AnthropicJson => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": false,
+            "max_tokens": 1,
         }),
     }
 }
@@ -1777,7 +1802,12 @@ async fn read_health_probe_response(
             if first_response_ms.is_none() && !chunk.is_empty() {
                 first_response_ms = Some(started.elapsed().as_millis() as u64);
             }
-            let remaining = PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES.saturating_sub(body.len());
+            let max_bytes = if mode.is_streaming() {
+                PROVIDER_HEALTH_PROBE_STREAM_SCAN_MAX_BYTES
+            } else {
+                PROVIDER_HEALTH_PROBE_JSON_MAX_BYTES
+            };
+            let remaining = max_bytes.saturating_sub(body.len());
             if remaining == 0 {
                 return Err(anyhow!("response_too_large"));
             }
@@ -1787,7 +1817,7 @@ async fn read_health_probe_response(
             if health_probe_stream_failed(&text) {
                 return Err(anyhow!("upstream_stream_error"));
             }
-            if mode.is_streaming() && health_probe_stream_completed(&text, &mode) {
+            if mode.is_streaming() && health_probe_stream_accepted(&text, &mode) {
                 return Ok(HealthProbeResponseObservation {
                     first_response_ms,
                     response_preview: health_probe_preview(&text),
@@ -1835,6 +1865,82 @@ fn health_probe_stream_completed(body: &str, mode: &ProviderHealthProbeMode) -> 
                             && health_probe_chat_finish_reason(&value)
                     })
         }),
+        ProviderHealthProbeMode::AnthropicStreaming => health_probe_sse_values(body).any(|value| {
+            !health_probe_value_failed(&value)
+                && value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| {
+                        kind == "message_stop"
+                            || (kind == "message_delta"
+                                && value
+                                    .pointer("/delta/stop_reason")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|reason| !reason.trim().is_empty()))
+                    })
+        }),
+        _ => false,
+    }
+}
+
+/// Mirrors the practical New API/Sub2-style channel-test contract: a stream
+/// is live once it yields a recognizable, non-error event. We deliberately do
+/// not wait for a huge terminal frame here: this is a management-only
+/// reachability probe, while normal relay traffic retains its strict terminal
+/// handling and error propagation.
+fn health_probe_stream_accepted(body: &str, mode: &ProviderHealthProbeMode) -> bool {
+    if health_probe_stream_completed(body, mode) {
+        return true;
+    }
+    let Some(data) = health_probe_sse_lines(body).next() else {
+        return false;
+    };
+    if data == "[DONE]" {
+        return matches!(mode, ProviderHealthProbeMode::ChatStreaming);
+    }
+    let normalized = data.trim();
+    if normalized.is_empty() || !normalized.starts_with('{') {
+        return false;
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(normalized) {
+        if health_probe_value_failed(&value) {
+            return false;
+        }
+        return match mode {
+            ProviderHealthProbeMode::ResponsesStreaming => value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind.starts_with("response.")),
+            ProviderHealthProbeMode::ChatStreaming => {
+                value.get("choices").is_some() || value.get("id").is_some()
+            }
+            ProviderHealthProbeMode::AnthropicStreaming => value
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| {
+                    kind.starts_with("message_") || kind.starts_with("content_block_")
+                }),
+            _ => false,
+        };
+    }
+    // A few compatible Responses gateways emit a single very large
+    // `response.created` JSON line. Its initial ASCII fields are enough to
+    // prove the stream is accepted; explicit error prefixes remain failures.
+    let compact = normalized.split_whitespace().collect::<String>();
+    if compact.contains("\"type\":\"error\"")
+        || compact.contains("\"type\":\"response.failed\"")
+        || compact.contains("\"error\":{")
+    {
+        return false;
+    }
+    match mode {
+        ProviderHealthProbeMode::ResponsesStreaming => compact.contains("\"type\":\"response."),
+        ProviderHealthProbeMode::ChatStreaming => {
+            compact.contains("\"choices\"") || compact.contains("\"id\"")
+        }
+        ProviderHealthProbeMode::AnthropicStreaming => {
+            compact.contains("\"type\":\"message_") || compact.contains("\"type\":\"content_block_")
+        }
         _ => false,
     }
 }
@@ -2096,6 +2202,13 @@ fn balance_probe_candidates(base_url: &str) -> Result<Vec<ProviderBalanceProbeCa
             ProviderBalanceProbeProfile::Sub2Usage,
             api_root.join("usage")?,
         ),
+        // New API deployments are split on whether their router preserves the
+        // trailing slash. Try the documented slash form first; the no-slash
+        // variant remains a bounded compatibility fallback for other hosts.
+        (
+            ProviderBalanceProbeProfile::NewApiTokenUsage,
+            origin.join("api/usage/token/")?,
+        ),
         (
             ProviderBalanceProbeProfile::NewApiTokenUsage,
             origin.join("api/usage/token")?,
@@ -2148,7 +2261,7 @@ async fn read_limited_probe_body(response: reqwest::Response) -> Result<Vec<u8>>
         let mut body = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| anyhow!("response_read_error"))?;
-            let remaining = PROVIDER_HEALTH_PROBE_RESPONSE_MAX_BYTES.saturating_sub(body.len());
+            let remaining = PROVIDER_BALANCE_PROBE_RESPONSE_MAX_BYTES.saturating_sub(body.len());
             if remaining == 0 || chunk.len() > remaining {
                 return Err(anyhow!("response_too_large"));
             }
@@ -2166,6 +2279,10 @@ fn balance_response_failed(value: &Value) -> bool {
             .get("success")
             .and_then(Value::as_bool)
             .is_some_and(|success| !success)
+        || value
+            .get("code")
+            .and_then(Value::as_bool)
+            .is_some_and(|code| !code)
 }
 
 fn balance_display_for_profile(
@@ -2189,26 +2306,62 @@ fn balance_display_for_profile(
         // New API reports unlimited status separately; numerical values are
         // upstream quota units, so the UI must not invent a currency symbol.
         ProviderBalanceProbeProfile::NewApiTokenUsage => {
-            if value
-                .pointer("/data/unlimited_quota")
+            let Some(data) = recognized_new_api_token_usage(value) else {
+                return None;
+            };
+            let numeric_pointers = [
+                "/data/total_available",
+                "/data/remaining",
+                "/data/balance",
+                "/total_available",
+                "/remaining",
+                "/balance",
+            ];
+            // New API's `unlimited_quota` is authoritative for its
+            // token-usage envelope. `total_available` can be a signed usage
+            // accounting value (including a negative number) and must not be
+            // exposed as a monetary balance when the route explicitly marks
+            // the quota unlimited.
+            if data
+                .get("unlimited_quota")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
             {
                 return Some("无限额度".to_string());
             }
-            balance_display_at(
-                value,
-                &[
-                    "/data/total_available",
-                    "/data/remaining",
-                    "/data/balance",
-                    "/total_available",
-                    "/remaining",
-                    "/balance",
-                ],
-            )
+            // Finite New API quotas may legitimately be zero or negative;
+            // preserve that value so the UI can render the depleted red state.
+            balance_display_at(value, &numeric_pointers)
         }
     }
+}
+
+/// Avoid treating arbitrary JSON that happens to contain a balance-looking
+/// field as a New API token-usage response. Unknown payloads remain
+/// `余额不可查`; only a success envelope plus the documented token-usage shape
+/// can produce a numeric or unlimited display.
+fn recognized_new_api_token_usage(value: &Value) -> Option<&Value> {
+    let data = value.get("data")?;
+    let has_success_envelope = value.get("code").and_then(Value::as_bool).unwrap_or(false)
+        || value
+            .get("success")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || data
+            .get("object")
+            .and_then(Value::as_str)
+            .is_some_and(|object| object == "token_usage");
+    let has_usage_field = [
+        "unlimited_quota",
+        "total_available",
+        "total_granted",
+        "total_used",
+        "remaining",
+        "balance",
+    ]
+    .iter()
+    .any(|field| data.get(*field).is_some());
+    (has_success_envelope && has_usage_field).then_some(data)
 }
 
 fn balance_display_at(value: &Value, pointers: &[&str]) -> Option<String> {
@@ -4007,9 +4160,77 @@ mod tests {
     }
 
     #[test]
+    fn health_probe_accepts_a_large_responses_first_event_without_waiting_for_terminal() {
+        let body = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_large\",\"metadata\":\"{}\"}}}}\n\n",
+            "x".repeat(24_000)
+        );
+        assert!(health_probe_stream_accepted(
+            &body,
+            &ProviderHealthProbeMode::ResponsesStreaming
+        ));
+        assert!(!health_probe_stream_accepted(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"blocked\"}}\n\n",
+            &ProviderHealthProbeMode::ResponsesStreaming
+        ));
+    }
+
+    #[test]
+    fn health_probe_responses_use_codex_style_input_items() {
+        let body = health_probe_request_body(
+            &ProviderHealthProbeMode::ResponsesStreaming,
+            "gpt-5.6-terra",
+            "hi",
+        );
+        assert_eq!(
+            body.pointer("/input/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content").and_then(Value::as_str),
+            Some("hi")
+        );
+        assert_eq!(
+            body.get("max_output_tokens").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert!(body.get("store").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("previous_response_id").is_none());
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert!(body.get("metadata").is_none());
+    }
+
+    #[test]
+    fn health_probe_adds_anthropic_messages_without_changing_responses_default() {
+        assert_eq!(
+            health_probe_endpoint_url("https://upstream.example/v1", &Channel::Anthropic).unwrap(),
+            "https://upstream.example/v1/messages"
+        );
+        let body = health_probe_request_body(
+            &ProviderHealthProbeMode::AnthropicStreaming,
+            "claude-sonnet-4",
+            "hi",
+        );
+        assert_eq!(
+            body.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert!(health_probe_stream_accepted(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+            &ProviderHealthProbeMode::AnthropicStreaming
+        ));
+        assert!(!health_probe_stream_accepted(
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"bad key\"}}\n\n",
+            &ProviderHealthProbeMode::AnthropicStreaming
+        ));
+    }
+
+    #[test]
     fn built_in_balance_profiles_use_only_safe_api_roots_and_recognized_json() {
         let candidates = balance_probe_candidates("https://upstream.example/v1/responses").unwrap();
-        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates.len(), 3);
         assert_eq!(
             candidates[0].profile,
             ProviderBalanceProbeProfile::Sub2Usage
@@ -4021,6 +4242,10 @@ mod tests {
         );
         assert_eq!(
             candidates[1].endpoint,
+            "https://upstream.example/api/usage/token/"
+        );
+        assert_eq!(
+            candidates[2].endpoint,
             "https://upstream.example/api/usage/token"
         );
         assert_eq!(
@@ -4037,7 +4262,49 @@ mod tests {
                 ProviderBalanceProbeProfile::NewApiTokenUsage,
             )
             .as_deref(),
+            None
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({
+                    "code": true,
+                    "data": {"object": "token_usage", "unlimited_quota": true}
+                }),
+                ProviderBalanceProbeProfile::NewApiTokenUsage,
+            )
+            .as_deref(),
             Some("无限额度")
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({
+                    "code": true,
+                    "data": {
+                        "object": "token_usage",
+                        "unlimited_quota": true,
+                        "total_available": -9815964
+                    }
+                }),
+                ProviderBalanceProbeProfile::NewApiTokenUsage,
+            )
+            .as_deref(),
+            Some("无限额度")
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({"balance": 0}),
+                ProviderBalanceProbeProfile::Sub2Usage,
+            )
+            .as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            balance_display_for_profile(
+                &json!({"balance": "-$10.25"}),
+                ProviderBalanceProbeProfile::Sub2Usage,
+            )
+            .as_deref(),
+            Some("-$10.25")
         );
         assert!(balance_display_for_profile(
             &json!({"status": "ok", "data": {"message": "no balance here"}}),
@@ -4185,6 +4452,15 @@ mod tests {
                                 "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"blocked\"}}\n\n".to_string(),
                             );
                         }
+                        if model == "large-first-event" {
+                            return (
+                                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                                format!(
+                                    "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp_large\",\"metadata\":\"{}\"}}}}\n\n",
+                                    "x".repeat(24_000)
+                                ),
+                            );
+                        }
                         (
                             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                             "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"content\":[{\"text\":\"probe-response\"}]}]}}\n\n".to_string(),
@@ -4292,6 +4568,23 @@ mod tests {
         assert!(chat.results[0].ok);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
 
+        let large = probe_provider_health_inner(
+            &state,
+            ProviderHealthProbeInput {
+                provider_id: provider_id.to_string(),
+                key_ids: Vec::new(),
+                target: ProviderHealthProbeTarget::AllEnabled,
+                model: "large-first-event".to_string(),
+                mode: ProviderHealthProbeMode::ResponsesStreaming,
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(large.results[0].ok);
+        assert_eq!(large.results[0].message, "stream_accepted");
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+
         let blocked = probe_provider_health_inner(
             &state,
             ProviderHealthProbeInput {
@@ -4307,7 +4600,7 @@ mod tests {
         .unwrap();
         assert!(!blocked.results[0].ok);
         assert_eq!(blocked.results[0].message, "upstream_stream_error");
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
 
         let after = {
             let config = state.config.read().await;
@@ -4326,7 +4619,7 @@ mod tests {
         assert_eq!(balance.message, "balance_api_not_detected");
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            3,
+            4,
             "the health-route fixture only counts its three matching POST requests"
         );
         std::fs::remove_dir_all(dir).ok();
