@@ -48,7 +48,7 @@ const gateHeaders = booleanArg(args["gate-headers"]);
 const generatedControls = booleanArg(args["generated-controls"]);
 const sequentialToolOutputChars = args["tool-output-chars"] === undefined
   ? 0
-  : boundedPositiveInteger(args["tool-output-chars"], "--tool-output-chars", 512_000);
+  : boundedPositiveInteger(args["tool-output-chars"], "--tool-output-chars", 1_000_000);
 const scenario = String(args.scenario ?? "ordinary").trim().toLowerCase();
 const baselineLabel = basename(dirname(oldExecutable));
 const COMMIT_MATURITY_PROBE_DELAY_MS = 700;
@@ -231,6 +231,18 @@ try {
     ]).has(field)) &&
     newRun.identityMarkers.shadow_affinity_trusted_identity === true &&
     expectedShadowObservation;
+  // Product releases intentionally advance the default `Atoapi/<version>`
+  // header. The secret-free synthetic fixture has no custom User-Agent, so
+  // only there may the corresponding local-only prefix digest differ without
+  // making an otherwise exact wire comparison look regressed. Copied user
+  // configurations remain strict, as do all identity fields except the two
+  // derived from this header.
+  const defaultUserAgentIdentityShift = syntheticConfig &&
+    expectedDefaultUserAgentIdentityShift(
+      oldRun.upstreamHeaders,
+      newRun.upstreamHeaders,
+      identity
+    );
   const recovery = scenario === "lineage-recovery"
     ? summarizeLineageRecovery(baseline, fastrelay, model)
     : null;
@@ -317,7 +329,8 @@ try {
     candidate_user_agent_version:
       String(newRun.upstreamHeaders["user-agent"] ?? "") === expectedCandidateUserAgent,
     protocol_headers: JSON.stringify(baselineComparableHeaders) === JSON.stringify(fastrelayComparableHeaders),
-    local_identity: identity.equal || expectedIdentityCorrection || scenario === "lineage-recovery"
+    local_identity: identity.equal || expectedIdentityCorrection || defaultUserAgentIdentityShift ||
+      scenario === "lineage-recovery"
   };
   const report = {
     pass: Object.values(checks).every(Boolean),
@@ -361,6 +374,7 @@ try {
     baseline_shadow_observation: shadowObservationClass(oldRun.identityMarkers),
     fastrelay_shadow_observation: shadowObservationClass(newRun.identityMarkers),
     client_owned_cache_key_correction: clientOwnedCacheKeyCorrection,
+    default_user_agent_identity_shift: defaultUserAgentIdentityShift,
     sequential_metadata_correction: sequentialMetadataCorrection,
     regenerated_tool_id_correction: regeneratedToolIdCorrection,
     checks,
@@ -392,7 +406,11 @@ try {
     `candidate default User-Agent must match its Cargo package version (${expectedCandidateUserAgent})`
   );
   assert.equal(checks.protocol_headers, true, "upstream protocol headers changed unexpectedly");
-  assert.equal(checks.local_identity, true, "local identity changed outside the attested caller cache-key correction");
+  assert.equal(
+    checks.local_identity,
+    true,
+    "local identity changed outside the attested caller cache-key or default product User-Agent version correction"
+  );
   if (scenario === "ordinary") {
     assert.equal(
       report.meaningful_differing_paths.length,
@@ -507,9 +525,11 @@ try {
     "FastRelay must preserve upstream protocol headers apart from its intentional product-version token"
   );
   assert.equal(
-    report.shadow_identity_equal || report.client_owned_cache_key_correction,
+    report.shadow_identity_equal ||
+      report.client_owned_cache_key_correction ||
+      report.default_user_agent_identity_shift,
     true,
-    `FastRelay must preserve ${baselineLabel} shadow affinity identity unless the corrected client-owned cache key changes only its local placement scope`
+    `FastRelay must preserve ${baselineLabel} shadow affinity identity unless the corrected client-owned cache key or default product User-Agent version changes only its local scope`
   );
   if (gateHeaders) {
     assert.equal(
@@ -1235,6 +1255,20 @@ function comparableProtocolHeaders(headers, ignoreBodyLength = false) {
   };
   if (ignoreBodyLength) comparable["content-length"] = "<body-length>";
   return comparable;
+}
+
+function expectedDefaultUserAgentIdentityShift(baselineHeaders, candidateHeaders, identity) {
+  const baseline = String(baselineHeaders["user-agent"] ?? "");
+  const candidate = String(candidateHeaders["user-agent"] ?? "");
+  const defaultAtoapiUserAgent = /^Atoapi\/\d+(?:\.\d+){1,3}$/u;
+  return baseline !== candidate &&
+    defaultAtoapiUserAgent.test(baseline) &&
+    defaultAtoapiUserAgent.test(candidate) &&
+    identity.differingFields.length > 0 &&
+    identity.differingFields.every((field) => new Set([
+      "provider_prefix_key",
+      "provider_prefix_fingerprint"
+    ]).has(field));
 }
 
 function summarizeLineageRecovery(baseline, candidate, model) {

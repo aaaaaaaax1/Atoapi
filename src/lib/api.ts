@@ -116,6 +116,7 @@ export interface ProviderKeyTestResult {
 }
 
 export type ProviderHealthProbeMode =
+  | "minimal_cost"
   | "responses_streaming"
   | "chat_streaming"
   | "chat_json"
@@ -1494,7 +1495,10 @@ function fallback(name: string, args?: Record<string, unknown>) {
   if (name === "delete_provider" && (args?.providerId || args?.provider_id)) {
     const providerId = String(args.providerId ?? args.provider_id);
     const agentId = String(args?.agentId ?? args?.agent_id ?? "");
-    if (agentId && !providerBelongsToAgentPreview(providerId, agentId)) {
+    if (agentId && providerBelongsToAnotherAgentPreview(providerId, agentId)) {
+      throw new Error("不能删除其他 Agent 的独立上游");
+    }
+    if (agentId && !providerIsTrustedPrivateToAgentPreview(providerId, agentId)) {
       fallbackConfig = {
         ...fallbackConfig,
         agent_injections: fallbackConfig.agent_injections.map((item) =>
@@ -1509,6 +1513,11 @@ function fallback(name: string, args?: Record<string, unknown>) {
                 )
               }
             : item
+        ),
+        agent_provider_orders: removePreviewAgentProviderFromOrder(
+          fallbackConfig.agent_provider_orders,
+          agentId,
+          providerId
         ),
         updated_at: new Date().toISOString()
       };
@@ -1535,6 +1544,14 @@ function fallback(name: string, args?: Record<string, unknown>) {
       providers,
       provider_key_pools: (fallbackConfig.provider_key_pools ?? []).filter((item) => item.provider_id !== providerId),
       active_provider_id: activeProviderId,
+      agent_provider_orders: removePreviewProviderFromAllOrders(
+        removePreviewAgentProviderFromOrder(
+          fallbackConfig.agent_provider_orders,
+          agentId,
+          sourceProviderId ?? ""
+        ),
+        providerId
+      ),
       agent_injections: fallbackConfig.agent_injections.map((item) =>
         item.provider_id === providerId && (!agentId || item.id === agentId)
           ? {
@@ -1862,6 +1879,48 @@ function inferPreviewModels(baseUrl: string, channel: Channel): ModelConfig[] {
 
 function providerBelongsToAgentPreview(providerId: string, agentId: string) {
   return providerId.startsWith(`agent-${slugify(agentId)}-`);
+}
+
+function providerIsRegisteredToAgentPreview(providerId: string, agentId: string) {
+  const agent = fallbackConfig.agent_injections.find((item) => item.id === agentId);
+  if (!agent || (agent.hidden_provider_ids ?? []).includes(providerId)) return false;
+  return agent.provider_id === providerId
+    || (fallbackConfig.agent_provider_orders ?? []).some(
+      (order) => order.agent_id === agentId && order.provider_ids.includes(providerId)
+    );
+}
+
+function providerIsTrustedPrivateToAgentPreview(providerId: string, agentId: string) {
+  return providerBelongsToAgentPreview(providerId, agentId)
+    && providerIsRegisteredToAgentPreview(providerId, agentId);
+}
+
+function providerBelongsToAnotherAgentPreview(providerId: string, agentId: string) {
+  return fallbackConfig.agent_injections.some((agent) =>
+    agent.id !== agentId && providerIsTrustedPrivateToAgentPreview(providerId, agent.id)
+  );
+}
+
+function removePreviewAgentProviderFromOrder(
+  orders: AgentProviderOrderConfig[] | undefined,
+  agentId: string,
+  providerId: string
+) {
+  if (!providerId) return orders;
+  return (orders ?? [])
+    .map((order) => order.agent_id === agentId
+      ? { ...order, provider_ids: order.provider_ids.filter((id) => id !== providerId) }
+      : order)
+    .filter((order) => order.provider_ids.length > 0);
+}
+
+function removePreviewProviderFromAllOrders(
+  orders: AgentProviderOrderConfig[] | undefined,
+  providerId: string
+) {
+  return (orders ?? [])
+    .map((order) => ({ ...order, provider_ids: order.provider_ids.filter((id) => id !== providerId) }))
+    .filter((order) => order.provider_ids.length > 0);
 }
 
 function providerCloneMatchesSourcePreview(providerId: string, sourceId: string, agentId: string) {

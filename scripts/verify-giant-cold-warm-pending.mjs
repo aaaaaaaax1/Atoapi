@@ -29,14 +29,32 @@ const usageSequence = [
   [283_954, 3_801],
   [285_637, 278_080]
 ];
+const AUTOMATIC_READ_ONLY_PROBE_PATHS = new Set([
+  "/v1/usage",
+  "/v1/models",
+  "/api/usage/token/",
+  "/api/usage/token"
+]);
 let upstream = null;
 let tempRoot = null;
 let captured = [];
+let unexpectedUpstreamRequests = [];
 const rootInput = buildGiantToolRoot();
 
 try {
   upstream = createServer(async (request, response) => {
-    const body = JSON.parse(await readRequestBody(request));
+    const rawBody = await readRequestBody(request);
+    if (request.method !== "POST" || request.url !== "/v1/responses") {
+      unexpectedUpstreamRequests.push({
+        method: request.method,
+        path: request.url,
+        body_bytes: Buffer.byteLength(rawBody)
+      });
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end('{"error":{"message":"unexpected isolated fixture request"}}');
+      return;
+    }
+    const body = JSON.parse(rawBody);
     const index = captured.length;
     captured.push({ body, headers: safeHeaders(request.headers) });
     const [inputTokens, cachedTokens] = usageSequence[index] ?? usageSequence.at(-1);
@@ -111,6 +129,12 @@ try {
     }
 
     assert.equal(captured.length, usageSequence.length, "one inbound must produce one upstream POST");
+    assert(
+      unexpectedUpstreamRequests.every((request) =>
+        request.method === "GET" && AUTOMATIC_READ_ONLY_PROBE_PATHS.has(request.path)
+      ),
+      `only configured startup balance/model GET probes may run outside an inbound: ${JSON.stringify(unexpectedUpstreamRequests)}`
+    );
     for (let turn = 0; turn < captured.length; turn += 1) {
       const body = captured[turn].body;
       assert.equal(body.model, model, `turn ${turn}: model changed on the frozen wire`);
@@ -195,7 +219,8 @@ try {
       turn_diagnostics: turnDiagnostics,
       prompt_cache_key_stable: true,
       wire_prefix_append_only: true,
-      giant_cold_low_reads: lowReads.length
+      giant_cold_low_reads: lowReads.length,
+      automatic_read_only_probe_requests: unexpectedUpstreamRequests.length
     }, null, 2));
   } finally {
     await stopChild(child);

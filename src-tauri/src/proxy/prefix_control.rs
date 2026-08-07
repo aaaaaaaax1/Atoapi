@@ -11,7 +11,7 @@ use super::{
     responses_current_tail_makes_avoidable_unreliable, responses_huge_dynamic_history_cold_read,
     responses_small_avoidable_tail_granularity, responses_tiny_instability_recovery_tail_is_clean,
     responses_tool_tail_burst, should_learn_provider_prefix_family_state,
-    should_learn_sent_provider_bucket, TailInputDiagnostics,
+    should_learn_sent_provider_bucket_on_final_wire, TailInputDiagnostics,
 };
 
 const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
@@ -574,13 +574,17 @@ impl PrefixController {
         };
         let learn_sent_bucket = !provider_unstable
             && !evidence.tail_granularity
-            && should_learn_sent_provider_bucket(
+            && should_learn_sent_provider_bucket_on_final_wire(
                 input.previous,
                 record,
                 shortfall_tokens,
                 shortfall_tokens_128,
                 input.tail,
                 input.used_response_session,
+                matches!(
+                    input.final_responses_static_projection,
+                    FinalResponsesStaticProjection::Observed(Some(_))
+                ),
             );
         let sent_bucket_tokens = if learn_sent_bucket {
             provider_cache_bucket_max(record.input_tokens)

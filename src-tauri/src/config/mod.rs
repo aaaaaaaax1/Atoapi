@@ -3,7 +3,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -1013,6 +1013,81 @@ fn proxy_bind_conflicts(host: &str, port: u16, other_host: &str, other_port: u16
     let other_ip = other_host.parse::<IpAddr>()?;
     Ok(ip == other_ip || ip.is_unspecified() || other_ip.is_unspecified())
 }
+
+fn provider_is_private_to_agent_for_migration(provider_id: &str, agent_id: &str) -> bool {
+    provider_id.starts_with(&format!(
+        "agent-{}-",
+        sanitize_agent_provider_id_part_for_migration(agent_id)
+    ))
+}
+
+fn unique_agent_provider_id_for_migration(
+    config: &AppConfig,
+    agent_id: &str,
+    source_provider_id: &str,
+) -> String {
+    let base = format!(
+        "agent-{}-{}",
+        sanitize_agent_provider_id_part_for_migration(agent_id),
+        sanitize_agent_provider_id_part_for_migration(source_provider_id),
+    );
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while config
+        .providers
+        .iter()
+        .any(|provider| provider.id == candidate)
+    {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn unique_agent_provider_name_for_migration(config: &AppConfig, desired: &str) -> String {
+    let base = desired.trim();
+    let base = if base.is_empty() {
+        "Agent provider"
+    } else {
+        base
+    };
+    let mut candidate = base.to_string();
+    let mut suffix = 2;
+    while config
+        .providers
+        .iter()
+        .any(|provider| provider.name == candidate)
+    {
+        candidate = format!("{base} ({suffix})");
+        suffix += 1;
+    }
+    candidate
+}
+
+fn sanitize_agent_provider_id_part_for_migration(value: &str) -> String {
+    let mut result = value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while result.contains("--") {
+        result = result.replace("--", "-");
+    }
+    let result = result.trim_matches('-').to_string();
+    if result.is_empty() {
+        "provider".to_string()
+    } else {
+        result
+    }
+}
+
 impl AppConfig {
     pub fn upstream_proxy_url_for(&self, use_system_proxy: bool) -> Option<&str> {
         use_system_proxy
@@ -1067,6 +1142,9 @@ impl AppConfig {
             normalize_agent_injections(&mut config.agent_injections);
             if config.agent_injections != previous_agent_injections {
                 config.updated_at = Utc::now();
+                changed = true;
+            }
+            if config.migrate_legacy_agent_provider_bindings() {
                 changed = true;
             }
             if config.prune_orphaned_references() {
@@ -1142,6 +1220,226 @@ impl AppConfig {
         }
         self.updated_at = now;
         true
+    }
+
+    /// Converts old Agent bindings that still point at a shared provider into
+    /// independent per-Agent records. The original provider is kept intact as
+    /// a migration source; only the Agent binding and its visible saved list
+    /// move to the clone. This keeps an Agent's Key rotation, health, balance,
+    /// compaction, channel, and cache-capability state from leaking into any
+    /// other Agent.
+    fn migrate_legacy_agent_provider_bindings(&mut self) -> bool {
+        let now = Utc::now();
+        let routes = self
+            .agent_injections
+            .iter()
+            .enumerate()
+            .map(|(index, agent)| {
+                (
+                    index,
+                    agent.id.clone(),
+                    agent.label.clone(),
+                    agent.provider_id.clone(),
+                    agent.hidden_provider_ids.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut registered_agents_by_provider: HashMap<String, HashSet<String>> = HashMap::new();
+        for (_, agent_id, _, bound_provider_id, hidden_provider_ids) in &routes {
+            let ordered_provider_ids = self
+                .agent_provider_orders
+                .iter()
+                .find(|order| order.agent_id == *agent_id)
+                .map(|order| order.provider_ids.as_slice())
+                .unwrap_or_default();
+            for provider_id in ordered_provider_ids {
+                if !hidden_provider_ids.contains(provider_id) {
+                    registered_agents_by_provider
+                        .entry(provider_id.clone())
+                        .or_default()
+                        .insert(agent_id.clone());
+                }
+            }
+            if let Some(provider_id) = bound_provider_id {
+                registered_agents_by_provider
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .insert(agent_id.clone());
+            }
+        }
+        let mut changed = false;
+
+        for (agent_index, agent_id, agent_label, bound_provider_id, hidden_provider_ids) in routes {
+            let mut visible_provider_ids = self
+                .agent_provider_orders
+                .iter()
+                .find(|order| order.agent_id == agent_id)
+                .map(|order| order.provider_ids.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|provider_id| !hidden_provider_ids.contains(provider_id))
+                .collect::<Vec<_>>();
+            if let Some(provider_id) = bound_provider_id.as_ref() {
+                if !visible_provider_ids
+                    .iter()
+                    .any(|visible_id| visible_id == provider_id)
+                {
+                    visible_provider_ids.push(provider_id.clone());
+                }
+            }
+
+            let mut replacements = HashMap::new();
+            for source_provider_id in &visible_provider_ids {
+                let shared_with_another_agent = registered_agents_by_provider
+                    .get(source_provider_id)
+                    .is_some_and(|agents| agents.iter().any(|owner| owner != &agent_id));
+                if (provider_is_private_to_agent_for_migration(source_provider_id, &agent_id)
+                    && !shared_with_another_agent)
+                    || replacements.contains_key(source_provider_id)
+                {
+                    continue;
+                }
+                if let Some(cloned_provider_id) = self.clone_provider_for_agent_migration(
+                    &agent_id,
+                    &agent_label,
+                    source_provider_id,
+                    now,
+                ) {
+                    replacements.insert(source_provider_id.clone(), cloned_provider_id);
+                }
+            }
+            if replacements.is_empty() {
+                continue;
+            }
+
+            let replacement_for = |provider_id: &str| {
+                replacements
+                    .get(provider_id)
+                    .cloned()
+                    .unwrap_or_else(|| provider_id.to_string())
+            };
+            let next_bound_provider_id = bound_provider_id.as_deref().map(replacement_for);
+            let mut next_order = Vec::new();
+            for provider_id in visible_provider_ids {
+                let provider_id = replacement_for(&provider_id);
+                if !next_order.iter().any(|existing| existing == &provider_id) {
+                    next_order.push(provider_id);
+                }
+            }
+            if let Some(provider_id) = next_bound_provider_id.as_ref() {
+                if !next_order.iter().any(|existing| existing == provider_id) {
+                    next_order.push(provider_id.clone());
+                }
+            }
+
+            let agent = &mut self.agent_injections[agent_index];
+            agent.provider_id = next_bound_provider_id;
+            for source_provider_id in replacements.keys() {
+                agent
+                    .hidden_provider_ids
+                    .retain(|hidden_id| hidden_id != source_provider_id);
+            }
+            agent.last_status = Some("已迁移为当前 Agent 独立上游".to_string());
+
+            if let Some(order) = self
+                .agent_provider_orders
+                .iter_mut()
+                .find(|order| order.agent_id == agent_id)
+            {
+                order.provider_ids = next_order;
+            } else if !next_order.is_empty() {
+                self.agent_provider_orders.push(AgentProviderOrderConfig {
+                    agent_id: agent_id.clone(),
+                    provider_ids: next_order,
+                });
+            }
+            changed = true;
+        }
+
+        if changed {
+            self.updated_at = now;
+        }
+        changed
+    }
+
+    fn clone_provider_for_agent_migration(
+        &mut self,
+        agent_id: &str,
+        agent_label: &str,
+        source_provider_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
+        let source_provider = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == source_provider_id)
+            .cloned()?;
+        let cloned_provider_id =
+            unique_agent_provider_id_for_migration(self, agent_id, source_provider_id);
+        let mut cloned_provider = source_provider.clone();
+        cloned_provider.id = cloned_provider_id.clone();
+        cloned_provider.name = unique_agent_provider_name_for_migration(
+            self,
+            &format!("{} / {}", source_provider.name, agent_label),
+        );
+        cloned_provider.created_at = now;
+        cloned_provider.updated_at = now;
+        self.providers.push(cloned_provider);
+
+        if let Some(mut pool) = self
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == source_provider_id)
+            .cloned()
+        {
+            pool.provider_id = cloned_provider_id.clone();
+            pool.updated_at = now;
+            self.provider_key_pools.push(pool);
+        }
+        if let Some(mut compact_mode) = self
+            .provider_compact_modes
+            .iter()
+            .find(|mode| mode.provider_id == source_provider_id)
+            .cloned()
+        {
+            compact_mode.provider_id = cloned_provider_id.clone();
+            compact_mode.updated_at = now;
+            self.provider_compact_modes.push(compact_mode);
+        }
+        if let Some(mut auto_compaction) = self
+            .provider_auto_compaction_limits
+            .iter()
+            .find(|limit| limit.provider_id == source_provider_id)
+            .cloned()
+        {
+            auto_compaction.provider_id = cloned_provider_id.clone();
+            auto_compaction.updated_at = now;
+            self.provider_auto_compaction_limits.push(auto_compaction);
+        }
+        if let Some(mut channel_mode) = self
+            .provider_channel_modes
+            .iter()
+            .find(|mode| mode.provider_id == source_provider_id)
+            .cloned()
+        {
+            channel_mode.provider_id = cloned_provider_id.clone();
+            channel_mode.updated_at = now;
+            self.provider_channel_modes.push(channel_mode);
+        }
+        let cache_capabilities = self
+            .provider_cache_capabilities
+            .iter()
+            .filter(|capability| capability.provider_id == source_provider_id)
+            .cloned()
+            .map(|mut capability| {
+                capability.provider_id = cloned_provider_id.clone();
+                capability.updated_at = now;
+                capability
+            })
+            .collect::<Vec<_>>();
+        self.provider_cache_capabilities.extend(cache_capabilities);
+
+        Some(cloned_provider_id)
     }
 
     /// Remove route and presentation references that can no longer be selected
@@ -2856,6 +3154,188 @@ updated_at = "2026-06-21T00:00:00Z"
         );
         assert!(config.provider_cache_capabilities.is_empty());
         assert!(!config.normalize_legacy_static_default_user_agents());
+    }
+
+    #[test]
+    fn startup_migrates_legacy_agent_routes_into_isolated_provider_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-provider-isolation-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let source_provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 1,
+                recovery_minutes: 30,
+                keys: vec![key_input("source-key", Some("test-secret"), true, 5)],
+            })))
+            .unwrap();
+        config.mark_provider_key_success(&source_provider_id, Some("source-key"));
+        let now = Utc::now();
+        config
+            .provider_compact_modes
+            .push(ProviderCompactModeConfig {
+                provider_id: source_provider_id.clone(),
+                mode: CompactCompatibilityMode::NonSseValidation,
+                updated_at: now,
+            });
+        config
+            .provider_auto_compaction_limits
+            .push(ProviderAutoCompactionConfig {
+                provider_id: source_provider_id.clone(),
+                token_limit: Some(90_000),
+                updated_at: now,
+            });
+        config
+            .provider_channel_modes
+            .push(ProviderChannelModeConfig {
+                provider_id: source_provider_id.clone(),
+                mode: ProviderChannelMode::Manual,
+                updated_at: now,
+            });
+        config.record_cache_capability_probe(
+            &source_provider_id,
+            "gpt-5.6-terra",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityStatus::Verified,
+            Some("source-key".to_string()),
+        );
+        for agent_id in ["codex", "opencode"] {
+            let agent = config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .unwrap();
+            agent.enabled = true;
+            agent.provider_id = Some(source_provider_id.clone());
+        }
+        config.agent_provider_orders = ["codex", "opencode"]
+            .into_iter()
+            .map(|agent_id| AgentProviderOrderConfig {
+                agent_id: agent_id.to_string(),
+                provider_ids: vec![source_provider_id.clone()],
+            })
+            .collect();
+        config.save(&path).unwrap();
+
+        let mut loaded = AppConfig::load_or_create(&path).unwrap();
+        let provider_for = |agent_id: &str| {
+            loaded
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .and_then(|agent| agent.provider_id.clone())
+                .unwrap()
+        };
+        let codex_provider_id = provider_for("codex");
+        let opencode_provider_id = provider_for("opencode");
+        assert_ne!(codex_provider_id, source_provider_id);
+        assert_ne!(opencode_provider_id, source_provider_id);
+        assert_ne!(codex_provider_id, opencode_provider_id);
+        assert!(provider_is_private_to_agent_for_migration(
+            &codex_provider_id,
+            "codex"
+        ));
+        assert!(provider_is_private_to_agent_for_migration(
+            &opencode_provider_id,
+            "opencode"
+        ));
+        assert!(loaded
+            .providers
+            .iter()
+            .any(|provider| provider.id == source_provider_id));
+        assert_eq!(loaded.provider_key_pools.len(), 3);
+        assert_eq!(loaded.provider_compact_modes.len(), 3);
+        assert_eq!(loaded.provider_auto_compaction_limits.len(), 3);
+        assert_eq!(loaded.provider_channel_modes.len(), 3);
+        assert_eq!(loaded.provider_cache_capabilities.len(), 3);
+
+        loaded.mark_provider_key_failure(
+            &codex_provider_id,
+            Some("source-key"),
+            "quota exhausted",
+            true,
+        );
+        let key_status = |provider_id: &str| {
+            loaded
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == provider_id)
+                .and_then(|pool| pool.keys.iter().find(|key| key.id == "source-key"))
+                .map(|key| key.status.clone())
+        };
+        assert_eq!(
+            key_status(&codex_provider_id),
+            Some(ProviderKeyStatus::Unhealthy)
+        );
+        assert_eq!(
+            key_status(&source_provider_id),
+            Some(ProviderKeyStatus::Healthy)
+        );
+        assert_eq!(
+            key_status(&opencode_provider_id),
+            Some(ProviderKeyStatus::Healthy)
+        );
+
+        let reloaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(reloaded.providers.len(), 3, "migration is idempotent");
+        assert_eq!(reloaded.provider_key_pools.len(), 3);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn shared_prefixed_legacy_provider_is_still_split_per_agent() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(None);
+        input.id = Some("agent-codex-manual-shared".to_string());
+        let source_provider_id = config.upsert_provider(input).unwrap();
+        for agent_id in ["codex", "opencode"] {
+            let agent = config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .unwrap();
+            agent.provider_id = Some(source_provider_id.clone());
+        }
+        config.agent_provider_orders = ["codex", "opencode"]
+            .into_iter()
+            .map(|agent_id| AgentProviderOrderConfig {
+                agent_id: agent_id.to_string(),
+                provider_ids: vec![source_provider_id.clone()],
+            })
+            .collect();
+
+        assert!(config.migrate_legacy_agent_provider_bindings());
+        let provider_for = |agent_id: &str| {
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == agent_id)
+                .and_then(|agent| agent.provider_id.clone())
+                .unwrap()
+        };
+        let codex_provider_id = provider_for("codex");
+        let opencode_provider_id = provider_for("opencode");
+        assert_ne!(codex_provider_id, source_provider_id);
+        assert_ne!(opencode_provider_id, source_provider_id);
+        assert_ne!(codex_provider_id, opencode_provider_id);
+        assert!(provider_is_private_to_agent_for_migration(
+            &codex_provider_id,
+            "codex"
+        ));
+        assert!(provider_is_private_to_agent_for_migration(
+            &opencode_provider_id,
+            "opencode"
+        ));
+        assert!(config
+            .agent_provider_orders
+            .iter()
+            .all(|order| !order.provider_ids.contains(&source_provider_id)));
     }
 
     #[test]

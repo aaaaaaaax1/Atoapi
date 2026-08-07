@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::config::Channel;
 
-const ACTION_SCOPE_VERSION: &str = "composite-action-scope-v2";
+const ACTION_SCOPE_VERSION: &str = "canonical-action-scope-v3";
 
 /// The evidence needed before a request may inherit state that can alter a
 /// future upstream request. Placement hints such as `prompt_cache_key` are
@@ -53,21 +53,46 @@ impl CompositeActionScope {
             return None;
         }
 
-        let anchor_key = hash_parts(&[
-            ACTION_SCOPE_VERSION,
-            current_boot_epoch(),
-            workspace,
-            agent_id,
-            provider_id,
-            endpoint.as_str(),
-            model,
-            input.channel.label(),
-            key_realm_id,
-            thread_id.as_deref().unwrap_or(""),
-            conversation_id.as_deref().unwrap_or(""),
-            session_id.as_deref().unwrap_or(""),
-            input.identity_source,
-        ]);
+        let anchor_key = if matches!(input.channel, Channel::Responses) {
+            // Keep only attested native Codex Responses aligned with the
+            // cache-placement identity: the first present Codex dimension is
+            // canonical, while secondary IDs may rotate between turns.
+            let (canonical_identity_kind, canonical_identity_value) = canonical_identity(
+                thread_id.as_deref(),
+                conversation_id.as_deref(),
+                session_id.as_deref(),
+            )?;
+            hash_parts(&[
+                ACTION_SCOPE_VERSION,
+                current_boot_epoch(),
+                workspace,
+                agent_id,
+                provider_id,
+                endpoint.as_str(),
+                model,
+                input.channel.label(),
+                key_realm_id,
+                canonical_identity_kind,
+                canonical_identity_value,
+                input.identity_source,
+            ])
+        } else {
+            hash_parts(&[
+                ACTION_SCOPE_VERSION,
+                current_boot_epoch(),
+                workspace,
+                agent_id,
+                provider_id,
+                endpoint.as_str(),
+                model,
+                input.channel.label(),
+                key_realm_id,
+                thread_id.as_deref().unwrap_or(""),
+                conversation_id.as_deref().unwrap_or(""),
+                session_id.as_deref().unwrap_or(""),
+                input.identity_source,
+            ])
+        };
 
         Some(Self {
             anchor_key,
@@ -106,6 +131,17 @@ fn optional_identity(value: Option<&str>) -> Option<Option<String>> {
         && value.len() == raw.len()
         && !raw.chars().any(char::is_control))
     .then(|| Some(raw.to_string()))
+}
+
+fn canonical_identity<'a>(
+    thread_id: Option<&'a str>,
+    conversation_id: Option<&'a str>,
+    session_id: Option<&'a str>,
+) -> Option<(&'static str, &'a str)> {
+    thread_id
+        .map(|value| ("thread-id", value))
+        .or_else(|| conversation_id.map(|value| ("conversation-id", value)))
+        .or_else(|| session_id.map(|value| ("session-id", value)))
 }
 
 fn hash_parts(parts: &[&str]) -> String {
@@ -170,11 +206,23 @@ mod tests {
     }
 
     #[test]
-    fn binds_every_conversation_and_upstream_realm_dimension() {
+    fn binds_canonical_identity_and_upstream_realm_dimension() {
         let baseline = CompositeActionScope::derive(input()).unwrap();
         let mut changed = input();
         changed.session_id = Some("session-b");
-        assert_ne!(baseline, CompositeActionScope::derive(changed).unwrap());
+        assert_eq!(
+            baseline,
+            CompositeActionScope::derive(changed).unwrap(),
+            "secondary IDs must not split a stable attested thread scope"
+        );
+
+        let mut changed = input();
+        changed.conversation_id = Some("conversation-b");
+        assert_eq!(
+            baseline,
+            CompositeActionScope::derive(changed).unwrap(),
+            "secondary IDs must not split a stable attested thread scope"
+        );
 
         let mut changed = input();
         changed.agent_id = Some("other-agent");
@@ -190,6 +238,58 @@ mod tests {
 
         let mut changed = input();
         changed.key_realm_id = "key-realm-b";
+        assert_ne!(baseline, CompositeActionScope::derive(changed).unwrap());
+    }
+
+    #[test]
+    fn falls_back_to_conversation_then_session_when_primary_identity_is_absent() {
+        let mut conversation = input();
+        conversation.thread_id = None;
+        conversation.session_id = None;
+        let conversation_scope = CompositeActionScope::derive(conversation).unwrap();
+
+        let mut changed_secondary = input();
+        changed_secondary.thread_id = None;
+        changed_secondary.session_id = Some("session-b");
+        assert_eq!(
+            conversation_scope,
+            CompositeActionScope::derive(changed_secondary).unwrap()
+        );
+
+        let mut changed_conversation = input();
+        changed_conversation.thread_id = None;
+        changed_conversation.session_id = None;
+        changed_conversation.conversation_id = Some("conversation-b");
+        assert_ne!(
+            conversation_scope,
+            CompositeActionScope::derive(changed_conversation).unwrap()
+        );
+
+        let mut session = input();
+        session.thread_id = None;
+        session.conversation_id = None;
+        let session_scope = CompositeActionScope::derive(session).unwrap();
+
+        let mut changed_session = input();
+        changed_session.thread_id = None;
+        changed_session.conversation_id = None;
+        changed_session.session_id = Some("session-b");
+        assert_ne!(
+            session_scope,
+            CompositeActionScope::derive(changed_session).unwrap()
+        );
+    }
+
+    #[test]
+    fn non_native_channels_keep_strict_composite_identity() {
+        let chat = Channel::Chat;
+        let mut baseline = input();
+        baseline.channel = &chat;
+        let baseline = CompositeActionScope::derive(baseline).unwrap();
+
+        let mut changed = input();
+        changed.channel = &chat;
+        changed.session_id = Some("session-b");
         assert_ne!(baseline, CompositeActionScope::derive(changed).unwrap());
     }
 

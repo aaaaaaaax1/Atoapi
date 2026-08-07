@@ -17,6 +17,11 @@ use super::ProviderHealthProbeMode;
 use crate::config::Channel;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+// Some third-party Responses compatibility layers treat an empty instruction
+// field as an invitation to install a large Codex default prompt.  A fixed,
+// visible, ordinary assistant instruction keeps the management probe on the
+// same lightweight Responses path as standard OpenAI-compatible key tests.
+const RESPONSES_HEALTH_PROBE_INSTRUCTIONS: &str = "You are ChatGPT, a helpful assistant.";
 
 pub(super) fn client(use_system_proxy: bool, explicit_proxy_url: Option<&str>) -> Result<Client> {
     let mut builder = Client::builder()
@@ -106,16 +111,32 @@ pub(super) fn endpoint_url(base_url: &str, channel: &Channel) -> Result<String> 
 
 pub(super) fn request_body(mode: &ProviderHealthProbeMode, model: &str, prompt: &str) -> Value {
     match mode {
+        ProviderHealthProbeMode::MinimalCost => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": true,
+            "max_tokens": 1,
+        }),
         ProviderHealthProbeMode::ResponsesStreaming => json!({
             "model": model,
-            "input": [{ "role": "user", "content": prompt }],
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": prompt }]
+            }],
+            "instructions": RESPONSES_HEALTH_PROBE_INSTRUCTIONS,
             "stream": true,
+            "store": false,
             "max_output_tokens": 1,
         }),
         ProviderHealthProbeMode::ResponsesJson => json!({
             "model": model,
-            "input": [{ "role": "user", "content": prompt }],
+            "input": [{
+                "role": "user",
+                "content": [{ "type": "input_text", "text": prompt }]
+            }],
+            "instructions": RESPONSES_HEALTH_PROBE_INSTRUCTIONS,
             "stream": false,
+            "store": false,
             "max_output_tokens": 1,
         }),
         ProviderHealthProbeMode::ChatStreaming => json!({

@@ -827,15 +827,13 @@ async fn list_models_for_agent(
         Err(response) => return response,
     };
     let config = state.config.read().await;
-    let agent_provider_id = authorized_agent
-        .as_deref()
-        .and_then(|agent_id| {
-            config
-                .agent_injections
-                .iter()
-                .find(|agent| agent.id == agent_id)
-        })
-        .and_then(|agent| agent.provider_id.as_deref());
+    let authorized_agent_config = authorized_agent.as_deref().and_then(|agent_id| {
+        config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == agent_id)
+    });
+    let agent_provider_id = authorized_agent_config.and_then(|agent| agent.provider_id.as_deref());
     let data = config
         .providers
         .iter()
@@ -845,11 +843,25 @@ async fn list_models_for_agent(
                     .map(|provider_id| provider.id == provider_id)
                     .unwrap_or(true)
         })
-        .flat_map(|provider| provider_model_list_items(provider, authorized_agent.is_some()))
+        .flat_map(|provider| {
+            let fallback_model = authorized_agent_config
+                .filter(|_| provider.models.iter().all(|model| !model.enabled))
+                .and_then(|agent| agent.model_id.as_deref())
+                .or_else(|| {
+                    authorized_agent_config
+                        .filter(|_| provider.models.iter().all(|model| !model.enabled))
+                        .map(|_| "gpt-5.2")
+                });
+            provider_model_list_items(provider, authorized_agent.is_some(), fallback_model)
+        })
         .collect::<Vec<_>>();
     Json(json!({ "object": "list", "data": data })).into_response()
 }
-fn provider_model_list_items(provider: &ProviderConfig, include_codex_aliases: bool) -> Vec<Value> {
+fn provider_model_list_items(
+    provider: &ProviderConfig,
+    include_codex_aliases: bool,
+    fallback_model: Option<&str>,
+) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen_ids = HashSet::new();
     for model in provider.models.iter().filter(|model| model.enabled) {
@@ -884,6 +896,21 @@ fn provider_model_list_items(provider: &ProviderConfig, include_codex_aliases: b
                     "canonical_id": model.id
                 }));
             }
+        }
+    }
+    if items.is_empty() {
+        if let Some(model_id) = fallback_model
+            .map(str::trim)
+            .filter(|model_id| !model_id.is_empty())
+        {
+            items.push(json!({
+                "id": model_id,
+                "object": "model",
+                "owned_by": provider.name,
+                "provider": provider.id,
+                "display_name": model_id,
+                "atoapi_fallback": true
+            }));
         }
     }
     items
@@ -4420,7 +4447,7 @@ async fn run_generation_for_authorized_agent(
         matches!(active_request_channel, Channel::Responses),
         upstream_request_diagnostics.final_wire_receipt.as_ref(),
     );
-    let prefix_observation = observe_provider_prefix_usage(
+    let prefix_observation = observe_provider_prefix_usage_with_final_scope(
         &state,
         prefix_state_update_key.as_deref(),
         provider_prefix_family_key.as_deref(),
@@ -4479,6 +4506,7 @@ async fn run_generation_for_authorized_agent(
             && !sync_compact_diagnostic_only
             && !confirmed_compaction
             && !full_replay_ambiguous_local_lineage,
+        upstream_request_diagnostics.final_scope_waterline.as_ref(),
     )
     .await;
     let (gap_breakdown, final_scope_rollback_reclassified) =
@@ -6759,7 +6787,63 @@ async fn update_provider_prefix_state_with_tail_and_guard(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn observe_provider_prefix_usage(
+    state: &AppState,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    raw_usage: Option<&UsageRecord>,
+    effective_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    current_maturity_parent_scope_digest: Option<&str>,
+    settled_maturity_parent_scope_digest: Option<&str>,
+    late_atoapi_mutation_categories: &[String],
+    used_response_session: bool,
+    retried_full_response: bool,
+    guard_budget_exhausted: bool,
+    pre_request_avoidable_tokens: u64,
+    recovery_applicable: bool,
+    guard_source_is_exact: bool,
+    exact_settle_window_elapsed: bool,
+    settled_exact_state_finished_at: Option<Instant>,
+    preserve_existing_native_maturity_scope: bool,
+    learn_state: bool,
+) -> ProviderPrefixUsageObservation {
+    observe_provider_prefix_usage_with_final_scope(
+        state,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        raw_usage,
+        effective_usage,
+        tail,
+        final_responses_static_projection,
+        current_maturity_parent_scope_digest,
+        settled_maturity_parent_scope_digest,
+        late_atoapi_mutation_categories,
+        used_response_session,
+        retried_full_response,
+        guard_budget_exhausted,
+        pre_request_avoidable_tokens,
+        recovery_applicable,
+        guard_source_is_exact,
+        exact_settle_window_elapsed,
+        settled_exact_state_finished_at,
+        preserve_existing_native_maturity_scope,
+        learn_state,
+        None,
+    )
+    .await
+}
+
+/// The production settlement path may additionally provide the exact final
+/// scope waterline.  That receipt is stronger than the generic tail-shape
+/// heuristics: when it proves a small, exact, non-rollback sent-vs-settled
+/// residual, retain that sent bucket for the next request's bounded 500ms
+/// maturity guard.  Test callers without a final-scope receipt keep the
+/// historical conservative path through the wrapper above.
+#[allow(clippy::too_many_arguments)]
+async fn observe_provider_prefix_usage_with_final_scope(
     state: &AppState,
     provider_prefix_key: Option<&str>,
     provider_prefix_family_key: Option<&str>,
@@ -6789,6 +6873,7 @@ async fn observe_provider_prefix_usage(
     // terminals, and ordinary lineage rejection.
     preserve_existing_native_maturity_scope: bool,
     learn_state: bool,
+    final_scope_waterline: Option<&FinalScopeWaterlineLog>,
 ) -> ProviderPrefixUsageObservation {
     let native_responses_scope = matches!(
         final_responses_static_projection,
@@ -6930,9 +7015,14 @@ async fn observe_provider_prefix_usage(
         } else {
             None
         };
-        let next = state_observation
+        let mut next = state_observation
             .as_ref()
             .and_then(|observation| observation.next.clone());
+        if let (Some(next_state), Some(raw), Some(final_scope)) =
+            (next.as_mut(), raw_usage, final_scope_waterline)
+        {
+            promote_exact_final_scope_sent_waterline(next_state, raw, final_scope, tail);
+        }
         let learn_family = state_observation
             .as_ref()
             .is_some_and(|observation| observation.learn_family);
@@ -7034,6 +7124,54 @@ async fn observe_provider_prefix_usage(
     }
 }
 
+/// Preserve a small exact final-scope sent bucket as next-turn evidence when
+/// the upstream terminal proves that the current wire was sent farther than
+/// the settled cache waterline.  This is intentionally narrower than generic
+/// tail learning: noisy/material tool tails remain real new input, and any
+/// rollback, scope ambiguity, or large residual fails open.
+fn promote_exact_final_scope_sent_waterline(
+    next: &mut PrefixWarmState,
+    raw: &UsageRecord,
+    final_scope: &FinalScopeWaterlineLog,
+    tail: &TailInputDiagnostics,
+) {
+    const MAX_PENDING_TOKENS_128: u64 = 4_096;
+
+    if raw.input_tokens < 16_000
+        || raw.cache_read_tokens == 0
+        || final_scope.outcome != "settled"
+        || !final_scope.sent_prediction_eligible
+        || !final_scope.predecessor_exact
+        || !final_scope.predecessor_bound
+        || final_scope.continuity_reset
+        || final_scope.rollback_tokens_128 != 0
+        || final_scope.raw_cache_read_tokens != raw.cache_read_tokens
+        || final_scope.sent_prefix_bucket_tokens_128 <= final_scope.settled_prefix_bucket_tokens_128
+        || final_scope.candidate_avoidable_tokens_128 == 0
+        || final_scope.candidate_avoidable_tokens_128 > MAX_PENDING_TOKENS_128
+        || final_scope.candidate_avoidable_tokens_128
+            > final_scope
+                .sent_prefix_bucket_tokens_128
+                .saturating_sub(final_scope.settled_prefix_bucket_tokens_128)
+        || responses_current_tail_makes_avoidable_unreliable(tail)
+        || responses_tool_tail_burst(tail)
+        || tail.message_chars > 1_024
+        || tail.tool_call_chars > 4_096
+        || tail.tool_output_chars >= 4_096
+        || tail.largest_tool_output_chars >= 4_096
+    {
+        return;
+    }
+
+    let pending = final_scope.candidate_avoidable_tokens_128;
+    let sent = final_scope.sent_prefix_bucket_tokens_128;
+    next.seen_bucket_tokens = next.seen_bucket_tokens.max(sent);
+    next.seen_bucket_tokens_128 = next.seen_bucket_tokens_128.max(sent);
+    next.avoidable_shortfall_tokens = next.avoidable_shortfall_tokens.max(pending);
+    next.avoidable_shortfall_tokens_128 = next.avoidable_shortfall_tokens_128.max(pending);
+    next.avoidable_shortfall_streak = next.avoidable_shortfall_streak.max(1);
+}
+
 /// Returns a fixed, non-sensitive explanation for a cross-request frozen
 /// static-wire transition.  Empty late-mutation categories are meaningful: the
 /// normal pending-body path first freezes only after all local controls are
@@ -7074,6 +7212,7 @@ fn clear_recent_clean_tiny_gap_evidence(
     }
 }
 
+#[cfg(test)]
 fn should_learn_sent_provider_bucket(
     previous: Option<&PrefixWarmState>,
     record: &UsageRecord,
@@ -7081,6 +7220,29 @@ fn should_learn_sent_provider_bucket(
     current_shortfall_128: u64,
     tail_input_diagnostics: &TailInputDiagnostics,
     used_response_session: bool,
+) -> bool {
+    should_learn_sent_provider_bucket_on_final_wire(
+        previous,
+        record,
+        current_shortfall,
+        current_shortfall_128,
+        tail_input_diagnostics,
+        used_response_session,
+        false,
+    )
+}
+
+/// The native Responses caller may additionally prove that the current frozen
+/// wire is exact.  Keep the public generic learner conservative; only this
+/// final-wire path can admit the aggregate mixed-tail extension below.
+fn should_learn_sent_provider_bucket_on_final_wire(
+    previous: Option<&PrefixWarmState>,
+    record: &UsageRecord,
+    current_shortfall: u64,
+    current_shortfall_128: u64,
+    tail_input_diagnostics: &TailInputDiagnostics,
+    used_response_session: bool,
+    exact_final_responses_wire: bool,
 ) -> bool {
     if used_response_session || record.cache_read_tokens == 0 {
         return false;
@@ -7134,6 +7296,7 @@ fn should_learn_sent_provider_bucket(
         current_shortfall,
         current_shortfall_128,
         tail_input_diagnostics,
+        exact_final_responses_wire,
     ) {
         return true;
     }
@@ -7328,6 +7491,7 @@ fn responses_all_stage_tail_can_learn_sent_bucket(
     current_shortfall: u64,
     current_shortfall_128: u64,
     tail_input_diagnostics: &TailInputDiagnostics,
+    exact_final_responses_wire: bool,
 ) -> bool {
     if current_shortfall < 128 {
         return false;
@@ -7352,7 +7516,9 @@ fn responses_all_stage_tail_can_learn_sent_bucket(
     let has_large_tail = tail_input_diagnostics.message_chars >= 8_192
         || tail_input_diagnostics.tool_output_chars >= 8_192
         || tail_input_diagnostics.largest_tool_output_chars >= 8_192
-        || tail_input_diagnostics.tool_call_chars >= 8_192;
+        || tail_input_diagnostics.tool_call_chars >= 8_192
+        || (exact_final_responses_wire
+            && responses_exact_low_noise_mixed_aggregate_tail(tail_input_diagnostics));
     if !has_large_tail {
         return false;
     }
@@ -7370,6 +7536,46 @@ fn responses_all_stage_tail_can_learn_sent_bucket(
     } else {
         ratio >= 0.90
     }
+}
+
+/// A native Responses FullReplay can add a semantically meaningful but still
+/// small control tail through several fields at once.  The existing large-tail
+/// gate deliberately looks at each component independently, which leaves an
+/// exact, low-noise `mixed` continuation (for example message + tool call +
+/// small tool result) unable to teach the sent waterline.  Admit that narrow
+/// aggregate only when the canonical predecessor proof is exact.  The caller
+/// retains all of its existing cache-alignment, prior-waterline and hit-ratio
+/// checks, so this never turns a generic mixed request into a prediction.
+fn responses_exact_low_noise_mixed_aggregate_tail(tail: &TailInputDiagnostics) -> bool {
+    const MIN_AGGREGATE_CHARS: u64 = 8_192;
+    const MAX_INPUT_ITEMS: u64 = 10;
+    const MAX_MESSAGE_CHARS: u64 = 1_024;
+    const MAX_TOOL_CALL_CHARS: u64 = 4_096;
+    // Keep every individual tool result below the existing material-tool
+    // boundary. Larger or noisy tool paths retain their dedicated policies.
+    const MAX_TOOL_OUTPUT_CHARS: u64 = 8_191;
+    const MAX_TOOL_OUTPUT_LINES: u64 = 128;
+
+    let aggregate_chars = tail
+        .message_chars
+        .saturating_add(tail.tool_call_chars)
+        .saturating_add(tail.tool_output_chars);
+    tail.delta_from_session
+        && matches!(tail.source.as_deref(), Some("mixed"))
+        && tail.input_items <= MAX_INPUT_ITEMS
+        && tail.message_chars <= MAX_MESSAGE_CHARS
+        && tail.tool_call_chars <= MAX_TOOL_CALL_CHARS
+        && tail.tool_output_chars <= MAX_TOOL_OUTPUT_CHARS
+        && tail.largest_tool_output_chars <= MAX_TOOL_OUTPUT_CHARS
+        && tail.tool_output_lines <= MAX_TOOL_OUTPUT_LINES
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && aggregate_chars >= MIN_AGGREGATE_CHARS
 }
 
 fn responses_precise_tool_tail_can_learn_sent_bucket(
@@ -25266,8 +25472,8 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let normal = provider_model_list_items(&provider, false);
-        let codex = provider_model_list_items(&provider, true);
+        let normal = provider_model_list_items(&provider, false, None);
+        let codex = provider_model_list_items(&provider, true, None);
         let ids = codex
             .iter()
             .filter_map(|item| item.get("id").and_then(Value::as_str))
@@ -25280,6 +25486,102 @@ mod tests {
             item.get("canonical_id").and_then(Value::as_str) == Some("nc/gpt-5.6-sol")
                 && item.get("id").and_then(Value::as_str) == Some("gpt-5.6-sol")
         }));
+    }
+
+    #[test]
+    fn agent_model_list_has_a_consistent_fallback_when_the_provider_catalog_is_empty() {
+        let provider = ProviderConfig {
+            id: "empty-catalog".to_string(),
+            name: "empty-catalog".to_string(),
+            base_url: "https://empty.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: false,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let items = provider_model_list_items(&provider, true, Some("gpt-5.2"));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].get("id").and_then(Value::as_str), Some("gpt-5.2"));
+        assert_eq!(
+            items[0].get("atoapi_fallback").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_agent_model_list_is_non_empty_without_an_upstream_model_fetch() {
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        let mut provider = test_responses_provider("http://127.0.0.1:9/v1".to_string());
+        provider.id = "empty-catalog".to_string();
+        provider.models.clear();
+        config.providers = vec![provider];
+
+        for (agent_id, model_id) in [("proxy-mode", "gpt-5.6-terra"), ("codex", "gpt-5.6-sol")] {
+            let agent = config
+                .agent_injections
+                .iter_mut()
+                .find(|agent| agent.id == agent_id)
+                .unwrap();
+            agent.enabled = true;
+            agent.provider_id = Some("empty-catalog".to_string());
+            agent.model_id = Some(model_id.to_string());
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-scoped-model-list-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = router(state.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+
+        for (path, agent_id, expected_model) in [
+            ("/v1/models", "proxy-mode", "gpt-5.6-terra"),
+            ("/codex/v1/models", "codex", "gpt-5.6-sol"),
+        ] {
+            let scoped_key = agent_injection::agent_local_key("local-test-key", agent_id);
+            let response = client
+                .get(format!("http://{addr}{path}"))
+                .bearer_auth(scoped_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.json::<Value>().await.unwrap();
+            let models = body
+                .get("data")
+                .and_then(Value::as_array)
+                .expect("model response should include data");
+            assert!(models.iter().any(|model| {
+                model.get("id").and_then(Value::as_str) == Some(expected_model)
+                    && model.get("atoapi_fallback").and_then(Value::as_bool) == Some(true)
+            }));
+        }
+
+        server.abort();
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -25367,7 +25669,7 @@ mod tests {
             updated_at: Utc::now(),
         };
 
-        let items = provider_model_list_items(&provider, true);
+        let items = provider_model_list_items(&provider, true, None);
         assert!(items.iter().any(|item| {
             item.get("id").and_then(Value::as_str) == Some("gpt-5.5")
                 && item.get("canonical_id").and_then(Value::as_str) == Some("gpt-5.6-sol")
@@ -36022,6 +36324,334 @@ mod tests {
         let kept = states.get("main-prefix").unwrap();
         assert_eq!(kept.seen_bucket_tokens, warm.cache_read_tokens);
         assert!(kept.seen_bucket_tokens < provider_cache_bucket_max(large_tail.input_tokens));
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn exact_low_noise_mixed_aggregate_tail_advances_only_the_sent_waterline() {
+        // The individual components deliberately stay below the old 8 KiB
+        // gate, while their exact canonical FullReplay tail is just over it.
+        // This is the narrow real-world shape that previously lost the
+        // follow-up maturity opportunity.
+        let mut previous = prefix_state(131_000, 130_560, 440);
+        previous.responses_static_projection_digest = Some("frozen-wire".to_string());
+        let record = UsageRecord {
+            input_tokens: 143_360,
+            cache_read_tokens: 130_560,
+            ..UsageRecord::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 4,
+            delta_from_session: true,
+            message_chars: 512,
+            tool_call_chars: 3_600,
+            tool_output_chars: 4_096,
+            largest_tool_output_chars: 4_096,
+            tool_output_lines: 24,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        assert_eq!(provider_cache_shortfall(&record), 12_800);
+        assert!(
+            !should_learn_sent_provider_bucket(
+                Some(&previous),
+                &record,
+                provider_cache_shortfall(&record),
+                provider_cache_shortfall_128(&record),
+                &tail,
+                false,
+            ),
+            "the generic path must remain conservative without an exact final-wire receipt"
+        );
+        assert!(should_learn_sent_provider_bucket_on_final_wire(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &tail,
+            false,
+            true,
+        ));
+
+        let observed = PrefixController::observe(PrefixStateInput {
+            previous: Some(&previous),
+            usage: &record,
+            tail: &tail,
+            used_response_session: false,
+            retried_full_response: false,
+            guard_budget_exhausted: false,
+            exact_settle_window_elapsed: false,
+            final_responses_static_projection: FinalResponsesStaticProjection::Observed(Some(
+                "frozen-wire",
+            )),
+        });
+        let next = observed
+            .next
+            .expect("the exact low-noise tail must keep normal state learning");
+        assert_eq!(next.cache_read_tokens, record.cache_read_tokens);
+        assert_eq!(next.shortfall_tokens, 12_800);
+        assert_eq!(
+            next.seen_bucket_tokens,
+            provider_cache_bucket_max(record.input_tokens)
+        );
+        assert_eq!(
+            next.seen_bucket_tokens_128,
+            provider_cache_bucket_max_128(record.input_tokens)
+        );
+
+        let gap = PrefixController::classify_gap(PrefixGapInput {
+            previous_exact: Some(&previous),
+            previous_best: Some(&previous),
+            previous_family: None,
+            usage: &record,
+            tail: &tail,
+            guard_budget_exhausted: false,
+            pre_request_avoidable_tokens: 0,
+            recovery_applicable: false,
+            exact_settle_window_elapsed: false,
+            static_wire_drift: false,
+        });
+        assert_eq!(gap.avoidable_tokens, 0);
+        assert_eq!(gap.new_tail_tokens, 12_800);
+    }
+
+    #[test]
+    fn mixed_aggregate_tail_requires_exact_low_noise_evidence() {
+        let previous = prefix_state(131_000, 130_560, 440);
+        let record = UsageRecord {
+            input_tokens: 143_360,
+            cache_read_tokens: 130_560,
+            ..UsageRecord::default()
+        };
+        let exact_tail = TailInputDiagnostics {
+            input_items: 4,
+            delta_from_session: true,
+            message_chars: 512,
+            tool_call_chars: 3_600,
+            tool_output_chars: 4_096,
+            largest_tool_output_chars: 4_096,
+            tool_output_lines: 24,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let mut missing_exact_proof = exact_tail.clone();
+        missing_exact_proof.delta_from_session = false;
+        assert!(!should_learn_sent_provider_bucket_on_final_wire(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &missing_exact_proof,
+            false,
+            true,
+        ));
+
+        let mut noisy = exact_tail.clone();
+        noisy.tool_output_hash_like_count = 1;
+        assert!(!should_learn_sent_provider_bucket_on_final_wire(
+            Some(&previous),
+            &record,
+            provider_cache_shortfall(&record),
+            provider_cache_shortfall_128(&record),
+            &noisy,
+            false,
+            true,
+        ));
+
+        let low_ratio_record = UsageRecord {
+            input_tokens: 143_360,
+            cache_read_tokens: 124_928,
+            ..UsageRecord::default()
+        };
+        let low_ratio_previous = prefix_state(125_000, 124_928, 72);
+        assert!(provider_cache_ratio(&low_ratio_record).unwrap() < 0.90);
+        assert!(!should_learn_sent_provider_bucket_on_final_wire(
+            Some(&low_ratio_previous),
+            &low_ratio_record,
+            provider_cache_shortfall(&low_ratio_record),
+            provider_cache_shortfall_128(&low_ratio_record),
+            &exact_tail,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn exact_final_scope_sent_waterline_promotion_is_narrow_and_monotonic() {
+        let raw = UsageRecord {
+            input_tokens: 23_495,
+            cache_read_tokens: 22_912,
+            ..UsageRecord::default()
+        };
+        let scope = FinalScopeWaterlineLog {
+            outcome: "settled".to_string(),
+            sent_prediction_eligible: true,
+            predecessor_exact: true,
+            predecessor_bound: true,
+            raw_cache_read_tokens: raw.cache_read_tokens,
+            sent_prefix_bucket_tokens_128: 23_424,
+            settled_prefix_bucket_tokens_128: 22_912,
+            candidate_avoidable_tokens_128: 384,
+            ..FinalScopeWaterlineLog::default()
+        };
+        let safe_tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 128,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let mut next = prefix_state(raw.input_tokens, raw.cache_read_tokens, 0);
+        next.seen_bucket_tokens = raw.cache_read_tokens;
+        next.seen_bucket_tokens_128 = raw.cache_read_tokens;
+        promote_exact_final_scope_sent_waterline(&mut next, &raw, &scope, &safe_tail);
+        assert_eq!(next.seen_bucket_tokens, 23_424);
+        assert_eq!(next.seen_bucket_tokens_128, 23_424);
+        assert_eq!(next.avoidable_shortfall_tokens, 384);
+        assert_eq!(next.avoidable_shortfall_tokens_128, 384);
+        assert_eq!(next.avoidable_shortfall_streak, 1);
+
+        // A later, smaller receipt can never lower the already proven
+        // waterline or turn a settled shortfall into a fabricated regression.
+        let smaller_scope = FinalScopeWaterlineLog {
+            sent_prefix_bucket_tokens_128: 23_040,
+            settled_prefix_bucket_tokens_128: 22_912,
+            candidate_avoidable_tokens_128: 128,
+            raw_cache_read_tokens: raw.cache_read_tokens,
+            outcome: "settled".to_string(),
+            sent_prediction_eligible: true,
+            predecessor_exact: true,
+            predecessor_bound: true,
+            ..FinalScopeWaterlineLog::default()
+        };
+        promote_exact_final_scope_sent_waterline(&mut next, &raw, &smaller_scope, &safe_tail);
+        assert_eq!(next.seen_bucket_tokens, 23_424);
+        assert_eq!(next.avoidable_shortfall_tokens, 384);
+
+        let mut rollback = scope.clone();
+        rollback.rollback_tokens_128 = 128;
+        let before = next.clone();
+        promote_exact_final_scope_sent_waterline(&mut next, &raw, &rollback, &safe_tail);
+        assert_eq!(next.seen_bucket_tokens, before.seen_bucket_tokens);
+        assert_eq!(
+            next.avoidable_shortfall_tokens,
+            before.avoidable_shortfall_tokens
+        );
+
+        let mut large_tool_tail = safe_tail.clone();
+        large_tool_tail.tool_output_chars = 4_096;
+        large_tool_tail.largest_tool_output_chars = 4_096;
+        promote_exact_final_scope_sent_waterline(&mut next, &raw, &scope, &large_tool_tail);
+        assert_eq!(next.seen_bucket_tokens, before.seen_bucket_tokens);
+        assert_eq!(
+            next.avoidable_shortfall_tokens,
+            before.avoidable_shortfall_tokens
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_final_scope_sent_waterline_reaches_next_request_settle_guard() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-final-scope-sent-waterline-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0sent-waterline";
+        let parent = "exact-parent";
+        let static_projection = "stable-wire";
+        let raw = UsageRecord {
+            input_tokens: 23_495,
+            cache_read_tokens: 22_912,
+            ..UsageRecord::default()
+        };
+        let mut prior = prefix_state(raw.input_tokens, raw.cache_read_tokens, 0);
+        prior.responses_static_projection_digest = Some(static_projection.to_string());
+        seed_native_maturity_scope(&state, key, parent, prior).await;
+
+        let scope = FinalScopeWaterlineLog {
+            outcome: "settled".to_string(),
+            sent_prediction_eligible: true,
+            predecessor_exact: true,
+            predecessor_bound: true,
+            raw_cache_read_tokens: raw.cache_read_tokens,
+            sent_prefix_bucket_tokens_128: 23_424,
+            settled_prefix_bucket_tokens_128: 22_912,
+            candidate_avoidable_tokens_128: 384,
+            ..FinalScopeWaterlineLog::default()
+        };
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 128,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        let observation = observe_provider_prefix_usage_with_final_scope(
+            &state,
+            Some(key),
+            None,
+            Some(&raw),
+            Some(&raw),
+            &tail,
+            FinalResponsesStaticProjection::Observed(Some(static_projection)),
+            Some(parent),
+            Some(parent),
+            &[],
+            false,
+            false,
+            false,
+            0,
+            false,
+            true,
+            false,
+            None,
+            false,
+            true,
+            Some(&scope),
+        )
+        .await;
+        assert!(observation.gap.is_some());
+
+        let scoped = state
+            .prefix_maturity_scopes
+            .lock()
+            .await
+            .get(key, parent, Some(static_projection))
+            .expect("the exact final scope must remain available");
+        assert_eq!(scoped.seen_bucket_tokens_128, 23_424);
+        assert_eq!(scoped.avoidable_shortfall_tokens_128, 384);
+        assert_eq!(scoped.avoidable_shortfall_streak, 1);
+        drop(scoped);
+
+        let guard = wait_for_provider_prefix_settle_on_final_wire(
+            &state,
+            &Channel::Responses,
+            Some(key),
+            None,
+            &tail,
+            false,
+            Some(TokioDuration::from_millis(1)),
+            FinalResponsesStaticProjection::Observed(Some(static_projection)),
+            Some(parent),
+        )
+        .await;
+        assert!(guard.wait_ms > 0);
+        assert!(guard.wait_ms <= 500);
+        assert_eq!(
+            guard.reason.as_deref(),
+            Some("responses_first_exact_avoidable_settle")
+        );
+        assert_eq!(guard.source.as_deref(), Some("exact"));
+        assert_eq!(guard.pre_request_avoidable_tokens, 384);
 
         fs::remove_dir_all(dir).ok();
     }

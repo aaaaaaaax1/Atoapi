@@ -14,6 +14,17 @@ const result = await build({
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text).toString("base64")}`;
 const { providerDisplayName, requestAgentBadge } = await import(moduleUrl);
 
+const scopeSourcePath = fileURLToPath(new URL("../src/graphite/providerScope.ts", import.meta.url));
+const scopeResult = await build({
+  entryPoints: [scopeSourcePath],
+  bundle: true,
+  format: "esm",
+  platform: "node",
+  write: false
+});
+const scopeModuleUrl = `data:text/javascript;base64,${Buffer.from(scopeResult.outputFiles[0].text).toString("base64")}`;
+const { providersForGraphiteAgent } = await import(scopeModuleUrl);
+
 const codex = { id: "codex", label: "Codex", kind: "codex" };
 const claude = { id: "claude-code", label: "Claude Code", kind: "claude-code" };
 
@@ -63,6 +74,28 @@ assert.deepEqual(
 assert.deepEqual(
   requestAgentBadge("open-code", "OpenCode", []),
   { label: "OpenCode", tone: "opencode" }
+);
+
+const scopeAgent = { id: "codex", label: "Codex", kind: "codex", provider_id: "agent-codex-bound", hidden_provider_ids: [] };
+const scopeProviders = [
+  { id: "agent-codex-stale", name: "stale" },
+  { id: "agent-codex-bound", name: "bound" },
+  { id: "shared", name: "shared" },
+  { id: "agent-opencode-private", name: "other" }
+];
+assert.deepEqual(
+  providersForGraphiteAgent(scopeProviders, scopeAgent, ["shared"]).map((provider) => provider.id),
+  ["shared", "agent-codex-bound"],
+  "an Agent page must retain registered private and explicit shared records, but not another Agent or a stale prefix-only record"
+);
+assert.deepEqual(
+  providersForGraphiteAgent(
+    scopeProviders,
+    { ...scopeAgent, hidden_provider_ids: ["shared"] },
+    ["shared"]
+  ).map((provider) => provider.id),
+  ["agent-codex-bound"],
+  "a shared provider detached from this Agent must not reappear because of a stale order entry"
 );
 
 const controlPlaneSource = await readFile(

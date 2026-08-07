@@ -27,9 +27,12 @@ import type {
   GraphitePrototypeHostProps,
   GraphiteProviderPayload
 } from "./graphite/frameProtocol";
-import { providerBelongsToAgent, providersForGraphiteAgent } from "./graphite/providerScope";
+import {
+  providerIsTrustedPrivateToAgent,
+  providersForGraphiteAgent
+} from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.28";
+const APP_VERSION = "v1.4.33";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
@@ -363,12 +366,13 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     setNotice("");
     const editablePayload = payload;
     let existing = config?.providers.find((provider) => provider.id === editablePayload.id) ?? null;
+    const editingAgent = config?.agent_injections.find((agent) => agent.id === agentId);
+    const editingOrder = config?.agent_provider_orders
+      ?.find((order) => order.agent_id === agentId)?.provider_ids ?? [];
     const editingBoundLegacyProvider = Boolean(
-      agentId && existing && !providerBelongsToAgent(existing.id, agentId)
+      agentId && existing && editingAgent
+        && !providerIsTrustedPrivateToAgent(existing.id, editingAgent, editingOrder)
     );
-    if (editingBoundLegacyProvider && existing?.id.startsWith("agent-")) {
-      throw new Error("不能编辑其他 Agent 的独立上游");
-    }
 
     const existingKeys = new Map((existing?.key_pool?.keys ?? []).map((key) => [key.id, key]));
     const input: ProviderInput = {
@@ -465,8 +469,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
   }
 
-  async function deleteProviderFromGraphite(agentId: string, providerId: string) {
-    if (!providerId) return;
+  async function deleteProviderFromGraphite(agentId: string, providerId: string): Promise<string> {
+    if (!providerId) return "";
     setError("");
     try {
       const nextConfig = await command<AppConfig>("delete_provider", {
@@ -476,7 +480,9 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         agent_id: agentId || null
       });
       setConfig(nextConfig);
-      setNotice("上游已删除");
+      const notice = agentId ? "已从当前 Agent 移除" : "上游已删除";
+      setNotice(notice);
+      return notice;
     } catch (cause) {
       const message = String(cause);
       setError(message);
@@ -552,7 +558,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     const selectedPath = result.paths.find((path) =>
       result.recommended_use_system_proxy ? path.path === "system-proxy" : path.path === "direct"
     );
-    const pathLabel = result.recommended_use_system_proxy ? "绯荤粺浠ｇ悊鏇村揩" : "鐩磋繛鏇村揩";
+    const pathLabel = result.recommended_use_system_proxy ? "系统代理更快" : "直连更快";
     setProviderConnectionStatus((current) => ({
       ...current,
       [provider.id]: result.ok
@@ -642,8 +648,8 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       return { notice: "上游已保存，当前使用上游未改变", closeOverlay: "providerOverlay" };
     }
     if (action === "delete-provider") {
-      await deleteProviderFromGraphite(text("agentId"), text("providerId"));
-      return { notice: "上游已删除", closeOverlay: "confirmOverlay" };
+      const notice = await deleteProviderFromGraphite(text("agentId"), text("providerId"));
+      return { notice, closeOverlay: "confirmOverlay" };
     }
     if (action === "fetch-models") {
       const provider = providerPayload();
@@ -687,19 +693,24 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     if (action === "run-health-probe") {
       const providerId = text("providerId");
       const modelId = text("modelId");
-      const mode = text("mode") as ProviderHealthProbeInput["mode"];
+      const requestedMode = text("mode") as ProviderHealthProbeInput["mode"];
+      const mode = requestedMode === "minimal_cost" ? "responses_streaming" : requestedMode;
       const target = text("target") as ProviderHealthProbeInput["target"];
       const keyIds = Array.isArray(payload.keyIds)
         ? payload.keyIds.map((keyId) => String(keyId).trim()).filter(Boolean)
         : [];
       if (!providerId) throw new Error("请先保存上游，再执行测活");
       if (!modelId) throw new Error("请选择测活模型");
-      if (![
+      const supportedModes: ProviderHealthProbeInput["mode"][] = [
+        "minimal_cost",
         "responses_streaming",
         "chat_streaming",
         "chat_json",
-        "responses_json"
-      ].includes(mode)) {
+        "responses_json",
+        "anthropic_streaming",
+        "anthropic_json"
+      ];
+      if (!supportedModes.includes(requestedMode)) {
         throw new Error("测活请求形态无效");
       }
       const result = await command<ProviderHealthProbeResult>("probe_provider_health", {

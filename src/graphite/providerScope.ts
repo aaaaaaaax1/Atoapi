@@ -16,20 +16,44 @@ export function providerCloneMatchesSource(
   return providerId.startsWith(`${base}-`) && /^\d+$/.test(suffix);
 }
 
+/**
+ * Prefixes are display-friendly names, not durable ownership records. An
+ * Agent may manage a provider only after it appears in its binding or saved
+ * order; hidden records stay hidden even if an old order still contains them.
+ */
+export function providerIsRegisteredToAgent(
+  providerId: string,
+  agent: AgentInjectionConfig,
+  providerOrder: readonly string[] = []
+): boolean {
+  return !(agent.hidden_provider_ids ?? []).includes(providerId)
+    && (providerId === agent.provider_id || providerOrder.includes(providerId));
+}
+
+export function providerIsTrustedPrivateToAgent(
+  providerId: string,
+  agent: AgentInjectionConfig,
+  providerOrder: readonly string[] = []
+): boolean {
+  return providerBelongsToAgent(providerId, agent.id)
+    && providerIsRegisteredToAgent(providerId, agent, providerOrder);
+}
+
 export function providersForGraphiteAgent(
   providers: ProviderConfig[],
   agent: AgentInjectionConfig,
   providerOrder: readonly string[] = []
 ): ProviderConfig[] {
-  // New providers are private to the Agent page that created them. Retain a
-  // legacy shared provider only when this Agent is still explicitly bound to
-  // it, so a user can select/clone it without suddenly seeing every other
-  // Agent's historical provider list.
+  // A provider appears only through this Agent's explicit binding or saved
+  // order. This keeps manual/legacy `agent-...` IDs from being mistaken for
+  // current private records after a refresh.
   const orderIndex = new Map(providerOrder.map((providerId, index) => [providerId, index]));
+  const hiddenProviderIds = new Set(agent.hidden_provider_ids ?? []);
   return providers
     .map((provider, sourceIndex) => ({ provider, sourceIndex }))
     .filter(({ provider }) =>
-    providerBelongsToAgent(provider.id, agent.id) || provider.id === agent.provider_id
+      !hiddenProviderIds.has(provider.id)
+        && providerIsRegisteredToAgent(provider.id, agent, providerOrder)
     )
     .sort((left, right) => {
       const leftOrder = orderIndex.get(left.provider.id) ?? Number.MAX_SAFE_INTEGER;

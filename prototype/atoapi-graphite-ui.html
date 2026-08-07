@@ -6933,7 +6933,7 @@
           <label class="field"><span>测试请求形态</span><select id="healthProbeModeInput" aria-label="测试请求形态"><option value="responses_streaming">Responses API（流式）</option><option value="chat_streaming">Chat Completions（流式）</option><option value="chat_json">Chat Completions（JSON）</option><option value="responses_json">Responses API（JSON）</option><option value="anthropic_streaming">Anthropic Messages（流式）</option><option value="anthropic_json">Anthropic Messages（JSON）</option></select></label>
           <label class="field wide"><span>测活发送内容</span><textarea id="healthProbePromptInput" aria-label="测活发送内容" spellcheck="false">hi</textarea><small>默认发送 hi。这里的内容只用于本次手动测活，不会写入正常会话、日志或 Key 配置。</small></label>
         </div>
-        <p class="health-probe-hint">默认冷启动发送 hi，最多请求 1 个输出 token；不带工具、会话续接或缓存字段。测活是独立管理请求，不写入正常请求列表、Token/缓存指标或本地响应缓存。流式模式收到有效首事件即通过，只有明确的上游错误才显示为不通过。</p>
+        <p class="health-probe-hint">默认使用 Responses API 流式请求发送 hi；不带历史、工具或缓存字段，收到首个有效事件即通过。测活是独立管理请求，不写入正常会话或统计。</p>
         <div class="health-probe-summary" id="healthProbeSummary">准备就绪：每个启用 Key 只发送一次独立测活请求。</div>
         <section class="health-probe-result" id="healthProbeResult" hidden aria-live="polite">
           <header class="health-probe-result-head"><i class="icon" data-lucide="list-checks"></i>测活结果</header>

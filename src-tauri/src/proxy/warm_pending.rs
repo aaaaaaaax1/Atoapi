@@ -24,6 +24,7 @@ enum PendingMaturityKind {
     ProviderWaterlineRollback,
     ExactPendingTailLag,
     ToolCallOnlyExactPendingTailLag,
+    ExactLargeLowNoiseMixedTailLag,
 }
 
 impl PendingMaturityKind {
@@ -46,6 +47,11 @@ impl PendingMaturityKind {
             // A tool-call-only parent is a separate, one-shot proof. Tool
             // output remains a hard semantic boundary and never uses it.
             Self::ToolCallOnlyExactPendingTailLag => 1,
+            // A large predecessor residual can be real provider indexing lag
+            // when the exact final-scope receipt binds it and the current
+            // mixed tail carries only tiny, non-noisy control data. Keep it
+            // to one direct successor just like the small exact-tail path.
+            Self::ExactLargeLowNoiseMixedTailLag => 1,
         }
     }
 
@@ -62,6 +68,7 @@ impl PendingMaturityKind {
             Self::ProviderWaterlineRollback => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ToolCallOnlyExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
+            Self::ExactLargeLowNoiseMixedTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
         }
     }
 
@@ -72,6 +79,9 @@ impl PendingMaturityKind {
             Self::ProviderWaterlineRollback => "responses_provider_waterline_rollback_pending",
             Self::ExactPendingTailLag => "responses_exact_pending_tail_lag",
             Self::ToolCallOnlyExactPendingTailLag => "responses_tool_call_exact_pending_tail_lag",
+            Self::ExactLargeLowNoiseMixedTailLag => {
+                "responses_exact_large_low_noise_mixed_tail_lag"
+            }
         }
     }
 }
@@ -144,6 +154,9 @@ impl WarmPendingClaim {
             PendingMaturityKind::ExactPendingTailLag
             | PendingMaturityKind::ToolCallOnlyExactPendingTailLag => {
                 !compaction_requested && exact_pending_followup_is_settle_safe(tail)
+            }
+            PendingMaturityKind::ExactLargeLowNoiseMixedTailLag => {
+                !compaction_requested && exact_large_low_noise_followup_is_settle_safe(tail)
             }
             PendingMaturityKind::GiantColdRoot => true,
         }
@@ -247,6 +260,7 @@ impl WarmPendingRegistry {
                 claim.kind,
                 PendingMaturityKind::ExactPendingTailLag
                     | PendingMaturityKind::ToolCallOnlyExactPendingTailLag
+                    | PendingMaturityKind::ExactLargeLowNoiseMixedTailLag
             )
         }) {
             return;
@@ -399,6 +413,10 @@ fn pending_maturity(
         Some(PendingMaturity {
             kind: PendingMaturityKind::ToolCallOnlyExactPendingTailLag,
         })
+    } else if exact_large_low_noise_mixed_tail_lag(raw_usage, tail, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ExactLargeLowNoiseMixedTailLag,
+        })
     } else {
         None
     }
@@ -450,9 +468,19 @@ fn exact_pending_tail_lag_evidence(
     raw_usage: Option<&UsageRecord>,
     final_scope: &FinalScopeWaterlineLog,
 ) -> bool {
+    exact_pending_tail_lag_evidence_in_range(raw_usage, final_scope, 128, 2_048)
+}
+
+/// A larger exact residual is only eligible for the separate low-noise mixed
+/// tail gate below. Keeping the range explicit prevents ordinary message or
+/// material-tool paths from inheriting a broad foreground wait.
+fn exact_pending_tail_lag_evidence_in_range(
+    raw_usage: Option<&UsageRecord>,
+    final_scope: &FinalScopeWaterlineLog,
+    minimum_pending_tokens_128: u64,
+    maximum_pending_tokens_128: u64,
+) -> bool {
     const MIN_INPUT_TOKENS: u64 = 16_384;
-    const MIN_PENDING_TOKENS_128: u64 = 128;
-    const MAX_PENDING_TOKENS_128: u64 = 2_048;
 
     let Some(record) = raw_usage else {
         return false;
@@ -466,7 +494,7 @@ fn exact_pending_tail_lag_evidence(
         && final_scope.predecessor_bound
         && !final_scope.continuity_reset
         && final_scope.rollback_tokens_128 == 0
-        && (MIN_PENDING_TOKENS_128..=MAX_PENDING_TOKENS_128).contains(&candidate)
+        && (minimum_pending_tokens_128..=maximum_pending_tokens_128).contains(&candidate)
         && final_scope.raw_cache_read_tokens == record.cache_read_tokens
         && final_scope.sent_prefix_bucket_tokens_128 > final_scope.settled_prefix_bucket_tokens_128
 }
@@ -555,6 +583,66 @@ fn exact_pending_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
         && tail.tool_output_json_like_chars == 0
         && tail.tool_output_noise_hint.is_none()
         && tail.source.as_deref() == Some("message")
+}
+
+/// A clean small-to-medium mixed tail is often just a tool-control/result
+/// boundary. If an exact final-scope receipt proves a preceding
+/// 2,049–131,072-token span is still pending, a single capped wait can let
+/// that already-sent prefix materialise before the direct successor. No
+/// request fields are changed.
+fn exact_large_low_noise_mixed_tail_lag(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MIN_PENDING_TOKENS_128: u64 = 2_049;
+    const MAX_PENDING_TOKENS_128: u64 = 131_072;
+
+    exact_pending_tail_lag_evidence_in_range(
+        raw_usage,
+        final_scope,
+        MIN_PENDING_TOKENS_128,
+        MAX_PENDING_TOKENS_128,
+    ) && exact_large_low_noise_mixed_tail_is_settle_safe(tail)
+}
+
+/// The mixed-tail extension stays below the material-tool threshold.  It
+/// admits clean, bounded control results which the live full-replay traces
+/// show can otherwise carry a large already-sent indexing residual. Large
+/// output, noise markers, and unknown shapes continue down the immediate
+/// path. This is a latency-only gate, not a context transform.
+fn exact_large_low_noise_mixed_tail_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    const MAX_INPUT_ITEMS: u64 = 10;
+    const MAX_MESSAGE_CHARS: u64 = 1_024;
+    const MAX_TOOL_CALL_CHARS: u64 = 4_096;
+    // `material_tool_tail` takes over at 8 KiB.  Keep this strictly below
+    // that boundary so a real material result retains its existing one-shot
+    // policy instead of being folded into the clean-control gate.
+    const MAX_TOOL_OUTPUT_CHARS: u64 = 8_191;
+    const MAX_TOOL_OUTPUT_LINES: u64 = 128;
+
+    tail.input_items <= MAX_INPUT_ITEMS
+        && tail.message_chars <= MAX_MESSAGE_CHARS
+        && tail.tool_call_chars <= MAX_TOOL_CALL_CHARS
+        && tail.tool_output_chars <= MAX_TOOL_OUTPUT_CHARS
+        && tail.largest_tool_output_chars <= MAX_TOOL_OUTPUT_CHARS
+        && tail.tool_output_lines <= MAX_TOOL_OUTPUT_LINES
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && matches!(
+            tail.source.as_deref(),
+            Some("mixed" | "tool_call" | "tool_output")
+        )
+}
+
+fn exact_large_low_noise_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    exact_pending_followup_is_settle_safe(tail)
+        || exact_large_low_noise_mixed_tail_is_settle_safe(tail)
 }
 
 /// A material tool result is new context on its own request, but its exact
@@ -1116,6 +1204,263 @@ mod tests {
             registry.len(),
             0,
             "an exact pending tail-lag child must not restart a wait chain"
+        );
+    }
+
+    #[test]
+    fn large_exact_low_noise_mixed_tail_lag_arms_one_direct_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let replay = UsageRecord {
+            input_tokens: 331_203,
+            cache_read_tokens: 261_793,
+            ..UsageRecord::default()
+        };
+        let quiet_mixed_parent = TailInputDiagnostics {
+            input_items: 7,
+            message_chars: 142,
+            tool_call_chars: 4,
+            tool_output_chars: 102,
+            largest_tool_output_chars: 102,
+            tool_output_lines: 8,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                replay.cache_read_tokens,
+                67_456,
+            )),
+            Some(&root),
+            Some(&replay),
+            &quiet_mixed_parent,
+            true,
+            false,
+        );
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("a bounded, exact large low-noise mixed residual must give only its direct child a capped maturity window");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_exact_large_low_noise_mixed_tail_lag"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 4,
+                tool_call_chars: 4,
+                tool_output_chars: 50,
+                largest_tool_output_chars: 50,
+                tool_output_lines: 5,
+                source: Some("mixed".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 6,
+                message_chars: 256,
+                tool_call_chars: 512,
+                tool_output_chars: 5_996,
+                largest_tool_output_chars: 5_996,
+                tool_output_lines: 82,
+                source: Some("mixed".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 8,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 3,
+                    tool_output_chars: 8_192,
+                    largest_tool_output_chars: 8_192,
+                    source: Some("tool_output".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a material new tool result keeps immediate dispatch"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 3,
+                    tool_call_chars: 4,
+                    tool_output_chars: 50,
+                    largest_tool_output_chars: 50,
+                    tool_output_path_like_count: 1,
+                    source: Some("mixed".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a noisy mixed tail keeps immediate dispatch"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(&quiet_mixed_parent, true),
+            "compaction remains an independent semantic boundary"
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .is_none(),
+            "the large exact-tail window is one-shot and never queues a sibling"
+        );
+    }
+
+    #[test]
+    fn million_scale_dynamic_mixed_tails_use_one_bounded_exact_wait_without_chaining() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        // This deliberately carries only aggregate token and tail-shape data:
+        // it covers a million-scale FullReplay without retaining a tool or
+        // conversation payload in the controller or test fixture.
+        let parent = UsageRecord {
+            input_tokens: 1_048_707,
+            cache_read_tokens: 976_896,
+            ..UsageRecord::default()
+        };
+        let first_dynamic_tail = TailInputDiagnostics {
+            input_items: 8,
+            message_chars: 196,
+            tool_call_chars: 398,
+            tool_output_chars: 5_996,
+            largest_tool_output_chars: 5_996,
+            tool_output_lines: 82,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                parent.cache_read_tokens,
+                71_680,
+            )),
+            Some(&root),
+            Some(&parent),
+            &first_dynamic_tail,
+            true,
+            false,
+        );
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("a million-scale exact low-noise residual must retain its one direct maturation opportunity");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_exact_large_low_noise_mixed_tail_lag"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+
+        let child = head(2);
+        let child_usage = UsageRecord {
+            input_tokens: 1_056_893,
+            cache_read_tokens: 985_088,
+            ..UsageRecord::default()
+        };
+        let second_dynamic_tail = TailInputDiagnostics {
+            input_items: 5,
+            message_chars: 96,
+            tool_call_chars: 4,
+            tool_output_chars: 511,
+            largest_tool_output_chars: 511,
+            tool_output_lines: 12,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        assert!(claim.followup_is_settle_safe(&second_dynamic_tail, false));
+
+        registry.settle(
+            Some(&claim),
+            Some(prefix),
+            Some(scope),
+            Some(&exact_pending_tail_lag_log(
+                scope,
+                child_usage.cache_read_tokens,
+                71_680,
+            )),
+            Some(&child),
+            Some(&child_usage),
+            &second_dynamic_tail,
+            true,
+            false,
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(child))
+                .is_none(),
+            "dynamic mixed tails must not turn the 500ms optimization into a foreground wait chain"
+        );
+    }
+
+    #[test]
+    fn large_exact_low_noise_mixed_tail_gate_rejects_unbounded_or_noisy_parents() {
+        let replay = UsageRecord {
+            input_tokens: 331_203,
+            cache_read_tokens: 261_793,
+            ..UsageRecord::default()
+        };
+        let quiet_parent = TailInputDiagnostics {
+            input_items: 4,
+            tool_call_chars: 4,
+            tool_output_chars: 50,
+            largest_tool_output_chars: 50,
+            tool_output_lines: 5,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let scope = "final-scope";
+        assert!(exact_large_low_noise_mixed_tail_lag(
+            Some(&replay),
+            &quiet_parent,
+            &exact_pending_tail_lag_log(scope, replay.cache_read_tokens, 67_456),
+        ));
+        assert!(
+            !exact_large_low_noise_mixed_tail_lag(
+                Some(&replay),
+                &quiet_parent,
+                &exact_pending_tail_lag_log(scope, replay.cache_read_tokens, 131_073),
+            ),
+            "unbounded residuals remain on the immediate path"
+        );
+        let noisy_parent = TailInputDiagnostics {
+            tool_output_path_like_count: 1,
+            ..quiet_parent
+        };
+        assert!(
+            !exact_large_low_noise_mixed_tail_lag(
+                Some(&replay),
+                &noisy_parent,
+                &exact_pending_tail_lag_log(scope, replay.cache_read_tokens, 67_456),
+            ),
+            "noise-marked tails remain on the immediate path"
         );
     }
 

@@ -126,6 +126,10 @@ pub struct ProviderKeyTestResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHealthProbeMode {
+    /// Lowest-cost health check: one short Chat Completions stream and stop
+    /// after the first valid SSE event. Responses remains available as an
+    /// explicit mode for routes that require it.
+    MinimalCost,
     ResponsesStreaming,
     ChatStreaming,
     ChatJson,
@@ -134,18 +138,27 @@ pub enum ProviderHealthProbeMode {
     AnthropicJson,
 }
 
+impl Default for ProviderHealthProbeMode {
+    fn default() -> Self {
+        Self::ResponsesStreaming
+    }
+}
+
 impl ProviderHealthProbeMode {
     fn is_streaming(&self) -> bool {
         matches!(
             self,
-            Self::ResponsesStreaming | Self::ChatStreaming | Self::AnthropicStreaming
+            Self::MinimalCost
+                | Self::ResponsesStreaming
+                | Self::ChatStreaming
+                | Self::AnthropicStreaming
         )
     }
 
     fn endpoint_channel(&self) -> Channel {
         match self {
+            Self::MinimalCost | Self::ChatStreaming | Self::ChatJson => Channel::Chat,
             Self::ResponsesStreaming | Self::ResponsesJson => Channel::Responses,
-            Self::ChatStreaming | Self::ChatJson => Channel::Chat,
             Self::AnthropicStreaming | Self::AnthropicJson => Channel::Anthropic,
         }
     }
@@ -180,6 +193,7 @@ pub struct ProviderHealthProbeInput {
     #[serde(default)]
     pub target: ProviderHealthProbeTarget,
     pub model: String,
+    #[serde(default)]
     pub mode: ProviderHealthProbeMode,
     #[serde(default)]
     pub prompt: Option<String>,
@@ -492,7 +506,7 @@ fn clone_provider_for_agent_config(
         .ok_or_else(|| anyhow::anyhow!("provider {source_provider_id} was not found"))?;
 
     let target_provider_id =
-        if provider_is_registered_to_agent(config, source_provider_id, agent_id) {
+        if provider_is_trusted_private_to_agent(config, source_provider_id, agent_id) {
             source_provider_id.to_string()
         } else if let Some(existing) = config.providers.iter().find(|provider| {
             provider_clone_matches_source(&provider.id, source_provider_id, agent_id)
@@ -672,17 +686,50 @@ fn provider_belongs_to_agent(provider_id: &str, agent_id: &str) -> bool {
 }
 
 fn provider_is_registered_to_agent(config: &AppConfig, provider_id: &str, agent_id: &str) -> bool {
-    config.agent_provider_orders.iter().any(|order| {
-        order.agent_id == agent_id
-            && order
-                .provider_ids
-                .iter()
-                .any(|registered| registered == provider_id)
-    }) || (provider_belongs_to_agent(provider_id, agent_id)
-        && config
-            .agent_injections
-            .iter()
-            .any(|agent| agent.id == agent_id && agent.provider_id.as_deref() == Some(provider_id)))
+    let Some(agent) = config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == agent_id)
+    else {
+        return false;
+    };
+    if agent
+        .hidden_provider_ids
+        .iter()
+        .any(|hidden_id| hidden_id == provider_id)
+    {
+        return false;
+    }
+    agent.provider_id.as_deref() == Some(provider_id)
+        || config.agent_provider_orders.iter().any(|order| {
+            order.agent_id == agent_id
+                && order
+                    .provider_ids
+                    .iter()
+                    .any(|registered| registered == provider_id)
+        })
+}
+
+/// A generated-looking ID is only ownership evidence after the Agent has
+/// explicitly registered it through its current binding or saved order. This
+/// avoids treating a user's manual `agent-...` ID as an Atoapi private clone.
+fn provider_is_trusted_private_to_agent(
+    config: &AppConfig,
+    provider_id: &str,
+    agent_id: &str,
+) -> bool {
+    provider_belongs_to_agent(provider_id, agent_id)
+        && provider_is_registered_to_agent(config, provider_id, agent_id)
+}
+
+fn provider_is_owned_by_another_agent(
+    config: &AppConfig,
+    provider_id: &str,
+    agent_id: &str,
+) -> bool {
+    config.agent_injections.iter().any(|agent| {
+        agent.id != agent_id && provider_is_trusted_private_to_agent(config, provider_id, &agent.id)
+    })
 }
 
 fn provider_clone_matches_source(provider_id: &str, source_id: &str, agent_id: &str) -> bool {
@@ -756,8 +803,13 @@ fn prepare_agent_owned_provider_input(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let provider_id = match requested_id {
-        Some(provider_id) if provider_is_registered_to_agent(config, provider_id, agent_id) => {
+        Some(provider_id)
+            if provider_is_trusted_private_to_agent(config, provider_id, agent_id) =>
+        {
             provider_id.to_string()
+        }
+        Some(provider_id) if provider_is_owned_by_another_agent(config, provider_id, agent_id) => {
+            anyhow::bail!("provider {provider_id} belongs to another Agent")
         }
         Some(provider_id) => {
             let selected_model_id = config
@@ -867,8 +919,11 @@ fn visible_provider_ids_for_agent(
         .providers
         .iter()
         .filter(|provider| {
-            provider_belongs_to_agent(&provider.id, agent_id)
-                || agent.provider_id.as_deref() == Some(provider.id.as_str())
+            !agent
+                .hidden_provider_ids
+                .iter()
+                .any(|hidden_id| hidden_id == &provider.id)
+                && provider_is_registered_to_agent(config, &provider.id, agent_id)
         })
         .map(|provider| provider.id.clone())
         .collect())
@@ -1004,16 +1059,24 @@ fn delete_provider_config(
             .position(|agent| agent.id == agent_id)
             .ok_or_else(|| anyhow::anyhow!("agent injection {agent_id} was not found"))?;
 
+        if provider_is_owned_by_another_agent(config, provider_id, agent_id) {
+            anyhow::bail!("provider {provider_id} belongs to another Agent");
+        }
+
+        // A prefix alone is not sufficient evidence of ownership: legacy and
+        // user-authored IDs may look like Agent clones.  An unregistered row
+        // is therefore detached from this Agent rather than physically
+        // deleted, which prevents both resurrection and accidental loss.
         if !provider_is_registered_to_agent(config, provider_id, agent_id) {
-            let agent = &mut config.agent_injections[agent_index];
-            hide_provider_for_agent(agent, provider_id);
-            if agent.provider_id.as_deref() == Some(provider_id) {
-                agent.provider_id = None;
-                agent.model_id = None;
-                agent.enabled = false;
-            }
-            agent.last_status =
-                Some("已从当前 Agent 移除共享上游，其他 Agent 不受影响".to_string());
+            detach_shared_provider_from_agent(config, agent_index, agent_id, provider_id);
+            return Ok(());
+        }
+
+        // A non-private provider belongs to the shared collection.  The
+        // Agent page may remove only its own association; deleting the
+        // physical shared record here would silently break other Agents.
+        if !provider_is_trusted_private_to_agent(config, provider_id, agent_id) {
+            detach_shared_provider_from_agent(config, agent_index, agent_id, provider_id);
             return Ok(());
         }
 
@@ -1057,10 +1120,14 @@ fn delete_provider_config(
             .find(|provider| provider_clone_matches_source(provider_id, &provider.id, agent_id))
             .map(|provider| provider.id.clone());
         remove_provider_records(config, provider_id);
-        let agent = &mut config.agent_injections[agent_index];
         if let Some(source_provider_id) = source_provider_id.as_deref() {
-            hide_provider_for_agent(agent, source_provider_id);
+            hide_provider_for_agent(
+                &mut config.agent_injections[agent_index],
+                source_provider_id,
+            );
+            remove_provider_from_agent_order(config, agent_id, source_provider_id);
         }
+        let agent = &mut config.agent_injections[agent_index];
         if agent.provider_id.as_deref() == Some(provider_id) {
             agent.provider_id = None;
             agent.model_id = None;
@@ -1087,6 +1154,36 @@ fn delete_provider_config(
     }
     remove_provider_records(config, provider_id);
     Ok(())
+}
+
+fn detach_shared_provider_from_agent(
+    config: &mut AppConfig,
+    agent_index: usize,
+    agent_id: &str,
+    provider_id: &str,
+) {
+    let agent = &mut config.agent_injections[agent_index];
+    hide_provider_for_agent(agent, provider_id);
+    if agent.provider_id.as_deref() == Some(provider_id) {
+        agent.provider_id = None;
+        agent.model_id = None;
+        agent.enabled = false;
+    }
+    agent.last_status = Some("已从当前 Agent 移除共享上游，其他 Agent 不受影响".to_string());
+    remove_provider_from_agent_order(config, agent_id, provider_id);
+}
+
+fn remove_provider_from_agent_order(config: &mut AppConfig, agent_id: &str, provider_id: &str) {
+    if let Some(order) = config
+        .agent_provider_orders
+        .iter_mut()
+        .find(|order| order.agent_id == agent_id)
+    {
+        order.provider_ids.retain(|id| id != provider_id);
+    }
+    config
+        .agent_provider_orders
+        .retain(|order| !order.provider_ids.is_empty());
 }
 
 fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
@@ -1646,12 +1743,15 @@ async fn probe_provider_health_key(
         Ok(client) => client,
         Err(_) => return failed_health_probe_result(key_id, started, "client_unavailable"),
     };
+    // Health probes must stay entirely outside normal cache capability logic.
+    // They send one minimal cold request only; cache-control fields are not
+    // injected even when the same provider has accepted them for relay calls.
     let request_body = health_probe::request_body(mode, model, prompt);
     let request = client
         .post(endpoint)
         .headers(health_probe::headers(
             secret,
-            &input.channel,
+            &mode.endpoint_channel(),
             mode.is_streaming(),
             input.custom_user_agent.as_deref(),
         ))
@@ -1794,15 +1894,17 @@ fn health_probe_stream_completed(body: &str, mode: &ProviderHealthProbeMode) -> 
                 .is_some_and(|kind| kind == "response.completed")
                 && !health_probe_value_failed(&value)
         }),
-        ProviderHealthProbeMode::ChatStreaming => health_probe_sse_lines(body).any(|data| {
-            data == "[DONE]"
-                || serde_json::from_str::<Value>(data)
-                    .ok()
-                    .is_some_and(|value| {
-                        !health_probe_value_failed(&value)
-                            && health_probe_chat_finish_reason(&value)
-                    })
-        }),
+        ProviderHealthProbeMode::MinimalCost | ProviderHealthProbeMode::ChatStreaming => {
+            health_probe_sse_lines(body).any(|data| {
+                data == "[DONE]"
+                    || serde_json::from_str::<Value>(data)
+                        .ok()
+                        .is_some_and(|value| {
+                            !health_probe_value_failed(&value)
+                                && health_probe_chat_finish_reason(&value)
+                        })
+            })
+        }
         ProviderHealthProbeMode::AnthropicStreaming => health_probe_sse_values(body).any(|value| {
             !health_probe_value_failed(&value)
                 && value
@@ -1834,7 +1936,10 @@ fn health_probe_stream_accepted(body: &str, mode: &ProviderHealthProbeMode) -> b
         return false;
     };
     if data == "[DONE]" {
-        return matches!(mode, ProviderHealthProbeMode::ChatStreaming);
+        return matches!(
+            mode,
+            ProviderHealthProbeMode::MinimalCost | ProviderHealthProbeMode::ChatStreaming
+        );
     }
     let normalized = data.trim();
     if normalized.is_empty() || !normalized.starts_with('{') {
@@ -1849,7 +1954,7 @@ fn health_probe_stream_accepted(body: &str, mode: &ProviderHealthProbeMode) -> b
                 .get("type")
                 .and_then(Value::as_str)
                 .is_some_and(|kind| kind.starts_with("response.")),
-            ProviderHealthProbeMode::ChatStreaming => {
+            ProviderHealthProbeMode::MinimalCost | ProviderHealthProbeMode::ChatStreaming => {
                 value.get("choices").is_some() || value.get("id").is_some()
             }
             ProviderHealthProbeMode::AnthropicStreaming => value
@@ -1873,7 +1978,7 @@ fn health_probe_stream_accepted(body: &str, mode: &ProviderHealthProbeMode) -> b
     }
     match mode {
         ProviderHealthProbeMode::ResponsesStreaming => compact.contains("\"type\":\"response."),
-        ProviderHealthProbeMode::ChatStreaming => {
+        ProviderHealthProbeMode::MinimalCost | ProviderHealthProbeMode::ChatStreaming => {
             compact.contains("\"choices\"") || compact.contains("\"id\"")
         }
         ProviderHealthProbeMode::AnthropicStreaming => {
@@ -2431,9 +2536,26 @@ pub async fn fetch_provider_models(
                 custom_user_agent = provider.custom_user_agent.clone();
             }
             if upstream_secret.is_none() {
-                upstream_secret = config
-                    .provider_api_key(provider_id)
-                    .map_err(to_command_error)?;
+                // Saved-provider model discovery must use the same eligible
+                // Key-pool snapshot as connection and balance checks.  In
+                // particular, an enabled pool must never silently fall back
+                // to the legacy connection-info Key.
+                upstream_secret = connection_path_test_input_from_config(
+                    &config,
+                    &ProviderKeyTestInput {
+                        provider_id: Some(provider_id.to_string()),
+                        key_id: None,
+                        api_key: None,
+                        base_url: base_url.clone(),
+                        models_url: models_url.clone(),
+                        is_full_url,
+                        custom_user_agent: custom_user_agent.clone(),
+                        channel: input.channel.clone(),
+                        use_system_proxy: input.use_system_proxy,
+                    },
+                )
+                .map_err(to_command_error)?
+                .api_key;
             }
         }
     }
@@ -3394,7 +3516,11 @@ fn stage_agent_injection_route_update(
     let agent_id = input.id.clone();
     let mut staged = config.clone();
     if let Some(provider_id) = input.provider_id.clone() {
-        if !provider_is_registered_to_agent(&staged, &provider_id, &agent_id) {
+        // A legacy shared row may be visible in an Agent's saved list for
+        // migration, but a route must never keep sharing it. Bind a private
+        // clone so provider settings, Key pools, probes, and later deletion
+        // remain isolated per Agent.
+        if !provider_is_trusted_private_to_agent(&staged, &provider_id, &agent_id) {
             let private_provider_id = clone_provider_for_agent_config(
                 &mut staged,
                 &agent_id,
@@ -3859,6 +3985,15 @@ mod tests {
             .find(|agent| agent.id == "codex")
             .unwrap()
             .provider_id = Some("agent-codex-first".to_string());
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec![
+                    "agent-codex-first".to_string(),
+                    "agent-codex-second".to_string(),
+                ],
+            });
 
         reorder_agent_providers_config(
             &mut config,
@@ -4147,7 +4282,98 @@ mod tests {
     }
 
     #[test]
-    fn health_probe_responses_use_codex_style_input_items() {
+    fn health_probe_defaults_to_responses_streaming_when_mode_is_omitted() {
+        let input = serde_json::from_value::<ProviderHealthProbeInput>(serde_json::json!({
+            "provider_id": "provider-a",
+            "model": "gpt-5.6-terra"
+        }))
+        .expect("a health probe without a mode must retain the Responses default");
+        assert_eq!(input.mode, ProviderHealthProbeMode::ResponsesStreaming);
+    }
+
+    #[test]
+    fn health_probe_legacy_minimal_cost_body_is_a_single_minimal_chat_request() {
+        let body = health_probe::request_body(
+            &ProviderHealthProbeMode::MinimalCost,
+            "gpt-5.6-terra",
+            "hi",
+        );
+        assert_eq!(
+            body.get("model").and_then(Value::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            body.pointer("/messages/0/role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            body.pointer("/messages/0/content").and_then(Value::as_str),
+            Some("hi")
+        );
+        assert_eq!(body.get("stream").and_then(Value::as_bool), Some(true));
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(1));
+        for forbidden in [
+            "input",
+            "instructions",
+            "store",
+            "tools",
+            "previous_response_id",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "prompt_cache_options",
+            "metadata",
+        ] {
+            assert!(
+                body.get(forbidden).is_none(),
+                "the default Key health body must not contain {forbidden}"
+            );
+        }
+        assert!(
+            serde_json::to_vec(&body).unwrap().len() <= 112,
+            "the default Key health body must stay within its minimal wire budget"
+        );
+    }
+
+    #[test]
+    fn health_probe_selected_mode_owns_the_protocol_headers() {
+        let anthropic = health_probe::headers(
+            "health-probe-secret",
+            &ProviderHealthProbeMode::AnthropicStreaming.endpoint_channel(),
+            true,
+            None,
+        );
+        assert_eq!(
+            anthropic
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        let responses = health_probe::headers(
+            "health-probe-secret",
+            &ProviderHealthProbeMode::ResponsesStreaming.endpoint_channel(),
+            true,
+            None,
+        );
+        assert!(responses.get("anthropic-version").is_none());
+    }
+
+    #[test]
+    fn health_probe_legacy_minimal_cost_streams_use_chat_sse_recognition() {
+        let first_event = concat!(
+            "data: {\"id\":\"chatcmpl_probe\",\"choices\":[{\"delta\":{\"content\":\"h\"}}]}\n\n"
+        );
+        assert!(health_probe_stream_accepted(
+            first_event,
+            &ProviderHealthProbeMode::MinimalCost
+        ));
+        assert!(health_probe_stream_completed(
+            "data: [DONE]\n\n",
+            &ProviderHealthProbeMode::MinimalCost
+        ));
+    }
+
+    #[test]
+    fn health_probe_responses_use_minimal_input_and_no_store() {
         let body = health_probe::request_body(
             &ProviderHealthProbeMode::ResponsesStreaming,
             "gpt-5.6-terra",
@@ -4158,19 +4384,34 @@ mod tests {
             Some("user")
         );
         assert_eq!(
-            body.pointer("/input/0/content").and_then(Value::as_str),
+            body.pointer("/input/0/content/0/type")
+                .and_then(Value::as_str),
+            Some("input_text")
+        );
+        assert_eq!(
+            body.pointer("/input/0/content/0/text")
+                .and_then(Value::as_str),
             Some("hi")
+        );
+        assert_eq!(
+            body.get("instructions").and_then(Value::as_str),
+            Some("You are ChatGPT, a helpful assistant."),
+            "a health probe must use the short explicit instruction that prevents an upstream Codex default"
         );
         assert_eq!(
             body.get("max_output_tokens").and_then(Value::as_u64),
             Some(1)
         );
-        assert!(body.get("store").is_none());
+        assert_eq!(body.get("store").and_then(Value::as_bool), Some(false));
         assert!(body.get("tools").is_none());
         assert!(body.get("previous_response_id").is_none());
         assert!(body.get("prompt_cache_key").is_none());
         assert!(body.get("prompt_cache_retention").is_none());
         assert!(body.get("metadata").is_none());
+        assert!(
+            body.get("prompt_cache_options").is_none(),
+            "health probes must not carry cache-control fields"
+        );
     }
 
     #[test]
@@ -4423,8 +4664,10 @@ mod tests {
         let requests_for_responses = requests.clone();
         let requests_for_chat = requests.clone();
         let observed_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let observed_chat_bodies = Arc::new(Mutex::new(Vec::<Value>::new()));
         let observed_headers = Arc::new(Mutex::new(Vec::<axum::http::HeaderMap>::new()));
         let bodies_for_responses = observed_bodies.clone();
+        let bodies_for_chat = observed_chat_bodies.clone();
         let headers_for_responses = observed_headers.clone();
         let upstream = axum::Router::new()
             .route(
@@ -4465,10 +4708,12 @@ mod tests {
             )
             .route(
                 "/v1/chat/completions",
-                axum::routing::post(move || {
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
                     let requests = requests_for_chat.clone();
+                    let bodies = bodies_for_chat.clone();
                     async move {
                         requests.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().unwrap().push(body);
                         (
                             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
                             "data: {\"choices\":[{\"delta\":{\"content\":\"probe-response\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n",
@@ -4530,7 +4775,7 @@ mod tests {
                 provider_id: provider_id.to_string(),
                 key_ids: Vec::new(),
                 target: ProviderHealthProbeTarget::AllEnabled,
-                model: "health-model".to_string(),
+                model: "gpt-5.6-sol".to_string(),
                 mode: ProviderHealthProbeMode::ResponsesStreaming,
                 prompt: Some("private probe prompt".to_string()),
             },
@@ -4547,21 +4792,34 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let first_body = observed_bodies.lock().unwrap().first().cloned().unwrap();
         assert_eq!(
-            first_body.pointer("/input/0/role").and_then(Value::as_str),
-            Some("user")
-        );
-        assert_eq!(
             first_body
-                .pointer("/input/0/content")
+                .pointer("/input/0/content/0/text")
                 .and_then(Value::as_str),
             Some("private probe prompt")
+        );
+        assert_eq!(
+            first_body.get("instructions").and_then(Value::as_str),
+            Some("You are ChatGPT, a helpful assistant."),
+            "the isolated Responses probe must replace an upstream Codex default with its short visible instruction"
         );
         assert_eq!(
             first_body.get("max_output_tokens").and_then(Value::as_u64),
             Some(1)
         );
+        assert_eq!(
+            first_body.get("store").and_then(Value::as_bool),
+            Some(false),
+            "the probe must explicitly disable response storage"
+        );
+        assert!(
+            serde_json::to_vec(&first_body).unwrap().len() <= 320,
+            "the dynamic probe body must stay below the minimal wire budget"
+        );
+        assert!(
+            first_body.get("prompt_cache_options").is_none(),
+            "unverified providers must not receive an unsupported cache-control field"
+        );
         for field in [
-            "store",
             "tools",
             "previous_response_id",
             "prompt_cache_key",
@@ -4606,8 +4864,8 @@ mod tests {
                 provider_id: provider_id.to_string(),
                 key_ids: Vec::new(),
                 target: ProviderHealthProbeTarget::AllEnabled,
-                model: "health-model".to_string(),
-                mode: ProviderHealthProbeMode::ChatStreaming,
+                model: "gpt-5.6-sol".to_string(),
+                mode: ProviderHealthProbeMode::MinimalCost,
                 prompt: None,
             },
         )
@@ -4615,6 +4873,44 @@ mod tests {
         .unwrap();
         assert!(chat.results[0].ok);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
+        let chat_body = observed_chat_bodies
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            chat_body
+                .pointer("/messages/0/role")
+                .and_then(Value::as_str),
+            Some("user")
+        );
+        assert_eq!(
+            chat_body
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+            Some("hi")
+        );
+        assert_eq!(chat_body.get("max_tokens").and_then(Value::as_u64), Some(1));
+        assert!(
+            serde_json::to_vec(&chat_body).unwrap().len() <= 112,
+            "the default Key health wire body must remain minimal"
+        );
+        for field in [
+            "input",
+            "instructions",
+            "store",
+            "tools",
+            "previous_response_id",
+            "prompt_cache_key",
+            "prompt_cache_options",
+            "metadata",
+        ] {
+            assert!(
+                chat_body.get(field).is_none(),
+                "the default Key health request must not contain {field}"
+            );
+        }
 
         let large = probe_provider_health_inner(
             &state,
@@ -5165,6 +5461,100 @@ mod tests {
     }
 
     #[test]
+    fn deleting_an_unregistered_agent_like_provider_hides_it_without_destroying_it() {
+        let mut config = AppConfig::default();
+        // This is the real stale state: the card is visible from its private
+        // ID, while a historical config has neither an active binding nor a
+        // provider-order entry for it.
+        config.providers.push(test_provider("agent-codex-stale"));
+
+        delete_provider_config(&mut config, "agent-codex-stale", Some("codex")).unwrap();
+
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "agent-codex-stale"));
+        assert_eq!(
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "codex")
+                .map(|agent| agent.hidden_provider_ids.as_slice()),
+            Some(["agent-codex-stale".to_string()].as_slice())
+        );
+        assert!(visible_provider_ids_for_agent(&config, "codex")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn deleting_ordered_shared_provider_detaches_and_removes_the_order_entry() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec!["shared".to_string()],
+            });
+        let opencode = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "opencode")
+            .unwrap();
+        opencode.enabled = true;
+        opencode.provider_id = Some("shared".to_string());
+
+        delete_provider_config(&mut config, "shared", Some("codex")).unwrap();
+
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "shared"));
+        assert!(config
+            .agent_provider_orders
+            .iter()
+            .all(|order| order.agent_id != "codex"
+                || !order.provider_ids.contains(&"shared".to_string())));
+        assert!(!visible_provider_ids_for_agent(&config, "codex")
+            .unwrap()
+            .iter()
+            .any(|provider_id| provider_id == "shared"));
+        assert_eq!(
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "opencode")
+                .and_then(|agent| agent.provider_id.as_deref()),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn one_agent_cannot_hide_or_delete_another_agents_private_provider() {
+        let mut config = AppConfig::default();
+        config
+            .providers
+            .push(test_provider("agent-opencode-private"));
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "opencode")
+            .unwrap()
+            .provider_id = Some("agent-opencode-private".to_string());
+
+        let error = delete_provider_config(&mut config, "agent-opencode-private", Some("codex"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("belongs to another Agent"));
+        assert!(config
+            .providers
+            .iter()
+            .any(|provider| provider.id == "agent-opencode-private"));
+    }
+
+    #[test]
     fn selecting_hidden_shared_provider_restores_it_only_for_that_agent() {
         let mut config = AppConfig::default();
         config.providers.push(test_provider("shared"));
@@ -5185,6 +5575,136 @@ mod tests {
             .unwrap();
         assert!(codex.hidden_provider_ids.is_empty());
         assert_eq!(codex.provider_id.as_deref(), Some(provider_id.as_str()));
+    }
+
+    #[test]
+    fn route_update_clones_a_legacy_shared_provider_even_when_it_is_registered_to_the_agent() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec!["shared".to_string()],
+            });
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some("shared".to_string());
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "opencode")
+            .unwrap()
+            .provider_id = Some("shared".to_string());
+
+        let (staged, _) = stage_agent_injection_route_update(
+            &config,
+            AgentInjectionRouteUpdate {
+                id: "codex".to_string(),
+                provider_id: Some("shared".to_string()),
+                model_id: None,
+            },
+        )
+        .unwrap();
+
+        let codex_provider_id = staged
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .and_then(|agent| agent.provider_id.as_deref())
+            .unwrap();
+        assert!(provider_is_trusted_private_to_agent(
+            &staged,
+            codex_provider_id,
+            "codex"
+        ));
+        assert_ne!(codex_provider_id, "shared");
+        assert!(staged
+            .providers
+            .iter()
+            .any(|provider| provider.id == "shared"));
+        assert_eq!(
+            staged
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "opencode")
+                .and_then(|agent| agent.provider_id.as_deref()),
+            Some("shared")
+        );
+        assert!(staged.agent_provider_orders.iter().any(|order| {
+            order.agent_id == "codex" && order.provider_ids == vec![codex_provider_id.to_string()]
+        }));
+    }
+
+    #[test]
+    fn agent_private_clones_keep_key_pool_health_isolated() {
+        use crate::config::{
+            KeyLoadBalanceStrategy, ProviderKeyInput, ProviderKeyPoolInput, ProviderKeyStatus,
+        };
+
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("shared"));
+        config
+            .upsert_provider_key_pool(
+                "shared",
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 1,
+                    recovery_minutes: 30,
+                    keys: vec![ProviderKeyInput {
+                        id: Some("same-key".to_string()),
+                        alias: Some("shared source key".to_string()),
+                        key: Some("test-secret".to_string()),
+                        enabled: true,
+                        priority: 0,
+                        status: ProviderKeyStatus::Healthy,
+                        total_requests: 0,
+                        successes: 0,
+                        failures: 0,
+                        last_checked_at: None,
+                        last_error: None,
+                        disabled_until: None,
+                    }],
+                },
+            )
+            .unwrap();
+        // Establish a real healthy source state before cloning. Key-pool
+        // editors intentionally initialize new Keys as Unknown; this test is
+        // specifically about a later failure remaining scoped to one clone.
+        config.mark_provider_key_success("shared", Some("same-key"));
+        let codex_provider =
+            clone_provider_for_agent_config(&mut config, "codex", "shared", None).unwrap();
+        let opencode_provider =
+            clone_provider_for_agent_config(&mut config, "opencode", "shared", None).unwrap();
+
+        config.mark_provider_key_failure(
+            &codex_provider,
+            Some("same-key"),
+            "quota exhausted",
+            true,
+        );
+
+        let key_status = |provider_id: &str| {
+            config
+                .provider_key_pools
+                .iter()
+                .find(|pool| pool.provider_id == provider_id)
+                .and_then(|pool| pool.keys.iter().find(|key| key.id == "same-key"))
+                .map(|key| key.status.clone())
+        };
+        assert_eq!(
+            key_status(&codex_provider),
+            Some(ProviderKeyStatus::Unhealthy)
+        );
+        assert_eq!(key_status("shared"), Some(ProviderKeyStatus::Healthy));
+        assert_eq!(
+            key_status(&opencode_provider),
+            Some(ProviderKeyStatus::Healthy)
+        );
     }
 
     #[test]

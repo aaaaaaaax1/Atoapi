@@ -691,10 +691,15 @@ const bridgeSource = String.raw`
 
   function healthProbeModeLabel(mode) {
     return ({
+      // minimal_cost is a legacy wire value; never expose its implementation
+      // policy in the UI. New probes always default to Responses streaming.
+      minimal_cost: "Responses API（流式）",
       responses_streaming: "Responses API（流式）",
       chat_streaming: "Chat Completions（流式）",
       chat_json: "Chat Completions（JSON）",
-      responses_json: "Responses API（JSON）"
+      responses_json: "Responses API（JSON）",
+      anthropic_streaming: "Anthropic Messages（流式）",
+      anthropic_json: "Anthropic Messages（JSON）"
     }[mode] || "Responses API（流式）");
   }
 
@@ -748,8 +753,7 @@ const bridgeSource = String.raw`
     if (title) title.textContent = healthProbeTarget === "current" ? "当前 Key 测活" : (healthProbeTarget === "all_enabled" ? "全部 Key 测活" : "指定 Key 测活");
     if (subtitle) subtitle.textContent = provider.name + " · " + (healthProbeTarget === "current" ? "当前可用 Key" : (healthProbeTarget === "all_enabled" ? "全部启用 Key" : "指定 Key"));
     if (mode) {
-      const channel = host.state?.providerDetails?.[providerId]?.channel;
-      mode.value = channel === "chat" ? "chat_streaming" : "responses_streaming";
+      mode.value = "responses_streaming";
     }
     if (prompt) prompt.value = healthProbePrompt || "hi";
     renderHealthProbeModels();
@@ -761,7 +765,10 @@ const bridgeSource = String.raw`
 
   function runHealthProbe() {
     const model = $bridge("#healthProbeModelInput")?.value.trim() || "";
-    const mode = $bridge("#healthProbeModeInput")?.value || "responses_streaming";
+    const selectedMode = $bridge("#healthProbeModeInput")?.value || "responses_streaming";
+    // Accept old DOM/config values without exposing the old implementation
+    // label or changing the new default wire shape.
+    const mode = selectedMode === "minimal_cost" ? "responses_streaming" : selectedMode;
     const prompt = $bridge("#healthProbePromptInput")?.value ?? "hi";
     healthProbePrompt = prompt || "hi";
     if (!healthProbeProviderId) {
