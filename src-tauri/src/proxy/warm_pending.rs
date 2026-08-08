@@ -1078,8 +1078,8 @@ mod tests {
             !claim.followup_is_settle_safe(
                 &TailInputDiagnostics {
                     input_items: 3,
-                    tool_output_chars: 8_000,
-                    largest_tool_output_chars: 8_000,
+                    tool_output_chars: 32_768,
+                    largest_tool_output_chars: 30_000,
                     source: Some("tool_output".to_string()),
                     ..TailInputDiagnostics::default()
                 },
@@ -1850,8 +1850,8 @@ mod tests {
             !claim.followup_is_settle_safe(
                 &TailInputDiagnostics {
                     input_items: 3,
-                    tool_output_chars: 32_768,
-                    largest_tool_output_chars: 30_000,
+                    tool_output_chars: 8_000,
+                    largest_tool_output_chars: 8_000,
                     source: Some("tool_output".to_string()),
                     ..TailInputDiagnostics::default()
                 },

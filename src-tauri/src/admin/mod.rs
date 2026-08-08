@@ -3465,6 +3465,7 @@ fn attach_codex_ui_patch_status(
             patch_status
         ),
         injected_at: Utc::now().to_rfc3339(),
+        changed: false,
     });
 }
 

@@ -1,5 +1,478 @@
 # Atoapi Current Workflow Checkpoint
 
+## AUTHORITATIVE ACTIVE STATE — 2026-08-08 (supersedes the 2026-07-30 release block below)
+
+### Objective, accepted base, and promotion rule
+
+- The accepted frozen base is **v1.4.33**, packaged at
+  `G:\Atoapi\releases\v1.4.33-exact-sent-waterline-maturity-20260807\Atoapi.exe`.
+  The source commit is `85b56a6` (`feat: 发布 v1.4.33 命中成熟、测活与 Agent 隔离修复`).
+- Current source deliberately **continues from v1.4.33**. Do not revert to an
+  earlier cache line, reintroduce a rejected historical candidate, or mix
+  unrelated provider/key/model/request-family cohorts.
+- A change becomes the next accepted base only when a same Provider, selected
+  Key realm, model, channel/request family, and cold-start/compaction filter
+  comparison strictly exceeds that scope's verified historical champion in
+  raw provider cached-token ratio, while preserving one inbound = one upstream
+  POST, no error regression, and no total-TTFT regression. A mixed global
+  metric, a fixture pass, a diagnostic reclassification, or a provider-only
+  recovery is never a promotion by itself.
+
+### Uncommitted v1.4.33-following candidate (under verification, not promoted)
+
+- Working-tree files: `src-tauri/src/proxy/mod.rs`,
+  `src-tauri/src/proxy/prefix_control.rs`, and
+  `src-tauri/src/proxy/warm_pending.rs`.
+- The candidate expands one **exact, low-noise, already-sent** maturity window
+  from `4,096` to `16,384` avoidable tokens, still capped at 500ms.
+- An exact material-tool parent may give exactly one direct child containing up
+  to `49,152` tool-output characters a bounded maturity window. Larger/noisy
+  children remain immediate. This is not a retry, prewarm, route switch, key
+  switch, or second upstream request.
+- This candidate has no same-scope live positive result yet. Keep it as the
+  current test line only; do not call it a cache champion or package it as one.
+
+### Verification completed on 2026-08-08
+
+- Rustup was restored from the official winget source; active toolchain is
+  `stable-x86_64-pc-windows-msvc`, `cargo 1.97.1`.
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` passed.
+- Focused candidate regressions passed: three direct tool-tail child cases,
+  two exact material-tail cases, the 12,288-token exact evidence case, and two
+  final-scope sent-waterline cases.
+- Full Rust suite passed: `995 passed, 0 failed, 12 ignored`.
+- `cargo build --manifest-path src-tauri/Cargo.toml --release --bin atoapi`
+  passed, producing a fresh `src-tauri/target/release/atoapi.exe` without
+  replacing the live runtime.
+- `scripts/verify-missing-response-id-control-prefix.mjs` passed with two
+  upstream POSTs and preserved exact control-prefix placement.
+- `scripts/verify-giant-cold-warm-pending.mjs` passed with five inbound
+  requests = five generation attempts = five upstream POSTs; all foreground
+  waits were at or below 500ms.
+- First live isolated pilot (2026-08-08) used the packaged v1.4.33 EXE as
+  control and the fresh candidate EXE for
+  `agent-codex-provider-4 / gpt-5.6-terra / realm 4611…9673`,
+  `tool-tail-maturity`, one pair and three turns. Both arms failed at the
+  seed with the same `HTTP 500 / atoapi_error`, before any isolated inbound,
+  attempt, upstream, usage, or cache metric was recorded. The artifact is
+  `output/candidate-v1433-v1433-tool-tail-maturity-pilot-20260808.json`.
+- A second minimal `full-replay` seed pilot with only 4,096 stable instruction
+  characters and four output tokens failed identically for both arms. Its
+  artifact is `output/candidate-v1433-v1433-full-replay-seed-pilot-20260808.json`.
+  Therefore the blocker is the shared isolated
+  `agent-codex-provider-4` configuration/upstream path, not tool-tail size,
+  the v1.4.33-following maturity logic, or the A/B arm selection.
+- A single bounded read/write health diagnostic against the currently running
+  `18883` Codex route returned HTTP 502 without `response.completed` for the
+  same `gpt-5.6-terra` scope. The metrics window advanced from 1,521 to 1,524
+  inbounds because other live traffic was concurrent, so no one-request delta
+  is attributed to that probe. This confirms the selected upstream path was
+  unavailable at the time of comparison; no further real requests were sent.
+- A later minimal request using the production Codex wire contract, including
+  `store=false`, returned HTTP 200 with `response.completed` and one inbound /
+  one attempt / one upstream increment. The running process is therefore
+  currently able to reach the configured relay; this does not prove a fresh
+  process can decrypt the on-disk Provider credential.
+- `scripts/verify-release-champion.mjs` now preserves `store=false` in every
+  live comparison request and reports only safe error categories for generic
+  `atoapi_error` responses. Its self-test passes. The isolated comparison
+  still fails before metrics with HTTP 500; source inspection maps this route
+  to the `failed to select provider key` branch, so it remains an invalid
+  comparison rather than cache evidence.
+- Re-saving the `运河 / agent-codex-provider-4` record updated its on-disk
+  timestamp to `2026-08-08T08:50:13.627917700Z`. A credential-safe DPAPI probe
+  then established the real boundary: the live `18883` v1.4.33 process can use
+  the record, while the Codex verification worker (`desktop-jrsahpg\\codexsandboxoffline`)
+  cannot decrypt the same on-disk `dpapi:` Provider credential. Both processes
+  are in Windows session 1, but they do not share a DPAPI principal. Copying
+  `config.toml` or pointing a child at the live config therefore cannot make a
+  worker-launched isolated EXE select that credential. `cache-key.dpapi` is not
+  a Provider-key fallback; it protects Atoapi's encrypted response cache.
+  This is an invalid fixture/upstream-path result, not a candidate regression
+  or a positive optimization. Do not increase its sample size until the two
+  isolated arms are launched under the same interactive Windows principal as
+  the working v1.4.33 process.
+- The verifier was then run under the desktop `msj` principal. It selected the
+  same Provider / Key realm in fresh isolated processes, proving that the
+  saved configuration is reusable when DPAPI is evaluated in its owning user
+  context. The `tool-tail-maturity` seed still had no usable cache evidence:
+  v1.4.33 ended after 30.020s with `502 / upstream_transport`, while the
+  candidate ended after 64.027s with `504 / system-proxy:header_wait_slow`.
+  Both preserved exactly one inbound = one attempt = one upstream POST.
+- A second desktop-principal `full-replay` seed reduced the request body to
+  4,496 bytes. The v1.4.33 control again ended with `502 / upstream_transport`
+  after 30.020s. The candidate's seed completed once (`743` input tokens,
+  zero cached tokens), but its first follow-up ended with
+  `upstream_sse_error`. Static wire continuity and one-attempt/one-POST held,
+  but neither arm completed a comparable cacheable sequence. These artifacts
+  are invalid for promotion and indicate fresh isolated upstream/system-proxy
+  instability, not a DPAPI/configuration loss or an accepted cache result.
+  They are retained at
+  `output/candidate-v1433-v1433-tool-tail-maturity-interactive-20260808-171100.json`
+  and `output/candidate-v1433-v1433-full-replay-interactive-20260808-171300.json`.
+- Same-binary v1.4.33 order controls proved the failure is not candidate code:
+  with identical 1,024-character full-replay wires, one fresh arm completed
+  `3/3` Responses requests while another stopped at its first follow-up.
+  A diagnostic direct-path override on temporary config copies produced the
+  same split result, so Windows system-proxy selection is not the root cause.
+  The relay's safe `upstream_sse_error:payload_limit` label is not treated as
+  a deterministic input-size finding because byte-identical requests both
+  completed and failed on different fresh arms. No cache comparison may be
+  promoted from this non-deterministic upstream/relay behavior.
+- The verifier now supports up to 2,500,000 seed-context characters and an
+  explicit `--minimum-seed-input-tokens` acceptance floor. This enables a
+  500k-token-class dynamic-tail run only when upstream usage actually proves
+  the requested scale; it does not relabel characters as tokens.
+- A desktop-principal 1,000,000-character `full-replay` ladder seed then
+  completed under the current, explicitly pinned
+  `agent-codex-bizd / gpt-5.6-terra / Key 2 / realm 7bf7…9cab7` scope. Both
+  v1.4.33 and the candidate completed all `3/3` requests with one inbound =
+  one attempt = one upstream POST; the observed realm matched the pinned
+  cohort and each seed reported `266,740` or more actual input tokens. This
+  is valid scale evidence but not a promotion: candidate raw hit was higher by
+  only `0.00139` percentage points, cache-128 was lower by `0.00850` points,
+  and its follow-up contained `266,752` provider-instability tokens. Artifact:
+  `output/control-v1433-v1433-context-stair-1m-20260808-key2.json`.
+- The same 1M ladder was immediately repeated candidate-first to test order
+  bias. The candidate completed its three requests, but v1.4.33's seed ended
+  as `upstream_sse_error:capacity` before usage/realm evidence. The comparison
+  fails closed and is not cache evidence. Together, the two runs show that
+  fresh isolated upstream capacity/cache behavior is still not reproducible;
+  do not escalate to 1.5M, 2M, 2.35M, or `dynamic-tail-mix`, and do not retry
+  in a loop. Artifact:
+  `output/control-v1433-v1433-context-stair-1m-candidate-first-20260808-key2.json`.
+- During the next return, Codex injection changed the live scope to
+   `agent-codex-provider-2` (`https://quiteai.autos/v1`), with no enabled Key
+   pool. A same-binary 1M self-control on that new scope completed all requests
+   but measured only `183,965` seed input tokens, below the 200k gate. A 1.5M
+   same-binary self-control then completed both arms with `274,545` seed input
+   tokens and matched realm `7bcb…4ab6`; however one arm had `274,432`
+   provider-instability tokens and the aggregate comparison therefore failed
+   closed. The apparent cache delta is same-binary arm-order/cache placement,
+   not candidate evidence. Artifact:
+   `output/control-v1433-v1433-self-1m5-20260808-provider2.json`.
+- A read-only metrics snapshot for the current `agent-codex-provider-2` scope
+  shows the latest populated buckets all at
+  `cache_avoidable_gap_tokens = 0`; observed shortfall is attributed to new
+  tails and provider instability. There is no falsifiable physical cache gap
+  for the v1.4.33-following wait expansion to recover in this scope.
+ - The verifier now records per-arm `seed_cache_read_tokens` and requires exact
+  seed-cache symmetry before any strict cache gain can become positive evidence.
+  This closes the order-prewarm false-positive seen in the isolated-cache
+  artifact; legacy artifacts without the new field are reconstructed from
+  their seed request during offline replay. The self-test passes, and the old
+  isolated-cache artifact now correctly reports
+  `seed_cache_read_symmetry = false` and `positive_cache_evidence = false`.
+ - The verifier entrypoint now also writes fail-closed reports to the requested
+  `--output` path from its top-level error handler. A local missing-parameter
+  probe produced a complete artifact with exit code `2`, and the self-test
+  passed; future child/cleanup failures will no longer disappear as
+  artifact-less runs.
+- A local scan of every retained `candidate-v1433-v1433*.json` artifact found
+  no `pass = true` or `positive_cache_evidence = true` result. There is no
+  overlooked v1.4.33-following candidate to package or promote.
+- One bounded candidate-first repeat at 1.5M confirmed the same-binary order
+  effect: both arms reached `274,539` seed tokens and completed `3/3`, but the
+  first candidate arm read `0` cached tokens while the later champion arm read
+  `274,176`. Provider-instability was `548,864` tokens on the candidate arm
+  and `274,432` on the champion arm. The comparison failed closed; this is
+  definitive order/cache-placement evidence, not a candidate regression or a
+  positive optimization. Artifact:
+  `output/control-v1433-v1433-self-1m5-candidate-first-20260808-provider2.json`.
+- The follow-up 1.5M candidate comparison with `--isolate-upstream-cache`
+  was rejected before launch by the managed approval service because its
+  servers were overloaded. No upstream request or artifact was produced; the
+  next safe continuation is to rerun that exact isolated-cache scope only
+  after the approval service is available.
+- Once approval was available, the isolated-cache champion-first comparison
+  completed both arms and met the token/one-POST gates, but the candidate seed
+  already read `274,176` cached tokens while the champion seed was cold; the
+  result also contained `256` provider-instability tokens, so its apparent
+  `99.89%` candidate cache-128 rate is not promotable evidence. The matching
+  candidate-first same-binary control then failed both arms at the first
+  `upstream_sse_error` with zero usage, confirming that the isolated upstream
+  path is still non-reproducible. Artifacts:
+  `output/candidate-v1433-v1433-isolated-cache-1m5-20260808-provider2.json` and
+  `output/control-v1433-v1433-isolated-cache-1m5-candidate-first-20260808-provider2.json`.
+ - `npm.cmd run build`, the selected frontend/diagnostic regressions,
+  release-champion self-test, acceptance self-test, and `git diff --check`
+  have passed in this checkpoint. Existing compiler warnings are dead-code
+  warnings only; no test failed.
+- A separate Codex injection-stability repair is now present in the uncommitted
+  source line (`src-tauri/src/agent_injection.rs`, `src-tauri/src/state.rs`,
+  and `src-tauri/src/admin/mod.rs`). The prior writer minted a new random
+  `atoapi-model-catalog-<uuid>.json` and rewrote `C:\Users\MSJ\.codex\config.toml`
+  on every enabled-injection refresh/startup, even when the effective route,
+  model catalog, local key, and endpoint were unchanged. This is a concrete
+  configuration-churn mechanism that can make Codex hot-reload while a session
+  is active. Catalog artifacts are now content-addressed and reused; an
+  unchanged reapply leaves the Codex config untouched, and an unsuccessful
+  config replacement cannot delete an already referenced catalog. Startup also
+  avoids persisting a no-op injection refresh. The targeted injection suite,
+  startup regression, full Rust suite (`995 passed, 0 failed, 12 ignored`),
+  release build, formatting, and diff checks pass. The live 18883 v1.4.33
+  runtime was not replaced or restarted, so this repair is not yet live.
+
+ - A guarded 1.5M candidate run detected a live scope drift before any
+   comparable sequence: the configured provider name remained
+   `agent-codex-provider-2`, but both arms observed realm
+   `4574f5…5b407` instead of the pinned `7bcb…4ab6`. The verifier failed
+   closed; the result contains no promotable evidence. Re-snapshot the current
+   realm before any further external comparison.
+
+ - After rebinding the current provider2 Key, the actual scope
+   `4574f5…5b407` completed a 1.5M candidate comparison with both arms at
+   `3/3` and `274,543` seed tokens. The candidate seed read `274,176` cached
+   tokens while the champion seed was cold (`0`), and the candidate also had
+   `256` provider-instability tokens. The new seed-symmetry gate rejected the
+   apparent `99.86%` candidate hit rate; this is still order/prewarm evidence,
+   not a promotion. Artifact:
+   `output/candidate-v1433-v1433-isolated-cache-1m5-20260808-provider2-realm4574.json`.
+ - A test-only distinct-User-Agent isolation attempt separated the two upstream
+  placement lanes, but the champion arm failed its first seed with
+  `upstream_sse_error` while the candidate completed. Both arms therefore do
+  not form a comparable cohort; no promotion evidence was produced. Artifact:
+   `output/candidate-v1433-v1433-isolated-ua-1m5-20260808-provider2-realm4574.json`.
+ - A smaller dual-lane stability gate on the same `4574f5…5b407` realm completed
+  both arms, but the candidate lane showed `3,584` provider-instability tokens
+  and read `2,816` seed-cache tokens while the champion seed was cold. The
+  seed-symmetry and provider-stability gates both rejected promotion, so no
+  1.5M rerun is justified yet. Artifact:
+   `output/control-v1433-v1433-stability-ua-small-20260808-realm4574.json`.
+- A 1.5M diagnostic with distinct per-arm prompt-cache keys made seed cache
+  symmetry explicit, but the candidate arm still hit provider instability
+  (`274,432` tokens) and ended below the champion (`33.29%` vs `66.59%`
+  cache-128). It is not promotion evidence; the remaining blocker is upstream
+  waterline/capacity behavior, not cache-key contamination. Artifact:
+  `output/candidate-v1433-v1433-isolated-prompt-key-1m5-20260808-realm4574.json`.
+
+ - A later keyed small stability gate did not publish an artifact after its
+   temporary child exited; its verifier cleanup was allowed to finish without
+   touching the live process. It produced no evidence and must not be retried
+   concurrently or counted as a cache result.
+
+ - The first valid 1.5M candidate comparison on the current `4574f5…5b407`
+   scope passed cohort, seed-symmetry, one-POST, and provider-stability gates.
+   Candidate cache-128 was `0.665941` vs champion `0.665114`, but strict
+   shortfall/full-bucket improvement was absent and candidate TTFT p95 regressed
+   (`34,337ms` vs `13,218ms`). The release verdict remains `pass=false` and
+   `positive_cache_evidence=false`; v1.4.33 stays the base. Artifact:
+   `output/candidate-v1433-v1433-isolated-prompt-key-1m5-20260808-realm4574-stable.json`.
+- A same-binary 1.5M latency control on the identical isolated prompt-key
+  setup was itself provider-confounded: the champion arm recorded `281,600`
+  provider-instability tokens and the candidate arm `563,200`. Its apparent
+  TTFT/cache ordering is therefore not evidence about candidate code. Artifact:
+  `output/control-v1433-v1433-latency-1m5-20260808-realm4574.json`.
+
+### Live runtime observation (read-only; not champion evidence)
+
+- Installation verification on 2026-08-08 completed for the separate v1.4.34
+  injection-stability package. The live listener is PID `35736` running
+  `G:\Atoapi\releases\v1.4.34-injection-stability-20260808\Atoapi.exe` and
+  `/health` returned HTTP 200. The live executable is therefore v1.4.34, not
+  the prior v1.4.33 process. After installation, the sole content-addressed
+  catalog
+  `C:\Users\MSJ\.codex\atoapi-model-catalog-fc19c3377eb13062c9689f277bf52f16eb4a862f3fdf7dab312f1a705b8659e8.json`
+  and `C:\Users\MSJ\.codex\config.toml` stayed unchanged for a continuous
+  30-second observation. This is a passed injection-stability validation, not
+  cache-champion evidence; v1.4.33 remains the cache comparison base.
+- Workspace cleanup completed on 2026-08-08. `cargo clean` removed the
+  generated `G:\Atoapi\src-tauri\target` tree: `47,388` files / `103.7 GiB`.
+  The first sandboxed attempt was denied on the Cargo artifact lock; the
+  standard clean completed under the user's approved elevated project scope.
+  The live v1.4.34 release process, v1.4.33 champion, v1.4.34 rollback package,
+  source/configuration, and all raw cache-comparison artifacts were retained.
+  Historical release packages total only `1.041 GiB`, while Atoapi runtime data
+  is about `0.01 GiB`; neither is a safe replacement for the generated build
+  cache and neither was deleted.
+- Post-clean live comparison confirms the user's perceived v1.4.34 hit drop is
+  cohort mixing, not a cache-policy regression. In the current rolling
+  metrics, `agent-codex-provider-2 / realm 4574f5c2… / gpt-5.6-terra` reached
+  `3,801,638` input tokens and `3,717,120` cached (`97.7768%`) across 16
+  successful rows, with `cache_avoidable_gap_tokens=0`. The mixed
+  `agent-codex-bizd / realm 7bf7f91b…` slice had `8,350,127` input tokens and
+  `5,123,680` cached (`61.3605%`); its `1,597,548` provider-unstable and
+  `1,612,468` new-tail tokens account for the loss, while avoidable remained
+  zero. The rolling aggregate was therefore not a valid v1.4.33 comparison.
+- Historical v1.4.33 release cohorts show the accepted positive line is
+  provider/realm-dependent: the strongest retained Terra cohort was
+  `agent-codex-provider-6 / realm bc8fca9d…` at `36,865,244` input and
+  `36,451,968` cached (`98.8790%`, 151 requests); another large positive was
+  provider-4/realm4611 at `98.3879%`. These cannot be mixed with the current
+  bizd/realm7bf7 slice. Current live diagnostic counts are dominated by
+  `provider-prefix-break` (84), `tool_tail_burst_real_tail` (28),
+  `provider_waterline_rollback` (24), and `tail_lag_previous_not_caught` (23);
+  `cache_avoidable_gap_tokens` remains zero. This falsifies another foreground
+  wait expansion as a safe fix.
+- The source diff from the v1.4.33 commit (`85b56a6`) contains no production
+  cache-policy change; the remaining `proxy/mod.rs` delta is test coverage for
+  bounded material-tool-tail maturity. The v1.4.34 production delta is the
+  injection/config churn repair and verifier hardening. Do not claim v1.4.34
+  is a cache champion; compare only same Provider/realm/model/request-family
+  cohorts and treat current provider instability as upstream evidence.
+- A read-only route audit after the v1.4.34 install confirms the enabled Codex
+  injection is bound to `agent-codex-provider-2`; authenticated
+  `GET /codex/v1/models` reports that same Provider. The rolling bizd rows are
+  therefore not a valid proxy for the currently injected Codex route and must
+  not be used to declare a v1.4.34 cache regression. The next A/B must remain
+  `provider-2 / realm 4574f5c2… / gpt-5.6-terra / Responses`.
+- `http://127.0.0.1:18883/health` returned HTTP 200 on 2026-08-08.
+  `GET /codex/v1/models` returned HTTP 401, which confirms that the Codex
+  route is mounted and protected by the local key; `GET /codex/v1` itself is
+  not an endpoint and returns 404 by design.
+- At the read-only snapshot, `agent_generation` reported 1,445 inbound
+  requests and 1,445 generation attempts, with zero multi-attempt inbounds.
+  The aggregate provider cached-token ratio was 93.6569%, but the recent
+  window mixes Provider/model realms and is therefore not comparable with a
+  historical champion. The active snapshot also had one request in flight.
+- Recent rows showed zero `cache_avoidable_gap_tokens`; misses were attributed
+  to new tails or provider instability. Do not broaden the wait domain without
+  a falsifiable, nonzero physical cached-token opportunity.
+- A fresh read-only snapshot at `2026-08-08T13:57:57Z` confirms the live
+  process is still the packaged v1.4.33 executable (PID `43512`), with no
+  restart or replacement. Within the current `agent-codex-provider-2 /
+  gpt-5.6-terra / realm 4574f5c2…` slice, all 200 retained recent rows
+  completed successfully; aggregate `cache_avoidable_gap_tokens` was `0`,
+  while `cache_new_tail_gap_tokens` was `1,020,928` and
+  `cache_provider_unstable_gap_tokens` was `7,905,792`. This is direct
+  evidence against expanding the foreground maturity wait again: the present
+  loss is new-tail/provider instability, not a measured avoidable prefix gap.
+- The uncommitted candidate's local Rust and synthetic wire regressions still
+  pass, but its widened `4,096 -> 16,384` exact-gap and material-tool-child
+  waits remain unproven on real traffic. Keep v1.4.33 as the sole accepted
+  base and do not package or deploy this candidate until a fresh same-scope
+  run shows strict raw-token and strict-shortfall improvement with no TTFT or
+  stability regression.
+- A follow-up live final-scope audit of the same 200 `provider-2 / terra /
+  realm4574…` rows found 159 rows with a positive sent-vs-settled residual
+  (`candidate_avoidable_tokens_128`), totaling `4,436,096` tokens. However,
+  `cache_avoidable_gap_tokens` stayed zero in every one of those rows; the
+  residual was accompanied by `4,394,752` provider-unstable tokens overall.
+  Only five rows fell inside the candidate's newly widened `4,096–16,384`
+  band, and they likewise did not produce a real avoidable cache gain. This
+  falsifies the current wait-expansion hypothesis on live traffic: the missing
+  tokens are upstream rollback/instability, not a local maturity window that
+  Atoapi can safely recover without another request.
+- The uncommitted `4,096 -> 16,384` first-exact window and the widened
+  material-tool-child wait were therefore removed from source on 2026-08-08.
+  The remaining source cache behavior is again the v1.4.33 policy line; the
+  injection-stability repair and fail-closed verifier hardening remain
+  untouched. Focused rollback regressions (`17` warm-pending, `27`
+  prefix-control, and the immediate small-tool child), formatting, the release
+  build, release-champion self-test, and a release-EXE giant-context run all
+  passed. That run preserved `5 inbound = 5 attempts = 5 upstream POSTs`, a
+  stable prompt-cache key, append-only FullReplay wire, no automatic probes,
+  and the 500ms foreground ceiling.
+- The logged-in desktop account `desktop-jrsahpg\\msj` is active in Windows
+  session 1, but this Codex worker has only the sandbox token and lacks both
+  session-token and scheduled-task permissions. A bounded Shell.Application
+  launch probe produced no desktop-owned child output, so no real upstream
+  request was sent from the wrong DPAPI principal. The current worker cannot
+  truthfully perform the same-principal 500k-token comparison by itself;
+  forcing it would only recreate the already-known invalid credential result.
+- A separate, non-cache-champion reliability package was produced at
+  `G:\Atoapi\releases\v1.4.34-injection-stability-20260808` on 2026-08-08.
+  It contains the source-built `Atoapi.exe`, an NSIS installer, SHA-256 sums,
+  release notes, and the verification report. All version surfaces were
+  advanced to `1.4.34`; the package contains only the verified injection
+  stability repair and verifier hardening, with the v1.4.33 cache policy.
+  Full release preflight passed (`993 passed`, `12 ignored`, three capacity
+  baselines, frontend and diagnostic suites), as did the release-EXE giant
+  context one-POST regression. NSIS packaging completed successfully. MSI was
+  not emitted because WiX `light.exe` failed during bundle creation; this is
+  recorded in the package report. The live v1.4.33 process remains untouched.
+- A v1.4.35 candidate package was built on 2026-08-08 at
+  `G:\Atoapi\releases\v1.4.35-release-champion-runner-20260808`. It contains
+  the source-built EXE, NSIS installer, SHA-256 sums, and release/test notes.
+  Full preflight passed (`996 passed`, `12 ignored`, three capacity baselines,
+  frontend/diagnostic/acceptance checks), and the runner's debug/release unit
+  tests passed `3/3`. This package adds only the fixed same-principal runner;
+  it does not promote a cache change and has not been installed over live
+  v1.4.34.
+- Hard baseline check after packaging: live PID `35736` is still
+  `v1.4.34-injection-stability-20260808\Atoapi.exe`; the retained champion is
+  file-version `1.4.33`; the new candidate is file-version `1.4.35`. The
+  production diff from commit `85b56a6` contains only the fixed admin runner
+  and runner-support changes; no cache-policy production path was changed.
+  The v1.4.33 champion executable remains the runner's fixed control path.
+  Therefore baseline preservation is confirmed. A cache-hit improvement is
+  **not yet claimed** until v1.4.35 runs the same-principal live A/B; unit,
+  synthetic, mixed-realm, or offline evidence cannot promote it.
+
+### Next return point
+
+1. Keep the current 18883 runtime running and untouched. When ready for the
+   same-principal comparison, run the v1.4.35 candidate from the workspace
+   release layout; use the packaged v1.4.33 EXE as control and the current
+   candidate EXE in an isolated, same-scope comparison.
+2. Before deploying the source-built injection repair, retain the existing
+   Codex configuration as the rollback point and verify one explicit
+   enable/apply operation under the interactive desktop principal. The first
+   post-repair apply may intentionally replace the legacy UUID catalog with a
+   stable content-addressed catalog; subsequent unchanged applies must leave
+   both `config.toml` and that catalog's timestamp/path unchanged. Do not
+   restart or replace live 18883 merely to perform this source verification.
+3. The current Codex injection scope is `agent-codex-bizd / gpt-5.6-terra`
+   with explicit `Key 2` and observed realm `7bf7…9cab7`; do not reuse the
+   retired `agent-codex-provider-4 / realm 4611…` scope. The verifier wrapper
+   now exposes `-KeyId`, `-SeedContextChars`, and
+   `-MinimumSeedInputTokens` so the 1M-to-2.35M ladder can be run without
+   hand-editing the command. The DPAPI/configuration boundary is resolved, but
+   upstream capacity/cache terminals remain non-deterministic. Do not mask
+   this with retries, route changes, key rotation, tool-tail changes, or a
+   broader sample.
+   `scripts/run-release-champion-interactive.ps1` remains the same-profile
+   seed entry point.
+ 3a. Scope override from the latest 20:03 snapshot: Codex now uses
+     `agent-codex-provider-2 / gpt-5.6-terra` at
+     `https://quiteai.autos/v1`, with no enabled Key pool and observed realm
+     `7bcb…4ab6`. The preceding bizd/Key-2 observations remain historical
+     artifacts and must not be mixed into this scope.
+ 4. For the requested long-context work, use `dynamic-tail-mix` with a
+   500k-token acceptance floor based on actual upstream `input_tokens`, not
+   characters. A full 11-turn, two-arm run is multi-million-token traffic;
+   execute it only after the fresh-sequence gate is reproducible and keep
+   `v1.4.33` as the comparison base.
+ 5. After a bounded seed succeeds, run the release-champion comparison only
+   against that exact cohort; retain raw result artifacts and reject
+   mixed-provider summaries.
+ 5a. `scripts/run-release-champion-interactive.ps1` now defaults to the
+    observed current scope (`agent-codex-provider-2 / realm 4574f5c2…`),
+    supports `dynamic-tail-mix`, and for that scenario defaults to the
+    requested 2.35M-character / 450k-input-token seed class, 11 turns, and
+    131,072-character two-tool tails. It also enables isolated upstream-cache
+    lanes and a per-run prompt-cache-key prefix so a future desktop-principal
+    run cannot silently fall back to the retired provider4/realm4611 fixture or
+    shared placement.
+6. Promote this candidate only on a strict positive result under the rule
+   above. If it is neutral, unstable, or regresses cache/TTFT/errors, retain
+   v1.4.33 as the base and investigate the next measured miss cause instead of
+   extending waits again.
+7. Each future positive result becomes the sole accepted base for the next
+   iteration, with its scope, raw before/after metrics, tests, and return point
+   appended here before packaging.
+8. After v1.4.35 is running under the owning desktop principal, call the fixed
+   local-admin runner with `POST /admin/release-champion/run`, then poll
+   `GET /admin/release-champion/status`. It accepts no request body or custom
+   arguments; the artifact is written under the Atoapi config
+   `release/release-champion` directory. Promote only a strict positive result.
+
+### Task-card and Super Brain status
+
+- `docs/task-card-auto-channel-compact-20260629.md` is complete: automatic
+  channel selection, compression compatibility boundaries, and Provider-level
+  multi-Key management are all checked off. Its stated next task is the cache
+  hit-rate comparison described above.
+- Super Brain runtime v0.5.98 was verified on 2026-08-08: package entry,
+  private memory root, MCP binding, functional probe, and activation receipt
+  are all ready. It is configured not to store raw prompts, transcripts, or
+  provider secrets.
+- The task-card reporter itself is currently unavailable to this Codex worker:
+  its private-state lock is denied by the sandbox principal. Treat this file
+  and the verified live probes above as the current authoritative checkpoint;
+  do not claim that the G1 task card was refreshed until it runs under its
+  owning principal.
+
 ## AUTHORITATIVE RELEASE STATE - 2026-07-30
 
 - **v1.4.13 is packaged** at `G:\Atoapi\releases\v1.4.13-full-replay-waf-auto-compact-cache-continuity-20260730`; it contains the independent portable EXE and NSIS installer, both carrying file/product version `1.4.13`.

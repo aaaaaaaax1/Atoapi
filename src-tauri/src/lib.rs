@@ -9,6 +9,7 @@ mod metrics;
 mod metrics_history;
 mod persistence;
 mod proxy;
+mod release_champion_runner;
 mod state;
 
 /// Default upstream product identity.

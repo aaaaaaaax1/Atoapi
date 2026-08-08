@@ -37,6 +37,7 @@ use crate::{
         DispatchDrainOutcome, DispatchTracker, ResponsesFullReplayRiskObservations,
         TransportClients, UpstreamCacheAffinity, WarmPendingRegistry,
     },
+    release_champion_runner::ReleaseChampionRunner,
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +120,7 @@ pub struct AppState {
     pub agent_runtime_models: StdMutex<HashMap<String, String>>,
     pub shadow_affinity: Arc<Mutex<ShadowAffinityStore>>,
     pub cache_validation: Mutex<CacheValidationController>,
+    pub release_champion_runner: ReleaseChampionRunner,
     pub relay_tasks: DispatchTracker,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
@@ -758,6 +760,7 @@ impl AppState {
             agent_runtime_models: StdMutex::new(agent_runtime_models),
             shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
+            release_champion_runner: ReleaseChampionRunner::default(),
             relay_tasks: DispatchTracker::default(),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
@@ -812,6 +815,7 @@ impl AppState {
             agent_runtime_models: StdMutex::new(agent_runtime_models),
             shadow_affinity,
             cache_validation: Mutex::new(CacheValidationController::default()),
+            release_champion_runner: ReleaseChampionRunner::default(),
             relay_tasks: DispatchTracker::default(),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
@@ -865,9 +869,16 @@ impl AppState {
         let mut config = self.config.write().await;
         let has_enabled_agent = config.agent_injections.iter().any(|item| item.enabled);
         if has_enabled_agent {
+            let before = toml::to_string(&*config)?;
             agent_injection::apply_enabled(&mut config)?;
-            config.updated_at = Utc::now();
-            self.persist_config_snapshot(&config).await?;
+            // An already-current Codex injection must not churn Atoapi's
+            // persisted status on every launch.  More importantly, this
+            // makes the startup reconciler a true no-op after the target
+            // config/catalog has been verified current.
+            if toml::to_string(&*config)? != before {
+                config.updated_at = Utc::now();
+                self.persist_config_snapshot(&config).await?;
+            }
         }
 
         // An injection rewrite keeps one prior catalog for a short handoff.

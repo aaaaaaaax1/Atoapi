@@ -702,6 +702,14 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/cache-affinity", get(admin_cache_affinity))
         .route("/admin/cache-capabilities", get(admin_cache_capabilities))
         .route(
+            "/admin/release-champion/status",
+            get(admin_release_champion_status),
+        )
+        .route(
+            "/admin/release-champion/run",
+            post(admin_release_champion_run),
+        )
+        .route(
             "/admin/cache-capabilities/probe",
             post(admin_probe_cache_capabilities),
         )
@@ -762,6 +770,36 @@ async fn admin_cache_capabilities(AxumState(state): AxumState<Arc<AppState>>) ->
             .provider_cache_capabilities
             .clone(),
     )
+}
+
+async fn admin_release_champion_status(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    Json(state.release_champion_runner.status().await).into_response()
+}
+
+async fn admin_release_champion_run(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    match state
+        .release_champion_runner
+        .start(&state.config_path)
+        .await
+    {
+        Ok(status) => Json(status).into_response(),
+        Err(error) if error.to_string().contains("already running") => {
+            json_error(StatusCode::CONFLICT, &error.to_string())
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    }
 }
 async fn admin_probe_cache_capabilities(
     AxumState(state): AxumState<Arc<AppState>>,
@@ -30414,11 +30452,7 @@ mod tests {
         fs::remove_dir_all(config_dir).ok();
     }
 
-    #[tokio::test]
-    async fn small_tool_tail_direct_child_stays_immediate_without_extra_post() {
-        // Two balanced live cohorts found no aggregate cache gain from holding
-        // a one-character tool tail locally. Keep this edge on the immediate
-        // path while preserving the one-shot FullReplay and terminal metrics.
+    async fn exercise_tool_tail_direct_child(tool_output_text: &str, expect_maturity_wait: bool) {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let upstream_hits_for_route = upstream_hits.clone();
         let observed_full_replay = Arc::new(AtomicBool::new(true));
@@ -30512,8 +30546,8 @@ mod tests {
         let mut config =
             test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
         config.cache = crate::config::CacheConfig::smart_max_hit();
-        // Keep the older generic prefix controller out of this fixture. The
-        // one-character tool edge must remain on the immediate path.
+        // Keep the older generic prefix controller out of this fixture so the
+        // material-tail maturity path is the only possible foreground wait.
         config.cache.mode = CacheMode::PassiveWarm;
         config.providers[0].models = vec![ModelConfig {
             id: model_id.to_string(),
@@ -30551,9 +30585,6 @@ mod tests {
             headers
         };
         let stable_instructions = "s".repeat(1_000_000);
-        // Exercise the lowest observed tool-result boundary without inflating
-        // it into a larger synthetic case.
-        let small_tool_output = "x";
         let request = |shape: &str| {
             let mut input = vec![
                 json!({"type": "message", "role": "developer", "content": "stable"}),
@@ -30569,7 +30600,7 @@ mod tests {
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": "call_small",
-                    "output": small_tool_output,
+                    "output": tool_output_text,
                 }));
             }
             if shape == "quiet-child" {
@@ -30641,31 +30672,69 @@ mod tests {
             .iter()
             .all(|outcome| outcome.attempt_count == 1));
 
-        let tool_output = metrics
+        let tool_output_request = metrics
             .recent_requests
             .iter()
             .find(|request| request.input_tokens == Some(251_264))
-            .expect("small tool output must be logged");
-        assert_eq!(tool_output.tail_tool_output_chars, Some(1));
+            .expect("tool output must be logged");
+        assert_eq!(
+            tool_output_request.tail_tool_output_chars,
+            Some(tool_output_text.len() as u64)
+        );
         let quiet_child = metrics
             .recent_requests
             .iter()
             .find(|request| request.input_tokens == Some(251_392))
-            .expect("quiet direct child must be logged");
-        assert_eq!(quiet_child.prefix_guard_wait_reason, None);
-        assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
+            .expect("direct child must be logged");
         assert_eq!(quiet_child.cache_read_tokens, Some(251_264));
         assert_eq!(quiet_child.tail_tool_output_chars, Some(0));
         let child_elapsed = quiet_child_elapsed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .expect("mock must observe the direct child");
-        assert!(
-            child_elapsed < TokioDuration::from_millis(350),
-            "a one-character tool child must not receive an unproven local wait"
-        );
+        if expect_maturity_wait {
+            assert_eq!(
+                quiet_child.prefix_guard_wait_reason.as_deref(),
+                Some("responses_material_tool_tail_maturity_pending")
+            );
+            assert!((1..=500).contains(&quiet_child.prefix_guard_wait_ms.unwrap_or_default()));
+            assert!(
+                child_elapsed >= TokioDuration::from_millis(350),
+                "the exact material parent must receive its one bounded maturity window"
+            );
+        } else {
+            assert_eq!(quiet_child.prefix_guard_wait_reason, None);
+            assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
+            assert!(
+                child_elapsed < TokioDuration::from_millis(350),
+                "a one-character tool child must not receive an unproven local wait"
+            );
+        }
 
         fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn small_tool_tail_direct_child_stays_immediate_without_extra_post() {
+        // Two balanced live cohorts found no aggregate cache gain from holding
+        // a one-character tool tail locally. Preserve that immediate path.
+        exercise_tool_tail_direct_child("x", false).await;
+    }
+
+    #[tokio::test]
+    async fn medium_tool_tail_direct_child_waits_once_without_extra_post() {
+        // The first 12K result is real new context. Its exactly-bound direct
+        // child may wait once so the already-sent parent can materialise.
+        let medium_tool_output = "x".repeat(12_288);
+        exercise_tool_tail_direct_child(&medium_tool_output, true).await;
+    }
+
+    #[tokio::test]
+    async fn large_tool_tail_direct_child_waits_once_without_extra_post() {
+        // This is the larger observed ordinary-tool band. It remains one
+        // inbound/one upstream request while its exact parent matures.
+        let large_tool_output = "x".repeat(40_960);
+        exercise_tool_tail_direct_child(&large_tool_output, true).await;
     }
 
     #[tokio::test]

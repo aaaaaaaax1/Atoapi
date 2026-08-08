@@ -58,6 +58,9 @@ pub struct AgentInjectionResult {
     pub backup_path: Option<PathBuf>,
     pub status: String,
     pub injected_at: String,
+    /// True when this application changed an injected configuration artifact.
+    #[serde(default)]
+    pub changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +129,7 @@ pub fn set_enabled(
             backup_path: None,
             status: item.last_status.clone().unwrap_or_default(),
             injected_at: Utc::now().to_rfc3339(),
+            changed: true,
         }]);
     }
 
@@ -158,8 +162,10 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
         let item = &mut config.agent_injections[index];
         item.enabled = true;
         item.target_path = result.target_path.clone();
-        item.last_injected_at = Some(Utc::now());
-        item.last_status = Some(result.status.clone());
+        if result.changed {
+            item.last_injected_at = Some(Utc::now());
+            item.last_status = Some(result.status.clone());
+        }
     }
     Ok(vec![result])
 }
@@ -188,9 +194,12 @@ pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>
         let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
         let result = apply_item(&config.agent_injections[index], &context)?;
         let item = &mut config.agent_injections[index];
+        item.enabled = true;
         item.target_path = result.target_path.clone();
-        item.last_injected_at = Some(Utc::now());
-        item.last_status = Some(result.status.clone());
+        if result.changed {
+            item.last_injected_at = Some(Utc::now());
+            item.last_status = Some(result.status.clone());
+        }
         results.push(result);
     }
     Ok(results)
@@ -602,6 +611,7 @@ fn apply_item(
     context: &InjectionContext,
 ) -> Result<AgentInjectionResult> {
     let started = Utc::now();
+    let mut changed = true;
     let (target_path, backup_path, status) = match item.kind {
         AgentInjectionKind::ClaudeCode => {
             let target = item
@@ -621,7 +631,7 @@ fn apply_item(
                 .target_path
                 .clone()
                 .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
-            write_codex_config(&target, context)?;
+            changed = write_codex_config(&target, context)?;
             (
                 Some(target),
                 None,
@@ -717,6 +727,7 @@ fn apply_item(
         backup_path,
         status,
         injected_at: started.to_rfc3339(),
+        changed,
     })
 }
 
@@ -895,7 +906,7 @@ fn write_claude_code_settings(path: &Path, context: &InjectionContext) -> Result
     write_json_pretty(path, &value)
 }
 
-fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
+fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     let target_existed = path.exists();
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut doc = if text.trim().is_empty() {
@@ -938,7 +949,7 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
         .map(parse_codex_restore_fragment)
         .transpose()?;
     let previous_catalog_path = managed_codex_catalog_path(&doc, path);
-    let model_catalog_path = write_codex_model_catalog(path, context)?;
+    let (model_catalog_path, catalog_created) = write_codex_model_catalog(path, context)?;
 
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["disable_response_storage"] = value(true);
@@ -988,8 +999,16 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
         provider["experimental_bearer_token"] = value(context.local_key.as_str());
     }
 
-    if let Err(error) = write_text(path, &doc.to_string()) {
-        fs::remove_file(&model_catalog_path).ok();
+    let rendered = doc.to_string();
+    if rendered == text {
+        return Ok(catalog_created);
+    }
+    if let Err(error) = write_text(path, &rendered) {
+        // A failed config replacement must never delete a catalog that the
+        // existing Codex config may still reference.
+        if catalog_created {
+            fs::remove_file(&model_catalog_path).ok();
+        }
         return Err(error);
     }
     cleanup_unreferenced_codex_catalogs(
@@ -997,10 +1016,13 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<()> {
         &model_catalog_path,
         previous_catalog_path.as_deref(),
     );
-    Ok(())
+    Ok(true)
 }
 
-fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> Result<PathBuf> {
+fn write_codex_model_catalog(
+    config_path: &Path,
+    context: &InjectionContext,
+) -> Result<(PathBuf, bool)> {
     let mut catalog = serde_json::from_str::<Value>(OFFICIAL_CODEX_MODELS_JSON)
         .context("bundled Codex model catalog is invalid")?;
     let models = catalog
@@ -1062,11 +1084,12 @@ fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> 
         }
     }
 
+    let catalog_text = format!("{}\n", serde_json::to_string_pretty(&catalog)?);
+    let digest = Sha256::digest(catalog_text.as_bytes());
     let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
     let catalog_path = parent.join(format!(
-        "{}{}.json",
+        "{}{digest:x}.json",
         CODEX_MODEL_CATALOG_FILE_PREFIX,
-        Uuid::new_v4().simple()
     ));
     let catalog_path = if catalog_path.is_absolute() {
         catalog_path
@@ -1075,8 +1098,13 @@ fn write_codex_model_catalog(config_path: &Path, context: &InjectionContext) -> 
             .context("failed to resolve Codex model catalog path")?
             .join(catalog_path)
     };
-    write_json_pretty(&catalog_path, &catalog)?;
-    Ok(catalog_path)
+    let needs_write = fs::read_to_string(&catalog_path)
+        .map(|existing| existing != catalog_text)
+        .unwrap_or(true);
+    if needs_write {
+        write_text(&catalog_path, &catalog_text)?;
+    }
+    Ok((catalog_path, needs_write))
 }
 
 fn cleanup_unreferenced_codex_catalogs(
@@ -1843,7 +1871,7 @@ command = "npx"
             }],
         };
 
-        write_codex_config(&path, &context).unwrap();
+        assert!(write_codex_config(&path, &context).unwrap());
         let first_document: toml::Value =
             toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         let first_catalog_path = first_document
@@ -1851,7 +1879,7 @@ command = "npx"
             .and_then(toml::Value::as_str)
             .map(PathBuf::from)
             .expect("first Codex injection should write model_catalog_json");
-        write_codex_config(&path, &context).unwrap();
+        assert!(!write_codex_config(&path, &context).unwrap());
         let text = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
 
@@ -1881,7 +1909,7 @@ command = "npx"
             .expect("Codex injection should write model_catalog_json");
         assert!(catalog_path.is_absolute());
         assert!(is_managed_codex_catalog_path(&catalog_path));
-        assert_ne!(catalog_path, first_catalog_path);
+        assert_eq!(catalog_path, first_catalog_path);
         assert!(first_catalog_path.exists());
         let active_catalogs = fs::read_dir(&dir)
             .unwrap()
@@ -1889,9 +1917,8 @@ command = "npx"
             .map(|entry| entry.path())
             .filter(|candidate| is_managed_codex_catalog_path(candidate))
             .collect::<Vec<_>>();
-        assert_eq!(active_catalogs.len(), 2);
+        assert_eq!(active_catalogs.len(), 1);
         assert!(active_catalogs.contains(&first_catalog_path));
-        assert!(active_catalogs.contains(&catalog_path));
         let catalog: Value =
             serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
         let models = catalog["models"].as_array().unwrap();
