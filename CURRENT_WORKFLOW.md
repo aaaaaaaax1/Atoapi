@@ -831,9 +831,10 @@
   same-realm, non-provider-unstable `cache_avoidable_gap_tokens` (at least
   4,096 tokens) before it has a falsifiable local cache hypothesis.
 
-### 2026-08-09 v1.4.35 runner dynamic-validation checkpoint
+### 2026-08-09 v1.4.36 runner dynamic-validation checkpoint
 
-- The active `v1.4.35-release-champion-runner-20260808` is a small
+- v1.4.36 is the next small release node, built from the validated
+  `v1.4.35-release-champion-runner-20260808` base. It is a small
   stability/verification milestone, not a binary cache-hit champion. It
   preserves gzip transport on the active BIZD route, completes the calibrated
   150K--200K dynamic text-tail workflow, and is within 0.026273pp of the
@@ -843,6 +844,11 @@
   turn-by-turn crossover plus fixed inter-arm pace to distinguish provider
   placement noise from binary behavior. A v1.4.33-versus-v1.4.33 control
   reached 0.0000pp raw/cache-128 delta under that method.
+- The packaged v1.4.36 EXE completed a fresh isolated BIZD 75K-token
+  calibration against v1.4.33: both arms completed 3/3 terminal SSE requests,
+  had exact input/cache-hit symmetry and zero avoidable gap. The candidate's
+  local overhead was unchanged; its +484ms TTFT p95 was entirely upstream, so
+  this is packaging/transport confirmation rather than cache promotion.
 - Keep this checkpoint as the base for the next positive optimization search.
   Do not promote its cache result or replace v1.4.33 until an exact current
   BIZD cohort produces a positive, non-provider-confounded cache delta.
@@ -854,8 +860,11 @@
 Pin BIZD Key 2 for any isolated comparison; do not mix APX, TokenX, or sub5
 artifacts into this scope. v1.4.33 remains the binary hit-rate champion. The
 only candidate to evaluate is the user-visible running
-`releases/v1.4.35-release-champion-runner-20260808/Atoapi.exe` (SHA-256
-`23fc5fd902dc9734b860b272dd94a281ae79ad1dfa7daf0dff990bd50f7da264`), not
+`releases/v1.4.36-runner-dynamic-validation-20260809/Atoapi.exe`
+(SHA-256 `bb4eef2ce422490bfb2ae1a07fb79a04289104f9f2d8da513b0b8348371b47b5`).
+Until that release is installed, the live service remains the validated
+`v1.4.35-release-champion-runner-20260808` SHA-256
+`23fc5fd902dc9734b860b272dd94a281ae79ad1dfa7daf0dff990bd50f7da264`, not
 the older `v1.4.35-champion-derived-rebuilt-20260808` artifact. The older
 rebuilt binary sent a 157K-token seed uncompressed and failed with local
 `upstream_transport`; it is not representative of the active release.

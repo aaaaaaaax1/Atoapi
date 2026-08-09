@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn release_executable_resolves_workspace_root() {
         let root = workspace_root_from_release_exe(Path::new(
-            r"G:\Atoapi\releases\v1.4.35-release-champion-runner\Atoapi.exe",
+            r"G:\Atoapi\releases\v1.4.36-runner-dynamic-validation\Atoapi.exe",
         ))
         .expect("release layout must resolve");
         assert_eq!(root, PathBuf::from(r"G:\Atoapi"));
