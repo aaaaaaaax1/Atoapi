@@ -865,6 +865,27 @@
   Do not promote its cache result or replace v1.4.33 until an exact current
   BIZD cohort produces a positive, non-provider-confounded cache delta.
 
+### 2026-08-09 v1.4.37 multi-Key count UI checkpoint
+
+- v1.4.37 is an additive UI/package checkpoint built on v1.4.36. On an
+  upstream row with an enabled multi-Key pool, it now renders a compact
+  `N 个 Key` chip immediately to the left of the existing balance chip.
+  `N` is the configured pool Key count; no Key value, preview, or secret is
+  exposed.
+- A normal single-Key upstream or a disabled multi-Key pool renders exactly
+  the prior balance UI with no new chip. This checkpoint changes neither
+  routing, health selection, balance probing, cache behavior, nor the
+  v1.4.33 binary hit-rate champion.
+- Focused multi-Key and provider-health UI regressions plus the production
+  frontend build passed before packaging. The full FastRelayCore release gate
+  then passed (996 Rust release tests; 12 manual baselines ignored), as did
+  the NSIS build. Both copied release artifacts report FileVersion and
+  ProductVersion `1.4.37`:
+  `releases/v1.4.37-multikey-count-20260809/Atoapi.exe`
+  (SHA-256 `371b141e9bc3506dc7654723272f80249048b5f193dbb26f64f952ccda78bd48`)
+  and `Atoapi_1.4.37_x64-setup.exe`
+  (SHA-256 `c1be8b80d819c880e53374ee619d849bd4da505b6c6605a8cff6026babb72314`).
+
 ### Next return point
 
 **Current override (2026-08-09, active):** the hand-selected route is

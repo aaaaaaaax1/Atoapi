@@ -854,6 +854,15 @@ const bridgeSource = String.raw`
     return "is-healthy";
   }
 
+  function keyPoolCountBadge(provider) {
+    if (provider?.keyPoolEnabled !== true) return "";
+    const count = Number.isFinite(Number(provider?.keyPoolCount))
+      ? Math.max(0, Math.floor(Number(provider.keyPoolCount)))
+      : 0;
+    const label = count + " 个 Key";
+    return '<span class="key-pool-count-chip" title="已启用多 Key 池：共 ' + escape(label) + '">' + icon("key-round", 12) + '<span>' + escape(label) + '</span></span>';
+  }
+
   function applyBalanceProbe(result) {
     if (!result?.provider_id) return;
     const provider = providers.find((item) => item.id === result.provider_id);
@@ -1471,7 +1480,7 @@ const bridgeSource = String.raw`
       '<article class="provider-row ' + (provider.active ? "active" : "") + '" data-provider-id="' + escape(provider.id) + '">' +
       '<span class="provider-mark" draggable="true" data-provider-drag="' + escape(provider.id) + '" title="拖动调整上游顺序" style="cursor:grab">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
       '<div class="provider-copy"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small></div>' +
-      '<div class="provider-meta"><div class="provider-tags">' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
+      '<div class="provider-meta"><div class="provider-tags">' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + keyPoolCountBadge(provider) + '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
       '<div class="provider-actions"><button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>' +
       '<button class="tool-button connection-test-button" type="button" data-test-provider="' + escape(provider.id) + '" aria-label="测试 ' + escape(provider.name) + ' 连通性" title="测试当前 Key 连通性">' + icon("plug-zap", 14) + '连通</button>' +
       '<button class="tool-button health-probe-button" type="button" data-health-probe-provider="' + escape(provider.id) + '" aria-label="测活 ' + escape(provider.name) + '" title="测活">' + icon("activity", 14) + '测活</button>' +
@@ -2014,6 +2023,8 @@ function buildState(
     keys: provider.key_pool?.enabled
       ? provider.key_pool.available_keys
       : (provider.has_api_key ? 1 : 0),
+    keyPoolEnabled: provider.key_pool?.enabled === true,
+    keyPoolCount: provider.key_pool?.keys.length ?? 0,
     active: false,
     latency: providerConnectionStatus[provider.id] ?? "未检测",
     balance: providerBalanceStatus[provider.id] ?? null

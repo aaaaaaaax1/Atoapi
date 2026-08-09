@@ -3,6 +3,7 @@ dist/
 target/
 src-tauri/target/
 logs/
+output/
 releases/
 _archive/
 .vite/

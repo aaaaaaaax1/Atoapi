@@ -32,7 +32,7 @@ import {
   providersForGraphiteAgent
 } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.36";
+const APP_VERSION = "v1.4.37";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;

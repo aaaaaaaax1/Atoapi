@@ -34,6 +34,31 @@ assert.match(
 );
 assert.match(
   bridgeSource,
+  /function keyPoolCountBadge\(provider\)[\s\S]{0,360}provider\?\.keyPoolEnabled !== true/,
+  "the provider-list Key-count badge must render only for an enabled multi-Key pool"
+);
+assert.match(
+  bridgeSource,
+  /keyPoolCountBadge\(provider\) \+ '<button class="balance-probe-chip /,
+  "an enabled multi-Key count must appear immediately to the left of the balance badge"
+);
+assert.match(
+  host,
+  /keyPoolEnabled:\s*provider\.key_pool\?\.enabled === true/,
+  "the host must pass the multi-Key enabled boundary into the provider-list state"
+);
+assert.match(
+  host,
+  /keyPoolCount:\s*provider\.key_pool\?\.keys\.length \?\? 0/,
+  "the provider-list Key count must use the pool's configured Key count"
+);
+assert.match(
+  html,
+  /\.key-pool-count-chip\s*\{[\s\S]{0,420}white-space:\s*nowrap/,
+  "the Key-count chip must remain compact beside the balance chip"
+);
+assert.match(
+  bridgeSource,
   /key\.enabledDirty\s*=\s*true/,
   "a local key enable edit must be marked dirty before a health refresh"
 );
