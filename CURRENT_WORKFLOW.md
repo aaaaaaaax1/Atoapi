@@ -18,7 +18,21 @@
   metric, a fixture pass, a diagnostic reclassification, or a provider-only
   recovery is never a promotion by itself.
 
-### Uncommitted v1.4.33-following candidate (under verification, not promoted)
+### Champion inheritance correction (2026-08-08)
+
+- `git merge-base --is-ancestor 85b56a6 HEAD` passed. The latest source is
+  directly derived from the v1.4.33 champion; its core `final_scope_waterline`,
+  exact 500ms maturity guard, material-tool-tail guard, and one-inbound/one-
+  upstream attempt gate are still present in HEAD.
+- v1.4.35 is therefore not a separate cache baseline. It is the champion core
+  plus Agent injection stability, provider/key isolation, and the release-
+  champion verifier/runner. Further hit-rate work must branch from this
+  inherited line, then use v1.4.33 only as the acceptance comparator.
+- A fresh release build from the current source completed successfully. Fresh
+  binary SHA-256: `DF88E64250765009C055238FC5ED6C82318A67997C38533C9E9A37F6307D052F`.
+  It has not replaced the live 18883 process.
+
+### Historical wording: v1.4.33-following candidate (not a separate current base)
 
 - Working-tree files: `src-tauri/src/proxy/mod.rs`,
   `src-tauri/src/proxy/prefix_control.rs`, and
@@ -266,6 +280,33 @@
 
 ### Live runtime observation (read-only; not champion evidence)
 
+### 2026-08-08 dynamic 500k capacity recheck
+
+- The new dense-seed verifier path is present only in the verification harness:
+  `scripts/verify-release-champion.mjs` accepts `fixture-profile natural-dense`,
+  and `scripts/run-release-champion-interactive.ps1` forwards it. It does not
+  change Atoapi cache or session behavior.
+- A 1.5M-character natural seed with `dynamic_tail_profile=natural-dense`
+  reached `326,968` input tokens before the third tail. Both arms then returned
+  `upstream_sse_error:payload_limit` at a `1,853,498`-byte request body:
+  `output/candidate-v1433-v1435-natural-dense-dynamic-450k-500k-provider2-80k-calibration-20260808.json`.
+- A 500K-character dense seed was rejected on the first request by both arms
+  with the same `upstream_sse_error:payload_limit` and identical `1,381,706`
+  byte bodies, before usage was returned:
+  `output/candidate-v1433-v1435-natural-dense-seed-500k-calibration-20260808.json`.
+- A 300K-character dense seed completed `3/3` on both arms at `256,837`
+  seed / `256,867` peak input tokens:
+  `output/control-v1433-v1435-dense-seed-300k-capacity-20260808.json`.
+- A 380K-character dense seed completed `3/3` on both arms at `340,375`
+  champion seed and `347,565` candidate seed tokens, but seed-cache symmetry
+  was false and provider-instability was `694,272` tokens:
+  `output/control-v1433-v1435-dense-seed-380k-capacity-20260808.json`.
+- These are capacity/placement diagnostics, not cache-champion evidence. The
+  current provider/realm has no valid 450K-500K raw-input cohort, so v1.4.33
+  remains the accepted champion and no cache wait/session-delta change is
+  justified. Do not rerun the same 500K shape until a same-scope upstream path
+  reports a context capacity that can actually reach the gate.
+
 - Installation verification on 2026-08-08 completed for the separate v1.4.34
   injection-stability package. The live listener is PID `35736` running
   `G:\Atoapi\releases\v1.4.34-injection-stability-20260808\Atoapi.exe` and
@@ -398,8 +439,466 @@
   Therefore baseline preservation is confirmed. A cache-hit improvement is
   **not yet claimed** until v1.4.35 runs the same-principal live A/B; unit,
   synthetic, mixed-realm, or offline evidence cannot promote it.
+- First same-principal v1.4.35 runner execution started at
+  `2026-08-08T17:00:18Z` and completed at `2026-08-08T17:00:29Z`. Both the
+  v1.4.33 champion and current candidate failed on the first 2.35M-character
+  seed with the same `upstream_sse_error:payload_limit`; each still met
+  `1 inbound = 1 attempt = 1 upstream POST`, and both observed the pinned
+  provider-2 / realm4574 scope. No usage or cache tokens were emitted, so this
+  is a provider context/payload ceiling, not a cache regression or promotion
+  result. Artifact:
+  `output/candidate-v1433-v1435-dynamic-500k-payload-limit-20260808.json`.
+
+- The new natural-dense dynamic verifier path was exercised against the current
+  Codex binding `agent-codex-vcsub / gpt-5.6-terra / realm c98fe...` with two
+  requested pairs, a 1.5M-character seed, 220K tool-character budget, and a
+  required peak range of 450K–500K input tokens. The v1.4.33 champion completed
+  its seed at `274,541` input tokens, but its first dynamic follow-up returned
+  HTTP 429; the v1.4.35 candidate returned HTTP 429 at its seed. Both attempted
+  requests still preserved `1 inbound = 1 attempt = 1 upstream POST`, but the
+  dynamic sequence had no complete usage/SSE cohort and never reached the peak
+  gate. Artifact:
+  `output/candidate-v1433-v1435-natural-dense-dynamic-450k-500k-20260808.json`.
+  This is upstream rate/capacity evidence, not cache evidence. Do not package
+  or promote v1.4.35 from it; v1.4.33 remains the champion.
+- The verifier-only continuation now supports `dynamic-tail-profile=natural-dense`,
+  per-arm `minimum/maximum_peak_input_tokens`, and an explicit
+  `require_ttft_no_regression` gate. Its self-test and frontend build pass. The
+  historical run used a 1.5M seed plus 220K dynamic-tail budget. The current
+  wrapper uses the calibrated 80K dense-tail default and still does not alter
+  normal Atoapi traffic.
+
+### 2026-08-09 generated prompt-cache-key isolated evidence (not promoted)
+
+- The running `18883` process remains the v1.4.35 release and was not stopped,
+  replaced, or configured by this work. The verifier started two disposable
+  copies of that same binary with copied configuration; the only A/B difference
+  was `prompt_cache_key` capability `unsupported` (baseline) versus the current
+  verified compatibility path (candidate). Each completed request had one
+  inbound, one generation attempt, one main upstream POST, a terminal SSE,
+  the same provider/model/selected-Key realm, and no downstream disconnect.
+- The first 20-by-2 interleaved run (`fabc9811a2c87d18`) was diagnostic only:
+  the historical verifier did not yet enforce TTFT. It showed candidate warm
+  cache-128 `94.1919%` versus baseline `62.7862%`, with `759,552` fewer
+  provider-unstable tokens, but it cannot promote a route.
+- The verifier now records complete timing coverage and rejects any candidate
+  whose end-to-end TTFT p95 is higher (`--max-ttft-regression-ms 0`). In strict
+  run `88b77903509fd170`, the candidate still improved warm cache-128
+  `94.2510% -> 99.4705%` and reduced provider-unstable tokens by `112,640`,
+  but TTFT p95 was `3,362ms` versus `3,084ms` (+`278ms`). It is rejected.
+- A fresh strict, interleaved confirmation (`53a780215341bbc8`) reproduced the
+  cache direction (`94.1741% -> 99.5243%` warm cache-128) but again failed the
+  latency gate: candidate TTFT p95 `7,403ms` versus baseline `5,618ms`
+  (+`1,785ms`). The corresponding upstream TTFT p95 delta was +`1,784ms`,
+  while candidate local preparation p95 was `3ms`; this run identifies an
+  upstream latency tail, not a safe local cache-wait regression to tune away.
+- A follow-up guard-reason probe and the narrower proactive-wait ablation both
+  stopped at their first isolated request with upstream HTTP `502`, while the
+  unchanged live 18883 process continued to return `25/25` recent HTTP `200`
+  requests on the same provider with one upstream attempt. The discarded
+  ablation was removed from source; it produced no valid cache or timing
+  evidence and must not be revived as a production change.
+- Therefore do **not** set an effect-promotion record, package a new release,
+  or call this a new champion. v1.4.33 remains the accepted hit-rate champion;
+  v1.4.35 remains its inherited functional base with injection stability.
+  Keep the prompt-cache-key path as an evidence-backed candidate only, and
+  rerun its strict A/B only when the same scope can demonstrate non-regressing
+  upstream TTFT.
+
+### 2026-08-09 strict verifier continuation (not promoted)
+
+- The generated prompt-cache-key verifier now constructs both arms from the
+  same deterministic record multiset and rotates only the first line. Its
+  default prefix is 1,000 lines (the minimum is 10), the input-budget gate
+  remains authoritative, paired input-token delta defaults to `<=128`, and
+  bounded request-body byte counts plus timing/guard-reason fields are kept as
+  diagnostics. Self-test and syntax checks passed.
+- The release-champion verifier now enforces paired dynamic input fingerprints
+  and token symmetry, requires the final dynamic-tail follow-up itself to fall
+  inside any configured peak range, passes peak gates to both champion and
+  candidate aggregates, and the interactive release wrapper always requires
+  non-regressing end-to-end TTFT. No production cache path was changed.
+- The current owner configuration is `agent-codex-apx / gpt-5.6-terra` with
+  observed realm prefix `1e9c1f31039f`. A stale `agent-codex-provider-2`
+  preflight was rejected before starting an isolated process, so it produced
+  no upstream traffic. A one-request isolated probe on the actual route
+  completed HTTP 200 / terminal SSE / one upstream POST.
+- The request-shape ladder on that route completed at 100, 500, 1,000, and
+  1,500 fixture lines (the 1,500-line body was 181,735 bytes); 2,200 lines
+  returned HTTP 400 at 266,435 bytes. This is a verifier capacity boundary,
+  not cache evidence, and the 2,200-line shape is not to be retried blindly.
+- A strict 20-by-2 run with the safe 1,000-line shape stopped at the first
+  baseline request with isolated upstream HTTP 502. It had no comparable
+  cache/TTFT cohort, no retry, and no promotion. The live 18883 process
+  remained healthy afterward: 20/20 recent `agent-codex-apx` rows were HTTP
+  200 with one upstream attempt on the same observed realm.
+- The prior provider-2 450K–500K natural-dense dynamic ladder remains
+  unprovable (payload/context limits before complete usage); it is not being
+  repeated. v1.4.33 remains the accepted cache champion and v1.4.35 remains
+  the functional/injection-stability base.
+
+### 2026-08-09 APX generated prompt-cache-key: strict reproducible configuration positive
+
+- The active owner-selected scope is `agent-codex-apx / gpt-5.6-terra /
+  realm 1e9c1f31039f54e416767d68361c71f17e8a70cda0831989205907e3a9d361c9`.
+  The running `18883` process remains the packaged v1.4.35 release and was
+  never stopped, replaced, or used as a verifier target. Both experiments used
+  disposable copies of that exact binary and copied the current owner config.
+- The only A/B difference was the verified generated `prompt_cache_key`
+  compatibility field: the baseline temporary config forced it `unsupported`,
+  while the candidate retained the current verified record. Final-wire
+  `cache_metadata` receipts proved the baseline field was absent and the
+  candidate field was present on every request. The field value itself was
+  never recorded.
+- First strict 20-by-2 interleaved run (baseline first), artifact
+  `output/generated-prompt-cache-key-cross-ab-apx-500k-ledger-rerun-20260809-145210.json`:
+  both arms processed `1,045,350` input tokens with paired delta `0`; all 40
+  requests completed with one inbound = one attempt = one upstream POST.
+  Candidate cache-128 was `89.5047%` versus `69.5929%` (+`19.9118` points),
+  warm cache-128 was `94.1935%` versus `73.2387%` (+`20.9548` points), and
+  end-to-end TTFT p95 was `4,309ms` versus `5,179ms` (candidate `-870ms`).
+- Independent strict 20-by-2 interleaved run (candidate first, fresh fixture),
+  artifact
+  `output/generated-prompt-cache-key-cross-ab-apx-500k-candidate-first-20260809-145612.json`:
+  both arms processed `1,125,350` input tokens with paired delta `0`; again
+  all 40 requests were complete, single-attempt, same-provider/model/realm,
+  and free of local avoidable gaps. Candidate cache-128 was `94.2154%` versus
+  `89.2280%` (+`4.9874` points), warm cache-128 `99.1492%` versus `93.9005%`
+  (+`5.2487` points), and TTFT p95 `4,938ms` versus `7,337ms` (candidate
+  `-2,399ms`).
+- Both arms were cold on their first request in the first run, so the positive
+  result is not a prewarmed-seed artifact. The order-reversed confirmation,
+  final-wire witness, exact input-token symmetry, TTFT gate, and one-POST gate
+  make this the accepted **APX configuration champion** for this exact scope.
+  Keep the verified generated-key compatibility path enabled; do not replace
+  it with broad waits, retries, prewarm, tail rewriting, or an unmeasured
+  cache-control field.
+- This is deliberately **not** a binary-version promotion over v1.4.33: the
+  comparison uses the same v1.4.35 executable in two temporary configuration
+  modes, and the generated-key mechanism predates the current injection and
+  verifier changes. v1.4.33 therefore remains the historical binary release
+  champion until a direct same-scope binary A/B strictly beats it. Do not mint
+  a fictitious v1.4.36 package for this configuration-only result; the active
+  v1.4.35 package already contains the verified path. Retain the JSON files as
+  raw evidence only and do not commit them.
+
+### 2026-08-09 current scope drift to sub5 and binary A/B blocked
+
+- At **2026-08-09 15:47:04 +08:00**, the saved Codex configuration changed
+  from the earlier APX route to the currently hand-selected
+  `agent-codex-sub5 / gpt-5.6-terra`. The latest live realm was
+  `8e2aac53087cc7313c65a20adaf9cb8d8d78534b3fe554656a61cb11a1f944b8`.
+  Earlier APX configuration evidence remains APX-scoped and must not be
+  mixed into this sub5 cohort.
+- The first source/source binary comparison on that exact sub5 scope used
+  v1.4.33 versus v1.4.35, with identical copied configuration and a paired
+  1,000-line dynamic fixture. It stopped at baseline turn 6 with HTTP 502 /
+  `upstream_transport`; the request still had one inbound, one attempt, and
+  one upstream POST, and observed the correct provider/model/realm. It has no
+  scored binary result and cannot establish regression or promotion. Artifact:
+  `output/v1433-v1435-current-verified-config-binary-ab-20260809-155012.json`.
+- A bounded same-binary health preflight was then rejected before launch by
+  the managed approval service because its servers were overloaded. No
+  workaround, alternate execution path, or extra upstream traffic was used.
+  The sub5 Key pool is enabled with sequential selection and `next_index=0`;
+  the current first Key is
+  `key-1786252264826-0-62862f3691c048`. A retry with that explicit Key pin was
+  also rejected before launch by the same approval-service overload. Wait for
+  the approval service to recover before any further live isolated run.
+  v1.4.33 remains the historical binary champion; the APX verified-key result
+  remains a separate APX configuration champion only.
+- After the explicit Key pin became available, the bounded sub5 health
+  preflight did launch under Key
+  `key-1786252264826-0-62862f3691c048`. It used the **same v1.4.33 EXE on
+  both arms**. One arm completed 3/3 with the pinned realm; the other failed
+  on its first seed with HTTP 200 plus native `response.failed`, classified as
+  `upstream_sse_error:capacity`, while still preserving one inbound = one
+  attempt = one upstream POST and the correct realm. Artifact:
+  `output/control-v1433-current-scope-key0-health-20260809-160923.json`.
+  This same-binary split is direct evidence of sub5 capacity/order instability,
+  not a v1.4.35 code result. Do not promote or repeat the full binary A/B until
+  a fresh same-binary preflight is stable on both arms.
+
+### 2026-08-09 current scope correction: tokenx-5 serial binary A/B
+
+- A fresh read-only check corrected the stale sub5 return point: the saved
+  Codex injection and the running `18883` ledger now select
+  `agent-codex-tokenx-5 / gpt-5.6-terra`. The current sequential pool starts
+  at `key-1786261917468-0-3f91b3af507b48`; the observed live realm is
+  `84ed756f5e79836d21eaaaeaf1b33552f9dc0550865998d035ea4f837e932a27`.
+  APX and sub5 evidence remain historical scopes and must not be mixed into
+  this cohort.
+- The generated-key verifier now supports distinct `--baseline-exe` and
+  `--candidate-exe`, exact `source/source` configurations, `--serial` arm
+  order, and explicit `--key-id` pool pinning. Its syntax check, self-test,
+  failed-SSE ledger test, and key-pin test pass. It never stops or reconfigures
+  the live `18883` process.
+- A first sandbox-launched probe returned local HTTP 500 before any inbound,
+  generation, or upstream counter advanced. The sandbox principal cannot
+  decrypt the owner's Windows-DPAPI Provider Key; this is an execution-identity
+  boundary, not a provider, cache, or binary failure. All valid tokenx runs
+  below were launched under the normal interactive Windows principal.
+- Same-binary v1.4.33 serial health control (3-by-2) completed all six turns
+  on the pinned Key/realm with terminal SSE, exact paired input tokens,
+  `1 inbound = 1 attempt = 1 upstream POST`, full replay, and zero avoidable
+  gap. Its three-sample TTFT p95 differed by 303ms between identical arms,
+  confirming that this bounded control proves serial health only, not a
+  latency verdict. Artifact:
+  `output/control-v1433-tokenx5-key0-serial-health-elevated-20260809-163150.json`.
+- Full source/source v1.4.33 baseline-first versus v1.4.35 candidate (20-by-2)
+  completed all 40 requests with exact input-token symmetry. Both arms had
+  cache-128 `94.2499%` and warm cache-128 `99.1947%`; the candidate TTFT p95
+  was 696ms slower, entirely explained by a 704ms slower upstream TTFT p95.
+  It fails the strict per-cohort latency gate and is not a promotion. Artifact:
+  `output/v1433-v1435-tokenx5-key0-serial-baseline-first-20260809-163307.json`.
+- The first order-reversed cohort stopped at candidate turn 13 on native
+  `response.failed: upstream_stream_error`; it preserved one POST but has no
+  complete comparator and is discarded. A read-only live check afterward
+  found the tokenx Key0 healthy and the latest 30 tokenx rows complete and
+  single-attempt, so a new independent order-reversed cohort was justified.
+- The fresh candidate-first rerun completed all 40 requests with the same
+  provider/model/realm, full replay, complete timing, one POST per inbound,
+  zero avoidable gap, and exact paired input tokens. Both arms had cache-128
+  `94.3455%` and warm cache-128 `99.2910%`; candidate TTFT p95 was 559ms
+  faster, with upstream TTFT p95 1,045ms faster. Artifact:
+  `output/v1433-v1435-tokenx5-key0-serial-candidate-first-rerun-20260809-163712.json`.
+- Pooling the two complete, order-balanced cohorts gives 40 requests per arm,
+  `2,170,700` input tokens and `2,044,416` cache-read tokens per arm: raw hit
+  rate `94.1823%`, cache-128 `94.2968%`, exact hit delta `0.0000pp`. Pooled
+  candidate TTFT p95 is 69ms faster and upstream TTFT p95 65ms faster. The
+  direction reversal proves the earlier TTFT tail is upstream/time-order
+  noise, not a local binary regression. Therefore v1.4.33's cache-hit
+  champion baseline is **preserved**, but v1.4.35 has **no measured hit-rate
+  improvement** on this current scope and must not be promoted or packaged as
+  a new cache champion. Keep the current verified configuration as-is; raw
+  `output/*.json` artifacts are evidence and are not committed.
+
+### 2026-08-09 TokenX Key1 scoped prompt-cache-key effect: positive hit signal, not promoted
+
+- After the Key0 binary comparison, the live sequential pool naturally marked
+  Key0 `enabled = false`; it has no cooldown timestamp and was **not** revived
+  by this work. The current owner-selected live scope is now Key1
+  `key-1786261948268-0-c9af8fbc12ddc`, realm
+  `2187a537a6a3daa08a18d971b1ff5e3a524b655138b227c187005bd473bf7272`.
+  Recent live rows on that realm remained HTTP 200, terminal-SSE, and
+  single-attempt. Do not mix the earlier Key0/`84ed...` binary evidence with
+  this Key1 configuration cohort.
+- The generated-key verifier was tightened to accept an explicit Key-scoped
+  capability record only when `--key-id` is supplied, rewrite only that
+  selected Key's temporary capability records, and stop the first isolated
+  arm process before starting the next in `--serial` mode. It now records an
+  optional inter-arm delay; syntax, capability-scope, key-pin, SSE-ledger,
+  and final-wire self-tests pass. The production config and live `18883`
+  listener remain untouched.
+- A first `source` versus `unsupported` Key1 preflight showed that the source
+  arm carried both `prompt_cache_key` and retention. It is useful bundle
+  evidence but not a single-field attribution, so it is not used for a
+  promotion claim.
+- The clean PCK-only control uses temporary `unsupported` versus `verified`
+  records while keeping retention unsupported on **both** arms. Final-wire
+  receipts showed exactly no cache-control field on the baseline and exactly
+  `prompt_cache_key` on the candidate. A candidate-first 3-by-2 preflight
+  was fully comparable: warm cache-128 `98.0676%` versus `49.0338%`
+  (+`49.0338pp`) and candidate TTFT p95 528ms faster. Artifact:
+  `output/control-tokenx5-key1-prompt-cache-key-only-candidate-first-health-20260809-165243.json`.
+- A process-serial baseline-first 3-by-2 control reproduced the wire and
+  hit direction (warm `98.0296%` versus `0%`), but had a 402ms candidate
+  TTFT p95 tail. This confirms that arm ordering still affects the remote
+  timing tail even when the first process has exited before the second starts.
+  Artifact:
+  `output/control-tokenx5-key1-pck-only-process-serial-health-20260809-165704.json`.
+- Two full, process-serial 10-by-2 cohorts used a 30-second inter-arm delay,
+  exact Key1/realm pinning, exact input-token symmetry, full replay,
+  terminal SSE, one POST per inbound, final-wire receipts, and no locally
+  avoidable gap. Baseline-first cache-128 was `49.1031%` versus candidate
+  `88.7444%` (+`39.6413pp`); candidate-first was `39.8569%` versus
+  `89.6781%` (+`49.8212pp`). The corresponding artifacts are
+  `output/tokenx5-key1-pck-only-process-serial-10-baseline-first-20260809-165805.json`
+  and
+  `output/tokenx5-key1-pck-only-process-serial-10-candidate-first-20260809-170016.json`.
+- The two full cohorts pool to 20 requests and `1,073,050` input tokens per
+  arm: baseline raw/cache-128 `44.7323%`/`44.7815%`, candidate
+  `89.0829%`/`89.1808%`, a reproducible +`44.3506pp`/+`44.3993pp` hit signal.
+  However pooled candidate TTFT p95 is 515ms slower and upstream TTFT p95 is
+  452ms slower (the first cohort includes a single 7,002ms upstream tail).
+  Under the standing strict `0ms` end-to-end TTFT rule this effect is **not
+  promoted** as the Key1 configuration champion, despite the large cache-hit
+  delta. Do not call it a v1.4.35 binary promotion, package it, or alter
+  cache waits/retries to chase the upstream tail. The currently verified
+  configuration is already the owner's active setting and is retained; this
+  record is an effect candidate pending non-regressing latency evidence.
+
+### 2026-08-09 TokenX Key1 dynamic-context 128k rung: upstream quota-blocked
+
+- The first real dynamic-tail capacity rung used the v1.4.33 champion binary
+  on both arms, the active Key1/realm, `dynamic-tail-mix`, 11 turns, one pair,
+  natural-dense seed/tails, and upstream-cache isolation. The release verifier
+  default fallback launches one complete arm process before the other, so this
+  did not send concurrent arm requests or touch live `18883`.
+- The champion arm completed six terminal-SSE requests with one inbound = one
+  attempt = one main upstream POST, correct provider/model/realm, static-wire
+  continuity, zero avoidable/provider-unstable gap, seed `89,577` input
+  tokens, and observed peak `116,781` input tokens. It then received upstream
+  HTTP 403 `insufficient_user_quota` on the next dynamic tail; the candidate
+  cannot form a comparison. Artifact:
+  `output/control-v1433-tokenx5-key1-dynamic-128k-20260809-170526.json`.
+- This is not a context-capacity ceiling or cache regression. It is a
+  third-party quota terminal after a partial isolated sequence, so the rung is
+  invalid and the 256k/384k/450–500k ladder is paused. Do not retry the failed
+  request, switch Key, revive Key0, change cache waits, or promote a result.
+  A read-only postcheck found live Key1 still enabled/healthy and its latest
+  20 tokenx rows terminal-SSE/single-attempt HTTP 200, so live `18883` was not
+  altered by the isolated failure.
+
+### 2026-08-09 APX PCK-only configuration champion under authorized upstream-TTFT policy
+
+- The owner explicitly authorized an upstream-only TTFT exemption: a
+  configuration effect may pass when all usual cache/SSE/realm/one-POST/wire
+  gates pass and local TTFT overhead remains bounded, even if the remote
+  upstream TTFT p95 is slower. The verifier now exposes
+  `--allow-upstream-ttft-regression` and retains a separate
+  `--max-local-ttft-overhead-regression-ms` gate (bounded to 500ms). It reports
+  end-to-end, upstream, and local-overhead p95 separately; the exemption never
+  hides a local proxy regression. The PCK control now also rejects a
+  `source`-bundle comparison from being mislabelled as a single-field effect.
+- At **2026-08-09 17:15 +08:00**, the owner-selected Codex route changed from
+  TokenX to the current `agent-codex-apx / gpt-5.6-terra / realm
+  1e9c1f31039f54e416767d68361c71f17e8a70cda0831989205907e3a9d361c9`.
+  The APX Key pool is disabled, so this comparison cannot silently rotate a
+  Key. The live `18883` process remained untouched and current APX rows were
+  full-replay, terminal-SSE, and one-POST before testing.
+- Two fresh, process-serial PCK-only 10-by-2 cohorts ran with 30-second
+  inter-arm separation and exact final-wire controls (`[]` baseline versus
+  `[prompt_cache_key]` candidate). Both had exact paired input tokens, same
+  provider/model/realm, complete timing, full replay, no downstream
+  disconnect, and zero local avoidable gap. Baseline-first cache-128 was
+  `39.3125%` versus `88.6294%` (+`49.3169pp`); candidate-first was `79.4298%`
+  versus `89.4077%` (+`9.9779pp`). Artifacts:
+  `output/apx-pck-only-process-serial-10-policy-rerun-20260809-171746.json`
+  and
+  `output/apx-pck-only-process-serial-10-policy-candidate-first-20260809-171951.json`.
+- Pooled across both directions, each arm processed `1,103,050` input tokens:
+  baseline raw/cache-128/warm-cache-128 `58.2066%`/`58.2781%`/`64.7393%`,
+  candidate `88.8881%`/`88.9973%`/`98.8642%`. The accepted hit deltas are
+  +`30.6815pp` raw, +`30.7192pp` cache-128, and +`34.1249pp` warm cache-128.
+  Candidate end-to-end and upstream TTFT p95 were +3,425ms/+3,422ms, while
+  local TTFT-overhead p95 was only +1ms (493ms versus 492ms), safely within
+  the authorized 500ms local ceiling.
+- Therefore the verified generated `prompt_cache_key` path is the current
+  **APX configuration champion** for this exact provider/model/realm under
+  the authorized upstream-TTFT policy. This is a configuration effect on the
+  existing v1.4.35 executable, not a new binary champion or a reason to mint
+  a release package. Keep the verified path enabled, retain v1.4.33 as the
+  binary hit-rate champion, and do not commit raw `output/*.json` evidence.
+
+### 2026-08-09 APX retention-on-PCK preflight: no incremental hit gain
+
+- The generated-control verifier now supports
+  `--preserve-control-field prompt-cache-key`, allowing a true single-field
+  retention comparison without mislabelling a `source` bundle. Both temporary
+  arms keep the verified PCK record; only `prompt_cache_retention` changes
+  from `unsupported` to `verified`. The final-wire witnesses were exactly
+  `[prompt_cache_key]` for the baseline and
+  `[prompt_cache_key, prompt_cache_retention]` for the candidate.
+- The process-serial APX preflight completed every safety gate with the same
+  v1.4.35 executable, provider/model/realm, full replay, terminal SSE, one
+  upstream POST per inbound, exact wire isolation, and no local avoidable
+  gap. Artifact (evidence only, not for commit):
+  `output/apx-retention-on-pck-process-serial-health-20260809-174651.json`.
+- Retention produced no measurable increment: raw hit `65.3883%` on both
+  arms, cache-128 `65.4264%` on both, and warm cache-128 `98.1395%` on both
+  (`0.0000pp` throughout). Retention is therefore not a positive APX
+  optimization, does not receive a full 10-by-2 expansion, and must not be
+  enabled or promoted as part of the configuration champion.
+
+### 2026-08-09 APX fresh exact-scope gap analysis: no controllable cache deficit
+
+- Read-only live `18883` metrics at `2026-08-09T10:07:52Z` matched 182
+  successful rows for the active APX realm. They carried `35,963,458` input
+  tokens, `34,943,744` cache-read tokens (`97.1646%` raw token hit), one
+  upstream attempt per row, `full_replay`, and no continuity reset. Their
+  `972,032` shortfall tokens split into `891,392` new-tail and `61,952`
+  provider-unstable tokens; `cache_avoidable_gap_tokens = 0`.
+- A separate 32-day persisted-history pass reached the same exact
+  provider/model/realm scope through both release cohorts and exact hourly
+  affinity buckets. The two independently aggregated totals agree exactly:
+  2,549 successful requests, `411,055,075` input tokens, `392,633,472`
+  cache-read tokens (`95.5185%` raw token hit), `17,763,712` shortfall,
+  `10,765,312` new-tail, and `0` avoidable tokens. This rules out an
+  aggregation or cohort-mixing explanation for the zero controllable gap.
+- Do not add a cache wait, prewarm, retry, context rewrite, or other
+  production behavior on this evidence. A future APX candidate needs repeated
+  same-realm, non-provider-unstable `cache_avoidable_gap_tokens` (at least
+  4,096 tokens) before it has a falsifiable local cache hypothesis.
+
+### 2026-08-09 v1.4.35 runner dynamic-validation checkpoint
+
+- The active `v1.4.35-release-champion-runner-20260808` is a small
+  stability/verification milestone, not a binary cache-hit champion. It
+  preserves gzip transport on the active BIZD route, completes the calibrated
+  150K--200K dynamic text-tail workflow, and is within 0.026273pp of the
+  v1.4.33 cache-128 champion while improving local and upstream TTFT p95.
+- The verifier now rejects unsupported synthetic long tool-history separately,
+  validates a declared tool-schema probe, and uses a shared-cache,
+  turn-by-turn crossover plus fixed inter-arm pace to distinguish provider
+  placement noise from binary behavior. A v1.4.33-versus-v1.4.33 control
+  reached 0.0000pp raw/cache-128 delta under that method.
+- Keep this checkpoint as the base for the next positive optimization search.
+  Do not promote its cache result or replace v1.4.33 until an exact current
+  BIZD cohort produces a positive, non-provider-confounded cache delta.
 
 ### Next return point
+
+**Current override (2026-08-09, active):** the hand-selected route is
+`agent-codex-bizd / gpt-5.6-terra / realm 7bf7f91b71eb452aa4dee2e4f4e87a8a89b50e721a6e60c814b92ddc9139cab7 / Responses`.
+Pin BIZD Key 2 for any isolated comparison; do not mix APX, TokenX, or sub5
+artifacts into this scope. v1.4.33 remains the binary hit-rate champion. The
+only candidate to evaluate is the user-visible running
+`releases/v1.4.35-release-champion-runner-20260808/Atoapi.exe` (SHA-256
+`23fc5fd902dc9734b860b272dd94a281ae79ad1dfa7daf0dff990bd50f7da264`), not
+the older `v1.4.35-champion-derived-rebuilt-20260808` artifact. The older
+rebuilt binary sent a 157K-token seed uncompressed and failed with local
+`upstream_transport`; it is not representative of the active release.
+
+The first BIZD tool-history fixture failed at long context because the relay
+rejects synthetic tool replay, even after a small schema-corrected probe
+passes. Use verifier-only `dynamic-tail-mode text` for long dynamic cache
+comparison: 11 turns, five natural 16KB tails, full replay, and enforced
+150K--200K input-token peak. This is valid dynamic-tail evidence but does not
+claim BIZD long tool-history compatibility. A two-pair isolated run had all
+terminal/SSE/realm/input-symmetry gates but showed lane placement variance;
+the same-binary v1.4.33 control varied by 4.008pp. The shared-cache,
+turn-by-turn crossover control then reached exactly 0.0000pp raw/cache-128
+delta for v1.4.33 versus itself. The completed active-runner comparison used
+that stabilized method and fixed 1.5s inter-arm pace: 22/22 terminal SSE per
+arm, exact realm and input symmetry, peak 198,068 tokens, zero avoidable gap,
+and cache-128 `94.548440%` (v1.4.33) versus `94.522167%` (runner), a
+non-promotable `-0.026273pp` candidate delta. The 1,024 cached-token
+difference is explained by `+1,536` new-tail tokens and a 512-token upstream
+instability split; local p95 was 2ms faster and upstream/total TTFT p95 was
+838ms faster for the runner. Keep v1.4.33 as champion and do not claim a
+runner regression or promotion from this provider-confounded near-tie. Raw
+`output/*.json` evidence remains untracked and must not be committed.
+
+**Historical APX override (superseded):** the active route was
+`agent-codex-apx / gpt-5.6-terra / realm 1e9c1f31039f54e416767d68361c71f17e8a70cda0831989205907e3a9d361c9`.
+The verified PCK-only APX configuration is the accepted configuration
+champion under the owner-authorized upstream-TTFT policy; preserve the 500ms
+local-overhead ceiling. The v1.4.33 binary hit-rate champion remains intact;
+v1.4.35 is its functional/injection-stability base, not a new binary champion.
+TokenX Key0/Key1 evidence and its quota-blocked dynamic ladder are historical;
+do not revive a disabled Key, rotate automatically, or mix those cohorts into
+APX. Obtain a fresh APX metrics snapshot before proposing a new cache change.
+The strict generated-key A/B has now passed twice with the verified 1,000-line
+shape, exact input-token symmetry, final-wire receipts, and the authorized
+upstream-TTFT policy with a bounded local-overhead gate. The fresh APX
+exact-scope analysis found zero avoidable tokens, and retention added no
+measurable gain on top of PCK. Do not rerun either in a loop or disable the
+verified PCK capability. The next cache change must first identify a nonzero,
+controllable **APX** gap from live evidence; retain the current verified
+configuration as the baseline. Do not run the provider-2
+450K–500K natural-dense shape again. Items 3, 3a, and 5a below are retained
+historical return points and are superseded by this override.
 
 1. Keep the current 18883 runtime running and untouched. When ready for the
    same-principal comparison, run the v1.4.35 candidate from the workspace
@@ -412,7 +911,7 @@
    stable content-addressed catalog; subsequent unchanged applies must leave
    both `config.toml` and that catalog's timestamp/path unchanged. Do not
    restart or replace live 18883 merely to perform this source verification.
-3. The current Codex injection scope is `agent-codex-bizd / gpt-5.6-terra`
+ 3. **Historical/superseded:** the Codex injection scope was `agent-codex-bizd / gpt-5.6-terra`
    with explicit `Key 2` and observed realm `7bf7…9cab7`; do not reuse the
    retired `agent-codex-provider-4 / realm 4611…` scope. The verifier wrapper
    now exposes `-KeyId`, `-SeedContextChars`, and
@@ -423,7 +922,7 @@
    broader sample.
    `scripts/run-release-champion-interactive.ps1` remains the same-profile
    seed entry point.
- 3a. Scope override from the latest 20:03 snapshot: Codex now uses
+ 3a. **Historical/superseded:** the scope override from the latest 20:03 snapshot used
      `agent-codex-provider-2 / gpt-5.6-terra` at
      `https://quiteai.autos/v1`, with no enabled Key pool and observed realm
      `7bcb…4ab6`. The preceding bizd/Key-2 observations remain historical
@@ -436,7 +935,7 @@
  5. After a bounded seed succeeds, run the release-champion comparison only
    against that exact cohort; retain raw result artifacts and reject
    mixed-provider summaries.
- 5a. `scripts/run-release-champion-interactive.ps1` now defaults to the
+ 5a. **Historical/superseded:** `scripts/run-release-champion-interactive.ps1` previously defaulted to the
     observed current scope (`agent-codex-provider-2 / realm 4574f5c2…`),
     supports `dynamic-tail-mix`, and for that scenario defaults to the
     requested 2.35M-character / 450k-input-token seed class, 11 turns, and
@@ -472,6 +971,14 @@
   and the verified live probes above as the current authoritative checkpoint;
   do not claim that the G1 task card was refreshed until it runs under its
   owning principal.
+- At **2026-08-09 18:14 +08:00**, the official Super Brain first-load
+  bootstrap completed successfully: the package and memory markers resolved,
+  MCP binding and its seven-check functional probe passed, and activation
+  became `full_brain_active`. The current Codex task then received a new
+  owner-session H7 contract, hot-index entry, scoped activation, visible
+  progress receipt, and hash-verified project proof. It stores no raw prompt,
+  transcript, Provider Key, or `output/*.json` content. The active return
+  point remains the APX no-controllable-gap conclusion above.
 
 ## AUTHORITATIVE RELEASE STATE - 2026-07-30
 

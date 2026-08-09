@@ -12,6 +12,29 @@ param(
     [ValidateRange(0, 1000000)]
     [int]$MinimumSeedInputTokens = 0,
 
+    [ValidateRange(0, 1000000)]
+    [int]$MinimumPeakInputTokens = 0,
+
+    [ValidateRange(0, 1000000)]
+    [int]$MaximumPeakInputTokens = 0,
+
+    [ValidateSet('mixed', 'natural-dense')]
+    [string]$DynamicTailProfile = 'mixed',
+
+    [ValidateSet('natural', 'natural-dense', 'legacy-repeated')]
+    [string]$FixtureProfile = 'natural',
+
+    [switch]$RequireTtftNoRegression = $true,
+
+    [ValidateRange(0, 10000)]
+    [int]$MaxInputTokenDelta = 128,
+
+    [ValidateRange(1024, 512000)]
+    [int]$ToolChars = 0,
+
+    [ValidateRange(1, 8)]
+    [int]$ToolCalls = 0,
+
     [string]$Model = 'gpt-5.6-terra',
 
     [ValidatePattern('^[0-9a-f]{64}$')]
@@ -36,21 +59,35 @@ $verifier = Join-Path $PSScriptRoot 'verify-release-champion.mjs'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $isDynamicTailMix = $Scenario -eq 'dynamic-tail-mix'
 
+if (-not $RequireTtftNoRegression) {
+    throw 'Release-champion promotion always requires non-regressing end-to-end TTFT; this gate cannot be disabled.'
+}
+
 # The dynamic-tail fixture is only meaningful at the requested half-million
-# token class. These defaults remain overrideable, but invoking that scenario
-# no longer silently degenerates into the historical three-turn short probe.
+# token class. The natural seed remains deliberately distinct from the dense
+# tail: changing the seed to CJK-dense at the same character count would exceed
+# the currently observed provider body ceiling sooner, not make the result more
+# comparable.
 if ($isDynamicTailMix) {
     if ($SeedContextChars -eq 0) {
-        $SeedContextChars = 2350000
+        $SeedContextChars = if ($DynamicTailProfile -eq 'natural-dense') { 1500000 } else { 2350000 }
     }
     if ($MinimumSeedInputTokens -eq 0) {
-        $MinimumSeedInputTokens = 450000
+        $MinimumSeedInputTokens = if ($DynamicTailProfile -eq 'natural-dense') { 250000 } else { 450000 }
+    }
+    if ($MinimumPeakInputTokens -eq 0 -and $DynamicTailProfile -eq 'natural-dense') {
+        $MinimumPeakInputTokens = 450000
+    }
+    if ($MaximumPeakInputTokens -eq 0 -and $DynamicTailProfile -eq 'natural-dense') {
+        $MaximumPeakInputTokens = 500000
     }
 }
 
 $turns = if ($isDynamicTailMix) { 11 } else { 3 }
-$toolChars = if ($isDynamicTailMix) { 131072 } else { 40960 }
-$toolCalls = if ($isDynamicTailMix) { 2 } else { 1 }
+# Keep the default dense-tail probe below the current provider2 body ceiling;
+# a larger value is explicit and must be justified by a fresh capacity result.
+$toolChars = if ($ToolChars -gt 0) { $ToolChars } elseif ($isDynamicTailMix -and $DynamicTailProfile -eq 'natural-dense') { 80000 } elseif ($isDynamicTailMix) { 131072 } else { 40960 }
+$toolCalls = if ($ToolCalls -gt 0) { $ToolCalls } elseif ($isDynamicTailMix) { 2 } else { 1 }
 
 foreach ($item in @(
     @{ Label = 'Atoapi config directory'; Path = $ConfigDir; Type = 'Container' },
@@ -79,7 +116,9 @@ if (-not (Test-Path -LiteralPath $outputDirectory)) {
 Write-Host 'Runs a bounded, isolated A/B seed. The running 18883 instance is never stopped or signaled.'
 Write-Host "Windows identity: $(whoami)"
 Write-Host "Scenario: $Scenario; pairs: $Pairs; turns: $turns; model: $Model"
-Write-Host "Seed context chars: $SeedContextChars; minimum seed input tokens: $MinimumSeedInputTokens"
+Write-Host "Seed context chars: $SeedContextChars; minimum seed input tokens: $MinimumSeedInputTokens; peak gate: $MinimumPeakInputTokens-$MaximumPeakInputTokens"
+Write-Host "Dynamic tail profile: $DynamicTailProfile; tool chars: $toolChars; strict TTFT gate: $RequireTtftNoRegression; input-token delta: $MaxInputTokenDelta"
+Write-Host "Fixture profile: $FixtureProfile"
 Write-Host "Provider: $ProviderId; Key realm: $($KeyRealmHash.Substring(0, 12))..."
 if (-not [string]::IsNullOrWhiteSpace($KeyId)) {
     Write-Host "Pinned Key: $KeyId"
@@ -103,15 +142,21 @@ $arguments = @(
     '--stable-instruction-chars', '16384',
     '--seed-context-chars', "$SeedContextChars",
     '--minimum-seed-input-tokens', "$MinimumSeedInputTokens",
+    '--minimum-peak-input-tokens', "$MinimumPeakInputTokens",
+    '--maximum-peak-input-tokens', "$MaximumPeakInputTokens",
+    '--max-input-token-delta', "$MaxInputTokenDelta",
     '--tool-chars', "$toolChars",
     '--tool-calls', "$toolCalls",
     '--tool-output-shape', 'natural',
-    '--fixture-profile', 'natural',
+    '--dynamic-tail-profile', $DynamicTailProfile,
+    '--fixture-profile', $FixtureProfile,
     '--max-local-proxy-overhead-regression-ms', '500',
     '--isolate-upstream-cache',
     '--prompt-cache-key-prefix', "atoapi-release-champion-$stamp",
     '--output', $Output
 )
+
+$arguments += '--require-ttft-no-regression'
 
 if (-not [string]::IsNullOrWhiteSpace($KeyId)) {
     $arguments += @('--key-id', $KeyId.Trim())

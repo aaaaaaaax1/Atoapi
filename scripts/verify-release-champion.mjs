@@ -120,6 +120,16 @@ async function runLiveComparison(options) {
     );
   }
   const pairs = boundedInteger(options.pairs ?? 2, "--pairs", 1, 8);
+  // Pair zero is often the first use of a freshly isolated upstream lane.
+  // Execute any requested warm-up pairs so the lane reaches its ordinary
+  // placement state, but never let their cold-start accounting influence a
+  // release aggregate or promotion decision.
+  const warmupPairs = boundedInteger(
+    options["warmup-pairs"] ?? 0,
+    "--warmup-pairs",
+    0,
+    pairs - 1
+  );
   const pairOffset = boundedInteger(options["pair-offset"] ?? 0, "--pair-offset", 0, 1);
   const firstArm = normalizeFirstArm(options["first-arm"] ?? "champion");
   const turns = boundedInteger(
@@ -171,14 +181,56 @@ async function runLiveComparison(options) {
     0,
     1_000_000
   );
+  const minimumPeakInputTokens = boundedInteger(
+    options["minimum-peak-input-tokens"] ?? 0,
+    "--minimum-peak-input-tokens",
+    0,
+    1_000_000
+  );
+  const maximumPeakInputTokens = boundedInteger(
+    options["maximum-peak-input-tokens"] ?? 0,
+    "--maximum-peak-input-tokens",
+    0,
+    1_000_000
+  );
+  if (maximumPeakInputTokens > 0 && maximumPeakInputTokens < minimumPeakInputTokens) {
+    throw new FailClosedError(
+      "peak_input_token_range_invalid",
+      "--maximum-peak-input-tokens must be zero or at least --minimum-peak-input-tokens"
+    );
+  }
   const toolChars = boundedInteger(options["tool-chars"] ?? 32_768, "--tool-chars", 1_024, 512_000);
   const toolCalls = boundedInteger(options["tool-calls"] ?? 1, "--tool-calls", 1, 8);
   const toolOutputShape = normalizeToolOutputShape(options["tool-output-shape"] ?? "natural");
+  const dynamicTailProfile = normalizeDynamicTailProfile(
+    options["dynamic-tail-profile"] ?? "mixed"
+  );
+  if (!dynamicTailProfile) {
+    throw new FailClosedError(
+      "invalid_dynamic_tail_profile",
+      "--dynamic-tail-profile must be mixed or natural-dense"
+    );
+  }
+  const dynamicTailMode = normalizeDynamicTailMode(
+    options["dynamic-tail-mode"] ?? "tool"
+  );
+  if (!dynamicTailMode) {
+    throw new FailClosedError(
+      "invalid_dynamic_tail_mode",
+      "--dynamic-tail-mode must be tool or text"
+    );
+  }
+  if (scenario !== "dynamic-tail-mix" && dynamicTailMode !== "tool") {
+    throw new FailClosedError(
+      "dynamic_tail_mode_scenario_mismatch",
+      "--dynamic-tail-mode text is available only for dynamic-tail-mix"
+    );
+  }
   const fixtureProfile = normalizeFixtureProfile(options["fixture-profile"] ?? "natural");
   if (!fixtureProfile) {
     throw new FailClosedError(
       "invalid_fixture_profile",
-      "--fixture-profile must be natural or legacy-repeated"
+      "--fixture-profile must be natural, natural-dense, or legacy-repeated"
     );
   }
   // A repeated payload gives a later pair an upstream-warmed context and can
@@ -189,6 +241,12 @@ async function runLiveComparison(options) {
   const turnDelayMs = boundedInteger(
     options["turn-delay-ms"] ?? 0,
     "--turn-delay-ms",
+    0,
+    5_000
+  );
+  const interArmDelayMs = boundedInteger(
+    options["inter-arm-delay-ms"] ?? 0,
+    "--inter-arm-delay-ms",
     0,
     5_000
   );
@@ -210,6 +268,12 @@ async function runLiveComparison(options) {
     0,
     120_000
   );
+  const maxInputTokenDelta = boundedInteger(
+    options["max-input-token-delta"] ?? 128,
+    "--max-input-token-delta",
+    0,
+    10_000
+  );
   // A bounded foreground prefix-maturity wait is an intentional cache
   // optimization, not an unbounded local regression. Keep the default strict
   // for ordinary comparisons, but let a live verification explicitly model
@@ -226,6 +290,10 @@ async function runLiveComparison(options) {
     0,
     pairs * turns
   );
+  // Promotion evidence always carries the end-to-end TTFT gate. The CLI flag
+  // remains accepted for compatibility, but omitting it must not create a
+  // looser live comparison than the interactive wrapper.
+  const requireTtftNoRegression = true;
   const sharedUpstreamUserAgent = optionalUpstreamUserAgent(options["upstream-user-agent"]);
   const championUpstreamUserAgent = optionalUpstreamUserAgent(
     options["champion-upstream-user-agent"]
@@ -235,7 +303,20 @@ async function runLiveComparison(options) {
   ) ?? sharedUpstreamUserAgent;
   const keepRunDir = booleanArg(options["keep-run-dir"]);
   const isolateUpstreamCache = booleanArg(options["isolate-upstream-cache"]);
+  const sharedCacheCrossover = booleanArg(options["shared-cache-crossover"]);
   const requestedReuseRuntimePerArm = booleanArg(options["reuse-runtime-per-arm"]);
+  if (sharedCacheCrossover && isolateUpstreamCache) {
+    throw new FailClosedError(
+      "shared_cache_crossover_isolation_conflict",
+      "--shared-cache-crossover cannot be combined with --isolate-upstream-cache"
+    );
+  }
+  if (sharedCacheCrossover && !requestedReuseRuntimePerArm) {
+    throw new FailClosedError(
+      "shared_cache_crossover_requires_reuse",
+      "--shared-cache-crossover requires --reuse-runtime-per-arm for turn-by-turn ordering"
+    );
+  }
   // An isolated-cache arm must not keep a process-owned upstream connection
   // pool across pairs. Otherwise an upstream placement can remain permanently
   // attached to the champion/candidate role even after the metadata lane is
@@ -314,6 +395,7 @@ async function runLiveComparison(options) {
     const settings = {
       scenario,
       pairs,
+      warmup_pairs: warmupPairs,
       pair_offset: pairOffset,
       first_arm: firstArm,
       turns,
@@ -321,23 +403,35 @@ async function runLiveComparison(options) {
       stable_instruction_chars: stableInstructionChars,
       seed_context_chars: seedContextChars,
       minimum_seed_input_tokens: minimumSeedInputTokens,
+      minimum_peak_input_tokens: minimumPeakInputTokens,
+      maximum_peak_input_tokens: maximumPeakInputTokens,
       tool_chars: toolChars,
       tool_calls: toolCalls,
       tool_output_shape: toolOutputShape,
+      dynamic_tail_profile: dynamicTailProfile,
+      dynamic_tail_mode: dynamicTailMode,
       fixture_profile: fixtureProfile,
       fresh_fixture_per_pair: freshFixturePerPair,
       turn_delay_ms: turnDelayMs,
+      inter_arm_delay_ms: interArmDelayMs,
       pair_delay_ms: pairDelayMs,
       require_candidate_guarded_requests: requireCandidateGuardedRequests,
       client_prompt_cache_key: Boolean(options["prompt-cache-key-prefix"]),
       max_ttft_regression_ms: maxTtftRegressionMs,
+      max_input_token_delta: maxInputTokenDelta,
+      require_ttft_no_regression: requireTtftNoRegression,
       max_local_proxy_overhead_regression_ms: maxLocalProxyOverheadRegressionMs,
       max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
       champion_upstream_user_agent: championUpstreamUserAgent,
       candidate_upstream_user_agent: candidateUpstreamUserAgent,
       forced_use_system_proxy: forceUseSystemProxy,
       isolate_upstream_cache: isolateUpstreamCache,
-      isolation_lane_strategy: isolateUpstreamCache ? "pair-crossover-v1" : "shared-v1",
+      shared_cache_crossover: sharedCacheCrossover,
+      isolation_lane_strategy: sharedCacheCrossover
+        ? "shared-turn-crossover-v1"
+        : isolateUpstreamCache
+          ? "pair-crossover-v1"
+          : "shared-v1",
       reuse_runtime_per_arm: reuseRuntimePerArm,
       reuse_runtime_per_arm_requested: requestedReuseRuntimePerArm,
       runtime_reuse_disabled_for_isolation:
@@ -350,7 +444,10 @@ async function runLiveComparison(options) {
       champion: await executableArtifact(championExe),
       candidate: await executableArtifact(candidateExe)
     };
-    const armRuns = { champion: [], candidate: [] };
+    // Preserve every executed arm result for diagnostics, while keeping only
+    // non-warm-up pairs in the aggregates below. This makes a cold lane
+    // visible without giving it any path to a promotion verdict.
+    const rawArmRuns = { champion: [], candidate: [] };
     const orderedPairs = [];
     const interleavedTurnOrders = [];
     let abortedAfterPair = null;
@@ -386,6 +483,8 @@ async function runLiveComparison(options) {
             seedContextChars,
             toolChars,
             toolOutputShape,
+            dynamicTailProfile,
+            dynamicTailMode,
             fixtureProfile,
             pair
           ]).slice(0, 16)}`
@@ -399,14 +498,16 @@ async function runLiveComparison(options) {
           const isolationLane = isolateUpstreamCache
             ? isolationLaneForPair(pair, arm)
             : null;
-          const lane = sha256Parts([
-            "release-champion-lane-v2",
+          const lane = releaseCachePlacementLane({
             runId,
             keyRealmHash,
             requestFamily,
             pair,
-            isolationLane ?? arm
-          ]);
+            arm,
+            isolationLane,
+            isolateUpstreamCache,
+            sharedCacheCrossover
+          });
           return {
             arm,
             executable,
@@ -449,8 +550,8 @@ async function runLiveComparison(options) {
             result.turn_order[0] ?? interleavedTurnOrder(pair, 0, pairOffset, firstArm)
           );
           interleavedTurnOrders.push(result.turn_order);
-          armRuns.champion.push(result.champion);
-          armRuns.candidate.push(result.candidate);
+          rawArmRuns.champion.push(result.champion);
+          rawArmRuns.candidate.push(result.candidate);
           pairResult = result;
         } else {
           // The one-runtime-per-arm fallback retains the previous pair-level
@@ -466,7 +567,7 @@ async function runLiveComparison(options) {
             );
             const armSpec = armSpecFor(arm);
             const result = await runIsolatedDynamicArm(armSpec);
-            armRuns[arm].push(result);
+            rawArmRuns[arm].push(result);
             results[arm] = result;
           }
           pairResult = results;
@@ -495,20 +596,43 @@ async function runLiveComparison(options) {
       }
     }
 
-    const champion = aggregateArm("champion", cohort, artifacts.champion, armRuns.champion);
+    const championRunPartitions = partitionRunsByWarmup(rawArmRuns.champion, warmupPairs);
+    const candidateRunPartitions = partitionRunsByWarmup(rawArmRuns.candidate, warmupPairs);
+    const warmupRawRuns = {
+      champion: championRunPartitions.warmup,
+      candidate: candidateRunPartitions.warmup
+    };
+    const scoredArmRuns = {
+      champion: championRunPartitions.scored,
+      candidate: candidateRunPartitions.scored
+    };
+    const scoredPairIds = pairedRunIds(scoredArmRuns.champion, scoredArmRuns.candidate);
+    const champion = aggregateArm(
+      "champion",
+      cohort,
+      artifacts.champion,
+      scoredArmRuns.champion,
+      0,
+      minimumPeakInputTokens,
+      maximumPeakInputTokens
+    );
     const candidate = aggregateArm(
       "candidate",
       cohort,
       artifacts.candidate,
-      armRuns.candidate,
-      requireCandidateGuardedRequests
+      scoredArmRuns.candidate,
+      requireCandidateGuardedRequests,
+      minimumPeakInputTokens,
+      maximumPeakInputTokens
     );
     const comparison = compareArmResults(
       champion,
       candidate,
       maxTtftRegressionMs,
       maxLocalProxyOverheadRegressionMs,
-      maxFullBucketRegressionRequests
+      maxFullBucketRegressionRequests,
+      requireTtftNoRegression,
+      maxInputTokenDelta
     );
     return {
       schema: SCHEMA,
@@ -521,6 +645,9 @@ async function runLiveComparison(options) {
       pair_order: orderedPairs,
       turn_order: reuseRuntimePerArm ? interleavedTurnOrders : null,
       aborted_after_pair: abortedAfterPair,
+      warmup_pair_ids: scheduledPairIds(warmupPairs),
+      scored_pair_ids: scoredPairIds,
+      warmup_raw_runs: warmupRawRuns,
       champion,
       candidate,
       comparison
@@ -571,6 +698,7 @@ async function prepareDynamicArmSpec(spec) {
       pair: spec.pair,
       runId: spec.runId,
       lane: spec.lane,
+      isolationLane: spec.isolationLane,
       fixtureFamily: spec.fixtureFamily,
       cohort: spec.cohort,
       settings: spec.settings,
@@ -692,7 +820,12 @@ async function advanceScenarioCursor(cursor, turn) {
     let phase = turn === 0 ? "seed" : `followup-${turn}`;
     const toolTailMaturityTurn = spec.settings.scenario === "tool-tail-maturity" && turn === 2;
     const dynamicTail = spec.settings.scenario === "dynamic-tail-mix"
-      ? dynamicTailProfileForTurn(turn, spec.settings.tool_chars, spec.settings.tool_calls)
+      ? dynamicTailProfileForTurn(
+        turn,
+        spec.settings.tool_chars,
+        spec.settings.tool_calls,
+        spec.settings.dynamic_tail_profile
+      )
       : null;
     if (dynamicTail) {
       const eventOrdinal = dynamicTail.ordinal;
@@ -700,14 +833,21 @@ async function advanceScenarioCursor(cursor, turn) {
         ? `${fixtureFamily}-tail-${eventOrdinal}`
         : `tail-${eventOrdinal}`;
       state.input.push(
-        ...buildToolFixtureItems({
-          pair: spec.pair,
-          fixtureFamily: scopedFixtureFamily,
-          targetChars: dynamicTail.targetChars,
-          shape: dynamicTail.shape,
-          calls: dynamicTail.calls,
-          eventOrdinal
-        }),
+        ...(spec.settings.dynamic_tail_mode === "text"
+          ? [message(buildDynamicTextTail({
+            targetChars: dynamicTail.targetChars,
+            shape: dynamicTail.shape,
+            fixtureFamily: scopedFixtureFamily,
+            eventOrdinal
+          }))]
+          : buildToolFixtureItems({
+            pair: spec.pair,
+            fixtureFamily: scopedFixtureFamily,
+            targetChars: dynamicTail.targetChars,
+            shape: dynamicTail.shape,
+            calls: dynamicTail.calls,
+            eventOrdinal
+          })),
         message(`Dynamic tail ${eventOrdinal} completed. Preserve it and reply with OK only.`)
       );
       cursor.dynamicTailEvents.push({
@@ -756,6 +896,10 @@ async function advanceScenarioCursor(cursor, turn) {
       input: state.input,
       instructions: cursor.stableInstructions,
       maxOutputTokens: spec.settings.max_output_tokens,
+      tools: releaseFixtureToolsForScenario(
+        spec.settings.scenario,
+        spec.settings.dynamic_tail_mode
+      ),
       requestKind,
       phase,
       promptCacheKey: spec.promptCacheKey
@@ -802,6 +946,8 @@ function finalizeScenarioCursor(cursor) {
     // the order-balanced second pair from running.
     minimumGuardedRequests: 0,
     minimumSeedInputTokens: spec.settings.minimum_seed_input_tokens,
+    minimumPeakInputTokens: spec.settings.minimum_peak_input_tokens,
+    maximumPeakInputTokens: spec.settings.maximum_peak_input_tokens,
     requests,
     fatal,
     compactionSeen: state.compactionSeen
@@ -813,6 +959,34 @@ function interleavedTurnOrder(pair, turn, pairOffset = 0, firstArm = "champion")
   return (pair + turn + pairOffset + Number(candidateFirst)) % 2 === 0
     ? ["champion", "candidate"]
     : ["candidate", "champion"];
+}
+
+function isWarmupPair(pair, warmupPairs) {
+  return Number.isInteger(pair) && pair >= 0 && pair < warmupPairs;
+}
+
+function partitionRunsByWarmup(runs, warmupPairs) {
+  const warmup = [];
+  const scored = [];
+  for (const run of array(runs)) {
+    (isWarmupPair(run?.pair, warmupPairs) ? warmup : scored).push(run);
+  }
+  return { warmup, scored };
+}
+
+function scheduledPairIds(pairCount) {
+  return Array.from({ length: pairCount }, (_, pair) => pair);
+}
+
+function pairedRunIds(championRuns, candidateRuns) {
+  const pairIdsFor = (runs) => new Set(array(runs)
+    .map((run) => run?.pair)
+    .filter((pair) => Number.isInteger(pair) && pair >= 0));
+  const championPairIds = pairIdsFor(championRuns);
+  const candidatePairIds = pairIdsFor(candidateRuns);
+  return [...championPairIds]
+    .filter((pair) => candidatePairIds.has(pair))
+    .sort((left, right) => left - right);
 }
 
 function comparisonPairInvalid(result) {
@@ -862,11 +1036,15 @@ async function runInterleavedDynamicPair(specs) {
       );
       turnOrder.push(order);
       let terminalFailure = false;
-      for (const arm of order) {
+      for (let index = 0; index < order.length; index += 1) {
+        const arm = order[index];
         const advanced = await advanceScenarioCursor(cursors[arm], turn);
         if (!advanced) {
           terminalFailure = true;
           break;
+        }
+        if (index + 1 < order.length && champion.settings.inter_arm_delay_ms > 0) {
+          await delay(champion.settings.inter_arm_delay_ms);
         }
       }
       // A failed arm makes the pair invalid. Stop this pair rather than adding
@@ -918,12 +1096,18 @@ async function sendOneInbound(spec) {
       .map((item) => String(item?.inbound_request_id ?? ""))
       .filter(Boolean)
   );
+  const body = buildResponsesRequestBody(spec);
+  const serializedBody = JSON.stringify(body);
+  // Hash only the replayed input array. The candidate's placement field is
+  // intentionally excluded, while any arm-specific fixture drift becomes a
+  // fail-closed, content-free evidence mismatch.
+  const inputFingerprint = sha256Text(JSON.stringify(body.input));
+  const requestBodyBytes = Buffer.byteLength(serializedBody, "utf8");
   const startedAt = Date.now();
   let responseStatus = 0;
   let responseText = "";
   let transportError = null;
   try {
-    const body = buildResponsesRequestBody(spec);
     const response = await fetch(`${spec.runtime.baseUrl}/codex/v1/responses`, {
       method: "POST",
       headers: {
@@ -936,7 +1120,7 @@ async function sendOneInbound(spec) {
           request_kind: spec.requestKind
         })
       },
-      body: JSON.stringify(body),
+      body: serializedBody,
       signal: AbortSignal.timeout(180_000)
     });
     responseStatus = response.status;
@@ -1034,6 +1218,8 @@ async function sendOneInbound(spec) {
     response_failure_kind: responseFailureKind,
     elapsed_ms: Date.now() - startedAt,
     sse_completed: terminal,
+    input_fingerprint: inputFingerprint,
+    request_body_bytes: requestBodyBytes,
     counters,
     inbound_id_hash: inboundId ? sha256Text(inboundId).slice(0, 24) : null,
     observed_realm_id: observedRealmId || null,
@@ -1117,8 +1303,34 @@ function buildResponsesRequestBody(spec) {
     instructions: spec.instructions,
     input: spec.input
   };
+  if (Array.isArray(spec.tools) && spec.tools.length > 0) body.tools = spec.tools;
   if (spec.promptCacheKey) body.prompt_cache_key = spec.promptCacheKey;
   return body;
+}
+
+// Tool-history scenarios replay a completed call and its output as part of the
+// input history. Declare that tool from the seed onward as a real Codex
+// request does; some Responses-compatible relays reject an otherwise valid
+// historical call when its name is absent from the top-level tools schema.
+// This is verifier-fixture compatibility only, never a production rewrite.
+function releaseFixtureToolsForScenario(scenario, dynamicTailMode = "tool") {
+  if (scenario === "dynamic-tail-mix" && dynamicTailMode === "text") return [];
+  if (!new Set(["dynamic-tail-mix", "tool-burst", "tool-tail-maturity"]).has(scenario)) {
+    return [];
+  }
+  return [{
+    type: "function",
+    name: "read_release_fixture",
+    description: "Read a deterministic release-validation fixture.",
+    parameters: {
+      type: "object",
+      properties: {
+        part: { type: "integer", minimum: 1 },
+        total_parts: { type: "integer", minimum: 1 }
+      },
+      additionalProperties: false
+    }
+  }];
 }
 
 async function waitForSettledInbound({ baseUrl, beforeCounters, knownRawInboundIds }) {
@@ -1356,6 +1568,38 @@ function dynamicTailRecoverySummary(events, requests) {
   };
 }
 
+function dynamicTailTerminalFollowup(events, requests) {
+  const injected = array(events);
+  const terminalEvent = injected.at(-1);
+  if (!terminalEvent) {
+    return { present: false, expected_phase: null, phase: null, input_tokens: 0 };
+  }
+  const requestRows = array(requests);
+  const eventPhase = typeof terminalEvent.phase === "string" ? terminalEvent.phase.trim() : "";
+  const matchingInjectionIndexes = requestRows
+    .map((request, index) => eventPhase && request?.phase === eventPhase ? index : -1)
+    .filter((index) => index >= 0);
+  const injectionIndex = matchingInjectionIndexes.length === 1
+    ? matchingInjectionIndexes[0]
+    : -1;
+  const followup = injectionIndex >= 0 ? requestRows[injectionIndex + 1] : null;
+  const eventTurn = Number(terminalEvent.turn);
+  const expectedPhase = Number.isInteger(eventTurn) && eventTurn >= 0
+    ? `followup-${eventTurn + 1}`
+    : null;
+  const valid = Boolean(eventPhase) && matchingInjectionIndexes.length === 1 && Boolean(expectedPhase) && Boolean(followup) &&
+    followup?.phase === expectedPhase &&
+    followup?.request_kind === "turn" &&
+    followup?.sse_completed === true &&
+    number(followup?.input_tokens) > 0;
+  return {
+    present: valid,
+    expected_phase: expectedPhase,
+    phase: followup?.phase ?? null,
+    input_tokens: number(followup?.input_tokens)
+  };
+}
+
 function emptyDynamicTailMix() {
   return {
     injections: 0,
@@ -1426,7 +1670,12 @@ function buildDynamicRun(input) {
   const seedRequest = requests.find((item) => item.phase === "seed");
   const seedInputTokens = number(seedRequest?.input_tokens);
   const seedCacheReadTokens = number(seedRequest?.cache_read_tokens);
+  const peakInputTokens = comparable.reduce(
+    (maximum, item) => Math.max(maximum, number(item.input_tokens)),
+    0
+  );
   const dynamicTail = dynamicTailRecoverySummary(input.dynamicTailEvents, requests);
+  const terminalDynamicFollowup = dynamicTailTerminalFollowup(input.dynamicTailEvents, requests);
   const smallContextColdReadForegroundWait = requests.some((item) =>
     number(item.input_tokens) > 0 &&
     number(item.input_tokens) < 32_000 &&
@@ -1439,6 +1688,8 @@ function buildDynamicRun(input) {
     input_tokens: inputTokens,
     seed_input_tokens: seedInputTokens,
     seed_cache_read_tokens: seedCacheReadTokens,
+    peak_input_tokens: peakInputTokens,
+    dynamic_tail_terminal_followup_input_tokens: terminalDynamicFollowup.input_tokens,
     cache_read_tokens: cacheReadTokens,
     raw_token_hit_rate: ratio(cacheReadTokens, inputTokens),
     cacheable_tokens_128: cacheableTokens,
@@ -1471,6 +1722,18 @@ function buildDynamicRun(input) {
     input_usage_present: inputTokens > 0,
     required_seed_input_tokens:
       seedInputTokens >= number(input.minimumSeedInputTokens),
+    required_peak_input_tokens:
+      peakInputTokens >= number(input.minimumPeakInputTokens),
+    maximum_peak_input_tokens:
+      number(input.maximumPeakInputTokens) === 0 ||
+      peakInputTokens <= number(input.maximumPeakInputTokens),
+    dynamic_tail_terminal_followup_peak_in_range:
+      input.scenario !== "dynamic-tail-mix" ||
+      (number(input.minimumPeakInputTokens) === 0 && number(input.maximumPeakInputTokens) === 0) ||
+      (terminalDynamicFollowup.present &&
+        terminalDynamicFollowup.input_tokens >= number(input.minimumPeakInputTokens) &&
+        (number(input.maximumPeakInputTokens) === 0 ||
+          terminalDynamicFollowup.input_tokens <= number(input.maximumPeakInputTokens))),
     cacheable_128_evidence_present: cacheableTokens > 0,
     warm_stable_prefix_evidence_present: warmCacheableTokens > 0,
     static_wire_continuity: staticWire.pass,
@@ -1525,6 +1788,9 @@ function failedDynamicRun({ arm, pair, cohort, executable, reason }) {
       complete_usage_coverage: false,
     input_usage_present: false,
     required_seed_input_tokens: false,
+    required_peak_input_tokens: false,
+    maximum_peak_input_tokens: false,
+    dynamic_tail_terminal_followup_peak_in_range: false,
       cacheable_128_evidence_present: false,
       warm_stable_prefix_evidence_present: false,
     static_wire_continuity: false,
@@ -1539,7 +1805,15 @@ function failedDynamicRun({ arm, pair, cohort, executable, reason }) {
   };
 }
 
-function aggregateArm(arm, cohort, executable, runs, minimumGuardedRequests = 0) {
+function aggregateArm(
+  arm,
+  cohort,
+  executable,
+  runs,
+  minimumGuardedRequests = 0,
+  minimumPeakInputTokens = 0,
+  maximumPeakInputTokens = 0
+) {
   const normalized = runs.map((run) => validateDynamicRun(run, arm));
   const metrics = emptyMetrics();
   const dynamicTailMix = emptyDynamicTailMix();
@@ -1592,6 +1866,10 @@ function aggregateArm(arm, cohort, executable, runs, minimumGuardedRequests = 0)
   metrics.full_bucket_denominator = cacheableRows.length;
   const comparableRows = retainedRequests.filter((item) => number(item.input_tokens) > 0);
   Object.assign(metrics, timingSummary(comparableRows));
+  metrics.peak_input_tokens = comparableRows.reduce(
+    (maximum, item) => Math.max(maximum, number(item.input_tokens)),
+    0
+  );
   metrics.usage_coverage = normalized.length > 0 && normalized.every(
     (run) => number(run.metrics?.usage_coverage) === 1
   ) ? 1 : 0;
@@ -1608,6 +1886,16 @@ function aggregateArm(arm, cohort, executable, runs, minimumGuardedRequests = 0)
     avoidable_gap_zero: metrics.avoidable_gap_tokens === 0,
     complete_timing_coverage: metrics.timing_complete_requests === comparableRows.length,
     input_usage_present: metrics.input_tokens > 0,
+    required_peak_input_tokens:
+      number(minimumPeakInputTokens) === 0 ||
+      (normalized.length > 0 && normalized.every(
+        (run) => run.checks?.required_peak_input_tokens === true
+      )),
+    maximum_peak_input_tokens:
+      number(maximumPeakInputTokens) === 0 ||
+      (normalized.length > 0 && normalized.every(
+        (run) => run.checks?.maximum_peak_input_tokens === true
+      )),
     cacheable_128_evidence_present: metrics.cacheable_tokens_128 > 0,
     warm_stable_prefix_evidence_present: metrics.warm_stable_prefix_tokens_128 > 0,
     static_wire_continuity: normalized.length > 0 && normalized.every(
@@ -1618,6 +1906,10 @@ function aggregateArm(arm, cohort, executable, runs, minimumGuardedRequests = 0)
       metrics.guarded_requests >= number(minimumGuardedRequests),
     dynamic_tail_followup_coverage: normalized.length > 0 && normalized.every(
       (run) => run.scenario !== "dynamic-tail-mix" || run.checks?.dynamic_tail_followup_coverage === true
+    ),
+    dynamic_tail_terminal_followup_peak_in_range: normalized.length > 0 && normalized.every(
+      (run) => run.scenario !== "dynamic-tail-mix" ||
+        run.checks?.dynamic_tail_terminal_followup_peak_in_range === true
     )
   };
   return {
@@ -1643,13 +1935,202 @@ function aggregateSeedCacheReadTokens(aggregate) {
   return 0;
 }
 
+function outboundInputSemanticFingerprints(request) {
+  const source = request?.outbound_prefix_fingerprints;
+  const fields = ["input_full", "instructions", "tools_schema", "pre_input_wire"];
+  if (!source || typeof source !== "object") return null;
+  const result = {};
+  for (const field of fields) {
+    const value = typeof source[field] === "string" ? source[field] : "";
+    if (!value) return null;
+    result[field] = value;
+  }
+  return result;
+}
+
+// Compare the request evidence that actually left the proxy, not merely the
+// nominal scenario fixture. The same client input can be serialized or
+// transformed differently by the two versions; that is not valid A/B evidence
+// even when a provider happens to return a cache hit.
+function pairedInputSymmetry(champion, candidate, maxInputTokenDelta = 128) {
+  return pairedRunInputSymmetry(
+    array(champion?.runs),
+    array(candidate?.runs),
+    maxInputTokenDelta,
+    true
+  );
+}
+
+// Keep the dynamic-tail-specific diagnostic because its follow-up evidence is
+// useful when tuning a growing context. Promotion itself uses the all-scenario
+// proof above, so a full-replay or compaction comparison cannot bypass it.
+function pairedDynamicInputSymmetry(champion, candidate, maxInputTokenDelta = 128) {
+  const championRuns = array(champion?.runs).filter(
+    (run) => run?.scenario === "dynamic-tail-mix"
+  );
+  const candidateRuns = array(candidate?.runs).filter(
+    (run) => run?.scenario === "dynamic-tail-mix"
+  );
+  const dynamicExpected = number(champion?.metrics?.dynamic_tail_mix?.injections) > 0 ||
+    number(candidate?.metrics?.dynamic_tail_mix?.injections) > 0;
+  return pairedRunInputSymmetry(
+    championRuns,
+    candidateRuns,
+    maxInputTokenDelta,
+    dynamicExpected
+  );
+}
+
+function pairedRunInputSymmetry(
+  championRuns,
+  candidateRuns,
+  maxInputTokenDelta,
+  required
+) {
+  const championPairIds = championRuns.map((run) => run?.pair);
+  const candidatePairIds = candidateRuns.map((run) => run?.pair);
+  const anyRuns = championRuns.length > 0 || candidateRuns.length > 0;
+  const applicable = required || anyRuns;
+  if (!applicable) {
+    return {
+      applicable: false,
+      pass: true,
+      pair_count: 0,
+      request_pair_count: 0,
+      max_input_token_delta: 0,
+      allowed_input_token_delta: maxInputTokenDelta,
+      phases_match: true,
+      input_fingerprints_match: true,
+      client_input_fingerprints_match: true,
+      outbound_semantic_fingerprints_match: true,
+      actual_outbound_semantic_fingerprints_match: true,
+      request_kinds_match: true,
+      terminal_sse_complete: true,
+      pair_ids_valid: true,
+      pair_ids_unique: true,
+      all_pairs_have_requests: true,
+      input_tokens_present: true,
+      runs_present: false,
+      scored_pair_ids: []
+    };
+  }
+  const pairIdsValid = [...championPairIds, ...candidatePairIds].every(
+    (pair) => Number.isInteger(pair) && pair >= 0
+  );
+  const championPairIdsUnique = new Set(championPairIds).size === championPairIds.length;
+  const candidatePairIdsUnique = new Set(candidatePairIds).size === candidatePairIds.length;
+  const championByPair = new Map(championRuns.map((run) => [run?.pair, run]));
+  const candidateByPair = new Map(candidateRuns.map((run) => [run?.pair, run]));
+  const runsPresent = championRuns.length > 0 && candidateRuns.length > 0;
+  let requestPairCount = 0;
+  let maxDelta = 0;
+  let pairsAligned = pairIdsValid && championPairIdsUnique && candidatePairIdsUnique &&
+    championRuns.length === candidateRuns.length &&
+    championByPair.size === championRuns.length &&
+    candidateByPair.size === candidateRuns.length &&
+    championPairIds.every((pair) => candidateByPair.has(pair));
+  let phasesMatch = true;
+  let inputFingerprintsMatch = true;
+  let outboundSemanticFingerprintsMatch = true;
+  let requestKindsMatch = true;
+  let terminalSseComplete = true;
+  let inputTokensPresent = true;
+  let allPairsHaveRequests = true;
+  for (const championRun of championRuns) {
+    const candidateRun = candidateByPair.get(championRun?.pair);
+    if (!candidateRun) {
+      pairsAligned = false;
+      continue;
+    }
+    const championRequests = array(championRun.requests);
+    const candidateRequests = array(candidateRun.requests);
+    if (championRequests.length === 0 || candidateRequests.length === 0) {
+      allPairsHaveRequests = false;
+      pairsAligned = false;
+    }
+    if (championRequests.length !== candidateRequests.length) {
+      pairsAligned = false;
+      continue;
+    }
+    for (let index = 0; index < championRequests.length; index += 1) {
+      const baseline = championRequests[index];
+      const contender = candidateRequests[index];
+      requestPairCount += 1;
+      const baselinePhase = typeof baseline?.phase === "string" ? baseline.phase : "";
+      const contenderPhase = typeof contender?.phase === "string" ? contender.phase : "";
+      if (!baselinePhase || baselinePhase !== contenderPhase) {
+        phasesMatch = false;
+        pairsAligned = false;
+      }
+      const baselineKind = typeof baseline?.request_kind === "string" ? baseline.request_kind : "";
+      const contenderKind = typeof contender?.request_kind === "string" ? contender.request_kind : "";
+      if (!baselineKind || baselineKind !== contenderKind) {
+        requestKindsMatch = false;
+        pairsAligned = false;
+      }
+      if (baseline?.sse_completed !== true || contender?.sse_completed !== true) {
+        terminalSseComplete = false;
+      }
+      const baselineFingerprint = String(baseline?.input_fingerprint ?? "");
+      const contenderFingerprint = String(contender?.input_fingerprint ?? "");
+      if (!baselineFingerprint || baselineFingerprint !== contenderFingerprint) {
+        inputFingerprintsMatch = false;
+      }
+      const baselineOutbound = outboundInputSemanticFingerprints(baseline);
+      const contenderOutbound = outboundInputSemanticFingerprints(contender);
+      if (!baselineOutbound || !contenderOutbound ||
+        Object.keys(baselineOutbound).some((field) => baselineOutbound[field] !== contenderOutbound[field])) {
+        outboundSemanticFingerprintsMatch = false;
+      }
+      const baselineTokens = number(baseline?.input_tokens);
+      const contenderTokens = number(contender?.input_tokens);
+      if (baselineTokens <= 0 || contenderTokens <= 0) {
+        inputTokensPresent = false;
+        continue;
+      }
+      maxDelta = Math.max(maxDelta, Math.abs(baselineTokens - contenderTokens));
+    }
+  }
+  const scoredPairIds = pairedRunIds(championRuns, candidateRuns);
+  return {
+    applicable: true,
+    pass: runsPresent && pairsAligned && allPairsHaveRequests && requestPairCount > 0 && phasesMatch &&
+      inputFingerprintsMatch && outboundSemanticFingerprintsMatch && requestKindsMatch &&
+      terminalSseComplete && inputTokensPresent && maxDelta <= maxInputTokenDelta,
+    pair_count: championRuns.length,
+    request_pair_count: requestPairCount,
+    max_input_token_delta: maxDelta,
+    allowed_input_token_delta: maxInputTokenDelta,
+    phases_match: phasesMatch,
+    input_fingerprints_match: inputFingerprintsMatch,
+    client_input_fingerprints_match: inputFingerprintsMatch,
+    outbound_semantic_fingerprints_match: outboundSemanticFingerprintsMatch,
+    actual_outbound_semantic_fingerprints_match: outboundSemanticFingerprintsMatch,
+    request_kinds_match: requestKindsMatch,
+    terminal_sse_complete: terminalSseComplete,
+    pair_ids_valid: pairIdsValid,
+    pair_ids_unique: championPairIdsUnique && candidatePairIdsUnique,
+    all_pairs_have_requests: allPairsHaveRequests,
+    input_tokens_present: inputTokensPresent,
+    runs_present: runsPresent,
+    scored_pair_ids: scoredPairIds
+  };
+}
+
 function compareArmResults(
   champion,
   candidate,
   maxTtftRegressionMs,
   maxLocalProxyOverheadRegressionMs = 0,
-  maxFullBucketRegressionRequests = 0
+  maxFullBucketRegressionRequests = 0,
+  requireTtftNoRegression = true,
+  maxInputTokenDelta = 128
 ) {
+  // Keep the positional parameter for compatibility with older callers, but
+  // never let a false value weaken promotion evidence. End-to-end TTFT is a
+  // mandatory release gate; only the explicit bounded tolerance may vary.
+  const effectiveRequireTtftNoRegression = true;
+  void requireTtftNoRegression;
   const cohortMatches = sameCohort(champion.cohort, candidate.cohort);
   const observedRealmMatches = champion.metrics.observed_realm_ids.length === 1 &&
     candidate.metrics.observed_realm_ids.length === 1 &&
@@ -1657,6 +2138,16 @@ function compareArmResults(
   const championSeedCacheReadTokens = aggregateSeedCacheReadTokens(champion);
   const candidateSeedCacheReadTokens = aggregateSeedCacheReadTokens(candidate);
   const seedCacheReadSymmetry = championSeedCacheReadTokens === candidateSeedCacheReadTokens;
+  const dynamicInputSymmetry = pairedDynamicInputSymmetry(
+    champion,
+    candidate,
+    maxInputTokenDelta
+  );
+  const actualOutboundInputSymmetry = pairedInputSymmetry(
+    champion,
+    candidate,
+    maxInputTokenDelta
+  );
   const fullBucketRequestDelta =
     candidate.metrics.full_bucket_requests - champion.metrics.full_bucket_requests;
   const fullBucketDenominatorsMatch =
@@ -1690,6 +2181,8 @@ function compareArmResults(
     cohort_matches: cohortMatches,
     observed_key_realm_matches: observedRealmMatches,
     seed_cache_read_symmetry: seedCacheReadSymmetry,
+    dynamic_input_symmetry: dynamicInputSymmetry.pass,
+    actual_outbound_input_symmetry: actualOutboundInputSymmetry.pass,
     candidate_raw_token_hit_not_lower:
       candidate.metrics.raw_token_hit_rate >= champion.metrics.raw_token_hit_rate,
     candidate_cache_128_hit_not_lower:
@@ -1727,12 +2220,12 @@ function compareArmResults(
   // Remote TTFT belongs to the hand-selected upstream and has its own visible
   // verdict below. A cache-preserving local candidate must not be rejected
   // solely because this pair saw provider-side timing variance.
-  delete gatingChecks.candidate_ttft_p95_not_regressed;
   const cacheCheckNames = [
     "champion_valid",
     "candidate_valid",
     "cohort_matches",
     "observed_key_realm_matches",
+    "actual_outbound_input_symmetry",
     "candidate_raw_token_hit_not_lower",
     "candidate_cache_128_hit_not_lower",
     "candidate_warm_stable_prefix_hit_not_lower",
@@ -1760,6 +2253,9 @@ function compareArmResults(
     evidence_confounded_by_provider_instability: !providerInstabilityFree,
     local_latency_pass: localLatencyPass,
     latency_pass: latencyPass,
+    ttft_no_regression_required: effectiveRequireTtftNoRegression,
+    input_symmetry: dynamicInputSymmetry,
+    actual_outbound_input_symmetry: actualOutboundInputSymmetry,
     checks,
     deltas: {
       raw_token_hit_rate: candidate.metrics.raw_token_hit_rate - champion.metrics.raw_token_hit_rate,
@@ -1827,12 +2323,21 @@ async function compareOfflineArtifacts(options) {
     0,
     Math.max(champion.metrics.full_bucket_denominator, candidate.metrics.full_bucket_denominator)
   );
+  const maxInputTokenDelta = boundedInteger(
+    options["max-input-token-delta"] ?? 128,
+    "--max-input-token-delta",
+    0,
+    10_000
+  );
+  const requireTtftNoRegression = true;
   const comparison = compareArmResults(
     champion,
     candidate,
     maxTtftRegressionMs,
     maxLocalProxyOverheadRegressionMs,
-    maxFullBucketRegressionRequests
+    maxFullBucketRegressionRequests,
+    requireTtftNoRegression,
+    maxInputTokenDelta
   );
   return {
     schema: SCHEMA,
@@ -1846,7 +2351,9 @@ async function compareOfflineArtifacts(options) {
     settings: {
       max_ttft_regression_ms: maxTtftRegressionMs,
       max_local_proxy_overhead_regression_ms: maxLocalProxyOverheadRegressionMs,
-      max_full_bucket_regression_requests: maxFullBucketRegressionRequests
+      max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
+      max_input_token_delta: maxInputTokenDelta,
+      require_ttft_no_regression: requireTtftNoRegression
     }
   };
 }
@@ -2372,6 +2879,7 @@ function emptyMetrics() {
     requests: 0,
     successful_sse_requests: 0,
     input_tokens: 0,
+    peak_input_tokens: 0,
     cache_read_tokens: 0,
     raw_token_hit_rate: 0,
     cacheable_tokens_128: 0,
@@ -2420,6 +2928,13 @@ function buildSeedContext(targetChars, fixtureFamily = null, profile = "natural"
   const fixturePrefix = fixtureFamily ? `[fixture ${fixtureFamily}] ` : "";
   if (targetChars <= 0) {
     return `${fixturePrefix}Release champion seed. Reply with OK only.`;
+  }
+  if (profile === "natural-dense") {
+    // Keep the seed natural and pair-specific, but use the same compact,
+    // non-repeating CJK-rich record shape as the validated dynamic tail. This
+    // reaches the requested token class without recreating the oversized
+    // 2MB+ ASCII seed that the relay rejects before usage is returned.
+    return buildNaturalDenseToolOutput(targetChars, fixtureFamily, 0, 1);
   }
   if (profile !== "legacy-repeated") {
     return buildNaturalFixtureText(targetChars, fixtureFamily, "history");
@@ -2535,8 +3050,22 @@ function buildToolFixtureItems({ pair, fixtureFamily = null, targetChars, shape,
   return items;
 }
 
+// Some compatible upstreams accept long full-replay context but reject a
+// synthetic function_call history at that same size. Text mode keeps the
+// growing, shape-varied tail and the exact A/B symmetry without claiming to
+// exercise tool-history behavior on an upstream that cannot replay it.
+function buildDynamicTextTail({ targetChars, shape, fixtureFamily = null, eventOrdinal = 0 }) {
+  const scopedFixture = fixtureFamily
+    ? `${fixtureFamily}-text-tail-${eventOrdinal}`
+    : `text-tail-${eventOrdinal}`;
+  return buildToolOutput(targetChars, shape, scopedFixture, 0, 1);
+}
+
 function buildToolOutput(targetChars, shape, fixtureFamily = null, partIndex = 0, partCount = 1) {
   const partLabel = partCount > 1 ? ` tool_part=${partIndex + 1}/${partCount}` : "";
+  if (shape === "natural-dense") {
+    return buildNaturalDenseToolOutput(targetChars, fixtureFamily, partIndex, partCount);
+  }
   if (shape === "natural") {
     const scopedFixture = fixtureFamily
       ? `${fixtureFamily}-tool-${partIndex + 1}`
@@ -2576,15 +3105,78 @@ function buildToolOutput(targetChars, shape, fixtureFamily = null, partIndex = 0
   return unit.repeat(Math.ceil(targetChars / unit.length)).slice(0, targetChars);
 }
 
-function dynamicTailProfileForTurn(turn, baseChars, baseCalls) {
+// A CJK-rich, prose-like tool record produces a high token density without
+// falling back to repeated filler, timestamps, paths, hashes, or user text.
+// The opaque pair fixture is converted into a compact Chinese marker so fresh
+// pairs still have distinct bodies while no raw cache-placement identity is
+// written into the fixture.
+function buildNaturalDenseToolOutput(targetChars, fixtureFamily = null, partIndex = 0, partCount = 1) {
+  const marker = naturalDenseFixtureMarker(fixtureFamily);
+  const part = partCount > 1 ? `第${partIndex + 1}段` : "本段";
+  const subjects = [
+    "依赖清单",
+    "接口约束",
+    "回归记录",
+    "变更说明",
+    "兼容结论",
+    "验证要点",
+    "状态快照",
+    "审阅意见"
+  ];
+  const actions = [
+    "已核对前序事实",
+    "保持既有边界",
+    "补充必要证据",
+    "确认调用顺序",
+    "保留稳定上下文",
+    "标记待复核条件",
+    "关联完成结果",
+    "排除无关变更"
+  ];
+  const outcomes = [
+    "等待下一项任务继续使用",
+    "不改写已经确认的记录",
+    "只允许新增信息追加",
+    "保持结果可以逐项追溯",
+    "避免把临时信号当成结论",
+    "保留完整工具语义",
+    "不改变既有调用契约",
+    "以最新请求为处理焦点"
+  ];
+  let output = "";
+  for (let index = 0; output.length < targetChars; index += 1) {
+    const ordinal = String(index + 1).padStart(6, "0");
+    const subject = subjects[(index * 5 + partIndex) % subjects.length];
+    const action = actions[(index * 3 + partCount) % actions.length];
+    const outcome = outcomes[(index * 7 + partIndex + partCount) % outcomes.length];
+    output += `记录${ordinal}：${part}${subject}${action}，${outcome}。批次${marker}\n`;
+  }
+  return output.slice(0, targetChars);
+}
+
+function naturalDenseFixtureMarker(fixtureFamily) {
+  if (!fixtureFamily) return "基线";
+  const syllables = [
+    "甲", "乙", "丙", "丁", "戊", "己", "庚", "辛",
+    "壬", "癸", "东", "南", "西", "北", "春", "秋"
+  ];
+  return [...sha256Text(String(fixtureFamily)).slice(0, 12)]
+    .map((value) => syllables[Number.parseInt(value, 16)])
+    .join("");
+}
+
+function dynamicTailProfileForTurn(turn, baseChars, baseCalls, tailProfile = "mixed") {
   if (turn <= 0 || turn % 2 === 0) return null;
-  const profiles = [
+  const mixedProfiles = [
     { shape: "natural", scale: 0.25, calls_delta: 0 },
     { shape: "structured", scale: 0.5, calls_delta: 1 },
     { shape: "noisy", scale: 0.75, calls_delta: 2 },
     { shape: "flat", scale: 1, calls_delta: 3 },
     { shape: "natural", scale: 0.35, calls_delta: 1 }
   ];
+  const profiles = tailProfile === "natural-dense"
+    ? mixedProfiles.map((item) => ({ ...item, shape: "natural-dense" }))
+    : mixedProfiles;
   const ordinal = Math.floor((turn - 1) / 2) + 1;
   const profile = profiles[(ordinal - 1) % profiles.length];
   return {
@@ -2618,6 +3210,60 @@ function isolationLaneForPair(pair, arm) {
   }
   const championGetsLaneA = Number(pair) % 2 === 0;
   return (arm === "champion") === championGetsLaneA ? "lane-a" : "lane-b";
+}
+
+function releaseCachePlacementLane({
+  runId,
+  keyRealmHash,
+  requestFamily,
+  pair,
+  arm,
+  isolationLane,
+  isolateUpstreamCache,
+  sharedCacheCrossover = false
+}) {
+  if (Boolean(sharedCacheCrossover)) {
+    // Both binaries replay the exact same turn into one upstream cache key.
+    // runInterleavedDynamicPair rotates the first sender every turn, so cache
+    // placement and short capacity windows are balanced without relying on
+    // an unverified provider interpretation of separate prompt-cache keys.
+    return sha256Parts([
+      "release-champion-lane-v3",
+      runId,
+      keyRealmHash,
+      requestFamily,
+      "shared-turn-crossover",
+      pair
+    ]);
+  }
+  if (Boolean(isolateUpstreamCache)) {
+    if (isolationLane !== "lane-a" && isolationLane !== "lane-b") {
+      throw new FailClosedError(
+        "invalid_isolation_lane",
+        "an isolated upstream-cache comparison requires lane-a or lane-b"
+      );
+    }
+    // A/B lanes remain distinct within one pair, but the physical lane keeps
+    // its generated placement identity after the crossover. Pair-specific
+    // fixtures and session/thread identities are intentionally separate.
+    return sha256Parts([
+      "release-champion-lane-v3",
+      runId,
+      keyRealmHash,
+      requestFamily,
+      "isolated",
+      isolationLane
+    ]);
+  }
+  return sha256Parts([
+    "release-champion-lane-v3",
+    runId,
+    keyRealmHash,
+    requestFamily,
+    "shared",
+    pair,
+    arm
+  ]);
 }
 
 function releaseFixtureConversationIdentity(pair, fixtureFamily = null, isolationLane = null) {
@@ -2706,16 +3352,26 @@ function normalizeScenario(value) {
 
 function normalizeToolOutputShape(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  if (new Set(["natural", "flat", "structured", "noisy"]).has(normalized)) return normalized;
+  if (new Set(["natural", "natural-dense", "flat", "structured", "noisy"]).has(normalized)) return normalized;
   throw new FailClosedError(
     "invalid_tool_output_shape",
-    "--tool-output-shape must be natural, flat, structured, or noisy"
+    "--tool-output-shape must be natural, natural-dense, flat, structured, or noisy"
   );
+}
+
+function normalizeDynamicTailProfile(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  return new Set(["mixed", "natural-dense"]).has(normalized) ? normalized : null;
+}
+
+function normalizeDynamicTailMode(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  return new Set(["tool", "text"]).has(normalized) ? normalized : null;
 }
 
 function normalizeFixtureProfile(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  return new Set(["natural", "legacy-repeated"]).has(normalized)
+  return new Set(["natural", "natural-dense", "legacy-repeated"]).has(normalized)
     ? normalized
     : null;
 }
@@ -3057,15 +3713,19 @@ function printUsage() {
     --champion-exe <old.exe> --candidate-exe <new.exe> \\
     --source-config-dir <Atoapi-config-dir> --model <model> \\
     --key-realm-hash <opaque-hash> [--provider-id <id>] \\
-    [--scenario full-replay|tool-burst|dynamic-tail-mix|tool-tail-maturity|compacted-anchor|compaction-root] [--pairs 2] [--turns 6] \\
+    [--scenario full-replay|tool-burst|dynamic-tail-mix|tool-tail-maturity|compacted-anchor|compaction-root] [--pairs 2] [--warmup-pairs 0] [--turns 6] \\
     [--pair-offset 0|1] [--first-arm champion|candidate] \\
-    [--seed-context-chars <0-2500000>] [--minimum-seed-input-tokens <0-1000000>] [--fixture-profile natural|legacy-repeated] \\
-    [--tool-calls <1-8>] [--tool-output-shape natural|flat|structured|noisy] \\
-    [--turn-delay-ms <0-5000>] [--pair-delay-ms <0-60000>] \\
+    [--seed-context-chars <0-2500000>] [--minimum-seed-input-tokens <0-1000000>] \\
+    [--minimum-peak-input-tokens <0-1000000>] [--maximum-peak-input-tokens <0-1000000>] \\
+    [--max-input-token-delta <0-10000>] \\
+    [--fixture-profile natural|natural-dense|legacy-repeated] [--dynamic-tail-profile mixed|natural-dense] \\
+    [--tool-calls <1-8>] [--tool-output-shape natural|natural-dense|flat|structured|noisy] \\
+    [--turn-delay-ms <0-5000>] [--inter-arm-delay-ms <0-5000>] [--pair-delay-ms <0-60000>] \\
     [--reuse-fixture-across-pairs] \\
     [--isolate-upstream-cache] \\
-    [--reuse-runtime-per-arm] \\
+    [--reuse-runtime-per-arm] [--shared-cache-crossover] \\
     [--max-local-proxy-overhead-regression-ms <0-500>] \\
+    [--require-ttft-no-regression] \\
     [--max-full-bucket-regression-requests <calibrated-count>] \\
     [--upstream-user-agent <test-only-stable-value>] \\
     [--champion-upstream-user-agent <value>] [--candidate-upstream-user-agent <value>] \\
@@ -3093,7 +3753,9 @@ Safety:
   --pair-delay-ms is test-only pacing between fresh pairs; it never changes a
   request body, retries an inbound, or touches the running service. --first-arm
   and --pair-offset only choose which isolated arm sends first; they never alter
-  the selected Provider, Key, proxy, request body, or upstream call count.`);
+  the selected Provider, Key, proxy, request body, or upstream call count.
+  --warmup-pairs executes the earliest pairs but excludes their raw results
+  from aggregates and promotion; it may be set from 0 through --pairs minus 1.`);
 }
 
 async function runSelfTest() {
@@ -3146,6 +3808,24 @@ async function runSelfTest() {
     "a transport diagnostic may rewrite only the copied provider record"
   );
   assert.equal(boundedInteger("60000", "--pair-delay-ms", 0, 60_000), 60_000);
+  assert.equal(boundedInteger("1500", "--inter-arm-delay-ms", 0, 5_000), 1_500);
+  assert.equal(boundedInteger("1", "--warmup-pairs", 0, 1), 1);
+  assert.throws(
+    () => boundedInteger("2", "--warmup-pairs", 0, 1),
+    (error) => error?.code === "invalid_parameter",
+    "warm-up pairs must leave at least one scored pair"
+  );
+  assert.deepEqual(scheduledPairIds(2), [0, 1]);
+  assert.deepEqual(
+    partitionRunsByWarmup([{ pair: 0 }, { pair: 1 }, { pair: 2 }], 1),
+    { warmup: [{ pair: 0 }], scored: [{ pair: 1 }, { pair: 2 }] },
+    "warm-up evidence must stay out of the scored aggregate"
+  );
+  assert.deepEqual(
+    pairedRunIds([{ pair: 2 }, { pair: 1 }], [{ pair: 1 }, { pair: 2 }]),
+    [1, 2],
+    "scored pair identifiers must contain only complete two-arm pairs"
+  );
   assert.equal(
     boundedInteger("2500000", "--seed-context-chars", 0, 2_500_000),
     2_500_000,
@@ -3227,6 +3907,23 @@ async function runSelfTest() {
     },
     "live champion fixtures must retain Codex's store=false wire contract"
   );
+  const dynamicFixtureTools = releaseFixtureToolsForScenario("dynamic-tail-mix");
+  assert.equal(dynamicFixtureTools.length, 1);
+  assert.equal(dynamicFixtureTools[0].name, "read_release_fixture");
+  assert.deepEqual(releaseFixtureToolsForScenario("full-replay"), []);
+  assert.deepEqual(releaseFixtureToolsForScenario("dynamic-tail-mix", "text"), []);
+  assert.deepEqual(
+    buildResponsesRequestBody({
+      cohort: { model: "request-model" },
+      maxOutputTokens: 16,
+      instructions: "stable",
+      input: [],
+      tools: dynamicFixtureTools,
+      promptCacheKey: "fixture-key"
+    }).tools,
+    dynamicFixtureTools,
+    "tool-history fixtures must declare the replayed tool from the seed onward"
+  );
   assert.deepEqual(
     [1, 3, 5, 7, 9].map((turn) => dynamicTailProfileForTurn(turn, 16_384, 1).shape),
     ["natural", "structured", "noisy", "flat", "natural"]
@@ -3239,7 +3936,23 @@ async function runSelfTest() {
   assert.equal(normalizeToolOutputShape("structured"), "structured");
   assert.equal(normalizeToolOutputShape("noisy"), "noisy");
   assert.equal(normalizeToolOutputShape("natural"), "natural");
+  assert.equal(normalizeToolOutputShape("natural_dense"), "natural-dense");
+  assert.equal(normalizeDynamicTailProfile("natural_dense"), "natural-dense");
+  assert.equal(normalizeDynamicTailProfile("unknown"), null);
+  assert.equal(normalizeDynamicTailMode("text"), "text");
+  assert.equal(normalizeDynamicTailMode("unknown"), null);
+  assert.equal(
+    buildDynamicTextTail({
+      targetChars: 1024,
+      shape: "natural-dense",
+      fixtureFamily: "fixture",
+      eventOrdinal: 1
+    }).length,
+    1024,
+    "text-tail mode must preserve the configured dynamic-tail size"
+  );
   assert.equal(normalizeFixtureProfile("natural"), "natural");
+  assert.equal(normalizeFixtureProfile("natural_dense"), "natural-dense");
   assert.equal(normalizeFixtureProfile("legacy_repeated"), "legacy-repeated");
   assert.equal(normalizeFixtureProfile("unknown"), null);
   assert.deepEqual(
@@ -3399,6 +4112,34 @@ async function runSelfTest() {
   assert.equal(buildSeedContext(128).length, 128);
   const pairFixtureA = "fixture-pair-a";
   const pairFixtureB = "fixture-pair-b";
+  const denseSeedA = buildSeedContext(4096, pairFixtureA, "natural-dense");
+  const denseSeedB = buildSeedContext(4096, pairFixtureB, "natural-dense");
+  assert.notEqual(denseSeedA, denseSeedB, "dense seed fixtures must split fresh pairs");
+  const denseSeedStats = fixtureLineStats(denseSeedA);
+  assert.equal(
+    denseSeedStats.line_count,
+    denseSeedStats.unique_line_count,
+    "dense seed fixtures must not repeat a complete line"
+  );
+  assert.equal(denseSeedStats.max_repeated_line_count, 1);
+  const denseToolA = buildToolOutput(4096, "natural-dense", pairFixtureA);
+  const denseToolB = buildToolOutput(4096, "natural-dense", pairFixtureB);
+  assert.notEqual(denseToolA, denseToolB, "dense fixtures must split fresh pairs");
+  const denseStats = fixtureLineStats(denseToolA);
+  assert.equal(
+    denseStats.line_count,
+    denseStats.unique_line_count,
+    "dense fixtures must not repeat a complete tool-output line"
+  );
+  assert.equal(denseStats.max_repeated_line_count, 1);
+  assert.equal(
+    dynamicTailProfileForTurn(1, 16_384, 1, "natural-dense").shape,
+    "natural-dense"
+  );
+  assert.equal(
+    dynamicTailProfileForTurn(2, 16_384, 1, "natural-dense"),
+    null
+  );
   const naturalFixture = buildStableInstructions(32_768, pairFixtureA, "natural");
   const naturalFixtureStats = fixtureLineStats(naturalFixture);
   assert.equal(naturalFixture.length, 32_768);
@@ -3494,6 +4235,69 @@ async function runSelfTest() {
   assert.equal(isolationLaneForPair(0, "candidate"), "lane-b");
   assert.equal(isolationLaneForPair(1, "champion"), "lane-b");
   assert.equal(isolationLaneForPair(1, "candidate"), "lane-a");
+  const laneAOnChampionPair0 = releaseCachePlacementLane({
+    runId: "self-test-run",
+    keyRealmHash: "opaque-realm-1234",
+    requestFamily: "codex-responses-full-replay",
+    pair: 0,
+    arm: "champion",
+    isolationLane: isolationLaneForPair(0, "champion"),
+    isolateUpstreamCache: true
+  });
+  const laneAOnCandidatePair1 = releaseCachePlacementLane({
+    runId: "self-test-run",
+    keyRealmHash: "opaque-realm-1234",
+    requestFamily: "codex-responses-full-replay",
+    pair: 1,
+    arm: "candidate",
+    isolationLane: isolationLaneForPair(1, "candidate"),
+    isolateUpstreamCache: true
+  });
+  const laneBOnCandidatePair0 = releaseCachePlacementLane({
+    runId: "self-test-run",
+    keyRealmHash: "opaque-realm-1234",
+    requestFamily: "codex-responses-full-replay",
+    pair: 0,
+    arm: "candidate",
+    isolationLane: isolationLaneForPair(0, "candidate"),
+    isolateUpstreamCache: true
+  });
+  assert.equal(laneAOnChampionPair0, laneAOnCandidatePair1);
+  assert.equal(
+    generatedPromptCacheKey("self-test", laneAOnChampionPair0),
+    generatedPromptCacheKey("self-test", laneAOnCandidatePair1),
+    "the crossed-over arm must retain the same isolated lane placement key after warm-up"
+  );
+  assert.notEqual(
+    generatedPromptCacheKey("self-test", laneAOnChampionPair0),
+    generatedPromptCacheKey("self-test", laneBOnCandidatePair0),
+    "the two arms in one pair must retain distinct placement lanes"
+  );
+  const sharedCrossoverChampion = releaseCachePlacementLane({
+    runId: "self-test-run",
+    keyRealmHash: "opaque-realm-1234",
+    requestFamily: "codex-responses-full-replay",
+    pair: 0,
+    arm: "champion",
+    isolationLane: null,
+    isolateUpstreamCache: false,
+    sharedCacheCrossover: true
+  });
+  const sharedCrossoverCandidate = releaseCachePlacementLane({
+    runId: "self-test-run",
+    keyRealmHash: "opaque-realm-1234",
+    requestFamily: "codex-responses-full-replay",
+    pair: 0,
+    arm: "candidate",
+    isolationLane: null,
+    isolateUpstreamCache: false,
+    sharedCacheCrossover: true
+  });
+  assert.equal(
+    sharedCrossoverChampion,
+    sharedCrossoverCandidate,
+    "shared-cache crossover must give both arms one cache placement key per pair"
+  );
   assert.deepEqual(
     releaseFixtureConversationIdentity(2, pairFixtureA),
     releaseFixtureConversationIdentity(2, pairFixtureA),
@@ -3511,6 +4315,7 @@ async function runSelfTest() {
   );
   const stableWire = {
     cache_metadata: "sha256-128:cache-a",
+    input_full: "sha256-128:input-a",
     instructions: "sha256-128:instructions-a",
     tools_schema: "sha256-128:tools-a",
     pre_input_wire: "sha256-128:pre-a"
@@ -3593,7 +4398,23 @@ async function runSelfTest() {
     arm,
     cohort,
     executable: { path: `${arm}.exe`, sha256: "a".repeat(64) },
-    runs: [],
+    runs: [{
+      schema: SCHEMA,
+      kind: "dynamic-run",
+      pass: true,
+      arm,
+      cohort,
+      scenario: "full-replay",
+      pair: 0,
+      requests: [{
+        phase: "seed",
+        request_kind: "turn",
+        sse_completed: true,
+        input_fingerprint: "self-test-valid-seed",
+        input_tokens: 1024,
+        outbound_prefix_fingerprints: stableWire
+      }]
+    }],
     metrics: {
       requests: 4,
       successful_sse_requests: 4,
@@ -3664,6 +4485,25 @@ async function runSelfTest() {
   assert.equal(equalBaseline.pass, false);
   assert.equal(equalBaseline.baseline_pass, true);
   assert.equal(equalBaseline.positive_cache_evidence, false);
+  const coldLaneCandidate = valid("candidate", 0.9);
+  coldLaneCandidate.runs = coldLaneCandidate.runs.map((run) => ({
+    ...run,
+    requests: run.requests.map((request) => ({
+      ...request,
+      input_tokens: number(request.input_tokens) + 7_144
+    }))
+  }));
+  const coldLanePromotionVerdict = compareArmResults(
+    valid("champion", 0.9),
+    coldLaneCandidate,
+    0,
+    0,
+    0,
+    true,
+    128
+  );
+  assert.equal(coldLanePromotionVerdict.checks.actual_outbound_input_symmetry, false);
+  assert.equal(coldLanePromotionVerdict.baseline_pass, false);
   assert.equal(compareArmResults(valid("champion", 0.9), valid("candidate", 0.89), 0).pass, false);
   const cacheWinsButRemoteTtftVaries = valid("candidate", 0.9);
   cacheWinsButRemoteTtftVaries.metrics.ttft_p95_ms = 125;
@@ -3701,10 +4541,299 @@ async function runSelfTest() {
   );
   assert.equal(
     remoteTtftVarianceVerdict.pass,
-    true,
-    "remote TTFT variance must not veto otherwise unconfounded cache evidence"
+    false,
+    "promotion evidence must reject an end-to-end TTFT regression by default"
   );
   assert.equal(remoteTtftVarianceVerdict.latency_pass, false);
+  assert.equal(remoteTtftVarianceVerdict.ttft_no_regression_required, true);
+  const strictRemoteTtftVerdict = compareArmResults(
+    saturatedChampion,
+    positiveCacheWithRemoteTtftVariance,
+    0,
+    0,
+    0,
+    true
+  );
+  assert.equal(
+    strictRemoteTtftVerdict.pass,
+    false,
+    "an explicit strict TTFT gate must reject a remote latency regression"
+  );
+  assert.equal(strictRemoteTtftVerdict.baseline_pass, false);
+  assert.equal(strictRemoteTtftVerdict.ttft_no_regression_required, true);
+  const legacyRelaxedTtftVerdict = compareArmResults(
+    saturatedChampion,
+    positiveCacheWithRemoteTtftVariance,
+    0,
+    0,
+    0,
+    false
+  );
+  assert.equal(
+    legacyRelaxedTtftVerdict.baseline_pass,
+    false,
+    "a legacy false TTFT flag must not weaken release promotion"
+  );
+  assert.equal(legacyRelaxedTtftVerdict.ttft_no_regression_required, true);
+  const dynamicInputRuns = (fingerprint, inputTokens, outboundFamily = fingerprint) => [{
+    scenario: "dynamic-tail-mix",
+    pair: 0,
+    requests: [
+      ["seed", inputTokens],
+      ["dynamic-tail-1-natural-dense", inputTokens + 128],
+      ["followup-2", inputTokens + 256]
+    ].map(([phase, tokens]) => ({
+      phase,
+      request_kind: "turn",
+      sse_completed: true,
+      input_fingerprint: phase === "seed" ? fingerprint : `${fingerprint}-${phase}`,
+      input_tokens: tokens,
+      outbound_prefix_fingerprints: {
+        input_full: `input:${outboundFamily}:${phase}`,
+        instructions: `instructions:${outboundFamily}`,
+        tools_schema: `tools:${outboundFamily}`,
+        pre_input_wire: `pre-input:${outboundFamily}`
+      }
+    }))
+  }];
+  const symmetricDynamicInputs = pairedDynamicInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    { runs: dynamicInputRuns("same", 450_064) },
+    128
+  );
+  assert.equal(symmetricDynamicInputs.pass, true);
+  assert.equal(symmetricDynamicInputs.max_input_token_delta, 64);
+  const symmetricAllScenarioInputs = pairedInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    { runs: dynamicInputRuns("same", 450_064) },
+    128
+  );
+  assert.equal(symmetricAllScenarioInputs.pass, true);
+  assert.equal(symmetricAllScenarioInputs.client_input_fingerprints_match, true);
+  assert.equal(symmetricAllScenarioInputs.actual_outbound_semantic_fingerprints_match, true);
+  const coldLaneInputDelta = pairedInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    { runs: dynamicInputRuns("same", 457_144) },
+    128
+  );
+  assert.equal(coldLaneInputDelta.pass, false);
+  assert.equal(coldLaneInputDelta.max_input_token_delta, 7_144);
+  const allScenarioOutboundMismatch = pairedInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000, "left") },
+    { runs: dynamicInputRuns("same", 450_000, "right") },
+    128
+  );
+  assert.equal(allScenarioOutboundMismatch.pass, false);
+  assert.equal(allScenarioOutboundMismatch.actual_outbound_semantic_fingerprints_match, false);
+  const phaseMismatchedInput = pairedInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    {
+      runs: [{
+        ...dynamicInputRuns("same", 450_000)[0],
+        requests: dynamicInputRuns("same", 450_000)[0].requests.map((request, index) =>
+          index === 1 ? { ...request, phase: "unexpected-phase" } : request
+        )
+      }]
+    },
+    128
+  );
+  assert.equal(phaseMismatchedInput.pass, false);
+  assert.equal(phaseMismatchedInput.phases_match, false);
+  const compactionInputRuns = (fingerprint) => [{
+    scenario: "compaction-root",
+    pair: 0,
+    requests: [{
+      phase: "compaction",
+      request_kind: "compaction",
+      sse_completed: true,
+      input_fingerprint: fingerprint,
+      input_tokens: 450_000,
+      outbound_prefix_fingerprints: {
+        input_full: "input:compaction",
+        instructions: "instructions:compaction",
+        tools_schema: "tools:compaction",
+        pre_input_wire: "pre-input:compaction"
+      }
+    }]
+  }];
+  assert.equal(
+    pairedInputSymmetry(
+      { runs: compactionInputRuns("compaction-input") },
+      { runs: compactionInputRuns("compaction-input") },
+      128
+    ).pass,
+    true,
+    "all-scenario input symmetry must validate compaction requests without requiring a turn kind"
+  );
+  assert.equal(
+    pairedInputSymmetry({ runs: [] }, { runs: [] }, 128).pass,
+    false,
+    "promotion evidence must fail closed when no scored pair has actual outbound input proof"
+  );
+  const emptyDynamicPair = pairedDynamicInputSymmetry(
+    {
+      runs: [
+        ...dynamicInputRuns("same", 450_000),
+        { ...dynamicInputRuns("same", 450_000)[0], pair: 1, requests: [] }
+      ]
+    },
+    {
+      runs: [
+        ...dynamicInputRuns("same", 450_000),
+        { ...dynamicInputRuns("same", 450_000)[0], pair: 1, requests: [] }
+      ]
+    },
+    128
+  );
+  assert.equal(emptyDynamicPair.pass, false);
+  assert.equal(emptyDynamicPair.all_pairs_have_requests, false);
+  const duplicateDynamicPair = pairedDynamicInputSymmetry(
+    {
+      runs: [
+        ...dynamicInputRuns("same", 450_000),
+        { ...dynamicInputRuns("same", 450_000)[0], pair: 0 }
+      ]
+    },
+    {
+      runs: [
+        ...dynamicInputRuns("same", 450_000),
+        { ...dynamicInputRuns("same", 450_000)[0], pair: 0 }
+      ]
+    },
+    128
+  );
+  assert.equal(duplicateDynamicPair.pass, false);
+  assert.equal(duplicateDynamicPair.pair_ids_unique, false);
+  const invalidDynamicPair = pairedDynamicInputSymmetry(
+    { runs: [{ ...dynamicInputRuns("same", 450_000)[0], pair: null }] },
+    { runs: [{ ...dynamicInputRuns("same", 450_000)[0], pair: null }] },
+    128
+  );
+  assert.equal(invalidDynamicPair.pass, false);
+  assert.equal(invalidDynamicPair.pair_ids_valid, false);
+  const asymmetricDynamicInputs = pairedDynamicInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    { runs: dynamicInputRuns("other", 450_129) },
+    128
+  );
+  assert.equal(asymmetricDynamicInputs.pass, false);
+  assert.equal(asymmetricDynamicInputs.input_fingerprints_match, false);
+  const upstreamSemanticMismatch = pairedDynamicInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000, "left") },
+    { runs: dynamicInputRuns("same", 450_000, "right") },
+    128
+  );
+  assert.equal(upstreamSemanticMismatch.pass, false);
+  assert.equal(upstreamSemanticMismatch.outbound_semantic_fingerprints_match, false);
+  assert.equal(
+    pairedDynamicInputSymmetry(
+      { runs: [] },
+      { runs: [] },
+      128
+    ).pass,
+    true,
+    "non-dynamic comparisons do not need a dynamic input symmetry proof"
+  );
+  const terminalDynamicFollowup = dynamicTailTerminalFollowup(
+    [{ phase: "dynamic-tail-1-natural-dense", turn: 1 }],
+    dynamicInputRuns("same", 450_000)[0].requests
+  );
+  assert.equal(terminalDynamicFollowup.input_tokens, 450_256);
+  assert.equal(terminalDynamicFollowup.present, true);
+  assert.equal(
+    dynamicTailTerminalFollowup(
+      [{ phase: "dynamic-tail-1-natural-dense" }],
+      dynamicInputRuns("same", 450_000)[0].requests
+    ).present,
+    false,
+    "a terminal tail without a recorded turn must not infer an arbitrary next request"
+  );
+  assert.equal(
+    dynamicTailTerminalFollowup(
+      [{ turn: 1 }],
+      [
+        { ...dynamicInputRuns("same", 450_000)[0].requests[0], phase: undefined },
+        { ...dynamicInputRuns("same", 450_000)[0].requests[2] }
+      ]
+    ).present,
+    false,
+    "a terminal tail without a recorded phase must not match an undefined request phase"
+  );
+  assert.equal(
+    dynamicTailTerminalFollowup(
+      [{ phase: "dynamic-tail-1-natural-dense", turn: 1 }],
+      [
+        dynamicInputRuns("same", 450_000)[0].requests[0],
+        dynamicInputRuns("same", 450_000)[0].requests[1],
+        { ...dynamicInputRuns("same", 450_000)[0].requests[2], phase: "wrong-followup" }
+      ]
+    ).present,
+    false,
+    "a tail must be followed by its expected turn before it can satisfy the peak gate"
+  );
+  const repeatedTailPhaseRequests = [
+    dynamicInputRuns("same", 450_000)[0].requests[0],
+    dynamicInputRuns("same", 450_000)[0].requests[1],
+    { ...dynamicInputRuns("same", 450_000)[0].requests[1] },
+    dynamicInputRuns("same", 450_000)[0].requests[2]
+  ];
+  assert.equal(
+    dynamicTailTerminalFollowup(
+      [{ phase: "dynamic-tail-1-natural-dense", turn: 1 }],
+      repeatedTailPhaseRequests
+    ).present,
+    false,
+    "a duplicated terminal tail phase must not select an arbitrary follow-up"
+  );
+  const dynamicPeakRequest = (phase, inputTokens, fingerprint) => ({
+    phase,
+    request_kind: "turn",
+    input_fingerprint: fingerprint,
+    input_tokens: inputTokens,
+    cache_read_tokens: inputTokens,
+    cache_avoidable_gap_tokens: 0,
+    cache_new_tail_gap_tokens: 0,
+    cache_provider_unstable_gap_tokens: 0,
+    cache_shortfall_tokens: 0,
+    sse_completed: true,
+    observed_realm_id: cohort.key_realm_hash,
+    outbound_prefix_fingerprints: stableWire,
+    prefix_guard_wait_ms: 0,
+    local_prepare_ms: 1,
+    upstream_ttft_ms: 80,
+    ttft_ms: 80,
+    checks: {
+      per_inbound_one_attempt_one_post: true,
+      exact_counter_delta: true,
+      provider_matches_cohort: true,
+      model_matches_cohort: true,
+      observed_key_realm_matches_cohort: true,
+      timing_present: true
+    }
+  });
+  const seedPeakButTailFollowupLow = buildDynamicRun({
+    arm: "champion",
+    pair: 0,
+    cohort,
+    executable: valid("champion", 0.9).executable,
+    scenario: "dynamic-tail-mix",
+    promptCacheKeyUsed: true,
+    dynamicTailEvents: [{ phase: "dynamic-tail-1-natural-dense", shape: "natural-dense", target_chars: 1 }],
+    minimumGuardedRequests: 0,
+    minimumSeedInputTokens: 0,
+    minimumPeakInputTokens: 450_000,
+    maximumPeakInputTokens: 500_000,
+    requests: [
+      dynamicPeakRequest("seed", 460_000, "seed"),
+      dynamicPeakRequest("dynamic-tail-1-natural-dense", 460_128, "tail"),
+      dynamicPeakRequest("followup-2", 420_000, "followup")
+    ],
+    fatal: null,
+    compactionSeen: false
+  });
+  assert.equal(seedPeakButTailFollowupLow.checks.required_peak_input_tokens, true);
+  assert.equal(seedPeakButTailFollowupLow.checks.dynamic_tail_terminal_followup_peak_in_range, false);
+  assert.equal(seedPeakButTailFollowupLow.pass, false);
   const oneFullBucketBehind = valid("candidate", 0.9);
   oneFullBucketBehind.metrics.full_bucket_requests = 2;
   oneFullBucketBehind.metrics.full_bucket_rate = 0.5;
