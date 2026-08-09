@@ -849,6 +849,18 @@
   had exact input/cache-hit symmetry and zero avoidable gap. The candidate's
   local overhead was unchanged; its +484ms TTFT p95 was entirely upstream, so
   this is packaging/transport confirmation rather than cache promotion.
+- A v1.4.36 BIZD Key 2 `prompt_cache_key` configuration pilot also completed
+  4/4 serial terminal SSE requests per arm, exact final-wire
+  `unsupported -> verified` receipts, exact input-token symmetry, and no
+  local avoidable gap. It produced exactly `0.0000pp` raw/cache-128/warm-cache
+  delta, so do not enable or promote this configuration on BIZD; its +472ms
+  p95 difference was entirely upstream and local overhead was unchanged.
+- Read-only BIZD live analysis then covered 54 successful full-replay requests:
+  13,510,226 input tokens, 13,259,008 cache-read tokens (`98.1405%`), one
+  upstream attempt each, gzip without fallback, and `0` avoidable tokens.
+  The remaining 94,976 tokens are real new tails (mostly 8K--40K tool outputs)
+  and 52,096 are provider waterline instability. Do not add waits, prewarm,
+  retries, context rewriting, or tool-output compression on this evidence.
 - Keep this checkpoint as the base for the next positive optimization search.
   Do not promote its cache result or replace v1.4.33 until an exact current
   BIZD cohort produces a positive, non-provider-confounded cache delta.
