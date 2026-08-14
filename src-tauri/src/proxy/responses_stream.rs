@@ -14,6 +14,9 @@ use super::{
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct StreamObservation {
     pub model_output_started: bool,
+    /// True when the newly ingested frame contains user-visible text rather
+    /// than metadata, reasoning, or a tool/function payload.
+    pub visible_text_output_started: bool,
     pub completed_event_seen: bool,
     pub responses_completed_event_seen: bool,
     pub message_stop_event_seen: bool,
@@ -39,6 +42,7 @@ pub(super) struct StreamSummary {
     pub cache_capability_rejection_fields: HashSet<ProviderCacheCapabilityField>,
     pub compaction_output_seen: bool,
     pub model_output_seen: bool,
+    pub visible_text_output_seen: bool,
     pub frame_overflowed: bool,
     responses_completed_sequence: Option<u64>,
     message_stop_sequence: Option<u64>,
@@ -329,6 +333,7 @@ impl ResponsesStreamState {
 
     pub fn ingest(&mut self, chunk: &[u8]) -> StreamObservation {
         let output_seen_before = self.summary.model_output_seen;
+        let visible_text_seen_before = self.summary.visible_text_output_seen;
         for event in self.decoder.push_ordered(chunk) {
             let sequence = self.next_event_sequence();
             match event {
@@ -341,6 +346,8 @@ impl ResponsesStreamState {
         }
         StreamObservation {
             model_output_started: !output_seen_before && self.summary.model_output_seen,
+            visible_text_output_started: !visible_text_seen_before
+                && self.summary.visible_text_output_seen,
             completed_event_seen: self.summary.completed_event_seen,
             responses_completed_event_seen: self.summary.responses_completed_event_seen,
             message_stop_event_seen: self.summary.message_stop_event_seen,
@@ -420,6 +427,8 @@ impl ResponsesStreamState {
         }
         self.capture_output_items(&value, effective_event_type);
         self.summary.model_output_seen |= value_has_model_output(&value);
+        self.summary.visible_text_output_seen |=
+            value_has_visible_text_output_with_event(&value, effective_event_type);
         self.summary.compaction_output_seen |= value_has_compaction_output(&value);
         if value.get("error").is_some_and(|error| !error.is_null()) {
             self.summary.error_event_seen = true;
@@ -600,6 +609,116 @@ pub(super) fn value_has_model_output(value: &Value) -> bool {
             .any(value_has_model_output)
 }
 
+/// Returns whether a value carries text that is intended for the assistant's
+/// visible answer.  This is deliberately narrower than `value_has_model_output`:
+/// reasoning summaries, tool/function arguments, and generic non-empty deltas
+/// must not advance the visible-text clock. Refusal text is included because
+/// it is rendered as assistant-visible text by the protocol adapters.
+#[allow(dead_code)]
+fn value_has_visible_text_output_with_event(
+    value: &Value,
+    inherited_event_type: Option<&str>,
+) -> bool {
+    if let Value::Array(items) = value {
+        return items
+            .iter()
+            .any(|item| value_has_visible_text_output_with_event(item, inherited_event_type));
+    }
+
+    let Value::Object(object) = value else {
+        return false;
+    };
+    let event_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .or(inherited_event_type);
+
+    (match event_type {
+        Some("response.output_text.delta") => object.get("delta").is_some_and(non_empty_text_value),
+        Some("response.output_text.done") | Some("output_text") => {
+            object.get("text").is_some_and(non_empty_text_value)
+        }
+        Some("response.refusal.delta") => {
+            object.get("delta").is_some_and(non_empty_text_value)
+                || object
+                    .get("delta")
+                    .and_then(|delta| delta.get("refusal"))
+                    .is_some_and(non_empty_text_value)
+        }
+        Some("response.refusal.done") => {
+            object.get("refusal").is_some_and(non_empty_text_value)
+                || object.get("text").is_some_and(non_empty_text_value)
+        }
+        Some("content_block_delta") => {
+            object
+                .get("delta")
+                .and_then(Value::as_object)
+                .is_some_and(|delta| {
+                    delta.get("type").and_then(Value::as_str) == Some("text_delta")
+                        && delta.get("text").is_some_and(non_empty_text_value)
+                })
+        }
+        Some("content_block_start") => object
+            .get("content_block")
+            .and_then(Value::as_object)
+            .is_some_and(|block| {
+                block.get("type").and_then(Value::as_str) == Some("text")
+                    && block.get("text").is_some_and(non_empty_text_value)
+            }),
+        Some("message") => {
+            object
+                .get("content")
+                .is_some_and(visible_text_content_value)
+                || object.get("refusal").is_some_and(non_empty_text_value)
+        }
+        _ => false,
+    }) || object
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| choices.iter().any(chat_choice_has_visible_text))
+        || ["item", "output", "response", "data", "content"]
+            .into_iter()
+            .filter_map(|key| object.get(key))
+            .any(|nested| value_has_visible_text_output_with_event(nested, None))
+}
+
+fn non_empty_text_value(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| !text.is_empty())
+}
+
+fn visible_text_content_value(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => items.iter().any(visible_text_content_value),
+        Value::Object(object) => {
+            let kind = object.get("type").and_then(Value::as_str);
+            matches!(kind, Some("text") | Some("output_text"))
+                && object.get("text").is_some_and(non_empty_text_value)
+        }
+        _ => false,
+    }
+}
+
+fn chat_choice_has_visible_text(choice: &Value) -> bool {
+    choice
+        .get("delta")
+        .and_then(|delta| delta.get("content"))
+        .is_some_and(visible_text_content_value)
+        || choice
+            .get("delta")
+            .and_then(|delta| delta.get("refusal"))
+            .is_some_and(non_empty_text_value)
+        || choice.get("text").is_some_and(non_empty_text_value)
+        || choice
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .is_some_and(visible_text_content_value)
+        || choice
+            .get("message")
+            .and_then(|message| message.get("refusal"))
+            .is_some_and(non_empty_text_value)
+}
+
 fn delta_has_content(value: &Value) -> bool {
     match value {
         Value::String(text) => !text.is_empty(),
@@ -741,6 +860,87 @@ data: {"id":"resp-top-level","object":"response","output":[{"type":"function_cal
                 .model_output_started
         );
         assert!(state.finish().model_output_seen);
+    }
+
+    #[test]
+    fn visible_text_clock_excludes_reasoning_and_tool_metadata_but_includes_refusal_text() {
+        let mut state = ResponsesStreamState::default();
+        let reasoning = state.ingest(
+            b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"plan\"}\n\n",
+        );
+        assert!(reasoning.model_output_started);
+        assert!(!reasoning.visible_text_output_started);
+
+        let tool = state.ingest(
+            b"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{}\"}\n\n",
+        );
+        assert!(!tool.visible_text_output_started);
+
+        let refusal =
+            state.ingest(b"data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n");
+        assert!(refusal.visible_text_output_started);
+
+        let text = state
+            .ingest(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n");
+        assert!(!text.visible_text_output_started);
+        assert!(state.finish().visible_text_output_seen);
+    }
+
+    #[test]
+    fn visible_text_clock_supports_chat_and_anthropic_text_deltas() {
+        let mut chat = ResponsesStreamState::default();
+        assert!(
+            chat.ingest(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n")
+                .visible_text_output_started
+        );
+
+        let mut legacy_chat = ResponsesStreamState::default();
+        assert!(
+            legacy_chat
+                .ingest(b"data: {\"choices\":[{\"text\":\"legacy\"}]}\n\n")
+                .visible_text_output_started
+        );
+
+        let mut anthropic = ResponsesStreamState::default();
+        assert!(anthropic
+            .ingest(b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n")
+            .visible_text_output_started);
+    }
+
+    #[test]
+    fn visible_text_clock_supports_nested_completed_output_and_item_messages() {
+        let mut completed = ResponsesStreamState::default();
+        assert!(completed
+            .ingest(
+                br#"data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}
+
+"#,
+            )
+            .visible_text_output_started);
+
+        let mut item_done = ResponsesStreamState::default();
+        assert!(item_done
+            .ingest(
+                br#"data: {"type":"response.output_item.done","item":{"type":"message","content":[{"type":"output_text","text":"done"}]}}
+
+"#,
+            )
+            .visible_text_output_started);
+    }
+
+    #[test]
+    fn visible_text_clock_uses_sse_event_header_when_payload_omits_type() {
+        let mut responses = ResponsesStreamState::default();
+        assert!(
+            responses
+                .ingest(b"event: response.output_text.delta\ndata: {\"delta\":\"hello\"}\n\n")
+                .visible_text_output_started
+        );
+
+        let mut anthropic = ResponsesStreamState::default();
+        assert!(anthropic
+            .ingest(b"event: content_block_delta\ndata: {\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n")
+            .visible_text_output_started);
     }
 
     #[test]

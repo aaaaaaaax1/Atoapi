@@ -50,6 +50,10 @@ const preservedControlField = optionalControlField(args["preserve-control-field"
 if (preservedControlField === controlField) {
   throw new Error("--preserve-control-field must differ from --field");
 }
+const bootstrapIsolatedOptions = booleanArg(args["bootstrap-isolated-options"]);
+if (bootstrapIsolatedOptions && controlField !== "prompt-cache-options") {
+  throw new Error("--bootstrap-isolated-options requires --field prompt-cache-options");
+}
 const baselineCapabilityMode = normalizeCapabilityMode(args["baseline-capability"] ?? "unsupported");
 const candidateCapabilityMode = normalizeCapabilityMode(args["candidate-capability"] ?? "verified");
 const serialArms = booleanArg(args.serial);
@@ -233,6 +237,8 @@ try {
       same_binary: baselineExecutable === candidateExecutable,
       baseline_capability_mode: baselineCapabilityMode,
       candidate_capability_mode: candidateCapabilityMode,
+      isolated_candidate_force_field: isolatedCandidateForceField(),
+      bootstrap_isolated_options: bootstrapIsolatedOptions,
       control_field_isolation: cacheControlFieldIsolation(
         baselineArm.records,
         candidateArm.records,
@@ -326,6 +332,13 @@ async function snapshotSourceConfig(directory) {
   if (pinnedKeyId) validatePinnedKeyConfiguration(configText, providerId, pinnedKeyId);
   const preserveSourceConfig = baselineCapabilityMode === "source" &&
     candidateCapabilityMode === "source";
+  const scopedConfigText = preserveSourceConfig || !bootstrapIsolatedOptions
+    ? configText
+    : bootstrapIsolatedCapabilityScope(configText, {
+      providerId,
+      model,
+      keyId: pinnedKeyId
+    });
   if (preserveSourceConfig) {
     const keyPath = join(directory, "cache-key.dpapi");
     return {
@@ -334,7 +347,7 @@ async function snapshotSourceConfig(directory) {
       keyPath: await fileExists(keyPath) ? keyPath : null
     };
   }
-  const blocks = tomlArrayBlocks(configText, "provider_cache_capabilities");
+  const blocks = tomlArrayBlocks(scopedConfigText, "provider_cache_capabilities");
   const matches = blocks.filter((block) => capabilityMatches(block.body));
   const activeMatches = pinnedKeyId
     ? matches.filter((block) => extractTomlString(block.body, "key_id") === pinnedKeyId)
@@ -343,7 +356,8 @@ async function snapshotSourceConfig(directory) {
     const scope = pinnedKeyId ? `Key ${pinnedKeyId}` : "generic scope";
     throw new Error(`expected exactly one ${scope} matching ${controlField} capability record`);
   }
-  if (extractTomlString(activeMatches[0].body, "status") !== "verified") {
+  if (extractTomlString(activeMatches[0].body, "status") !== "verified" &&
+    !bootstrapIsolatedOptions) {
     throw new Error("the active matching candidate capability must be verified before a cross A/B run");
   }
   if (preservedControlField) {
@@ -361,10 +375,41 @@ async function snapshotSourceConfig(directory) {
   }
   const keyPath = join(directory, "cache-key.dpapi");
   return {
-    configText,
+    configText: scopedConfigText,
     localKey,
     keyPath: await fileExists(keyPath) ? keyPath : null
   };
+}
+
+function bootstrapIsolatedCapabilityScope(configText, scope) {
+  const existing = new Set(
+    tomlArrayBlocks(configText, "provider_cache_capabilities")
+      .filter((block) => capabilityScopeExactlyMatches(block.body, scope))
+      .map((block) => extractTomlString(block.body, "field"))
+      .filter(Boolean)
+  );
+  const missing = [
+    "prompt-cache-key",
+    "prompt-cache-retention",
+    "prompt-cache-options",
+    "prompt-cache-breakpoint"
+  ].filter((field) => !existing.has(field));
+  if (missing.length === 0) return configText;
+  const now = new Date().toISOString();
+  const records = missing.map((field) => [
+    "[[provider_cache_capabilities]]",
+    `provider_id = ${JSON.stringify(scope.providerId)}`,
+    `model_id = ${JSON.stringify(scope.model)}`,
+    'channel = "responses"',
+    ...(scope.keyId ? [`key_id = ${JSON.stringify(scope.keyId)}`] : []),
+    `field = ${JSON.stringify(field)}`,
+    "evidence_version = 2",
+    "enabled = false",
+    'status = "unverified"',
+    'effect_status = "unverified"',
+    `updated_at = ${JSON.stringify(now)}`
+  ].join("\n"));
+  return `${configText.trimEnd()}\n\n${records.join("\n\n")}\n`;
 }
 
 async function materializeConfig(source, directory, capabilityMode) {
@@ -420,6 +465,15 @@ function capabilityScopeMatchesFor(body, scope) {
   return !scope.keyId || extractTomlString(body, "key_id") === scope.keyId;
 }
 
+function capabilityScopeExactlyMatches(body, scope) {
+  const matchesRoute = extractTomlString(body, "provider_id") === scope.providerId &&
+    extractTomlString(body, "model_id") === scope.model &&
+    extractTomlString(body, "channel") === "responses";
+  if (!matchesRoute) return false;
+  const keyId = extractTomlString(body, "key_id");
+  return scope.keyId ? keyId === scope.keyId : !keyId;
+}
+
 function capabilityMatches(body) {
   return capabilityScopeMatches(body) && extractTomlString(body, "field") === controlField;
 }
@@ -433,18 +487,24 @@ function replaceCapabilityString(block, key, value) {
 
 async function startRuntime(label, configDir, requestedPort, localKey, executable) {
   const port = await findAvailablePort(requestedPort);
+  const env = {
+    ...process.env,
+    ATOAPI_CONFIG_DIR: configDir,
+    ATOAPI_ISOLATED_TEST_INSTANCE: "1",
+    ATOAPI_TEST_LISTEN_PORT: String(port),
+    ATOAPI_PREFIX_DIAGNOSTICS: "1",
+    ATOAPI_AUTOMATIC_CACHE_CANARY: "0"
+  };
+  // Never inherit a developer's ad-hoc force flag into either arm. Only the
+  // candidate of an explicit Options A/B receives this test-only gate.
+  delete env.ATOAPI_FORCE_ISOLATED_CACHE_CONTROL_FIELD;
+  const forcedField = label === "candidate" ? isolatedCandidateForceField() : null;
+  if (forcedField) env.ATOAPI_FORCE_ISOLATED_CACHE_CONTROL_FIELD = forcedField;
   const child = spawn(executable, [], {
     cwd: repoRoot,
     windowsHide: true,
     stdio: "ignore",
-    env: {
-      ...process.env,
-      ATOAPI_CONFIG_DIR: configDir,
-      ATOAPI_ISOLATED_TEST_INSTANCE: "1",
-      ATOAPI_TEST_LISTEN_PORT: String(port),
-      ATOAPI_PREFIX_DIAGNOSTICS: "1",
-      ATOAPI_AUTOMATIC_CACHE_CANARY: "0"
-    }
+    env
   });
   const baseUrl = `http://127.0.0.1:${port}`;
   try {
@@ -954,6 +1014,7 @@ function inputTokenSymmetry(baselineRecords, candidateRecords, allowedDelta = ma
 function controlFieldJsonName(field) {
   if (field === "prompt-cache-key") return "prompt_cache_key";
   if (field === "prompt-cache-retention") return "prompt_cache_retention";
+  if (field === "prompt-cache-options") return "prompt_cache_options";
   throw new Error(`unsupported control field: ${field}`);
 }
 
@@ -1489,6 +1550,12 @@ function normalizeCapabilityMode(value) {
   throw new Error("capability mode must be source, unsupported, or verified");
 }
 
+function isolatedCandidateForceField() {
+  return controlField === "prompt-cache-options" && candidateCapabilityMode === "verified"
+    ? "prompt-cache-options"
+    : null;
+}
+
 function controlFieldExpectedOnWire(capabilityMode) {
   if (capabilityMode === "source") return null;
   return capabilityMode !== "unsupported";
@@ -1654,13 +1721,13 @@ function printUsage() {
   console.log([
     "Usage:",
     "  node scripts/verify-generated-prompt-cache-key-cross-ab.mjs \\",
-    "    --provider-id <id> --model <id> [--field prompt-cache-key|prompt-cache-retention] \\",
-    "    [--preserve-control-field prompt-cache-key|prompt-cache-retention] \\",
+    "    --provider-id <id> --model <id> [--field prompt-cache-key|prompt-cache-retention|prompt-cache-options] \\",
+    "    [--preserve-control-field prompt-cache-key|prompt-cache-retention|prompt-cache-options] \\",
     "    [--exe <atoapi.exe>] [--baseline-exe <atoapi.exe>] [--candidate-exe <atoapi.exe>] \\",
     "    [--baseline-capability source|unsupported|verified] [--candidate-capability source|unsupported|verified] \\",
     "    [--source-config-dir <dir>] [--lines 1000] [--serial] [--between-arms-delay-ms 0] \\",
     "    [--first-arm baseline|candidate] \\",
-    "    [--key-id <opaque-id>] [--key-realm-hash <64-hex>] \\",
+    "    [--key-id <opaque-id>] [--key-realm-hash <64-hex>] [--bootstrap-isolated-options] \\",
     "    [--max-ttft-regression-ms 0] [--allow-upstream-ttft-regression] \\",
     "    [--max-local-ttft-overhead-regression-ms 500] [--max-input-token-delta 128] [--output <report.json>]",
     "Runs isolated cache-control or exact-binary A/B comparisons for one field; --serial stops one arm process before starting the other."
@@ -1822,6 +1889,24 @@ function runSelfTest() {
     (block) => extractTomlString(block.body, "field") === "prompt-cache-retention"
   ).body, "status"), "unsupported");
 
+  const bootstrappedOptionsScope = bootstrapIsolatedCapabilityScope(
+    capabilityFixture,
+    fixtureScope
+  );
+  const bootstrappedOptionsFields = tomlArrayBlocks(
+    bootstrappedOptionsScope,
+    "provider_cache_capabilities"
+  )
+    .filter((block) => capabilityScopeExactlyMatches(block.body, fixtureScope))
+    .map((block) => extractTomlString(block.body, "field"))
+    .sort();
+  assert.deepEqual(bootstrappedOptionsFields, [
+    "prompt-cache-breakpoint",
+    "prompt-cache-key",
+    "prompt-cache-options",
+    "prompt-cache-retention"
+  ]);
+
   const baselineWire = finalWireCacheControlEvidence({
     // A legacy provider-prefix identity must not turn this zero-control final
     // wire into a positive placement witness.
@@ -1840,6 +1925,11 @@ function runSelfTest() {
       cache_metadata: cacheMetadataFingerprint('{"prompt_cache_retention":"24h"}')
     }
   });
+  const optionsWire = finalWireCacheControlEvidence({
+    outbound_prefix_fingerprints: {
+      cache_metadata: cacheMetadataFingerprint('{"prompt_cache_options":{"mode":"implicit","ttl":"30m"}}')
+    }
+  });
   const unknownWire = finalWireCacheControlEvidence({
     outbound_prefix_fingerprints: {
       cache_metadata: "sha256-128:00000000000000000000000000000000"
@@ -1850,6 +1940,7 @@ function runSelfTest() {
   assert.deepEqual(baselineWire.fields, []);
   assert.deepEqual(candidateWire.fields, ["prompt_cache_key"]);
   assert.deepEqual(retentionWire.fields, ["prompt_cache_retention"]);
+  assert.deepEqual(optionsWire.fields, ["prompt_cache_options"]);
   assert.equal(unknownWire.observed, true);
   assert.equal(unknownWire.recognized, false);
 
@@ -1907,7 +1998,15 @@ function runSelfTest() {
     "verified",
     "prompt-cache-key"
   );
+  const isolatedOptions = cacheControlFieldIsolation(
+    [{ final_wire_cache_control_fields: baselineWire.fields }],
+    [{ final_wire_cache_control_fields: optionsWire.fields }],
+    "prompt-cache-options",
+    "unsupported",
+    "verified"
+  );
   assert.equal(isolatedRetention.pass, true);
+  assert.equal(isolatedOptions.pass, true);
 
   const failedInbound = { inbound_request_id: "failed-inbound" };
   assert.equal(
@@ -1962,8 +2061,10 @@ function runSelfTest() {
 
 function normalizeControlField(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
-  if (normalized === "prompt-cache-key" || normalized === "prompt-cache-retention") return normalized;
-  throw new Error("--field must be prompt-cache-key or prompt-cache-retention");
+  if (normalized === "prompt-cache-key" ||
+    normalized === "prompt-cache-retention" ||
+    normalized === "prompt-cache-options") return normalized;
+  throw new Error("--field must be prompt-cache-key, prompt-cache-retention, or prompt-cache-options");
 }
 
 function optionalControlField(value) {

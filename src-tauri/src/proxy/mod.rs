@@ -302,6 +302,11 @@ struct UpstreamRequestDiagnostics {
     sent_cache_capability_fields: Vec<ProviderCacheCapabilityField>,
     controlled_cache_probe_fields: Vec<ProviderCacheCapabilityField>,
     controlled_cache_probe_breakpoint_placement_digest: Option<String>,
+    // A one-way provider/key reference captured before transport. It is not
+    // an upstream capability dimension and intentionally remains distinct
+    // from cache_capability_key_id, which is learned only after response
+    // headers arrive.
+    selected_provider_key_ref: Option<String>,
     cache_capability_key_id: Option<String>,
     client_owned_prompt_cache_key: bool,
     client_owned_prompt_cache_key_local_id: Option<String>,
@@ -372,6 +377,9 @@ impl UpstreamRequestDiagnostics {
             self.controlled_cache_probe_breakpoint_placement_digest = next
                 .controlled_cache_probe_breakpoint_placement_digest
                 .clone();
+        }
+        if next.selected_provider_key_ref.is_some() {
+            self.selected_provider_key_ref = next.selected_provider_key_ref.clone();
         }
         if next.cache_capability_key_id.is_some() {
             self.cache_capability_key_id = next.cache_capability_key_id.clone();
@@ -499,9 +507,90 @@ impl Drop for FinalScopeDispatchGuard {
         );
     }
 }
+#[derive(Debug)]
 struct UpstreamSendOutcome {
     response: reqwest::Response,
     diagnostics: UpstreamRequestDiagnostics,
+}
+
+/// A request can fail before an upstream response head exists, but the exact
+/// outbound transport facts are already known at that point. Preserve only
+/// those bounded diagnostics across the one-shot boundary; callers must never
+/// reconstruct them from the route defaults or inspect the raw reqwest error.
+#[derive(Debug)]
+struct UpstreamTransportError {
+    source: reqwest::Error,
+    diagnostics: UpstreamRequestDiagnostics,
+    category: &'static str,
+}
+
+impl std::fmt::Display for UpstreamTransportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for UpstreamTransportError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn upstream_transport_error_metadata(error: &anyhow::Error) -> Option<&UpstreamTransportError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<UpstreamTransportError>())
+}
+
+fn upstream_transport_error_diagnostics(
+    error: &anyhow::Error,
+) -> Option<&UpstreamRequestDiagnostics> {
+    upstream_transport_error_metadata(error).map(|error| &error.diagnostics)
+}
+
+fn upstream_transport_error_category(error: &anyhow::Error) -> &'static str {
+    upstream_transport_error_metadata(error)
+        .map(|error| error.category)
+        .unwrap_or("other")
+}
+
+fn classify_reqwest_transport_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "timeout";
+    }
+    if error.status().is_some() {
+        return "http";
+    }
+    // The raw reqwest error is never persisted. It is inspected only here to
+    // produce one coarse, non-sensitive diagnostic category.
+    let detail = error.to_string().to_ascii_lowercase();
+    if detail.contains("dns")
+        || detail.contains("name or service")
+        || detail.contains("failed to lookup")
+        || detail.contains("could not resolve")
+    {
+        "dns"
+    } else if detail.contains("tls")
+        || detail.contains("ssl")
+        || detail.contains("certificate")
+        || detail.contains("handshake")
+    {
+        "tls"
+    } else if detail.contains("proxy") || detail.contains("tunnel") {
+        "proxy"
+    } else if error.is_connect()
+        || detail.contains("connection")
+        || detail.contains("broken pipe")
+        || detail.contains("reset by peer")
+    {
+        "connection"
+    } else {
+        "other"
+    }
+}
+
+fn upstream_transport_error_metric_message(error: &anyhow::Error) -> String {
+    format!("transport:{}", upstream_transport_error_category(error))
 }
 
 #[derive(Debug)]
@@ -1393,6 +1482,12 @@ async fn run_responses_compact_for_authorized_agent(
             active_request_channel.clone(),
             &active_upstream_body,
         )
+        .with_selected_provider_key_ref(affinity_identity::selected_key_ref_id(
+            &config.local_key,
+            &config.workspace_fingerprint,
+            &decision,
+            &selected_provider_key,
+        ))
         .with_explicit_proxy_url(
             config
                 .upstream_proxy_url_for(decision.provider.use_system_proxy)
@@ -1450,6 +1545,9 @@ async fn run_responses_compact_for_authorized_agent(
     let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
+            let transport_diagnostics = upstream_transport_error_diagnostics(&err);
+            let transport_error_category = upstream_transport_error_category(&err);
+            let transport_error_metric = upstream_transport_error_metric_message(&err);
             let mut failure_diagnostics = body_diagnostics(
                 &decision.upstream_channel,
                 &upstream_body,
@@ -1475,12 +1573,17 @@ async fn run_responses_compact_for_authorized_agent(
                     &compact_response_session_reuse,
                     requested_model_for_log.clone(),
                     "compact-transport",
+                    transport_diagnostics,
+                    Some(transport_error_category),
                 );
                 log.agent_id = authorized_agent.clone();
                 log.agent_label = authorized_agent.clone();
                 log.inbound_body_bytes = Some(inbound_body_bytes);
                 let mut errors = compact_metric_errors.clone();
-                errors.push(("upstream_transport".to_string(), err.to_string()));
+                errors.push((
+                    "upstream_transport".to_string(),
+                    transport_error_metric.clone(),
+                ));
                 finalize_agent_generation(
                     &state,
                     &request_id,
@@ -1495,7 +1598,7 @@ async fn run_responses_compact_for_authorized_agent(
                     None,
                     errors,
                     None,
-                    None,
+                    transport_diagnostics,
                 )
                 .await;
             } else {
@@ -1520,9 +1623,11 @@ async fn run_responses_compact_for_authorized_agent(
                     authorized_agent.as_deref(),
                     "compact-transport",
                     1,
+                    transport_diagnostics,
+                    Some(transport_error_category),
                     &compact_metric_errors,
                     "upstream_transport",
-                    &err.to_string(),
+                    &transport_error_metric,
                 )
                 .await;
             }
@@ -1611,6 +1716,8 @@ async fn run_responses_compact_for_authorized_agent(
                     &compact_response_session_reuse,
                     requested_model_for_log.clone(),
                     "compact-body",
+                    Some(&upstream_request_diagnostics),
+                    None,
                 );
                 log.status = status;
                 log.agent_id = authorized_agent.clone();
@@ -1659,6 +1766,8 @@ async fn run_responses_compact_for_authorized_agent(
                     authorized_agent.as_deref(),
                     "compact-body",
                     upstream_request_diagnostics.attempts.max(1),
+                    Some(&upstream_request_diagnostics),
+                    None,
                     &compact_metric_errors,
                     "upstream_body",
                     &err.to_string(),
@@ -1857,6 +1966,9 @@ async fn run_responses_compact_for_authorized_agent(
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         provider_id: Some(decision.provider.id.clone()),
+        selected_provider_key_ref: upstream_request_diagnostics
+            .selected_provider_key_ref
+            .clone(),
         model: decision.model.clone(),
         requested_model: requested_model_for_log.clone(),
         agent_reasoning_effort: reasoning_diagnostics.agent.clone(),
@@ -1924,6 +2036,7 @@ async fn run_responses_compact_for_authorized_agent(
         prefix_state_cache_read_tokens: None,
         status,
         ttft_ms: response_ready_ms,
+        visible_text_ttft_ms: None,
         first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(response_ready_ms, None)),
         local_prepare_ms: None,
@@ -3029,11 +3142,20 @@ async fn run_generation_for_authorized_agent(
     // and options candidates must continue to compare within their ordinary
     // selected-Key realm; attaching a generated-key digest to those runs would
     // make a valid baseline look like a different scope.
+    let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
+        agent_generation,
+        native_responses_passthrough,
+        &active_request_channel,
+        active_used_response_session,
+        response_session_starts_compaction_epoch,
+        trusted_generated_cache_identity.is_some(),
+    );
     let controlled_probe_fields = controlled_cache_probe_fields(
         &config,
         &decision,
         &active_request_channel,
         selected_provider_key.key_id.as_deref(),
+        generated_prompt_cache_key_eligible,
     );
     let validation_uses_generated_key_scope =
         controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
@@ -3067,14 +3189,6 @@ async fn run_generation_for_authorized_agent(
     // remains a fresh semantic epoch, but it is also the root that must warm
     // the next ordinary FullReplay request; omitting a static field only on
     // that root creates an avoidable second placement split.
-    let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
-        agent_generation,
-        native_responses_passthrough,
-        &active_request_channel,
-        active_used_response_session,
-        response_session_starts_compaction_epoch,
-        trusted_generated_cache_identity.is_some(),
-    );
     let generated_prompt_cache_key_promoted = generated_prompt_cache_key_eligible
         && config.generated_prompt_cache_key_promoted_for_scope(
             &decision.provider.id,
@@ -3137,8 +3251,16 @@ async fn run_generation_for_authorized_agent(
     // A generated placement key may also be measured in an explicit candidate
     // run. Promotion certificates remain exact-session scoped, so they cannot
     // make a different conversation eligible.
-    let candidate_cache_routing_requested =
-        shadow_affinity_decision.as_mut().is_some_and(|decision| {
+    // An isolated verifier may request the already-planned Options probe
+    // without starting the normal shadow controller.  This is deliberately
+    // narrower than a generic force flag: it requires the test-instance
+    // marker, the exact `prompt-cache-options` field name, and a planner
+    // result containing that one field only.  It therefore cannot change the
+    // live process or turn an unplanned/multi-field cache control into a wire
+    // mutation.
+    let isolated_options_probe_forced = isolated_options_probe_requested(&controlled_probe_fields);
+    let candidate_cache_routing_requested = isolated_options_probe_forced
+        || shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let channel_eligible =
                 matches!(active_request_channel, Channel::Responses | Channel::Chat)
                     && !controlled_probe_fields.is_empty();
@@ -3493,6 +3615,8 @@ async fn run_generation_for_authorized_agent(
             &response_session_reuse_diagnostics,
             requested_model_for_log.clone(),
             "responses_full_replay_risk_gate",
+            None,
+            None,
         );
         request_log.status = StatusCode::UNPROCESSABLE_ENTITY.as_u16();
         request_log.agent_id = authorized_agent.clone();
@@ -3710,6 +3834,12 @@ async fn run_generation_for_authorized_agent(
         .with_gzip_enabled(
             decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
         )
+        .with_selected_provider_key_ref(affinity_identity::selected_key_ref_id(
+            &config.local_key,
+            &config.workspace_fingerprint,
+            &decision,
+            &selected_provider_key,
+        ))
         .with_upstream_affinity_scope(upstream_affinity_scope)
         .into_dispatch();
     let mut request_plan = Some(frozen_generation.take_one_shot_plan());
@@ -3767,6 +3897,9 @@ async fn run_generation_for_authorized_agent(
     let send_outcome = match initial_send {
         Ok(response) => response,
         Err(err) => {
+            let transport_diagnostics = upstream_transport_error_diagnostics(&err);
+            let transport_error_category = upstream_transport_error_category(&err);
+            let transport_error_metric = upstream_transport_error_metric_message(&err);
             upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                 .take()
                 .and_then(|guard| guard.finish(None, false, false, None, None));
@@ -3788,6 +3921,8 @@ async fn run_generation_for_authorized_agent(
                     &response_session_reuse_diagnostics,
                     requested_model_for_log.clone(),
                     "main-transport",
+                    transport_diagnostics,
+                    Some(transport_error_category),
                 );
                 log.final_scope_waterline =
                     upstream_request_diagnostics.final_scope_waterline.clone();
@@ -3803,9 +3938,12 @@ async fn run_generation_for_authorized_agent(
                     "transport_error",
                     None,
                     None,
-                    vec![("upstream_transport".to_string(), err.to_string())],
+                    vec![(
+                        "upstream_transport".to_string(),
+                        transport_error_metric.clone(),
+                    )],
                     shadow_affinity_decision.clone(),
-                    None,
+                    transport_diagnostics,
                 )
                 .await;
             } else {
@@ -3829,10 +3967,14 @@ async fn run_generation_for_authorized_agent(
                     upstream_request_diagnostics.final_scope_waterline.clone(),
                     None,
                     "main-transport",
-                    upstream_request_diagnostics.attempts.saturating_add(1),
+                    transport_diagnostics
+                        .map(|diagnostics| diagnostics.attempts)
+                        .unwrap_or_else(|| upstream_request_diagnostics.attempts.saturating_add(1)),
+                    transport_diagnostics,
+                    Some(transport_error_category),
                     &request_metric_errors,
                     "upstream_transport",
-                    &err.to_string(),
+                    &transport_error_metric,
                 )
                 .await;
             }
@@ -3915,6 +4057,8 @@ async fn run_generation_for_authorized_agent(
                         &response_session_reuse_diagnostics,
                         requested_model_for_log.clone(),
                         "reasoning-effort-error-body",
+                        Some(&current_send_diagnostics),
+                        None,
                     );
                     log.final_scope_waterline =
                         upstream_request_diagnostics.final_scope_waterline.clone();
@@ -4100,6 +4244,8 @@ async fn run_generation_for_authorized_agent(
                         &response_session_reuse_diagnostics,
                         requested_model_for_log.clone(),
                         "upstream-body",
+                        Some(&upstream_request_diagnostics),
+                        None,
                     );
                     log.final_scope_waterline =
                         upstream_request_diagnostics.final_scope_waterline.clone();
@@ -4138,6 +4284,8 @@ async fn run_generation_for_authorized_agent(
                         &response_session_reuse_diagnostics,
                         requested_model_for_log.clone(),
                         "upstream-body",
+                        Some(&upstream_request_diagnostics),
+                        None,
                     );
                     log.final_scope_waterline =
                         upstream_request_diagnostics.final_scope_waterline.clone();
@@ -4628,6 +4776,9 @@ async fn run_generation_for_authorized_agent(
         upstream_channel: active_request_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         provider_id: Some(decision.provider.id.clone()),
+        selected_provider_key_ref: upstream_request_diagnostics
+            .selected_provider_key_ref
+            .clone(),
         model: decision.model.clone(),
         requested_model: requested_model_for_log.clone(),
         agent_reasoning_effort: None,
@@ -4706,6 +4857,7 @@ async fn run_generation_for_authorized_agent(
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
         status,
         ttft_ms: elapsed,
+        visible_text_ttft_ms: None,
         first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
         local_prepare_ms: Some(local_prepare_ms),
@@ -10105,6 +10257,8 @@ async fn record_upstream_transport_failure(
     agent_id: Option<&str>,
     source: &str,
     upstream_attempt_total: u64,
+    upstream_diagnostics: Option<&UpstreamRequestDiagnostics>,
+    transport_error_category: Option<&str>,
     request_errors: &[(String, String)],
     error_scope: &str,
     error_message: &str,
@@ -10126,6 +10280,8 @@ async fn record_upstream_transport_failure(
         response_session_reuse_diagnostics,
         requested_model,
         source,
+        upstream_diagnostics,
+        transport_error_category,
     );
     let upstream_attempt_total = upstream_attempt_total.max(1);
     log.upstream_attempt_total = Some(upstream_attempt_total);
@@ -10159,6 +10315,8 @@ fn upstream_transport_failure_log(
     response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
     requested_model: Option<String>,
     source: &str,
+    upstream_diagnostics: Option<&UpstreamRequestDiagnostics>,
+    transport_error_category: Option<&str>,
 ) -> RequestLog {
     let elapsed = started.elapsed().as_millis() as u64;
     let body_bytes = serialized_body_len(upstream_channel, body);
@@ -10172,6 +10330,23 @@ fn upstream_transport_failure_log(
     } else {
         body_bytes
     };
+    // A pre-header send error has no response telemetry, but it still has the
+    // exact final wire facts. Do not default these fields from the route: that
+    // would incorrectly report raw body bytes/no gzip and obscure the actual
+    // proxy path. The fallback exists only for local rejections that never
+    // created an outbound request.
+    let outbound = upstream_diagnostics
+        .cloned()
+        .unwrap_or_else(|| UpstreamRequestDiagnostics {
+            network_path: if decision.provider.use_system_proxy {
+                "system-proxy"
+            } else {
+                "direct"
+            },
+            request_body_bytes: body_bytes,
+            sent_body_bytes: body_bytes,
+            ..UpstreamRequestDiagnostics::default()
+        });
 
     RequestLog {
         id: request_id.to_string(),
@@ -10184,6 +10359,7 @@ fn upstream_transport_failure_log(
         upstream_channel: upstream_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         provider_id: Some(decision.provider.id.clone()),
+        selected_provider_key_ref: outbound.selected_provider_key_ref.clone(),
         model: decision.model.clone(),
         requested_model,
         agent_reasoning_effort: body_diagnostics.reasoning.agent.clone(),
@@ -10206,10 +10382,10 @@ fn upstream_transport_failure_log(
         cache_key: cache_key.map(ToOwned::to_owned),
         provider_prefix_key: provider_prefix_key.map(ToOwned::to_owned),
         provider_prefix_fingerprint: provider_prefix_fingerprint.map(ToOwned::to_owned),
-        outbound_prefix_fingerprints: maybe_responses_wire_prefix_fingerprints(
-            upstream_channel,
-            body,
-        ),
+        outbound_prefix_fingerprints: outbound
+            .outbound_prefix_fingerprints
+            .clone()
+            .or_else(|| maybe_responses_wire_prefix_fingerprints(upstream_channel, body)),
         provider_cache_diagnostic: None,
         final_scope_waterline: None,
         shadow_affinity_mode: None,
@@ -10241,41 +10417,52 @@ fn upstream_transport_failure_log(
         prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
         status: 0,
         ttft_ms: elapsed,
+        visible_text_ttft_ms: None,
         first_byte_ms: None,
         upstream_ttft_ms: Some(upstream_ttft_ms(elapsed, Some(prefix_guard_wait.wait_ms))),
         local_prepare_ms: Some(local_prepare_ms),
-        upstream_headers_ms: Some(0),
-        upstream_last_attempt_headers_ms: Some(0),
-        upstream_http_version: None,
-        upstream_network_path: None,
-        upstream_remote_addr: None,
-        upstream_pool_diagnostic: None,
-        upstream_trace_id: None,
-        upstream_trace_source: None,
-        upstream_server_timing: None,
-        upstream_timing_source: None,
-        upstream_reported_processing_ms: None,
-        upstream_non_processing_ms: None,
+        upstream_headers_ms: Some(outbound.headers_ms),
+        upstream_last_attempt_headers_ms: Some(outbound.last_attempt_headers_ms),
+        upstream_http_version: outbound.http_version.clone(),
+        upstream_network_path: Some(outbound.network_path.to_string()),
+        upstream_remote_addr: outbound.remote_addr.clone(),
+        upstream_pool_diagnostic: outbound.pool_diagnostic.clone(),
+        upstream_trace_id: outbound.upstream_trace_id.clone(),
+        upstream_trace_source: outbound.upstream_trace_source.clone(),
+        upstream_server_timing: outbound.server_timing.clone(),
+        upstream_timing_source: outbound.timing_source.clone(),
+        upstream_reported_processing_ms: outbound.reported_processing_ms,
+        upstream_non_processing_ms: outbound.non_processing_ms,
         upstream_first_chunk_ms: None,
         stream_upstream_wait_ms: None,
         stream_client_backpressure_ms: None,
         aggregate_done_ms: None,
-        upstream_retry_wait_ms: Some(0),
-        upstream_attempts: Some(1),
-        request_body_bytes: Some(body_bytes),
-        sent_body_bytes: Some(body_bytes),
-        request_body_encode_ms: Some(0),
-        gzip_encode_ms: Some(0),
-        gzip_attempted: Some(false),
-        gzip_fallback_used: Some(false),
-        upstream_header_wait_class: Some(format!(
-            "{}:transport_error",
-            if decision.provider.use_system_proxy {
-                "system-proxy"
-            } else {
-                "direct"
-            }
-        )),
+        upstream_retry_wait_ms: Some(outbound.retry_wait_ms),
+        upstream_attempts: Some(outbound.attempts.max(1)),
+        request_body_bytes: Some(outbound.request_body_bytes),
+        sent_body_bytes: Some(outbound.sent_body_bytes),
+        request_body_encode_ms: Some(outbound.request_body_encode_ms),
+        gzip_encode_ms: Some(outbound.gzip_encode_ms),
+        gzip_attempted: Some(outbound.gzip_attempted),
+        gzip_fallback_used: Some(outbound.gzip_fallback_used),
+        upstream_header_wait_class: Some(match transport_error_category {
+            Some(category) => format!(
+                "{}:transport_error:{category}",
+                if outbound.network_path.is_empty() {
+                    "direct"
+                } else {
+                    outbound.network_path
+                }
+            ),
+            None => format!(
+                "{}:transport_error",
+                if outbound.network_path.is_empty() {
+                    "direct"
+                } else {
+                    outbound.network_path
+                }
+            ),
+        }),
         total_ms: elapsed,
         input_tokens: None,
         output_tokens: None,
@@ -10403,6 +10590,7 @@ async fn cache_hit_response(
         upstream_channel: decision.upstream_channel.label().to_string(),
         provider: decision.provider.name.clone(),
         provider_id: Some(decision.provider.id.clone()),
+        selected_provider_key_ref: None,
         model: decision.model.clone(),
         requested_model,
         agent_reasoning_effort: None,
@@ -10450,6 +10638,7 @@ async fn cache_hit_response(
         prefix_state_cache_read_tokens: None,
         status: hit.entry.status,
         ttft_ms: elapsed,
+        visible_text_ttft_ms: None,
         first_byte_ms: None,
         upstream_ttft_ms: Some(0),
         local_prepare_ms: None,
@@ -11655,6 +11844,7 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
             .as_ref()
             .map(|body| body.len() as u64)
             .unwrap_or(original_body_len),
+        selected_provider_key_ref: plan.selected_provider_key_ref().map(ToOwned::to_owned),
         outbound_prefix_fingerprints,
         ..UpstreamRequestDiagnostics::default()
     };
@@ -11773,7 +11963,12 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
                     affinity.clear(scope);
                 }
             }
-            Err(err.into())
+            Err(UpstreamTransportError {
+                category: classify_reqwest_transport_error(&err),
+                source: err,
+                diagnostics,
+            }
+            .into())
         }
     }
 }
@@ -13008,6 +13203,7 @@ fn controlled_cache_probe_fields(
     decision: &RouteDecision,
     channel: &Channel,
     key_id: Option<&str>,
+    generated_prompt_cache_key_eligible: bool,
 ) -> Vec<ProviderCacheCapabilityField> {
     let accepted = |field| {
         config.cache_capability_probe_accepted_for_key(
@@ -13030,20 +13226,65 @@ fn controlled_cache_probe_fields(
                 )
                 .is_some_and(|record| record.effect_status == ProviderCacheEffectStatus::Unverified)
     };
+    // A generated key is the only candidate that can preserve the same
+    // trusted session placement on the eventual production wire.  When that
+    // exact FullReplay path is available and still lacks an effect verdict,
+    // validate it before the retention-only probe. Historical retention-on-
+    // PCK checks were deliberately no-op, so testing retention first would
+    // postpone the only candidate with a plausible cache-placement gain.
+    // This remains validation-only: it cannot enable the field on ordinary
+    // traffic until an exact-scope effect certificate is promoted.
+    if generated_prompt_cache_key_eligible
+        && awaiting_effect(ProviderCacheCapabilityField::PromptCacheKey)
+    {
+        return vec![ProviderCacheCapabilityField::PromptCacheKey];
+    }
     if decision.provider.prompt_cache_retention_enabled
         && awaiting_effect(ProviderCacheCapabilityField::PromptCacheRetention)
     {
         return vec![ProviderCacheCapabilityField::PromptCacheRetention];
     }
-    for field in [ProviderCacheCapabilityField::PromptCacheOptions] {
+    // Once a field has a terminal effect verdict (promoted, no-benefit, or
+    // error), it is no longer an actionable probe. Keep walking the field
+    // ladder so one exhausted experiment cannot starve the next cache
+    // candidate indefinitely. Breakpoint is deliberately last because its
+    // exact insertion placement is an additional scope dimension.
+    for field in [
+        ProviderCacheCapabilityField::PromptCacheOptions,
+        ProviderCacheCapabilityField::PromptCacheBreakpoint,
+    ] {
         if awaiting_effect(field) {
             return vec![field];
         }
     }
-    accepted(ProviderCacheCapabilityField::PromptCacheKey)
-        .then_some(ProviderCacheCapabilityField::PromptCacheKey)
-        .into_iter()
-        .collect()
+    Vec::new()
+}
+
+fn isolated_options_probe_requested(
+    controlled_probe_fields: &[ProviderCacheCapabilityField],
+) -> bool {
+    isolated_options_probe_requested_with_env(
+        std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOAPI_FORCE_ISOLATED_CACHE_CONTROL_FIELD")
+            .ok()
+            .as_deref(),
+        controlled_probe_fields,
+    )
+}
+
+fn isolated_options_probe_requested_with_env(
+    isolated_test_instance: Option<&str>,
+    forced_field: Option<&str>,
+    controlled_probe_fields: &[ProviderCacheCapabilityField],
+) -> bool {
+    isolated_test_instance == Some("1")
+        && forced_field == Some("prompt-cache-options")
+        && matches!(
+            controlled_probe_fields,
+            [ProviderCacheCapabilityField::PromptCacheOptions]
+        )
 }
 
 /// A cache-validation candidate is only evidence when its one selected
@@ -17671,6 +17912,163 @@ mod tests {
     }
 
     #[test]
+    fn controlled_cache_probe_prefers_unverified_generated_key_when_full_replay_is_eligible() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://provider.example/v1".to_string());
+        provider.id = "candidate-priority".to_string();
+        provider.prompt_cache_retention_enabled = true;
+        let decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-terra".to_string(),
+        };
+        let key_id = Some("key-priority");
+        for field in [
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+        ] {
+            config.record_cache_capability_probe_for_key(
+                &decision.provider.id,
+                &decision.model,
+                Channel::Responses,
+                key_id,
+                field,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+        }
+
+        assert_eq!(
+            controlled_cache_probe_fields(
+                &config,
+                &decision,
+                &Channel::Responses,
+                key_id,
+                true,
+            ),
+            vec![ProviderCacheCapabilityField::PromptCacheKey],
+            "the trusted native FullReplay candidate must validate PCK before a known-no-op retention probe"
+        );
+        assert_eq!(
+            controlled_cache_probe_fields(&config, &decision, &Channel::Responses, key_id, false,),
+            vec![ProviderCacheCapabilityField::PromptCacheRetention],
+            "non-eligible request shapes must retain the conservative retention-only probe order"
+        );
+    }
+
+    #[test]
+    fn controlled_cache_probe_skips_terminal_effects_and_reaches_breakpoint() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://provider.example/v1".to_string());
+        provider.id = "candidate-ladder".to_string();
+        provider.prompt_cache_retention_enabled = true;
+        let decision = RouteDecision {
+            provider,
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.6-terra".to_string(),
+        };
+        let key_id = Some("key-ladder");
+        for field in ProviderCacheCapabilityField::ALL {
+            config.record_cache_capability_probe_for_key(
+                &decision.provider.id,
+                &decision.model,
+                Channel::Responses,
+                key_id,
+                field,
+                ProviderCacheCapabilityStatus::Verified,
+                None,
+            );
+        }
+
+        let effect_status = |config: &mut AppConfig,
+                             field: ProviderCacheCapabilityField,
+                             status: ProviderCacheEffectStatus| {
+            config
+                .provider_cache_capabilities
+                .iter_mut()
+                .find(|item| {
+                    item.provider_id == decision.provider.id
+                        && item.model_id == decision.model
+                        && item.key_id.as_deref() == key_id
+                        && item.field == field
+                })
+                .expect("the test capability record must exist")
+                .effect_status = status;
+        };
+
+        effect_status(
+            &mut config,
+            ProviderCacheCapabilityField::PromptCacheKey,
+            ProviderCacheEffectStatus::NoBenefit,
+        );
+        assert_eq!(
+            controlled_cache_probe_fields(&config, &decision, &Channel::Responses, key_id, true,),
+            vec![ProviderCacheCapabilityField::PromptCacheRetention],
+            "a terminal PCK verdict must advance the ladder instead of re-probing PCK"
+        );
+
+        effect_status(
+            &mut config,
+            ProviderCacheCapabilityField::PromptCacheRetention,
+            ProviderCacheEffectStatus::NoBenefit,
+        );
+        effect_status(
+            &mut config,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheEffectStatus::Error,
+        );
+        assert_eq!(
+            controlled_cache_probe_fields(&config, &decision, &Channel::Responses, key_id, false,),
+            vec![ProviderCacheCapabilityField::PromptCacheBreakpoint],
+            "the breakpoint probe must remain reachable after earlier fields finish"
+        );
+
+        effect_status(
+            &mut config,
+            ProviderCacheCapabilityField::PromptCacheBreakpoint,
+            ProviderCacheEffectStatus::Promoted,
+        );
+        assert!(
+            controlled_cache_probe_fields(&config, &decision, &Channel::Responses, key_id, false,)
+                .is_empty(),
+            "a fully adjudicated capability ladder must stop issuing probes"
+        );
+    }
+
+    #[test]
+    fn isolated_options_probe_requires_exact_test_gate_and_single_planned_field() {
+        let options = [ProviderCacheCapabilityField::PromptCacheOptions];
+        assert!(isolated_options_probe_requested_with_env(
+            Some("1"),
+            Some("prompt-cache-options"),
+            &options,
+        ));
+        assert!(!isolated_options_probe_requested_with_env(
+            None,
+            Some("prompt-cache-options"),
+            &options,
+        ));
+        assert!(!isolated_options_probe_requested_with_env(
+            Some("0"),
+            Some("prompt-cache-options"),
+            &options,
+        ));
+        assert!(!isolated_options_probe_requested_with_env(
+            Some("1"),
+            Some("prompt-cache-key"),
+            &options,
+        ));
+        assert!(!isolated_options_probe_requested_with_env(
+            Some("1"),
+            Some("prompt-cache-options"),
+            &[
+                ProviderCacheCapabilityField::PromptCacheKey,
+                ProviderCacheCapabilityField::PromptCacheOptions,
+            ],
+        ));
+    }
+
+    #[test]
     fn transient_scope_cooldowns_prune_expiry_and_have_a_hard_cardinality_bound() {
         let mut cooldowns = HashMap::new();
         cooldowns.insert(
@@ -17894,6 +18292,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: provider.api_key_encrypted.clone().unwrap_or_default(),
             key_id: None,
+            encrypted_material_digest: None,
         };
         let realm_id = affinity_identity::realm_id(&decision, &selected_key);
         cache_validation::CacheValidationScope {
@@ -21097,6 +21496,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: "key-a-secret".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let exact_scope = cache_validation::CacheValidationScope {
             channel: Channel::Responses,
@@ -21535,6 +21935,7 @@ mod tests {
         let first_key = SelectedProviderKey {
             secret: "first-upstream-secret".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let rotated_key = SelectedProviderKey {
             secret: "rotated-upstream-secret".to_string(),
@@ -21542,6 +21943,7 @@ mod tests {
             // includes the secret digest, so it must still create a distinct
             // upstream cache placement.
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
 
         let first = generated_prompt_cache_key(&identity, &decision, &first_key);
@@ -21562,10 +21964,12 @@ mod tests {
         let direct_key = SelectedProviderKey {
             secret: "direct-upstream-secret".to_string(),
             key_id: None,
+            encrypted_material_digest: None,
         };
         let pooled_key = SelectedProviderKey {
             secret: "pooled-upstream-secret".to_string(),
             key_id: Some("pool-key".to_string()),
+            encrypted_material_digest: None,
         };
         assert_eq!(
             selected_prompt_cache_placement_key(
@@ -22499,10 +22903,12 @@ mod tests {
         let first_key = SelectedProviderKey {
             secret: "first-provider-key".to_string(),
             key_id: Some("first".to_string()),
+            encrypted_material_digest: None,
         };
         let rotated_key = SelectedProviderKey {
             secret: "rotated-provider-key".to_string(),
             key_id: Some("rotated".to_string()),
+            encrypted_material_digest: None,
         };
         let first_realm_key = provider_prefix_control_key_for_selected_key(
             Some("stable-provider-key"),
@@ -22604,6 +23010,7 @@ mod tests {
         let selected = SelectedProviderKey {
             secret: "selected-key".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let v4 = provider_prefix_control_key_for_selected_key(
             Some("stable-fingerprint"),
@@ -22630,6 +23037,7 @@ mod tests {
         let selected = SelectedProviderKey {
             secret: "selected-key".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let v4 = provider_prefix_control_key_for_selected_key(
             Some("stable-fingerprint"),
@@ -22667,6 +23075,7 @@ mod tests {
         let selected = SelectedProviderKey {
             secret: "selected-key".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let default_key = provider_prefix_control_key_for_selected_key(
             Some("stable-fingerprint"),
@@ -23152,6 +23561,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: "secret".to_string(),
             key_id: Some("key-record".to_string()),
+            encrypted_material_digest: None,
         };
         let affinity_a = affinity_identity::derive(
             &config,
@@ -24761,10 +25171,12 @@ mod tests {
         let key_a = SelectedProviderKey {
             secret: "upstream-secret-a".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let key_b = SelectedProviderKey {
             secret: "upstream-secret-b".to_string(),
             key_id: Some("key-b".to_string()),
+            encrypted_material_digest: None,
         };
         let raw = "codex-native-placement-key";
 
@@ -24904,6 +25316,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: "upstream-secret".to_string(),
             key_id: Some("key-a".to_string()),
+            encrypted_material_digest: None,
         };
         let fallback_request = json!({
             "input": [{"role": "user", "content": "same first message"}]
@@ -40363,6 +40776,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: provider.api_key_encrypted.clone().unwrap_or_default(),
             key_id: None,
+            encrypted_material_digest: None,
         };
         let validation_scope = cache_validation::CacheValidationScope {
             channel: Channel::Responses,
@@ -41366,6 +41780,8 @@ mod tests {
                 &ResponseSessionReuseDiagnostics::default(),
                 Some("gpt-5.5".to_string()),
                 "test-post-burst",
+                None,
+                None,
             );
             request_log.status = 200;
             request_log.cache_status = "bypass".to_string();
@@ -43279,6 +43695,98 @@ mod tests {
         assert!(outcome.diagnostics.gzip_attempted);
         assert!(!outcome.diagnostics.gzip_fallback_used);
         assert!(outcome.diagnostics.sent_body_bytes < outcome.diagnostics.request_body_bytes);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn pre_header_transport_error_preserves_final_wire_diagnostics() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-pre-header-transport-diagnostics-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let url = format!("http://127.0.0.1:{unavailable_port}/v1/responses");
+        let provider = test_responses_provider(url.clone());
+        let body = json!({
+            "model": "gpt-test",
+            "stream": false,
+            "input": [{
+                "role": "user",
+                "content": "x".repeat(320_000)
+            }]
+        });
+        let error = send_main_upstream_request(
+            &state,
+            "upstream-key",
+            RequestPlan::new(&provider, url, Channel::Responses, &body)
+                .with_gzip_enabled(true)
+                .with_selected_provider_key_ref(Some("opaque-key-ref".to_string()))
+                .into_one_shot(),
+            &HeaderMap::new(),
+        )
+        .await
+        .expect_err("the closed local port must fail before response headers");
+        let diagnostics = upstream_transport_error_diagnostics(&error)
+            .expect("a pre-header transport error must retain its exact final wire diagnostics");
+
+        assert_eq!(diagnostics.network_path, "direct");
+        assert_eq!(diagnostics.attempts, 1);
+        assert_eq!(
+            diagnostics.selected_provider_key_ref.as_deref(),
+            Some("opaque-key-ref")
+        );
+        assert!(diagnostics.headers_ms < 10_000);
+        assert!(diagnostics.gzip_attempted);
+        assert!(diagnostics.sent_body_bytes < diagnostics.request_body_bytes);
+        assert_eq!(upstream_transport_error_category(&error), "connection");
+        assert_eq!(
+            upstream_transport_error_metric_message(&error),
+            "transport:connection"
+        );
+
+        let log = upstream_transport_failure_log(
+            "pre-header-test",
+            &Instant::now(),
+            &Channel::Responses,
+            &Channel::Responses,
+            &RouteDecision {
+                provider,
+                upstream_channel: Channel::Responses,
+                model: "gpt-test".to_string(),
+            },
+            None,
+            None,
+            None,
+            &PrefixGuardWaitDiagnostics::default(),
+            0,
+            &body_diagnostics(&Channel::Responses, &body, &body, false),
+            &body,
+            false,
+            &ResponseSessionReuseDiagnostics::default(),
+            None,
+            "test-pre-header",
+            Some(diagnostics),
+            Some(upstream_transport_error_category(&error)),
+        );
+        assert_eq!(log.upstream_network_path.as_deref(), Some("direct"));
+        assert_eq!(log.upstream_attempts, Some(1));
+        assert_eq!(
+            log.selected_provider_key_ref.as_deref(),
+            Some("opaque-key-ref")
+        );
+        assert_eq!(log.gzip_attempted, Some(true));
+        assert!(log.sent_body_bytes.unwrap_or(u64::MAX) < log.request_body_bytes.unwrap_or(0));
+        assert_eq!(
+            log.upstream_header_wait_class.as_deref(),
+            Some("direct:transport_error:connection")
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -45503,6 +46011,7 @@ mod tests {
         let selected_key = SelectedProviderKey {
             secret: "upstream-key".to_string(),
             key_id: None,
+            encrypted_material_digest: None,
         };
         let continuation_scope = ContinuationScope::from_action_scope(
             &CompositeActionScope::derive(ActionScopeInput {

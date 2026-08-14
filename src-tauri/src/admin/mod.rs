@@ -121,6 +121,22 @@ pub struct ProviderKeyTestResult {
     pub models_count: usize,
 }
 
+/// Lightweight runtime state for an already-saved multi-Key editor. It
+/// intentionally omits Key previews and secrets so the UI can poll the live
+/// routing switch and health status without repeatedly rebuilding all config.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderKeyPoolHealthSnapshot {
+    pub provider_id: String,
+    pub keys: Vec<ProviderKeyPoolHealthEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderKeyPoolHealthEntry {
+    pub id: String,
+    pub enabled: bool,
+    pub status: crate::config::ProviderKeyStatus,
+}
+
 /// Explicit management-only probe variants. These use the standard upstream
 /// request shapes without entering the normal relay, routing, or cache path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -333,6 +349,40 @@ pub struct ModelInput {
 #[tauri::command]
 pub async fn get_config(state: State<'_, Arc<AppState>>) -> CommandResult<PublicConfig> {
     Ok(state.public_config().await)
+}
+
+#[tauri::command]
+pub async fn get_provider_key_pool_health(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+) -> CommandResult<ProviderKeyPoolHealthSnapshot> {
+    let config = state.config.read().await;
+    Ok(provider_key_pool_health_snapshot(&config, &provider_id))
+}
+
+fn provider_key_pool_health_snapshot(
+    config: &AppConfig,
+    provider_id: &str,
+) -> ProviderKeyPoolHealthSnapshot {
+    let keys = config
+        .provider_key_pools
+        .iter()
+        .find(|pool| pool.provider_id == provider_id)
+        .map(|pool| {
+            pool.keys
+                .iter()
+                .map(|key| ProviderKeyPoolHealthEntry {
+                    id: key.id.clone(),
+                    enabled: key.enabled,
+                    status: key.status.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ProviderKeyPoolHealthSnapshot {
+        provider_id: provider_id.to_string(),
+        keys,
+    }
 }
 
 #[tauri::command]
@@ -3872,6 +3922,52 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn key_pool_health_snapshot_exposes_live_toggle_and_status_only() {
+        let now = Utc::now();
+        let mut config = AppConfig::default();
+        config
+            .provider_key_pools
+            .push(crate::config::ProviderKeyPoolConfig {
+                provider_id: "provider-a".to_string(),
+                enabled: true,
+                strategy: crate::config::KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 3,
+                recovery_minutes: 10,
+                next_index: 0,
+                keys: vec![crate::config::ProviderKeyConfig {
+                    id: "quota-key".to_string(),
+                    alias: Some("quota key".to_string()),
+                    key_encrypted: Some("encrypted-secret".to_string()),
+                    enabled: false,
+                    priority: 5,
+                    status: crate::config::ProviderKeyStatus::Unhealthy,
+                    total_requests: 4,
+                    successes: 3,
+                    failures: 1,
+                    last_checked_at: Some(now),
+                    last_error: Some("insufficient balance".to_string()),
+                    disabled_until: None,
+                    created_at: now,
+                    updated_at: now,
+                }],
+                updated_at: now,
+            });
+
+        let snapshot = provider_key_pool_health_snapshot(&config, "provider-a");
+        assert_eq!(snapshot.provider_id, "provider-a");
+        assert_eq!(snapshot.keys.len(), 1);
+        assert_eq!(snapshot.keys[0].id, "quota-key");
+        assert!(!snapshot.keys[0].enabled);
+        assert_eq!(
+            snapshot.keys[0].status,
+            crate::config::ProviderKeyStatus::Unhealthy
+        );
+        assert!(provider_key_pool_health_snapshot(&config, "missing")
+            .keys
+            .is_empty());
     }
 
     #[test]

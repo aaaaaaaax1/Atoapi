@@ -56,6 +56,19 @@ impl FinalResponsesWirePlan {
         self
     }
 
+    /// Carries an opaque selected-Key reference through the final wire plan
+    /// to local terminal diagnostics. It never changes the sealed wire or
+    /// enters the upstream request.
+    pub(super) fn with_selected_provider_key_ref(
+        mut self,
+        selected_provider_key_ref: Option<String>,
+    ) -> Self {
+        self.envelope = self
+            .envelope
+            .with_selected_provider_key_ref(selected_provider_key_ref);
+        self
+    }
+
     pub(super) fn with_upstream_affinity_scope(
         mut self,
         scope: Option<UpstreamAffinityScope>,
@@ -193,12 +206,18 @@ mod tests {
             cache_plan,
             None,
         )
+        .with_selected_provider_key_ref(Some("opaque-key-reference".to_string()))
         .with_upstream_affinity_scope(Some(scope));
 
         let expected_wire = plan.request_plan().wire().body().to_vec();
         let mut dispatch = plan.into_dispatch();
         let one_shot = dispatch.take_one_shot_plan();
         assert_eq!(one_shot.wire().body().as_ref(), expected_wire.as_slice());
+        assert_eq!(
+            one_shot.selected_provider_key_ref(),
+            Some("opaque-key-reference"),
+            "the selected Key reference remains local transport metadata"
+        );
         assert!(one_shot.upstream_affinity_scope().is_some());
         assert!(
             !format!("{one_shot:?}").contains("opaque-trusted-session-scope"),

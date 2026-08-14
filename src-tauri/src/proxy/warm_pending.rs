@@ -21,6 +21,7 @@ const WARM_PENDING_MAX_ENTRIES: usize = 64;
 enum PendingMaturityKind {
     GiantColdRoot,
     MaterialToolTail,
+    ExactMediumToolTail,
     ProviderWaterlineRollback,
     ExactPendingTailLag,
     ToolCallOnlyExactPendingTailLag,
@@ -37,6 +38,11 @@ impl PendingMaturityKind {
             // child, then fail open. A later tool result has a different
             // exact predecessor and therefore earns its own one-shot window.
             Self::MaterialToolTail => 1,
+            // A 4-8 KiB tool result is normally too small to inherit the
+            // material-tail path. When the final-scope ledger proves a small
+            // already-sent residual on the exact predecessor, however, its
+            // one quiet direct child has the same bounded opportunity.
+            Self::ExactMediumToolTail => 1,
             // A proven upstream waterline rollback gets one direct successor.
             // Persistent provider loss must fail open after that one window.
             Self::ProviderWaterlineRollback => 1,
@@ -65,6 +71,7 @@ impl PendingMaturityKind {
             // cross the short maturation boundary.  If that child arrives
             // later, it sends immediately rather than waiting again.
             Self::MaterialToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
+            Self::ExactMediumToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ProviderWaterlineRollback => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ToolCallOnlyExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
@@ -76,6 +83,7 @@ impl PendingMaturityKind {
         match self {
             Self::GiantColdRoot => "responses_giant_cold_prefix_warm_pending",
             Self::MaterialToolTail => "responses_material_tool_tail_maturity_pending",
+            Self::ExactMediumToolTail => "responses_exact_medium_tool_tail_maturity_pending",
             Self::ProviderWaterlineRollback => "responses_provider_waterline_rollback_pending",
             Self::ExactPendingTailLag => "responses_exact_pending_tail_lag",
             Self::ToolCallOnlyExactPendingTailLag => "responses_tool_call_exact_pending_tail_lag",
@@ -148,6 +156,7 @@ impl WarmPendingClaim {
     ) -> bool {
         match self.kind {
             PendingMaturityKind::MaterialToolTail
+            | PendingMaturityKind::ExactMediumToolTail
             | PendingMaturityKind::ProviderWaterlineRollback => {
                 !compaction_requested && direct_followup_is_settle_safe(tail)
             }
@@ -400,6 +409,10 @@ fn pending_maturity(
     } else if material_tool_tail_has_exact_predecessor(raw_usage, tail, final_scope) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::MaterialToolTail,
+        })
+    } else if exact_medium_tool_tail_has_pending_residual(raw_usage, tail, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ExactMediumToolTail,
         })
     } else if provider_waterline_rollback(raw_usage, final_scope) {
         Some(PendingMaturity {
@@ -667,6 +680,44 @@ fn material_tool_tail_has_exact_predecessor(
         return false;
     }
     true
+}
+
+/// A 4-8 KiB tool result is real context on its own request, so it must not
+/// be folded into the broad material-tail policy.  The final-scope ledger can
+/// nevertheless prove a small, already-sent residual on the exact same
+/// predecessor.  In that narrow case, allow one quiet direct child to wait
+/// for at most the existing 500ms cap.  This never rewrites either request or
+/// adds another upstream dispatch.
+fn exact_medium_tool_tail_has_pending_residual(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MIN_TOOL_OUTPUT_CHARS: u64 = 4_096;
+    const MAX_TOOL_OUTPUT_CHARS: u64 = 8_191;
+    const MAX_PENDING_TOKENS_128: u64 = 1_024;
+
+    let Some(record) = raw_usage else {
+        return false;
+    };
+    let tool_output_chars = tail.tool_output_chars.max(tail.largest_tool_output_chars);
+    let tool_or_mixed = matches!(
+        tail.source.as_deref(),
+        Some("tool_output") | Some("mixed") | Some("tool_call")
+    );
+    record.input_tokens >= 16_384
+        && tail.input_items > 0
+        && tool_or_mixed
+        && (MIN_TOOL_OUTPUT_CHARS..=MAX_TOOL_OUTPUT_CHARS).contains(&tool_output_chars)
+        && final_scope.outcome == "settled"
+        && final_scope.sent_prediction_eligible
+        && final_scope.predecessor_exact
+        && final_scope.predecessor_bound
+        && !final_scope.continuity_reset
+        && final_scope.rollback_tokens_128 == 0
+        && final_scope.raw_cache_read_tokens == record.cache_read_tokens
+        && final_scope.sent_prefix_bucket_tokens_128 > final_scope.settled_prefix_bucket_tokens_128
+        && (128..=MAX_PENDING_TOKENS_128).contains(&final_scope.candidate_avoidable_tokens_128)
 }
 
 #[cfg(test)]
@@ -1033,6 +1084,51 @@ mod tests {
             ),
             "a new material or noisy child must retain immediate dispatch"
         );
+    }
+
+    #[test]
+    fn exact_medium_tool_tail_with_sent_residual_arms_one_safe_direct_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let medium_tool_tail = TailInputDiagnostics {
+            input_items: 3,
+            tool_output_chars: 6_144,
+            largest_tool_output_chars: 6_144,
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&exact_log_with_gap(scope, 88_064, 512)),
+            Some(&root),
+            Some(&warm_tool_replay()),
+            &medium_tool_tail,
+            true,
+            false,
+        );
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect(
+                "an exact 4-8KiB tool tail with a sent residual must arm its one safe direct child",
+            );
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_exact_medium_tool_tail_maturity_pending"
+        );
+        assert!(claim.followup_is_settle_safe(&TailInputDiagnostics::default(), false));
+
+        let no_pending_residual = exact_log_with_gap(scope, 88_064, 0);
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&warm_tool_replay()),
+            &medium_tool_tail,
+            &no_pending_residual,
+        ));
     }
 
     #[test]

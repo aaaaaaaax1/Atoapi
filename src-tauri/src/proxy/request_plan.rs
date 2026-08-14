@@ -12,6 +12,12 @@ pub(super) struct RequestPlan {
     explicit_proxy_url: Option<String>,
     custom_user_agent: Option<String>,
     request_body_gzip_enabled: bool,
+    // An opaque, local-only reference to the already selected pooled Key.
+    // It is transport metadata only: it never affects the frozen wire body or
+    // is sent to the upstream.  Keeping it on the one-shot plan lets every
+    // terminal path, including a pre-header transport error, retain the exact
+    // selected-Key evidence needed for fail-closed release verification.
+    selected_provider_key_ref: Option<String>,
     upstream_affinity_scope: Option<UpstreamAffinityScope>,
     wire: PreparedWireRequest,
 }
@@ -47,6 +53,7 @@ impl RequestPlan {
             explicit_proxy_url: None,
             custom_user_agent: provider.custom_user_agent.clone(),
             request_body_gzip_enabled: provider.request_body_gzip_enabled,
+            selected_provider_key_ref: None,
             upstream_affinity_scope: None,
             wire,
         }
@@ -59,6 +66,18 @@ impl RequestPlan {
 
     pub(super) fn with_explicit_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.explicit_proxy_url = self.use_system_proxy.then_some(proxy_url).flatten();
+        self
+    }
+
+    /// Binds an already selected pooled Key to local terminal diagnostics.
+    /// The caller provides an opaque one-way reference, never a secret or raw
+    /// Key ID. It deliberately has no effect on the upstream wire.
+    pub(super) fn with_selected_provider_key_ref(
+        mut self,
+        selected_provider_key_ref: Option<String>,
+    ) -> Self {
+        self.selected_provider_key_ref =
+            selected_provider_key_ref.filter(|value| !value.trim().is_empty());
         self
     }
 
@@ -103,6 +122,10 @@ impl RequestPlan {
         self.request_body_gzip_enabled
     }
 
+    pub(super) fn selected_provider_key_ref(&self) -> Option<&str> {
+        self.selected_provider_key_ref.as_deref()
+    }
+
     pub(super) fn upstream_affinity_scope(&self) -> Option<&UpstreamAffinityScope> {
         self.upstream_affinity_scope.as_ref()
     }
@@ -139,6 +162,10 @@ impl OneShotRequestPlan {
 
     pub(super) fn request_body_gzip_enabled(&self) -> bool {
         self.plan.request_body_gzip_enabled()
+    }
+
+    pub(super) fn selected_provider_key_ref(&self) -> Option<&str> {
+        self.plan.selected_provider_key_ref()
     }
 
     pub(super) fn upstream_affinity_scope(&self) -> Option<&UpstreamAffinityScope> {

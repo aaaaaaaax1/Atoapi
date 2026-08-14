@@ -79,6 +79,78 @@ pub(super) fn key_realm_id(selected_key: &SelectedProviderKey) -> String {
     hash_parts(&["key-record-v2", key_id, &secret_digest])
 }
 
+/// Legacy v2 reference retained only to recognize metrics written by a prior
+/// development build. New requests must use [`selected_key_ref_id`].
+pub(super) fn selected_key_ref_id_v2(
+    local_key: &str,
+    workspace_fingerprint: &str,
+    provider_id: &str,
+    selected_key: &SelectedProviderKey,
+) -> Option<String> {
+    let local_key = local_key.trim();
+    let workspace_fingerprint = workspace_fingerprint.trim();
+    let provider_id = provider_id.trim();
+    let key_id = selected_key.key_id.as_deref()?.trim();
+    if local_key.is_empty()
+        || workspace_fingerprint.is_empty()
+        || provider_id.is_empty()
+        || key_id.is_empty()
+    {
+        return None;
+    }
+    Some(hash_parts(&[
+        "selected-provider-key-ref-v2",
+        local_key,
+        workspace_fingerprint,
+        provider_id,
+        key_id,
+    ]))
+}
+
+/// A locally keyed observability reference for a selected pooled Key. It
+/// intentionally contains no upstream Key material. Its v3 scope additionally
+/// binds the saved encrypted Key record and current upstream placement, so an
+/// isolated verifier can map it without decrypting the desktop user's DPAPI
+/// material. The local proxy token remains a private salt, preventing a
+/// metrics observer from enumerating friendly Key IDs from the reference.
+pub(super) fn selected_key_ref_id(
+    local_key: &str,
+    workspace_fingerprint: &str,
+    decision: &RouteDecision,
+    selected_key: &SelectedProviderKey,
+) -> Option<String> {
+    let local_key = local_key.trim();
+    let workspace_fingerprint = workspace_fingerprint.trim();
+    let provider_id = decision.provider.id.trim();
+    let provider_deployment = normalized_deployment(&decision.provider.base_url);
+    let channel = decision.upstream_channel.label();
+    let model = decision.model.trim();
+    let key_id = selected_key.key_id.as_deref()?.trim();
+    let encrypted_material_digest = selected_key.encrypted_material_digest.as_deref()?.trim();
+    if local_key.is_empty()
+        || workspace_fingerprint.is_empty()
+        || provider_id.is_empty()
+        || provider_deployment.is_empty()
+        || channel.is_empty()
+        || model.is_empty()
+        || key_id.is_empty()
+        || encrypted_material_digest.is_empty()
+    {
+        return None;
+    }
+    Some(hash_parts(&[
+        "selected-provider-key-ref-v3",
+        local_key,
+        workspace_fingerprint,
+        provider_id,
+        &provider_deployment,
+        channel,
+        model,
+        key_id,
+        encrypted_material_digest,
+    ]))
+}
+
 pub(super) fn realm_id(decision: &RouteDecision, selected_key: &SelectedProviderKey) -> String {
     let provider_deployment = normalized_deployment(&decision.provider.base_url);
     let channel = decision.upstream_channel.label();
@@ -365,11 +437,12 @@ mod tests {
 
     fn context() -> (AppConfig, RouteDecision, SelectedProviderKey) {
         let mut config = AppConfig::default();
+        config.local_key = "local-key-a".to_string();
         config.workspace_fingerprint = "workspace-a".to_string();
         let provider = ProviderConfig {
             id: "provider-a".to_string(),
             name: "Provider A".to_string(),
-            base_url: "https://example.test/v1".to_string(),
+            base_url: "https://provider-a.example/v1".to_string(),
             models_url: None,
             is_full_url: false,
             custom_user_agent: None,
@@ -388,11 +461,12 @@ mod tests {
             RouteDecision {
                 provider,
                 upstream_channel: Channel::Responses,
-                model: "gpt-5.5".to_string(),
+                model: "model-a".to_string(),
             },
             SelectedProviderKey {
                 secret: "secret-value".to_string(),
-                key_id: Some("key-record-a".to_string()),
+                key_id: Some("key-a".to_string()),
+                encrypted_material_digest: Some(hash_text("dpapi:opaque-encrypted-key-a")),
             },
         )
     }
@@ -495,9 +569,123 @@ mod tests {
             &SelectedProviderKey {
                 secret: "other-secret".to_string(),
                 key_id: Some("key-record-b".to_string()),
+                encrypted_material_digest: Some(hash_text("dpapi:encrypted-record-b")),
             },
         );
         assert_ne!(first.realm_id, second.realm_id);
+    }
+
+    #[test]
+    fn selected_key_reference_v3_is_placement_bound_and_never_contains_key_material() {
+        let (config, decision, key) = context();
+        let reference = selected_key_ref_id(
+            &config.local_key,
+            &config.workspace_fingerprint,
+            &decision,
+            &key,
+        )
+        .expect("pooled Key must have an opaque reference");
+        assert_eq!(reference.len(), 64);
+        assert_eq!(
+            reference, "df14495c4f3e6b1fc68cd3a3e7f564bec796df46eb2795a955bda5a1d237d4be",
+            "Rust and the PowerShell resolver must share the v3 hash contract"
+        );
+        assert!(!reference.contains("key-record-a"));
+        assert!(!reference.contains("secret-value"));
+        assert_ne!(
+            reference,
+            selected_key_ref_id_v2(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &decision.provider.id,
+                &key,
+            )
+            .expect("v2 compatibility reference remains available")
+        );
+        assert_eq!(
+            reference,
+            selected_key_ref_id(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &decision,
+                &key,
+            )
+            .expect("the same selected Key must remain stable")
+        );
+        assert_ne!(
+            reference,
+            selected_key_ref_id(&config.local_key, "other-workspace", &decision, &key,)
+                .expect("a separate workspace must not share a Key reference")
+        );
+        assert_ne!(
+            reference,
+            selected_key_ref_id(
+                "other-local-key",
+                &config.workspace_fingerprint,
+                &decision,
+                &key,
+            )
+            .expect("a different local Key must not share a Key reference")
+        );
+        let mut changed_material = key.clone();
+        changed_material.encrypted_material_digest = Some(hash_text("dpapi:rotated-record-a"));
+        assert_ne!(
+            reference,
+            selected_key_ref_id(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &decision,
+                &changed_material,
+            )
+            .expect("a rotated encrypted record must change the v3 reference")
+        );
+        let mut changed_url = decision.clone();
+        changed_url.provider.base_url = "https://other.example.test/v1/".to_string();
+        assert_ne!(
+            reference,
+            selected_key_ref_id(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &changed_url,
+                &key,
+            )
+            .expect("a different upstream deployment must change the v3 reference")
+        );
+        let mut changed_channel = decision.clone();
+        changed_channel.upstream_channel = Channel::Chat;
+        assert_ne!(
+            reference,
+            selected_key_ref_id(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &changed_channel,
+                &key,
+            )
+            .expect("a different upstream channel must change the v3 reference")
+        );
+        let mut changed_model = decision.clone();
+        changed_model.model = "gpt-5.6".to_string();
+        assert_ne!(
+            reference,
+            selected_key_ref_id(
+                &config.local_key,
+                &config.workspace_fingerprint,
+                &changed_model,
+                &key,
+            )
+            .expect("a different upstream model must change the v3 reference")
+        );
+        assert!(selected_key_ref_id(
+            &config.local_key,
+            &config.workspace_fingerprint,
+            &decision,
+            &SelectedProviderKey {
+                secret: "direct-secret".to_string(),
+                key_id: None,
+                encrypted_material_digest: None,
+            },
+        )
+        .is_none());
     }
 
     #[test]

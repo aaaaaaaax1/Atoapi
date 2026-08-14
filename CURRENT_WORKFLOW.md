@@ -18,6 +18,511 @@
   metric, a fixture pass, a diagnostic reclassification, or a provider-only
   recovery is never a promotion by itself.
 
+### 2026-08-14 v1.4.39 exact-medium-tool-tail-maturity package
+
+- Fresh current-upstream dynamic A/B passed under the repaired verifier: two isolated, lane-crossed three-turn dynamic pairs completed against frozen v1.4.33 with a common test User-Agent, no client prompt_cache_key, distinct native placement keys per arm, and exact client/input/outbound semantic wire hashes. Cold seeds were symmetric (2/2), and the candidate added no cold start. Warm cache-128 was 72.0348% for the candidate versus 24.5919% for v1.4.33 (+47.4429pp); local pre-upstream p95 was 1ms faster and end-to-end TTFT p95 was 433ms faster. Provider-instability and avoidable-gap counters were zero. Raw evidence remains local-only at output\v1433-v1438-medium-tail-native-placement-gate-20260814-2045.json.
+- Verifier repair: native placement isolation is now a live-only fail-closed gate. Every request in each arm/pair must carry one stable one-way placement fingerprint, and the arms must differ. Cold seed provider-accounting deltas are reported but excluded from the token-delta ceiling only when exact client input plus the complete outbound semantic wire hashes match; every warm request remains within the strict 128-token ceiling.
+- Packaged candidate: releases\v1.4.39-exact-medium-tool-tail-maturity-20260814 contains Atoapi.exe and Atoapi_1.4.39_x64-setup.exe, both FileVersion 1.4.39, plus BUILD-MANIFEST.json with SHA-256 checksums. The full release gate passed: Rust format, 1,021 Rust release tests, capacity baselines, frontend/UI regressions, acceptance, release-champion self-test, and NSIS bundle creation. Live 18883 was not changed.
+- Champion status: retain v1.4.33 as historical champion until the installed v1.4.39 package reproduces a fresh same-scope positive dynamic A/B. v1.4.39 is the verified positive candidate and the next base for stackable optimization, not a retroactive champion relabel.
+- Next return point: install/use v1.4.39 normally, refresh the hand-selected upstream scope, then run one fresh two-pair dynamic native-placement A/B against v1.4.33. Promote only if the positive warm result and all symmetry, cold-start, local-latency, and provider-stability gates reproduce.
+### 2026-08-14 post-package reproducibility and promotion correction
+
+- The initial isolated +47.4429pp 3-turn result is now diagnostic only, not promotion evidence. In the packaged v1.4.39 replay, candidate-first pair 1 sent a cold seed and the following champion request with the same pair body read 52,736 cache tokens despite distinct local placement fingerprints. Therefore those fingerprints do not prove the selected upstream isolates cache placement, and whole-arm sequential isolated pairs can transfer cache warmth across arms.
+- The packaged isolated replay is invalid for promotion: the candidate had two cold seeds versus the champion's one, warm cache-128 was lower, and provider-waterline/TTFT evidence was asymmetric. This is neither an accepted v1.4.39 regression nor a candidate cache win.
+- Two shared turn-by-turn crossover attempts were then made to balance cross-arm warming. Both stopped before a comparable pair due to seed-stage upstream_transport 502 (first champion, then candidate after reversed runtime startup). No hit, latency, or product conclusion is retained from them.
+- Release verifier policy corrected: live promotion now requires shared turn-by-turn placement crossover. Native placement fingerprints remain a fail-closed diagnostic proof, but cannot by themselves authorize an upstream-isolated promotion.
+- Current champion remains v1.4.33. v1.4.39 remains a packaged functional checkpoint, but must not be installed or described as a cache-hit champion on the basis of the isolated diagnostic. Next cache gate is one clean shared-turn-crossover dynamic A/B when the current upstream completes both arms.
+### 2026-08-12 BIZD desktop-realm recovery and dynamic self-control
+
+### 2026-08-12 agent-codex-api-2 dynamic attribution (latest)
+
+### 2026-08-13 agent-codex-200-0-1 half-million dynamic capacity control
+
+- **Fresh desktop-selected scope:** immediately before this control the
+  desktop-owner resolver matched `agent-codex-200-0-1 / gpt-5.6-terra / realm
+  6bf06912a0c6...`, with multi-Key pin off. The live `18883` process and its
+  saved Key configuration remained read-only.
+- **50ä¸‡çº§ control is invalid, not a binary result:** v1.4.33 versus the same
+  v1.4.33 binary used the common `Atoapi/1.4.37-cache-control` User-Agent,
+  shared turn-by-turn crossover, a 1.5M-character seed, and variable natural
+  tool tails intended to reach 450K--500K input tokens. Both arms completed
+  their cold seed and four terminal SSE turns, with one inbound = one main
+  upstream POST and equal cold-seed counts. At the champion arm's fifth
+  dynamic request, however, the upstream emitted terminal `bad_gateway` after
+  24,070ms; the pair therefore stopped before complete wire/input symmetry.
+- **Observed boundary:** the largest completed request was only `326,201`
+  input tokens, below the 450K gate. Both arms reported
+  `cache_avoidable_gap_tokens=0`; each had `291,840` provider-instability
+  tokens at different crossover turns. This is a current-upstream capacity or
+  waterline event, not cache evidence and not a candidate regression/gain.
+  Local-only evidence:
+  `output/control-v1433-v1433-current-agent200-dynamic-500k-20260813.json`.
+- **Decision:** preserve v1.4.33 as the binary champion; do not change the
+  production cache path, reclassify the failure as avoidable, or claim that
+  the 500K target has been accepted. The next bounded rung is a paced,
+  changing-context 150K--200K text-tail v1.4.33 self-control on this exact
+  realm. Only a complete symmetric control can authorize the corresponding
+  candidate-versus-champion run.
+
+- **Live scope refreshed under the desktop owner:** Provider
+  `agent-codex-api-2`, model `gpt-5.6-terra`, Responses streaming, Key realm
+  `6caa20931c37...`, multi-Key pin off. The live 18883 process was left
+  untouched.
+- **Forward complete 2x11 comparison:** both arms completed `22/22` terminal
+  SSE/usage records with exact dynamic and actual outbound wire symmetry and
+  symmetric cold-seed accounting. Warm cache-128 was exactly `99.3283%` on
+  both arms. Candidate TTFT p95 was `8,226ms` versus champion `5,493ms`, so
+  this is a neutral-hit / latency-negative result and cannot promote.
+- **Reverse unthrottled reproduction:** pair 0 appeared candidate-positive,
+  but pair 1 ended with an incomplete candidate SSE. The aggregate is
+  diagnostic-only and contributes no promotion evidence.
+- **Throttled reverse reproduction:** all `22/22` requests completed with
+  exact input/wire symmetry. Candidate warm cache-128 was `99.4339%` versus
+  champion `94.2700%` (`+5.1639pp`) and candidate TTFT p95 was `5,188ms`
+  versus `5,966ms` (`-778ms`). However, cold seeds were asymmetric
+  (candidate `1`, champion `2`) and provider instability was asymmetric
+  (`1,024` versus `163,840` tokens), so this remains a positive hypothesis,
+  not a champion result.
+- **Warm-up retry and same-binary smoke:** the warm-up retry stopped on an
+  upstream `502` before any scored pair; a later same-binary smoke also had
+  an asymmetric cold seed. Both are invalid diagnostic artifacts.
+- **Current decision:** keep v1.4.33 as the frozen champion. `avoidable_gap`
+  remains `0` in the latest live sample, so do not change the production
+  cache path. The current candidate's local changes remain bounded multi-Key
+  health/UI synchronization plus pre-header transport diagnostics; focused
+  Rust, UI, and verifier tests pass.
+- **Next gate:** wait for a clean same-realm window, then run one symmetric
+  warm-up pair plus two scored 2x11 pairs. Promotion requires complete SSE,
+  equal cold starts, zero provider-instability gap on both arms, strict warm
+  hit improvement, and no TTFT/local-proxy regression.
+- **2026-08-13 candidate-first warm-up retry:** the warm-up pair itself
+  completed, but the first scored pair stopped with candidate `10/11` SSE,
+  candidate `156,672` provider-instability tokens, and asymmetric cold-seed
+  exposure (`candidate=0`, `champion=1`). The scored pair is diagnostic-only;
+  no hit or TTFT conclusion is retained. Do not keep replaying this exact
+  natural-dense failure vector; use a lower-noise natural tool-tail variant
+  to separate upstream capacity from local candidate behavior.
+- **2026-08-13 reverse natural-tool control:** the lower-noise mixed natural
+  tool-tail fixture completed `22/22` on both arms with exact dynamic/actual
+  outbound symmetry and equal cold-seed counts. Warm cache-128 was exactly
+  `99.6167%` on both arms; candidate TTFT p95 was `3,869ms` versus champion
+  `3,897ms` (`-28ms`). Provider instability remained symmetric at `1,536`
+  tokens per arm, so this is a clean stability control with no candidate hit
+  gain, not a promotion.
+
+- **Latest fixed-UA crossover controls (same live scope):** the desktop-owner
+  rerun used one explicit common upstream User-Agent so UA could not explain a
+  cross-binary difference. The champion-first scored reverse (`output\\candidate-v1433-current-dynamic-4k-natural-tool-mixed-20260813-031820-live-reverse-fixedua.json`)
+  completed `22/22` per arm with exact client/input/actual-outbound symmetry,
+  one cold seed per arm, and one inbound = one upstream POST. Warm cache-128
+  was `99.5876%` for both arms (delta `0`); candidate TTFT p95 was `4,060ms`
+  versus champion `5,709ms` (`-1,649ms`). The only remaining difference was
+  provider-instability (`candidate +512` tokens), so the verifier correctly
+  marked it `positive_cache_evidence=false` and did not promote.
+- **Opposite-order fixed-UA control:**
+  `output\\candidate-v1433-current-dynamic-4k-natural-tool-mixed-20260813-032454-live-forward-fixedua.json`
+  also completed `22/22` and had symmetric request wire, but candidate had
+  two cold seeds versus champion one, seed-cache asymmetry, TTFT p95 `5,928ms`
+  versus `5,694ms` (`+234ms`), and provider-instability asymmetry. Its apparent
+  warm cache-128 `+4.9842pp` is therefore order/waterline contamination, not
+  a local cache gain. Both fixed-UA runs are diagnostic only; v1.4.33 remains
+  the frozen champion and no production cache path is changed.
+
+- **2026-08-13 8KiB material-tool-tail probe:** the first candidate/champion
+  run used the same live `agent-codex-api-2 / gpt-5.6-terra / realm 6caa...`
+  scope, common test UA, 820K seed, and 8KiB natural tool tail. The first
+  scored pair completed on both arms, but the candidate then received an
+  upstream `502 upstream_error` at request 8 of the next pair. The partial
+  aggregate showed only `+0.1240pp` warm cache-128, zero provider-instability
+  delta, and candidate TTFT p95 `+2,191ms`; because candidate SSE/usage and
+  dynamic wire symmetry were incomplete, this is not promotion evidence.
+- **8KiB reverse and same-binary controls:** reversing startup order aborted
+  before a valid scored pair, and a v1.4.33-vs-v1.4.33 control also stopped in
+  warm-up on the same upstream `502 upstream_error`. These controls attribute
+  the 8KiB failure to the current provider capacity/waterline or fixture,
+  not to the candidate's local cache path. Keep the bounded material-tail
+  policy unchanged; do not expand the 500ms wait or reclassify these misses as
+  avoidable. Evidence is local-only:
+  `output/candidate-v1433-current-dynamic-8k-natural-tool-20260813-034512.json`,
+  `output/candidate-v1433-current-dynamic-8k-natural-tool-20260813-035002-reverse.json`,
+  and `output/control-v1433-v1433-dynamic-8k-natural-tool-20260813-035257.json`.
+
+- **2026-08-12 rebuilt candidate and tool-history compatibility checkpoint:**
+  the current source was rebuilt before the latest tool-history work; the
+  resulting local candidate is `src-tauri\target\release\atoapi.exe`
+  (`58fd53...e25b`). Focused Rust transport diagnostics, Key-pool UI, release
+  verifier, frontend build, and release build checks passed. The production
+  changes are multi-Key health/UI synchronization and bounded failed-request
+  diagnostics; they do not alter a successful request's cache policy, cache
+  key, retry count, or upstream affinity. Therefore this binary is not
+  presumed to improve cache hit rate and remains a candidate only.
+- **2026-08-12 1KiB tool-history calibration passed:** under the desktop-owner
+  selected `agent-codex-bizd / gpt-5.6-terra / realm 7af0106b48d5...` scope,
+  isolated 820K-character seed calibration with one declared tool schema and
+  a 1KiB natural tool output completed `6/6` terminal SSE/usage records per
+  arm with actual outbound/schema symmetry, one inbound = one upstream POST,
+  and matching warm cache-128 `99.4522%`. Evidence is local-only
+  `output/calibration-v1433-v1437-bizd-terra-tool-schema-150k-20260812.json`.
+  This is compatibility/capacity evidence, not a champion promotion.
+- **2026-08-12 4KiB dynamic natural-dense A/B is void:** the first 4KiB
+  `natural-dense` tool-history tail received an upstream `502 upstream_error`
+  after about 77.5 seconds in the header phase. It used the same declared tool
+  schema, one main POST, HTTP/2, gzip, and no local retry/wire drift, but the
+  matching other arm did not run, so cold/warm allocation and dynamic inputs
+  are not symmetric. It is an upstream compatibility/capacity event, not a
+  cache, candidate, or TTFT result. Evidence is local-only
+  `output/candidate-v1433-v1437-rebuilt-bizd-terra-realm7af-dynamic-tool-150k-200k-820k-shared-crossover-20260812.json`.
+- **Immediate next probe:** use the proven three-turn isolated `tool-burst`
+  fixture and change only the natural tool-output size from 1KiB to 4KiB
+  (one call, same 820K seed, same selected desktop Key realm). If it passes,
+  test the 4KiB `natural-dense` shape separately; only after both are stable
+  may the two-pair 150K--200K changing-context tool-tail A/B resume.
+- **4KiB probe attempt was invalid before candidate traffic:** the verifier
+  stopped at `before_candidate_pair_0` because the live BIZD pool gained a
+  third sibling Key after the snapshot. The selected Provider/model/realm and
+  pinned Key were unchanged; the old scope fingerprint nevertheless included
+  every sibling Key, so this was an acceptance-harness false positive rather
+  than a cache, transport, or candidate result. No hit-rate or TTFT evidence
+  from that attempt is retained.
+- **Verifier repair:** when an explicit `--key-id` pin is present, the live
+  selection fingerprint now includes the pool enabled state and only the
+  pinned Key's id/enabled/cooldown/material digest. Provider/route/model,
+  endpoint/channel/proxy, target Codex config, pool enabled state, and the
+  pinned Key itself remain fail-closed; unrelated sibling Key health/material
+  changes no longer abort a fixed-realm probe. Self-test and syntax checks
+  pass. This is verifier-only and does not change Atoapi production caching.
+
+- **Actual selected scope:** the desktop-owner resolver succeeded immediately
+  before testing on `agent-codex-bizd / gpt-5.6-terra / realm
+  7af0106b48d5...`, with the currently selected multi-Key realm pinned. The
+  Codex sandbox identity cannot decrypt the desktop user's DPAPI Key; that is
+  an execution-identity boundary, not a production Atoapi Key failure. Run
+  live isolated verification under the desktop owner so each isolated Atoapi
+  process can reuse the same saved selected Key.
+- **Capacity/fixture:** the only current proven Tinypx calibration remains
+  820,000 natural seed characters. On the present BIZD scope, the same
+  fixture produced 151,653-token seeds and 191,691--192,201-token peaks, so
+  it is inside the 150K--200K acceptance interval.
+- **First BIZD control invalid:** candidate-first v1.4.33 versus v1.4.33
+  stopped in pair 0 when the champion slot received a terminally incomplete
+  `upstream_sse_error:capacity` seed, while the identical other slot completed.
+  This is an upstream capacity event, not a cache or binary result. Evidence:
+  local-only `output/control-v1433-v1433-live-bizd-terra-realm7af-dynamic-text-150k-200k-820k-shared-crossover-20260812-1918.json`.
+- **Reversed BIZD self-control:** the champion-first / champion-start retry
+  completed all 44 requests (two pairs, two identical v1.4.33 binaries,
+  11 turns each) with terminal SSE/usage, exact semantic and actual outbound
+  input symmetry, one inbound = one main upstream POST, equal aggregate seed
+  cache evidence (one cold and one warm seed per arm), and a warm-only
+  cache-128 delta of **0.0000pp**. Both arms had zero avoidable cache gap.
+  The strict all-gate verdict remains false only because the upstream carried
+  1,536 versus 1,024 provider-instability tokens and the candidate-shaped
+  same binary saw a 47,846ms upstream TTFT outlier (aggregate p95 +993ms);
+  local proxy p95 was only +3ms. This validates cache/cold-start fairness and
+  confirms the earlier capacity failure was not a deterministic binary issue;
+  it is not a new champion or a timing result. Evidence: local-only
+  `output/control-v1433-v1433-live-bizd-terra-realm7af-dynamic-text-150k-200k-820k-shared-crossover-champion-start-20260812-1922.json`.
+- **Next:** while the desktop resolver still returns this exact BIZD/model/
+  realm and the live gate remains clean, run the same two-pair dynamic text-tail
+  crossover as v1.4.37 versus the frozen v1.4.33 champion using an explicit
+  common User-Agent. Retain only independently verified local positive
+  components; promote only a complete, symmetric, strictly higher cache result.
+
+### Latest governed return â€” 2026-08-11 (current sub5 scope)
+
+### 2026-08-11 current Tinypx dynamic-context comparison
+
+- **Cohort and binaries:** the interactive desktop resolver refreshed the
+  hand-selected scope to `agent-codex-tinypx-6 / gpt-5.6-terra / realm
+  149caaa30991...` with multi-Key pin off. The two compared binaries were the
+  frozen v1.4.33 champion (`bca193...5380c1`) and the current v1.4.37 source
+  candidate (`371b141...bd48`). This is a separate cohort and must not be
+  combined with xapi, BIZD, APX, TokenX, sub5, or codex-20 results.
+- **Dynamic-context validity:** two shared-turn crossover pairs completed
+  `22/22` terminal SSE/usage records on each arm, with one inbound = one
+  upstream POST, exact paired input/outbound symmetry, and input peaks from
+  151K to 192K tokens. Each pair had 11 distinct input fingerprints; the two
+  seed fingerprints differed between pairs. The five growing natural-dense
+  tails per pair were approximately 4.2K / 8.3K / 12.3K / 16.4K / 5.8K chars,
+  followed by changing continuation turns. Thus the comparison uses changing
+  context while preserving identical inputs inside each A/B turn.
+- **Cold-start accounting:** each arm had two seed requests: one cold and one
+  warm seed (`0` and `150,272` cached tokens in opposite pair order). Seed
+  requests are excluded from the diagnostic hit comparison, but their counts
+  and cold/warm allocation are exactly symmetric, so the candidate introduced
+  no extra cold start.
+- **Result and attribution:** after excluding the seed requests, observed
+  candidate cache-128 was `-9.4533pp`; that apparent loss is dominated by
+  `+329,984` candidate-side `provider_unstable_gap_tokens` on Tinypx. Both
+  arms had `cache_avoidable_gap_tokens=0`. Excluding provider-waterline
+  instability as well, candidate new-tail loss was **1,792 tokens lower**
+  (`47,872` vs `49,664`), equivalent to a narrow **+0.0516pp**
+  cacheable-token advantage. Candidate local proxy p95 was only `+1ms`; its
+  larger end-to-end TTFT p95 difference was upstream-side. This is a
+  repeatable-positive hypothesis, not a promotion: the upstream instability
+  asymmetry is too large for a single run to replace the v1.4.33 champion.
+- **Evidence:** local-only
+  `output/candidate-v1433-v1433-dynamic-tail-mix-interactive-20260812-015156.json`.
+  Do not commit `output/*.json` artifacts. Next: immediately refresh the
+  actual selected scope, then reproduce this exact dynamic varying-context
+  path with the opposite persistent-runtime start order; only stable positive
+  non-provider evidence can create a new champion.
+- **Opposite-start reproduction invalid:** the champion-first persistent
+  runtime retry stopped in pair 0 when the candidate received `HTTP 200 /
+  upstream_incomplete_eof` on the same second dynamic-tail shape, without
+  terminal usage. The matching live Tinypx Codex main request simultaneously
+  failed with HTTP 502. This is diagnostic-only upstream stream instability,
+  not a candidate cache regression or a promotion result. Local-only evidence:
+  `output/candidate-v1433-v1433-dynamic-tail-mix-interactive-20260812-020245.json`.
+- **Verifier acceptance update:** dynamic cache comparisons now use warm
+  (non-seed) raw/cache-128/full-bucket metrics. Raw seed evidence still must
+  be complete; each arm must have the same seed-request and cold-seed counts,
+  and the candidate may not add a cold start. The verifier self-test and the
+  interactive runner self-test both pass. This is an acceptance-harness change
+   only, not a production cache-policy change or a new champion.
+
+- **2026-08-11 same-binary capacity control:** a one-pair v1.4.33-versus-v1.4.33
+  shared-turn crossover on the same Tinypx scope completed `11/11` terminal
+  SSE/usage records on both arms, with exact input/wire symmetry and one
+  inbound = one upstream POST. The natural seed reached `156,799` input tokens
+  and the dynamic peak reached `197,143`, so this scope can carry the required
+  `150Kâ€“200K` context. It is diagnostic-only: with one crossover pair the
+  champion arm received the cold seed (`0` cached tokens) while the other arm
+  received the warm seed (`156,416` cached tokens), so the cold/warm exposure is
+  intentionally unbalanced until a second pair is completed. The same run also
+  showed provider-waterline instability of `192,000` tokens vs `768` tokens and
+  a `+478ms` TTFT p95 difference; its apparent hit delta is therefore not a
+  version result. Local-only evidence:
+  `output/preflight-v1433-v1433-tinypx-dynamic-150k-200k-20260811.json`.
+  Keep v1.4.33 as champion; wait for a clean stability window, complete two
+  balanced same-binary controls, then test v1.4.37/current source.
+
+- **2026-08-11 balanced-control retry:** the candidate-first, two-pair
+  v1.4.33-versus-v1.4.33 crossover reached the required context and balanced
+  the seed exposure (`313,602` seed tokens and `156,416` warm-seed cache reads
+  on each arm; one cold seed each; peak `197,213`). Pair 0 completed on both
+  arms, but candidate pair 1 stopped at `followup-2` with upstream HTTP 502 and
+  no terminal usage, leaving champion `14/14` and candidate `13/14` complete.
+  The verifier therefore rejected input/outbound symmetry and provider
+  stability. The apparent candidate-side warm cache `+23.073pp` and TTFT
+  `-32,698ms` are invalid control artifacts, not a version result. Local-only
+  evidence:
+  `output/control-v1433-v1433-tinypx-dynamic-150k-200k-candidate-first-20260811.json`.
+  Do not rerun this failure vector immediately; keep v1.4.33 champion and
+  wait for a clean high-context window before a smaller calibrated control.
+- **Post-control live gate:** a fresh desktop-principal resolver check at
+  `2026-08-11T19:59:43Z` retained the same Provider/model/realm and multi-Key
+  setting, but the same-scope failure buffer then contained an HTTP 502 at
+  `2026-08-11T19:59:37Z` and a non-terminal streamed response at
+  `2026-08-11T19:59:50Z`. Do not treat the temporary 200 high-context rows as
+  a stable promotion cohort; no candidate A/B follows this control.
+
+### 2026-08-11 Tinypx dynamic retries and same-binary attribution controls
+
+- **Scope refresh:** the interactive resolver matched the latest successful
+  Codex main request at `2026-08-11T18:52:58Z` to
+  `agent-codex-tinypx-6 / gpt-5.6-terra / realm 149caaa30991...`, with
+  multi-Key pin off. No provider, Key, or live `18883` process was changed.
+- **Candidate retry invalid:** local artifact
+  `output/candidate-v1433-v1433-dynamic-tail-mix-interactive-20260812-025402.json`
+  used v1.4.33 SHA `bca193...5380c1` versus v1.4.37 SHA
+  `371b141...bd48`, common User-Agent `Atoapi/1.4.37`, text-only varying
+  tails, and shared crossover. Both seeds were wire/input symmetric at
+  `120,566` input tokens, but that is below the required `150K` minimum. The
+  champion's first dynamic tail then returned upstream HTTP 502; the
+  candidate had only completed its seed. This run is invalid and contributes
+  no hit-rate or promotion evidence.
+- **Same-binary attribution control invalid:** local artifact
+  `output/candidate-v1433-v1433-dynamic-tail-mix-interactive-20260812-025811.json`
+  used v1.4.33 in both slots, common User-Agent `Atoapi/1.4.33`, and an
+  `820,000`-character seed. The first seed request (about `842,170` body
+  bytes) returned upstream HTTP 502 before usage; the other identical arm did
+  not send. This confirms the current Tinypx large-body/dynamic path is not a
+  usable comparison cohort, but it is not a cache regression or a promotion.
+- **Decision:** keep v1.4.33 as the champion. Do not fold either artifact into
+  hit statistics or Git. Resume only after a capacity-calibrated fixture can
+  reach the real `150Kâ€“200K` token gate and the selected upstream completes
+  both arms; protocol/schema probes remain verifier-only and must not alter
+  production cache behavior.
+
+### Current execution handoff â€” 2026-08-11 (actual `agent-codex-20` cohort)
+
+- **2026-08-11 verifier scope-gate repair:** the live gate now selects the
+  newest terminal record matching the expected Provider/model/realm instead of
+  treating a newer independent Codex session as scope drift. A newer failure,
+  stale record, or incomplete SSE inside that exact scope still fails closed.
+  `verify-release-champion` and the interactive runner self-tests pass. A
+  read-only preflight resolved the current hand-selected scope as
+  `agent-codex-20 / gpt-5.6-terra / realm a4d4fff6998bâ€¦`, with multi-Key pin
+  enabled, at `2026-08-11T14:59:11.8533059Z`. No live service, upstream, or
+  Key was changed. Next: two-pair v1.4.33 same-binary text-tail self-control.
+
+- **2026-08-11 immediate scope refresh:** immediately before the planned
+  control, the same configured Provider/model resolved to a different current
+  hand-selected Key realm, `286e5e04583fâ€¦` (multi-Key pin enabled) at
+  `2026-08-11T15:21:35.1008160Z`. This is a new cohort; do not mix it with
+  the earlier `a4d4fff6998bâ€¦` preflight or use either preflight as a cache
+  result. No live service, configuration, or Key was changed by the refresh.
+
+- **2026-08-11 new-realm same-binary control invalid:** the first pair of the
+  `286e5e04583fâ€¦` 75K dynamic text-tail shared crossover used the same
+  v1.4.33 SHA (`bca193â€¦`) for both slots and bound the same Provider/model/
+  realm. The champion slot completed seed plus first dynamic tail, but the
+  candidate slot returned `502 / atoapi_error / upstream_transport` on that
+  first tail before headers or terminal usage. It stopped at pair 0, so it is
+  not a cache regression, candidate gain, or champion result. Local-only
+  evidence: `output/v1433-v1433-live-codex20-terra-realm286e-dynamic-text-75k-shared-crossover-self-control-2pair-delay30s-20260811-1544.json`.
+  Next: inspect copied-config parity and the pre-header transport/gzip branch
+  without immediately repeating the failed route.
+
+- **Accepted baseline remains unchanged:** the packaged v1.4.33 executable at
+  `releases/v1.4.33-exact-sent-waterline-maturity-20260807/Atoapi.exe` is the
+  only accepted binary cache-hit champion. The currently running v1.4.37 UI
+  process on `18883` was not stopped, restarted, reconfigured, or used as a
+  cache-promotion result.
+- **Current hand-selected scope:** `agent-codex-20 / gpt-5.6-terra / realm
+  a4d4fff6998bâ€¦`. Do not combine this cohort with the earlier sub5 /
+  `7235â€¦` artifacts. The current realm has 110 complete terminal flows with
+  `12,759,181` input tokens, `12,348,032` cached tokens,
+  `cache_avoidable_gap_tokens=0`, `new_tail_gap_tokens=363,392`, and
+  `provider_unstable_gap_tokens=18,432`; there is no demonstrated local
+  cache gap to solve by adding waiting, PCK, prewarm, retry, or context
+  rewriting.
+- **Current verification state:** the shared-crossover verifier now fails
+  closed when raw seed cache usage is incomplete, and correctly aggregates
+  cold/warm seed evidence across all scored pairs. The fixture now declares
+  its static `read_release_fixture` tool schema for tool-history scenarios.
+  These are verifier-only correctness/compatibility changes, not production
+  cache behavior and not a promotion.
+- **Known upstream/test confounds:** a 400K-character same-binary v1.4.33
+  shared control reached `75,577` seed tokens, but one arm stopped at
+  `followup-6` with `502 / atoapi_error / upstream_transport` before headers
+  or terminal usage. A separate BIZD probe showed that synthetic tool history
+  can be rejected by the selected relay even after both seeds complete. Never
+  count incomplete SSE/usage or an upstream transport/tool-schema rejection
+  as a cache delta.
+- **2026-08-11 BIZD Sol scope-drift control:** a fresh interactive scope read
+  resolved `agent-codex-bizd / gpt-5.6-sol / realm 23850accâ€¦` with no
+  multi-Key pin. The subsequent v1.4.33-versus-itself 75K, 11-turn, text-tail
+  shared-crossover pair completed `11/11` terminal SSE/usage records on each
+  arm, with one inbound = one main POST and actual gzip on the large requests.
+  It stopped before the balancing second pair because the independent live
+  `18883` gate observed a current request with a different model and realm.
+  The single completed pair therefore has unbalanced cold/warm seed exposure
+  and is diagnostic-only; its apparent cache-rate difference is neither a
+  v1.4.33 regression nor a candidate result. Local-only evidence:
+  `output/v1433-v1433-live-bizd-sol-realm23850-dynamic-text-75k-shared-crossover-self-control-2pair-20260811-2034.json`.
+- **2026-08-11 BIZD Terra stable full-replay self-control:** two consecutive
+  scope probes agreed on `agent-codex-bizd / gpt-5.6-terra / realm
+  c416f6c1â€¦` with the current multi-Key selection pinned. A two-pair 75K
+  v1.4.33-versus-itself shared crossover then completed all `12/12` terminal
+  SSE/usage records with exact actual-wire symmetry, one inbound = one main
+  POST, equal aggregate cold/warm seed evidence, zero avoidable gaps, and zero
+  provider-unstable gaps. Raw/cache-128/warm cache deltas were all `0.0000pp`;
+  local overhead p95 was `-1ms`. The second connection's remote TTFT p95 was
+  `+1801ms`, so this is a valid cache fairness/health control but not a timing
+  promotion result. Local-only evidence:
+  `output/v1433-v1433-live-bizd-terra-realmc416-full-replay-75k-shared-crossover-self-control-2pair-20260811-2114.json`.
+- **Next actions, in order:** (1) run local self-tests and audit the
+  verifier-only schema and seed-evidence gates; (2) refresh the actual
+  hand-selected scope immediately before the run; (3) run a minimal
+  same-binary v1.4.33 control using candidate-first persistent-start order
+  with a text-tail health path if the relay rejects tool history; (4) only
+  after two complete, symmetric same-binary controls, run v1.4.37/current
+  source against v1.4.33. A candidate may be retained only for independently
+  verified positive components; it cannot replace the cache champion without
+  strict same-scope positive cached-token evidence.
+- **Super Brain issue record (external to Atoapi):** package/adapter refresh
+  left the existing Codex task with
+  `ACTIVATION_RECEIPT_MANIFEST_STALE` plus a project-proof mismatch. Its
+  fail-closed block is correct, but the missing atomic migration/rebinding of
+  the current task is a control-plane runtime defect. Do not modify Super
+  Brain private state or global MCP registration while continuing this project;
+  retain this file and live artifacts as the project-side checkpoint.
+- **Atoapi transport-diagnostic repair (unpackaged):** a send failure before
+  upstream headers previously discarded its real final-wire diagnostics and
+  reconstructed metrics from route defaults. That could falsely report an
+  uncompressed raw upload or an inferred proxy path. The current source now
+  carries only the bounded actual diagnostics (network path, body sizes, gzip
+  decision, one-attempt count) plus a coarse `dns|tls|proxy|timeout|connection|
+  http|other` class; raw endpoint, Key, request body, and raw transport error
+  remain unlogged. The focused pre-header transport, stream-terminal, and
+  header-class regressions pass. This is observability-only: no retry, Key
+  status change, cache-policy change, or live-process change.
+
+- The current hand-selected Codex scope was refreshed immediately before the
+  latest isolated run: `agent-codex-sub5 / gpt-5.6-terra / realm
+  7235fe2d0a2dâ€¦`, observed at `2026-08-11T05:21:07.7394469Z`. The resolver
+  ran under the interactive Windows owner, matched the saved configuration,
+  and pinned the current healthy multi-Key selection without changing live
+  `18883` or rotating a Key.
+- The release verifier fairness self-test passes. Shared-cache crossover seed
+  evidence now sums every scored pair, while a missing raw
+  `cache_read_tokens` field fails closed instead of being treated as a cold
+  zero. This is verifier correctness only, not a cache-hit promotion.
+- The verifier now also records only the bounded terminal usage shape
+  (`present`, `absent`, `unrecognized`, or `not_seen`) and requires a numeric
+  usage shape for a completed SSE request. The parser never stores terminal
+  payload text; its deterministic self-test passes. This is evidence hardening
+  only and does not alter production relay behavior.
+- The interactive runner now exposes an explicit shared-turn crossover mode
+  for future health controls. It keeps the two isolated processes but gives
+  both arms one generated cache placement and alternates the first sender per
+  turn, avoiding the current lane-A/lane-B confound. Default release A/B
+  behavior remains isolated per-arm lanes. Both runner and verifier self-tests
+  pass after this verifier-only change.
+- Fresh same-binary v1.4.33 75K/11-turn dynamic text-tail self-control on the
+  refreshed scope is diagnostic-only: the champion-first arm completed its
+  75,283-token seed but the first dynamic tail returned a native
+  `upstream_sse_error` without terminal usage; the second arm, using the same
+  v1.4.33 executable, completed 11/11. The post-pair live gate simultaneously
+  saw the same provider/model/realm with HTTP 200 but an incomplete upstream
+  SSE terminal. This proves current upstream instability, not a candidate or
+  champion cache difference. Evidence remains local-only at
+  `output/v1433-v1433-live-sub5-dynamic-text-75k-self-control-champion-first-20260811-1322.json`.
+- A refreshed, candidate-first same-binary rerun confirms that the failure is
+  not a version difference: lane B completed 11/11 with terminal usage shape
+  `present` on every request, while lane A failed at `dynamic-tail-4-flat`
+  with HTTP 200 + `upstream_sse_error` + `not_seen` terminal usage. Both were
+  the same v1.4.33 SHA and realm. This exposes a current placement/upstream
+  lane confound; its `+42pp` apparent arm delta is invalid, not an
+  optimization. Evidence remains local-only at
+  `output/v1433-v1433-live-sub5-dynamic-text-75k-self-control-candidate-first-20260811-1338.json`.
+- The first shared-turn-crossover v1.4.33 control then completed **11/11**
+  terminal SSE requests on both isolated arms with `present` terminal usage
+  shapes, proving the lane-A failure is eliminated when both arms share one
+  placement and alternate each turn. It stopped before pair two because the
+  independent live-18883 gate observed a current same-scope HTTP 200
+  `upstream_sse_error` with no completion marker. The completed pair remains
+  diagnostic-only: provider-instability tokens differed by 76,800 between the
+  same executable arms, so it cannot be used to promote cache behavior.
+  Evidence remains local-only at
+  `output/v1433-v1433-live-sub5-dynamic-text-75k-shared-crossover-self-control-2pair-20260811-1350.json`.
+- The current manually selected Codex upstream later moved to a separate
+  cohort, `agent-codex-20 / gpt-5.6-terra / realm a4d4fff6998bâ€¦`. The
+  interactive resolver mapped that realm to the currently healthy pinned Key
+  at each attempted run; do not mix this cohort with the earlier `7235â€¦`
+  sub5 evidence.
+- Two fresh same-binary v1.4.33 shared-crossover controls on the new cohort
+  are diagnostic-only and preserve the champion unchanged. The 300K-character
+  seed reached only 57,462 tokens and therefore failed the 75K gate. The
+  corrected 400K-character seed reached 75,577 tokens and the champion arm
+  completed 7/7 terminal SSE requests, but the identical candidate arm failed
+  at `followup-6` with `HTTP 502 / atoapi_error / upstream_transport`, with no
+  upstream HTTP response or terminal usage. Both runs retained one inbound =
+  one upstream POST, identical semantic request fingerprints, the same model,
+  and the same realm. They cannot be used as cache, latency, or version
+  evidence. Local-only artifacts:
+  `output/v1433-v1433-live-codex-current-realm-dynamic-text-75k-shared-crossover-self-control-2pair-20260811-1424.json`
+  and
+  `output/v1433-v1433-live-codex20-current-realm-dynamic-text-75k-400k-shared-crossover-self-control-2pair-20260811-1100.json`.
+- The next gate on this new cohort is not a v1.4.37 promotion comparison. First
+  discriminate the repeated isolated `upstream_transport` failure from a
+  remaining arm/connection placement variable without changing the live
+  injection, Provider configuration, or Key health state.
+- Do not issue a v1.4.37 promotion comparison from this cohort. First improve
+  verifier-only terminal-usage shape evidence, then refresh the live scope and
+  require a complete v1.4.33 self-control before any candidate-first A/B.
+
 ### Champion inheritance correction (2026-08-08)
 
 - `git merge-base --is-ancestor 85b56a6 HEAD` passed. The latest source is
@@ -886,13 +1391,171 @@
   and `Atoapi_1.4.37_x64-setup.exe`
   (SHA-256 `c1be8b80d819c880e53374ee619d849bd4da505b6c6605a8cff6026babb72314`).
 
+### 2026-08-10 v1.4.37 current-scope cross-lane validation
+
+- The hand-selected live scope for this validation was
+  `agent-codex-200-0-1 / gpt-5.6-terra / realm 6bf06912a0c6...`, with one
+  saved Key and a common test-only `Atoapi/1.4.33` User-Agent. The live
+  `18883` instance and its Key pool were read-only throughout.
+- A v1.4.33 self-control health rung completed 3/3 terminal SSE requests per
+  arm with the same realm and one inbound-to-one-main-POST accounting. Its
+  strict comparison was intentionally not a promotion result because remote
+  TTFT varied; the transport/health gate itself passed.
+- Two one-pair, 75K--100K, 11-turn dynamic **text-tail** comparisons then
+  completed with 22/22 terminal SSE requests each and exact actual-outbound
+  input symmetry. The first lane placement showed the candidate at
+  `+8.9045pp` cache-128, but the provider-instability gate failed. The
+  crossed lane reproduced `0.0000pp` raw/cache-128/warm delta. Both arms had
+  `cache_avoidable_gap_tokens=0`.
+- Therefore the `+8.9045pp` is lane/provider placement variance, not a
+  candidate binary improvement. v1.4.33 remains the binary hit-rate champion;
+  the current v1.4.37 candidate is not packaged or promoted as a hit-rate
+  champion. Its independent multi-Key UI/health changes remain valid and are
+  retained as stackable functionality.
+- **Positive-component stacking rule:** retain an independent candidate
+  component when its own tests pass, but add it to the champion base as a
+  hit-rate optimization only after at least two same-scope, same-wire,
+  provider-stability-free positive comparisons. A lane-only gain, a provider
+  TTFT change, or a result with zero avoidable gap is not inherited as a cache
+  optimization. Keep the zero-extra-upstream-request and no-prewarm gates.
+
+### 2026-08-11 live scope refresh: upstream 502 blocks a fresh comparison
+
+- At **2026-08-11 09:25:38 +08:00**, the read-only live-scope resolver saw
+  `agent-codex-0-12-1 / gpt-5.6-terra / realm 7283ea70d3ba...` with multi-Key
+  pinning disabled. A later verifier launch correctly refreshed again from the
+  newest terminal record and found `agent-codex-sub5 / gpt-5.6-terra / realm
+  7235fe2d0a2d...` with its current healthy Key pinned. This is expected
+  owner-side scope drift; do not reuse the earlier 0-12-1 observation as the
+  test scope and do not rotate a Key to force either route.
+- The 75K/3-turn same-wire v1.4.33-versus-v1.4.37 preflight on that refreshed
+  sub5 scope returned upstream HTTP 502 on the initial seed for both arms
+  (about 27s and 33s respectively). Each failure still had one inbound request,
+  one generation attempt, and one upstream POST. The after-pair live gate
+  observed the same provider/model/realm and current HTTP 502, so the saved
+  report is diagnostic-only and cannot establish a cache regression, a cache
+  gain, or a promotion:
+  `output/v1433-v1437-live-0121-full-replay-75k-champion-first-tool-20260811-0350.json`.
+- An earlier 75K/11-turn text-tail attempt did not finish before the host
+  command limit and produced no report; its isolated child was terminated while
+  the live v1.4.37 process remained untouched. It is not evidence.
+- Deterministic regressions remain green: `test:release-champion`,
+  `test:key-pool-ui`, `test:provider-health-probe-ui`, and `git diff --check`.
+  The v1.4.37 multi-Key UI/health components remain independent stackable
+  positives; v1.4.33 remains the binary cache-hit champion.
+- A later same-binary v1.4.33 self-control on the then-current sub5 scope did
+  complete 3/3 terminal SSE requests per arm with one inbound-to-one-main-POST
+  accounting, but the after-pair live scope gate detected that the owner had
+  moved to a different provider/realm. The champion arm measured
+  `cache-128=65.9814%` with `0` provider-instability tokens; the other arm
+  measured `cache-128=0%` with `144,384` provider-instability tokens and
+  incomplete usage. The report is therefore diagnostic-only:
+  `output/v1433-v1433-live-sub5-full-replay-75k-self-control-20260811-0400.json`.
+  Do not treat this as a v1.4.33 regression or a candidate gain. A self-control
+  must pass both arm health and the after-pair live scope gate before any
+  candidate A/B is meaningful.
+
 ### Next return point
 
-**Current override (2026-08-09, active):** the hand-selected route is
-`agent-codex-bizd / gpt-5.6-terra / realm 7bf7f91b71eb452aa4dee2e4f4e87a8a89b50e721a6e60c814b92ddc9139cab7 / Responses`.
-Pin BIZD Key 2 for any isolated comparison; do not mix APX, TokenX, or sub5
-artifacts into this scope. v1.4.33 remains the binary hit-rate champion. The
-only candidate to evaluate is the user-visible running
+### 2026-08-11 current Codex realm / verifier recovery checkpoint
+
+- The release verifier's live-scope gate now filters to the expected
+  Provider/model/realm before judging freshness, terminal SSE, and failure
+  state. Its node self-test and the PowerShell runner self-test pass; an
+  independent newer Codex scope no longer invalidates a bound comparison.
+- At 2026-08-11T16:31:10 +08:00, the desktop-user (DPAPI-capable) resolver
+  bound the actual hand-selected route to `agent-codex-20 / gpt-5.6-terra /
+  realm 286e5e04583f...`, with a current multi-Key pin. The sandbox account
+  cannot decrypt DPAPI-protected saved Key metadata, so any live verification
+  must run through the desktop-user context; this is an execution-environment
+  boundary, not an Atoapi Key or routing change.
+- The earlier realm-286e same-binary dynamic text-tail self-control is
+  diagnostic-only: its candidate slot ended before terminal usage with
+  `502 / atoapi_error / upstream_transport`. It cannot establish a champion
+  regression, a candidate gain, gzip behavior, or any cache comparison.
+  v1.4.33's legacy pre-header error log reconstructs gzip/body fields from
+  defaults, so that artifact is explicitly excluded from wire-size and gzip
+  attribution.
+- Next gate: run a short 75K same-binary v1.4.33 shared-crossover full-replay
+  health control on this exact current realm. Only if both arms retain terminal
+  SSE, usage, scope, and cache symmetry may dynamic text-tail validation resume.
+  Tool-history validation remains separate because the active third-party
+  route may reject synthetic replay even when the static `tools` schema is
+  present.
+- The first such control, started at 2026-08-11 16:36 +08:00, was strictly
+  invalid and stopped after pair 0. Both arms were the identical v1.4.33 SHA
+  `bca193...5380c1`, used the same realm, static-wire fingerprints, HTTP/2
+  system-proxy path, and compressed outbound body. The candidate placement
+  completed seed and followup-1, then received HTTP 200 followed by
+  `upstream_stream_error` at followup-2 with no terminal SSE/usage. The
+  champion placement's two turns completed. Because the two-pair crossover
+  could not finish, cache and TTFT deltas are not comparable. Artifact
+  (evidence only, untracked):
+  `output/v1433-v1433-live-codex20-terra-realm286e-full-replay-75k-shared-crossover-2pair-20260811-1636.json`.
+- Do not immediately replay that same sequence. First inspect the failed
+  stream boundary and isolated-runtime parity; only a differentiating local
+  condition justifies a new minimal probe. This result does not lower the
+  v1.4.33 champion or show a candidate regression.
+- The runner now exposes verifier-only `turn_delay_ms` and
+  `inter_arm_delay_ms` controls. They change only pacing, never request bodies,
+  Key selection, cache policy, or live 18883. The local runner self-test and
+  `git diff --check` pass. A bounded retry may use the historical 1.5s
+  inter-arm/turn pace to distinguish upstream capacity timing from a local
+  stream-path defect; it remains diagnostic until both crossover pairs finish.
+- The paced retry did finish both same-binary arms with `3/3` terminal SSE and
+  usage, but the owner-side route changed during the launch: the verifier
+  refreshed from the expected `agent-codex-20 / realm 286e...` to
+  `agent-codex-xapi / realm 3359...` with multi-Key pin disabled. The artifact
+  filename therefore must not be read as a 286e result. Its one crossover pair
+  deliberately put the cold seed on one arm and the warm seed on the other, so
+  the `65.9864%` versus `98.9796%` cache-128 values are not a hit comparison.
+  This is a completed transport-health observation only; it neither proves a
+  pacing fix nor changes the v1.4.33 champion.
+- Treat the 286e and xapi artifacts as separate cohorts. Before any further
+  comparison, refresh the desktop-user live scope immediately before launch,
+  require it to remain stable through the full two-pair crossover, and reject
+  any artifact whose provider/model/realm differs from the launch scope.
+- The xapi scope stayed stable across three desktop-user samples at
+  17:07:43, 17:07:53, and 17:08:02 +08:00 (`agent-codex-xapi / terra /
+  realm 3359b3...`, multi-Key pin off). Static source review classifies the
+  earlier 286e failure as a raw upstream body-stream transport error before
+  terminal SSE; Atoapi then synthesized the client `response.failed` frame.
+  Downstream disconnect and backpressure were false/zero. The remaining
+  subcategory is intentionally unknown (`other`) and is not cache evidence.
+- With this stable xapi window, the next valid health gate is a fresh two-pair
+  same-binary v1.4.33 crossover using the 1.5s turn/inter-arm pacing. A scope
+  change, incomplete SSE/usage, or asymmetric crossover invalidates the whole
+  artifact; no cache or champion conclusion may be drawn from a partial pair.
+- The fresh xapi health gate passed: both 2-pair arms (same v1.4.33 SHA
+  `bca193...5380c1`) completed all `6/6` requests, so the crossover had
+  `12/12` terminal SSE and usage records. Provider/model/realm stayed fixed at
+  `agent-codex-xapi / gpt-5.6-terra / 3359b3...`; actual outbound input and
+  static-wire fingerprints were symmetric, seed totals were symmetric, and
+  `cache_avoidable_gap_tokens` stayed zero. The strict self-control delta was
+  `0.0000pp` raw/cache-128/warm; baseline gates passed. The `-1447ms` TTFT p95
+  delta was upstream timing only, not a cache gain. Artifact (evidence only,
+  untracked):
+  `output/v1433-v1433-live-codex-xapi-terra-realm3359-full-replay-75k-shared-paced-2pair-20260811-1710.json`.
+- The health gate is now clear for a candidate comparison. The next candidate
+  is the current source-built v1.4.37 (`src-tauri/target/release/atoapi.exe`,
+  SHA `371b141...bd48`) against the v1.4.33 champion. Use dynamic **text-tail**
+  mode for the long rung; keep synthetic tool-history compatibility as a
+  separate probe and do not mix it into cache-hit conclusions.
+- The first xapi long-rung launch was stopped before any request because a
+  cross-binary comparison on a Provider without `custom_user_agent` must carry
+  an explicit common UA. No traffic or evidence was produced by that attempt.
+  For the retry, bind both isolated arms to the current live common
+  `Atoapi/1.4.37` UA; keep this as a test-only wire parity control and record it
+  in the artifact.
+
+**Historical override (superseded 2026-08-10):** the hand-selected route was
+`agent-codex-tokenx-5 / gpt-5.6-terra / realm 41adc934b393d23de5c721a2a7333149774f25e3eeb2089c379d50470bddfd32 / Responses`.
+Pin the currently healthy saved Key
+`key-1786262087926-0-ef7e1f5138e3d8` for every isolated comparison. The first
+sequential Key is already in its own temporary cooldown and must not be
+revived or allowed to rotate into a test. Do not mix BIZD, APX, TokenX prior
+Key/realm, or sub5 artifacts into this scope. v1.4.33 remains the binary
+hit-rate champion. The only candidate to evaluate is the user-visible running
 `releases/v1.4.36-runner-dynamic-validation-20260809/Atoapi.exe`
 (SHA-256 `bb4eef2ce422490bfb2ae1a07fb79a04289104f9f2d8da513b0b8348371b47b5`).
 Until that release is installed, the live service remains the validated
@@ -902,7 +1565,38 @@ the older `v1.4.35-champion-derived-rebuilt-20260808` artifact. The older
 rebuilt binary sent a 157K-token seed uncompressed and failed with local
 `upstream_transport`; it is not representative of the active release.
 
-The first BIZD tool-history fixture failed at long context because the relay
+**Previous current override (superseded 2026-08-10):** use the hand-selected
+`agent-codex-200-0-1 / gpt-5.6-terra / realm 6bf06912a0c6... / Responses`
+scope and the current source-built candidate
+`src-tauri/target/release/atoapi.exe` for future isolated comparisons.
+Keep `releases/v1.4.33-exact-sent-waterline-maturity-20260807/Atoapi.exe` as
+the binary champion. Refresh this scope from live metrics before every run;
+
+**Latest live refresh (2026-08-11, current):** resolve the hand-selected
+Provider/model/realm from the latest terminal record immediately before every
+isolated run. The route can change between a read-only preflight and the
+verifier launch; the verifier's refreshed scope is authoritative for that
+artifact. The current sub5 75K preflight is diagnostic-only because both arms
+and the same-scope live gate received upstream HTTP 502 before usage evidence.
+Keep v1.4.33 as the binary hit-rate champion and retain v1.4.37's independently
+verified multi-Key UI/health components for stacking.
+
+When a candidate has several components, evaluate each component on its own
+evidence and keep every independent positive component that passes its tests;
+do not discard the whole candidate because one component or one provider lane
+fails. Only a cache-path component may be added to the v1.4.33 champion base
+after two same-scope, same-wire, provider-stability-free positive comparisons.
+Refresh the actual current scope from live metrics before every run; never
+rotate a Key or mix cohorts. A fresh dynamic A/B may resume only after the
+same current scope completes a v1.4.33 self-control or paired preflight with
+terminal SSE and usage evidence on both arms.
+
+The first fresh TokenX rung is a one-pair 150K--200K dynamic **text-tail**
+source/source A/B. It preserves full replay and five shape-varied tails while
+keeping the new realm's synthetic tool-history compatibility as a separate,
+explicit probe; it does not claim tool-history support until that probe passes.
+
+**Historical BIZD result (superseded scope):** the first BIZD tool-history fixture failed at long context because the relay
 rejects synthetic tool replay, even after a small schema-corrected probe
 passes. Use verifier-only `dynamic-tail-mode text` for long dynamic cache
 comparison: 11 turns, five natural 16KB tails, full replay, and enforced
@@ -1306,3 +2000,12 @@ Mandatory order:
 - Then make the smallest change that attacks that cause.
 - Then verify with v0.0.89, v0.0.90, current version, plus any directly relevant historical positive/negative versions.
 - Do not keep shipping micro-adjustments without a falsifiable reason and a metric that can prove the change.
+
+## 2026-08-13 ¿É¼ûÕýÎÄÊ××ÖÓëÕæÊµÑÓ³ÙÕï¶Ï
+
+- ÏÖÏó£ºÇáÁ¿²â»îµÄ¡°Ê×¸ö·µ»ØÊÂ¼þ¡±²»µÈÓÚÕæÊµÇëÇóÊ××Ö£»²â»îÊ¹ÓÃ `stream=true`¡¢`max_output_tokens=1`£¬ÊÕµ½¹ÜÀí/´´½¨ÊÂ¼þ¼´¿É½áÊø£¬²»ÄÜ´ú±íÄ£ÐÍÕýÎÄÊ××Ö¡£
+- Õï¶Ï£ºÕæÊµÇëÇóµÄ±¾µØ×¼±¸Í¨³£Ô¼ 2¨C40ms£¬prefix wait ÓÐÔ¼ 500ms Ó²ÉÏÏÞ£¬gzip Ô¼ 1¨C6ms£¬ÏÂÓÎ backpressure Îª 0£»Ö÷ÒªÑÓ³ÙÀ´×ÔÏµÍ³´úÀí/ÉÏÓÎ headers ÓëÊ×¸ö SSE Êä³ö£¬´ú±íÐÔÇëÇóµÄ `upstream_headers_ms` ¿É´ïÊýÊ®Ãëµ½Á½°ÙÃë¡£
+- ´úÂë¹Û²â£ººó¶ËÐÂÔö `visible_text_ttft_ms`£¬Ö»ÔÚ Responses/Chat/Anthropic µÄ¿É¼ûÎÄ±¾»ò¾Ü´ðÎÄ±¾Ê×¸ö delta µ½´ïÊ±¼ÇÂ¼£»reasoning¡¢function-call ²ÎÊýºÍ¹¤¾ßÔªÊý¾Ý²»»áÃ°³äÕýÎÄÊ××Ö¡£UI ¼ÌÐøÏÔÊ¾Ä£ÐÍÊ××Ö£¬²¢ÔÚÏêÇéÏÔÊ¾¿É¼ûÕýÎÄÊ××ÖºÍ¶ÀÁ¢µÄÊ×¸öÉÏÓÎÊÂ¼þ¡£
+- ÑéÖ¤£º`node scripts/test-graphite-latency-labels.mjs`¡¢`node scripts/test-provider-health-probe-ui.mjs`¡¢`node scripts/test-graphite-key-pool-ui.mjs`¡¢`npm.cmd run -s build`¡¢`cargo check --manifest-path src-tauri/Cargo.toml` ¾ùÍ¨¹ý£»½ö´æÔÚ¼ÈÓÐ dead-code warning¡£
+- A/B ½áÂÛ£º`output/latency-v1433-v1437-realshape-20260813-150904.json` ÎÞÓÐÐ§°æ±¾½áÂÛ£»¹Ú¾üÊ×¸ö 600K seed ÔÚÉÏÓÎ `capacity` ´íÎó£¬ºòÑ¡Î´ÐÎ³ÉÇëÇó£¬²»ÄÜ¾Ý´Ë½ú¼¶»òÌæ»» live¡£´ËÇ°ÎÈ¶¨Í¬¶þ½øÖÆÑù±¾ÏÔÊ¾±¾µØ p95 Ô¼²î 2ms¡¢ÉÏÓÎ TTFT ²îÔ¼ 2452ms£¬Î´Ö§³ÖÐÞ¸Ä»º´æ/prefix wait/gzip/live Â·ÓÉ¡£
+- ÏÂÒ»²½£ºÔÚ×ÀÃæÓÃ»§ `desktop-jrsahpg\\msj` µÄÊÖÑ¡ÉÏÓÎÅäÖÃ¿É½âÃÜÇÒÊµ¼Ê¿ÉÓÃÊ±£¬Ë¢ÐÂ hand-selected scope£¬°´¶Ô³Æ¶¯Ì¬ÉÏÏÂÎÄÖØÐÂÅÜ paced `150K¨C230K` Í¬¶þ½øÖÆ¿ØÖÆ£¬ÔÙ²âºòÑ¡£»±£³Ö `v1.4.33` Îª¹Ú¾ü»ùÏß£¬Î´ÐÎ³ÉÎÞ´íÎó¡¢ÎÞ¶îÍâÀäÆô¶¯ÇÒÃüÖÐ²»µÍÓÚ»ùÏßµÄÕýÓÅ»¯Ç°²»½ú¼¶¡£

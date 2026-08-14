@@ -2691,6 +2691,7 @@ mod tests {
             &SelectedProviderKey {
                 secret: "secret".to_string(),
                 key_id: Some("key".to_string()),
+                encrypted_material_digest: None,
             },
         )
     }

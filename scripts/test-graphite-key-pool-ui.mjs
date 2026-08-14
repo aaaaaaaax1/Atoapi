@@ -69,6 +69,26 @@ assert.match(
 );
 assert.match(
   bridgeSource,
+  /function syncOpenProviderKeyPoolHealth\(\)[\s\S]{0,420}sync-provider-key-pool-health/,
+  "an open saved-provider editor must request live multi-Key health snapshots"
+);
+assert.match(
+  bridgeSource,
+  /window\.setInterval\(syncOpenProviderKeyPoolHealth, 500\)/,
+  "the open multi-Key editor must reconcile a runtime quota failure within half a second"
+);
+assert.match(
+  bridgeSource,
+  /openProviderEditor = function\(providerId = null\)[\s\S]{0,180}syncOpenProviderKeyPoolHealth\(\)/,
+  "opening the provider editor must perform an immediate Key-health reconciliation"
+);
+assert.match(
+  controlPlane,
+  /action === "sync-provider-key-pool-health"[\s\S]{0,420}command<ProviderKeyPoolHealthSnapshot>\("get_provider_key_pool_health"/,
+  "the health reconciliation must use the lightweight live Key snapshot command"
+);
+assert.match(
+  bridgeSource,
   /!key\.enabledDirty[\s\S]{0,160}persisted\.enabled/,
   "a health refresh must not overwrite an unsaved enable edit"
 );

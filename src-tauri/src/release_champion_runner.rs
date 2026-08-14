@@ -2,7 +2,6 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,14 +13,8 @@ use uuid::Uuid;
 
 const CHAMPION_RELEASE_DIR: &str = "v1.4.33-exact-sent-waterline-maturity-20260807";
 const CHAMPION_EXE_NAME: &str = "Atoapi.exe";
-const PROVIDER_ID: &str = "agent-codex-provider-2";
-const MODEL_ID: &str = "gpt-5.6-terra";
-const KEY_REALM_HASH: &str = "4574f5c28bcca32c7845a8625bed88d421bcdf03b48a4550d5109d3e2e25b407";
 const SCENARIO: &str = "dynamic-tail-mix";
-const EMBEDDED_VERIFIER: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../scripts/verify-release-champion.mjs"
-));
+const COMMON_UPSTREAM_USER_AGENT: &str = "Atoapi-ReleaseChampion-1";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -81,8 +74,10 @@ impl ReleaseChampionRunner {
 
     /// Starts one fixed, same-principal release comparison. This intentionally
     /// accepts no caller-controlled command, executable, Provider, Key, model,
-    /// or output path. It can only compare the accepted v1.4.33 champion with
-    /// the currently running package on the selected Codex Provider-2 realm.
+    /// or output path. It compares the fixed v1.4.33 hit-rate comparator with
+    /// the currently running development package on the latest completed
+    /// Codex scope. The wrapper resolves and pins the actual saved multi-Key
+    /// realm before starting either isolated arm.
     pub async fn start(&self, config_path: &Path) -> Result<ReleaseChampionRunStatus> {
         let mut status = self.status.lock().await;
         if status.phase == ReleaseChampionRunPhase::Running {
@@ -139,67 +134,39 @@ impl ReleaseChampionRunPlan {
             .join(CHAMPION_EXE_NAME);
         if !champion_exe.is_file() {
             bail!(
-                "accepted v1.4.33 champion executable is missing: {}",
+                "v1.4.33 hit-rate comparator executable is missing: {}",
                 champion_exe.display()
+            );
+        }
+
+        let runner_script = workspace_root
+            .join("scripts")
+            .join("run-release-champion-interactive.ps1");
+        if !runner_script.is_file() {
+            bail!(
+                "interactive release champion runner is missing: {}",
+                runner_script.display()
             );
         }
 
         let output_dir = config_dir.join("release").join("release-champion");
         fs::create_dir_all(&output_dir)
             .context("failed to create release champion artifact directory")?;
-        let script_path = materialize_embedded_verifier(&output_dir)?;
         let run_id = format!(
             "{}-{}",
             Utc::now().format("%Y%m%d-%H%M%S"),
             Uuid::new_v4().simple()
         );
-        let output_path = output_dir.join(format!("v1433-current-{SCENARIO}-{run_id}.json"));
-        let prompt_cache_key_prefix = format!("atoapi-release-champion-{run_id}");
-        let arguments = vec![
-            script_path.display().to_string(),
-            "--live".to_string(),
-            "--champion-exe".to_string(),
-            champion_exe.display().to_string(),
-            "--candidate-exe".to_string(),
-            candidate_exe.display().to_string(),
-            "--source-config-dir".to_string(),
-            config_dir.display().to_string(),
-            "--model".to_string(),
-            MODEL_ID.to_string(),
-            "--key-realm-hash".to_string(),
-            KEY_REALM_HASH.to_string(),
-            "--provider-id".to_string(),
-            PROVIDER_ID.to_string(),
-            "--scenario".to_string(),
-            SCENARIO.to_string(),
-            "--pairs".to_string(),
-            "1".to_string(),
-            "--turns".to_string(),
-            "11".to_string(),
-            "--max-output-tokens".to_string(),
-            "16".to_string(),
-            "--stable-instruction-chars".to_string(),
-            "16384".to_string(),
-            "--seed-context-chars".to_string(),
-            "2350000".to_string(),
-            "--minimum-seed-input-tokens".to_string(),
-            "450000".to_string(),
-            "--tool-chars".to_string(),
-            "131072".to_string(),
-            "--tool-calls".to_string(),
-            "2".to_string(),
-            "--tool-output-shape".to_string(),
-            "natural".to_string(),
-            "--fixture-profile".to_string(),
-            "natural".to_string(),
-            "--max-local-proxy-overhead-regression-ms".to_string(),
-            "500".to_string(),
-            "--isolate-upstream-cache".to_string(),
-            "--prompt-cache-key-prefix".to_string(),
-            prompt_cache_key_prefix,
-            "--output".to_string(),
-            output_path.display().to_string(),
-        ];
+        let output_path = output_dir.join(format!(
+            "development-v1438-vs-champion-v1433-{SCENARIO}-{run_id}.json"
+        ));
+        let arguments = interactive_runner_arguments(
+            &runner_script,
+            &champion_exe,
+            &candidate_exe,
+            config_dir,
+            &output_path,
+        );
         Ok(Self {
             workspace_root,
             output_path,
@@ -230,34 +197,55 @@ fn workspace_root_from_release_exe(candidate_exe: &Path) -> Result<PathBuf> {
     Ok(workspace_root.to_path_buf())
 }
 
-fn materialize_embedded_verifier(output_dir: &Path) -> Result<PathBuf> {
-    let digest = Sha256::digest(EMBEDDED_VERIFIER.as_bytes());
-    let path = output_dir.join(format!("verify-release-champion-{digest:x}.mjs"));
-    let needs_write = fs::read_to_string(&path)
-        .map(|existing| existing != EMBEDDED_VERIFIER)
-        .unwrap_or(true);
-    if needs_write {
-        fs::write(&path, EMBEDDED_VERIFIER)
-            .with_context(|| format!("failed to materialize verifier at {}", path.display()))?;
-    }
-    Ok(path)
+fn interactive_runner_arguments(
+    runner_script: &Path,
+    champion_exe: &Path,
+    candidate_exe: &Path,
+    config_dir: &Path,
+    output_path: &Path,
+) -> Vec<String> {
+    vec![
+        "-NoProfile".to_string(),
+        "-ExecutionPolicy".to_string(),
+        "Bypass".to_string(),
+        "-File".to_string(),
+        runner_script.display().to_string(),
+        "-Scenario".to_string(),
+        SCENARIO.to_string(),
+        "-Pairs".to_string(),
+        "1".to_string(),
+        "-ProviderScope".to_string(),
+        "codex-agent".to_string(),
+        "-ChampionExe".to_string(),
+        champion_exe.display().to_string(),
+        "-CandidateExe".to_string(),
+        candidate_exe.display().to_string(),
+        "-ConfigDir".to_string(),
+        config_dir.display().to_string(),
+        "-Output".to_string(),
+        output_path.display().to_string(),
+        "-UpstreamUserAgent".to_string(),
+        COMMON_UPSTREAM_USER_AGENT.to_string(),
+    ]
 }
 
 fn run_plan(plan: ReleaseChampionRunPlan) -> Result<ReleaseChampionRunStatus> {
-    let exit = Command::new("node")
+    let exit = Command::new("powershell.exe")
         .args(&plan.arguments)
         .current_dir(&plan.workspace_root)
-        .env(
-            "ATOAPI_RELEASE_CHAMPION_WORKSPACE_ROOT",
-            &plan.workspace_root,
-        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .context("failed to start the embedded release champion verifier with Node.js")?;
+        .context("failed to start the interactive release champion runner")?;
     let finished_at = Utc::now();
     let exit_code = exit.code();
+    if !plan.output_path.is_file() {
+        let exit_detail = exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        bail!("release champion runner exited before writing a report (exit code {exit_detail})");
+    }
     let report = fs::read_to_string(&plan.output_path).with_context(|| {
         format!(
             "release champion report was not written: {}",
@@ -316,9 +304,25 @@ mod tests {
     }
 
     #[test]
-    fn embedded_verifier_is_the_live_fail_closed_script() {
-        assert!(EMBEDDED_VERIFIER.contains("release-champion-comparison"));
-        assert!(EMBEDDED_VERIFIER.contains("--isolate-upstream-cache"));
-        assert!(EMBEDDED_VERIFIER.contains("dynamic-tail-mix"));
+    fn runner_delegates_scope_refresh_and_user_agent_parity_to_interactive_wrapper() {
+        let arguments = interactive_runner_arguments(
+            Path::new(r"G:\Atoapi\scripts\run-release-champion-interactive.ps1"),
+            Path::new(r"G:\Atoapi\releases\v1.4.33\Atoapi.exe"),
+            Path::new(r"G:\Atoapi\releases\v1.4.38\Atoapi.exe"),
+            Path::new(r"C:\Users\MSJ\AppData\Roaming\Atoapi"),
+            Path::new(r"C:\Users\MSJ\AppData\Roaming\Atoapi\release\report.json"),
+        );
+        assert!(arguments
+            .windows(2)
+            .any(|pair| { pair[0] == "-ProviderScope" && pair[1] == "codex-agent" }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "-UpstreamUserAgent" && pair[1] == COMMON_UPSTREAM_USER_AGENT
+        }));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument == "agent-codex-provider-2"));
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.starts_with("4574f5")));
     }
 }

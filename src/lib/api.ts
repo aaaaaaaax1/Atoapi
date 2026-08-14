@@ -84,6 +84,12 @@ export interface PublicProviderKey {
   disabled_until?: string | null;
 }
 
+/** Runtime-only multi-Key state used to keep an open editor in sync. */
+export interface ProviderKeyPoolHealthSnapshot {
+  provider_id: string;
+  keys: Array<Pick<PublicProviderKey, "id" | "enabled" | "status">>;
+}
+
 export interface ProviderKeyPoolInput {
   enabled: boolean;
   strategy: KeyLoadBalanceStrategy;
@@ -404,6 +410,7 @@ export interface MetricsSnapshot {
     status: number;
     cold_start?: boolean | null;
     ttft_ms: number;
+    visible_text_ttft_ms?: number | null;
     first_byte_ms?: number | null;
     upstream_ttft_ms?: number | null;
     local_prepare_ms?: number | null;
@@ -511,6 +518,7 @@ export interface MetricsSnapshot {
     status: number;
     cold_start?: boolean | null;
     ttft_ms: number;
+    visible_text_ttft_ms?: number | null;
     first_byte_ms?: number | null;
     upstream_ttft_ms?: number | null;
     local_prepare_ms?: number | null;
@@ -1071,6 +1079,14 @@ function hasTauriRuntime() {
 function fallback(name: string, args?: Record<string, unknown>) {
   if (name === "get_config") return fallbackConfig;
   if (name === "reload_config") return fallbackConfig;
+  if (name === "get_provider_key_pool_health") {
+    const providerId = String(args?.providerId ?? args?.provider_id ?? "");
+    const keys = fallbackConfig.providers.find((provider) => provider.id === providerId)?.key_pool?.keys ?? [];
+    return {
+      provider_id: providerId,
+      keys: keys.map((key) => ({ id: key.id, enabled: key.enabled, status: key.status }))
+    } satisfies ProviderKeyPoolHealthSnapshot;
+  }
   if (name === "reveal_provider_api_key") {
     const providerId = String(args?.providerId ?? args?.provider_id ?? "");
     return fallbackProviderSecrets.get(providerId) ?? null;

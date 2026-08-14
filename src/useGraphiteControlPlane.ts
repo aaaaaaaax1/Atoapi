@@ -15,9 +15,10 @@ import {
     type ProviderBalanceProbeResult,
     type ProviderCacheCapabilityProbeResult,
     type ProviderConnectionPathTestResult,
-    type ProviderHealthProbeInput,
-    type ProviderHealthProbeResult,
+  type ProviderHealthProbeInput,
+  type ProviderHealthProbeResult,
   type ProviderInput,
+  type ProviderKeyPoolHealthSnapshot,
   type ProviderKeyTestResult,
   type ProviderNetworkPathDiagnosticResult,
   type ProxyStatus
@@ -32,7 +33,7 @@ import {
   providersForGraphiteAgent
 } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.37";
+const APP_VERSION = "v1.4.39";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
@@ -795,6 +796,22 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       return passed === results.length
         ? { notice: `${passed} 个 Key 测试通过`, payload: { keyPoolHealth } }
         : { error: `${passed}/${results.length} 个 Key 测试通过；请在列表中查看状态`, payload: { keyPoolHealth } };
+    }
+    if (action === "sync-provider-key-pool-health") {
+      const providerId = text("providerId");
+      if (!providerId) return;
+      const snapshot = await command<ProviderKeyPoolHealthSnapshot>("get_provider_key_pool_health", {
+        providerId,
+        provider_id: providerId
+      });
+      return {
+        payload: {
+          keyPoolHealth: {
+            providerId: snapshot.provider_id,
+            keys: snapshot.keys
+          }
+        }
+      };
     }
     if (action === "diagnose-network-paths") {
       const providerId = text("providerId");

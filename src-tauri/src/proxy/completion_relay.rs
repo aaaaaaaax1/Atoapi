@@ -703,6 +703,8 @@ pub(super) async fn stream_upstream(
                     agent_log_id.as_deref(),
                     "stream-relay-admission",
                     upstream_request_diagnostics.attempts,
+                    Some(&upstream_request_diagnostics),
+                    None,
                     &[],
                     "stream_relay_admission",
                     "proxy relay is shutting down",
@@ -797,6 +799,7 @@ pub(super) async fn stream_upstream(
             };
         let mut first_chunk_at: Option<u64> = None;
         let mut first_model_output_at: Option<u64> = None;
+        let mut first_visible_text_output_at: Option<u64> = None;
         let mut cache_capture = BoundedCacheCapture::new(eligible);
         let mut stream_state = ResponsesStreamState::default();
         let use_generic_responses_error_gate = matches!(client_channel, Channel::Responses)
@@ -965,6 +968,10 @@ pub(super) async fn stream_upstream(
                 responses_completion_seen |= observation.responses_completed_event_seen;
                 if first_model_output_at.is_none() && observation.model_output_started {
                     first_model_output_at = Some(chunk_received_at);
+                }
+                if first_visible_text_output_at.is_none() && observation.visible_text_output_started
+                {
+                    first_visible_text_output_at = Some(chunk_received_at);
                 }
                 let terminal_seen = match client_channel {
                     Channel::Responses => observation.responses_completed_event_seen,
@@ -1518,6 +1525,9 @@ pub(super) async fn stream_upstream(
             upstream_channel: decision.upstream_channel.label().to_string(),
             provider: decision.provider.name.clone(),
             provider_id: Some(decision.provider.id.clone()),
+            selected_provider_key_ref: upstream_request_diagnostics
+                .selected_provider_key_ref
+                .clone(),
             model: decision.model.clone(),
             requested_model,
             agent_reasoning_effort: None,
@@ -1593,6 +1603,7 @@ pub(super) async fn stream_upstream(
             prefix_state_cache_read_tokens: prefix_guard_wait.state_cache_read_tokens,
             status,
             ttft_ms,
+            visible_text_ttft_ms: first_visible_text_output_at,
             first_byte_ms: first_chunk_at,
             upstream_ttft_ms: Some(upstream_ttft_ms(ttft_ms, Some(prefix_guard_wait.wait_ms))),
             local_prepare_ms: Some(local_prepare_ms),

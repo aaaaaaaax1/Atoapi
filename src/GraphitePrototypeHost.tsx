@@ -84,6 +84,7 @@ const bridgeSource = String.raw`
       source.disabled = true;
     }
     window.parent.postMessage({ channel: CHANNEL, kind: "action", action, payload, requestId }, "*");
+    return requestId;
   };
   const settle = (requestId) => {
     const source = pendingActions.get(requestId);
@@ -122,6 +123,14 @@ const bridgeSource = String.raw`
   const strategyToUi = (value) => ({ "round-robin": "轮询", priority: "优先级", "least-used": "最低使用", random: "随机", sequential: "顺序" }[value] || "顺序");
   const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "sequential");
   const selectedProviderId = () => editingProviderId || currentAgent()?.provider || "";
+  let keyPoolHealthSyncRequestId = "";
+  function syncOpenProviderKeyPoolHealth() {
+    if (keyPoolHealthSyncRequestId || !isOpen("providerOverlay") || document.visibilityState === "hidden") return;
+    const providerId = selectedProviderId();
+    if (!providerId) return;
+    keyPoolHealthSyncRequestId = send("sync-provider-key-pool-health", { providerId });
+  }
+  window.setInterval(syncOpenProviderKeyPoolHealth, 500);
   const REQUESTS_PER_PAGE = 20;
   const REQUEST_PAGE_LIMIT = 10;
   const DEFAULT_KEY_PRIORITY = 5;
@@ -815,7 +824,7 @@ const bridgeSource = String.raw`
         const firstResponse = Number.isFinite(Number(item?.first_response_ms))
           ? Number(item.first_response_ms)
           : null;
-        const timing = "耗时 " + elapsed + "ms · 首字 " + (firstResponse == null ? "未返回" : firstResponse + "ms");
+        const timing = "轻量测活 " + elapsed + "ms · 首个上游事件 " + (firstResponse == null ? "未返回" : firstResponse + "ms");
         const detail = status + transport + " · " + String(item?.message || "");
         const preview = item?.response_preview ? '<small class="health-probe-preview">' + escape(item.response_preview) + '</small>' : "";
         return '<article class="health-probe-row ' + (ok ? "is-pass" : "is-fail") + '">'
@@ -1135,6 +1144,7 @@ const bridgeSource = String.raw`
     if (message.kind === "state") applyState(message.state);
     if (message.kind === "ack") {
       settle(message.requestId);
+      if (message.requestId === keyPoolHealthSyncRequestId) keyPoolHealthSyncRequestId = "";
       if (message.closeOverlay) closeOverlay(message.closeOverlay);
       if (message.payload?.models) {
         fetchedModelIds = message.payload.models
@@ -1667,6 +1677,7 @@ const bridgeSource = String.raw`
   openProviderEditor = function(providerId = null) {
     originalOpenProviderEditor(providerId);
     applyEditorData(providerId);
+    syncOpenProviderKeyPoolHealth();
   };
 
   const originalOpenDeleteConfirm = openDeleteConfirm;
@@ -1697,17 +1708,22 @@ const bridgeSource = String.raw`
     const request = requests.find((item) => item.id === requestId);
     if (!request) { originalOpenRequestDetail(requestId); return; }
     $bridge("#requestDetailSubtitle").textContent = request.provider + " · " + request.model;
-    const rawModelTtftMs = Number(request.modelTtftMs || 0);
     const displayedTtftMs = Number(request.ttftMs || 0);
-    const modelTtftRow = rawModelTtftMs > 0 && Math.abs(rawModelTtftMs - displayedTtftMs) >= 1
-      ? '<div class="detail-row"><span>模型首字</span><b>' + escape(requestDuration(rawModelTtftMs)) + '</b></div>'
+    const visibleTextTtftMs = Number(request.visibleTextTtftMs || 0);
+    const upstreamFirstEventMs = Number(request.upstreamFirstEventMs || 0);
+    const visibleTextTtftRow = visibleTextTtftMs > 0 && Math.abs(visibleTextTtftMs - displayedTtftMs) >= 1
+      ? '<div class="detail-row"><span>可见正文首字</span><b>' + escape(requestDuration(visibleTextTtftMs)) + '</b></div>'
+      : '';
+    const upstreamFirstEventRow = upstreamFirstEventMs > 0 && Math.abs(upstreamFirstEventMs - displayedTtftMs) >= 1
+      ? '<div class="detail-row"><span>首个上游事件</span><b>' + escape(requestDuration(upstreamFirstEventMs)) + '</b></div>'
       : '';
     $bridge("#requestDetailBody").innerHTML =
       '<div class="status-band"><span class="status-icon">' + icon(request.stateTone === "error" ? "circle-x" : "circle-check", 17) + '</span><div><b>' + escape(request.state) + '</b><small>' + escape(request.stateTone === "error" ? (request.errorDetail || request.detail) : "成功流已完整收尾并记录 usage") + '</small></div></div>' +
       '<div class="detail-list">' +
       '<div class="detail-row"><span>请求 ID</span><code>' + escape(request.id) + '</code></div>' +
-      '<div class="detail-row"><span>首字 / 总耗时</span><b>' + escape(request.ttft) + ' / ' + escape(request.total) + '</b></div>' +
-      modelTtftRow +
+      '<div class="detail-row"><span>模型首字 / 总耗时</span><b>' + escape(request.ttft) + ' / ' + escape(request.total) + '</b></div>' +
+      visibleTextTtftRow +
+      upstreamFirstEventRow +
       '<div class="detail-row"><span>输入 / 输出</span><b>' + escape(request.input) + ' / ' + escape(request.output) + '</b></div>' +
       '<div class="detail-row"><span>缓存命中</span><b>' + escape(request.cached) + ' · ' + escape(request.ratio) + '</b></div>' +
       '<div class="detail-row"><span>缓存细节</span><b>' + escape(request.detail) + '</b></div>' +
@@ -2087,7 +2103,20 @@ function buildState(
     .filter((request) => request.status >= 400 || request.cache_status === "error")
     .sort((left, right) => Date.parse(right.at) - Date.parse(left.at)), selectedAgent?.id);
   type RequestRecord = MetricsSnapshot["recent_requests"][number];
-  const preferredFirstByteMs = (request: RequestRecord): number => {
+  // `ttft_ms` is recorded by the relay at the first actual model output. Do
+  // not substitute a raw network chunk here: Responses providers can send
+  // `response.created` well before the first output-text delta.
+  const modelFirstTokenMs = (request: RequestRecord): number => {
+    const modelOutput = request.ttft_ms;
+    if (typeof modelOutput === "number" && Number.isFinite(modelOutput) && modelOutput >= 0) return modelOutput;
+    return 0;
+  };
+  const visibleTextFirstTokenMs = (request: RequestRecord): number => {
+    const visibleText = request.visible_text_ttft_ms;
+    if (typeof visibleText === "number" && Number.isFinite(visibleText) && visibleText >= 0) return visibleText;
+    return 0;
+  };
+  const upstreamFirstEventMs = (request: RequestRecord): number => {
     const direct = request.first_byte_ms;
     if (typeof direct === "number" && Number.isFinite(direct) && direct >= 0) return direct;
     const headers = request.upstream_headers_ms;
@@ -2099,7 +2128,7 @@ function buildState(
       const derived = headers + firstChunk;
       if (derived > 0) return derived;
     }
-    return request.ttft_ms ?? 0;
+    return modelFirstTokenMs(request);
   };
   const toRequestItem = (request: RequestRecord) => {
     const input = request.input_tokens ?? 0;
@@ -2115,7 +2144,9 @@ function buildState(
     const providerName = provider
       ? providerDisplayName(provider, recordAgent)
       : request.provider;
-    const displayFirstByteMs = preferredFirstByteMs(request);
+    const displayModelFirstTokenMs = modelFirstTokenMs(request);
+    const displayVisibleTextFirstTokenMs = visibleTextFirstTokenMs(request);
+    const displayUpstreamFirstEventMs = upstreamFirstEventMs(request);
     const state = requestRecordState({
       status: request.status,
       cacheStatus: request.cache_status,
@@ -2156,11 +2187,17 @@ function buildState(
       agentTone: badge.tone,
       clientChannel: request.client_channel ?? "Responses",
       channel: `${request.client_channel ?? "Responses"} · ${request.agent_id ?? "Agent"} · 流式`,
-      ttft: formatDuration(displayFirstByteMs),
+      ttft: formatDuration(displayModelFirstTokenMs),
       total: formatDuration(request.total_ms),
-      ttftMs: displayFirstByteMs,
+      ttftMs: displayModelFirstTokenMs,
       modelTtft: formatDuration(request.ttft_ms),
       modelTtftMs: request.ttft_ms,
+      visibleTextTtft: displayVisibleTextFirstTokenMs > 0
+        ? formatDuration(displayVisibleTextFirstTokenMs)
+        : "未记录",
+      visibleTextTtftMs: displayVisibleTextFirstTokenMs,
+      upstreamFirstEvent: formatDuration(displayUpstreamFirstEventMs),
+      upstreamFirstEventMs: displayUpstreamFirstEventMs,
       totalMs: request.total_ms,
       input: formatTokenCount(input),
       output: formatTokenCount(request.output_tokens ?? 0),
@@ -2353,7 +2390,7 @@ function buildState(
   };
   const p95FirstByte = (requests: readonly RequestRecord[]) => {
     const values = requests
-      .map(preferredFirstByteMs)
+      .map(modelFirstTokenMs)
       .filter((value) => Number.isFinite(value) && value > 0)
       .sort((left, right) => left - right);
     if (!values.length) return 0;

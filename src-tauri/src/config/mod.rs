@@ -918,6 +918,17 @@ pub struct PublicProviderKey {
 pub struct SelectedProviderKey {
     pub secret: String,
     pub key_id: Option<String>,
+    /// SHA-256 of the saved `key_encrypted` record, never of the decrypted
+    /// upstream secret.  This lets local diagnostics identify a rotated
+    /// desktop-user DPAPI record without exposing or decrypting it again.
+    pub encrypted_material_digest: Option<String>,
+}
+
+pub(crate) fn encrypted_provider_key_material_digest(encrypted: &str) -> Option<String> {
+    (!encrypted.trim().is_empty()).then(|| {
+        let digest = Sha256::digest(encrypted.as_bytes());
+        format!("{digest:x}")
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1716,6 +1727,10 @@ impl AppConfig {
                 let selected = &mut pool.keys[selected_index];
                 selected.total_requests = selected.total_requests.saturating_add(1);
                 selected.updated_at = now;
+                let encrypted_material_digest = selected
+                    .key_encrypted
+                    .as_deref()
+                    .and_then(encrypted_provider_key_material_digest);
                 let secret = selected
                     .key_encrypted
                     .as_deref()
@@ -1725,6 +1740,7 @@ impl AppConfig {
                     return Ok(Some(SelectedProviderKey {
                         secret,
                         key_id: Some(selected.id.clone()),
+                        encrypted_material_digest,
                     }));
                 }
             }
@@ -1741,6 +1757,7 @@ impl AppConfig {
             key.map(|secret| SelectedProviderKey {
                 secret,
                 key_id: None,
+                encrypted_material_digest: None,
             })
         })
     }
@@ -4045,6 +4062,62 @@ enabled = true
             .expect("key selection should work")
             .expect("healthy key should exist");
         assert_eq!(next.key_id.as_deref(), Some("key-b"));
+    }
+
+    #[test]
+    fn selected_pooled_key_carries_only_its_saved_encrypted_material_digest() {
+        let mut config = AppConfig::default();
+        let provider_id = config
+            .upsert_provider(provider_input(Some(ProviderKeyPoolInput {
+                enabled: true,
+                strategy: KeyLoadBalanceStrategy::Sequential,
+                failure_threshold: 1,
+                recovery_minutes: 5,
+                keys: vec![key_input("key-a", Some("sk-first"), true, 5)],
+            })))
+            .expect("provider should save");
+        let saved = config
+            .provider_key(&provider_id, "key-a")
+            .expect("saved Key must exist")
+            .key_encrypted
+            .clone()
+            .expect("saved Key must keep encrypted material");
+        let expected = encrypted_provider_key_material_digest(&saved)
+            .expect("non-empty encrypted material must produce a digest");
+        let selected = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("selection should work")
+            .expect("pooled Key should be selected");
+        assert_eq!(selected.key_id.as_deref(), Some("key-a"));
+        assert_eq!(
+            selected.encrypted_material_digest.as_deref(),
+            Some(expected.as_str())
+        );
+        assert_ne!(
+            selected.encrypted_material_digest.as_deref(),
+            Some("sk-first")
+        );
+
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 1,
+                    recovery_minutes: 5,
+                    keys: vec![key_input("key-a", Some("sk-rotated"), true, 5)],
+                },
+            )
+            .expect("rotated Key should save");
+        let rotated = config
+            .select_provider_key_for_request(&provider_id, None, None)
+            .expect("selection should work after Key rotation")
+            .expect("rotated Key should be selected");
+        assert_ne!(
+            selected.encrypted_material_digest, rotated.encrypted_material_digest,
+            "a replaced saved Key record must produce a new diagnostic reference input"
+        );
     }
 
     #[test]

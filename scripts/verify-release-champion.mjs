@@ -44,6 +44,18 @@ class FailClosedError extends Error {
   }
 }
 
+// The live Codex metrics guard is intentionally stricter than the isolated
+// arm runner.  When it fails after a pair has already completed, retain only
+// a bounded, payload-free projection for diagnosis; never let that evidence
+// become a promotion result.
+class LiveCodexMetricsGateError extends FailClosedError {
+  constructor(code, message, evidence) {
+    super(code, message);
+    this.name = "LiveCodexMetricsGateError";
+    this.liveGateEvidence = evidence;
+  }
+}
+
 if (booleanArg(args.help) || booleanArg(args.h)) {
   printUsage();
   process.exit(0);
@@ -104,6 +116,7 @@ async function runLiveComparison(options) {
   const sourceConfigDir = resolve(String(options["source-config-dir"]));
   const model = String(options.model).trim();
   const keyRealmHash = validateOpaqueHash(options["key-realm-hash"], "--key-realm-hash");
+  const providerScope = normalizeProviderScope(options["provider-scope"] ?? "codex-agent");
   const scenario = normalizeScenario(options.scenario ?? "full-replay");
   if (!scenario) {
     throw new FailClosedError(
@@ -144,10 +157,14 @@ async function runLiveComparison(options) {
       "--scenario compaction-root requires --turns 2 (seed plus compaction root)"
     );
   }
-  if (scenario === "dynamic-tail-mix" && (turns < 11 || turns % 2 === 0)) {
+  // Eleven turns remains the normal full-five-tail dynamic mix. A three-turn
+  // control is also meaningful: it has one changed tail and its one direct
+  // successor, so bounded medium-tail maturity behavior can be compared in
+  // the largest request-size envelope both binaries can actually complete.
+  if (scenario === "dynamic-tail-mix" && (turns < 3 || turns % 2 === 0)) {
     throw new FailClosedError(
       "dynamic_tail_mix_turn_count",
-      "--scenario dynamic-tail-mix requires an odd turn count of at least 11 so every tail profile gets a follow-up"
+      "--scenario dynamic-tail-mix requires an odd turn count of at least 3; 11 remains the full five-tail default"
     );
   }
   const requestedPort = boundedInteger(options.port ?? 18_885, "--port", 1_024, 65_500);
@@ -202,6 +219,12 @@ async function runLiveComparison(options) {
   const toolChars = boundedInteger(options["tool-chars"] ?? 32_768, "--tool-chars", 1_024, 512_000);
   const toolCalls = boundedInteger(options["tool-calls"] ?? 1, "--tool-calls", 1, 8);
   const toolOutputShape = normalizeToolOutputShape(options["tool-output-shape"] ?? "natural");
+  // Historical tool-history validation declares the synthetic fixture schema
+  // from the seed onward. Keep that behavior by default: omitting the flag
+  // must never silently change a previously valid comparison wire.
+  // `--include-tool-schema=false` is available only for an explicit protocol
+  // compatibility probe and has a distinct fixture identity.
+  const includeToolSchema = resolveIncludeToolSchema(options);
   const dynamicTailProfile = normalizeDynamicTailProfile(
     options["dynamic-tail-profile"] ?? "mixed"
   );
@@ -274,26 +297,18 @@ async function runLiveComparison(options) {
     0,
     10_000
   );
-  // A bounded foreground prefix-maturity wait is an intentional cache
-  // optimization, not an unbounded local regression. Keep the default strict
-  // for ordinary comparisons, but let a live verification explicitly model
-  // the user-approved 500ms ceiling when it is exercising that path.
-  const maxLocalProxyOverheadRegressionMs = boundedInteger(
-    options["max-local-proxy-overhead-regression-ms"] ?? 0,
-    "--max-local-proxy-overhead-regression-ms",
-    0,
-    500
-  );
+  // Promotion keeps local pre-upstream work strict by default.  A caller may
+  // explicitly choose to treat end-to-end TTFT as a diagnostic because it also
+  // includes the hand-selected upstream's scheduling variance; that never
+  // relaxes the local latency gate.
+  const maxLocalProxyOverheadRegressionMs = strictLocalLatencyRegressionBudget(options);
   const maxFullBucketRegressionRequests = boundedInteger(
     options["max-full-bucket-regression-requests"] ?? 0,
     "--max-full-bucket-regression-requests",
     0,
     pairs * turns
   );
-  // Promotion evidence always carries the end-to-end TTFT gate. The CLI flag
-  // remains accepted for compatibility, but omitting it must not create a
-  // looser live comparison than the interactive wrapper.
-  const requireTtftNoRegression = true;
+  const requireTtftNoRegression = resolvePromotionTtftPolicy(options);
   const sharedUpstreamUserAgent = optionalUpstreamUserAgent(options["upstream-user-agent"]);
   const championUpstreamUserAgent = optionalUpstreamUserAgent(
     options["champion-upstream-user-agent"]
@@ -303,7 +318,19 @@ async function runLiveComparison(options) {
   ) ?? sharedUpstreamUserAgent;
   const keepRunDir = booleanArg(options["keep-run-dir"]);
   const isolateUpstreamCache = booleanArg(options["isolate-upstream-cache"]);
+  // A live isolated comparison is only meaningful when the native upstream
+  // placement telemetry proves both arms stayed on distinct, stable lanes.
+  // Offline artifacts predate this proof in some cases, so their explicit
+  // compatibility path keeps the requirement disabled.
+  const nativePlacementIsolationRequired = isolateUpstreamCache;
   const sharedCacheCrossover = booleanArg(options["shared-cache-crossover"]);
+  // An opaque prompt-cache placement value is local evidence that the two
+  // arms chose different values; it does not prove that a selected upstream
+  // honors the field as an isolation boundary. The live v1.4.39 replay
+  // demonstrated cross-arm cache transfer despite distinct fingerprints, so
+  // promotion must use turn-by-turn shared placement crossover until a future
+  // upstream-specific isolation proof exists.
+  const promotionRequiresSharedUpstreamPlacementCrossover = true;
   const requestedReuseRuntimePerArm = booleanArg(options["reuse-runtime-per-arm"]);
   if (sharedCacheCrossover && isolateUpstreamCache) {
     throw new FailClosedError(
@@ -325,11 +352,35 @@ async function runLiveComparison(options) {
     requestedReuseRuntimePerArm,
     isolateUpstreamCache
   );
+  // Shared crossover aligns the placement key and turn order, but its two
+  // persistent isolated runtimes still own different connection pools. Keep a
+  // bounded diagnostic switch so a same-binary control can prove whether a
+  // failure follows the second-created runtime rather than the product arm.
+  const persistentRuntimeStartOrder = normalizePersistentRuntimeStartOrder(
+    options["persistent-runtime-start-order"] ?? "champion"
+  );
+  if (persistentRuntimeStartOrder !== "champion" && !reuseRuntimePerArm) {
+    throw new FailClosedError(
+      "persistent_runtime_start_order_requires_reuse",
+      "--persistent-runtime-start-order candidate requires --reuse-runtime-per-arm without upstream-cache isolation"
+    );
+  }
   const pinnedKeyId = optionalOpaqueIdentifier(options["key-id"], "--key-id");
   const forceUseSystemProxy = optionalBoolean(
     options["force-use-system-proxy"],
     "--force-use-system-proxy"
   );
+  const liveCodexMetricsUrl = optionalLiveCodexMetricsUrl(
+    options["live-codex-metrics-url"]
+  );
+  const liveCodexMaxAgeSeconds = liveCodexMetricsUrl
+    ? boundedInteger(
+      options["live-codex-max-age-seconds"] ?? 600,
+      "--live-codex-max-age-seconds",
+      30,
+      3_600
+    )
+    : null;
   const sourceSnapshot = await snapshotLiveConfig(sourceConfigDir);
   try {
     const configText = await readRequiredText(
@@ -343,25 +394,55 @@ async function runLiveComparison(options) {
       );
     }
     const codexRoute = codexAgentRoute(configText);
-    const configProviderId = codexRoute?.provider_id ?? "";
-    if (!configProviderId) {
+    const codexProviderId = codexRoute?.provider_id ?? "";
+    if (providerScope === "codex-agent") {
+      if (!codexProviderId) {
+        throw new FailClosedError(
+          "missing_codex_provider",
+          "source config has no Codex agent injection provider_id"
+        );
+      }
+      if (codexRoute?.enabled !== true) {
+        throw new FailClosedError(
+          "codex_agent_not_enabled",
+          "source config has no enabled Codex agent injection; live verification must use the hand-selected Codex route"
+        );
+      }
+    }
+    const activeProviderId = extractTomlString(configText, "active_provider_id");
+    const providerId = String(
+      options["provider-id"] ?? (providerScope === "active-provider" ? activeProviderId : codexProviderId)
+    ).trim();
+    if (!providerId) {
       throw new FailClosedError(
-        "missing_codex_provider",
-        "source config has no Codex agent injection provider_id"
+        providerScope === "active-provider" ? "missing_active_provider" : "provider_scope_mismatch",
+        providerScope === "active-provider"
+          ? "active-provider scope requires an explicit active_provider_id in the source config"
+          : "--provider-id must match the Codex provider_id in the snapshotted source config"
       );
     }
-    if (codexRoute?.enabled !== true) {
-      throw new FailClosedError(
-        "codex_agent_not_enabled",
-        "source config has no enabled Codex agent injection; live verification must use the hand-selected Codex route"
-      );
-    }
-    const providerId = String(options["provider-id"] ?? configProviderId).trim();
-    if (!providerId || providerId !== configProviderId) {
+    if (providerScope === "codex-agent" && providerId !== codexProviderId) {
       throw new FailClosedError(
         "provider_scope_mismatch",
         "--provider-id must match the Codex provider_id in the snapshotted source config"
       );
+    }
+    if (providerScope === "active-provider") {
+      if (providerId !== activeProviderId) {
+        throw new FailClosedError(
+          "active_provider_scope_mismatch",
+          "active-provider scope requires --provider-id to match active_provider_id"
+        );
+      }
+      const activeProviderBlock = tomlArrayBlocks(configText, "providers")
+        .map((item) => item.body)
+        .find((item) => extractTomlString(item, "id") === activeProviderId);
+      if (!activeProviderBlock || extractTomlBoolean(activeProviderBlock, "enabled") !== true) {
+        throw new FailClosedError(
+          "active_provider_unavailable",
+          "active-provider scope requires an enabled active_provider_id Provider"
+        );
+      }
     }
     if (!model) {
       throw new FailClosedError("invalid_model", "--model must not be empty");
@@ -369,16 +450,20 @@ async function runLiveComparison(options) {
     // A Codex binding may leave model_id empty, meaning the Codex client
     // chooses its model per request. If it is explicitly bound, never let a
     // release comparison silently test a different model on the same Provider.
-    assertCodexRouteModelScope(codexRoute, model);
+    if (providerScope === "codex-agent") assertCodexRouteModelScope(codexRoute, model);
     validatePinnedKeyConfiguration(configText, providerId, pinnedKeyId);
     const liveSelectionScopeFingerprint = await currentLiveSelectionScopeFingerprint(
       sourceConfigDir,
-      configText
+      configText,
+      providerScope,
+      pinnedKeyId
     );
     await assertLiveSelectionScopeUnchanged(
       sourceConfigDir,
       liveSelectionScopeFingerprint,
-      "before_isolated_runtime_start"
+      "before_isolated_runtime_start",
+      providerScope,
+      pinnedKeyId
     );
     await assertFile(championExe, "--champion-exe");
     await assertFile(candidateExe, "--candidate-exe");
@@ -392,6 +477,18 @@ async function runLiveComparison(options) {
       key_realm_hash: keyRealmHash,
       request_family: requestFamily
     };
+    const assertLiveCodexScope = async (checkpoint) => {
+      if (!liveCodexMetricsUrl) return;
+      await assertLiveCodexMetricsScopeUnchanged({
+        metricsUrl: liveCodexMetricsUrl,
+        expectedProviderId: cohort.provider_id,
+        expectedModel: cohort.model,
+        expectedRealm: cohort.key_realm_hash,
+        maxAgeSeconds: liveCodexMaxAgeSeconds,
+        checkpoint
+      });
+    };
+    await assertLiveCodexScope("before_isolated_runtime_start");
     const settings = {
       scenario,
       pairs,
@@ -408,6 +505,7 @@ async function runLiveComparison(options) {
       tool_chars: toolChars,
       tool_calls: toolCalls,
       tool_output_shape: toolOutputShape,
+      include_tool_schema: includeToolSchema,
       dynamic_tail_profile: dynamicTailProfile,
       dynamic_tail_mode: dynamicTailMode,
       fixture_profile: fixtureProfile,
@@ -420,12 +518,18 @@ async function runLiveComparison(options) {
       max_ttft_regression_ms: maxTtftRegressionMs,
       max_input_token_delta: maxInputTokenDelta,
       require_ttft_no_regression: requireTtftNoRegression,
+      promotion_latency_policy: requireTtftNoRegression
+        ? "end-to-end-no-regression"
+        : "local-no-regression-upstream-exempt",
       max_local_proxy_overhead_regression_ms: maxLocalProxyOverheadRegressionMs,
       max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
       champion_upstream_user_agent: championUpstreamUserAgent,
       candidate_upstream_user_agent: candidateUpstreamUserAgent,
       forced_use_system_proxy: forceUseSystemProxy,
       isolate_upstream_cache: isolateUpstreamCache,
+      native_placement_isolation_required: nativePlacementIsolationRequired,
+      promotion_requires_shared_upstream_placement_crossover:
+        promotionRequiresSharedUpstreamPlacementCrossover,
       shared_cache_crossover: sharedCacheCrossover,
       isolation_lane_strategy: sharedCacheCrossover
         ? "shared-turn-crossover-v1"
@@ -436,14 +540,43 @@ async function runLiveComparison(options) {
       reuse_runtime_per_arm_requested: requestedReuseRuntimePerArm,
       runtime_reuse_disabled_for_isolation:
         requestedReuseRuntimePerArm && isolateUpstreamCache,
+      persistent_runtime_start_order: reuseRuntimePerArm
+        ? persistentRuntimeStartOrder
+        : "not_applicable",
       key_id_pinned: Boolean(pinnedKeyId),
-      hand_selected_model_bound: Boolean(codexRoute.model_id),
-      live_selection_scope_guard: "fail_closed"
+      hand_selected_model_bound: providerScope === "codex-agent" && Boolean(codexRoute?.model_id),
+      codex_route_model_bound: Boolean(codexRoute?.model_id),
+      live_selection_scope_guard: "fail_closed",
+      live_codex_metrics_scope_guard: liveCodexMetricsUrl ? "fail_closed" : "not_configured",
+      provider_scope: providerScope
     };
     const artifacts = {
       champion: await executableArtifact(championExe),
       candidate: await executableArtifact(candidateExe)
     };
+    const providerBlock = tomlArrayBlocks(configText, "providers")
+      .map((item) => item.body)
+      .find((item) => extractTomlString(item, "id") === providerId);
+    if (!providerBlock) {
+      throw new FailClosedError(
+        "provider_not_found_for_user_agent_parity",
+        "the selected Provider is missing from the snapshotted config; User-Agent parity cannot be proven"
+      );
+    }
+    const upstreamUserAgentParity = evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent,
+      candidateUpstreamUserAgent,
+      sourceCustomUserAgent: extractTomlString(providerBlock, "custom_user_agent").trim(),
+      championExecutableSha256: artifacts.champion.sha256,
+      candidateExecutableSha256: artifacts.candidate.sha256
+    });
+    if (!upstreamUserAgentParity.ok) {
+      throw new FailClosedError(
+        upstreamUserAgentParity.code,
+        upstreamUserAgentParity.message
+      );
+    }
+    settings.upstream_user_agent_parity = upstreamUserAgentParity.mode;
     // Preserve every executed arm result for diagnostics, while keeping only
     // non-warm-up pairs in the aggregates below. This makes a cold lane
     // visible without giving it any path to a promotion verdict.
@@ -451,6 +584,7 @@ async function runLiveComparison(options) {
     const orderedPairs = [];
     const interleavedTurnOrders = [];
     let abortedAfterPair = null;
+    let afterPairLiveGateFailure = null;
     let persistentArmRuntimes = null;
     try {
       if (reuseRuntimePerArm) {
@@ -458,20 +592,25 @@ async function runLiveComparison(options) {
           championExe,
           candidateExe,
           sourceConfigDir: sourceSnapshot.configDir,
-          configProviderId,
+          configProviderId: providerId,
           requestedPort,
           championUpstreamUserAgent,
           candidateUpstreamUserAgent,
           pinnedKeyId,
+          forceUseSystemProxy,
+          startOrder: persistentRuntimeStartOrder,
           keepRunDir
         });
       }
 
       for (let pair = 0; pair < pairs; pair += 1) {
+        await assertLiveCodexScope("before_pair_" + pair);
         await assertLiveSelectionScopeUnchanged(
           sourceConfigDir,
           liveSelectionScopeFingerprint,
-          `before_pair_${pair}`
+          `before_pair_${pair}`,
+          providerScope,
+          pinnedKeyId
         );
         const fixtureFamily = freshFixturePerPair
           ? `fixture-${sha256Parts([
@@ -483,6 +622,7 @@ async function runLiveComparison(options) {
             seedContextChars,
             toolChars,
             toolOutputShape,
+            ...(includeToolSchema ? ["include-tool-schema-v1"] : []),
             dynamicTailProfile,
             dynamicTailMode,
             fixtureProfile,
@@ -512,7 +652,7 @@ async function runLiveComparison(options) {
             arm,
             executable,
             sourceConfigDir: sourceSnapshot.configDir,
-            configProviderId,
+            configProviderId: providerId,
             cohort,
             settings,
             requestedPort,
@@ -560,10 +700,13 @@ async function runLiveComparison(options) {
           orderedPairs.push(order);
           const results = {};
           for (const arm of order) {
+            await assertLiveCodexScope("before_" + arm + "_pair_" + pair);
             await assertLiveSelectionScopeUnchanged(
               sourceConfigDir,
               liveSelectionScopeFingerprint,
-              `before_${arm}_pair_${pair}`
+              `before_${arm}_pair_${pair}`,
+              providerScope,
+              pinnedKeyId
             );
             const armSpec = armSpecFor(arm);
             const result = await runIsolatedDynamicArm(armSpec);
@@ -572,10 +715,27 @@ async function runLiveComparison(options) {
           }
           pairResult = results;
         }
+        try {
+          await assertLiveCodexScope("after_pair_" + pair);
+        } catch (error) {
+          // The pair itself is already complete and is useful for diagnosis,
+          // but the live Codex scope is no longer valid for a release verdict.
+          // Retain it in a diagnostic-only report and stop before any more
+          // isolated traffic is sent.
+          if (!(error instanceof LiveCodexMetricsGateError)) throw error;
+          abortedAfterPair = pair;
+          afterPairLiveGateFailure = {
+            code: error.code,
+            evidence: error.liveGateEvidence
+          };
+          break;
+        }
         await assertLiveSelectionScopeUnchanged(
           sourceConfigDir,
           liveSelectionScopeFingerprint,
-          `after_pair_${pair}`
+          `after_pair_${pair}`,
+          providerScope,
+          pinnedKeyId
         );
         // A release comparison is already invalid after either arm fails. Do
         // not convert a single third-party rejection into a burst of fresh
@@ -594,6 +754,22 @@ async function runLiveComparison(options) {
           disposeIsolatedRuntimeWorkspace(workspace, `${arm} persistent isolated runtime`, keepRunDir)
         ));
       }
+    }
+
+    if (afterPairLiveGateFailure) {
+      return buildAfterPairLiveGateFailureReport({
+        mode: reuseRuntimePerArm ? "live-isolated-reused-runtime" : "live-isolated",
+        runId,
+        cohort,
+        settings,
+        pairOrder: orderedPairs,
+        turnOrder: reuseRuntimePerArm ? interleavedTurnOrders : null,
+        abortedAfterPair,
+        warmupPairs,
+        rawArmRuns,
+        artifacts,
+        liveGateFailure: afterPairLiveGateFailure
+      });
     }
 
     const championRunPartitions = partitionRunsByWarmup(rawArmRuns.champion, warmupPairs);
@@ -632,7 +808,13 @@ async function runLiveComparison(options) {
       maxLocalProxyOverheadRegressionMs,
       maxFullBucketRegressionRequests,
       requireTtftNoRegression,
-      maxInputTokenDelta
+      maxInputTokenDelta,
+      nativePlacementIsolationRequired,
+      {
+        require_shared_upstream_placement_crossover:
+          promotionRequiresSharedUpstreamPlacementCrossover,
+        shared_upstream_placement_crossover_observed: sharedCacheCrossover
+      }
     );
     return {
       schema: SCHEMA,
@@ -673,6 +855,392 @@ async function runIsolatedDynamicArm(spec) {
   }
 }
 
+function diagnosticRunChecks() {
+  return [
+  "no_runtime_failure",
+  "every_sse_completed",
+  "every_inbound_one_attempt_one_main_post",
+  "cohort_bound_on_every_request",
+  "complete_usage_coverage",
+  "complete_cache_read_token_evidence",
+  "complete_timing_coverage",
+  "input_usage_present",
+  "required_seed_input_tokens",
+  "required_peak_input_tokens",
+  "maximum_peak_input_tokens",
+  "dynamic_tail_terminal_followup_peak_in_range",
+  "cacheable_128_evidence_present",
+  "warm_stable_prefix_evidence_present",
+  "static_wire_continuity",
+  "small_context_cold_read_no_foreground_wait",
+  "one_observed_key_realm",
+  "avoidable_gap_zero",
+  "required_guarded_requests",
+  "compaction_observed",
+    "dynamic_tail_followup_coverage"
+  ];
+}
+
+function diagnosticAggregateChecks() {
+  return [
+  "every_run_passed",
+  "cohort_consistent",
+  "one_observed_key_realm",
+  "every_sse_completed",
+  "every_inbound_one_attempt_one_main_post",
+  "avoidable_gap_zero",
+  "complete_timing_coverage",
+  "input_usage_present",
+  "required_peak_input_tokens",
+  "maximum_peak_input_tokens",
+  "cacheable_128_evidence_present",
+  "warm_stable_prefix_evidence_present",
+  "static_wire_continuity",
+  "full_bucket_denominator_present",
+  "required_guarded_requests",
+  "dynamic_tail_followup_coverage",
+    "dynamic_tail_terminal_followup_peak_in_range"
+  ];
+}
+
+function diagnosticRequestChecks() {
+  return [
+  "terminal_response_completed",
+  "terminal_usage_shape_present",
+  "exact_counter_delta",
+  "per_inbound_one_attempt_one_post",
+  "aggregate_no_multi_attempt",
+  "metric_present",
+  "provider_matches_cohort",
+  "model_matches_cohort",
+  "observed_key_realm_present",
+  "observed_key_realm_matches_cohort",
+  "usage_present",
+  "cache_read_tokens_present",
+    "timing_present"
+  ];
+}
+
+function diagnosticMetricFields() {
+  return [
+  "requests",
+  "successful_sse_requests",
+  "input_tokens",
+  "warm_input_tokens",
+  "seed_input_tokens",
+  "seed_cache_read_tokens",
+  "seed_request_count",
+  "cold_seed_request_count",
+  "peak_input_tokens",
+  "dynamic_tail_terminal_followup_input_tokens",
+  "cache_read_tokens",
+  "raw_token_hit_rate",
+  "warm_cache_read_tokens",
+  "warm_raw_token_hit_rate",
+  "cacheable_tokens_128",
+  "cacheable_read_tokens_128",
+  "cache_128_hit_rate",
+  "warm_cacheable_tokens_128",
+  "warm_cacheable_read_tokens_128",
+  "warm_cache_128_hit_rate",
+  "warm_stable_prefix_tokens_128",
+  "warm_stable_prefix_cached_tokens_128",
+  "warm_stable_prefix_hit_rate",
+  "full_bucket_requests",
+  "full_bucket_rate",
+  "warm_full_bucket_requests",
+  "warm_full_bucket_rate",
+  "warm_full_bucket_denominator",
+  "cacheable_request_count",
+  "full_bucket_denominator",
+  "avoidable_gap_tokens",
+  "new_tail_gap_tokens",
+  "provider_unstable_gap_tokens",
+  "shortfall_tokens",
+  "guarded_requests",
+  "timing_complete_requests",
+  "local_pre_upstream_overhead_p95_ms",
+  "local_proxy_overhead_p95_ms",
+  "upstream_ttft_p95_ms",
+  "ttft_p95_ms",
+  "compaction_request_count",
+  "compaction_local_proxy_overhead_p95_ms",
+  "compaction_upstream_ttft_p95_ms",
+  "compaction_ttft_p95_ms",
+    "usage_coverage"
+  ];
+}
+
+function safeDiagnosticHash(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  return /^[a-f0-9]{16,128}$/u.test(normalized) ? normalized : null;
+}
+
+// A prompt-cache key is opaque placement material and must never be retained
+// in a release artifact. Its truncated one-way fingerprint is sufficient to
+// prove whether two live arms actually used separate native placement keys.
+function opaquePlacementFingerprint(value) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  return raw ? sha256Text(raw).slice(0, 32) : null;
+}
+
+function safeDiagnosticPair(value) {
+  return Number.isInteger(value) && value >= 0 && value <= 8 ? value : null;
+}
+
+function projectDiagnosticChecks(source, fields) {
+  const projected = {};
+  for (const field of fields) {
+    if (typeof source?.[field] === "boolean") projected[field] = source[field];
+  }
+  return projected;
+}
+
+function projectDiagnosticMetrics(metrics) {
+  const projected = {};
+  for (const field of diagnosticMetricFields()) {
+    const value = finiteNonNegativeNumber(metrics?.[field]);
+    if (value !== null) projected[field] = value;
+  }
+  const dynamicTail = metrics?.dynamic_tail_mix;
+  if (dynamicTail && typeof dynamicTail === "object") {
+    const dynamicTailProjection = {};
+    for (const field of [
+      "injections",
+      "injected_characters",
+      "followups_observed",
+      "followup_new_tail_tokens",
+      "followup_provider_unstable_tokens",
+      "followup_tail_lag_count"
+    ]) {
+      const value = finiteNonNegativeNumber(dynamicTail[field]);
+      if (value !== null) dynamicTailProjection[field] = value;
+    }
+    projected.dynamic_tail_mix = dynamicTailProjection;
+  }
+  return projected;
+}
+
+function projectDiagnosticFingerprints(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const projected = {};
+  for (const field of ["input_full", ...STATIC_WIRE_FIELDS]) {
+    const hash = safeDiagnosticHash(value[field]);
+    if (hash) projected[field] = hash;
+  }
+  return Object.keys(projected).length > 0 ? projected : null;
+}
+
+function projectDiagnosticCounters(counters) {
+  const projected = {};
+  for (const field of ["inbound_requests", "generation_attempts", "upstream_requests"]) {
+    const value = finiteNonNegativeNumber(counters?.[field]);
+    if (value !== null) projected[field] = value;
+  }
+  return projected;
+}
+
+function projectDiagnosticTransport(transport) {
+  const projected = {};
+  const numericFields = {
+    request_bytes: "request_body_bytes",
+    sent_bytes: "sent_body_bytes",
+    request_encode_ms: "request_body_encode_ms",
+    gzip_encode_ms: "gzip_encode_ms",
+    upstream_headers_ms: "upstream_attempt_headers_ms",
+    upstream_wait_ms: "stream_upstream_wait_ms",
+    client_backpressure_ms: "stream_client_backpressure_ms",
+    sse_chunks: "sse_chunks"
+  };
+  for (const [target, source] of Object.entries(numericFields)) {
+    const value = finiteNonNegativeNumber(transport?.[source]);
+    if (value !== null) projected[target] = value;
+  }
+  for (const field of ["gzip_attempted", "gzip_fallback_used", "downstream_disconnected"]) {
+    if (typeof transport?.[field] === "boolean") projected[field] = transport[field];
+  }
+  return projected;
+}
+
+function projectDiagnosticRequest(request) {
+  const metrics = {};
+  for (const field of [
+    "input_tokens",
+    "cache_read_tokens",
+    "cache_avoidable_gap_tokens",
+    "cache_new_tail_gap_tokens",
+    "cache_provider_unstable_gap_tokens",
+    "cache_shortfall_tokens",
+    "tail_input_items",
+    "tail_message_chars",
+    "tail_tool_call_chars",
+    "tail_tool_output_chars",
+    "tail_largest_tool_output_chars",
+    "tail_tool_output_lines",
+    "tail_tool_output_repeated_line_chars",
+    "tail_tool_output_timestamp_like_count",
+    "tail_tool_output_hash_like_count",
+    "tail_tool_output_json_like_chars",
+    "prefix_lag_input_delta_tokens",
+    "prefix_lag_cache_delta_tokens",
+    "prefix_lag_previous_gap_tokens",
+    "prefix_cache_instability_score",
+    "prefix_state_cache_read_tokens"
+  ]) {
+    const value = finiteNonNegativeNumber(request?.[field]);
+    if (value !== null) metrics[field] = value;
+  }
+  const timing = {};
+  for (const field of [
+    "prefix_guard_wait_ms",
+    "local_prepare_ms",
+    "upstream_headers_ms",
+    "upstream_first_chunk_ms",
+    "upstream_ttft_ms",
+    "ttft_ms"
+  ]) {
+    const value = finiteNonNegativeNumber(request?.[field]);
+    if (value !== null) timing[field] = value;
+  }
+  const projected = {
+    arm: request?.arm === "champion" || request?.arm === "candidate" ? request.arm : undefined,
+    pair: safeDiagnosticPair(request?.pair),
+    phase: safeLiveCodexLabel(request?.phase),
+    request_kind: safeLiveCodexLabel(request?.request_kind),
+    pass: request?.pass === true,
+    http_status: (() => {
+      const status = Number(request?.http_status);
+      return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+    })(),
+    response_failure_code: safeLiveCodexLabel(request?.response_failure_code),
+    response_failure_kind: safeLiveCodexLabel(request?.response_failure_kind),
+    elapsed_ms: finiteNonNegativeNumber(request?.elapsed_ms),
+    sse_completed: request?.sse_completed === true,
+    terminal_usage_shape: safeLiveCodexLabel(request?.terminal_usage_shape),
+    input_fingerprint: safeDiagnosticHash(request?.input_fingerprint),
+    outbound_prefix_fingerprints: projectDiagnosticFingerprints(request?.outbound_prefix_fingerprints),
+    provider_prefix_fingerprint: safeDiagnosticHash(request?.provider_prefix_fingerprint),
+    provider_prefix_key_present: request?.provider_prefix_key_present === true,
+    provider_prefix_key_fingerprint: safeDiagnosticHash(request?.provider_prefix_key_fingerprint),
+    cache_read_tokens_observed: request?.cache_read_tokens_observed === true,
+    metrics,
+    timing,
+    transport: projectDiagnosticTransport(request?.transport),
+    counters: projectDiagnosticCounters(request?.counters),
+    runtime_error_scopes: array(request?.runtime_error_scopes)
+      .map(safeLiveCodexLabel)
+      .filter(Boolean)
+      .slice(0, 4),
+    runtime_error_classes: array(request?.runtime_error_classes)
+      .map(safeLiveCodexLabel)
+      .filter(Boolean)
+      .slice(0, 4),
+    checks: projectDiagnosticChecks(request?.checks, diagnosticRequestChecks())
+  };
+  return Object.fromEntries(Object.entries(projected).filter(([, value]) => value !== undefined));
+}
+
+function projectDiagnosticArmRun(run) {
+  return {
+    arm: run?.arm === "champion" || run?.arm === "candidate" ? run.arm : null,
+    pair: safeDiagnosticPair(run?.pair),
+    scenario: safeLiveCodexLabel(run?.scenario),
+    pass: run?.pass === true,
+    prompt_cache_key_used: run?.prompt_cache_key_used === true,
+    metrics: projectDiagnosticMetrics(run?.metrics),
+    checks: projectDiagnosticChecks(run?.checks, diagnosticRunChecks()),
+    requests: array(run?.requests).map(projectDiagnosticRequest)
+  };
+}
+
+function projectDiagnosticArmAggregate(aggregate) {
+  return {
+    arm: aggregate?.arm === "champion" || aggregate?.arm === "candidate" ? aggregate.arm : null,
+    completed_run_count: array(aggregate?.runs).length,
+    pass: aggregate?.pass === true,
+    metrics: projectDiagnosticMetrics(aggregate?.metrics),
+    checks: projectDiagnosticChecks(aggregate?.checks, diagnosticAggregateChecks())
+  };
+}
+
+function buildAfterPairLiveGateFailureReport({
+  mode,
+  cohort,
+  settings,
+  pairOrder,
+  turnOrder,
+  abortedAfterPair,
+  warmupPairs,
+  rawArmRuns,
+  artifacts,
+  liveGateFailure
+}) {
+  const championRuns = array(rawArmRuns?.champion);
+  const candidateRuns = array(rawArmRuns?.candidate);
+  const diagnosticChampion = aggregateArm(
+    "champion",
+    cohort,
+    artifacts.champion,
+    championRuns,
+    0,
+    number(settings?.minimum_peak_input_tokens),
+    number(settings?.maximum_peak_input_tokens)
+  );
+  const diagnosticCandidate = aggregateArm(
+    "candidate",
+    cohort,
+    artifacts.candidate,
+    candidateRuns,
+    0,
+    number(settings?.minimum_peak_input_tokens),
+    number(settings?.maximum_peak_input_tokens)
+  );
+  const checkpoint = `after_pair_${Number.isInteger(abortedAfterPair) ? abortedAfterPair : "unknown"}`;
+  const code = safeLiveCodexLabel(liveGateFailure?.code) ?? "live_codex_metrics_gate_failed";
+  return {
+    schema: SCHEMA,
+    kind: "release-champion-diagnostic",
+    mode: safeLiveCodexLabel(mode),
+    pass: false,
+    fail_closed: true,
+    diagnostic_only: true,
+    promotion_eligible: false,
+    pair_order: array(pairOrder).map((order) => array(order)
+      .filter((arm) => arm === "champion" || arm === "candidate")),
+    turn_order: Array.isArray(turnOrder)
+      ? turnOrder.map((order) => array(order).map((turn) => array(turn)
+        .filter((arm) => arm === "champion" || arm === "candidate")))
+      : null,
+    aborted_after_pair: safeDiagnosticPair(abortedAfterPair),
+    warmup_pair_ids: scheduledPairIds(warmupPairs),
+    scored_pair_ids: [],
+    completed_isolated_pair_ids: pairedRunIds(championRuns, candidateRuns),
+    completed_isolated_arm_runs: {
+      champion: championRuns.map(projectDiagnosticArmRun),
+      candidate: candidateRuns.map(projectDiagnosticArmRun)
+    },
+    diagnostic_arm_aggregates: {
+      champion: projectDiagnosticArmAggregate(diagnosticChampion),
+      candidate: projectDiagnosticArmAggregate(diagnosticCandidate)
+    },
+    live_codex_gate: {
+      state: "failed",
+      checkpoint,
+      code,
+      evidence: liveGateFailure?.evidence ?? {
+        schema: "atoapi-live-codex-gate-evidence-v1",
+        checkpoint,
+        record_available: false
+      }
+    },
+    error: {
+      code,
+      message: "the after-pair live Codex scope gate failed; completed isolated arm evidence is diagnostic-only",
+      missing_parameters: []
+    }
+  };
+}
+
 async function runDynamicArmOnRuntime(spec) {
   try {
     return await exerciseScenario(await prepareDynamicArmSpec(spec));
@@ -711,7 +1279,7 @@ async function prepareDynamicArmSpec(spec) {
 async function startPersistentIsolatedArmRuntimes(spec) {
   const workspaces = {};
   try {
-    for (const arm of ["champion", "candidate"]) {
+    for (const arm of persistentRuntimeStartOrder(spec.startOrder)) {
       workspaces[arm] = await startIsolatedRuntimeWorkspace({
         arm,
         executable: arm === "champion" ? spec.championExe : spec.candidateExe,
@@ -721,6 +1289,7 @@ async function startPersistentIsolatedArmRuntimes(spec) {
           ? spec.championUpstreamUserAgent
           : spec.candidateUpstreamUserAgent,
         pinnedKeyId: spec.pinnedKeyId,
+        forceUseSystemProxy: spec.forceUseSystemProxy,
         requestedPort: spec.requestedPort,
         keepRunDir: spec.keepRunDir
       });
@@ -732,6 +1301,21 @@ async function startPersistentIsolatedArmRuntimes(spec) {
     ));
     throw error;
   }
+}
+
+function normalizePersistentRuntimeStartOrder(value) {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "champion" || normalized === "candidate") return normalized;
+  throw new FailClosedError(
+    "invalid_persistent_runtime_start_order",
+    "--persistent-runtime-start-order must be champion or candidate"
+  );
+}
+
+function persistentRuntimeStartOrder(firstArm) {
+  return normalizePersistentRuntimeStartOrder(firstArm) === "champion"
+    ? ["champion", "candidate"]
+    : ["candidate", "champion"];
 }
 
 async function startIsolatedRuntimeWorkspace(spec) {
@@ -888,6 +1472,11 @@ async function advanceScenarioCursor(cursor, turn) {
       state.input.push(message(`Stable follow-up ${turn}. Reply with OK only.`));
     }
 
+    const fixtureTools = releaseFixtureToolsForScenario(
+      spec.settings.scenario,
+      spec.settings.dynamic_tail_mode,
+      spec.settings.include_tool_schema
+    );
     const record = await sendOneInbound({
       runtime: spec.runtime,
       sessionId: cursor.sessionId,
@@ -896,10 +1485,8 @@ async function advanceScenarioCursor(cursor, turn) {
       input: state.input,
       instructions: cursor.stableInstructions,
       maxOutputTokens: spec.settings.max_output_tokens,
-      tools: releaseFixtureToolsForScenario(
-        spec.settings.scenario,
-        spec.settings.dynamic_tail_mode
-      ),
+      tools: fixtureTools,
+      toolChoice: fixtureTools.length > 0 ? "none" : null,
       requestKind,
       phase,
       promptCacheKey: spec.promptCacheKey
@@ -1096,6 +1683,9 @@ async function sendOneInbound(spec) {
       .map((item) => String(item?.inbound_request_id ?? ""))
       .filter(Boolean)
   );
+  const knownErrorFingerprints = new Set(
+    array(before?.recent_errors).map(errorFingerprint)
+  );
   const body = buildResponsesRequestBody(spec);
   const serializedBody = JSON.stringify(body);
   // Hash only the replayed input array. The candidate's placement field is
@@ -1142,6 +1732,7 @@ async function sendOneInbound(spec) {
   const attempts = array(after.recent_agent_upstream_attempts).filter(
     (item) => String(item?.inbound_request_id ?? "") === inboundId
   );
+  const runtimeErrorEvidence = freshRuntimeErrorEvidence(after, knownErrorFingerprints);
   const responseFailureCode = responseErrorCode(responseText);
   const responseFailed = responseHasNativeFailure(responseText);
   const responseFailureKind = (
@@ -1150,6 +1741,7 @@ async function sendOneInbound(spec) {
   const terminal = responseStatus >= 200 && responseStatus < 300 &&
     /\bresponse\.completed\b/u.test(responseText) &&
     !responseFailed;
+  const terminalUsage = terminalUsageShape(responseText);
   const exactCounterDelta = counters.inbound_requests === 1 &&
     counters.generation_attempts === 1 &&
     counters.upstream_requests === 1;
@@ -1168,25 +1760,35 @@ async function sendOneInbound(spec) {
   const observedRealmPresent = observedRealmId.length > 0;
   const observedKeyRealmMatches = observedRealmPresent &&
     observedRealmId === spec.cohort.key_realm_hash;
+  const finalScopeWaterline = finalScopeWaterlineEvidence(metric?.final_scope_waterline);
+  const rawCacheReadTokens = explicitFiniteNonNegativeNumber(metric?.cache_read_tokens);
+  const cacheReadTokensPresent = rawCacheReadTokens !== null;
   const completedInput = spec.requestKind === "compaction"
     ? extractCompactionItems(responseText)
     : [];
   const timing = {
     prefix_guard_wait_ms: finiteNonNegativeNumber(metric?.prefix_guard_wait_ms),
     local_prepare_ms: finiteNonNegativeNumber(metric?.local_prepare_ms),
+    request_body_encode_ms: finiteNonNegativeNumber(metric?.request_body_encode_ms),
+    gzip_encode_ms: finiteNonNegativeNumber(metric?.gzip_encode_ms),
     upstream_headers_ms: finiteNonNegativeNumber(metric?.upstream_headers_ms),
     upstream_first_chunk_ms: finiteNonNegativeNumber(metric?.upstream_first_chunk_ms),
     upstream_ttft_ms: finiteNonNegativeNumber(metric?.upstream_ttft_ms),
     ttft_ms: finiteNonNegativeNumber(metric?.ttft_ms)
   };
+  const localPreUpstreamOverhead = localPreUpstreamOverheadMs(timing);
   const timingPresent = !terminal || [
     timing.prefix_guard_wait_ms,
     timing.local_prepare_ms,
+    timing.request_body_encode_ms,
+    timing.gzip_encode_ms,
     timing.upstream_ttft_ms,
-    timing.ttft_ms
+    timing.ttft_ms,
+    localPreUpstreamOverhead
   ].every((value) => value !== null);
   const checks = {
     terminal_response_completed: terminal,
+    terminal_usage_shape_present: !terminal || terminalUsage === "present",
     exact_counter_delta: exactCounterDelta,
     per_inbound_one_attempt_one_post: perInboundSingleAttempt,
     aggregate_no_multi_attempt: aggregateSingleAttempt,
@@ -1196,6 +1798,7 @@ async function sendOneInbound(spec) {
     observed_key_realm_present: observedRealmPresent,
     observed_key_realm_matches_cohort: observedKeyRealmMatches,
     usage_present: number(metric?.input_tokens) > 0,
+    cache_read_tokens_present: cacheReadTokensPresent,
     timing_present: timingPresent
   };
   const failure = inboundFailureReason({
@@ -1216,6 +1819,7 @@ async function sendOneInbound(spec) {
     // This bounded classification is enough to separate a payload ceiling from
     // an authentication, model, or request-shape failure in live evidence.
     response_failure_kind: responseFailureKind,
+    terminal_usage_shape: terminalUsage,
     elapsed_ms: Date.now() - startedAt,
     sse_completed: terminal,
     input_fingerprint: inputFingerprint,
@@ -1231,6 +1835,12 @@ async function sendOneInbound(spec) {
     // SSE-path difference without retaining proxy addresses, URLs, headers,
     // request bodies, credentials, or upstream messages.
     transport: transportEvidence(metric),
+    // Never retain raw runtime error strings: a transport library can echo an
+    // endpoint or request material. These are allow-listed scopes and coarse
+    // classes only, so a later self-control can discriminate a proxy/TLS/DNS
+    // failure from a candidate wire regression without exposing live details.
+    runtime_error_scopes: runtimeErrorEvidence.scopes,
+    runtime_error_classes: runtimeErrorEvidence.classes,
     // These fields are bounded diagnostics only: they contain no request
     // body, tool text, credential, or cache-key value.  Retain them per
     // request so a large aggregate new-tail gap can be traced to one phase
@@ -1241,6 +1851,7 @@ async function sendOneInbound(spec) {
     // including at a compaction root.
     provider_prefix_key_present:
       typeof metric?.provider_prefix_key === "string" && metric.provider_prefix_key.length > 0,
+    provider_prefix_key_fingerprint: opaquePlacementFingerprint(metric?.provider_prefix_key),
     outbound_prefix_fingerprints: metric?.outbound_prefix_fingerprints ?? null,
     prefix_lag_classification: metric?.prefix_lag_classification ?? null,
     prefix_lag_input_delta_tokens: number(metric?.prefix_lag_input_delta_tokens),
@@ -1249,9 +1860,16 @@ async function sendOneInbound(spec) {
     prefix_cache_instability_score: number(metric?.prefix_cache_instability_score),
     prefix_state_cache_read_tokens: number(metric?.prefix_state_cache_read_tokens),
     input_tokens: number(metric?.input_tokens),
-    cache_read_tokens: number(metric?.cache_read_tokens),
+    cache_read_tokens: rawCacheReadTokens ?? 0,
+    // Preserve whether the upstream metric was actually present.  A missing
+    // counter must never later masquerade as a legitimate cold-cache zero.
+    cache_read_tokens_observed: cacheReadTokensPresent,
     cache_avoidable_gap_tokens: number(metric?.cache_avoidable_gap_tokens),
+    cache_new_tail_gap_tokens_observed:
+      finiteNonNegativeNumber(metric?.cache_new_tail_gap_tokens) !== null,
     cache_new_tail_gap_tokens: number(metric?.cache_new_tail_gap_tokens),
+    cache_provider_unstable_gap_tokens_observed:
+      finiteNonNegativeNumber(metric?.cache_provider_unstable_gap_tokens) !== null,
     cache_provider_unstable_gap_tokens: number(metric?.cache_provider_unstable_gap_tokens),
     cache_shortfall_tokens: number(metric?.cache_shortfall_tokens),
     tail_input_items: number(metric?.tail_input_items),
@@ -1267,9 +1885,14 @@ async function sendOneInbound(spec) {
     tail_tool_output_hash_like_count: number(metric?.tail_tool_output_hash_like_count),
     tail_tool_output_json_like_chars: number(metric?.tail_tool_output_json_like_chars),
     tail_tool_output_noise_hint: metric?.tail_tool_output_noise_hint ?? null,
-    // Keep the local and upstream portions separate in the release evidence.
-    // This is diagnostic only: the release gate below still evaluates total
-    // TTFT, so an upstream regression cannot be silently reclassified away.
+    tail_source: metric?.tail_source ?? null,
+    // The full ledger contains an opaque scope digest. Release evidence only
+    // retains the bounded booleans and token waterlines needed to prove that
+    // a candidate maturity gate actually ran on an exact direct successor.
+    final_scope_waterline: finalScopeWaterline,
+    // Keep local pre-upstream work separate from end-to-end provider timing.
+    // Promotion can explicitly exempt remote TTFT variance, but it never
+    // exempts an increase in any local component represented here.
     prefix_guard_wait_ms: timing.prefix_guard_wait_ms,
     prefix_guard_wait_reason: metric?.prefix_guard_wait_reason ?? null,
     prefix_guard_wait_source: metric?.prefix_guard_wait_source ?? null,
@@ -1277,6 +1900,9 @@ async function sendOneInbound(spec) {
     static_wire_drift_late_mutation_categories:
       metric?.static_wire_drift_late_mutation_categories ?? null,
     local_prepare_ms: timing.local_prepare_ms,
+    request_body_encode_ms: timing.request_body_encode_ms,
+    gzip_encode_ms: timing.gzip_encode_ms,
+    local_pre_upstream_overhead_ms: localPreUpstreamOverhead,
     upstream_headers_ms: timing.upstream_headers_ms,
     upstream_first_chunk_ms: timing.upstream_first_chunk_ms,
     upstream_ttft_ms: timing.upstream_ttft_ms,
@@ -1304,16 +1930,25 @@ function buildResponsesRequestBody(spec) {
     input: spec.input
   };
   if (Array.isArray(spec.tools) && spec.tools.length > 0) body.tools = spec.tools;
+  if (spec.toolChoice !== undefined && spec.toolChoice !== null) {
+    body.tool_choice = spec.toolChoice;
+  }
   if (spec.promptCacheKey) body.prompt_cache_key = spec.promptCacheKey;
   return body;
 }
 
 // Tool-history scenarios replay a completed call and its output as part of the
-// input history. Declare that tool from the seed onward as a real Codex
-// request does; some Responses-compatible relays reject an otherwise valid
-// historical call when its name is absent from the top-level tools schema.
+// input history. An explicit schema probe declares that tool from the seed
+// onward as a real Codex request does; some Responses-compatible relays reject
+// an otherwise valid historical call when its name is absent from the top-level
+// tools schema. Leaving the probe off preserves the prior fixture wire.
 // This is verifier-fixture compatibility only, never a production rewrite.
-function releaseFixtureToolsForScenario(scenario, dynamicTailMode = "tool") {
+function releaseFixtureToolsForScenario(
+  scenario,
+  dynamicTailMode = "tool",
+  includeToolSchema = true
+) {
+  if (!includeToolSchema) return [];
   if (scenario === "dynamic-tail-mix" && dynamicTailMode === "text") return [];
   if (!new Set(["dynamic-tail-mix", "tool-burst", "tool-tail-maturity"]).has(scenario)) {
     return [];
@@ -1382,6 +2017,69 @@ function transportEvidence(metric) {
   };
 }
 
+function finalScopeWaterlineEvidence(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return {
+    outcome: safeLiveCodexLabel(value.outcome),
+    sent_prediction_eligible: value.sent_prediction_eligible === true,
+    predecessor_proof: safeLiveCodexLabel(value.predecessor_proof),
+    predecessor_exact: value.predecessor_exact === true,
+    predecessor_bound: value.predecessor_bound === true,
+    continuity_reset: value.continuity_reset === true,
+    raw_input_tokens: number(value.raw_input_tokens),
+    raw_cache_read_tokens: number(value.raw_cache_read_tokens),
+    sent_prefix_bucket_tokens_128: number(value.sent_prefix_bucket_tokens_128),
+    settled_prefix_bucket_tokens_128: number(value.settled_prefix_bucket_tokens_128),
+    candidate_avoidable_tokens_128: number(value.candidate_avoidable_tokens_128),
+    rollback_tokens_128: number(value.rollback_tokens_128)
+  };
+}
+
+function errorFingerprint(error) {
+  return sha256Parts([
+    String(error?.at ?? ""),
+    String(error?.scope ?? ""),
+    String(error?.message ?? "")
+  ]);
+}
+
+function freshRuntimeErrorEvidence(metrics, knownFingerprints) {
+  const scopes = [];
+  const classes = [];
+  for (const error of array(metrics?.recent_errors)) {
+    if (knownFingerprints.has(errorFingerprint(error))) continue;
+    const scope = safeRuntimeErrorScope(error?.scope);
+    if (scope) scopes.push(scope);
+    const category = runtimeErrorCategory(error?.message);
+    if (category) classes.push(category);
+  }
+  return {
+    scopes: unique(scopes).slice(0, 4),
+    classes: unique(classes).slice(0, 4)
+  };
+}
+
+function safeRuntimeErrorScope(value) {
+  const normalized = String(value ?? "").trim();
+  return /^[A-Za-z0-9_:-]{1,96}$/u.test(normalized) ? normalized : null;
+}
+
+function runtimeErrorCategory(value) {
+  const normalized = String(value ?? "").toLowerCase();
+  if (!normalized) return null;
+  if (/(?:dns|name or service|failed to lookup|could not resolve)/u.test(normalized)) {
+    return "dns";
+  }
+  if (/(?:tls|ssl|certificate|handshake)/u.test(normalized)) return "tls";
+  if (/(?:proxy|tunnel)/u.test(normalized)) return "proxy";
+  if (/(?:timed?\s*out|timeout|deadline)/u.test(normalized)) return "timeout";
+  if (/(?:connection|connect|broken pipe|reset by peer|connection refused)/u.test(normalized)) {
+    return "connection";
+  }
+  if (/(?:http|bad gateway|status code)/u.test(normalized)) return "http";
+  return "other";
+}
+
 function safeTransportLabel(value) {
   const normalized = String(value ?? "").trim();
   // Deliberately reject whitespace, URLs, query strings, and anything that
@@ -1394,6 +2092,50 @@ function requestLogRows(metrics) {
     ...array(metrics?.recent_requests),
     ...array(metrics?.recent_failed_requests)
   ];
+}
+
+function usageShapeHasNumericToken(value) {
+  if (value === null || typeof value !== "object") return false;
+  if (Array.isArray(value)) return value.some(usageShapeHasNumericToken);
+  return Object.entries(value).some(([key, child]) =>
+    (/token/u.test(key) && explicitFiniteNonNegativeNumber(child) !== null) ||
+    usageShapeHasNumericToken(child)
+  );
+}
+
+function terminalUsageShape(responseText) {
+  const blocks = String(responseText ?? "").split(/\r?\n\r?\n+/u);
+  let terminalSeen = false;
+  for (const block of blocks) {
+    const terminalEvent = /(?:^|\n)event:\s*response\.completed\b/u.test(block) ||
+      /"type"\s*:\s*"response\.completed"/u.test(block);
+    if (!terminalEvent) continue;
+    terminalSeen = true;
+    const dataText = block
+      .split(/\r?\n/u)
+      .filter((line) => /^data:\s*/u.test(line))
+      .map((line) => line.replace(/^data:\s*/u, "").trim())
+      .join("\n");
+    let parsed = null;
+    for (const candidate of [dataText, block]) {
+      if (!candidate) continue;
+      try {
+        parsed = JSON.parse(candidate);
+        break;
+      } catch {
+        // A malformed/unknown terminal payload is retained only as a shape
+        // classification; the payload itself never enters the artifact.
+      }
+    }
+    const usage = parsed && typeof parsed === "object"
+      ? (parsed.response?.usage ?? parsed.usage ?? parsed.data?.response?.usage)
+      : undefined;
+    if (usage !== undefined) {
+      return usageShapeHasNumericToken(usage) ? "present" : "unrecognized";
+    }
+    if (/"usage"\s*:/u.test(block)) return "unrecognized";
+  }
+  return terminalSeen ? "absent" : "not_seen";
 }
 
 function responseErrorCode(responseText) {
@@ -1568,6 +2310,327 @@ function dynamicTailRecoverySummary(events, requests) {
   };
 }
 
+function counterObservationKind(request, counterName, observedName) {
+  const hasFiniteValue = Number.isFinite(Number(request?.[counterName]));
+  if (request?.[observedName] === true) return hasFiniteValue ? "explicit" : "missing";
+  if (request?.[observedName] === false) return "missing";
+  // Older artifacts did not preserve the explicit observed bit.  They remain
+  // useful for a historical readback, but never carry the same confidence as
+  // a newly captured, explicitly observed counter.
+  return Object.prototype.hasOwnProperty.call(request ?? {}, counterName) && hasFiniteValue
+    ? "legacy_inferred"
+    : "missing";
+}
+
+function allCounterObservations(requests, counterName, observedName) {
+  const kinds = array(requests).map((request) =>
+    counterObservationKind(request, counterName, observedName)
+  );
+  return {
+    complete: kinds.length > 0 && kinds.every((kind) => kind !== "missing"),
+    explicit: kinds.length > 0 && kinds.every((kind) => kind === "explicit"),
+    legacy_inferred: kinds.some((kind) => kind === "legacy_inferred"),
+    kinds
+  };
+}
+
+// Keep the raw provider result separate from the portion that remains after a
+// recorded provider-side cache rollback.  This is an attribution view only:
+// it never replaces the raw cache score and can never promote a release by
+// itself.  Its purpose is to stop a transient upstream waterline from being
+// mistaken for a binary-level hit-rate improvement.
+function providerExcludedWarmCache128(warmRequests) {
+  // Do not infer how many cached tokens a partially unstable request *would*
+  // have read.  Exclude that entire request instead, so this diagnostic is
+  // based only on observations untouched by a recorded provider rollback.
+  const providerCleanRequests = array(warmRequests).filter(
+    (request) =>
+      cacheableInputTokens128(number(request?.input_tokens)) > 0 &&
+      number(request?.cache_provider_unstable_gap_tokens) === 0
+  );
+  const providerExcludedCacheableTokens = providerCleanRequests.reduce(
+    (total, request) => total + cacheableInputTokens128(number(request?.input_tokens)),
+    0
+  );
+  const providerExcludedCachedTokens = providerCleanRequests.reduce(
+    (total, request) => total + Math.min(
+      number(request?.cache_read_tokens),
+      cacheableInputTokens128(number(request?.input_tokens))
+    ),
+    0
+  );
+  return {
+    // "provider_clean" is the canonical name.  The older "excluded" aliases
+    // remain for already-written evidence consumers.
+    provider_clean_warm_cacheable_tokens_128: providerExcludedCacheableTokens,
+    provider_clean_warm_cacheable_read_tokens_128: providerExcludedCachedTokens,
+    provider_clean_warm_cache_128_hit_rate: ratio(
+      providerExcludedCachedTokens,
+      providerExcludedCacheableTokens
+    ),
+    provider_excluded_warm_cacheable_tokens_128: providerExcludedCacheableTokens,
+    provider_excluded_warm_cacheable_read_tokens_128: providerExcludedCachedTokens,
+    provider_excluded_warm_cache_128_hit_rate: ratio(
+      providerExcludedCachedTokens,
+      providerExcludedCacheableTokens
+    )
+  };
+}
+
+// Dynamic-tail production work needs a stronger proof than a whole-run ratio:
+// inspect the retained, scored warm requests per pair.  A mismatch is useful
+// diagnostic evidence, but it is never silently normalized into a winner.
+function dynamicRunWarmAttribution(run) {
+  const warmRequests = array(run?.requests).filter(
+    (request) => request?.phase !== "seed" && number(request?.input_tokens) > 0
+  );
+  const cacheableRequests = warmRequests.filter(
+    (request) => cacheableInputTokens128(number(request?.input_tokens)) > 0
+  );
+  if (warmRequests.length === 0 || cacheableRequests.length === 0) return null;
+  const newTailObservation = allCounterObservations(
+    warmRequests,
+    "cache_new_tail_gap_tokens",
+    "cache_new_tail_gap_tokens_observed"
+  );
+  const providerUnstableObservation = allCounterObservations(
+    warmRequests,
+    "cache_provider_unstable_gap_tokens",
+    "cache_provider_unstable_gap_tokens_observed"
+  );
+  const warmCacheableTokens = cacheableRequests.reduce(
+    (total, request) => total + cacheableInputTokens128(number(request?.input_tokens)),
+    0
+  );
+  const warmCacheableReadTokens = cacheableRequests.reduce(
+    (total, request) => total + Math.min(
+      number(request?.cache_read_tokens),
+      cacheableInputTokens128(number(request?.input_tokens))
+    ),
+    0
+  );
+  const newTailGapTokens = sum(warmRequests, "cache_new_tail_gap_tokens");
+  const providerUnstableGapTokens = sum(
+    warmRequests,
+    "cache_provider_unstable_gap_tokens"
+  );
+  const providerCleanNewTailGapTokens = sum(
+    warmRequests.filter(
+      (request) => number(request?.cache_provider_unstable_gap_tokens) === 0
+    ),
+    "cache_new_tail_gap_tokens"
+  );
+  return {
+    counter_observations_complete:
+      newTailObservation.complete && providerUnstableObservation.complete,
+    counter_observations_explicit:
+      newTailObservation.explicit && providerUnstableObservation.explicit,
+    counter_observations_legacy_inferred:
+      newTailObservation.legacy_inferred || providerUnstableObservation.legacy_inferred,
+    new_tail_gap_observation_kinds: newTailObservation.kinds,
+    provider_unstable_gap_observation_kinds: providerUnstableObservation.kinds,
+    warm_cacheable_tokens_128: warmCacheableTokens,
+    warm_cacheable_read_tokens_128: warmCacheableReadTokens,
+    new_tail_gap_tokens: newTailGapTokens,
+    provider_clean_new_tail_gap_tokens: providerCleanNewTailGapTokens,
+    provider_excluded_new_tail_gap_tokens: providerCleanNewTailGapTokens,
+    provider_unstable_gap_tokens: providerUnstableGapTokens,
+    ...providerExcludedWarmCache128(warmRequests)
+  };
+}
+
+function pairedDynamicTailAttribution(champion, candidate) {
+  const championRuns = array(champion?.runs).filter(
+    (run) => run?.scenario === "dynamic-tail-mix"
+  );
+  const candidateRuns = array(candidate?.runs).filter(
+    (run) => run?.scenario === "dynamic-tail-mix"
+  );
+  const applicable = championRuns.length > 0 || candidateRuns.length > 0;
+  if (!applicable) {
+    return {
+      applicable: false,
+      complete: true,
+      counter_observations_explicit: true,
+      pair_count: 0,
+      scored_pair_ids: [],
+      pairs: [],
+      candidate_new_tail_delta_tokens: 0,
+      candidate_provider_clean_new_tail_delta_tokens: 0,
+      // Compatibility alias for reports written before provider-clean naming.
+      candidate_provider_excluded_new_tail_delta_tokens: 0,
+      candidate_provider_unstable_delta_tokens: 0,
+      provider_instability_free: true,
+      provider_instability_state: "not_applicable",
+      candidate_new_tail_direction: "not_applicable",
+      candidate_provider_clean_new_tail_direction: "not_applicable",
+      candidate_new_tail_non_regressing_every_pair: true,
+      candidate_provider_clean_new_tail_non_regressing_every_pair: true,
+      candidate_new_tail_strictly_improves_consistently: false,
+      candidate_new_tail_improvement_hypothesis: false,
+      candidate_new_tail_confirmed_improvement: false,
+      hypothesis_only: false
+    };
+  }
+
+  const championByPair = new Map(championRuns.map((run) => [run?.pair, run]));
+  const candidateByPair = new Map(candidateRuns.map((run) => [run?.pair, run]));
+  const pairIds = pairedRunIds(championRuns, candidateRuns);
+  const uniqueChampionPairs = new Set(championRuns.map((run) => run?.pair));
+  const uniqueCandidatePairs = new Set(candidateRuns.map((run) => run?.pair));
+  let complete =
+    championRuns.length > 0 &&
+    candidateRuns.length > 0 &&
+    championRuns.length === candidateRuns.length &&
+    uniqueChampionPairs.size === championRuns.length &&
+    uniqueCandidatePairs.size === candidateRuns.length &&
+    pairIds.length === championRuns.length;
+  const pairs = [];
+  for (const pair of pairIds) {
+    const championAttribution = dynamicRunWarmAttribution(championByPair.get(pair));
+    const candidateAttribution = dynamicRunWarmAttribution(candidateByPair.get(pair));
+    if (!championAttribution || !candidateAttribution) {
+      complete = false;
+      pairs.push({ pair, complete: false });
+      continue;
+    }
+    const newTailDelta =
+      candidateAttribution.new_tail_gap_tokens - championAttribution.new_tail_gap_tokens;
+    const counterObservationsComplete =
+      championAttribution.counter_observations_complete &&
+      candidateAttribution.counter_observations_complete;
+    const counterObservationsExplicit =
+      championAttribution.counter_observations_explicit &&
+      candidateAttribution.counter_observations_explicit;
+    const providerInstabilityObserved = counterObservationsComplete;
+    const providerClean =
+      providerInstabilityObserved &&
+      number(championAttribution.provider_unstable_gap_tokens) === 0 &&
+      number(candidateAttribution.provider_unstable_gap_tokens) === 0;
+    if (!counterObservationsComplete) complete = false;
+    pairs.push({
+      pair,
+      complete: counterObservationsComplete,
+      counter_observations_complete: counterObservationsComplete,
+      counter_observations_explicit: counterObservationsExplicit,
+      champion: championAttribution,
+      candidate: candidateAttribution,
+      candidate_new_tail_delta_tokens: newTailDelta,
+      candidate_new_tail_direction:
+        newTailDelta < 0 ? "candidate_lower" : newTailDelta > 0 ? "candidate_higher" : "tie",
+      provider_instability_observed: providerInstabilityObserved,
+      provider_clean: providerClean,
+      // A provider-clean pair keeps both request sequences intact.  We never
+      // invent a normalized score by subtracting some tokens from an unstable
+      // request or by comparing a different subset on each arm.
+      candidate_provider_clean_new_tail_delta_tokens: providerClean ? newTailDelta : null,
+      candidate_provider_excluded_new_tail_delta_tokens: providerClean ? newTailDelta : null,
+      candidate_provider_clean_new_tail_direction: !providerInstabilityObserved
+        ? "unknown"
+        : providerClean
+          ? (newTailDelta < 0 ? "candidate_lower" : newTailDelta > 0 ? "candidate_higher" : "tie")
+          : "not_comparable",
+      candidate_provider_unstable_delta_tokens:
+        candidateAttribution.provider_unstable_gap_tokens -
+        championAttribution.provider_unstable_gap_tokens
+    });
+  }
+  const completePairs = pairs.filter((pair) => pair.complete === true);
+  const rawNewTailDeltas = completePairs.map(
+    (pair) => number(pair.candidate_new_tail_delta_tokens)
+  );
+  const providerCleanPairs = completePairs.filter((pair) => pair.provider_clean === true);
+  const providerCleanNewTailDeltas = providerCleanPairs.map(
+    (pair) => number(pair.candidate_provider_clean_new_tail_delta_tokens)
+  );
+  const counterObservationsExplicit =
+    complete && completePairs.length > 0 &&
+    completePairs.every((pair) => pair.counter_observations_explicit === true);
+  const providerInstabilityFree =
+    complete && completePairs.length > 0 &&
+    completePairs.every((pair) => pair.provider_clean === true);
+  const candidateNewTailNonRegressingEveryPair =
+    complete && completePairs.length > 0 && rawNewTailDeltas.every((delta) => delta <= 0);
+  const candidateProviderCleanNewTailNonRegressingEveryPair =
+    providerInstabilityFree && providerCleanNewTailDeltas.every((delta) => delta <= 0);
+  const candidateNewTailStrictlyImprovesConsistently =
+    providerInstabilityFree && candidateNewTailNonRegressingEveryPair &&
+    rawNewTailDeltas.some((delta) => delta < 0);
+  const directionFor = (deltas, fallback) => !complete || deltas.length === 0
+    ? fallback
+    : deltas.every((delta) => delta <= 0) && deltas.some((delta) => delta < 0)
+      ? "candidate_lower"
+      : deltas.every((delta) => delta === 0)
+        ? "tie"
+        : deltas.every((delta) => delta >= 0) && deltas.some((delta) => delta > 0)
+          ? "candidate_higher"
+          : "mixed";
+  const candidateNewTailDirection = directionFor(rawNewTailDeltas, "incomplete");
+  const candidateProviderCleanNewTailDirection = providerInstabilityFree
+    ? directionFor(providerCleanNewTailDeltas, "not_available")
+    : complete
+      ? "not_comparable"
+      : "incomplete";
+  const candidateNewTailDeltaTokens = sum(
+    completePairs,
+    "candidate_new_tail_delta_tokens"
+  );
+  const candidateProviderCleanNewTailDeltaTokens = providerCleanPairs.length > 0
+    ? sum(providerCleanPairs, "candidate_provider_clean_new_tail_delta_tokens")
+    : null;
+  const candidateProviderUnstableDeltaTokens = sum(
+    completePairs,
+    "candidate_provider_unstable_delta_tokens"
+  );
+  const hypothesisOnly =
+    !complete ||
+    !counterObservationsExplicit ||
+    !providerInstabilityFree ||
+    candidateNewTailDirection === "mixed";
+  const candidateNewTailImprovementHypothesis =
+    candidateNewTailDeltaTokens < 0 && hypothesisOnly;
+  const candidateNewTailConfirmedImprovement =
+    candidateNewTailDeltaTokens < 0 && !hypothesisOnly &&
+    candidateNewTailStrictlyImprovesConsistently;
+  const providerInstabilityState = !complete
+    ? "incomplete"
+    : !counterObservationsExplicit
+      ? "legacy_or_missing_counter"
+      : providerInstabilityFree
+        ? "clean"
+        : "unstable";
+  return {
+    applicable: true,
+    complete,
+    counter_observations_explicit: counterObservationsExplicit,
+    pair_count: pairIds.length,
+    scored_pair_ids: pairIds,
+    pairs,
+    candidate_new_tail_delta_tokens: candidateNewTailDeltaTokens,
+    candidate_provider_clean_new_tail_delta_tokens:
+      candidateProviderCleanNewTailDeltaTokens,
+    candidate_provider_excluded_new_tail_delta_tokens:
+      candidateProviderCleanNewTailDeltaTokens,
+    candidate_provider_unstable_delta_tokens: candidateProviderUnstableDeltaTokens,
+    provider_instability_free: providerInstabilityFree,
+    provider_instability_state: providerInstabilityState,
+    candidate_new_tail_direction: candidateNewTailDirection,
+    candidate_provider_clean_new_tail_direction: candidateProviderCleanNewTailDirection,
+    candidate_new_tail_non_regressing_every_pair: candidateNewTailNonRegressingEveryPair,
+    candidate_provider_clean_new_tail_non_regressing_every_pair:
+      candidateProviderCleanNewTailNonRegressingEveryPair,
+    candidate_new_tail_strictly_improves_consistently:
+      candidateNewTailStrictlyImprovesConsistently,
+    candidate_new_tail_improvement_hypothesis: candidateNewTailImprovementHypothesis,
+    candidate_new_tail_confirmed_improvement: candidateNewTailConfirmedImprovement,
+    // Only a stable, provider-clean, pair-consistent new-tail improvement can
+    // justify proposing a production dynamic-tail policy change.  This is
+    // deliberately diagnostic; the ordinary release promotion gate remains
+    // based on raw complete A/B evidence.
+    hypothesis_only: hypothesisOnly
+  };
+}
+
 function dynamicTailTerminalFollowup(events, requests) {
   const injected = array(events);
   const terminalEvent = injected.at(-1);
@@ -1630,9 +2693,13 @@ function buildDynamicRun(input) {
   const requests = input.requests;
   const comparable = requests.filter((item) => item.input_tokens > 0);
   const cacheable = comparable.filter((item) => cacheableInputTokens128(item.input_tokens) > 0);
+  const warmComparable = comparable.filter((item) => item.phase !== "seed");
   const warm = cacheable.filter((item) => item.phase !== "seed");
+  const seedRequests = requests.filter((item) => item.phase === "seed");
   const inputTokens = sum(comparable, "input_tokens");
   const cacheReadTokens = sum(comparable, "cache_read_tokens");
+  const warmInputTokens = sum(warmComparable, "input_tokens");
+  const warmCacheReadTokens = sum(warmComparable, "cache_read_tokens");
   const cacheableTokens = cacheable.reduce(
     (total, item) => total + cacheableInputTokens128(item.input_tokens),
     0
@@ -1652,8 +2719,15 @@ function buildDynamicRun(input) {
   const fullBuckets = cacheable.filter(
     (item) => item.cache_read_tokens >= cacheableInputTokens128(item.input_tokens)
   ).length;
+  const warmFullBuckets = warm.filter(
+    (item) => item.cache_read_tokens >= cacheableInputTokens128(item.input_tokens)
+  ).length;
+  // Scope evidence is independent of cache-score eligibility. A failed
+  // request may legitimately have zero usage while still recording the
+  // selected realm; dropping that observation would falsely report a realm
+  // mismatch instead of the real request failure.
   const observedRealms = unique(
-    comparable.map((item) => item.observed_realm_id).filter(Boolean)
+    requests.map((item) => item.observed_realm_id).filter(Boolean)
   );
   const allTerminal = requests.length > 0 && requests.every((item) => item.sse_completed);
   const allSingle = requests.length > 0 && requests.every(
@@ -1664,12 +2738,30 @@ function buildDynamicRun(input) {
       item.checks?.model_matches_cohort &&
       item.checks?.observed_key_realm_matches_cohort
   );
+  const completeCacheReadTokenEvidence = requests.length > 0 && requests.every(
+    (item) => {
+      const value = explicitFiniteNonNegativeNumber(item?.cache_read_tokens);
+      const hasObservationMarker = Object.prototype.hasOwnProperty.call(
+        item ?? {},
+        "cache_read_tokens_observed"
+      );
+      return value !== null && (!hasObservationMarker || item.cache_read_tokens_observed === true);
+    }
+  );
   const usageCoverage = requests.length === 0 ? 0 : comparable.length / requests.length;
   const timing = timingSummary(comparable);
   const staticWire = staticWireContinuity(requests);
-  const seedRequest = requests.find((item) => item.phase === "seed");
+  const seedRequest = seedRequests[0];
   const seedInputTokens = number(seedRequest?.input_tokens);
   const seedCacheReadTokens = number(seedRequest?.cache_read_tokens);
+  const coldSeedRequestCount = seedRequests.filter((item) => {
+    const value = explicitFiniteNonNegativeNumber(item?.cache_read_tokens);
+    const hasObservationMarker = Object.prototype.hasOwnProperty.call(
+      item ?? {},
+      "cache_read_tokens_observed"
+    );
+    return value === 0 && (!hasObservationMarker || item.cache_read_tokens_observed === true);
+  }).length;
   const peakInputTokens = comparable.reduce(
     (maximum, item) => Math.max(maximum, number(item.input_tokens)),
     0
@@ -1686,20 +2778,31 @@ function buildDynamicRun(input) {
     requests: requests.length,
     successful_sse_requests: requests.filter((item) => item.sse_completed).length,
     input_tokens: inputTokens,
+    warm_input_tokens: warmInputTokens,
     seed_input_tokens: seedInputTokens,
     seed_cache_read_tokens: seedCacheReadTokens,
+    seed_request_count: seedRequests.length,
+    cold_seed_request_count: coldSeedRequestCount,
     peak_input_tokens: peakInputTokens,
     dynamic_tail_terminal_followup_input_tokens: terminalDynamicFollowup.input_tokens,
     cache_read_tokens: cacheReadTokens,
     raw_token_hit_rate: ratio(cacheReadTokens, inputTokens),
+    warm_cache_read_tokens: warmCacheReadTokens,
+    warm_raw_token_hit_rate: ratio(warmCacheReadTokens, warmInputTokens),
     cacheable_tokens_128: cacheableTokens,
     cacheable_read_tokens_128: cacheableReadTokens,
     cache_128_hit_rate: ratio(cacheableReadTokens, cacheableTokens),
+    warm_cacheable_tokens_128: warmCacheableTokens,
+    warm_cacheable_read_tokens_128: warmCacheableReadTokens,
+    warm_cache_128_hit_rate: ratio(warmCacheableReadTokens, warmCacheableTokens),
     warm_stable_prefix_tokens_128: warmCacheableTokens,
     warm_stable_prefix_cached_tokens_128: warmCacheableReadTokens,
     warm_stable_prefix_hit_rate: ratio(warmCacheableReadTokens, warmCacheableTokens),
     full_bucket_requests: fullBuckets,
     full_bucket_rate: ratio(fullBuckets, cacheable.length),
+    warm_full_bucket_requests: warmFullBuckets,
+    warm_full_bucket_rate: ratio(warmFullBuckets, warm.length),
+    warm_full_bucket_denominator: warm.length,
     cacheable_request_count: cacheable.length,
     full_bucket_denominator: cacheable.length,
     avoidable_gap_tokens: sum(comparable, "cache_avoidable_gap_tokens"),
@@ -1718,6 +2821,7 @@ function buildDynamicRun(input) {
     every_inbound_one_attempt_one_main_post: allSingle,
     cohort_bound_on_every_request: allCohortBound,
     complete_usage_coverage: usageCoverage === 1,
+    complete_cache_read_token_evidence: completeCacheReadTokenEvidence,
     complete_timing_coverage: metrics.timing_complete_requests === comparable.length,
     input_usage_present: inputTokens > 0,
     required_seed_input_tokens:
@@ -1824,9 +2928,13 @@ function aggregateArm(
       "requests",
       "successful_sse_requests",
       "input_tokens",
+      "warm_input_tokens",
       "cache_read_tokens",
+      "warm_cache_read_tokens",
       "cacheable_tokens_128",
       "cacheable_read_tokens_128",
+      "warm_cacheable_tokens_128",
+      "warm_cacheable_read_tokens_128",
       "warm_stable_prefix_tokens_128",
       "warm_stable_prefix_cached_tokens_128",
       "avoidable_gap_tokens",
@@ -1843,9 +2951,17 @@ function aggregateArm(
     mergeDynamicTailMix(dynamicTailMix, source.dynamic_tail_mix);
   }
   metrics.raw_token_hit_rate = ratio(metrics.cache_read_tokens, metrics.input_tokens);
+  metrics.warm_raw_token_hit_rate = ratio(
+    metrics.warm_cache_read_tokens,
+    metrics.warm_input_tokens
+  );
   metrics.cache_128_hit_rate = ratio(
     metrics.cacheable_read_tokens_128,
     metrics.cacheable_tokens_128
+  );
+  metrics.warm_cache_128_hit_rate = ratio(
+    metrics.warm_cacheable_read_tokens_128,
+    metrics.warm_cacheable_tokens_128
   );
   metrics.warm_stable_prefix_hit_rate = ratio(
     metrics.warm_stable_prefix_cached_tokens_128,
@@ -1855,6 +2971,32 @@ function aggregateArm(
   // object does not expose a separate count in older artifacts, so derive it
   // from the retained request evidence when available and otherwise fail closed.
   const retainedRequests = normalized.flatMap((run) => array(run.requests));
+  // Seed evidence is a shared-cache crossover boundary.  Do not derive it
+  // from the per-run aggregate fields: older reports could retain only the
+  // first pair's seed there, and a missing counter was normalized to zero.
+  // Keep every scored run's raw seed in the aggregate, while leaving an
+  // incomplete counter explicitly unknown for the comparison gate below.
+  const retainedSeedRows = retainedRequests.filter((item) => item?.phase === "seed");
+  metrics.seed_input_tokens = retainedSeedRows.reduce(
+    (total, item) => total + number(item?.input_tokens),
+    0
+  );
+  metrics.seed_request_count = retainedSeedRows.length;
+  const seedCacheReadEvidence = aggregateSeedCacheReadEvidence({ runs: normalized });
+  metrics.seed_cache_read_tokens = seedCacheReadEvidence.raw_complete
+    ? seedCacheReadEvidence.tokens
+    : null;
+  const coldSeedRows = retainedSeedRows.filter((item) => {
+    const value = explicitFiniteNonNegativeNumber(item?.cache_read_tokens);
+    const hasObservationMarker = Object.prototype.hasOwnProperty.call(
+      item ?? {},
+      "cache_read_tokens_observed"
+    );
+    return value === 0 && (!hasObservationMarker || item.cache_read_tokens_observed === true);
+  });
+  metrics.cold_seed_request_count = seedCacheReadEvidence.raw_complete
+    ? coldSeedRows.length
+    : null;
   const cacheableRows = retainedRequests.filter(
     (item) => cacheableInputTokens128(number(item.input_tokens)) > 0
   );
@@ -1865,6 +3007,18 @@ function aggregateArm(
   metrics.cacheable_request_count = cacheableRows.length;
   metrics.full_bucket_denominator = cacheableRows.length;
   const comparableRows = retainedRequests.filter((item) => number(item.input_tokens) > 0);
+  const warmRows = comparableRows.filter((item) => item.phase !== "seed");
+  const warmCacheableRows = warmRows.filter(
+    (item) => cacheableInputTokens128(number(item.input_tokens)) > 0
+  );
+  metrics.warm_full_bucket_requests = warmCacheableRows.filter(
+    (item) => number(item.cache_read_tokens) >= cacheableInputTokens128(number(item.input_tokens))
+  ).length;
+  metrics.warm_full_bucket_denominator = warmCacheableRows.length;
+  metrics.warm_full_bucket_rate = ratio(
+    metrics.warm_full_bucket_requests,
+    metrics.warm_full_bucket_denominator
+  );
   Object.assign(metrics, timingSummary(comparableRows));
   metrics.peak_input_tokens = comparableRows.reduce(
     (maximum, item) => Math.max(maximum, number(item.input_tokens)),
@@ -1873,6 +3027,12 @@ function aggregateArm(
   metrics.usage_coverage = normalized.length > 0 && normalized.every(
     (run) => number(run.metrics?.usage_coverage) === 1
   ) ? 1 : 0;
+  // Prefer retained per-request observations when present. This preserves the
+  // realm on zero-usage failed requests even if an older run-level metric was
+  // assembled from cache-scoreable requests only.
+  observedRealms.push(
+    ...retainedRequests.map((item) => item?.observed_realm_id).filter(Boolean)
+  );
   metrics.observed_realm_ids = unique(observedRealms);
   metrics.dynamic_tail_mix = dynamicTailMix;
   const checks = {
@@ -1925,14 +3085,162 @@ function aggregateArm(
   };
 }
 
-function aggregateSeedCacheReadTokens(aggregate) {
-  const explicit = Number(aggregate?.metrics?.seed_cache_read_tokens);
-  if (Number.isFinite(explicit)) return explicit;
-  for (const run of aggregate?.runs ?? []) {
-    const seed = (run.requests ?? []).find((item) => item.phase === "seed");
-    if (seed) return number(seed.cache_read_tokens);
+function aggregateSeedCacheReadEvidence(aggregate) {
+  const runs = array(aggregate?.runs);
+  // Reports without retained per-pair requests can still display their old
+  // aggregate metric, but they cannot prove a shared-cache crossover fair.
+  if (runs.length === 0) {
+    return {
+      tokens: explicitFiniteNonNegativeNumber(aggregate?.metrics?.seed_cache_read_tokens),
+      raw_complete: false,
+      source: "aggregate_metric"
+    };
   }
-  return 0;
+  let tokens = 0;
+  for (const run of runs) {
+    const seeds = array(run?.requests).filter((item) => item?.phase === "seed");
+    if (seeds.length !== 1) {
+      return { tokens: null, raw_complete: false, source: "raw_incomplete" };
+    }
+    const [seed] = seeds;
+    const value = explicitFiniteNonNegativeNumber(seed?.cache_read_tokens);
+    const hasObservationMarker = Object.prototype.hasOwnProperty.call(
+      seed ?? {},
+      "cache_read_tokens_observed"
+    );
+    if (value === null || (hasObservationMarker && seed.cache_read_tokens_observed !== true)) {
+      return { tokens: null, raw_complete: false, source: "raw_incomplete" };
+    }
+    tokens += value;
+  }
+  return { tokens, raw_complete: true, source: "raw_scored_runs" };
+}
+
+// Cold starts are excluded from the dynamic hit-rate numerator and
+// denominator, but only after the retained raw evidence proves both arms saw
+// the same number of seed requests and no arm received an extra cold seed.
+function aggregateColdSeedEvidence(aggregate) {
+  const runs = array(aggregate?.runs);
+  if (runs.length === 0) {
+    return { count: null, seed_count: 0, raw_complete: false, source: "aggregate_metric" };
+  }
+  let count = 0;
+  for (const run of runs) {
+    const seeds = array(run?.requests).filter((item) => item?.phase === "seed");
+    if (seeds.length !== 1) {
+      return { count: null, seed_count: seeds.length, raw_complete: false, source: "raw_incomplete" };
+    }
+    const [seed] = seeds;
+    const value = explicitFiniteNonNegativeNumber(seed?.cache_read_tokens);
+    const hasObservationMarker = Object.prototype.hasOwnProperty.call(
+      seed ?? {},
+      "cache_read_tokens_observed"
+    );
+    if (value === null || (hasObservationMarker && seed.cache_read_tokens_observed !== true)) {
+      return { count: null, seed_count: runs.length, raw_complete: false, source: "raw_incomplete" };
+    }
+    if (value === 0) count += 1;
+  }
+  return { count, seed_count: runs.length, raw_complete: true, source: "raw_scored_runs" };
+}
+
+// Native prompt-cache placement is intentionally retained only as a one-way
+// fingerprint. A live isolated comparison must prove that every request in an
+// arm's pair stayed on the same native placement, while the other arm used a
+// different one. This does not require the two crossed-over pairs to share a
+// placement: their lanes deliberately rotate between pairs.
+function nativePlacementFingerprint(request) {
+  const fingerprint = safeDiagnosticHash(request?.provider_prefix_key_fingerprint);
+  return request?.provider_prefix_key_present === true &&
+    typeof fingerprint === "string" && /^[a-f0-9]{32}$/u.test(fingerprint)
+    ? fingerprint
+    : null;
+}
+
+function nativePlacementRunEvidence(run) {
+  const requests = array(run?.requests);
+  const fingerprints = requests.map(nativePlacementFingerprint);
+  const presentOnEveryRequest = requests.length > 0 && fingerprints.every(Boolean);
+  const distinctFingerprints = unique(fingerprints.filter(Boolean));
+  const stable = presentOnEveryRequest && distinctFingerprints.length === 1;
+  return {
+    request_count: requests.length,
+    fingerprint_present_on_every_request: presentOnEveryRequest,
+    stable,
+    provider_prefix_key_fingerprint: stable ? distinctFingerprints[0] : null
+  };
+}
+
+function pairedNativePlacementIsolation(champion, candidate, required = false) {
+  const championRuns = array(champion?.runs);
+  const candidateRuns = array(candidate?.runs);
+  if (!required) {
+    return {
+      required: false,
+      applicable: false,
+      pass: true,
+      pair_count: 0,
+      pair_ids_valid: true,
+      pair_ids_unique: true,
+      pair_ids_aligned: true,
+      fingerprints_present: true,
+      fingerprints_stable: true,
+      arms_differ: true,
+      pairs: []
+    };
+  }
+  const championPairIds = championRuns.map((run) => run?.pair);
+  const candidatePairIds = candidateRuns.map((run) => run?.pair);
+  const pairIdsValid = [...championPairIds, ...candidatePairIds].every(
+    (pair) => Number.isInteger(pair) && pair >= 0
+  );
+  const championPairIdsUnique = new Set(championPairIds).size === championPairIds.length;
+  const candidatePairIdsUnique = new Set(candidatePairIds).size === candidatePairIds.length;
+  const championByPair = new Map(championRuns.map((run) => [run?.pair, run]));
+  const candidateByPair = new Map(candidateRuns.map((run) => [run?.pair, run]));
+  const pairIdsAligned = pairIdsValid && championPairIdsUnique && candidatePairIdsUnique &&
+    championRuns.length === candidateRuns.length &&
+    championByPair.size === championRuns.length &&
+    candidateByPair.size === candidateRuns.length &&
+    championPairIds.every((pair) => candidateByPair.has(pair));
+  const pairIds = [...new Set([...championPairIds, ...candidatePairIds]
+    .filter((pair) => Number.isInteger(pair) && pair >= 0))]
+    .sort((left, right) => left - right);
+  const pairs = pairIds.map((pair) => {
+    const championEvidence = nativePlacementRunEvidence(championByPair.get(pair));
+    const candidateEvidence = nativePlacementRunEvidence(candidateByPair.get(pair));
+    const fingerprintsDiffer = championEvidence.stable && candidateEvidence.stable &&
+      championEvidence.provider_prefix_key_fingerprint !==
+      candidateEvidence.provider_prefix_key_fingerprint;
+    return {
+      pair,
+      champion: championEvidence,
+      candidate: candidateEvidence,
+      fingerprints_differ: fingerprintsDiffer
+    };
+  });
+  const fingerprintsPresent = pairs.length > 0 && pairs.every((pair) =>
+    pair.champion.fingerprint_present_on_every_request &&
+    pair.candidate.fingerprint_present_on_every_request
+  );
+  const fingerprintsStable = pairs.length > 0 && pairs.every((pair) =>
+    pair.champion.stable && pair.candidate.stable
+  );
+  const armsDiffer = pairs.length > 0 && pairs.every((pair) => pair.fingerprints_differ);
+  const runsPresent = championRuns.length > 0 && candidateRuns.length > 0;
+  return {
+    required: true,
+    applicable: true,
+    pass: runsPresent && pairIdsAligned && fingerprintsPresent && fingerprintsStable && armsDiffer,
+    pair_count: pairs.length,
+    pair_ids_valid: pairIdsValid,
+    pair_ids_unique: championPairIdsUnique && candidatePairIdsUnique,
+    pair_ids_aligned: pairIdsAligned,
+    fingerprints_present: fingerprintsPresent,
+    fingerprints_stable: fingerprintsStable,
+    arms_differ: armsDiffer,
+    pairs
+  };
 }
 
 function outboundInputSemanticFingerprints(request) {
@@ -1998,6 +3306,8 @@ function pairedRunInputSymmetry(
       pair_count: 0,
       request_pair_count: 0,
       max_input_token_delta: 0,
+      max_warm_input_token_delta: 0,
+      max_cold_seed_input_token_delta: 0,
       allowed_input_token_delta: maxInputTokenDelta,
       phases_match: true,
       input_fingerprints_match: true,
@@ -2024,6 +3334,8 @@ function pairedRunInputSymmetry(
   const runsPresent = championRuns.length > 0 && candidateRuns.length > 0;
   let requestPairCount = 0;
   let maxDelta = 0;
+  let maxWarmInputTokenDelta = 0;
+  let maxColdSeedInputTokenDelta = 0;
   let pairsAligned = pairIdsValid && championPairIdsUnique && candidatePairIdsUnique &&
     championRuns.length === candidateRuns.length &&
     championByPair.size === championRuns.length &&
@@ -2088,7 +3400,19 @@ function pairedRunInputSymmetry(
         inputTokensPresent = false;
         continue;
       }
-      maxDelta = Math.max(maxDelta, Math.abs(baselineTokens - contenderTokens));
+      const inputTokenDelta = Math.abs(baselineTokens - contenderTokens);
+      maxDelta = Math.max(maxDelta, inputTokenDelta);
+      // Cold seeds do not enter cache-hit scoring. When the complete client
+      // input and the emitted semantic wire are already equal, a different
+      // upstream-reported seed token total is accounting noise, not evidence
+      // that either binary sent a different request. Keep it visible, but do
+      // not let it veto the warm dynamic comparison. Every non-seed request
+      // remains bound to the configured token-delta ceiling.
+      if (baselinePhase === "seed") {
+        maxColdSeedInputTokenDelta = Math.max(maxColdSeedInputTokenDelta, inputTokenDelta);
+      } else {
+        maxWarmInputTokenDelta = Math.max(maxWarmInputTokenDelta, inputTokenDelta);
+      }
     }
   }
   const scoredPairIds = pairedRunIds(championRuns, candidateRuns);
@@ -2096,10 +3420,12 @@ function pairedRunInputSymmetry(
     applicable: true,
     pass: runsPresent && pairsAligned && allPairsHaveRequests && requestPairCount > 0 && phasesMatch &&
       inputFingerprintsMatch && outboundSemanticFingerprintsMatch && requestKindsMatch &&
-      terminalSseComplete && inputTokensPresent && maxDelta <= maxInputTokenDelta,
+      terminalSseComplete && inputTokensPresent && maxWarmInputTokenDelta <= maxInputTokenDelta,
     pair_count: championRuns.length,
     request_pair_count: requestPairCount,
     max_input_token_delta: maxDelta,
+    max_warm_input_token_delta: maxWarmInputTokenDelta,
+    max_cold_seed_input_token_delta: maxColdSeedInputTokenDelta,
     allowed_input_token_delta: maxInputTokenDelta,
     phases_match: phasesMatch,
     input_fingerprints_match: inputFingerprintsMatch,
@@ -2124,20 +3450,36 @@ function compareArmResults(
   maxLocalProxyOverheadRegressionMs = 0,
   maxFullBucketRegressionRequests = 0,
   requireTtftNoRegression = true,
-  maxInputTokenDelta = 128
+  maxInputTokenDelta = 128,
+  nativePlacementIsolationRequired = false,
+  comparisonPolicy = {}
 ) {
-  // Keep the positional parameter for compatibility with older callers, but
-  // never let a false value weaken promotion evidence. End-to-end TTFT is a
-  // mandatory release gate; only the explicit bounded tolerance may vary.
-  const effectiveRequireTtftNoRegression = true;
-  void requireTtftNoRegression;
+  const effectiveRequireTtftNoRegression = requireTtftNoRegression === true;
+  // A cache improvement may not buy local foreground delay. This stays strict
+  // even for internal/offline callers so there is no alternate promotion path
+  // that can accidentally reintroduce a local allowance.
+  const effectiveMaxLocalProxyOverheadRegressionMs = 0;
+  void maxLocalProxyOverheadRegressionMs;
   const cohortMatches = sameCohort(champion.cohort, candidate.cohort);
   const observedRealmMatches = champion.metrics.observed_realm_ids.length === 1 &&
     candidate.metrics.observed_realm_ids.length === 1 &&
     champion.metrics.observed_realm_ids[0] === candidate.metrics.observed_realm_ids[0];
-  const championSeedCacheReadTokens = aggregateSeedCacheReadTokens(champion);
-  const candidateSeedCacheReadTokens = aggregateSeedCacheReadTokens(candidate);
-  const seedCacheReadSymmetry = championSeedCacheReadTokens === candidateSeedCacheReadTokens;
+  const championSeedCacheReadEvidence = aggregateSeedCacheReadEvidence(champion);
+  const candidateSeedCacheReadEvidence = aggregateSeedCacheReadEvidence(candidate);
+  const seedCacheReadEvidenceComplete =
+    championSeedCacheReadEvidence.raw_complete && candidateSeedCacheReadEvidence.raw_complete;
+  const seedCacheReadSymmetry = seedCacheReadEvidenceComplete &&
+    championSeedCacheReadEvidence.tokens === candidateSeedCacheReadEvidence.tokens;
+  const championColdSeedEvidence = aggregateColdSeedEvidence(champion);
+  const candidateColdSeedEvidence = aggregateColdSeedEvidence(candidate);
+  const coldSeedEvidenceComplete =
+    championColdSeedEvidence.raw_complete && candidateColdSeedEvidence.raw_complete;
+  const coldSeedRequestSymmetry = coldSeedEvidenceComplete &&
+    championColdSeedEvidence.seed_count === candidateColdSeedEvidence.seed_count;
+  const coldSeedSymmetry = coldSeedRequestSymmetry &&
+    championColdSeedEvidence.count === candidateColdSeedEvidence.count;
+  const candidateNoExtraColdStart = coldSeedEvidenceComplete &&
+    candidateColdSeedEvidence.count <= championColdSeedEvidence.count;
   const dynamicInputSymmetry = pairedDynamicInputSymmetry(
     champion,
     candidate,
@@ -2148,12 +3490,38 @@ function compareArmResults(
     candidate,
     maxInputTokenDelta
   );
+  const nativePlacementIsolation = pairedNativePlacementIsolation(
+    champion,
+    candidate,
+    nativePlacementIsolationRequired === true
+  );
+  const upstreamPlacementCrossoverRequired =
+    comparisonPolicy?.require_shared_upstream_placement_crossover === true;
+  const upstreamPlacementCrossoverObserved =
+    comparisonPolicy?.shared_upstream_placement_crossover_observed === true;
+  const upstreamPlacementCrossover = {
+    required: upstreamPlacementCrossoverRequired,
+    observed: upstreamPlacementCrossoverObserved,
+    pass: !upstreamPlacementCrossoverRequired || upstreamPlacementCrossoverObserved,
+    // A prompt-cache placement fingerprint is an Atoapi-local fact. It is
+    // not a provider capability certificate: the provider can still make one
+    // sequential arm's completed request visible to the other arm. Only the
+    // interleaved shared crossover balances that effect turn by turn.
+    reason: upstreamPlacementCrossoverRequired && !upstreamPlacementCrossoverObserved
+      ? "shared_turn_crossover_required_for_live_promotion"
+      : "not_applicable_or_observed"
+  };
+  // This is attribution-only evidence for a changing-context run.  It is
+  // deliberately kept out of checks, baseline_pass, and promotion gating.
+  const dynamicTailWarmAttribution = pairedDynamicTailAttribution(champion, candidate);
   const fullBucketRequestDelta =
     candidate.metrics.full_bucket_requests - champion.metrics.full_bucket_requests;
+  const warmFullBucketRequestDelta =
+    candidate.metrics.warm_full_bucket_requests - champion.metrics.warm_full_bucket_requests;
   const fullBucketDenominatorsMatch =
-    candidate.metrics.full_bucket_denominator === champion.metrics.full_bucket_denominator;
+    candidate.metrics.warm_full_bucket_denominator === champion.metrics.warm_full_bucket_denominator;
   const fullBucketCountWithinTolerance =
-    fullBucketDenominatorsMatch && fullBucketRequestDelta >= -maxFullBucketRegressionRequests;
+    fullBucketDenominatorsMatch && warmFullBucketRequestDelta >= -maxFullBucketRegressionRequests;
   // A full-bucket request is a useful discrete signal, but it must not veto a
   // demonstrably better aggregate cache result merely because one request
   // crossed a 128-token boundary differently. A stable-prefix ratio can also
@@ -2161,8 +3529,8 @@ function compareArmResults(
   // it not to regress while raw/cacheable hit and a real shortfall measure
   // strictly improve.
   const aggregateTokenHitStrictlyImproves =
-    candidate.metrics.raw_token_hit_rate > champion.metrics.raw_token_hit_rate &&
-    candidate.metrics.cache_128_hit_rate > champion.metrics.cache_128_hit_rate &&
+    candidate.metrics.warm_raw_token_hit_rate > champion.metrics.warm_raw_token_hit_rate &&
+    candidate.metrics.warm_cache_128_hit_rate > champion.metrics.warm_cache_128_hit_rate &&
     candidate.metrics.warm_stable_prefix_hit_rate >= champion.metrics.warm_stable_prefix_hit_rate &&
     candidate.metrics.shortfall_tokens < champion.metrics.shortfall_tokens;
   // A cold read after an otherwise warm prefix belongs to the selected
@@ -2174,23 +3542,39 @@ function compareArmResults(
     champion.metrics.provider_unstable_gap_tokens === 0 &&
     candidate.metrics.provider_unstable_gap_tokens === 0;
   const positiveCacheEvidence =
-    aggregateTokenHitStrictlyImproves && providerInstabilityFree && seedCacheReadSymmetry;
+    aggregateTokenHitStrictlyImproves && providerInstabilityFree && seedCacheReadSymmetry &&
+    coldSeedSymmetry && candidateNoExtraColdStart;
+  const championLocalPreUpstreamOverhead = finiteNonNegativeNumber(
+    champion.metrics.local_pre_upstream_overhead_p95_ms
+  );
+  const candidateLocalPreUpstreamOverhead = finiteNonNegativeNumber(
+    candidate.metrics.local_pre_upstream_overhead_p95_ms
+  );
+  const localPreUpstreamTimingComplete =
+    championLocalPreUpstreamOverhead !== null && candidateLocalPreUpstreamOverhead !== null;
   const checks = {
     champion_valid: champion.pass,
     candidate_valid: candidate.pass,
     cohort_matches: cohortMatches,
     observed_key_realm_matches: observedRealmMatches,
+    seed_cache_read_evidence_complete: seedCacheReadEvidenceComplete,
     seed_cache_read_symmetry: seedCacheReadSymmetry,
+    cold_seed_evidence_complete: coldSeedEvidenceComplete,
+    cold_seed_request_symmetry: coldSeedRequestSymmetry,
+    cold_seed_symmetry: coldSeedSymmetry,
+    candidate_no_extra_cold_start: candidateNoExtraColdStart,
     dynamic_input_symmetry: dynamicInputSymmetry.pass,
     actual_outbound_input_symmetry: actualOutboundInputSymmetry.pass,
+    native_placement_isolation: nativePlacementIsolation.pass,
+    upstream_placement_crossover: upstreamPlacementCrossover.pass,
     candidate_raw_token_hit_not_lower:
-      candidate.metrics.raw_token_hit_rate >= champion.metrics.raw_token_hit_rate,
+      candidate.metrics.warm_raw_token_hit_rate >= champion.metrics.warm_raw_token_hit_rate,
     candidate_cache_128_hit_not_lower:
-      candidate.metrics.cache_128_hit_rate >= champion.metrics.cache_128_hit_rate,
+      candidate.metrics.warm_cache_128_hit_rate >= champion.metrics.warm_cache_128_hit_rate,
     candidate_warm_stable_prefix_hit_not_lower:
       candidate.metrics.warm_stable_prefix_hit_rate >= champion.metrics.warm_stable_prefix_hit_rate,
     candidate_full_bucket_rate_not_lower:
-      candidate.metrics.full_bucket_rate >= champion.metrics.full_bucket_rate,
+      candidate.metrics.warm_full_bucket_rate >= champion.metrics.warm_full_bucket_rate,
     candidate_full_bucket_count_within_tolerance: fullBucketCountWithinTolerance,
     candidate_full_bucket_loss_explained_by_token_gain: aggregateTokenHitStrictlyImproves,
     candidate_full_bucket_gate:
@@ -2203,9 +3587,17 @@ function compareArmResults(
       candidate.metrics.successful_sse_requests === candidate.metrics.requests && candidate.metrics.requests > 0,
     candidate_one_attempt_one_main_post:
       candidate.checks.every_inbound_one_attempt_one_main_post === true,
+    local_pre_upstream_timing_complete: localPreUpstreamTimingComplete,
+    candidate_local_pre_upstream_overhead_p95_not_regressed:
+      localPreUpstreamTimingComplete &&
+      candidateLocalPreUpstreamOverhead <=
+      championLocalPreUpstreamOverhead + effectiveMaxLocalProxyOverheadRegressionMs,
+    // Compatibility alias: this now measures the complete local pre-upstream
+    // path, not only the prefix guard and request-plan preparation.
     candidate_local_proxy_overhead_p95_not_regressed:
-      candidate.metrics.local_proxy_overhead_p95_ms <=
-      champion.metrics.local_proxy_overhead_p95_ms + maxLocalProxyOverheadRegressionMs,
+      localPreUpstreamTimingComplete &&
+      candidateLocalPreUpstreamOverhead <=
+      championLocalPreUpstreamOverhead + effectiveMaxLocalProxyOverheadRegressionMs,
     candidate_ttft_p95_not_regressed:
       candidate.metrics.ttft_p95_ms <= champion.metrics.ttft_p95_ms + maxTtftRegressionMs
   };
@@ -2214,9 +3606,11 @@ function compareArmResults(
   delete gatingChecks.candidate_full_bucket_count_within_tolerance;
   delete gatingChecks.candidate_full_bucket_loss_explained_by_token_gain;
   delete gatingChecks.provider_instability_free;
-  delete gatingChecks.seed_cache_read_symmetry;
   delete gatingChecks.candidate_cache_strictly_improves;
   delete gatingChecks.candidate_positive_cache_evidence;
+  if (!effectiveRequireTtftNoRegression) {
+    delete gatingChecks.candidate_ttft_p95_not_regressed;
+  }
   // Remote TTFT belongs to the hand-selected upstream and has its own visible
   // verdict below. A cache-preserving local candidate must not be rejected
   // solely because this pair saw provider-side timing variance.
@@ -2225,7 +3619,15 @@ function compareArmResults(
     "candidate_valid",
     "cohort_matches",
     "observed_key_realm_matches",
+    "seed_cache_read_evidence_complete",
+    "seed_cache_read_symmetry",
+    "cold_seed_evidence_complete",
+    "cold_seed_request_symmetry",
+    "cold_seed_symmetry",
+    "candidate_no_extra_cold_start",
     "actual_outbound_input_symmetry",
+    "native_placement_isolation",
+    "upstream_placement_crossover",
     "candidate_raw_token_hit_not_lower",
     "candidate_cache_128_hit_not_lower",
     "candidate_warm_stable_prefix_hit_not_lower",
@@ -2239,8 +3641,9 @@ function compareArmResults(
   // hiding a cache regression behind a fast upstream, or vice versa, would
   // make the release evidence misleading.
   const cachePass = cacheCheckNames.every((name) => checks[name] === true);
-  const localLatencyPass = checks.candidate_local_proxy_overhead_p95_not_regressed;
-  const latencyPass = checks.candidate_ttft_p95_not_regressed;
+  const localLatencyPass = checks.candidate_local_pre_upstream_overhead_p95_not_regressed;
+  const endToEndLatencyPass = checks.candidate_ttft_p95_not_regressed;
+  const latencyPass = effectiveRequireTtftNoRegression ? endToEndLatencyPass : localLatencyPass;
   const baselinePass = Object.values(gatingChecks).every(Boolean);
   return {
     // A passing baseline only means "not measurably worse". The user's
@@ -2253,17 +3656,43 @@ function compareArmResults(
     evidence_confounded_by_provider_instability: !providerInstabilityFree,
     local_latency_pass: localLatencyPass,
     latency_pass: latencyPass,
+    end_to_end_ttft_pass: endToEndLatencyPass,
+    end_to_end_ttft_regression_exempted:
+      !effectiveRequireTtftNoRegression && !endToEndLatencyPass && localLatencyPass,
+    promotion_latency_policy: effectiveRequireTtftNoRegression
+      ? "end-to-end-no-regression"
+      : "local-no-regression-upstream-exempt",
     ttft_no_regression_required: effectiveRequireTtftNoRegression,
     input_symmetry: dynamicInputSymmetry,
     actual_outbound_input_symmetry: actualOutboundInputSymmetry,
+    native_placement_isolation: nativePlacementIsolation,
+    upstream_placement_crossover: upstreamPlacementCrossover,
+    dynamic_tail_warm_attribution: dynamicTailWarmAttribution,
+    cold_start_accounting: {
+      excluded_from_hit_comparison: true,
+      evidence_complete: coldSeedEvidenceComplete,
+      champion_seed_requests: championColdSeedEvidence.seed_count,
+      candidate_seed_requests: candidateColdSeedEvidence.seed_count,
+      champion_cold_seed_requests: championColdSeedEvidence.count,
+      candidate_cold_seed_requests: candidateColdSeedEvidence.count,
+      symmetric: coldSeedSymmetry,
+      candidate_no_extra_cold_start: candidateNoExtraColdStart
+    },
     checks,
     deltas: {
       raw_token_hit_rate: candidate.metrics.raw_token_hit_rate - champion.metrics.raw_token_hit_rate,
       cache_128_hit_rate: candidate.metrics.cache_128_hit_rate - champion.metrics.cache_128_hit_rate,
+      warm_raw_token_hit_rate:
+        candidate.metrics.warm_raw_token_hit_rate - champion.metrics.warm_raw_token_hit_rate,
+      warm_cache_128_hit_rate:
+        candidate.metrics.warm_cache_128_hit_rate - champion.metrics.warm_cache_128_hit_rate,
       warm_stable_prefix_hit_rate:
         candidate.metrics.warm_stable_prefix_hit_rate - champion.metrics.warm_stable_prefix_hit_rate,
       full_bucket_rate: candidate.metrics.full_bucket_rate - champion.metrics.full_bucket_rate,
       full_bucket_requests: fullBucketRequestDelta,
+      warm_full_bucket_rate:
+        candidate.metrics.warm_full_bucket_rate - champion.metrics.warm_full_bucket_rate,
+      warm_full_bucket_requests: warmFullBucketRequestDelta,
       avoidable_gap_tokens:
         candidate.metrics.avoidable_gap_tokens - champion.metrics.avoidable_gap_tokens,
       new_tail_gap_tokens:
@@ -2271,9 +3700,17 @@ function compareArmResults(
       provider_unstable_gap_tokens:
         candidate.metrics.provider_unstable_gap_tokens - champion.metrics.provider_unstable_gap_tokens,
       seed_cache_read_tokens:
-        candidateSeedCacheReadTokens - championSeedCacheReadTokens,
+        seedCacheReadEvidenceComplete
+          ? candidateSeedCacheReadEvidence.tokens - championSeedCacheReadEvidence.tokens
+          : null,
+      cold_seed_request_count:
+        coldSeedEvidenceComplete
+          ? candidateColdSeedEvidence.count - championColdSeedEvidence.count
+          : null,
       local_proxy_overhead_p95_ms:
-        candidate.metrics.local_proxy_overhead_p95_ms - champion.metrics.local_proxy_overhead_p95_ms,
+        candidateLocalPreUpstreamOverhead - championLocalPreUpstreamOverhead,
+      local_pre_upstream_overhead_p95_ms:
+        candidateLocalPreUpstreamOverhead - championLocalPreUpstreamOverhead,
       upstream_ttft_p95_ms:
         candidate.metrics.upstream_ttft_p95_ms - champion.metrics.upstream_ttft_p95_ms,
       ttft_p95_ms: candidate.metrics.ttft_p95_ms - champion.metrics.ttft_p95_ms
@@ -2311,12 +3748,7 @@ async function compareOfflineArtifacts(options) {
     0,
     120_000
   );
-  const maxLocalProxyOverheadRegressionMs = boundedInteger(
-    options["max-local-proxy-overhead-regression-ms"] ?? 0,
-    "--max-local-proxy-overhead-regression-ms",
-    0,
-    500
-  );
+  const maxLocalProxyOverheadRegressionMs = strictLocalLatencyRegressionBudget(options);
   const maxFullBucketRegressionRequests = boundedInteger(
     options["max-full-bucket-regression-requests"] ?? 0,
     "--max-full-bucket-regression-requests",
@@ -2329,7 +3761,7 @@ async function compareOfflineArtifacts(options) {
     0,
     10_000
   );
-  const requireTtftNoRegression = true;
+  const requireTtftNoRegression = resolvePromotionTtftPolicy(options);
   const comparison = compareArmResults(
     champion,
     candidate,
@@ -2353,7 +3785,10 @@ async function compareOfflineArtifacts(options) {
       max_local_proxy_overhead_regression_ms: maxLocalProxyOverheadRegressionMs,
       max_full_bucket_regression_requests: maxFullBucketRegressionRequests,
       max_input_token_delta: maxInputTokenDelta,
-      require_ttft_no_regression: requireTtftNoRegression
+      require_ttft_no_regression: requireTtftNoRegression,
+      promotion_latency_policy: requireTtftNoRegression
+        ? "end-to-end-no-regression"
+        : "local-no-regression-upstream-exempt"
     }
   };
 }
@@ -2378,6 +3813,12 @@ function validateAggregate(value, expectedArm) {
       "result JSON must be an atoapi-release-champion-v1 dynamic-arm-aggregate"
     );
   }
+  if (value?.diagnostic_only === true) {
+    throw new FailClosedError(
+      "diagnostic_only_artifact",
+      "diagnostic-only isolated evidence cannot be used for offline promotion"
+    );
+  }
   if (value.arm !== expectedArm) {
     throw new FailClosedError(
       "invalid_offline_artifact_arm",
@@ -2387,7 +3828,17 @@ function validateAggregate(value, expectedArm) {
   if (!isCompleteCohort(value.cohort)) {
     throw new FailClosedError("invalid_offline_cohort", "result JSON has no complete comparison cohort");
   }
-  const metrics = value.metrics ?? {};
+  const metrics = { ...(value.metrics ?? {}) };
+  // r2 evidence from August 13, 2026 predates the explicit
+  // local_pre_upstream_overhead_p95_ms field.  At that point the retained
+  // local_proxy_overhead_p95_ms field had the same full local-path meaning,
+  // so preserve offline comparability without rewriting the artifact.
+  const legacyLocalTimingAlias =
+    !Number.isFinite(Number(metrics.local_pre_upstream_overhead_p95_ms)) &&
+    Number.isFinite(Number(metrics.local_proxy_overhead_p95_ms));
+  if (legacyLocalTimingAlias) {
+    metrics.local_pre_upstream_overhead_p95_ms = metrics.local_proxy_overhead_p95_ms;
+  }
   for (const field of [
     "input_tokens",
     "cache_read_tokens",
@@ -2396,13 +3847,22 @@ function validateAggregate(value, expectedArm) {
     "warm_stable_prefix_hit_rate",
     "full_bucket_rate",
     "avoidable_gap_tokens",
+    "local_pre_upstream_overhead_p95_ms",
     "ttft_p95_ms"
   ]) {
     if (!Number.isFinite(Number(metrics[field]))) {
       throw new FailClosedError("invalid_offline_metrics", `result JSON metric ${field} is missing`);
     }
   }
-  return value;
+  return legacyLocalTimingAlias
+    ? {
+      ...value,
+      metrics: {
+        ...metrics,
+        local_pre_upstream_overhead_p95_source: "legacy_local_proxy_overhead_p95_ms"
+      }
+    }
+    : value;
 }
 
 function validateDynamicRun(value, expectedArm) {
@@ -2438,55 +3898,106 @@ async function snapshotLiveConfig(sourceConfigDir) {
   }
 }
 
-async function currentLiveSelectionScopeFingerprint(sourceConfigDir, configText = null) {
+async function currentLiveSelectionScopeFingerprint(
+  sourceConfigDir,
+  configText = null,
+  providerScope = "codex-agent",
+  pinnedKeyId = null
+) {
+  const normalizedProviderScope = normalizeProviderScope(providerScope);
   const text = configText ?? await readRequiredText(
     join(sourceConfigDir, "config.toml"),
     "live source config.toml"
   );
   const route = codexAgentRoute(text);
-  if (!route?.enabled || !route.provider_id) {
+  if (normalizedProviderScope === "codex-agent" && (!route?.enabled || !route.provider_id)) {
     throw new FailClosedError(
       "live_selection_scope_unavailable",
       "the live Codex route is not enabled or has no selected Provider"
     );
   }
+  const activeProviderId = extractTomlString(text, "active_provider_id");
+  const selectedProviderId = normalizedProviderScope === "active-provider"
+    ? activeProviderId
+    : route?.provider_id ?? "";
+  if (!selectedProviderId) {
+    throw new FailClosedError(
+      "live_selection_scope_unavailable",
+      normalizedProviderScope === "active-provider"
+        ? "the live config has no active_provider_id"
+        : "the live Codex route has no selected Provider"
+    );
+  }
   const providerBlock = tomlArrayBlocks(text, "providers")
     .map((item) => item.body)
-    .find((item) => extractTomlString(item, "id") === route.provider_id);
+    .find((item) => extractTomlString(item, "id") === selectedProviderId);
   if (!providerBlock) {
     throw new FailClosedError(
       "live_selection_scope_unavailable",
-      "the live Codex Provider is not present in the source config"
+      `the selected Provider ${selectedProviderId} is not present in the source config`
     );
   }
-  const keyPool = providerKeyPoolContext(text, route.provider_id);
+  if (extractTomlBoolean(providerBlock, "enabled") !== true) {
+    throw new FailClosedError(
+      "live_selection_scope_unavailable",
+      `the selected Provider ${selectedProviderId} is not enabled in the source config`
+    );
+  }
+  const keyPool = providerKeyPoolContext(text, selectedProviderId);
   const keyPoolMaterial = keyPool
     ? {
       enabled: extractTomlBoolean(keyPool.pool.body, "enabled"),
-      strategy: extractTomlString(keyPool.pool.body, "strategy"),
-      keys: keyPool.keys.map((key) => ({
-        id: extractTomlString(key.body, "id"),
-        enabled: extractTomlBoolean(key.body, "enabled"),
-        disabled_until: extractTomlRawValue(key.body, "disabled_until"),
-        material_digest: sha256Text(extractTomlString(key.body, "key_encrypted"))
-      }))
+      ...(pinnedKeyId
+        ? {
+          pinned_key: (() => {
+            const pinned = keyPool.keys.find(
+              (key) => extractTomlString(key.body, "id") === pinnedKeyId
+            );
+            return pinned
+              ? {
+                id: pinnedKeyId,
+                enabled: extractTomlBoolean(pinned.body, "enabled"),
+                disabled_until: extractTomlRawValue(pinned.body, "disabled_until"),
+                material_digest: sha256Text(extractTomlString(pinned.body, "key_encrypted"))
+              }
+              : { id: pinnedKeyId, missing: true };
+          })()
+        }
+        : {
+          strategy: extractTomlString(keyPool.pool.body, "strategy"),
+          keys: keyPool.keys.map((key) => ({
+            id: extractTomlString(key.body, "id"),
+            enabled: extractTomlBoolean(key.body, "enabled"),
+            disabled_until: extractTomlRawValue(key.body, "disabled_until"),
+            material_digest: sha256Text(extractTomlString(key.body, "key_encrypted"))
+          }))
+        })
     }
     : null;
-  const targetPath = route.target_path;
+  const targetPath = normalizedProviderScope === "codex-agent"
+    ? route?.target_path ?? ""
+    : "";
   const targetConfigDigest = targetPath
     ? await readFile(targetPath)
       .then((contents) => createHash("sha256").update(contents).digest("hex"))
       .catch(() => "missing")
     : "none";
   return sha256Parts([
-    "atoapi-release-champion-live-selection-scope-v1",
+    "atoapi-release-champion-live-selection-scope-v2",
     JSON.stringify({
-      route: {
-        provider_id: route.provider_id,
-        model_id: route.model_id,
-        enabled: route.enabled,
-        target_path_digest: sha256Text(targetPath)
-      },
+      provider_scope: normalizedProviderScope,
+      selected_provider_id: selectedProviderId,
+      active_provider_id: normalizedProviderScope === "active-provider"
+        ? activeProviderId
+        : "",
+      route: normalizedProviderScope === "codex-agent"
+        ? {
+          provider_id: route?.provider_id ?? "",
+          model_id: route?.model_id ?? "",
+          enabled: route?.enabled ?? false,
+          target_path_digest: sha256Text(targetPath)
+        }
+        : null,
       provider: {
         enabled: extractTomlBoolean(providerBlock, "enabled"),
         channel: extractTomlString(providerBlock, "channel"),
@@ -2503,8 +4014,19 @@ async function currentLiveSelectionScopeFingerprint(sourceConfigDir, configText 
   ]);
 }
 
-async function assertLiveSelectionScopeUnchanged(sourceConfigDir, expectedFingerprint, checkpoint) {
-  const currentFingerprint = await currentLiveSelectionScopeFingerprint(sourceConfigDir);
+async function assertLiveSelectionScopeUnchanged(
+  sourceConfigDir,
+  expectedFingerprint,
+  checkpoint,
+  providerScope = "codex-agent",
+  pinnedKeyId = null
+) {
+  const currentFingerprint = await currentLiveSelectionScopeFingerprint(
+    sourceConfigDir,
+    null,
+    providerScope,
+    pinnedKeyId
+  );
   if (currentFingerprint !== expectedFingerprint) {
     throw new FailClosedError(
       "live_selection_scope_changed",
@@ -2844,6 +4366,17 @@ function cacheableInputTokens128(inputTokens) {
     : 1_024 + Math.floor((inputTokens - 1_024) / 128) * 128;
 }
 
+function localPreUpstreamOverheadMs(timing) {
+  const components = [
+    timing?.prefix_guard_wait_ms,
+    timing?.local_prepare_ms,
+    timing?.request_body_encode_ms,
+    timing?.gzip_encode_ms
+  ];
+  if (components.some((value) => finiteNonNegativeNumber(value) === null)) return null;
+  return components.reduce((total, value) => total + Number(value), 0);
+}
+
 function timingSummary(rows) {
   const comparable = array(rows);
   const compaction = comparable.filter((item) => item.phase === "compaction");
@@ -2853,16 +4386,28 @@ function timingSummary(rows) {
   };
   return {
     timing_complete_requests: comparable.filter((item) => item.checks?.timing_present).length,
+    local_pre_upstream_overhead_p95_ms: p95(
+      comparable,
+      (item) => finiteNonNegativeNumber(item.local_pre_upstream_overhead_ms)
+    ),
     local_proxy_overhead_p95_ms: p95(
       comparable,
-      (item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms)
+      (item) => {
+        const guard = finiteNonNegativeNumber(item.prefix_guard_wait_ms);
+        const prepare = finiteNonNegativeNumber(item.local_prepare_ms);
+        return guard === null || prepare === null ? null : guard + prepare;
+      }
     ),
     upstream_ttft_p95_ms: p95(comparable, (item) => item.upstream_ttft_ms),
     ttft_p95_ms: p95(comparable, (item) => item.ttft_ms),
     compaction_request_count: compaction.length,
     compaction_local_proxy_overhead_p95_ms: p95(
       compaction,
-      (item) => number(item.prefix_guard_wait_ms) + number(item.local_prepare_ms),
+      (item) => {
+        const guard = finiteNonNegativeNumber(item.prefix_guard_wait_ms);
+        const prepare = finiteNonNegativeNumber(item.local_prepare_ms);
+        return guard === null || prepare === null ? null : guard + prepare;
+      },
       null
     ),
     compaction_upstream_ttft_p95_ms: p95(
@@ -2879,17 +4424,30 @@ function emptyMetrics() {
     requests: 0,
     successful_sse_requests: 0,
     input_tokens: 0,
+    warm_input_tokens: 0,
+    seed_input_tokens: 0,
+    seed_cache_read_tokens: 0,
+    seed_request_count: 0,
+    cold_seed_request_count: 0,
     peak_input_tokens: 0,
     cache_read_tokens: 0,
     raw_token_hit_rate: 0,
+    warm_cache_read_tokens: 0,
+    warm_raw_token_hit_rate: 0,
     cacheable_tokens_128: 0,
     cacheable_read_tokens_128: 0,
     cache_128_hit_rate: 0,
+    warm_cacheable_tokens_128: 0,
+    warm_cacheable_read_tokens_128: 0,
+    warm_cache_128_hit_rate: 0,
     warm_stable_prefix_tokens_128: 0,
     warm_stable_prefix_cached_tokens_128: 0,
     warm_stable_prefix_hit_rate: 0,
     full_bucket_requests: 0,
     full_bucket_rate: 0,
+    warm_full_bucket_requests: 0,
+    warm_full_bucket_rate: 0,
+    warm_full_bucket_denominator: 0,
     cacheable_request_count: 0,
     full_bucket_denominator: 0,
     avoidable_gap_tokens: 0,
@@ -2898,6 +4456,7 @@ function emptyMetrics() {
     shortfall_tokens: 0,
     guarded_requests: 0,
     timing_complete_requests: 0,
+    local_pre_upstream_overhead_p95_ms: 0,
     local_proxy_overhead_p95_ms: 0,
     upstream_ttft_p95_ms: 0,
     ttft_p95_ms: 0,
@@ -3350,6 +4909,15 @@ function normalizeScenario(value) {
     : null;
 }
 
+function normalizeProviderScope(value) {
+  const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
+  if (normalized === "codex-agent" || normalized === "active-provider") return normalized;
+  throw new FailClosedError(
+    "invalid_provider_scope",
+    "--provider-scope must be codex-agent or active-provider"
+  );
+}
+
 function normalizeToolOutputShape(value) {
   const normalized = String(value).trim().toLowerCase().replace(/_/gu, "-");
   if (new Set(["natural", "natural-dense", "flat", "structured", "noisy"]).has(normalized)) return normalized;
@@ -3493,6 +5061,347 @@ function processIsAlive(pid) {
   }
 }
 
+function optionalLiveCodexMetricsUrl(value) {
+  if (value === undefined || value === null) return null;
+  const normalized = String(value).trim();
+  if (!normalized) {
+    throw new FailClosedError(
+      "invalid_live_codex_metrics_url",
+      "--live-codex-metrics-url must be a local Atoapi metrics URL"
+    );
+  }
+  let parsed;
+  try {
+    parsed = new URL(normalized);
+  } catch {
+    throw new FailClosedError(
+      "invalid_live_codex_metrics_url",
+      "--live-codex-metrics-url must be a valid local Atoapi metrics URL"
+    );
+  }
+  if (
+    parsed.protocol !== "http:" ||
+    parsed.hostname !== "127.0.0.1" ||
+    parsed.port !== "18883" ||
+    parsed.pathname !== "/admin/metrics" ||
+    parsed.search ||
+    parsed.hash ||
+    parsed.username ||
+    parsed.password
+  ) {
+    throw new FailClosedError(
+      "invalid_live_codex_metrics_url",
+      "--live-codex-metrics-url must be exactly http://127.0.0.1:18883/admin/metrics"
+    );
+  }
+  return parsed.toString();
+}
+
+function selectLatestLiveCodexMainRecord(metrics) {
+  const rows = [
+    ...array(metrics?.recent_requests).map((record) => ({
+      source: "recent_requests",
+      record
+    })),
+    ...array(metrics?.recent_failed_requests).map((record) => ({
+      source: "recent_failed_requests",
+      record
+    }))
+  ];
+  const candidates = [];
+  for (const row of rows) {
+    const record = row.record;
+    if (
+      String(record?.agent_id ?? "") !== "codex" ||
+      String(record?.upstream_call_source ?? "") !== "main"
+    ) {
+      continue;
+    }
+    const observedAt = String(record?.at ?? "").trim();
+    if (!observedAt) {
+      throw new FailClosedError(
+        "live_codex_metrics_timestamp_missing",
+        "a Codex main metrics record has no timestamp; live scope cannot fall back to an older record"
+      );
+    }
+    const observedAtMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedAtMs)) {
+      throw new FailClosedError(
+        "live_codex_metrics_timestamp_invalid",
+        "a Codex main metrics record has an invalid timestamp; live scope cannot fall back to an older record"
+      );
+    }
+    candidates.push({ source: row.source, record, observedAtMs });
+  }
+  if (candidates.length === 0) {
+    throw new FailClosedError(
+      "live_codex_metrics_missing",
+      "no Codex main request is available in live metrics"
+    );
+  }
+  candidates.sort((left, right) => right.observedAtMs - left.observedAtMs);
+  return candidates[0];
+}
+
+function selectLatestLiveCodexMainRecordForExpectedScope(metrics, {
+  expectedProviderId,
+  expectedModel,
+  expectedRealm
+}) {
+  const rows = [
+    ...array(metrics?.recent_requests).map((record) => ({
+      source: "recent_requests",
+      record
+    })),
+    ...array(metrics?.recent_failed_requests).map((record) => ({
+      source: "recent_failed_requests",
+      record
+    }))
+  ];
+  const candidates = [];
+  for (const row of rows) {
+    const record = row.record;
+    if (
+      String(record?.agent_id ?? "") !== "codex" ||
+      String(record?.upstream_call_source ?? "") !== "main" ||
+      String(record?.provider_id ?? "").trim() !== expectedProviderId ||
+      String(record?.model ?? "").trim() !== expectedModel ||
+      String(record?.shadow_affinity_realm_id ?? "").trim() !== expectedRealm
+    ) {
+      continue;
+    }
+    const observedAt = String(record?.at ?? "").trim();
+    if (!observedAt) {
+      throw new FailClosedError(
+        "live_codex_metrics_timestamp_missing",
+        "the expected Codex main metrics record has no timestamp; live scope cannot fall back to an older record"
+      );
+    }
+    const observedAtMs = Date.parse(observedAt);
+    if (!Number.isFinite(observedAtMs)) {
+      throw new FailClosedError(
+        "live_codex_metrics_timestamp_invalid",
+        "the expected Codex main metrics record has an invalid timestamp; live scope cannot fall back to an older record"
+      );
+    }
+    candidates.push({ source: row.source, record, observedAtMs });
+  }
+  if (candidates.length === 0) {
+    throw new FailClosedError(
+      "live_codex_metrics_expected_scope_missing",
+      "no Codex main request matches the expected provider/model/realm in live metrics"
+    );
+  }
+  candidates.sort((left, right) => right.observedAtMs - left.observedAtMs);
+  return candidates[0];
+}
+
+function safeLiveCodexLabel(value) {
+  const normalized = String(value ?? "").trim();
+  return /^[A-Za-z0-9_-]{1,96}$/u.test(normalized) ? normalized : null;
+}
+
+function liveCodexGateRecency(ageMs, maxAgeSeconds) {
+  if (!Number.isFinite(ageMs)) return "unknown";
+  if (ageMs < -60_000) return "clock_skew";
+  return ageMs > Number(maxAgeSeconds) * 1_000 ? "stale" : "current";
+}
+
+function liveCodexGateTransportEvidence(record) {
+  const projected = {};
+  for (const [target, source] of Object.entries({
+    request_bytes: "request_body_bytes",
+    sent_bytes: "sent_body_bytes",
+    request_encode_ms: "request_body_encode_ms",
+    gzip_encode_ms: "gzip_encode_ms",
+    upstream_headers_ms: "upstream_attempt_headers_ms",
+    upstream_wait_ms: "stream_upstream_wait_ms",
+    client_backpressure_ms: "stream_client_backpressure_ms"
+  })) {
+    const value = finiteNonNegativeNumber(record?.[source]);
+    if (value !== null) projected[target] = value;
+  }
+  for (const field of ["gzip_attempted", "gzip_fallback_used", "downstream_disconnected"]) {
+    if (typeof record?.[field] === "boolean") projected[field] = record[field];
+  }
+  return projected;
+}
+
+function liveCodexGateEvidence({
+  checkpoint,
+  latest,
+  expectedProviderId,
+  expectedModel,
+  expectedRealm,
+  maxAgeSeconds
+}) {
+  const record = latest?.record;
+  if (!record || !latest) {
+    return {
+      schema: "atoapi-live-codex-gate-evidence-v1",
+      checkpoint,
+      record_available: false
+    };
+  }
+  const providerId = String(record?.provider_id ?? "").trim();
+  const model = String(record?.model ?? "").trim();
+  const realm = String(record?.shadow_affinity_realm_id ?? "").trim();
+  const ageMs = Date.now() - latest.observedAtMs;
+  const status = Number(record?.status);
+  return {
+    schema: "atoapi-live-codex-gate-evidence-v1",
+    checkpoint,
+    record_available: true,
+    record_source: latest.source === "recent_failed_requests"
+      ? "recent_failed_requests"
+      : "recent_requests",
+    recency: liveCodexGateRecency(ageMs, maxAgeSeconds),
+    http_status: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
+    protocol: {
+      client_channel: safeLiveCodexLabel(record?.client_channel),
+      upstream_channel: safeLiveCodexLabel(record?.upstream_channel),
+      upstream_call_kind: safeLiveCodexLabel(record?.upstream_call_kind)
+    },
+    terminal_sse: {
+      completed_event_seen: record?.sse_completed_event_seen === true,
+      done_marker_seen: record?.sse_done_marker_seen === true,
+      end_reason: safeLiveCodexLabel(record?.sse_end_reason),
+      chunks: finiteNonNegativeNumber(record?.sse_chunks)
+    },
+    cache_status: safeLiveCodexLabel(record?.cache_status),
+    scope: {
+      provider_present: Boolean(providerId),
+      model_present: Boolean(model),
+      key_realm_present: /^[0-9a-f]{64}$/u.test(realm),
+      provider_matches_expected: Boolean(providerId) && providerId === expectedProviderId,
+      model_matches_expected: Boolean(model) && model === expectedModel,
+      key_realm_matches_expected: /^[0-9a-f]{64}$/u.test(realm) && realm === expectedRealm
+    },
+    transport: liveCodexGateTransportEvidence(record)
+  };
+}
+
+function liveCodexGateError(code, message, evidence) {
+  return new LiveCodexMetricsGateError(code, message, evidence);
+}
+
+function validateLiveCodexMetricsScopeRecord({
+  checkpoint,
+  latest,
+  expectedProviderId,
+  expectedModel,
+  expectedRealm,
+  maxAgeSeconds
+}) {
+  const record = latest.record;
+  const ageMs = Date.now() - latest.observedAtMs;
+  const evidence = liveCodexGateEvidence({
+    checkpoint,
+    latest,
+    expectedProviderId,
+    expectedModel,
+    expectedRealm,
+    maxAgeSeconds
+  });
+  if (ageMs > maxAgeSeconds * 1_000 || ageMs < -60_000) {
+    throw liveCodexGateError(
+      "live_codex_metrics_stale",
+      "the latest matching Codex main metrics record is not current at " + checkpoint,
+      evidence
+    );
+  }
+  const status = Number(record?.status);
+  if (!Number.isInteger(status) || status < 200 || status >= 300) {
+    throw liveCodexGateError(
+      "live_codex_metrics_failed",
+      "the latest matching Codex main request failed at " + checkpoint,
+      evidence
+    );
+  }
+  if (
+    String(record?.client_channel ?? "") !== "responses" ||
+    String(record?.upstream_channel ?? "") !== "responses" ||
+    String(record?.upstream_call_kind ?? "") !== "stream" ||
+    record?.sse_completed_event_seen !== true
+  ) {
+    throw liveCodexGateError(
+      "live_codex_metrics_incomplete",
+      "the latest matching Codex main request is not a completed Responses streaming request at " + checkpoint,
+      evidence
+    );
+  }
+  const providerId = String(record?.provider_id ?? "").trim();
+  const model = String(record?.model ?? "").trim();
+  const realm = String(record?.shadow_affinity_realm_id ?? "").trim();
+  if (!providerId || !model || !/^[0-9a-f]{64}$/u.test(realm)) {
+    throw liveCodexGateError(
+      "live_codex_metrics_scope_incomplete",
+      "the latest matching Codex main request has incomplete provider/model/realm evidence at " + checkpoint,
+      evidence
+    );
+  }
+  if (
+    providerId !== expectedProviderId ||
+    model !== expectedModel ||
+    realm !== expectedRealm
+  ) {
+    throw liveCodexGateError(
+      "live_codex_metrics_scope_changed",
+      "the expected Codex provider/model/realm changed at " + checkpoint + "; live comparison stopped before more traffic was sent",
+      evidence
+    );
+  }
+  return evidence;
+}
+
+async function assertLiveCodexMetricsScopeUnchanged({
+  metricsUrl,
+  expectedProviderId,
+  expectedModel,
+  expectedRealm,
+  maxAgeSeconds,
+  checkpoint
+}) {
+  let metrics;
+  try {
+    metrics = await getJson(metricsUrl, 5_000);
+  } catch (error) {
+    const code = error instanceof FailClosedError
+      ? error.code
+      : "live_codex_metrics_unavailable";
+    throw liveCodexGateError(
+      code,
+      "the live Codex metrics gate could not be evaluated at " + checkpoint,
+      liveCodexGateEvidence({ checkpoint, maxAgeSeconds })
+    );
+  }
+  let latest;
+  try {
+    latest = selectLatestLiveCodexMainRecordForExpectedScope(metrics, {
+      expectedProviderId,
+      expectedModel,
+      expectedRealm
+    });
+  } catch (error) {
+    const code = error instanceof FailClosedError
+      ? error.code
+      : "live_codex_metrics_unavailable";
+    throw liveCodexGateError(
+      code,
+      "the live Codex metrics gate could not select a current matching Codex record at " + checkpoint,
+      liveCodexGateEvidence({ checkpoint, maxAgeSeconds })
+    );
+  }
+  return validateLiveCodexMetricsScopeRecord({
+    checkpoint,
+    latest,
+    expectedProviderId,
+    expectedModel,
+    expectedRealm,
+    maxAgeSeconds
+  });
+}
+
 async function getJson(url, timeoutMs) {
   const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
   if (!response.ok) {
@@ -3574,6 +5483,42 @@ function optionalUpstreamUserAgent(value) {
   return normalized;
 }
 
+function evaluateUpstreamUserAgentParity({
+  championUpstreamUserAgent,
+  candidateUpstreamUserAgent,
+  sourceCustomUserAgent,
+  championExecutableSha256,
+  candidateExecutableSha256
+}) {
+  const champion = String(championUpstreamUserAgent ?? "").trim();
+  const candidate = String(candidateUpstreamUserAgent ?? "").trim();
+  const source = String(sourceCustomUserAgent ?? "").trim();
+
+  // A one-arm override is never a valid A/B: it creates an intentional
+  // header/cache-lane split. Require both values and exact equality.
+  if (champion || candidate) {
+    if (!champion || !candidate || champion !== candidate) {
+      return {
+        ok: false,
+        code: "upstream_user_agent_mismatch",
+        message: "champion and candidate must use the same explicit upstream User-Agent"
+      };
+    }
+    return { ok: true, mode: "explicit-common" };
+  }
+
+  if (source) return { ok: true, mode: "source-config-common" };
+  if (championExecutableSha256 === candidateExecutableSha256) {
+    return { ok: true, mode: "same-binary-default" };
+  }
+
+  return {
+    ok: false,
+    code: "cross_binary_upstream_user_agent_unproven",
+    message: "cross-binary live comparison requires a common --upstream-user-agent when the selected Provider has no custom_user_agent"
+  };
+}
+
 function boundedInteger(value, label, minimum, maximum) {
   const parsed = Number.parseInt(String(value), 10);
   if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
@@ -3626,6 +5571,53 @@ function resolveFreshFixturePerPair(options) {
   return !reuseFixtureAcrossPairs;
 }
 
+function resolveIncludeToolSchema(options) {
+  return optionalBoolean(
+    options["include-tool-schema"],
+    "--include-tool-schema"
+  ) ?? true;
+}
+
+function resolvePromotionTtftPolicy(options) {
+  const strict = optionalBoolean(
+    options["require-ttft-no-regression"],
+    "--require-ttft-no-regression"
+  );
+  const upstreamExempt = optionalBoolean(
+    options["allow-upstream-ttft-regression"],
+    "--allow-upstream-ttft-regression"
+  );
+  if (strict === true && upstreamExempt === true) {
+    throw new FailClosedError(
+      "conflicting_ttft_promotion_policy",
+      "--require-ttft-no-regression and --allow-upstream-ttft-regression cannot both be true"
+    );
+  }
+  if (strict === false) {
+    throw new FailClosedError(
+      "invalid_ttft_promotion_policy",
+      "use --allow-upstream-ttft-regression to exempt only upstream TTFT; local latency remains mandatory"
+    );
+  }
+  return upstreamExempt !== true;
+}
+
+function strictLocalLatencyRegressionBudget(options) {
+  const value = boundedInteger(
+    options["max-local-proxy-overhead-regression-ms"] ?? 0,
+    "--max-local-proxy-overhead-regression-ms",
+    0,
+    500
+  );
+  if (value !== 0) {
+    throw new FailClosedError(
+      "local_latency_regression_budget_must_be_zero",
+      "release promotion requires --max-local-proxy-overhead-regression-ms 0"
+    );
+  }
+  return 0;
+}
+
 function ratio(numerator, denominator) {
   return denominator > 0 ? numerator / denominator : 0;
 }
@@ -3633,6 +5625,10 @@ function ratio(numerator, denominator) {
 function finiteNonNegativeNumber(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function explicitFiniteNonNegativeNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
 function number(value) {
@@ -3712,7 +5708,7 @@ function printUsage() {
   node scripts/verify-release-champion.mjs --live \\
     --champion-exe <old.exe> --candidate-exe <new.exe> \\
     --source-config-dir <Atoapi-config-dir> --model <model> \\
-    --key-realm-hash <opaque-hash> [--provider-id <id>] \\
+    --key-realm-hash <opaque-hash> [--provider-scope codex-agent|active-provider] [--provider-id <id>] \\
     [--scenario full-replay|tool-burst|dynamic-tail-mix|tool-tail-maturity|compacted-anchor|compaction-root] [--pairs 2] [--warmup-pairs 0] [--turns 6] \\
     [--pair-offset 0|1] [--first-arm champion|candidate] \\
     [--seed-context-chars <0-2500000>] [--minimum-seed-input-tokens <0-1000000>] \\
@@ -3720,6 +5716,7 @@ function printUsage() {
     [--max-input-token-delta <0-10000>] \\
     [--fixture-profile natural|natural-dense|legacy-repeated] [--dynamic-tail-profile mixed|natural-dense] \\
     [--tool-calls <1-8>] [--tool-output-shape natural|natural-dense|flat|structured|noisy] \\
+    [--include-tool-schema true|false] \\
     [--turn-delay-ms <0-5000>] [--inter-arm-delay-ms <0-5000>] [--pair-delay-ms <0-60000>] \\
     [--reuse-fixture-across-pairs] \\
     [--isolate-upstream-cache] \\
@@ -3747,9 +5744,17 @@ Safety:
   pool cannot bias the cache-placement result.
   --reuse-runtime-per-arm keeps one isolated process per arm across fresh
   pairs only when upstream-cache isolation is off.
+  --persistent-runtime-start-order changes only which persistent isolated
+  process is created first. It is a transport-placement diagnostic for reused
+  runtimes; it never changes the Key, request body, cache placement, or
+  turn-by-turn sender order.
   --fixture-profile natural is the default: an equal-length, deterministic,
   non-repeated synthetic context. legacy-repeated exists only to reproduce
   older fixture behavior; neither profile uses user context or changes Atoapi.
+  --include-tool-schema is on by default for historical compatibility. In a
+  tool-history scenario it adds the read_release_fixture schema plus
+  tool_choice=none from the seed onward. Pass false only for an explicit
+  schema-free protocol probe, because that intentionally changes the wire.
   --pair-delay-ms is test-only pacing between fresh pairs; it never changes a
   request body, retries an inbound, or touches the running service. --first-arm
   and --pair-offset only choose which isolated arm sends first; they never alter
@@ -3764,6 +5769,220 @@ async function runSelfTest() {
     live: true,
     model: "m"
   });
+  const oldRuntimeError = {
+    at: "2026-08-10T00:00:00Z",
+    scope: "upstream_transport",
+    message: "dns lookup failed"
+  };
+  assert.deepEqual(
+    freshRuntimeErrorEvidence({
+      recent_errors: [
+        oldRuntimeError,
+        { at: "2026-08-10T00:00:01Z", scope: "upstream_transport", message: "proxy tunnel failed" },
+        { at: "2026-08-10T00:00:02Z", scope: "untrusted scope value", message: "request timeout" }
+      ]
+    }, new Set([errorFingerprint(oldRuntimeError)])),
+    { scopes: ["upstream_transport"], classes: ["proxy", "timeout"] },
+    "release evidence must retain only new, allow-listed runtime error categories"
+  );
+  assert.equal(
+    optionalLiveCodexMetricsUrl("http://127.0.0.1:18883/admin/metrics"),
+    "http://127.0.0.1:18883/admin/metrics",
+    "the live Codex scope guard must stay on the protected local metrics endpoint"
+  );
+  assert.throws(
+    () => optionalLiveCodexMetricsUrl("http://localhost:18883/admin/metrics"),
+    (error) => error?.code === "invalid_live_codex_metrics_url"
+  );
+  const liveRealm = "a".repeat(64);
+  const latestLiveCodex = selectLatestLiveCodexMainRecord({
+    recent_requests: [{
+      at: "2026-08-10T00:00:00Z",
+      agent_id: "codex",
+      upstream_call_source: "main",
+      status: 200,
+      provider_id: "provider-a",
+      model: "model-a",
+      shadow_affinity_realm_id: liveRealm,
+      client_channel: "responses",
+      upstream_channel: "responses",
+      upstream_call_kind: "stream",
+      sse_completed_event_seen: true
+    }],
+    recent_failed_requests: [{
+      at: "2026-08-10T00:00:01Z",
+      agent_id: "codex",
+      upstream_call_source: "main",
+      status: 502,
+      provider_id: "provider-a",
+      model: "model-a",
+      shadow_affinity_realm_id: liveRealm,
+      client_channel: "responses",
+      upstream_channel: "responses",
+      upstream_call_kind: "stream",
+      sse_completed_event_seen: false
+    }]
+  });
+  assert.equal(
+    latestLiveCodex.record.status,
+    502,
+    "a newer failed Codex request must not fall back to an older success"
+  );
+  assert.equal(
+    latestLiveCodex.source,
+    "recent_failed_requests",
+    "the retained gate evidence must identify the bounded metrics collection"
+  );
+  const liveNow = Date.now();
+  const liveAt = (offsetMs = 0) => new Date(liveNow + offsetMs).toISOString();
+  const expectedLiveRecord = (overrides = {}) => ({
+    at: liveAt(),
+    agent_id: "codex",
+    upstream_call_source: "main",
+    status: 200,
+    provider_id: "provider-a",
+    model: "model-a",
+    shadow_affinity_realm_id: liveRealm,
+    client_channel: "responses",
+    upstream_channel: "responses",
+    upstream_call_kind: "stream",
+    sse_completed_event_seen: true,
+    ...overrides
+  });
+  const independentLiveRecord = expectedLiveRecord({
+    at: liveAt(1_000),
+    provider_id: "provider-b",
+    model: "model-b",
+    shadow_affinity_realm_id: "b".repeat(64)
+  });
+  const expectedLiveScope = {
+    expectedProviderId: "provider-a",
+    expectedModel: "model-a",
+    expectedRealm: liveRealm
+  };
+  const matchingHealthyWithNewerIndependent = selectLatestLiveCodexMainRecordForExpectedScope({
+    recent_requests: [expectedLiveRecord({ at: liveAt(-1_000) }), independentLiveRecord],
+    recent_failed_requests: []
+  }, expectedLiveScope);
+  assert.equal(
+    matchingHealthyWithNewerIndependent.record.provider_id,
+    "provider-a",
+    "a newer independent Codex scope must not replace the healthy expected scope"
+  );
+  assert.doesNotThrow(() => validateLiveCodexMetricsScopeRecord({
+    checkpoint: "self_test_healthy_expected_scope",
+    latest: matchingHealthyWithNewerIndependent,
+    ...expectedLiveScope,
+    maxAgeSeconds: 600
+  }));
+  const newestExpectedFailure = selectLatestLiveCodexMainRecordForExpectedScope({
+    recent_requests: [expectedLiveRecord({ at: liveAt(-2_000) }), independentLiveRecord],
+    recent_failed_requests: [expectedLiveRecord({ at: liveAt(-500), status: 502, sse_completed_event_seen: false })]
+  }, expectedLiveScope);
+  assert.equal(
+    newestExpectedFailure.record.status,
+    502,
+    "a new matching-scope failure must not fall back to an older matching success"
+  );
+  assert.throws(
+    () => validateLiveCodexMetricsScopeRecord({
+      checkpoint: "self_test_newest_expected_failure",
+      latest: newestExpectedFailure,
+      ...expectedLiveScope,
+      maxAgeSeconds: 600
+    }),
+    (error) => error?.code === "live_codex_metrics_failed"
+  );
+  assert.throws(
+    () => selectLatestLiveCodexMainRecordForExpectedScope({
+      recent_requests: [independentLiveRecord],
+      recent_failed_requests: []
+    }, expectedLiveScope),
+    (error) => error?.code === "live_codex_metrics_expected_scope_missing"
+  );
+  const staleExpectedScope = selectLatestLiveCodexMainRecordForExpectedScope({
+    recent_requests: [expectedLiveRecord({ at: liveAt(-601_000) }), independentLiveRecord],
+    recent_failed_requests: []
+  }, expectedLiveScope);
+  assert.throws(
+    () => validateLiveCodexMetricsScopeRecord({
+      checkpoint: "self_test_stale_expected_scope",
+      latest: staleExpectedScope,
+      ...expectedLiveScope,
+      maxAgeSeconds: 600
+    }),
+    (error) => error?.code === "live_codex_metrics_stale"
+  );
+  const incompleteExpectedScope = selectLatestLiveCodexMainRecordForExpectedScope({
+    recent_requests: [expectedLiveRecord({ at: liveAt(-250), sse_completed_event_seen: false }), independentLiveRecord],
+    recent_failed_requests: []
+  }, expectedLiveScope);
+  assert.throws(
+    () => validateLiveCodexMetricsScopeRecord({
+      checkpoint: "self_test_incomplete_expected_scope",
+      latest: incompleteExpectedScope,
+      ...expectedLiveScope,
+      maxAgeSeconds: 600
+    }),
+    (error) => error?.code === "live_codex_metrics_incomplete"
+  );
+  const incompleteLiveGateEvidence = liveCodexGateEvidence({
+    checkpoint: "after_pair_0",
+    latest: {
+      source: "recent_failed_requests",
+      observedAtMs: Date.now(),
+      record: {
+        status: 200,
+        client_channel: "responses",
+        upstream_channel: "responses",
+        upstream_call_kind: "stream",
+        sse_completed_event_seen: false,
+        sse_done_marker_seen: false,
+        sse_end_reason: "upstream_sse_error",
+        cache_status: "error",
+        provider_id: "provider-a",
+        model: "model-a",
+        shadow_affinity_realm_id: liveRealm,
+        request_body_bytes: 1_024,
+        sent_body_bytes: 512,
+        gzip_attempted: true,
+        sse_chunks: 4,
+        upstream_error_message: "Bearer must-not-be-retained",
+        raw_request_material: "must-not-be-retained"
+      }
+    },
+    expectedProviderId: "provider-a",
+    expectedModel: "model-a",
+    expectedRealm: liveRealm,
+    maxAgeSeconds: 600
+  });
+  assert.equal(incompleteLiveGateEvidence.record_available, true);
+  assert.equal(incompleteLiveGateEvidence.record_source, "recent_failed_requests");
+  assert.equal(incompleteLiveGateEvidence.http_status, 200);
+  assert.equal(incompleteLiveGateEvidence.terminal_sse.completed_event_seen, false);
+  assert.equal(incompleteLiveGateEvidence.scope.key_realm_matches_expected, true);
+  assert.equal(JSON.stringify(incompleteLiveGateEvidence).includes("Bearer"), false);
+  assert.equal(JSON.stringify(incompleteLiveGateEvidence).includes("must-not-be-retained"), false);
+  assert.deepEqual(
+    liveCodexGateEvidence({ checkpoint: "after_pair_0", maxAgeSeconds: 600 }),
+    {
+      schema: "atoapi-live-codex-gate-evidence-v1",
+      checkpoint: "after_pair_0",
+      record_available: false
+    },
+    "a metrics-read failure must not fabricate a record projection"
+  );
+  assert.throws(
+    () => selectLatestLiveCodexMainRecord({
+      recent_requests: [{
+        agent_id: "codex",
+        upstream_call_source: "main",
+        status: 200
+      }],
+      recent_failed_requests: []
+    }),
+    (error) => error?.code === "live_codex_metrics_timestamp_missing"
+  );
   const boundCodexRoute = codexAgentRoute([
     '[[agent_injections]]',
     'id = "codex"',
@@ -3788,11 +6007,111 @@ async function runSelfTest() {
     "an unpinned Codex binding deliberately takes its model from the actual request"
   );
   assert.equal(booleanArg(parseArgs(["--reuse-runtime-per-arm"])["reuse-runtime-per-arm"]), true);
+  assert.deepEqual(persistentRuntimeStartOrder("champion"), ["champion", "candidate"]);
+  assert.deepEqual(persistentRuntimeStartOrder("candidate"), ["candidate", "champion"]);
+  assert.throws(
+    () => normalizePersistentRuntimeStartOrder("lane-a"),
+    (error) => error instanceof FailClosedError && error.code === "invalid_persistent_runtime_start_order"
+  );
   assert.equal(optionalBoolean("true", "--force-use-system-proxy"), true);
   assert.equal(optionalBoolean("false", "--force-use-system-proxy"), false);
   assert.throws(
     () => optionalBoolean("maybe", "--force-use-system-proxy"),
     (error) => error?.code === "invalid_boolean_parameter"
+  );
+  assert.equal(resolveIncludeToolSchema({}), true);
+  const opaquePlacementKey = "release-fixture-placement-secret";
+  const opaquePlacementKeyFingerprint = opaquePlacementFingerprint(opaquePlacementKey);
+  assert.match(opaquePlacementKeyFingerprint, /^[a-f0-9]{32}$/u);
+  assert.notEqual(opaquePlacementKeyFingerprint, opaquePlacementKey);
+  const placementDiagnostic = projectDiagnosticRequest({
+    provider_prefix_key_present: true,
+    provider_prefix_key_fingerprint: opaquePlacementKeyFingerprint
+  });
+  assert.equal(
+    placementDiagnostic.provider_prefix_key_fingerprint,
+    opaquePlacementKeyFingerprint,
+    "release diagnostics must retain only the one-way native placement fingerprint"
+  );
+  assert.equal(
+    JSON.stringify(placementDiagnostic).includes(opaquePlacementKey),
+    false,
+    "release diagnostics must never retain a raw prompt-cache placement key"
+  );
+  assert.equal(
+    resolveIncludeToolSchema(parseArgs(["--include-tool-schema"])),
+    true,
+    "the historical tool-history wire must retain its schema by default"
+  );
+  assert.equal(
+    resolveIncludeToolSchema(parseArgs(["--include-tool-schema=false"])),
+    false
+  );
+  assert.throws(
+    () => resolveIncludeToolSchema({ "include-tool-schema": "maybe" }),
+    (error) => error?.code === "invalid_boolean_parameter"
+  );
+  assert.deepEqual(
+    evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent: "Atoapi/test",
+      candidateUpstreamUserAgent: "Atoapi/test",
+      sourceCustomUserAgent: "",
+      championExecutableSha256: "a".repeat(64),
+      candidateExecutableSha256: "b".repeat(64)
+    }),
+    { ok: true, mode: "explicit-common" },
+    "cross-binary comparisons must accept an explicitly shared User-Agent"
+  );
+  assert.equal(
+    evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent: null,
+      candidateUpstreamUserAgent: null,
+      sourceCustomUserAgent: "Provider-Compatible/2.0",
+      championExecutableSha256: "a".repeat(64),
+      candidateExecutableSha256: "b".repeat(64)
+    }).mode,
+    "source-config-common",
+    "a configured Provider User-Agent is shared by both isolated arms"
+  );
+  assert.equal(
+    evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent: null,
+      candidateUpstreamUserAgent: null,
+      sourceCustomUserAgent: "",
+      championExecutableSha256: "a".repeat(64),
+      candidateExecutableSha256: "a".repeat(64)
+    }).mode,
+    "same-binary-default"
+  );
+  assert.deepEqual(
+    evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent: null,
+      candidateUpstreamUserAgent: null,
+      sourceCustomUserAgent: "",
+      championExecutableSha256: "a".repeat(64),
+      candidateExecutableSha256: "b".repeat(64)
+    }),
+    {
+      ok: false,
+      code: "cross_binary_upstream_user_agent_unproven",
+      message: "cross-binary live comparison requires a common --upstream-user-agent when the selected Provider has no custom_user_agent"
+    },
+    "a cross-binary comparison without a common User-Agent must fail closed"
+  );
+  assert.deepEqual(
+    evaluateUpstreamUserAgentParity({
+      championUpstreamUserAgent: "Atoapi/1.4.33",
+      candidateUpstreamUserAgent: "Atoapi/1.4.37",
+      sourceCustomUserAgent: "",
+      championExecutableSha256: "a".repeat(64),
+      candidateExecutableSha256: "b".repeat(64)
+    }),
+    {
+      ok: false,
+      code: "upstream_user_agent_mismatch",
+      message: "champion and candidate must use the same explicit upstream User-Agent"
+    },
+    "different explicit User-Agents must fail closed"
   );
   assert.equal(
     extractTomlBoolean(
@@ -3907,11 +6226,20 @@ async function runSelfTest() {
     },
     "live champion fixtures must retain Codex's store=false wire contract"
   );
-  const dynamicFixtureTools = releaseFixtureToolsForScenario("dynamic-tail-mix");
+  const dynamicFixtureTools = releaseFixtureToolsForScenario(
+    "dynamic-tail-mix",
+    "tool",
+    true
+  );
   assert.equal(dynamicFixtureTools.length, 1);
   assert.equal(dynamicFixtureTools[0].name, "read_release_fixture");
+  assert.deepEqual(
+    releaseFixtureToolsForScenario("dynamic-tail-mix"),
+    dynamicFixtureTools,
+    "tool-history fixtures must retain their historical schema by default"
+  );
   assert.deepEqual(releaseFixtureToolsForScenario("full-replay"), []);
-  assert.deepEqual(releaseFixtureToolsForScenario("dynamic-tail-mix", "text"), []);
+  assert.deepEqual(releaseFixtureToolsForScenario("dynamic-tail-mix", "text", true), []);
   assert.deepEqual(
     buildResponsesRequestBody({
       cohort: { model: "request-model" },
@@ -3919,10 +6247,21 @@ async function runSelfTest() {
       instructions: "stable",
       input: [],
       tools: dynamicFixtureTools,
+      toolChoice: "none",
       promptCacheKey: "fixture-key"
-    }).tools,
-    dynamicFixtureTools,
-    "tool-history fixtures must declare the replayed tool from the seed onward"
+    }),
+    {
+      model: "request-model",
+      stream: true,
+      store: false,
+      max_output_tokens: 16,
+      instructions: "stable",
+      input: [],
+      tools: dynamicFixtureTools,
+      tool_choice: "none",
+      prompt_cache_key: "fixture-key"
+    },
+    "an explicit tool-schema probe must declare the replayed tool and prevent a new tool call"
   );
   assert.deepEqual(
     [1, 3, 5, 7, 9].map((turn) => dynamicTailProfileForTurn(turn, 16_384, 1).shape),
@@ -4108,6 +6447,32 @@ async function runSelfTest() {
     }),
     null,
     "a completed Responses stream must remain accepted"
+  );
+  assert.equal(
+    terminalUsageShape(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1}}}\n\n'
+    ),
+    "present",
+    "a standard completed usage payload must be recognized"
+  );
+  assert.equal(
+    terminalUsageShape(
+      'event: response.completed\ndata: {"type":"response.completed","response":{}}\n\n'
+    ),
+    "absent",
+    "a completed event without usage must be distinguished from a parsed usage"
+  );
+  assert.equal(
+    terminalUsageShape(
+      'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"input_tokens":"2"}}}\n\n'
+    ),
+    "unrecognized",
+    "a usage object with no numeric token fields must be marked unrecognized"
+  );
+  assert.equal(
+    terminalUsageShape('event: response.failed\ndata: {"type":"response.failed"}\n\n'),
+    "not_seen",
+    "a failed stream must not be reported as a completed usage shape"
   );
   assert.equal(buildSeedContext(128).length, 128);
   const pairFixtureA = "fixture-pair-a";
@@ -4412,6 +6777,8 @@ async function runSelfTest() {
         sse_completed: true,
         input_fingerprint: "self-test-valid-seed",
         input_tokens: 1024,
+        cache_read_tokens: 0,
+        cache_read_tokens_observed: true,
         outbound_prefix_fingerprints: stableWire
       }]
     }],
@@ -4419,24 +6786,36 @@ async function runSelfTest() {
       requests: 4,
       successful_sse_requests: 4,
       input_tokens: 4096,
+      warm_input_tokens: 3072,
       seed_input_tokens: 1024,
       seed_cache_read_tokens: 0,
+      seed_request_count: 1,
+      cold_seed_request_count: 1,
       cache_read_tokens: raw * 4096,
       raw_token_hit_rate: raw,
+      warm_cache_read_tokens: raw * 3072,
+      warm_raw_token_hit_rate: raw,
       cacheable_tokens_128: 4096,
       cacheable_read_tokens_128: raw * 4096,
       cache_128_hit_rate: raw,
+      warm_cacheable_tokens_128: 3072,
+      warm_cacheable_read_tokens_128: raw * 3072,
+      warm_cache_128_hit_rate: raw,
       warm_stable_prefix_tokens_128: 3072,
       warm_stable_prefix_cached_tokens_128: raw * 3072,
       warm_stable_prefix_hit_rate: raw,
       full_bucket_requests: raw === 1 ? 4 : 3,
       full_bucket_rate: raw === 1 ? 1 : 0.75,
+      warm_full_bucket_requests: raw === 1 ? 3 : 2,
+      warm_full_bucket_rate: raw === 1 ? 1 : 2 / 3,
+      warm_full_bucket_denominator: 3,
       cacheable_request_count: 4,
       full_bucket_denominator: 4,
       avoidable_gap_tokens: 0,
       new_tail_gap_tokens: 0,
       provider_unstable_gap_tokens: 0,
       shortfall_tokens: 0,
+      local_pre_upstream_overhead_p95_ms: 0,
       local_proxy_overhead_p95_ms: 0,
       upstream_ttft_p95_ms: 100,
       ttft_p95_ms: 100,
@@ -4448,6 +6827,215 @@ async function runSelfTest() {
       static_wire_continuity: true
     }
   });
+  const withNativePlacement = (aggregate, fingerprints) => ({
+    ...aggregate,
+    runs: aggregate.runs.map((run) => ({
+      ...run,
+      requests: [
+        {
+          ...run.requests[0],
+          provider_prefix_key_present: true,
+          provider_prefix_key_fingerprint: fingerprints[0]
+        },
+        {
+          ...run.requests[0],
+          phase: "followup-2",
+          input_fingerprint: "self-test-valid-followup",
+          provider_prefix_key_present: true,
+          provider_prefix_key_fingerprint: fingerprints[1] ?? fingerprints[0]
+        }
+      ]
+    }))
+  });
+  const nativePlacementChampion = withNativePlacement(
+    valid("champion", 0.9),
+    ["a".repeat(32), "a".repeat(32)]
+  );
+  const nativePlacementCandidate = withNativePlacement(
+    valid("candidate", 0.9),
+    ["b".repeat(32), "b".repeat(32)]
+  );
+  const nativePlacementVerdict = compareArmResults(
+    nativePlacementChampion,
+    nativePlacementCandidate,
+    0,
+    0,
+    0,
+    true,
+    128,
+    true
+  );
+  assert.equal(nativePlacementVerdict.baseline_pass, true);
+  assert.equal(nativePlacementVerdict.checks.native_placement_isolation, true);
+  assert.equal(nativePlacementVerdict.native_placement_isolation.required, true);
+  assert.equal(nativePlacementVerdict.native_placement_isolation.pair_count, 1);
+  assert.equal(nativePlacementVerdict.native_placement_isolation.fingerprints_present, true);
+  assert.equal(nativePlacementVerdict.native_placement_isolation.fingerprints_stable, true);
+  assert.equal(nativePlacementVerdict.native_placement_isolation.arms_differ, true);
+  const missingNativePlacementCandidate = {
+    ...nativePlacementCandidate,
+    runs: nativePlacementCandidate.runs.map((run) => ({
+      ...run,
+      requests: run.requests.map(({ provider_prefix_key_present, provider_prefix_key_fingerprint, ...request }) => request)
+    }))
+  };
+  const missingNativePlacementVerdict = compareArmResults(
+    nativePlacementChampion,
+    missingNativePlacementCandidate,
+    0,
+    0,
+    0,
+    true,
+    128,
+    true
+  );
+  assert.equal(missingNativePlacementVerdict.checks.native_placement_isolation, false);
+  assert.equal(missingNativePlacementVerdict.baseline_pass, false);
+  const unstableNativePlacementCandidate = withNativePlacement(
+    valid("candidate", 0.9),
+    ["b".repeat(32), "c".repeat(32)]
+  );
+  const unstableNativePlacementVerdict = compareArmResults(
+    nativePlacementChampion,
+    unstableNativePlacementCandidate,
+    0,
+    0,
+    0,
+    true,
+    128,
+    true
+  );
+  assert.equal(unstableNativePlacementVerdict.checks.native_placement_isolation, false);
+  assert.equal(unstableNativePlacementVerdict.native_placement_isolation.fingerprints_stable, false);
+  const sharedNativePlacementCandidate = withNativePlacement(
+    valid("candidate", 0.9),
+    ["a".repeat(32), "a".repeat(32)]
+  );
+  const sharedNativePlacementVerdict = compareArmResults(
+    nativePlacementChampion,
+    sharedNativePlacementCandidate,
+    0,
+    0,
+    0,
+    true,
+    128,
+    true
+  );
+  assert.equal(sharedNativePlacementVerdict.checks.native_placement_isolation, false);
+  assert.equal(sharedNativePlacementVerdict.native_placement_isolation.arms_differ, false);
+  const offlineNativePlacementCompatibility = compareArmResults(
+    valid("champion", 0.9),
+    valid("candidate", 0.9),
+    0
+  );
+  assert.equal(offlineNativePlacementCompatibility.native_placement_isolation.required, false);
+  assert.equal(offlineNativePlacementCompatibility.checks.native_placement_isolation, true);
+  const isolatedPlacementPromotionVerdict = compareArmResults(
+    valid("champion", 0.9),
+    valid("candidate", 0.9),
+    0,
+    0,
+    0,
+    true,
+    128,
+    false,
+    {
+      require_shared_upstream_placement_crossover: true,
+      shared_upstream_placement_crossover_observed: false
+    }
+  );
+  assert.equal(isolatedPlacementPromotionVerdict.baseline_pass, false);
+  assert.equal(isolatedPlacementPromotionVerdict.checks.upstream_placement_crossover, false);
+  assert.equal(
+    isolatedPlacementPromotionVerdict.upstream_placement_crossover.reason,
+    "shared_turn_crossover_required_for_live_promotion"
+  );
+  const sharedPlacementPromotionVerdict = compareArmResults(
+    valid("champion", 0.9),
+    valid("candidate", 0.9),
+    0,
+    0,
+    0,
+    true,
+    128,
+    false,
+    {
+      require_shared_upstream_placement_crossover: true,
+      shared_upstream_placement_crossover_observed: true
+    }
+  );
+  assert.equal(sharedPlacementPromotionVerdict.baseline_pass, true);
+  assert.equal(sharedPlacementPromotionVerdict.checks.upstream_placement_crossover, true);
+  const failedZeroUsageRealmRun = (arm) => buildDynamicRun({
+    arm,
+    pair: 0,
+    cohort,
+    executable: valid(arm, 0.9).executable,
+    scenario: "full-replay",
+    promptCacheKeyUsed: false,
+    dynamicTailEvents: [],
+    minimumGuardedRequests: 0,
+    minimumSeedInputTokens: 0,
+    minimumPeakInputTokens: 0,
+    maximumPeakInputTokens: 0,
+    requests: [{
+      phase: "seed",
+      request_kind: "turn",
+      sse_completed: false,
+      input_fingerprint: "self-test-zero-usage-failure",
+      input_tokens: 0,
+      cache_read_tokens: 0,
+      cache_read_tokens_observed: true,
+      observed_realm_id: cohort.key_realm_hash,
+      outbound_prefix_fingerprints: stableWire,
+      checks: {
+        per_inbound_one_attempt_one_post: true,
+        exact_counter_delta: true,
+        provider_matches_cohort: true,
+        model_matches_cohort: true,
+        observed_key_realm_matches_cohort: true
+      }
+    }],
+    fatal: "upstream_sse_error",
+    compactionSeen: false
+  });
+  const zeroUsageRealmRun = failedZeroUsageRealmRun("champion");
+  assert.deepEqual(
+    zeroUsageRealmRun.metrics.observed_realm_ids,
+    [cohort.key_realm_hash],
+    "a failed zero-usage request must retain its observed realm as scope evidence"
+  );
+  assert.equal(zeroUsageRealmRun.checks.one_observed_key_realm, true);
+  assert.equal(zeroUsageRealmRun.pass, false, "the failed run must remain invalid");
+  const aggregateFailedZeroUsageRealm = (arm) => {
+    const run = failedZeroUsageRealmRun(arm);
+    return aggregateArm(arm, cohort, valid(arm, 0.9).executable, [{
+      ...run,
+      // Simulate an already-materialized run aggregate that lost the realm
+      // because its only request had no usage. Retained request evidence must
+      // still restore the scope observation without legitimizing the failure.
+      metrics: { ...run.metrics, observed_realm_ids: [] }
+    }]);
+  };
+  const failedZeroUsageChampion = aggregateFailedZeroUsageRealm("champion");
+  const failedZeroUsageCandidate = aggregateFailedZeroUsageRealm("candidate");
+  assert.deepEqual(failedZeroUsageChampion.metrics.observed_realm_ids, [cohort.key_realm_hash]);
+  assert.equal(failedZeroUsageChampion.checks.one_observed_key_realm, true);
+  assert.equal(failedZeroUsageChampion.pass, false, "the failed aggregate must remain invalid");
+  const failedZeroUsageVerdict = compareArmResults(
+    failedZeroUsageChampion,
+    failedZeroUsageCandidate,
+    0
+  );
+  assert.equal(
+    failedZeroUsageVerdict.checks.observed_key_realm_matches,
+    true,
+    "matching zero-usage realm evidence must not be reported as scope drift"
+  );
+  assert.equal(failedZeroUsageVerdict.checks.champion_valid, false);
+  assert.equal(failedZeroUsageVerdict.checks.candidate_valid, false);
+  assert.equal(failedZeroUsageVerdict.baseline_pass, false);
+  assert.equal(failedZeroUsageVerdict.pass, false, "failed evidence must never qualify for promotion");
   const providerOnlyRun = {
     ...valid("champion", 0.9),
     pass: false,
@@ -4485,25 +7073,45 @@ async function runSelfTest() {
   assert.equal(equalBaseline.pass, false);
   assert.equal(equalBaseline.baseline_pass, true);
   assert.equal(equalBaseline.positive_cache_evidence, false);
-  const coldLaneCandidate = valid("candidate", 0.9);
-  coldLaneCandidate.runs = coldLaneCandidate.runs.map((run) => ({
+  assert.equal(equalBaseline.cold_start_accounting.excluded_from_hit_comparison, true);
+  assert.equal(equalBaseline.cold_start_accounting.symmetric, true);
+  assert.equal(equalBaseline.cold_start_accounting.candidate_no_extra_cold_start, true);
+  assert.equal(
+    equalBaseline.dynamic_tail_warm_attribution.applicable,
+    false,
+    "a non-dynamic comparison must expose no dynamic-tail attribution and keep its verdict unchanged"
+  );
+  const coldExcludedCandidate = valid("candidate", 0.9);
+  coldExcludedCandidate.metrics.raw_token_hit_rate = 0.1;
+  coldExcludedCandidate.metrics.cache_128_hit_rate = 0.1;
+  const coldExcludedVerdict = compareArmResults(valid("champion", 0.9), coldExcludedCandidate, 0);
+  assert.equal(coldExcludedVerdict.checks.candidate_raw_token_hit_not_lower, true);
+  assert.equal(coldExcludedVerdict.checks.candidate_cache_128_hit_not_lower, true);
+  assert.equal(coldExcludedVerdict.deltas.raw_token_hit_rate < 0, true);
+  assert.equal(coldExcludedVerdict.deltas.warm_cache_128_hit_rate, 0);
+  const coldSeedAccountingCandidate = valid("candidate", 0.9);
+  coldSeedAccountingCandidate.runs = coldSeedAccountingCandidate.runs.map((run) => ({
     ...run,
     requests: run.requests.map((request) => ({
       ...request,
       input_tokens: number(request.input_tokens) + 7_144
     }))
   }));
-  const coldLanePromotionVerdict = compareArmResults(
+  const coldSeedAccountingVerdict = compareArmResults(
     valid("champion", 0.9),
-    coldLaneCandidate,
+    coldSeedAccountingCandidate,
     0,
     0,
     0,
     true,
     128
   );
-  assert.equal(coldLanePromotionVerdict.checks.actual_outbound_input_symmetry, false);
-  assert.equal(coldLanePromotionVerdict.baseline_pass, false);
+  assert.equal(coldSeedAccountingVerdict.checks.actual_outbound_input_symmetry, true);
+  assert.equal(coldSeedAccountingVerdict.baseline_pass, true);
+  assert.equal(
+    coldSeedAccountingVerdict.actual_outbound_input_symmetry.max_cold_seed_input_token_delta,
+    7_144
+  );
   assert.equal(compareArmResults(valid("champion", 0.9), valid("candidate", 0.89), 0).pass, false);
   const cacheWinsButRemoteTtftVaries = valid("candidate", 0.9);
   cacheWinsButRemoteTtftVaries.metrics.ttft_p95_ms = 125;
@@ -4571,10 +7179,88 @@ async function runSelfTest() {
   );
   assert.equal(
     legacyRelaxedTtftVerdict.baseline_pass,
-    false,
-    "a legacy false TTFT flag must not weaken release promotion"
+    true,
+    "an explicit relaxed comparison may ignore remote TTFT when local timing is unchanged"
   );
-  assert.equal(legacyRelaxedTtftVerdict.ttft_no_regression_required, true);
+  assert.equal(legacyRelaxedTtftVerdict.ttft_no_regression_required, false);
+  assert.equal(legacyRelaxedTtftVerdict.end_to_end_ttft_regression_exempted, true);
+  const localRegressionUnderRelaxedPolicy = valid("candidate", 0.91);
+  localRegressionUnderRelaxedPolicy.metrics.local_pre_upstream_overhead_p95_ms = 1;
+  const localRegressionVerdict = compareArmResults(
+    valid("champion", 0.9),
+    localRegressionUnderRelaxedPolicy,
+    0,
+    0,
+    0,
+    false
+  );
+  assert.equal(localRegressionVerdict.baseline_pass, false);
+  assert.equal(localRegressionVerdict.checks.candidate_local_pre_upstream_overhead_p95_not_regressed, false);
+  const dynamicAttributionRun = (pair, newTailGapTokens, providerUnstableGapTokens = 0, explicit = true) => ({
+    scenario: "dynamic-tail-mix",
+    pair,
+    requests: [
+      {
+        phase: "seed",
+        input_tokens: 1_024,
+        cache_read_tokens: 0,
+        cache_new_tail_gap_tokens: 0,
+        cache_provider_unstable_gap_tokens: 0
+      },
+      {
+        phase: "followup",
+        input_tokens: 8_192,
+        cache_read_tokens: 4_096,
+        cache_new_tail_gap_tokens: newTailGapTokens,
+        cache_provider_unstable_gap_tokens: providerUnstableGapTokens,
+        ...(explicit ? {
+          cache_new_tail_gap_tokens_observed: true,
+          cache_provider_unstable_gap_tokens_observed: true
+        } : {})
+      }
+    ]
+  });
+  const cleanTailAttribution = pairedDynamicTailAttribution(
+    { runs: [dynamicAttributionRun(0, 8_192), dynamicAttributionRun(1, 8_192)] },
+    { runs: [dynamicAttributionRun(0, 0), dynamicAttributionRun(1, 8_192)] }
+  );
+  assert.equal(cleanTailAttribution.complete, true);
+  assert.equal(cleanTailAttribution.counter_observations_explicit, true);
+  assert.equal(cleanTailAttribution.provider_instability_state, "clean");
+  assert.equal(cleanTailAttribution.candidate_new_tail_direction, "candidate_lower");
+  assert.equal(cleanTailAttribution.hypothesis_only, false);
+  assert.equal(cleanTailAttribution.candidate_new_tail_confirmed_improvement, true);
+  const unstableTailAttribution = pairedDynamicTailAttribution(
+    { runs: [dynamicAttributionRun(0, 8_192)] },
+    { runs: [dynamicAttributionRun(0, 0, 8_192)] }
+  );
+  assert.equal(unstableTailAttribution.complete, true);
+  assert.equal(unstableTailAttribution.provider_instability_state, "unstable");
+  assert.equal(unstableTailAttribution.hypothesis_only, true);
+  assert.equal(unstableTailAttribution.candidate_new_tail_improvement_hypothesis, true);
+  assert.equal(unstableTailAttribution.candidate_new_tail_confirmed_improvement, false);
+  const mixedTailAttribution = pairedDynamicTailAttribution(
+    { runs: [dynamicAttributionRun(0, 8_192), dynamicAttributionRun(1, 8_192)] },
+    { runs: [dynamicAttributionRun(0, 0), dynamicAttributionRun(1, 16_384)] }
+  );
+  assert.equal(mixedTailAttribution.provider_instability_state, "clean");
+  assert.equal(mixedTailAttribution.candidate_new_tail_direction, "mixed");
+  assert.equal(mixedTailAttribution.hypothesis_only, true);
+  const missingCounterSource = dynamicAttributionRun(0, 8_192);
+  const { cache_new_tail_gap_tokens, cache_provider_unstable_gap_tokens, ...missingCounterRequest } =
+    missingCounterSource.requests[1];
+  const missingCounterAttribution = pairedDynamicTailAttribution(
+    { runs: [missingCounterSource] },
+    {
+      runs: [{
+        ...dynamicAttributionRun(0, 0),
+        requests: [dynamicAttributionRun(0, 0).requests[0], missingCounterRequest]
+      }]
+    }
+  );
+  assert.equal(missingCounterAttribution.complete, false);
+  assert.equal(missingCounterAttribution.provider_instability_state, "incomplete");
+  assert.equal(missingCounterAttribution.hypothesis_only, true);
   const dynamicInputRuns = (fingerprint, inputTokens, outboundFamily = fingerprint) => [{
     scenario: "dynamic-tail-mix",
     pair: 0,
@@ -4603,6 +7289,7 @@ async function runSelfTest() {
   );
   assert.equal(symmetricDynamicInputs.pass, true);
   assert.equal(symmetricDynamicInputs.max_input_token_delta, 64);
+  assert.equal(symmetricDynamicInputs.max_warm_input_token_delta, 64);
   const symmetricAllScenarioInputs = pairedInputSymmetry(
     { runs: dynamicInputRuns("same", 450_000) },
     { runs: dynamicInputRuns("same", 450_064) },
@@ -4611,13 +7298,36 @@ async function runSelfTest() {
   assert.equal(symmetricAllScenarioInputs.pass, true);
   assert.equal(symmetricAllScenarioInputs.client_input_fingerprints_match, true);
   assert.equal(symmetricAllScenarioInputs.actual_outbound_semantic_fingerprints_match, true);
-  const coldLaneInputDelta = pairedInputSymmetry(
+  const coldSeedAccountingVariance = pairedInputSymmetry(
     { runs: dynamicInputRuns("same", 450_000) },
-    { runs: dynamicInputRuns("same", 457_144) },
+    {
+      runs: dynamicInputRuns("same", 450_000).map((run) => ({
+        ...run,
+        requests: run.requests.map((request, index) => index === 0
+          ? { ...request, input_tokens: request.input_tokens + 7_144 }
+          : request)
+      }))
+    },
     128
   );
-  assert.equal(coldLaneInputDelta.pass, false);
-  assert.equal(coldLaneInputDelta.max_input_token_delta, 7_144);
+  assert.equal(coldSeedAccountingVariance.pass, true);
+  assert.equal(coldSeedAccountingVariance.max_input_token_delta, 7_144);
+  assert.equal(coldSeedAccountingVariance.max_warm_input_token_delta, 0);
+  assert.equal(coldSeedAccountingVariance.max_cold_seed_input_token_delta, 7_144);
+  const warmInputDelta = pairedInputSymmetry(
+    { runs: dynamicInputRuns("same", 450_000) },
+    {
+      runs: dynamicInputRuns("same", 450_000).map((run) => ({
+        ...run,
+        requests: run.requests.map((request, index) => index === 1
+          ? { ...request, input_tokens: request.input_tokens + 7_144 }
+          : request)
+      }))
+    },
+    128
+  );
+  assert.equal(warmInputDelta.pass, false);
+  assert.equal(warmInputDelta.max_warm_input_token_delta, 7_144);
   const allScenarioOutboundMismatch = pairedInputSymmetry(
     { runs: dynamicInputRuns("same", 450_000, "left") },
     { runs: dynamicInputRuns("same", 450_000, "right") },
@@ -4837,6 +7547,8 @@ async function runSelfTest() {
   const oneFullBucketBehind = valid("candidate", 0.9);
   oneFullBucketBehind.metrics.full_bucket_requests = 2;
   oneFullBucketBehind.metrics.full_bucket_rate = 0.5;
+  oneFullBucketBehind.metrics.warm_full_bucket_requests = 1;
+  oneFullBucketBehind.metrics.warm_full_bucket_rate = 1 / 3;
   assert.equal(
     compareArmResults(valid("champion", 0.9), oneFullBucketBehind, 0).pass,
     false
@@ -4865,6 +7577,8 @@ async function runSelfTest() {
   tokenSuperiorButOneFullBucketBehind.metrics.new_tail_gap_tokens = 128;
   tokenSuperiorButOneFullBucketBehind.metrics.full_bucket_requests = 2;
   tokenSuperiorButOneFullBucketBehind.metrics.full_bucket_rate = 0.5;
+  tokenSuperiorButOneFullBucketBehind.metrics.warm_full_bucket_requests = 1;
+  tokenSuperiorButOneFullBucketBehind.metrics.warm_full_bucket_rate = 1 / 3;
   const tokenSuperiorVerdict = compareArmResults(
     tokenSuperiorChampion,
     tokenSuperiorButOneFullBucketBehind,
@@ -4888,13 +7602,293 @@ async function runSelfTest() {
   const asymmetricSeedChampion = valid("champion", 0.9);
   const asymmetricSeedCandidate = valid("candidate", 0.91);
   asymmetricSeedCandidate.metrics.seed_cache_read_tokens = 128;
+  asymmetricSeedCandidate.runs = asymmetricSeedCandidate.runs.map((run) => ({
+    ...run,
+    requests: run.requests.map((request) => ({
+      ...request,
+      cache_read_tokens: request.phase === "seed" ? 128 : request.cache_read_tokens
+    }))
+  }));
   const asymmetricSeedVerdict = compareArmResults(
     asymmetricSeedChampion,
     asymmetricSeedCandidate,
     0
   );
+  assert.equal(asymmetricSeedVerdict.checks.seed_cache_read_evidence_complete, true);
   assert.equal(asymmetricSeedVerdict.checks.seed_cache_read_symmetry, false);
+  assert.equal(asymmetricSeedVerdict.baseline_pass, false);
   assert.equal(asymmetricSeedVerdict.positive_cache_evidence, false);
+  const seedRun = (arm, pair, seedCacheReadTokens) => ({
+    ...valid(arm, 0.9),
+    kind: "dynamic-run",
+    pair,
+    scenario: "full-replay",
+    metrics: {
+      ...valid(arm, 0.9).metrics,
+      seed_input_tokens: 156_416,
+      seed_cache_read_tokens: seedCacheReadTokens
+    },
+    requests: [{
+      phase: "seed",
+      request_kind: "turn",
+      sse_completed: true,
+      input_fingerprint: `shared-crossover-seed-${pair}`,
+      input_tokens: 156_416,
+      cache_read_tokens: seedCacheReadTokens,
+      cache_read_tokens_observed: true,
+      outbound_prefix_fingerprints: stableWire,
+      observed_realm_id: "observed-realm",
+      prefix_guard_wait_ms: 0,
+      local_prepare_ms: 1,
+      upstream_ttft_ms: 80,
+      ttft_ms: 80,
+      checks: {
+        per_inbound_one_attempt_one_post: true,
+        exact_counter_delta: true,
+        timing_present: true,
+        static_wire_continuity: true
+      }
+      }]
+  });
+  const unsafeDiagnosticRun = (arm) => {
+    const run = seedRun(arm, 0, 0);
+    return {
+      ...run,
+      fatal: "Bearer secret https://example.invalid/private/fatal",
+      executable: { path: "C:/private/path/secret.exe", sha256: "b".repeat(64) },
+      requests: run.requests.map((request) => ({
+        ...request,
+        compacted_input: [{ type: "input_text", text: "secret request body" }],
+        raw_request_body: "Bearer secret request body",
+        failure: "fatal https://example.invalid/private/fatal",
+        transport: {
+          ...request.transport,
+          upstream_network_path: "https://example.invalid/private/path",
+          request_body_bytes: 1_024,
+          sent_body_bytes: 512
+        }
+      }))
+    };
+  };
+  const postPairGateDiagnostic = buildAfterPairLiveGateFailureReport({
+    mode: "live-isolated",
+    cohort,
+    settings: {
+      minimum_peak_input_tokens: 0,
+      maximum_peak_input_tokens: 0
+    },
+    pairOrder: [["champion", "candidate"]],
+    turnOrder: null,
+    abortedAfterPair: 0,
+    warmupPairs: 0,
+    rawArmRuns: {
+      champion: [unsafeDiagnosticRun("champion")],
+      candidate: [unsafeDiagnosticRun("candidate")]
+    },
+    artifacts: {
+      champion: valid("champion", 0.9).executable,
+      candidate: valid("candidate", 0.9).executable
+    },
+    liveGateFailure: {
+      code: "live_codex_metrics_incomplete",
+      evidence: incompleteLiveGateEvidence
+    }
+  });
+  assert.equal(postPairGateDiagnostic.pass, false);
+  assert.equal(postPairGateDiagnostic.fail_closed, true);
+  assert.equal(postPairGateDiagnostic.promotion_eligible, false);
+  assert.equal(postPairGateDiagnostic.diagnostic_only, true);
+  assert.equal(postPairGateDiagnostic.aborted_after_pair, 0);
+  assert.deepEqual(postPairGateDiagnostic.scored_pair_ids, []);
+  assert.deepEqual(postPairGateDiagnostic.completed_isolated_pair_ids, [0]);
+  assert.equal(postPairGateDiagnostic.completed_isolated_arm_runs.champion.length, 1);
+  assert.equal(postPairGateDiagnostic.completed_isolated_arm_runs.candidate.length, 1);
+  assert.equal(postPairGateDiagnostic.diagnostic_arm_aggregates.champion.completed_run_count, 1);
+  assert.equal(postPairGateDiagnostic.diagnostic_arm_aggregates.candidate.completed_run_count, 1);
+  assert.equal(postPairGateDiagnostic.live_codex_gate.evidence.http_status, 200);
+  assert.equal(Object.hasOwn(postPairGateDiagnostic, "cohort"), false);
+  assert.equal(Object.hasOwn(postPairGateDiagnostic, "settings"), false);
+  assert.equal(Object.hasOwn(postPairGateDiagnostic.diagnostic_arm_aggregates.champion, "runs"), false);
+  assert.equal(Object.hasOwn(postPairGateDiagnostic.diagnostic_arm_aggregates.champion, "executable"), false);
+  const postPairDiagnosticText = JSON.stringify(postPairGateDiagnostic).toLowerCase();
+  for (const forbidden of [
+    "https://",
+    "bearer",
+    "secret",
+    "body",
+    "path",
+    "fatal",
+    "compacted"
+  ]) {
+    assert.equal(
+      postPairDiagnosticText.includes(forbidden),
+      false,
+      "diagnostic evidence must not retain " + forbidden
+    );
+  }
+  assert.throws(
+    () => validateAggregate(postPairGateDiagnostic.diagnostic_arm_aggregates.champion, "champion"),
+    (error) => error?.code === "invalid_offline_artifact_schema",
+    "diagnostic aggregates must never be usable as offline promotion evidence"
+  );
+  assert.throws(
+    () => extractArmArtifact(postPairGateDiagnostic, "champion"),
+    (error) => error?.code === "invalid_offline_artifact",
+    "a fail-closed post-pair report must not expose a promotion-shaped top-level arm"
+  );
+  const crossedSeedChampion = aggregateArm(
+    "champion",
+    cohort,
+    valid("champion", 0.9).executable,
+    [seedRun("champion", 0, 0), seedRun("champion", 1, 156_416)]
+  );
+  const crossedSeedCandidate = aggregateArm(
+    "candidate",
+    cohort,
+    valid("candidate", 0.9).executable,
+    [seedRun("candidate", 0, 156_416), seedRun("candidate", 1, 0)]
+  );
+  assert.equal(crossedSeedChampion.metrics.seed_cache_read_tokens, 156_416);
+  assert.equal(crossedSeedCandidate.metrics.seed_cache_read_tokens, 156_416);
+  const crossedSeedVerdict = compareArmResults(crossedSeedChampion, crossedSeedCandidate, 0);
+  assert.equal(crossedSeedVerdict.checks.seed_cache_read_evidence_complete, true);
+  assert.equal(
+    crossedSeedVerdict.checks.seed_cache_read_symmetry,
+    true,
+    "a two-pair shared-cache cold/warm crossover must aggregate to symmetric seed evidence"
+  );
+  assert.equal(crossedSeedVerdict.deltas.seed_cache_read_tokens, 0);
+  assert.equal(crossedSeedVerdict.baseline_pass, true);
+  assert.equal(crossedSeedVerdict.cold_start_accounting.symmetric, true);
+  const extraColdChampion = aggregateArm(
+    "champion",
+    cohort,
+    valid("champion", 0.9).executable,
+    [seedRun("champion", 0, 128), seedRun("champion", 1, 128)]
+  );
+  const extraColdCandidate = aggregateArm(
+    "candidate",
+    cohort,
+    valid("candidate", 0.9).executable,
+    [seedRun("candidate", 0, 0), seedRun("candidate", 1, 256)]
+  );
+  const extraColdVerdict = compareArmResults(extraColdChampion, extraColdCandidate, 0);
+  assert.equal(extraColdVerdict.checks.seed_cache_read_symmetry, true);
+  assert.equal(extraColdVerdict.checks.cold_seed_evidence_complete, true);
+  assert.equal(extraColdVerdict.checks.cold_seed_request_symmetry, true);
+  assert.equal(extraColdVerdict.checks.cold_seed_symmetry, false);
+  assert.equal(extraColdVerdict.checks.candidate_no_extra_cold_start, false);
+  assert.equal(extraColdVerdict.baseline_pass, false);
+  const legacyFirstPairSeedChampion = {
+    ...crossedSeedChampion,
+    metrics: {
+      ...crossedSeedChampion.metrics,
+      // Older reports retained the full per-pair evidence but accidentally
+      // surfaced only the first pair's cold seed in the aggregate metric.
+      seed_cache_read_tokens: 0
+    }
+  };
+  const legacyFirstPairSeedCandidate = {
+    ...crossedSeedCandidate,
+    metrics: {
+      ...crossedSeedCandidate.metrics,
+      seed_cache_read_tokens: 156_416
+    }
+  };
+  const legacyFirstPairSeedVerdict = compareArmResults(
+    legacyFirstPairSeedChampion,
+    legacyFirstPairSeedCandidate,
+    0
+  );
+  assert.equal(
+    legacyFirstPairSeedVerdict.checks.seed_cache_read_evidence_complete,
+    true
+  );
+  assert.equal(
+    legacyFirstPairSeedVerdict.checks.seed_cache_read_symmetry,
+    true,
+    "retained per-pair seed evidence must override legacy first-pair aggregate fields"
+  );
+  assert.equal(legacyFirstPairSeedVerdict.deltas.seed_cache_read_tokens, 0);
+  assert.equal(legacyFirstPairSeedVerdict.baseline_pass, true);
+  const unbalancedSeedCandidate = aggregateArm(
+    "candidate",
+    cohort,
+    valid("candidate", 0.9).executable,
+    [seedRun("candidate", 0, 156_416), seedRun("candidate", 1, 156_416)]
+  );
+  const unbalancedSeedVerdict = compareArmResults(
+    crossedSeedChampion,
+    unbalancedSeedCandidate,
+    0
+  );
+  assert.equal(
+    unbalancedSeedVerdict.checks.seed_cache_read_evidence_complete,
+    true
+  );
+  assert.equal(
+    unbalancedSeedVerdict.checks.seed_cache_read_symmetry,
+    false,
+    "a genuinely unbalanced shared-cache seed allocation must still fail closed"
+  );
+  assert.equal(unbalancedSeedVerdict.baseline_pass, false);
+  assert.equal(unbalancedSeedVerdict.pass, false);
+  const missingSeedEvidenceCandidate = {
+    ...crossedSeedCandidate,
+    runs: crossedSeedCandidate.runs.map((run, index) => index === 1
+      ? {
+        ...run,
+        requests: run.requests.map(({ cache_read_tokens, ...request }) => request)
+      }
+      : run)
+  };
+  const missingSeedEvidenceVerdict = compareArmResults(
+    crossedSeedChampion,
+    missingSeedEvidenceCandidate,
+    0
+  );
+  assert.equal(missingSeedEvidenceVerdict.checks.seed_cache_read_evidence_complete, false);
+  assert.equal(missingSeedEvidenceVerdict.checks.seed_cache_read_symmetry, false);
+  assert.equal(missingSeedEvidenceVerdict.baseline_pass, false);
+  assert.equal(missingSeedEvidenceVerdict.pass, false);
+  assert.equal(missingSeedEvidenceVerdict.deltas.seed_cache_read_tokens, null);
+  const missingSeedEvidenceBothArms = (aggregate) => ({
+    ...aggregate,
+    // Keep the legacy aggregate metric populated: raw evidence, not this
+    // fallback field, must decide whether a crossover is comparable.
+    metrics: { ...aggregate.metrics, seed_cache_read_tokens: 156_416 },
+    runs: aggregate.runs.map((run) => ({
+      ...run,
+      requests: run.requests.map(({ cache_read_tokens, cache_read_tokens_observed, ...request }) => request)
+    }))
+  });
+  const missingBothSeedVerdict = compareArmResults(
+    missingSeedEvidenceBothArms(crossedSeedChampion),
+    missingSeedEvidenceBothArms(crossedSeedCandidate),
+    0
+  );
+  assert.equal(missingBothSeedVerdict.checks.seed_cache_read_evidence_complete, false);
+  assert.equal(missingBothSeedVerdict.checks.seed_cache_read_symmetry, false);
+  assert.equal(missingBothSeedVerdict.baseline_pass, false);
+  assert.equal(missingBothSeedVerdict.deltas.seed_cache_read_tokens, null);
+  const staleSeedMetricRuns = [
+    seedRun("champion", 0, 0),
+    seedRun("champion", 1, 156_416)
+  ].map((run) => ({
+    ...run,
+    metrics: { ...run.metrics, seed_cache_read_tokens: 0 }
+  }));
+  const rawSeedAggregate = aggregateArm(
+    "champion",
+    cohort,
+    valid("champion", 0.9).executable,
+    staleSeedMetricRuns
+  );
+  assert.equal(
+    rawSeedAggregate.metrics.seed_cache_read_tokens,
+    156_416,
+    "aggregateArm must retain every scored run's raw seed total"
+  );
   const mismatched = valid("candidate", 0.9);
   mismatched.cohort = { ...cohort, model: "other" };
   assert.equal(compareArmResults(valid("champion", 0.9), mismatched, 0).pass, false);
@@ -5015,6 +8009,11 @@ async function runSelfTest() {
     await currentLiveSelectionScopeFingerprint(tmpdir(), scopedConfig),
     "the selected route fingerprint must be deterministic"
   );
+  assert.equal(normalizeProviderScope("active_provider"), "active-provider");
+  assert.throws(
+    () => normalizeProviderScope("unknown-scope"),
+    (error) => error?.code === "invalid_provider_scope"
+  );
   assert.notEqual(
     scopedFingerprint,
     await currentLiveSelectionScopeFingerprint(
@@ -5022,6 +8021,141 @@ async function runSelfTest() {
       scopedConfig.replace('channel = "responses"', 'channel = "chat"')
     ),
     "a selected upstream channel change must invalidate live evidence"
+  );
+  assert.equal(
+    scopedFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      scopedConfig.replace('local_key = "before"', 'local_key = "before"\nactive_provider_id = "unrelated-provider"')
+    ),
+    "an unrelated active_provider_id must not alter codex-agent scope"
+  );
+  const pinnedScopeConfig = [
+    'local_key = "before"',
+    "[[agent_injections]]",
+    'id = "codex"',
+    'provider_id = "provider-a"',
+    'enabled = true',
+    "[[providers]]",
+    'id = "provider-a"',
+    'base_url = "https://example.test/v1"',
+    'channel = "responses"',
+    'api_key_encrypted = "encrypted-a"',
+    'enabled = true',
+    "[[provider_key_pools]]",
+    'provider_id = "provider-a"',
+    'enabled = true',
+    'strategy = "sequential"',
+    "[[provider_key_pools.keys]]",
+    'id = "key-a"',
+    'key_encrypted = "encrypted-key-a"',
+    'enabled = true',
+    "[[provider_key_pools.keys]]",
+    'id = "key-b"',
+    'key_encrypted = "encrypted-key-b"',
+    'enabled = true',
+    ''
+  ].join("\n");
+  const pinnedScopeFingerprint = await currentLiveSelectionScopeFingerprint(
+    tmpdir(),
+    pinnedScopeConfig,
+    "codex-agent",
+    "key-a"
+  );
+  assert.equal(
+    pinnedScopeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      pinnedScopeConfig.replace(
+        'id = "key-b"\nkey_encrypted = "encrypted-key-b"\nenabled = true',
+        'id = "key-b"\nkey_encrypted = "rotated-sibling-material"\nenabled = false\ndisabled_until = 2099-01-01T00:00:00Z'
+      ),
+      "codex-agent",
+      "key-a"
+    ),
+    "a pinned live scope must ignore sibling Key health and material changes"
+  );
+  assert.notEqual(
+    pinnedScopeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      pinnedScopeConfig.replace('id = "key-a"\nkey_encrypted = "encrypted-key-a"\nenabled = true', 'id = "key-a"\nkey_encrypted = "encrypted-key-a"\nenabled = false'),
+      "codex-agent",
+      "key-a"
+    ),
+    "a pinned live scope must fail closed when the selected Key becomes unavailable"
+  );
+  assert.notEqual(
+    pinnedScopeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      pinnedScopeConfig.replace('key_encrypted = "encrypted-key-a"', 'key_encrypted = "rotated-key-a-material"'),
+      "codex-agent",
+      "key-a"
+    ),
+    "a pinned live scope must fail closed when the selected Key material changes"
+  );
+  const activeProviderConfig = [
+    'local_key = "before"',
+    'active_provider_id = "provider-b"',
+    "[[agent_injections]]",
+    'id = "codex"',
+    'provider_id = "provider-a"',
+    'model_id = "stale-model"',
+    'enabled = false',
+    "[[providers]]",
+    'id = "provider-a"',
+    'base_url = "https://a.example.test/v1"',
+    'channel = "responses"',
+    'api_key_encrypted = "encrypted-a"',
+    'enabled = true',
+    "[[providers]]",
+    'id = "provider-b"',
+    'base_url = "https://b.example.test/v1"',
+    'channel = "responses"',
+    'api_key_encrypted = "encrypted-b"',
+    'enabled = true',
+    ""
+  ].join("\n");
+  const activeFingerprint = await currentLiveSelectionScopeFingerprint(
+    tmpdir(),
+    activeProviderConfig,
+    "active-provider"
+  );
+  assert.equal(
+    activeFingerprint,
+    await currentLiveSelectionScopeFingerprint(tmpdir(), activeProviderConfig, "active_provider"),
+    "active-provider scope fingerprint must be deterministic and accept underscore alias"
+  );
+  assert.equal(
+    activeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      activeProviderConfig.replace('channel = "responses"', 'channel = "chat"'),
+      "active-provider"
+    ),
+    "a stale Codex injection Provider change must not alter active-provider scope"
+  );
+  assert.equal(
+    activeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      activeProviderConfig.replace('provider_id = "provider-a"', 'provider_id = "other-stale-provider"'),
+      "active-provider"
+    ),
+    "a stale Codex injection selection must not alter active-provider scope"
+  );
+  assert.notEqual(
+    activeFingerprint,
+    await currentLiveSelectionScopeFingerprint(
+      tmpdir(),
+      activeProviderConfig.replace(
+        'id = "provider-b"\nbase_url = "https://b.example.test/v1"\nchannel = "responses"',
+        'id = "provider-b"\nbase_url = "https://b.example.test/v1"\nchannel = "chat"'
+      ),
+      "active-provider"
+    ),
+    "the selected active Provider change must invalidate live evidence"
   );
   const sourceRoot = await mkdtemp(join(tmpdir(), "atoapi-release-champion-self-test-"));
   let snapshot = null;

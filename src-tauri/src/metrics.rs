@@ -708,6 +708,12 @@ pub struct RequestLog {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<String>,
+    /// A provider-scoped, one-way reference to the pooled Key selected for
+    /// this request. It is intentionally not a raw Key ID, realm, or secret.
+    /// Local release verification uses it to pin the exact live Key without
+    /// requiring a second process to decrypt desktop-user DPAPI material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider_key_ref: Option<String>,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_model: Option<String>,
@@ -808,6 +814,11 @@ pub struct RequestLog {
     pub prefix_state_cache_read_tokens: Option<u64>,
     pub status: u16,
     pub ttft_ms: u64,
+    /// Time from request ingress to the first user-visible assistant text.
+    /// This is narrower than `ttft_ms`, which may be advanced by reasoning,
+    /// tool output, or other model-output events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible_text_ttft_ms: Option<u64>,
     /// First raw upstream SSE bytes observed by the relay, measured from
     /// request ingress. This intentionally differs from `ttft_ms`, which is
     /// kept as the first model-output timing used by latency diagnostics.
@@ -3016,6 +3027,7 @@ mod tests {
             upstream_channel: "chat".to_string(),
             provider: "provider".to_string(),
             provider_id: Some("provider-id".to_string()),
+            selected_provider_key_ref: None,
             model: "model".to_string(),
             requested_model: None,
             agent_reasoning_effort: None,
@@ -3063,6 +3075,7 @@ mod tests {
             prefix_state_cache_read_tokens: None,
             status: 200,
             ttft_ms: 1,
+            visible_text_ttft_ms: None,
             first_byte_ms: None,
             upstream_ttft_ms: None,
             local_prepare_ms: None,
@@ -3186,6 +3199,7 @@ mod tests {
         let object = value.as_object_mut().unwrap();
         for key in [
             "provider_id",
+            "selected_provider_key_ref",
             "cold_start",
             "first_byte_ms",
             "shadow_affinity_mode",
@@ -3205,6 +3219,7 @@ mod tests {
         }
         let restored: RequestLog = serde_json::from_value(value).unwrap();
         assert!(restored.provider_id.is_none());
+        assert!(restored.selected_provider_key_ref.is_none());
         assert!(restored.cold_start.is_none());
         assert!(restored.first_byte_ms.is_none());
         assert!(restored.shadow_affinity_mode.is_none());
@@ -3215,7 +3230,18 @@ mod tests {
     fn request_log_serializes_stable_provider_id() {
         let value = serde_json::to_value(request_log("miss", Some("cache-key"))).unwrap();
         assert_eq!(value["provider_id"], "provider-id");
+        assert!(value.get("selected_provider_key_ref").is_none());
         assert!(value.get("cold_start").is_none());
+    }
+
+    #[test]
+    fn request_log_serializes_only_an_opaque_selected_key_reference() {
+        let mut log = request_log("miss", Some("cache-key"));
+        log.selected_provider_key_ref = Some("b".repeat(64));
+
+        let value = serde_json::to_value(log).unwrap();
+        assert_eq!(value["selected_provider_key_ref"], "b".repeat(64));
+        assert_ne!(value["selected_provider_key_ref"], "provider-id");
     }
 
     #[test]

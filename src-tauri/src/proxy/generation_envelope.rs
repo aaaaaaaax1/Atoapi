@@ -60,6 +60,19 @@ impl GenerationEnvelope {
         self
     }
 
+    /// Carries an opaque selected-Key reference into local terminal
+    /// diagnostics.  This remains outside the frozen request body and is
+    /// never sent upstream.
+    pub(super) fn with_selected_provider_key_ref(
+        mut self,
+        selected_provider_key_ref: Option<String>,
+    ) -> Self {
+        self.request_plan = self
+            .request_plan
+            .with_selected_provider_key_ref(selected_provider_key_ref);
+        self
+    }
+
     pub(super) fn with_upstream_affinity_scope(
         mut self,
         scope: Option<UpstreamAffinityScope>,

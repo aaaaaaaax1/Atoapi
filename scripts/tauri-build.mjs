@@ -1,6 +1,50 @@
-import { existsSync, readFileSync, statSync, unlinkSync } from "node:fs";
-import { join, delimiter } from "node:path";
+import { existsSync, lstatSync, rmSync, statSync } from "node:fs";
+import { join, delimiter, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
+
+const scriptArgs = process.argv.slice(2);
+const preflightOnly = scriptArgs.includes("--preflight-only");
+const repositoryRoot = resolve(".");
+
+// Keep release builds reproducible without touching user data, release archives,
+// or the full Rust target cache.  Every target is deliberately whitelisted and
+// must resolve inside this repository before it can be removed.
+const reproducibleBuildCaches = [
+  ["pnpm store", ".pnpm-store"],
+  ["Vite output", "dist"],
+  ["Vite cache", ".vite"],
+  ["Tauri bundle output", join("src-tauri", "target", "release", "bundle")]
+];
+
+function resolveRepositoryCache(relativePath) {
+  const absolutePath = resolve(repositoryRoot, relativePath);
+  const pathFromRepository = relative(repositoryRoot, absolutePath);
+  if (!pathFromRepository || pathFromRepository.startsWith("..") || pathFromRepository.includes(":")) {
+    throw new Error(`refusing to clear a cache outside the repository: ${relativePath}`);
+  }
+  return absolutePath;
+}
+
+function clearReproducibleBuildCaches() {
+  for (const [label, relativePath] of reproducibleBuildCaches) {
+    const absolutePath = resolveRepositoryCache(relativePath);
+    if (!existsSync(absolutePath)) {
+      continue;
+    }
+
+    const entry = lstatSync(absolutePath);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) {
+      throw new Error(`refusing to clear unexpected cache target: ${relativePath}`);
+    }
+
+    rmSync(absolutePath, { recursive: true, force: true, maxRetries: 2, retryDelay: 250 });
+    console.log(`[tauri-build] cleared ${label}: ${relativePath}`);
+  }
+}
+
+if (!preflightOnly) {
+  clearReproducibleBuildCaches();
+}
 
 const patcherBuild = spawnSync(process.execPath, [join("scripts", "build-codex-ui-patcher.mjs")], {
   stdio: "inherit",
@@ -22,8 +66,7 @@ if (preflight.status !== 0) {
   process.exit(preflight.status || 1);
 }
 
-const scriptArgs = process.argv.slice(2);
-if (scriptArgs.includes("--preflight-only")) {
+if (preflightOnly) {
   process.exit(0);
 }
 
@@ -53,28 +96,6 @@ const check = spawnSync(`cargo${exe}`, ["--version"], {
 if (check.status !== 0) {
   console.error("cargo not found. Install Rust or ensure cargo.exe exists in %USERPROFILE%\\.cargo\\bin.");
   process.exit(check.status || 1);
-}
-
-const config = JSON.parse(readFileSync(join("src-tauri", "tauri.conf.json"), "utf8"));
-const productName = config.productName || "Atoapi";
-const version = config.version;
-const staleBundleFiles = [
-  join("src-tauri", "target", "release", "bundle", "msi", `${productName}_${version}_x64_en-US.msi`),
-  join("src-tauri", "target", "release", "bundle", "nsis", `${productName}_${version}_x64-setup.exe`)
-];
-
-for (const file of staleBundleFiles) {
-  if (!existsSync(file)) {
-    continue;
-  }
-  try {
-    unlinkSync(file);
-  } catch (error) {
-    console.error(`failed to remove stale bundle: ${file}`);
-    console.error(error instanceof Error ? error.message : String(error));
-    console.error("Close any installer window or msiexec process that is using this file, then rerun npm.cmd run tauri:build.");
-    process.exit(1);
-  }
 }
 
 const tauriBin = process.platform === "win32"
