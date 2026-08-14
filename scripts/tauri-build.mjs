@@ -54,6 +54,25 @@ if (patcherBuild.status !== 0) {
   process.exit(patcherBuild.status || 1);
 }
 
+// Tauri's generate_context! macro validates frontendDist during the Rust
+// preflight.  A clean package has no dist/ yet, so materialize the fresh
+// frontend once before that gate; Tauri will run its normal beforeBuildCommand
+// again as part of the final bundle.
+const frontendDistEntry = join("dist", "index.html");
+if (!existsSync(frontendDistEntry)) {
+  const frontendBuild = spawnSync(
+    process.platform === "win32" ? "npm.cmd" : "npm",
+    ["run", "build"],
+    {
+      stdio: "inherit",
+      shell: process.platform === "win32"
+    }
+  );
+  if (frontendBuild.status !== 0) {
+    process.exit(frontendBuild.status || 1);
+  }
+}
+
 // A bundle is only allowed after the deterministic FastRelayCore gate.  It
 // never starts the desktop instance or talks to the configured upstream; the
 // separate release workflow may additionally request the isolated wire/cache

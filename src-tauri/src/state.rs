@@ -1862,6 +1862,7 @@ mod tests {
         const FULL_POST_BURST_EVIDENCE: usize = 1_536;
         const RUNTIME_SNAPSHOT_WARMUP_SAMPLES: usize = 5;
         const RUNTIME_SNAPSHOT_SAMPLE_COUNT: usize = 101;
+        const RUNTIME_SNAPSHOT_TRIAL_COUNT: usize = 3;
         // This runs on the background persistence worker, not on an inbound
         // request path. A 12ms steady-state p95 keeps the full-capacity
         // snapshot bounded. Five warmups avoid sampling allocator cold-start
@@ -1940,25 +1941,37 @@ mod tests {
             }
         }
 
-        for _ in 0..RUNTIME_SNAPSHOT_WARMUP_SAMPLES {
-            black_box(capture_runtime_state(&prefix_states, &shadow_affinity));
-        }
+        // A capacity gate must catch a persistent background-writer regression,
+        // not fail solely because the first sample overlaps with an antivirus,
+        // linker, or scheduler burst immediately after a clean release build.
+        // Keep the exact 12ms budget, but use the median p95 of three separately
+        // warmed trials so a real regression still needs only two bad trials to
+        // fail while a one-off host disturbance cannot reject a release.
+        let mut trial_p95_us = Vec::with_capacity(RUNTIME_SNAPSHOT_TRIAL_COUNT);
         let mut samples = Vec::with_capacity(RUNTIME_SNAPSHOT_SAMPLE_COUNT);
-        for _ in 0..RUNTIME_SNAPSHOT_SAMPLE_COUNT {
-            let started = Instant::now();
-            let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
-            black_box(snapshot);
-            samples.push(started.elapsed().as_micros());
+        for _ in 0..RUNTIME_SNAPSHOT_TRIAL_COUNT {
+            for _ in 0..RUNTIME_SNAPSHOT_WARMUP_SAMPLES {
+                black_box(capture_runtime_state(&prefix_states, &shadow_affinity));
+            }
+            samples.clear();
+            for _ in 0..RUNTIME_SNAPSHOT_SAMPLE_COUNT {
+                let started = Instant::now();
+                let snapshot = capture_runtime_state(&prefix_states, &shadow_affinity);
+                black_box(snapshot);
+                samples.push(started.elapsed().as_micros());
+            }
+            samples.sort_unstable();
+            let p95_index = samples
+                .len()
+                .saturating_mul(95)
+                .div_ceil(100)
+                .saturating_sub(1);
+            trial_p95_us.push(samples[p95_index]);
         }
-        samples.sort_unstable();
-        let p95_index = samples
-            .len()
-            .saturating_mul(95)
-            .div_ceil(100)
-            .saturating_sub(1);
-        let p95_us = samples[p95_index];
+        trial_p95_us.sort_unstable();
+        let p95_us = trial_p95_us[trial_p95_us.len() / 2];
         println!(
-            "fastrelay_runtime_snapshot prefixes={PREFIX_RUNTIME_STATE_LIMIT} assignments={FULL_SHADOW_ASSIGNMENTS} evidence={FULL_POST_BURST_EVIDENCE} p95_us={p95_us} samples_us={samples:?}",
+            "fastrelay_runtime_snapshot prefixes={PREFIX_RUNTIME_STATE_LIMIT} assignments={FULL_SHADOW_ASSIGNMENTS} evidence={FULL_POST_BURST_EVIDENCE} p95_us={p95_us} trial_p95_us={trial_p95_us:?} samples_us={samples:?}",
         );
         assert!(
             p95_us <= RUNTIME_SNAPSHOT_P95_BUDGET_US,

@@ -74,13 +74,23 @@ assert.match(
 );
 assert.match(
   bridgeSource,
-  /window\.setInterval\(syncOpenProviderKeyPoolHealth, 500\)/,
+  /function startProviderKeyPoolHealthSync\(\)[\s\S]{0,520}window\.setInterval\(syncOpenProviderKeyPoolHealth, 500\)/,
   "the open multi-Key editor must reconcile a runtime quota failure within half a second"
 );
 assert.match(
   bridgeSource,
-  /openProviderEditor = function\(providerId = null\)[\s\S]{0,180}syncOpenProviderKeyPoolHealth\(\)/,
+  /openProviderEditor = function\(providerId = null\)[\s\S]{0,220}startProviderKeyPoolHealthSync\(\)/,
   "opening the provider editor must perform an immediate Key-health reconciliation"
+);
+assert.match(
+  bridgeSource,
+  /closeOverlay = function\(id\)[\s\S]{0,180}id === "providerOverlay"\) stopProviderKeyPoolHealthSync\(\)/,
+  "closing the provider editor must stop its health reconciliation timer"
+);
+assert.match(
+  bridgeSource,
+  /document\.addEventListener\("visibilitychange",[\s\S]{0,360}stopProviderKeyPoolHealthSync\(\)/,
+  "hidden documents must stop the provider Key-health timer"
 );
 assert.match(
   controlPlane,

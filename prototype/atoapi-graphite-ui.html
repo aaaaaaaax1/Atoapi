@@ -4791,6 +4791,25 @@
       backdrop-filter: blur(18px) saturate(112%);
     }
 
+    /* Native move/resize can briefly contend with WebView2 compositing. The
+       host toggles this class only while the window is moving, resizing,
+       unfocused or minimized; normal visuals resume immediately afterwards. */
+    html.performance-paused .command-bar,
+    html.performance-paused .context-band,
+    html.performance-paused .provider-list,
+    html.performance-paused .utility-dock,
+    html.performance-paused .overlay,
+    html.performance-paused .cache-trend-tooltip,
+    html.performance-paused .cache-trend-state {
+      -webkit-backdrop-filter: none;
+      backdrop-filter: none;
+    }
+
+    html.performance-paused .cache-trend-state.loading .icon,
+    html.performance-paused .provider-actions [data-test-provider].is-loading svg {
+      animation-play-state: paused;
+    }
+
     .agent-tab[aria-selected="true"] {
       background: rgba(255, 255, 255, 0.052);
       box-shadow: none;

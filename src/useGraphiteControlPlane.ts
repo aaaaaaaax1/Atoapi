@@ -37,8 +37,13 @@ const APP_VERSION = "v1.4.39";
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
+const CACHE_VALIDATION_REFRESH_MS = 5_000;
 const PROVIDER_BALANCE_BATCH_SIZE = 4;
 const PROVIDER_CONNECTION_BATCH_SIZE = 4;
+
+function cacheValidationFingerprint(value: CacheValidationStatus | null): string {
+  return value ? JSON.stringify(value) : "";
+}
 
 function formatBalanceNotice(value: string | null | undefined): string {
   const text = String(value ?? "").trim();
@@ -178,7 +183,11 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       setConfig(nextConfig);
       setMetrics(nextMetrics);
       setProxyStatus(nextProxyStatus);
-      setCacheValidation(nextCacheValidation);
+      setCacheValidation((current) =>
+        cacheValidationFingerprint(current) === cacheValidationFingerprint(nextCacheValidation)
+          ? current
+          : nextCacheValidation
+      );
       const agents = visibleAgentInjections(nextConfig.agent_injections);
       setSelectedAgentId((current) => {
         if (current && agents.some((agent) => agent.id === current)) return current;
@@ -191,14 +200,23 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
 
   async function refreshMetrics() {
     try {
-      const [nextMetrics, nextCacheValidation] = await Promise.all([
-        command<MetricsSnapshot>("get_metrics"),
-        command<CacheValidationStatus>("get_cache_validation_status")
-      ]);
+      const nextMetrics = await command<MetricsSnapshot>("get_metrics");
       setMetrics(nextMetrics);
-      setCacheValidation(nextCacheValidation);
     } catch {
       // Keep the last verified snapshot visible when a transient refresh fails.
+    }
+  }
+
+  async function refreshCacheValidation() {
+    try {
+      const nextCacheValidation = await command<CacheValidationStatus>("get_cache_validation_status");
+      setCacheValidation((current) =>
+        cacheValidationFingerprint(current) === cacheValidationFingerprint(nextCacheValidation)
+          ? current
+          : nextCacheValidation
+      );
+    } catch {
+      // Cache-validation progress is advisory UI state; retain the last verified snapshot.
     }
   }
 
@@ -220,6 +238,15 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     const timer = window.setInterval(refreshIfAllowed, intervalMs);
     return () => window.clearInterval(timer);
   }, [metricsRefreshPolicy]);
+
+  useEffect(() => {
+    if (metricsRefreshPolicy === "manual" || !cacheValidation || cacheValidation.mode === "auto") return;
+    void refreshCacheValidation();
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") void refreshCacheValidation();
+    }, CACHE_VALIDATION_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [cacheValidation?.mode, metricsRefreshPolicy]);
 
   useEffect(() => {
     const fallbackRequests = [

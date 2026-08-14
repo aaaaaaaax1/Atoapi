@@ -32,7 +32,7 @@ use admin::{
     test_provider_connection_paths, test_provider_key, test_provider_key_pool,
     update_agent_injection_route,
 };
-use config::isolated_test_instance;
+use config::{isolated_test_instance, isolated_test_listen_port};
 use state::AppState;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -77,8 +77,30 @@ fn spawn_exit_shutdown(
     });
 }
 
+/// A port-isolated desktop instance must not reuse the live application's
+/// WebView2 profile.  Sharing it prevents a second renderer from starting and
+/// makes UI/GPU validation silently exercise the wrong process.  Keep a
+/// caller-supplied profile intact, but otherwise derive a per-process temporary
+/// directory before Tauri creates its first WebView2 environment.
+fn configure_isolated_webview_profile() {
+    if !isolated_test_instance() || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some() {
+        return;
+    }
+    let port = isolated_test_listen_port().unwrap_or_default();
+    let profile = std::env::temp_dir().join(format!(
+        "atoapi-isolated-webview2-{port}-{}",
+        std::process::id()
+    ));
+    if let Err(err) = std::fs::create_dir_all(&profile) {
+        eprintln!("failed to prepare isolated WebView2 profile {profile:?}: {err}");
+        return;
+    }
+    std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", profile);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    configure_isolated_webview_profile();
     let state = Arc::new(
         AppState::load()
             .unwrap_or_else(|err| panic!("failed to initialize application state: {err:?}")),

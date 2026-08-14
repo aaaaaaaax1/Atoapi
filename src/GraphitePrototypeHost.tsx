@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { command } from "./lib/api";
 import type {
   AgentInjectionConfig,
@@ -43,6 +44,8 @@ const bridgeSource = String.raw`
 (() => {
   const CHANNEL = "atoapi.graphite.bridge.v1";
   const host = { state: null };
+  let renderSuspended = false;
+  let deferredMetricsDelta = null;
   const $bridge = (selector, root = document) => root.querySelector(selector);
   const clone = (value) => JSON.parse(JSON.stringify(value ?? []));
   const replace = (target, source) => target.splice(0, target.length, ...clone(source));
@@ -124,13 +127,41 @@ const bridgeSource = String.raw`
   const strategyFromUi = (value) => ({ "轮询": "round-robin", "优先级": "priority", "最低使用": "least-used", "随机": "random", "顺序": "sequential" }[value] || "sequential");
   const selectedProviderId = () => editingProviderId || currentAgent()?.provider || "";
   let keyPoolHealthSyncRequestId = "";
+  let keyPoolHealthSyncTimer = 0;
+  function stopProviderKeyPoolHealthSync() {
+    if (!keyPoolHealthSyncTimer) return;
+    window.clearInterval(keyPoolHealthSyncTimer);
+    keyPoolHealthSyncTimer = 0;
+  }
   function syncOpenProviderKeyPoolHealth() {
-    if (keyPoolHealthSyncRequestId || !isOpen("providerOverlay") || document.visibilityState === "hidden") return;
+    if (renderSuspended || !isOpen("providerOverlay") || document.visibilityState === "hidden") {
+      stopProviderKeyPoolHealthSync();
+      return;
+    }
+    if (keyPoolHealthSyncRequestId) return;
     const providerId = selectedProviderId();
     if (!providerId) return;
     keyPoolHealthSyncRequestId = send("sync-provider-key-pool-health", { providerId });
   }
-  window.setInterval(syncOpenProviderKeyPoolHealth, 500);
+  function startProviderKeyPoolHealthSync() {
+    if (
+      keyPoolHealthSyncTimer ||
+      renderSuspended ||
+      !isOpen("providerOverlay") ||
+      document.visibilityState === "hidden" ||
+      !selectedProviderId()
+    ) return;
+    syncOpenProviderKeyPoolHealth();
+    keyPoolHealthSyncTimer = window.setInterval(syncOpenProviderKeyPoolHealth, 500);
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      stopProviderKeyPoolHealthSync();
+    } else if (isOpen("providerOverlay")) {
+      startProviderKeyPoolHealthSync();
+    }
+  });
+  window.addEventListener("pagehide", stopProviderKeyPoolHealthSync, { once: true });
   const REQUESTS_PER_PAGE = 20;
   const REQUEST_PAGE_LIMIT = 10;
   const DEFAULT_KEY_PRIORITY = 5;
@@ -1138,10 +1169,49 @@ const bridgeSource = String.raw`
     syncTrendController(true);
   }
 
+  function applyMetricsDelta(metrics, nextRequests) {
+    if (renderSuspended) {
+      deferredMetricsDelta = {
+        metrics: metrics || deferredMetricsDelta?.metrics,
+        ...(Array.isArray(nextRequests)
+          ? { requests: nextRequests }
+          : (Array.isArray(deferredMetricsDelta?.requests) ? { requests: deferredMetricsDelta.requests } : {}))
+      };
+      return;
+    }
+    if (!host.state) return;
+    const nextState = { ...host.state, metrics: metrics || host.state.metrics };
+    if (Array.isArray(nextRequests)) {
+      replace(requests, nextRequests);
+      nextState.requests = nextRequests;
+      renderRequests();
+    }
+    host.state = nextState;
+    applyMetrics(nextState);
+    syncTrendController(true);
+  }
+
+  function applyRenderSuspended(suspended) {
+    const next = suspended === true;
+    if (renderSuspended === next) return;
+    renderSuspended = next;
+    document.documentElement.classList.toggle("performance-paused", next);
+    if (next) {
+      stopProviderKeyPoolHealthSync();
+      return;
+    }
+    if (isOpen("providerOverlay")) startProviderKeyPoolHealthSync();
+    const deferred = deferredMetricsDelta;
+    deferredMetricsDelta = null;
+    if (deferred) applyMetricsDelta(deferred.metrics, deferred.requests);
+  }
+
   window.addEventListener("message", (event) => {
     const message = event.data || {};
     if (message.channel !== CHANNEL) return;
     if (message.kind === "state") applyState(message.state);
+    if (message.kind === "metrics-delta") applyMetricsDelta(message.metrics, message.requests);
+    if (message.kind === "render-suspension") applyRenderSuspended(message.suspended);
     if (message.kind === "ack") {
       settle(message.requestId);
       if (message.requestId === keyPoolHealthSyncRequestId) keyPoolHealthSyncRequestId = "";
@@ -1677,7 +1747,13 @@ const bridgeSource = String.raw`
   openProviderEditor = function(providerId = null) {
     originalOpenProviderEditor(providerId);
     applyEditorData(providerId);
-    syncOpenProviderKeyPoolHealth();
+    if (providerId) startProviderKeyPoolHealthSync();
+  };
+
+  const originalCloseOverlay = closeOverlay;
+  closeOverlay = function(id) {
+    originalCloseOverlay(id);
+    if (id === "providerOverlay") stopProviderKeyPoolHealthSync();
   };
 
   const originalOpenDeleteConfirm = openDeleteConfirm;
@@ -2452,10 +2528,49 @@ function buildState(
   };
 }
 
+interface GraphiteBridgeSync {
+  config: GraphitePrototypeHostProps["config"];
+  selectedAgentId: string;
+  includeColdStarts: boolean;
+  includeCompactions: boolean;
+  showDetailedErrors: boolean;
+  providerConnectionStatus: GraphitePrototypeHostProps["providerConnectionStatus"];
+  providerBalanceStatus: GraphitePrototypeHostProps["providerBalanceStatus"];
+  metricsRefreshPolicy: GraphitePrototypeHostProps["metricsRefreshPolicy"];
+  proxyStatus: GraphitePrototypeHostProps["proxyStatus"];
+  networkPathDiagnostic: GraphitePrototypeHostProps["networkPathDiagnostic"];
+  cacheValidation: GraphitePrototypeHostProps["cacheValidation"];
+  appVersion: string;
+  metricsFingerprint: string;
+  requestsFingerprint: string;
+}
+
+function requiresFullGraphiteState(
+  previous: GraphiteBridgeSync | null,
+  props: GraphitePrototypeHostProps
+): boolean {
+  return previous === null ||
+    previous.config !== props.config ||
+    previous.selectedAgentId !== props.selectedAgentId ||
+    previous.includeColdStarts !== props.includeColdStarts ||
+    previous.includeCompactions !== props.includeCompactions ||
+    previous.showDetailedErrors !== props.showDetailedErrors ||
+    previous.providerConnectionStatus !== props.providerConnectionStatus ||
+    previous.providerBalanceStatus !== props.providerBalanceStatus ||
+    previous.metricsRefreshPolicy !== props.metricsRefreshPolicy ||
+    previous.proxyStatus !== props.proxyStatus ||
+    previous.networkPathDiagnostic !== props.networkPathDiagnostic ||
+    previous.cacheValidation !== props.cacheValidation ||
+    previous.appVersion !== props.appVersion;
+}
+
 export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [ready, setReady] = useState(false);
+  const [renderSuspended, setRenderSuspended] = useState(false);
   const onBridgeActionRef = useRef(props.onBridgeAction);
+  const bridgeSyncRef = useRef<GraphiteBridgeSync | null>(null);
+  const renderResumeTimerRef = useRef<number | null>(null);
   onBridgeActionRef.current = props.onBridgeAction;
   const state = useMemo(
     () => buildState(props.config, props.metrics, props.selectedAgentId, props.includeColdStarts, props.includeCompactions, props.showDetailedErrors, props.providerConnectionStatus, props.providerBalanceStatus, props.metricsRefreshPolicy, props.proxyStatus, props.networkPathDiagnostic, props.cacheValidation, props.appVersion),
@@ -2466,9 +2581,115 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
     frameRef.current?.contentWindow?.postMessage({ channel: GRAPHITE_BRIDGE_CHANNEL, ...message }, "*");
   }, []);
 
+  const metricsFingerprint = useMemo(() => JSON.stringify(state.metrics), [state.metrics]);
+  const requestsFingerprint = useMemo(() => JSON.stringify(state.requests), [state.requests]);
+
   useEffect(() => {
-    if (ready) send({ kind: "state", state });
-  }, [ready, send, state]);
+    const appWindow = getCurrentWindow();
+    const unlisten: Array<() => void> = [];
+    let disposed = false;
+
+    const clearResumeTimer = () => {
+      if (renderResumeTimerRef.current === null) return;
+      window.clearTimeout(renderResumeTimerRef.current);
+      renderResumeTimerRef.current = null;
+    };
+    const settleAfterWindowActivity = () => {
+      if (disposed) return;
+      setRenderSuspended(true);
+      clearResumeTimer();
+      renderResumeTimerRef.current = window.setTimeout(() => {
+        renderResumeTimerRef.current = null;
+        void appWindow.isMinimized().then(
+          (minimized) => {
+            if (!disposed) setRenderSuspended(minimized);
+          },
+          () => {
+            if (!disposed) setRenderSuspended(false);
+          }
+        );
+      }, 220);
+    };
+
+    void Promise.all([
+      appWindow.onMoved(settleAfterWindowActivity),
+      appWindow.onResized(settleAfterWindowActivity),
+      appWindow.onFocusChanged(({ payload: focused }) => {
+        if (!focused) {
+          clearResumeTimer();
+          setRenderSuspended(true);
+          return;
+        }
+        settleAfterWindowActivity();
+      })
+    ]).then(
+      (listeners) => {
+        if (disposed) {
+          listeners.forEach((listener) => listener());
+          return;
+        }
+        unlisten.push(...listeners);
+      },
+      () => {
+        if (!disposed) setRenderSuspended(false);
+      }
+    );
+
+    return () => {
+      disposed = true;
+      clearResumeTimer();
+      unlisten.forEach((listener) => listener());
+    };
+  }, []);
+
+  useEffect(() => {
+    if (ready) send({ kind: "render-suspension", suspended: renderSuspended });
+  }, [ready, renderSuspended, send]);
+
+  useEffect(() => {
+    if (!ready) {
+      bridgeSyncRef.current = null;
+      return;
+    }
+
+    const previous = bridgeSyncRef.current;
+    if (previous === null || requiresFullGraphiteState(previous, props)) {
+      send({ kind: "state", state });
+    } else if (
+      previous.metricsFingerprint !== metricsFingerprint ||
+      previous.requestsFingerprint !== requestsFingerprint
+    ) {
+      send({
+        kind: "metrics-delta",
+        metrics: state.metrics,
+        ...(previous.requestsFingerprint !== requestsFingerprint ? { requests: state.requests } : {})
+      });
+    }
+
+    bridgeSyncRef.current = {
+      config: props.config,
+      selectedAgentId: props.selectedAgentId,
+      includeColdStarts: props.includeColdStarts,
+      includeCompactions: props.includeCompactions,
+      showDetailedErrors: props.showDetailedErrors,
+      providerConnectionStatus: props.providerConnectionStatus,
+      providerBalanceStatus: props.providerBalanceStatus,
+      metricsRefreshPolicy: props.metricsRefreshPolicy,
+      proxyStatus: props.proxyStatus,
+      networkPathDiagnostic: props.networkPathDiagnostic,
+      cacheValidation: props.cacheValidation,
+      appVersion: props.appVersion,
+      metricsFingerprint,
+      requestsFingerprint
+    };
+  }, [
+    metricsFingerprint,
+    props,
+    ready,
+    requestsFingerprint,
+    send,
+    state
+  ]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<GraphiteMessage>) => {
