@@ -61,14 +61,64 @@ assert.match(
   "metric updates must coalesce instead of repainting while rendering is suspended"
 );
 assert.match(
+  bridgeSource,
+  /const RELEASE_CHAMPION_AUTO_REFRESH_MS = 5_000;[\s\S]{0,220}releaseChampionRequestInFlight/,
+  "release-champion polling must have an explicit bounded refresh cadence and a single-flight gate"
+);
+assert.match(
+  bridgeSource,
+  /function scheduleReleaseChampionRefresh\(\)[\s\S]{0,1200}RELEASE_CHAMPION_AUTO_REFRESH_MS/,
+  "unchanged metric deltas must debounce their expensive historical champion query"
+);
+assert.match(
+  bridgeSource,
+  /function releaseChampionAutoRefreshAllowed\(\)[\s\S]{0,520}function cancelReleaseChampionRefresh\(\)/,
+  "backgrounded or render-suspended windows must be able to cancel deferred champion refreshes"
+);
+assert.match(
+  bridgeSource,
+  /function scheduleReleaseChampionRefresh\(\)[\s\S]{0,900}!releaseChampionAutoRefreshAllowed\(\)/,
+  "a deferred champion refresh must not run while the overview is inactive"
+);
+assert.match(
+  bridgeSource,
+  /const hasLoadedCurrentContext = contextKey === latestReleaseChampionContextKey;[\s\S]{0,160}const snapshot = hasLoadedCurrentContext \? latestReleaseChampion : null;/,
+  "a newly requested scope must not render a previously loaded scope's champion"
+);
+assert.match(
+  bridgeSource,
+  /releaseChampionRequestInFlight = false;[\s\S]{0,720}scheduleReleaseChampionRefresh\(\)/,
+  "a settled champion query must safely drain one coalesced refresh instead of leaving the UI stale"
+);
+assert.match(
   controlPlane,
-  /async function refreshMetrics\(\) \{[\s\S]{0,260}command<MetricsSnapshot>\("get_metrics"\)[\s\S]{0,180}setMetrics\(nextMetrics\)/,
-  "one-second metrics refreshes must not also fetch cache-validation state"
+  /function loadMetricsSnapshot\(forceAfterCurrent = false\): Promise<MetricsSnapshotFetch \| null> \{[\s\S]{0,1000}command<MetricsSnapshot>\("get_metrics"\)/,
+  "all metrics IPC must flow through one single-flight loader"
 );
 assert.doesNotMatch(
-  controlPlane.match(/async function refreshMetrics\(\) \{[\s\S]*?\n  \}/)?.[0] ?? "",
+  controlPlane.match(/function loadMetricsSnapshot\(forceAfterCurrent = false\): Promise<MetricsSnapshotFetch \| null> \{[\s\S]*?\n  \}/)?.[0] ?? "",
   /get_cache_validation_status/,
   "the metrics hot path must not force a full Graphite state refresh"
+);
+assert.match(
+  controlPlane,
+  /const metricsRefreshInFlight = useRef<Promise<MetricsSnapshotFetch \| null> \| null>\(null\);/,
+  "metrics IPC must retain a shared in-flight task"
+);
+assert.match(
+  controlPlane,
+  /const inFlight = metricsRefreshInFlight\.current;[\s\S]{0,600}return forceAfterCurrent[\s\S]{0,260}: inFlight;/,
+  "slow metrics IPC calls must be single-flight rather than piling up while the app is busy"
+);
+assert.match(
+  controlPlane,
+  /command<AppConfig>\("reload_config"\),[\s\S]{0,180}loadMetricsSnapshot\(\)/,
+  "the full refresh path must share the same metrics single-flight loader"
+);
+assert.match(
+  controlPlane,
+  /action === "clear-cache"[\s\S]{0,260}await refreshMetrics\(true\)/,
+  "a cache clear must queue a fresh snapshot after an older poll has settled"
 );
 assert.match(
   controlPlane,

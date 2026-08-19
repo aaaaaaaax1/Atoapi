@@ -212,6 +212,9 @@ pub(super) async fn finalize_agent_generation(
                             .controlled_cache_probe_breakpoint_placement_digest
                             .clone()
                     }),
+                    candidate_prompt_cache_options_ttl: diagnostics
+                        .and_then(|diagnostics| diagnostics.final_wire_receipt.as_ref())
+                        .and_then(|receipt| receipt.cache_controls.prompt_cache_options_ttl()),
                 },
                 Utc::now(),
             );

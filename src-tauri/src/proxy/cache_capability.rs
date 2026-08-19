@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::config::ProviderCacheCapabilityStatus;
-use crate::config::{AppConfig, Channel, ProviderCacheCapabilityField, ProviderConfig};
+use crate::config::{
+    AppConfig, Channel, PromptCacheOptionsTtl, ProviderCacheCapabilityField, ProviderConfig,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -15,17 +17,41 @@ pub(super) const PROVIDER_CACHE_METADATA_FIELDS: [&str; 4] = [
 
 const PROMPT_CACHE_RETENTION_VALUE: &str = "24h";
 
-#[cfg(test)]
-pub(super) const EFFECT_FIELDS: [ProviderCacheCapabilityField; 2] = [
-    ProviderCacheCapabilityField::PromptCacheOptions,
-    ProviderCacheCapabilityField::PromptCacheBreakpoint,
-];
+/// The 24h Options variant is an isolated A/B treatment only. Keeping the
+/// isolation marker in the predicate prevents a stray environment variable
+/// from changing normal desktop traffic.
+pub(super) fn isolated_prompt_cache_options_ttl_24h_enabled() -> bool {
+    isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+        std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOAPI_FORCE_ISOLATED_CACHE_OPTIONS_TTL24H")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+    isolated_test_instance: Option<&str>,
+    force_ttl_24h: Option<&str>,
+) -> bool {
+    isolated_test_instance == Some("1")
+        && force_ttl_24h
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+fn prompt_cache_options_value(ttl: PromptCacheOptionsTtl) -> Value {
+    json!({
+        "mode": "implicit",
+        "ttl": ttl.wire_value(),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct NativeCachePlan {
     preserve_prompt_cache_key: bool,
     enable_prompt_cache_retention: bool,
-    enable_modern_options: bool,
+    prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
     enable_explicit_breakpoint: bool,
 }
 
@@ -36,6 +62,7 @@ pub(super) struct NativeCachePlan {
 pub(super) struct CacheControlApplicationReceipt {
     changed_fields: Vec<String>,
     injected_fields: Vec<ProviderCacheCapabilityField>,
+    injected_prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
     injected_breakpoint: bool,
 }
 
@@ -53,6 +80,10 @@ impl CacheControlApplicationReceipt {
         self.injected_breakpoint
     }
 
+    pub(super) const fn injected_prompt_cache_options_ttl(&self) -> Option<PromptCacheOptionsTtl> {
+        self.injected_prompt_cache_options_ttl
+    }
+
     fn mark_changed(&mut self, key: &str) {
         mark_changed_field(&mut self.changed_fields, key);
     }
@@ -61,6 +92,11 @@ impl CacheControlApplicationReceipt {
         if !self.injected_fields.contains(&field) {
             self.injected_fields.push(field);
         }
+    }
+
+    fn mark_prompt_cache_options_injected(&mut self, ttl: PromptCacheOptionsTtl) {
+        self.mark_injected(ProviderCacheCapabilityField::PromptCacheOptions);
+        self.injected_prompt_cache_options_ttl = Some(ttl);
     }
 }
 
@@ -119,7 +155,22 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
     };
     let probe_selected = |field| controlled_probe_fields.contains(&field) && probe_accepted(field);
     let allowed = |field| probe_selected(field) || promoted(field);
-    let enable_modern_options = allowed(ProviderCacheCapabilityField::PromptCacheOptions);
+    let options_probe_selected = probe_selected(ProviderCacheCapabilityField::PromptCacheOptions);
+    let prompt_cache_options_ttl = if options_probe_selected {
+        Some(if isolated_prompt_cache_options_ttl_24h_enabled() {
+            PromptCacheOptionsTtl::TwentyFourHours
+        } else {
+            PromptCacheOptionsTtl::ThirtyMinutes
+        })
+    } else {
+        config.promoted_prompt_cache_options_ttl_for_scope(
+            &provider.id,
+            model,
+            channel,
+            key_id,
+            effect_scope_id,
+        )
+    };
     NativeCachePlan {
         // `prompt_cache_key` is never a normal routing rule. A schema probe
         // can accept the field without proving that it affects the upstream
@@ -130,9 +181,9 @@ pub(super) fn plan_with_effect_scope_and_probe_fields(
         // the caller only after it proves the trusted session and selected Key
         // boundary, so it cannot leak into generic provider traffic here.
         enable_prompt_cache_retention: provider.prompt_cache_retention_enabled
-            && !enable_modern_options
+            && prompt_cache_options_ttl.is_none()
             && allowed(ProviderCacheCapabilityField::PromptCacheRetention),
-        enable_modern_options,
+        prompt_cache_options_ttl,
         // This control has repeatedly been rejected by the active upstream
         // class. Production keeps its schema probe and final-wire diagnostics
         // available, but does not inject it until a placement-proven promotion
@@ -159,12 +210,10 @@ pub(super) fn apply(request: &mut Value, channel: &Channel, plan: NativeCachePla
         } else if object.remove("prompt_cache_retention").is_some() {
             mark_changed_field(&mut changed_fields, "prompt_cache_retention");
         }
-        if plan.enable_modern_options {
-            if !object.contains_key("prompt_cache_options") {
-                object.insert(
-                    "prompt_cache_options".to_string(),
-                    json!({"mode": "implicit", "ttl": "30m"}),
-                );
+        if let Some(ttl) = plan.prompt_cache_options_ttl {
+            let options = prompt_cache_options_value(ttl);
+            if object.get("prompt_cache_options") != Some(&options) {
+                object.insert("prompt_cache_options".to_string(), options);
                 mark_changed_field(&mut changed_fields, "prompt_cache_options");
             }
         } else if object.remove("prompt_cache_options").is_some() {
@@ -219,15 +268,13 @@ pub(super) fn apply_prepared_with_receipt(
     } else if request.remove_root("prompt_cache_retention") {
         receipt.mark_changed("prompt_cache_retention");
     }
-    if plan.enable_modern_options {
-        if request.body().get("prompt_cache_options").is_none()
-            && request.set_root(
-                "prompt_cache_options",
-                json!({"mode": "implicit", "ttl": "30m"}),
-            )
+    if let Some(ttl) = plan.prompt_cache_options_ttl {
+        let options = prompt_cache_options_value(ttl);
+        if request.body().get("prompt_cache_options") != Some(&options)
+            && request.set_root("prompt_cache_options", options)
         {
             receipt.mark_changed("prompt_cache_options");
-            receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheOptions);
+            receipt.mark_prompt_cache_options_injected(ttl);
         }
     } else if request.remove_root("prompt_cache_options") {
         receipt.mark_changed("prompt_cache_options");
@@ -273,8 +320,12 @@ pub(super) fn apply_generated_prompt_cache_key(
     let changed = request.set_root("prompt_cache_key", Value::String(cache_key.to_string()));
     if changed {
         receipt.mark_changed("prompt_cache_key");
+        // Presence alone is not an injection witness.  A candidate may be
+        // asked to apply a generated key that is already present on the
+        // frozen request; recording that no-op as injected would let the
+        // validation path treat an unchanged wire as a real treatment.
+        receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheKey);
     }
-    receipt.mark_injected(ProviderCacheCapabilityField::PromptCacheKey);
     changed
 }
 
@@ -973,6 +1024,8 @@ mod tests {
     const EFFECT_SCOPE_NONE: &str = "cache-effect-v2:test-realm:stream:no-store:bp=none";
     const EFFECT_SCOPE_BREAKPOINT: &str =
         "cache-effect-v2:test-realm:stream:no-store:bp=v2:test-placement";
+    const EFFECT_SCOPE_OPTIONS_24H: &str =
+        "cache-effect-v5:test-realm:stream:no-store:pco=implicit-24h:bp=none";
 
     fn provider(base_url: &str) -> ProviderConfig {
         ProviderConfig {
@@ -992,6 +1045,34 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn isolated_24h_options_require_both_explicit_isolation_flags() {
+        assert!(!isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+            None,
+            Some("1")
+        ));
+        assert!(!isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+            Some("1"),
+            None
+        ));
+        assert!(!isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+            Some("0"),
+            Some("true")
+        ));
+        assert!(isolated_prompt_cache_options_ttl_24h_enabled_with_env(
+            Some("1"),
+            Some("enabled")
+        ));
+        assert_eq!(
+            prompt_cache_options_value(PromptCacheOptionsTtl::ThirtyMinutes)["ttl"],
+            "30m"
+        );
+        assert_eq!(
+            prompt_cache_options_value(PromptCacheOptionsTtl::TwentyFourHours)["ttl"],
+            "24h"
+        );
     }
 
     #[test]
@@ -1058,28 +1139,23 @@ mod tests {
     }
 
     #[test]
-    fn verified_official_modern_controls_replace_legacy_retention_and_add_breakpoint() {
+    fn breakpoint_scoped_evidence_does_not_authorize_options() {
         let mut config = AppConfig::default();
-        for field in [
-            ProviderCacheCapabilityField::PromptCacheOptions,
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
             ProviderCacheCapabilityField::PromptCacheBreakpoint,
-        ] {
-            config.record_cache_capability_probe(
-                "provider-a",
-                "gpt-5.6-luna",
-                Channel::Responses,
-                field,
-                ProviderCacheCapabilityStatus::Verified,
-                None,
-            );
-        }
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
         config.record_cache_capability_effect_for_scope(
             "provider-a",
             "gpt-5.6-luna",
             &Channel::Responses,
             None,
             Some(EFFECT_SCOPE_BREAKPOINT),
-            &EFFECT_FIELDS,
+            &[ProviderCacheCapabilityField::PromptCacheBreakpoint],
             crate::config::ProviderCacheEffectStatus::Promoted,
             None,
             Some(0),
@@ -1107,15 +1183,14 @@ mod tests {
         let changed = apply(&mut body, &Channel::Responses, plan);
         assert_eq!(
             changed,
-            vec![
-                "prompt_cache_key",
-                "prompt_cache_retention",
-                "prompt_cache_options",
-                "input"
-            ]
+            vec!["prompt_cache_key", "prompt_cache_retention", "input"]
         );
         assert!(body.get("prompt_cache_retention").is_none());
-        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        // `EFFECT_SCOPE_BREAKPOINT` proves the breakpoint placement only. It
+        // must not be treated as an Options TTL certificate; otherwise a
+        // stale or mismatched cache-control proof could silently alter the
+        // final wire with a second experimental factor.
+        assert!(body.get("prompt_cache_options").is_none());
         assert_eq!(
             body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
             "explicit"
@@ -1857,6 +1932,27 @@ mod tests {
     }
 
     #[test]
+    fn generated_prompt_cache_key_noop_is_not_recorded_as_injected() {
+        let cache_key = "a".repeat(64);
+        let mut prepared = PreparedResponseBody::responses(json!({
+            "model": "gpt-5.6-luna",
+            "prompt_cache_key": cache_key,
+            "input": [{"role": "user", "content": "stable"}]
+        }));
+        let mut receipt = CacheControlApplicationReceipt::default();
+
+        assert!(!apply_generated_prompt_cache_key(
+            &mut prepared,
+            &cache_key,
+            &mut receipt,
+        ));
+        assert!(receipt.changed_fields().is_empty());
+        assert!(!receipt
+            .injected_fields()
+            .contains(&ProviderCacheCapabilityField::PromptCacheKey));
+    }
+
+    #[test]
     fn legacy_prompt_cache_retention_is_present_and_receipted_on_the_final_body() {
         let mut prepared = PreparedResponseBody::responses(json!({
             "model": "gpt-5.6-terra",
@@ -1959,8 +2055,123 @@ mod tests {
             &Channel::Responses,
             None,
         );
-        assert!(!third_party_plan.enable_modern_options);
+        assert!(third_party_plan.prompt_cache_options_ttl.is_none());
         assert!(!third_party_plan.enable_explicit_breakpoint);
+    }
+
+    #[test]
+    fn promoted_options_certificate_controls_the_exact_ttl_on_the_final_body() {
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            Some(EFFECT_SCOPE_NONE),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            crate::config::ProviderCacheEffectStatus::Promoted,
+            None,
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+
+        let mut legacy_body = PreparedResponseBody::responses(json!({
+            "model":"gpt-5.6-luna",
+            "prompt_cache_options":{"mode":"implicit","ttl":"24h"},
+            "input":[]
+        }));
+        let legacy_receipt = apply_prepared_with_receipt(
+            &mut legacy_body,
+            &Channel::Responses,
+            plan_with_effect_scope_and_probe_fields(
+                &config,
+                &provider("https://third.example/v1"),
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some(EFFECT_SCOPE_NONE),
+                &[],
+            ),
+        );
+        assert_eq!(legacy_body.body()["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(
+            legacy_receipt.injected_prompt_cache_options_ttl(),
+            Some(PromptCacheOptionsTtl::ThirtyMinutes)
+        );
+
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            Some(EFFECT_SCOPE_OPTIONS_24H),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            crate::config::ProviderCacheEffectStatus::Promoted,
+            None,
+            Some(0),
+            Some(1_024),
+            Some(100),
+            Some(100),
+        );
+        let mut promoted_24h_body = PreparedResponseBody::responses(json!({
+            "model":"gpt-5.6-luna",
+            "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
+            "input":[]
+        }));
+        let promoted_24h_receipt = apply_prepared_with_receipt(
+            &mut promoted_24h_body,
+            &Channel::Responses,
+            plan_with_effect_scope_and_probe_fields(
+                &config,
+                &provider("https://third.example/v1"),
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some(EFFECT_SCOPE_NONE),
+                &[],
+            ),
+        );
+        assert_eq!(
+            promoted_24h_body.body()["prompt_cache_options"]["ttl"],
+            "24h"
+        );
+        assert_eq!(
+            promoted_24h_receipt.injected_prompt_cache_options_ttl(),
+            Some(PromptCacheOptionsTtl::TwentyFourHours)
+        );
+
+        let mut wrong_scope_body = PreparedResponseBody::responses(json!({
+            "model":"gpt-5.6-luna",
+            "prompt_cache_options":{"mode":"implicit","ttl":"24h"},
+            "input":[]
+        }));
+        apply_prepared(
+            &mut wrong_scope_body,
+            &Channel::Responses,
+            plan_with_effect_scope_and_probe_fields(
+                &config,
+                &provider("https://third.example/v1"),
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some("cache-effect-v2:other-realm:stream:no-store:bp=none"),
+                &[],
+            ),
+        );
+        assert!(wrong_scope_body
+            .body()
+            .get("prompt_cache_options")
+            .is_none());
     }
 
     #[test]

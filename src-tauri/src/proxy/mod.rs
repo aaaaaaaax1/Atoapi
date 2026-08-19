@@ -18,11 +18,11 @@ use crate::{
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
-        AgentInboundStart, AgentLocalRejectionSettlement, AgentOwnerFailureSettlement,
-        AgentTerminalSettlement, FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore,
-        MetricsTransaction, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
+        AgentInboundStart, AgentOwnerFailureSettlement, AgentTerminalSettlement,
+        FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
+        ResponsesWirePrefixFingerprints, UsageRecord,
     },
-    state::{AppState, PrefixWarmState},
+    state::{AppState, PrefixWarmState, PromptCacheOptionsSiblingProof},
 };
 use anyhow::{anyhow, Context, Result};
 use axum::{
@@ -70,6 +70,7 @@ mod final_scope_shadow;
 pub(crate) mod final_scope_waterline;
 mod full_replay_continuity;
 mod generation_envelope;
+mod isolated_response_continuation;
 mod json_canonical;
 mod prefix_control;
 mod prepared_wire_request;
@@ -98,9 +99,7 @@ use cache_control_core::{
 };
 pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
-use completion_relay::{
-    canonical_responses_failure_payload, stream_upstream, ResponsesFailureCode,
-};
+use completion_relay::stream_upstream;
 #[cfg(test)]
 use completion_relay::{
     relay_chunk_parts, BoundedCacheCapture, STREAM_CACHE_CAPTURE_BYTE_LIMIT,
@@ -129,9 +128,7 @@ use prepared_wire_request::{
     serialize_responses_body_bytes_for_provider_prefix, PreparedResponseBody,
 };
 use request_plan::{OneShotRequestPlan, RequestPlan};
-use responses_full_replay_risk::{
-    evaluate_full_replay_risk, BlockedFullReplayShape, FullReplayRiskInput, FullReplayRiskSignals,
-};
+use responses_full_replay_risk::{BlockedFullReplayShape, FullReplayRiskSignals};
 pub(crate) use responses_full_replay_risk::{
     ResponsesFullReplayRiskObservations, ResponsesRouteScope,
 };
@@ -139,7 +136,9 @@ use responses_stream::{
     evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
     StreamEnd, TerminalCompatibility, TerminalFailure, TerminalPrecheckGuard,
 };
-use session_identity::{strip_dynamic_invocation_fields, SessionIdentity};
+use session_identity::{
+    strip_dynamic_invocation_fields, unambiguous_explicit_thread_id, SessionIdentity,
+};
 use settlement_pipeline::{
     agent_owner_failure_transaction, finalize_agent_generation, insert_cache_entries,
     AgentOwnerSettlementGuard,
@@ -155,7 +154,6 @@ const BACKGROUND_PREWARM_MAX_EXTRA_BUCKET_REQUESTS: u64 = 1;
 const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
 #[cfg(test)]
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
-const REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
@@ -434,13 +432,139 @@ fn clear_upstream_affinity_after_failed_settlement(
 }
 
 fn upstream_affinity_enabled_for_dispatch() -> bool {
-    // A third-party load-balancer cookie changes an otherwise identical
-    // request's upstream placement. Live long-replay A/Bs have not shown a
-    // stable cache benefit and did show waterline regressions on some routes.
-    // Keep the bounded cleanup/diagnostic plumbing inert rather than letting
-    // an unproven transport hint alter normal user traffic. This does not
-    // switch Provider or Key and never adds a second upstream request.
-    false
+    upstream_affinity_enabled_for_dispatch_with_env(
+        crate::config::isolated_test_instance(),
+        std::env::var("ATOAPI_EXPERIMENTAL_UPSTREAM_AFFINITY")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// A third-party load-balancer cookie changes an otherwise identical request's
+/// upstream placement. It is therefore permanently off for normal traffic and
+/// can be exercised only by an explicit, disposable isolated verifier arm.
+/// This never switches Provider or Key and never adds an upstream request.
+fn upstream_affinity_enabled_for_dispatch_with_env(isolated: bool, value: Option<&str>) -> bool {
+    isolated && value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+/// The recovery wait is intentionally an isolated verifier candidate. Normal
+/// traffic keeps the existing no-delay handling for provider-only waterline
+/// movement until a dynamic A/B proves a net cache benefit.
+fn isolated_provider_waterline_recovery_settle_enabled() -> bool {
+    isolated_provider_waterline_recovery_settle_enabled_with_env(
+        crate::config::isolated_test_instance(),
+        std::env::var("ATOAPI_EXPERIMENTAL_PROVIDER_WATERLINE_RECOVERY_SETTLE")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn isolated_provider_waterline_recovery_settle_enabled_with_env(
+    isolated: bool,
+    value: Option<&str>,
+) -> bool {
+    isolated && value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+/// A thread-stable generated prompt-cache placement is an isolated candidate
+/// only. It is deliberately opt-in until a dynamic session-churn A/B proves
+/// that keeping one trusted thread on one placement outweighs any upstream
+/// sharing risk. Normal desktop traffic remains on the current composite key.
+fn isolated_thread_stable_prompt_cache_key_bridge_enabled() -> bool {
+    crate::config::isolated_test_instance()
+        && std::env::var("ATOAPI_EXPERIMENTAL_THREAD_STABLE_PCK_BRIDGE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+/// Release evidence needs to prove whether the isolated candidate actually
+/// learned or replayed a recognized placement cookie, without retaining its
+/// opaque value. The marker is emitted only in the explicit isolated test
+/// mode and only extends an already allow-listed diagnostic label.
+fn annotate_upstream_affinity_test_diagnostic(diagnostics: &mut UpstreamRequestDiagnostics) {
+    if !upstream_affinity_enabled_for_dispatch() {
+        return;
+    }
+    let signal = match (
+        diagnostics.upstream_affinity_injected,
+        diagnostics.upstream_affinity_learned,
+    ) {
+        (true, true) => "affinity-injected-learned",
+        (true, false) => "affinity-injected",
+        (false, true) => "affinity-learned",
+        (false, false) => "affinity-none",
+    };
+    let base = diagnostics
+        .pool_diagnostic
+        .take()
+        .unwrap_or_else(|| "direct".to_string());
+    diagnostics.pool_diagnostic = Some(format!("{base}:{signal}"));
+}
+
+/// The release verifier must distinguish an actual final-wire cache control
+/// from a merely planned draft mutation. Keep this marker isolated and
+/// payload-free: it records only whether the allow-listed root field survived
+/// every final-wire compatibility step.
+fn annotate_isolated_cache_control_probe_diagnostic(diagnostics: &mut UpstreamRequestDiagnostics) {
+    let Some(field) = isolated_cache_control_probe_test_field() else {
+        return;
+    };
+    let injected = diagnostics.sent_cache_capability_fields.contains(&field);
+    let final_options_ttl = diagnostics
+        .final_wire_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.cache_controls.prompt_cache_options_ttl());
+    let signal = isolated_cache_control_probe_diagnostic_signal(
+        field,
+        injected,
+        field == ProviderCacheCapabilityField::PromptCacheOptions
+            && cache_capability::isolated_prompt_cache_options_ttl_24h_enabled(),
+        final_options_ttl,
+    );
+    let Some(signal) = signal else {
+        return;
+    };
+    let base = diagnostics
+        .pool_diagnostic
+        .take()
+        .unwrap_or_else(|| "direct".to_string());
+    diagnostics.pool_diagnostic = Some(format!("{base}:{signal}"));
+}
+
+fn isolated_cache_control_probe_diagnostic_signal(
+    field: ProviderCacheCapabilityField,
+    injected: bool,
+    prompt_cache_options_ttl_24h_requested: bool,
+    final_options_ttl: Option<crate::config::PromptCacheOptionsTtl>,
+) -> Option<&'static str> {
+    match (field, injected) {
+        (ProviderCacheCapabilityField::PromptCacheKey, true) => Some("cache-key-injected"),
+        (ProviderCacheCapabilityField::PromptCacheKey, false) => Some("cache-key-missing"),
+        (ProviderCacheCapabilityField::PromptCacheOptions, true)
+            if prompt_cache_options_ttl_24h_requested
+                && final_options_ttl
+                    == Some(crate::config::PromptCacheOptionsTtl::TwentyFourHours) =>
+        {
+            Some("cache-options-24h-injected")
+        }
+        (ProviderCacheCapabilityField::PromptCacheOptions, _)
+            if prompt_cache_options_ttl_24h_requested =>
+        {
+            Some("cache-options-24h-missing")
+        }
+        (ProviderCacheCapabilityField::PromptCacheOptions, true) if final_options_ttl.is_some() => {
+            Some("cache-options-injected")
+        }
+        (ProviderCacheCapabilityField::PromptCacheOptions, _) => Some("cache-options-missing"),
+        (ProviderCacheCapabilityField::PromptCacheRetention, true) => {
+            Some("cache-retention-injected")
+        }
+        (ProviderCacheCapabilityField::PromptCacheRetention, false) => {
+            Some("cache-retention-missing")
+        }
+        _ => None,
+    }
 }
 
 /// Single owner for one final-scope shadow ticket. Normal sync/stream paths
@@ -802,6 +926,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/admin/cache-capabilities/probe",
             post(admin_probe_cache_capabilities),
         )
+        .route(
+            "/admin/isolated-response-continuation/probe",
+            post(admin_probe_isolated_response_continuation),
+        )
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
@@ -904,12 +1032,361 @@ async fn admin_probe_cache_capabilities(
         input.provider_id.trim(),
         input.model_id.trim(),
         input.channel,
+        input.fields,
     )
     .await
     {
         Ok(result) => Json(result).into_response(),
         Err(err) => json_error(StatusCode::BAD_REQUEST, &err.to_string()),
     }
+}
+
+async fn admin_probe_isolated_response_continuation(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request,
+) -> Response {
+    if !isolated_response_continuation::exact_isolated_flag(
+        std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .as_deref(),
+    ) {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "isolated response continuation probe is disabled",
+        );
+    }
+
+    let input: isolated_response_continuation::ProbeInput =
+        match authorize_and_parse_isolated_admin_json(&state, request).await {
+            Ok(input) => input,
+            Err(response) => return response,
+        };
+    if let Err(message) = isolated_response_continuation::validate_input(&input) {
+        return json_error(StatusCode::BAD_REQUEST, message);
+    }
+
+    match run_isolated_response_continuation_probe(&state, input).await {
+        Ok(result) => Json(result).into_response(),
+        // Do not echo upstream bodies, URLs, or transport diagnostics through
+        // this admin-only diagnostic seam. The caller gets a stable category;
+        // detailed evidence stays in the local test process.
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "schema": "atoapi-isolated-response-continuation-probe-v1",
+                "ok": false,
+                "isolated": true,
+                "live_18883_touched": false,
+                "probe_error_code": isolated_response_continuation::classify_error(&error),
+                "no_raw_content": true,
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn authorize_and_parse_isolated_admin_json<T: DeserializeOwned>(
+    state: &AppState,
+    request: Request,
+) -> Result<T, Response> {
+    let config = state.config.read().await;
+    if config.local_key.trim().is_empty() {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "isolated probe requires a configured local administration key",
+        ));
+    }
+    drop(config);
+    if let Err(response) = authorize_admin(state, request.headers()).await {
+        return Err(response);
+    }
+    let bytes = to_bytes(request.into_body(), ADMIN_PROBE_BODY_LIMIT)
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "admin probe body exceeds the 16 KiB limit",
+            )
+        })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON body: {err}"),
+        )
+    })
+}
+
+async fn run_isolated_response_continuation_probe(
+    state: &AppState,
+    input: isolated_response_continuation::ProbeInput,
+) -> Result<isolated_response_continuation::ProbeResult> {
+    let provider_id = input.provider_id.trim();
+    let model_id = input.model_id.trim();
+    let (provider, selected_key) = {
+        let config = state.config.read().await;
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("selected provider was not found"))?;
+        if !provider.enabled {
+            return Err(anyhow!("selected provider is disabled"));
+        }
+        if !matches!(&provider.channel, Channel::Responses) {
+            return Err(anyhow!(
+                "native continuation probe requires a Responses provider"
+            ));
+        }
+
+        // Select only from private config clones. A supplied live Key-realm
+        // assertion is resolved across the usable pool without advancing the
+        // saved load-balancer cursor or writing config.
+        let selected = select_isolated_response_continuation_probe_key(
+            &config,
+            &provider,
+            model_id,
+            input.key_id.as_deref(),
+            input.key_realm_hash.as_deref(),
+        )?;
+        (provider, selected)
+    };
+
+    let user_agent = isolated_response_continuation::user_agent_for_provider(
+        provider.custom_user_agent.as_deref(),
+    );
+    // The live scope resolver publishes the complete cache realm, which binds
+    // the normalized deployment, channel, model, and selected Key record. The
+    // Key-record digest alone is intentionally only an internal component of
+    // that realm and must never be compared with the live assertion.
+    let key_realm_hash =
+        isolated_response_continuation_probe_realm(&provider, model_id, &selected_key);
+    if input
+        .key_realm_hash
+        .as_deref()
+        .is_some_and(|expected| expected.trim() != key_realm_hash)
+    {
+        return Err(anyhow!(
+            "selected provider key realm does not match the live scope assertion"
+        ));
+    }
+    let resolved_endpoint = upstream_url(&provider.base_url, &Channel::Responses);
+    let endpoint_fingerprint = isolated_response_continuation::fingerprint(&resolved_endpoint);
+    let transport_policy_fingerprint = isolated_response_continuation::transport_policy_fingerprint(
+        provider.use_system_proxy,
+        provider.request_body_gzip_enabled,
+        provider.is_full_url,
+    );
+    let continuation_realm_hash = isolated_response_continuation::continuation_realm_hash(
+        provider_id,
+        model_id,
+        &key_realm_hash,
+        &resolved_endpoint,
+        &user_agent,
+        &transport_policy_fingerprint,
+    );
+    let mut probe_provider = provider.clone();
+    // Both requests must carry the same explicit UA, even if the normal
+    // provider configuration has no custom UA. This is probe-local only.
+    probe_provider.custom_user_agent = Some(user_agent.clone());
+
+    let nonce = Uuid::new_v4().simple().to_string();
+    let seed_body = isolated_response_continuation::seed_body(model_id, &nonce);
+    let seed_response = send_provider_management_probe_request(
+        state,
+        &probe_provider,
+        &selected_key.secret,
+        &Channel::Responses,
+        &seed_body,
+        isolated_response_continuation::REQUEST_KIND,
+    )
+    .await
+    .with_context(|| "isolated seed request failed")?;
+    let seed = isolated_response_continuation::inspect_response(
+        seed_response.status,
+        &seed_response.content_type,
+        &seed_response.bytes,
+        false,
+    );
+
+    let mut upstream_request_count = 1;
+    let mut continuation =
+        isolated_response_continuation::ResponseObservation::not_attempted(false);
+    if seed.observation.accepted {
+        if let Some(response_id) = seed.response_id.as_deref() {
+            let continuation_body =
+                isolated_response_continuation::continuation_body(model_id, response_id, &nonce);
+            let continuation_response = send_provider_management_probe_request(
+                state,
+                &probe_provider,
+                &selected_key.secret,
+                &Channel::Responses,
+                &continuation_body,
+                isolated_response_continuation::REQUEST_KIND,
+            )
+            .await
+            .with_context(|| "isolated continuation request failed")?;
+            continuation = isolated_response_continuation::inspect_response(
+                continuation_response.status,
+                &continuation_response.content_type,
+                &continuation_response.bytes,
+                true,
+            )
+            .observation;
+            upstream_request_count = 2;
+        }
+    }
+
+    let (key_binding_kind, key_binding_fingerprint) =
+        if let Some(key_id) = selected_key.key_id.as_deref() {
+            (
+                "pool-key-id",
+                isolated_response_continuation::fingerprint(key_id),
+            )
+        } else {
+            (
+                "provider-connection-key",
+                isolated_response_continuation::fingerprint(&format!(
+                    "{provider_id}:provider-connection-key"
+                )),
+            )
+        };
+    let identity = isolated_response_continuation::ProbeIdentity {
+        provider_id: provider_id.to_string(),
+        model_id: model_id.to_string(),
+        channel: "responses",
+        key_binding_kind,
+        key_binding_fingerprint,
+        key_id_present: selected_key.key_id.is_some(),
+        key_id_fingerprint: selected_key
+            .key_id
+            .as_deref()
+            .map(isolated_response_continuation::fingerprint),
+        key_realm_hash,
+        endpoint_fingerprint,
+        user_agent_fingerprint: isolated_response_continuation::fingerprint(&user_agent),
+        transport_policy_fingerprint,
+        continuation_realm_hash,
+        same_user_agent: true,
+    };
+    let complete_evidence = seed.observation.sse
+        && seed.observation.usage_present
+        && continuation.sse
+        && continuation.usage_present;
+    let ok = upstream_request_count == 2
+        && seed.observation.accepted
+        && seed.observation.response_id_present
+        && continuation.accepted
+        && continuation.response_id_present
+        && complete_evidence;
+
+    Ok(isolated_response_continuation::ProbeResult {
+        schema: "atoapi-isolated-response-continuation-probe-v1",
+        ok,
+        isolated: true,
+        live_18883_touched: false,
+        identity,
+        seed: seed.observation,
+        continuation,
+        upstream_request_count,
+        expected_upstream_request_count: 2,
+        no_raw_content: true,
+    })
+}
+
+fn select_isolated_response_continuation_probe_key(
+    config: &AppConfig,
+    provider: &ProviderConfig,
+    model_id: &str,
+    requested_key_id: Option<&str>,
+    requested_key_realm_hash: Option<&str>,
+) -> Result<SelectedProviderKey> {
+    let provider_id = provider.id.as_str();
+    let select = |preferred_key_id: Option<&str>| -> Result<Option<SelectedProviderKey>> {
+        let mut selection_config = config.clone();
+        selection_config
+            .select_provider_key_for_request(provider_id, preferred_key_id, None)
+            .with_context(|| "failed to select the requested provider key")
+    };
+
+    if let Some(requested_key_id) = requested_key_id {
+        let selected = select(Some(requested_key_id))?
+            .ok_or_else(|| anyhow!("requested provider key is not enabled"))?;
+        if selected.key_id.as_deref() != Some(requested_key_id) {
+            return Err(anyhow!("requested provider key is not enabled"));
+        }
+        if requested_key_realm_hash.is_some_and(|expected| {
+            isolated_response_continuation_probe_realm(provider, model_id, &selected)
+                != expected.trim()
+        }) {
+            return Err(anyhow!(
+                "requested provider key does not match the live Key realm"
+            ));
+        }
+        return Ok(selected);
+    }
+
+    if let Some(expected_realm) = requested_key_realm_hash.map(str::trim) {
+        let candidate_key_ids = config
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id && pool.enabled)
+            .map(|pool| {
+                pool.keys
+                    .iter()
+                    .map(|key| key.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !candidate_key_ids.is_empty() {
+            let mut matches = Vec::new();
+            for key_id in candidate_key_ids {
+                let Some(selected) = select(Some(&key_id))? else {
+                    continue;
+                };
+                if selected.key_id.as_deref() == Some(key_id.as_str())
+                    && isolated_response_continuation_probe_realm(provider, model_id, &selected)
+                        == expected_realm
+                {
+                    matches.push(selected);
+                }
+            }
+            return match matches.len() {
+                1 => Ok(matches.remove(0)),
+                0 => Err(anyhow!(
+                    "the live Key realm did not match any currently usable provider Key"
+                )),
+                _ => Err(anyhow!(
+                    "the live Key realm matched more than one provider Key"
+                )),
+            };
+        }
+    }
+
+    let selected = select(None)?.ok_or_else(|| anyhow!("provider API key is not configured"))?;
+    if requested_key_realm_hash.is_some_and(|expected| {
+        isolated_response_continuation_probe_realm(provider, model_id, &selected) != expected.trim()
+    }) {
+        return Err(anyhow!(
+            "selected provider key realm does not match the live scope assertion"
+        ));
+    }
+    Ok(selected)
+}
+
+fn isolated_response_continuation_probe_realm(
+    provider: &ProviderConfig,
+    model_id: &str,
+    selected_key: &SelectedProviderKey,
+) -> String {
+    affinity_identity::realm_id(
+        &RouteDecision {
+            provider: provider.clone(),
+            upstream_channel: Channel::Responses,
+            model: model_id.trim().to_string(),
+        },
+        selected_key,
+    )
 }
 
 async fn authorize_and_parse_admin_json<T: DeserializeOwned>(
@@ -1657,6 +2134,7 @@ async fn run_responses_compact_for_authorized_agent(
             .sent_cache_capability_fields
             .retain(|field| *field != ProviderCacheCapabilityField::PromptCacheKey);
     }
+    annotate_isolated_cache_control_probe_diagnostic(&mut upstream_request_diagnostics);
     upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
 
     let status = upstream.status().as_u16();
@@ -2758,6 +3236,16 @@ async fn run_generation_for_authorized_agent(
     // Ambiguous local lineage still gets one ordinary upstream request, but it
     // must not publish a waterline or teach prefix state from an unproven body.
     let mut full_replay_ambiguous_local_lineage = false;
+    // This tracks an actual rewrite of regenerated native Codex tool call ids.
+    // A separate flag below records an already-unambiguous local FullReplay
+    // recovery; neither flag is set by an external continuation or compaction.
+    let mut local_tool_id_rebind_applied = false;
+    let mut local_response_session_recovered_unambiguously = false;
+    // A recovered ambiguous local FullReplay may prove that only native Codex
+    // call ids were regenerated. Keep its read-only rebind plan so the exact
+    // proof can be applied after the local `previous_response_id` is removed,
+    // rather than cloning the full body for a probe and scanning it again.
+    let mut recovered_local_tool_id_rebind_plan = None;
     let stale_external_continuation = match (
         continuation_scope.as_ref(),
         incoming_previous_response_id.as_deref(),
@@ -2858,10 +3346,36 @@ async fn run_generation_for_authorized_agent(
             upstream_body.as_object_mut(),
         ) {
             if let Some(local_head) = lease.head().filter(|head| head.response_id == response_id) {
-                if let Some(recovery) = recover_full_replay_input(local_head, request.get("input"))
+                if let Some(mut recovery) =
+                    recover_full_replay_input(local_head, request.get("input"))
                 {
+                    // Preserve whether the caller's local FullReplay was
+                    // already safe before considering the separate narrow
+                    // regenerated-tool-id equivalence proof.  A mere plan is
+                    // not an unambiguous recovery and must not suppress a
+                    // pending material-tail maturity window.
+                    let recovery_was_unambiguous = !recovery.ambiguous_local_lineage;
+                    // A FullReplay that differs from the local prefix only by
+                    // regenerated, closed Codex tool call ids is not an
+                    // ambiguous history.  Preserve it as FullReplay here;
+                    // the same proof rebases those ids after the local p_r is
+                    // removed, before the one final upstream dispatch.
+                    if recovery.ambiguous_local_lineage
+                        && native_responses_passthrough
+                        && trusted_codex_metadata.is_some()
+                    {
+                        recovered_local_tool_id_rebind_plan =
+                            plan_native_codex_replayed_tool_id_rebind(
+                                &local_head.input,
+                                &recovery.input,
+                            );
+                        if recovered_local_tool_id_rebind_plan.is_some() {
+                            recovery.ambiguous_local_lineage = false;
+                        }
+                    }
                     let rebuilt_incremental = recovery.rebuilt_incremental;
                     full_replay_ambiguous_local_lineage |= recovery.ambiguous_local_lineage;
+                    local_response_session_recovered_unambiguously |= recovery_was_unambiguous;
                     request.insert("input".to_string(), recovery.input);
                     full_replay_after_local_lineage = rebuilt_incremental;
                 } else {
@@ -2884,7 +3398,9 @@ async fn run_generation_for_authorized_agent(
     }
     // Only an unreconstructable external continuation remains after the local
     // full-replay recovery above. It must not affect local lineage state.
-    let client_supplied_previous_response_id = upstream_body
+    let final_body_has_no_external_previous_response_id =
+        upstream_body.get("previous_response_id").is_none();
+    let remaining_external_previous_response_id = upstream_body
         .get("previous_response_id")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
@@ -2894,22 +3410,31 @@ async fn run_generation_for_authorized_agent(
     // keeps the actual upstream prefix stable without rewriting a first turn,
     // an external continuation, compaction, ambiguous recovery, user text or
     // any tool result value.
-    if native_responses_passthrough
-        && trusted_codex_metadata.is_some()
-        && incoming_previous_response_id.is_none()
-        && !full_replay_ambiguous_local_lineage
-        && !stale_external_continuation_after_route_switch
-        && !response_session_starts_compaction_epoch
-    {
+    if should_rebind_native_codex_replayed_tool_ids(
+        native_responses_passthrough,
+        trusted_codex_metadata.is_some(),
+        final_body_has_no_external_previous_response_id,
+        full_replay_ambiguous_local_lineage,
+        stale_external_continuation_after_route_switch,
+        response_session_starts_compaction_epoch,
+    ) {
         if let Some(previous_input) = response_session_snapshot_lease
             .as_ref()
             .and_then(|lease| lease.control_head())
             .map(|head| head.input())
         {
-            rebind_native_codex_replayed_tool_ids_to_predecessor(
-                &mut upstream_body,
-                previous_input,
-            );
+            let rebind_plan = recovered_local_tool_id_rebind_plan.take().or_else(|| {
+                upstream_body.get("input").and_then(|current_input| {
+                    plan_native_codex_replayed_tool_id_rebind(previous_input, current_input)
+                })
+            });
+            if let Some(rebind_plan) = rebind_plan {
+                local_tool_id_rebind_applied |= apply_native_codex_replayed_tool_id_rebind_plan(
+                    &mut upstream_body,
+                    previous_input,
+                    &rebind_plan,
+                );
+            }
         }
     }
     let full_response_input = upstream_body.get("input").cloned();
@@ -2968,7 +3493,7 @@ async fn run_generation_for_authorized_agent(
                 "full_replay_after_route_switch"
             } else if full_replay_after_local_lineage {
                 "full_replay_after_local_lineage"
-            } else if client_supplied_previous_response_id.is_some()
+            } else if remaining_external_previous_response_id.is_some()
                 && !response_session_starts_compaction_epoch
             {
                 "external_continuation"
@@ -2979,16 +3504,8 @@ async fn run_generation_for_authorized_agent(
         );
     }
     let local_prepare_ms = started.elapsed().as_millis() as u64;
-    // Prefix maturity can only be decided from the final frozen Responses
-    // wire.  Keep the diagnostic shell here so local risk rejection remains
-    // immediate; the actual bounded wait is performed after `freeze()` and
-    // the safety gate below, before the one-shot dispatch is consumed.
-    let mut prefix_guard_wait = PrefixGuardWaitDiagnostics {
-        skip_reason: prefix_guard_skip_reason.map(str::to_string),
-        ..PrefixGuardWaitDiagnostics::default()
-    };
     let response_session_parent = if !response_session_compaction_parent_matched
-        || (client_supplied_previous_response_id.is_some()
+        || (remaining_external_previous_response_id.is_some()
             && !response_session_starts_compaction_epoch)
     {
         LineageParent::ExternalContinuation
@@ -3053,7 +3570,7 @@ async fn run_generation_for_authorized_agent(
             None
         },
         active_channel: &active_request_channel,
-        context_mode: if client_supplied_previous_response_id.is_some()
+        context_mode: if remaining_external_previous_response_id.is_some()
             && !response_session_starts_compaction_epoch
         {
             CacheContextMode::ExternalContinuation
@@ -3128,8 +3645,34 @@ async fn run_generation_for_authorized_agent(
     let trusted_generated_cache_identity = session_identity
         .as_ref()
         .filter(|identity| session_identity_source_is_trusted(identity.source));
-    let generated_prompt_cache_key_value = trusted_generated_cache_identity
-        .map(|identity| generated_prompt_cache_key(identity, &decision, &selected_provider_key));
+    let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
+        agent_generation,
+        native_responses_passthrough,
+        &active_request_channel,
+        active_used_response_session,
+        response_session_starts_compaction_epoch,
+        trusted_generated_cache_identity.is_some(),
+    );
+    let thread_stable_prompt_cache_key_bridge = generated_prompt_cache_key_eligible
+        && !full_replay_ambiguous_local_lineage
+        && final_body_has_no_external_previous_response_id
+        && !response_session_starts_compaction_epoch
+        && isolated_thread_stable_prompt_cache_key_bridge_enabled();
+    let generated_prompt_cache_key_value = trusted_generated_cache_identity.map(|identity| {
+        if thread_stable_prompt_cache_key_bridge {
+            generated_prompt_cache_key_thread_bridge(
+                identity,
+                &identity_client_request,
+                &decision,
+                &selected_provider_key,
+            )
+            .unwrap_or_else(|| {
+                generated_prompt_cache_key(identity, &decision, &selected_provider_key)
+            })
+        } else {
+            generated_prompt_cache_key(identity, &decision, &selected_provider_key)
+        }
+    });
     // Direct connection-info Keys used the v1.3.x placement key. Preserve that
     // stable value on the normal compatibility path so an upgrade does not
     // cold-start a working upstream cache; pooled Keys stay realm-scoped.
@@ -3142,14 +3685,6 @@ async fn run_generation_for_authorized_agent(
     // and options candidates must continue to compare within their ordinary
     // selected-Key realm; attaching a generated-key digest to those runs would
     // make a valid baseline look like a different scope.
-    let generated_prompt_cache_key_eligible = generated_native_full_replay_cache_controls_eligible(
-        agent_generation,
-        native_responses_passthrough,
-        &active_request_channel,
-        active_used_response_session,
-        response_session_starts_compaction_epoch,
-        trusted_generated_cache_identity.is_some(),
-    );
     let controlled_probe_fields = controlled_cache_probe_fields(
         &config,
         &decision,
@@ -3251,15 +3786,22 @@ async fn run_generation_for_authorized_agent(
     // A generated placement key may also be measured in an explicit candidate
     // run. Promotion certificates remain exact-session scoped, so they cannot
     // make a different conversation eligible.
-    // An isolated verifier may request the already-planned Options probe
-    // without starting the normal shadow controller.  This is deliberately
-    // narrower than a generic force flag: it requires the test-instance
-    // marker, the exact `prompt-cache-options` field name, and a planner
-    // result containing that one field only.  It therefore cannot change the
-    // live process or turn an unplanned/multi-field cache control into a wire
-    // mutation.
-    let isolated_options_probe_forced = isolated_options_probe_requested(&controlled_probe_fields);
-    let candidate_cache_routing_requested = isolated_options_probe_forced
+    // An isolated verifier may request exactly one already compatibility-
+    // verified native cache control without starting the normal shadow
+    // controller. It is limited to a disposable test instance and the exact
+    // provider/model/channel/Key scope, so it cannot alter live traffic or
+    // turn an unplanned multi-field mutation into a candidate.
+    let forced_isolated_cache_control_field = isolated_cache_control_probe_field(
+        &config,
+        &decision,
+        &active_request_channel,
+        selected_provider_key.key_id.as_deref(),
+    );
+    let isolated_cache_control_probe_forced = forced_isolated_cache_control_field.is_some();
+    let candidate_cache_control_fields = forced_isolated_cache_control_field
+        .map(|field| vec![field])
+        .unwrap_or_else(|| controlled_probe_fields.clone());
+    let candidate_cache_routing_requested = isolated_cache_control_probe_forced
         || shadow_affinity_decision.as_mut().is_some_and(|decision| {
             let channel_eligible =
                 matches!(active_request_channel, Channel::Responses | Channel::Chat)
@@ -3299,15 +3841,31 @@ async fn run_generation_for_authorized_agent(
             // placement key.
             true
         });
+    let mut isolated_cache_control_decision = decision.clone();
+    if forced_isolated_cache_control_field
+        == Some(ProviderCacheCapabilityField::PromptCacheRetention)
+    {
+        // Retention is normally a provider opt-in. The disposable verifier
+        // may test the already accepted field without changing that saved
+        // provider setting or any production request.
+        isolated_cache_control_decision
+            .provider
+            .prompt_cache_retention_enabled = true;
+    }
+    let cache_control_decision = if isolated_cache_control_probe_forced {
+        &isolated_cache_control_decision
+    } else {
+        &decision
+    };
     let mut cache_control_application = apply_native_cache_controls_with_probe_fields(
         &mut active_upstream_body,
         &config,
-        &decision,
+        cache_control_decision,
         &active_request_channel,
         selected_provider_key.key_id.as_deref(),
         Some(cache_effect_scope_id.as_str()),
         if candidate_cache_routing_requested {
-            &controlled_probe_fields
+            &candidate_cache_control_fields
         } else {
             &[]
         },
@@ -3353,7 +3911,32 @@ async fn run_generation_for_authorized_agent(
         );
     }
     let generated_prompt_cache_key_requested = candidate_cache_routing_requested
-        && controlled_probe_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
+        && candidate_cache_control_fields.contains(&ProviderCacheCapabilityField::PromptCacheKey);
+    // The isolated native-PCK verifier may request a distinct, deterministic
+    // candidate key.  This is a disposable experiment-only override: it is
+    // accepted only for an isolated process, only when the forced field is
+    // prompt_cache_key, and only after the normal generated-key eligibility
+    // gate has passed.  Production traffic never reads this variable.
+    let isolated_prompt_cache_key_override = if generated_prompt_cache_key_requested
+        && isolated_cache_control_probe_forced
+        && forced_isolated_cache_control_field == Some(ProviderCacheCapabilityField::PromptCacheKey)
+        // The thread-stable bridge owns the generated placement.  Never let
+        // the generic verifier override replace it, otherwise the candidate
+        // would test a run-scoped key instead of the thread-derived key.
+        && !thread_stable_prompt_cache_key_bridge
+        && std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        && generated_prompt_cache_key_eligible
+    {
+        std::env::var("ATOAPI_FORCE_ISOLATED_PROMPT_CACHE_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+    } else {
+        None
+    };
     if client_owned_prompt_cache_key_active {
         active_upstream_body.set_root(
             "prompt_cache_key",
@@ -3364,15 +3947,21 @@ async fn run_generation_for_authorized_agent(
                     .to_string(),
             ),
         );
-    } else if let Some(cache_key) = selected_prompt_cache_placement_key(
-        legacy_direct_prompt_cache_key_value.as_deref(),
-        generated_prompt_cache_key_value.as_deref(),
-        &selected_provider_key,
-        generated_prompt_cache_key_recovery_enabled,
-        generated_prompt_cache_key_requested,
-        generated_prompt_cache_key_promoted,
-        generated_prompt_cache_key_eligible,
-    ) {
+    } else if let Some(cache_key) =
+        if let Some(override_key) = isolated_prompt_cache_key_override.as_deref() {
+            Some(override_key)
+        } else {
+            selected_prompt_cache_placement_key(
+                legacy_direct_prompt_cache_key_value.as_deref(),
+                generated_prompt_cache_key_value.as_deref(),
+                &selected_provider_key,
+                generated_prompt_cache_key_recovery_enabled,
+                generated_prompt_cache_key_requested,
+                generated_prompt_cache_key_promoted,
+                generated_prompt_cache_key_eligible,
+            )
+        }
+    {
         cache_capability::apply_generated_prompt_cache_key(
             &mut active_upstream_body,
             cache_key,
@@ -3456,14 +4045,14 @@ async fn run_generation_for_authorized_agent(
     // position for a breakpoint.
     let actual_controlled_cache_probe_fields = candidate_cache_routing_requested.then(|| {
         controlled_cache_probe_fields_on_final_wire(
-            &controlled_probe_fields,
+            &candidate_cache_control_fields,
             &final_wire_receipt,
             Some(&cache_control_application),
         )
     });
     let candidate_cache_routing_applied = actual_controlled_cache_probe_fields
         .as_ref()
-        .is_some_and(|fields| fields == &controlled_probe_fields);
+        .is_some_and(|fields| fields == &candidate_cache_control_fields);
     if candidate_cache_routing_requested && !candidate_cache_routing_applied {
         if let Some(decision) = shadow_affinity_decision.as_mut() {
             decision.mode = "validation".to_string();
@@ -3502,10 +4091,9 @@ async fn run_generation_for_authorized_agent(
             active_channel: &active_request_channel,
             final_wire: &final_wire_receipt,
         });
-    // This is the first point where the semantic body and the actual outbound
-    // Responses wire are both final.  A safety decision here can therefore
-    // stop an unsafe FullReplay before the one-shot transport seam, without
-    // changing normal/delta routes or dispatching a second request.
+    // The semantic body and actual outbound Responses wire are both final at
+    // this point. Keep an aggregate shape for post-response diagnostics only;
+    // payload size or content shape must never block transparent forwarding.
     apply_prepared_body_lengths(&mut diagnostics, generation_plan.request_plan());
     let full_replay_risk_scope = (matches!(client_channel, Channel::Responses)
         && matches!(active_request_channel, Channel::Responses)
@@ -3536,30 +4124,8 @@ async fn run_generation_for_authorized_agent(
             full_replay_risk_signals,
         )
     });
-    let blocked_shape = match full_replay_risk_scope.as_ref() {
-        Some(scope) => state
-            .full_replay_risk_observations
-            .lock()
-            .await
-            .recent_blocked_shape(scope),
-        None => None,
-    };
-    let full_replay_risk = evaluate_full_replay_risk(FullReplayRiskInput {
-        is_responses_route: matches!(client_channel, Channel::Responses)
-            && matches!(active_request_channel, Channel::Responses),
-        is_full_replay: final_scope_waterline_is_full_replay,
-        has_native_continuation: generation_plan
-            .body()
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty()),
-        final_body_bytes: generation_plan.request_plan().body_len() as u64,
-        blocked_shape,
-        signals: full_replay_risk_signals,
-    });
     upstream_request_diagnostics.full_replay_risk_shape = full_replay_risk_shape;
-    // Register the inbound before a possible local rejection so Codex metrics
-    // truthfully report attempt_count=0 rather than losing the request.
+    // Register the inbound before the single upstream dispatch.
     let agent_policy = AttemptPolicy::Single;
     if agent_generation {
         let gate = AttemptGate::new(request_id.clone(), agent_policy)
@@ -3574,116 +4140,6 @@ async fn run_generation_for_authorized_agent(
             })
             .await;
         assert!(began, "a fresh Agent inbound id must begin exactly once");
-    }
-    if let Some(rejection) = full_replay_risk {
-        // This request never reaches a safe terminal settlement.  Retire only
-        // its exact process-local maturity receipt so a manual compact/new
-        // continuation starts from a clean local baseline rather than keeping
-        // an old FullReplay wait alive.
-        if final_scope_waterline_is_full_replay {
-            retire_native_maturity_scope(
-                &state,
-                provider_prefix_control_key.as_deref(),
-                final_maturity_parent_scope_digest(
-                    upstream_request_diagnostics.final_scope_shadow.as_ref(),
-                ),
-                final_wire_receipt
-                    .wire
-                    .responses_cache_maturity_static_projection_digest
-                    .as_deref(),
-            )
-            .await;
-        }
-        let diagnostic = rejection.diagnostic_summary();
-        let client_message = format!(
-            "full-replay context payload is unsafe for this upstream route; {diagnostic}; compact this conversation or start a new clean continuation"
-        );
-        let mut request_log = upstream_transport_failure_log(
-            &request_id,
-            &started,
-            &client_channel,
-            &active_request_channel,
-            &decision,
-            eligible.then_some(metrics_cache_key.as_str()),
-            provider_prefix_key.as_deref(),
-            provider_prefix_fingerprint.as_deref(),
-            &prefix_guard_wait,
-            local_prepare_ms,
-            &diagnostics,
-            generation_plan.body(),
-            active_used_response_session,
-            &response_session_reuse_diagnostics,
-            requested_model_for_log.clone(),
-            "responses_full_replay_risk_gate",
-            None,
-            None,
-        );
-        request_log.status = StatusCode::UNPROCESSABLE_ENTITY.as_u16();
-        request_log.agent_id = authorized_agent.clone();
-        request_log.agent_label = authorized_agent.clone();
-        request_log.upstream_request_id = None;
-        request_log.upstream_attempt_index = None;
-        request_log.upstream_attempt_total = Some(0);
-        request_log.upstream_attempts = Some(0);
-        request_log.upstream_call_kind = Some("local_rejection".to_string());
-        request_log.upstream_call_source = Some("responses_full_replay_risk_gate".to_string());
-        request_log.upstream_header_wait_class = Some("local:context_payload_unsafe".to_string());
-        request_log.provider_cache_diagnostic =
-            Some(format!("full_replay_risk:{}", rejection.reason.label()));
-        request_log.sse_end_reason = Some("context_payload_unsafe".to_string());
-        request_log.downstream_disconnected = Some(false);
-        request_log.downstream_disconnect_stage = None;
-        apply_tail_input_diagnostics(&mut request_log, &tail_input_diagnostics);
-        apply_session_anchor_diagnostics(&mut request_log, &session_anchor_diagnostics);
-        if agent_generation {
-            let mut transaction =
-                MetricsTransaction::agent_local_rejection(AgentLocalRejectionSettlement {
-                    inbound_request_id: request_id.clone(),
-                    request: request_log,
-                    inbound_outcome: AgentInboundOutcome::LocalRejection,
-                    terminal_state: Some("context_payload_unsafe".to_string()),
-                });
-            transaction.observe_error("context_payload_unsafe", diagnostic.clone());
-            state.metrics.commit(transaction).await;
-        } else {
-            let mut transaction = MetricsTransaction::local_rejection(request_log);
-            transaction.observe_error("context_payload_unsafe", diagnostic.clone());
-            state.metrics.commit(transaction).await;
-        }
-        let failure_payload = canonical_responses_failure_payload(
-            &decision.model,
-            None,
-            ResponsesFailureCode::ContextPayloadUnsafe,
-            client_message,
-            &request_id,
-            None,
-            None,
-        );
-        let (status, content_type, body) = if client_requested_stream {
-            let payload = serde_json::to_string(&failure_payload).unwrap_or_else(|_| {
-                "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
-            });
-            (
-                StatusCode::OK.as_u16(),
-                "text/event-stream",
-                Bytes::from(format!("event: response.failed\ndata: {payload}\n\n")),
-            )
-        } else {
-            (
-                StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
-                "application/json",
-                Bytes::from(
-                    serde_json::to_vec(&failure_payload)
-                        .unwrap_or_else(|_| b"{\"type\":\"response.failed\"}".to_vec()),
-                ),
-            )
-        };
-        let response = raw_bytes_response(status, content_type, body);
-        if let Some(handoff) = response_handoff {
-            let _ = handoff.send(response);
-            return Response::new(Body::empty());
-        }
-        return response;
     }
     let final_responses_static_projection = final_responses_maturity_projection(
         native_responses_passthrough && matches!(&active_request_channel, Channel::Responses),
@@ -3714,8 +4170,11 @@ async fn run_generation_for_authorized_agent(
             .map(ToOwned::to_owned)
         })
         .flatten();
-    prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
-        wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
+    // Prefix maturity is a cache observation, never a prerequisite for the
+    // upstream request. The live budget below is zero, so this snapshot can
+    // explain a cache opportunity without making it visible as user TTFT.
+    let mut prefix_guard_wait = if responses_prefix_snapshot_enabled || prefix_guard.is_some() {
+        wait_for_provider_prefix_settle_on_final_wire_with_scope_reason_and_options_proof(
             &state,
             &decision.upstream_channel,
             provider_prefix_control_key.as_deref(),
@@ -3726,6 +4185,11 @@ async fn run_generation_for_authorized_agent(
             final_responses_static_projection,
             final_maturity_parent_scope_digest.as_deref(),
             final_maturity_scope_skip_reason,
+            final_wire_receipt
+                .wire
+                .prompt_cache_options_sibling_proof
+                .as_ref(),
+            local_tool_id_rebind_applied,
         )
         .await
     } else {
@@ -3763,10 +4227,25 @@ async fn run_generation_for_authorized_agent(
         // remaining portion and never dispatches another upstream request.
         let already_waited = prefix_guard_wait.wait_duration;
         let remaining_budget = remaining_responses_prefix_wait_budget(already_waited);
-        let wait = if claim.followup_is_settle_safe(
-            &tail_input_diagnostics,
-            response_session_starts_compaction_epoch,
-        ) {
+        let local_full_replay_reconciled = local_tool_id_rebind_applied
+            || (local_response_session_recovered_unambiguously
+                && !full_replay_ambiguous_local_lineage
+                && final_body_has_no_external_previous_response_id
+                && !stale_external_continuation_after_route_switch
+                && !response_session_starts_compaction_epoch);
+        let suppress_duplicate_local_full_replay_material_tail_wait =
+            should_suppress_duplicate_local_full_replay_material_tail_wait(
+                local_full_replay_reconciled,
+                &prefix_guard_wait,
+                claim.is_material_tool_tail(),
+            );
+        let wait = if responses_foreground_wait_enabled()
+            && claim.followup_is_settle_safe(
+                &tail_input_diagnostics,
+                response_session_starts_compaction_epoch,
+            )
+            && !suppress_duplicate_local_full_replay_material_tail_wait
+        {
             claim.wait_duration().min(remaining_budget)
         } else {
             TokioDuration::ZERO
@@ -3814,7 +4293,18 @@ async fn run_generation_for_authorized_agent(
     let mut final_scope_dispatch = final_scope_begin
         .and_then(|result| result.ticket)
         .map(|ticket| FinalScopeDispatchGuard::new(state.clone(), ticket));
+    upstream_request_diagnostics.sent_cache_capability_fields =
+        final_wire_receipt.cache_controls.present_fields();
+    if upstream_request_diagnostics.client_owned_prompt_cache_key {
+        upstream_request_diagnostics
+            .sent_cache_capability_fields
+            .retain(|field| *field != ProviderCacheCapabilityField::PromptCacheKey);
+    }
+    // Record the isolated Options witness before the network await as well.
+    // A pre-header transport failure otherwise loses the exact frozen-wire
+    // fact that determines whether this candidate can be classified safely.
     upstream_request_diagnostics.final_wire_receipt = Some(final_wire_receipt);
+    annotate_isolated_cache_control_probe_diagnostic(&mut upstream_request_diagnostics);
     let skip_gzip_for_cold_stream = should_skip_request_body_gzip_for_cold_stream(
         &active_request_channel,
         client_requested_stream,
@@ -4140,6 +4630,7 @@ async fn run_generation_for_authorized_agent(
             .sent_cache_capability_fields
             .retain(|field| *field != ProviderCacheCapabilityField::PromptCacheKey);
     }
+    annotate_isolated_cache_control_probe_diagnostic(&mut upstream_request_diagnostics);
     upstream_request_diagnostics.cache_capability_key_id = selected_provider_key.key_id.clone();
     let is_stream = should_proxy_upstream_as_stream(
         is_success_status,
@@ -4692,6 +5183,10 @@ async fn run_generation_for_authorized_agent(
             && !sync_compact_diagnostic_only
             && !confirmed_compaction
             && !full_replay_ambiguous_local_lineage,
+        upstream_request_diagnostics
+            .final_wire_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.wire.prompt_cache_options_sibling_proof.as_ref()),
         upstream_request_diagnostics.final_scope_waterline.as_ref(),
     )
     .await;
@@ -5176,6 +5671,38 @@ async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
     final_maturity_parent_scope_digest: Option<&str>,
     final_maturity_scope_skip_reason: Option<&'static str>,
 ) -> PrefixGuardWaitDiagnostics {
+    wait_for_provider_prefix_settle_on_final_wire_with_scope_reason_and_options_proof(
+        state,
+        channel,
+        provider_prefix_key,
+        provider_prefix_family_key,
+        current_tail,
+        compaction_requested,
+        max_wait,
+        final_responses_static_projection,
+        final_maturity_parent_scope_digest,
+        final_maturity_scope_skip_reason,
+        None,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason_and_options_proof(
+    state: &AppState,
+    channel: &Channel,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_family_key: Option<&str>,
+    current_tail: &TailInputDiagnostics,
+    compaction_requested: bool,
+    max_wait: Option<TokioDuration>,
+    final_responses_static_projection: FinalResponsesStaticProjection<'_>,
+    final_maturity_parent_scope_digest: Option<&str>,
+    final_maturity_scope_skip_reason: Option<&'static str>,
+    final_prompt_cache_options_sibling_proof: Option<&PromptCacheOptionsSiblingProof>,
+    suppress_proactive_exact_settle: bool,
+) -> PrefixGuardWaitDiagnostics {
     if provider_prefix_key.is_none() && provider_prefix_family_key.is_none() {
         return PrefixGuardWaitDiagnostics {
             skip_reason: Some("no_provider_prefix_key".to_string()),
@@ -5217,13 +5744,36 @@ async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
                     ..PrefixGuardWaitDiagnostics::default()
                 };
             };
-            scopes
-                .get(
-                    prefix_control_key,
-                    parent_scope_digest,
-                    static_projection_digest,
-                )
-                .map(|state| ("exact".to_string(), state))
+            let exact = scopes.get(
+                prefix_control_key,
+                parent_scope_digest,
+                static_projection_digest,
+            );
+            // A 24h Options probe creates a new frozen-wire sibling.  During
+            // an isolated crossover, the sibling's freshly settled high-hit
+            // state can still be useful as a *wait hint* when the current
+            // Options state is older than the 500ms foreground window.  It is
+            // never treated as current-wire maturity or waterline evidence;
+            // the exact state remains authoritative for settlement.
+            let isolated_options_sibling =
+                cache_capability::isolated_prompt_cache_options_ttl_24h_enabled()
+                    .then(|| {
+                        scopes.newest_live_prompt_cache_options_sibling(
+                            prefix_control_key,
+                            parent_scope_digest,
+                            static_projection_digest,
+                            final_prompt_cache_options_sibling_proof,
+                        )
+                    })
+                    .flatten();
+            if isolated_options_sibling_should_supply_settle_hint(
+                exact.as_ref(),
+                isolated_options_sibling.as_ref(),
+            ) {
+                isolated_options_sibling.map(|state| ("options-sibling".to_string(), state))
+            } else {
+                exact.map(|state| ("exact".to_string(), state))
+            }
         } else {
             // Prefix settling is an optimization. A busy bookkeeping map must not
             // consume the caller's foreground wait budget before the actual
@@ -5262,10 +5812,12 @@ async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
         let state_cache_read_tokens = state.cache_read_tokens;
 
         if matches!(channel, Channel::Responses) {
-            if !PrefixController::final_static_projection_compatible(
-                &state,
-                final_responses_static_projection,
-            ) {
+            if source == "exact"
+                && !PrefixController::final_static_projection_compatible(
+                    &state,
+                    final_responses_static_projection,
+                )
+            {
                 return PrefixGuardWaitDiagnostics {
                     skip_reason: Some("final_static_projection_changed".to_string()),
                     source: Some(source),
@@ -5276,31 +5828,97 @@ async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
                     ..PrefixGuardWaitDiagnostics::default()
                 };
             }
+            // The isolated Options sibling is only a propagation-delay hint.
+            // Do not feed its waterline, avoidable-gap, instability, or cold
+            // evidence into the generic exact-source policy.  Its sole effect
+            // is to spend the remainder of the existing <=500ms fresh,
+            // high-hit settle window; no sibling evidence is returned as a
+            // current-wire recovery signal.
+            if source == "options-sibling" {
+                let cap = responses_foreground_wait_cap();
+                if compaction_requested {
+                    return PrefixGuardWaitDiagnostics {
+                        skip_reason: Some("options_sibling_compaction_requested".to_string()),
+                        source: Some(source),
+                        state_age_ms: Some(state_age_ms),
+                        ..PrefixGuardWaitDiagnostics::default()
+                    };
+                }
+                let requested_wait = cap.saturating_sub(state_age);
+                let request_budget = max_wait.unwrap_or(cap).min(cap);
+                if request_budget.is_zero() {
+                    return PrefixGuardWaitDiagnostics {
+                        skip_reason: Some("local_guard_budget_exhausted".to_string()),
+                        budget_exhausted: true,
+                        source: Some(source),
+                        state_age_ms: Some(state_age_ms),
+                        ..PrefixGuardWaitDiagnostics::default()
+                    };
+                }
+                if requested_wait.is_zero() {
+                    return PrefixGuardWaitDiagnostics {
+                        skip_reason: Some("options_sibling_settle_window_elapsed".to_string()),
+                        source: Some(source),
+                        state_age_ms: Some(state_age_ms),
+                        ..PrefixGuardWaitDiagnostics::default()
+                    };
+                }
+                let wait = requested_wait.min(request_budget);
+                sleep(wait).await;
+                return PrefixGuardWaitDiagnostics {
+                    wait_duration: wait,
+                    wait_ms: wait.as_millis() as u64,
+                    reason: Some("responses_prompt_cache_options_sibling_settle".to_string()),
+                    source: Some(source),
+                    state_age_ms: Some(state_age_ms),
+                    skip_reason: None,
+                    budget_exhausted: wait < requested_wait,
+                    pre_request_avoidable_tokens: 0,
+                    recovery_applicable: false,
+                    exact_settle_window_elapsed: false,
+                    settled_exact_state_finished_at: None,
+                    cache_instability_score: None,
+                    seen_bucket_tokens: None,
+                    state_cache_read_tokens: None,
+                };
+            }
             let avoidable_tokens = state
                 .avoidable_shortfall_tokens_128
                 .max(state.avoidable_shortfall_tokens);
-            let policy = PrefixController::before_request(PrefixControlInput {
-                source_is_exact: source == "exact",
-                recent_exact_high_hit: responses_exact_prefix_is_high_hit(&state),
-                recent_exact_warm_small_tail: responses_exact_prefix_is_warm_small_tail(
-                    &state,
-                    current_tail,
-                ),
-                avoidable_tokens,
-                fine_avoidable_tokens: state.avoidable_shortfall_tokens_128,
-                avoidable_shortfall_streak: state.avoidable_shortfall_streak,
-                cache_instability_score: state.cache_instability_score,
-                tiny_instability_recovery_safe: state.recent_clean_tiny_gap_streak
-                    >= MIN_CLEAN_TINY_RECOVERY_STREAK
-                    && responses_tiny_instability_recovery_tail_is_clean(current_tail),
-                current_tail_is_settle_safe: !responses_current_tail_makes_avoidable_unreliable(
-                    current_tail,
-                ) && !responses_tool_tail_burst(current_tail),
-                settle_after_cold_read: state.settle_after_cold_read,
-                compaction_requested,
-                state_age,
-                request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
-            });
+            let provider_waterline_recovery_candidate =
+                isolated_provider_waterline_recovery_settle_enabled()
+                    && responses_provider_waterline_recovery_settle_eligible(&state);
+            let policy = PrefixController::before_request_with_provider_waterline_recovery(
+                PrefixControlInput {
+                    source_is_exact: source == "exact",
+                    // A local FullReplay rebind has already reconciled the
+                    // predecessor before this frozen-wire check. Repeating
+                    // the no-gap proactive settle barrier here only adds up
+                    // to 500ms of foreground latency; retain all actionable
+                    // avoidable-gap recovery branches below.
+                    recent_exact_high_hit: !suppress_proactive_exact_settle
+                        && responses_exact_prefix_is_high_hit(&state),
+                    recent_exact_warm_small_tail: !suppress_proactive_exact_settle
+                        && responses_exact_prefix_is_warm_small_tail(&state, current_tail),
+                    avoidable_tokens,
+                    fine_avoidable_tokens: state.avoidable_shortfall_tokens_128,
+                    known_exact_pending_residual: state.avoidable_shortfall_tokens_128 > 0
+                        && state.seen_bucket_tokens_128 > state.cache_read_tokens,
+                    avoidable_shortfall_streak: state.avoidable_shortfall_streak,
+                    cache_instability_score: state.cache_instability_score,
+                    tiny_instability_recovery_safe: state.recent_clean_tiny_gap_streak
+                        >= MIN_CLEAN_TINY_RECOVERY_STREAK
+                        && responses_tiny_instability_recovery_tail_is_clean(current_tail),
+                    current_tail_is_settle_safe: !responses_current_tail_makes_avoidable_unreliable(
+                        current_tail,
+                    ) && !responses_tool_tail_burst(current_tail),
+                    settle_after_cold_read: state.settle_after_cold_read,
+                    compaction_requested,
+                    state_age,
+                    request_budget: max_wait.unwrap_or_else(responses_foreground_wait_cap),
+                },
+                provider_waterline_recovery_candidate,
+            );
             let exact_settle_window_elapsed = prefix_exact_settle_window_elapsed(
                 &source,
                 state_age,
@@ -5325,10 +5943,15 @@ async fn wait_for_provider_prefix_settle_on_final_wire_with_scope_reason(
                 };
             }
             sleep(policy.wait).await;
+            let reason = if source == "options-sibling" {
+                Some("responses_prompt_cache_options_sibling_settle".to_string())
+            } else {
+                policy.reason.map(str::to_string)
+            };
             return PrefixGuardWaitDiagnostics {
                 wait_duration: policy.wait,
                 wait_ms: policy.wait.as_millis() as u64,
-                reason: policy.reason.map(str::to_string),
+                reason,
                 source: Some(source),
                 state_age_ms: Some(state_age_ms),
                 skip_reason: None,
@@ -5888,6 +6511,25 @@ fn remaining_responses_prefix_wait_budget(already_waited: TokioDuration) -> Toki
     responses_foreground_wait_cap().saturating_sub(already_waited)
 }
 
+/// A fully reconciled local FullReplay has already restored the exact local
+/// predecessor before the frozen-wire guard. In that narrow no-gap case, a
+/// subsequent `MaterialToolTail` claim would repeat a foreground wait that
+/// cannot improve cache evidence. This applies to an already-unambiguous local
+/// recovery or an actual safe native tool-id rebind; it never covers external
+/// continuations, compaction, ambiguity, another claim kind, or an actionable
+/// pre-request gap.
+fn should_suppress_duplicate_local_full_replay_material_tail_wait(
+    local_full_replay_reconciled: bool,
+    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
+    material_tool_tail_claim: bool,
+) -> bool {
+    local_full_replay_reconciled
+        && material_tool_tail_claim
+        && prefix_guard_wait.wait_duration.is_zero()
+        && prefix_guard_wait.skip_reason.as_deref() == Some("no_avoidable_gap")
+        && prefix_guard_wait.pre_request_avoidable_tokens == 0
+}
+
 async fn settle_full_replay_maturity_pending(
     state: &AppState,
     upstream_request_diagnostics: &UpstreamRequestDiagnostics,
@@ -5898,8 +6540,14 @@ async fn settle_full_replay_maturity_pending(
     upstream_succeeded: bool,
     confirmed_compaction: bool,
 ) {
+    // This is deliberately evaluated at the final arm point.  The late
+    // shallow rollback path must remain absent from normal desktop traffic
+    // and from an isolated candidate that was launched without its explicit
+    // waterline-recovery treatment flag.
+    let late_shallow_provider_waterline_rollback_enabled =
+        isolated_provider_waterline_recovery_settle_enabled();
     let mut warm_pending = state.warm_pending.lock().await;
-    warm_pending.settle(
+    warm_pending.settle_with_late_shallow_provider_waterline_rollback(
         upstream_request_diagnostics.warm_pending_claim.as_ref(),
         prefix_control_key,
         upstream_request_diagnostics
@@ -5911,6 +6559,7 @@ async fn settle_full_replay_maturity_pending(
         tail,
         upstream_succeeded,
         confirmed_compaction,
+        late_shallow_provider_waterline_rollback_enabled,
     );
 }
 
@@ -5918,6 +6567,44 @@ fn responses_exact_prefix_is_high_hit(state: &PrefixWarmState) -> bool {
     state.input_tokens >= 32_000
         && state.cache_read_tokens >= 32_000
         && state.cache_read_tokens.saturating_mul(100) >= state.input_tokens.saturating_mul(98)
+}
+
+/// An isolated 24h Options probe may use a newer sibling only to spend the
+/// existing foreground wait window. The sibling is never reused as current
+/// wire maturity: any current exact state inside that window always wins, and
+/// an unstable/cold sibling fails open.
+fn isolated_options_sibling_should_supply_settle_hint(
+    exact: Option<&PrefixWarmState>,
+    sibling: Option<&PrefixWarmState>,
+) -> bool {
+    let cap = responses_foreground_wait_cap();
+    let exact_is_fresh = exact.is_some_and(|state| state.finished_at.elapsed() < cap);
+    !exact_is_fresh
+        && sibling.is_some_and(|state| {
+            state.finished_at.elapsed() < cap
+                && responses_exact_prefix_is_high_hit(state)
+                && !state.settle_after_cold_read
+                && state.cache_instability_score <= 2
+        })
+}
+
+/// A current state can be retried after one bounded settle only when it is a
+/// shallow, otherwise warm provider-waterline rollback. This excludes cold
+/// starts, large dynamic tails, locally actionable gaps, and all unstable
+/// histories. The caller additionally requires the disposable test flag.
+fn responses_provider_waterline_recovery_settle_eligible(state: &PrefixWarmState) -> bool {
+    const MIN_CACHED_TOKENS: u64 = 32_000;
+    const MAX_SHALLOW_SHORTFALL_TOKENS: u64 = 4_096;
+
+    let shortfall = state.shortfall_tokens_128.max(state.shortfall_tokens);
+    state.input_tokens >= MIN_CACHED_TOKENS
+        && state.cache_read_tokens >= MIN_CACHED_TOKENS
+        && state.cache_read_tokens.saturating_mul(100) >= state.input_tokens.saturating_mul(97)
+        && (128..=MAX_SHALLOW_SHORTFALL_TOKENS).contains(&shortfall)
+        && matches!(state.cache_instability_score, 1 | 2)
+        && state.avoidable_shortfall_tokens == 0
+        && state.avoidable_shortfall_tokens_128 == 0
+        && !state.settle_after_cold_read
 }
 
 /// A deliberately narrow extension of `responses_exact_prefix_is_high_hit`.
@@ -5968,7 +6655,16 @@ fn prefix_guard_wait_budget_for_channel(
     channel: &Channel,
     _elapsed_since_request_start: TokioDuration,
 ) -> Option<TokioDuration> {
-    matches!(channel, Channel::Responses).then_some(responses_foreground_wait_cap())
+    // Responses is the native Agent path. Hit-rate optimization on this path
+    // is observation-only and may never spend foreground latency.
+    matches!(channel, Channel::Responses).then_some(TokioDuration::ZERO)
+}
+
+/// Foreground cache settling is deliberately disabled on the live forwarding
+/// path.  Cache maturity may still be observed and settled after the upstream
+/// response, but it must never delay a caller's request.
+fn responses_foreground_wait_enabled() -> bool {
+    false
 }
 
 fn prefix_guard_wait_effect(
@@ -6238,61 +6934,6 @@ fn gzip_request_body(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), request_body_gzip_compression(bytes.len()));
     encoder.write_all(bytes)?;
     encoder.finish()
-}
-
-fn should_retry_without_gzip(status: reqwest::StatusCode) -> bool {
-    matches!(
-        status,
-        reqwest::StatusCode::BAD_REQUEST
-            | reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
-            | reqwest::StatusCode::NOT_IMPLEMENTED
-    )
-}
-
-fn request_body_gzip_scope_key(url: &str, channel: &Channel) -> String {
-    let channel = match channel {
-        Channel::Responses => "responses",
-        Channel::Chat => "chat",
-        Channel::Anthropic => "anthropic",
-    };
-    let provider_scope = reqwest::Url::parse(url)
-        .ok()
-        .and_then(|url| {
-            let scheme = url.scheme().to_string();
-            let host = url.host_str()?.to_ascii_lowercase();
-            let port = url
-                .port()
-                .map(|port| format!(":{port}"))
-                .unwrap_or_default();
-            Some(format!("{scheme}://{host}{port}"))
-        })
-        .unwrap_or_else(|| url.to_string());
-    format!("{channel}\0{provider_scope}")
-}
-
-fn request_body_gzip_cooldown_key(url: &str, channel: &Channel) -> String {
-    format!("gzip\0{}", request_body_gzip_scope_key(url, channel))
-}
-
-async fn request_body_gzip_cooldown_active(state: &AppState, key: &str) -> bool {
-    let mut cooldowns = state.request_body_gzip_cooldowns.lock().await;
-    match cooldowns.get(key).copied() {
-        Some(until) if until > Instant::now() => true,
-        Some(_) => {
-            cooldowns.remove(key);
-            false
-        }
-        None => false,
-    }
-}
-
-async fn note_request_body_gzip_fallback(state: &AppState, key: &str) {
-    let mut cooldowns = state.request_body_gzip_cooldowns.lock().await;
-    remember_bounded_scope_cooldown(
-        &mut cooldowns,
-        key,
-        TokioDuration::from_secs(REQUEST_BODY_GZIP_FALLBACK_COOLDOWN_SECS),
-    );
 }
 
 fn request_body_gzip_threshold_bytes(channel: &Channel) -> usize {
@@ -7022,6 +7663,7 @@ async fn observe_provider_prefix_usage(
         preserve_existing_native_maturity_scope,
         learn_state,
         None,
+        None,
     )
     .await
 }
@@ -7063,6 +7705,7 @@ async fn observe_provider_prefix_usage_with_final_scope(
     // terminals, and ordinary lineage rejection.
     preserve_existing_native_maturity_scope: bool,
     learn_state: bool,
+    final_prompt_cache_options_sibling_proof: Option<&PromptCacheOptionsSiblingProof>,
     final_scope_waterline: Option<&FinalScopeWaterlineLog>,
 ) -> ProviderPrefixUsageObservation {
     let native_responses_scope = matches!(
@@ -7268,7 +7911,12 @@ async fn observe_provider_prefix_usage_with_final_scope(
             // `next` was produced with the same settled parent, so the
             // compatibility check used by the pre-dispatch wait remains
             // exact even when another conversation shares this provider key.
-            scopes.insert(prefix_control_key, parent_scope_digest, next.clone());
+            scopes.insert_with_prompt_cache_options_proof(
+                prefix_control_key,
+                parent_scope_digest,
+                next.clone(),
+                final_prompt_cache_options_sibling_proof.cloned(),
+            );
         } else if let (Some(prefix_control_key), Some(parent_scope_digest)) =
             (provider_prefix_key, current_maturity_parent_scope_digest)
         {
@@ -7345,7 +7993,10 @@ fn promote_exact_final_scope_sent_waterline(
                 .saturating_sub(final_scope.settled_prefix_bucket_tokens_128)
         || responses_current_tail_makes_avoidable_unreliable(tail)
         || responses_tool_tail_burst(tail)
-        || tail.message_chars > 1_024
+        // A clean text tail can be larger than one kilobyte while still
+        // preserving an exact sent-waterline residual. Tool and noisy paths
+        // remain subject to their stricter limits below.
+        || tail.message_chars > 8_192
         || tail.tool_call_chars > 4_096
         || tail.tool_output_chars >= 4_096
         || tail.largest_tool_output_chars >= 4_096
@@ -11120,6 +11771,7 @@ pub(crate) async fn probe_and_record_provider_cache_capabilities(
     provider_id: &str,
     model_id: &str,
     requested_channel: Option<Channel>,
+    requested_fields: Option<Vec<ProviderCacheCapabilityField>>,
 ) -> Result<ProviderCacheCapabilityProbeResult> {
     probe_and_record_provider_cache_capabilities_with_key(
         state,
@@ -11127,6 +11779,7 @@ pub(crate) async fn probe_and_record_provider_cache_capabilities(
         model_id,
         requested_channel,
         None,
+        requested_fields,
     )
     .await
 }
@@ -11137,6 +11790,7 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
     model_id: &str,
     requested_channel: Option<Channel>,
     selected_key: Option<SelectedProviderKey>,
+    requested_fields: Option<Vec<ProviderCacheCapabilityField>>,
 ) -> Result<ProviderCacheCapabilityProbeResult> {
     let provider_id = provider_id.trim();
     let model_id = model_id.trim();
@@ -11167,6 +11821,19 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
             "native OpenAI cache capability verification requires a Chat or Responses provider"
         ));
     }
+    let requested_fields =
+        requested_fields.unwrap_or_else(|| ProviderCacheCapabilityField::ALL.to_vec());
+    let mut fields_to_probe = Vec::with_capacity(requested_fields.len());
+    for field in requested_fields {
+        if !fields_to_probe.contains(&field) {
+            fields_to_probe.push(field);
+        }
+    }
+    if fields_to_probe.is_empty() {
+        return Err(anyhow!(
+            "cache capability verification requires at least one requested field"
+        ));
+    }
     let selected_key = match selected_key {
         Some(selected_key) => selected_key,
         None => select_provider_api_key(state, provider_id, None, None).await?,
@@ -11194,7 +11861,7 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
             baseline.status,
             upstream_error_summary(&baseline.bytes)
         );
-        fields.extend(ProviderCacheCapabilityField::ALL.into_iter().map(|field| {
+        fields.extend(fields_to_probe.iter().copied().map(|field| {
             ProviderCacheCapabilityProbeFieldResult {
                 field,
                 status: ProviderCacheCapabilityStatus::Error,
@@ -11205,7 +11872,7 @@ async fn probe_and_record_provider_cache_capabilities_with_key(
             }
         }));
     } else {
-        for field in ProviderCacheCapabilityField::ALL {
+        for field in fields_to_probe {
             let body = cache_capability::field_probe_body(&probe_channel, model_id, &nonce, field);
             let response = send_provider_management_probe_request(
                 state,
@@ -11724,7 +12391,7 @@ pub(crate) fn build_management_probe_headers(
 /// resolution is used by prefix-state scoping so a versioned default or a
 /// provider override cannot accidentally inherit cache maturity from another
 /// upstream cache lane.
-fn effective_upstream_user_agent(custom_user_agent: Option<&str>) -> HeaderValue {
+pub(super) fn effective_upstream_user_agent(custom_user_agent: Option<&str>) -> HeaderValue {
     custom_user_agent
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -11807,13 +12474,8 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
     let original_body = prepared.body().clone();
     let request_body_encode_ms = prepared.encode_ms();
     let original_body_len = original_body.len() as u64;
-    let gzip_cooldown_key = request_body_gzip_cooldown_key(url, channel);
-    let gzip_cooldown_active = plan.request_body_gzip_enabled()
-        && request_body_gzip_cooldown_active(state, &gzip_cooldown_key).await;
     let gzip_threshold = request_body_gzip_threshold_bytes(channel);
-    let use_gzip = plan.request_body_gzip_enabled()
-        && !gzip_cooldown_active
-        && original_body.len() >= gzip_threshold;
+    let use_gzip = plan.request_body_gzip_enabled() && original_body.len() >= gzip_threshold;
     let (compressed_body, gzip_encode_ms) = if use_gzip {
         if let Some(body) = prepared.cached_gzip_body() {
             (Some(body), 0)
@@ -11937,11 +12599,9 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
                     }
                 }
             }
+            annotate_upstream_affinity_test_diagnostic(&mut diagnostics);
             // Do not retry an incompatible gzip request. Learn that state for
             // the next independent inbound and preserve this original result.
-            if sending_gzip && should_retry_without_gzip(response.status()) {
-                note_request_body_gzip_fallback(state, &gzip_cooldown_key).await;
-            }
             Ok(UpstreamSendOutcome {
                 response,
                 diagnostics,
@@ -11963,6 +12623,7 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
                     affinity.clear(scope);
                 }
             }
+            annotate_upstream_affinity_test_diagnostic(&mut diagnostics);
             Err(UpstreamTransportError {
                 category: classify_reqwest_transport_error(&err),
                 source: err,
@@ -13260,31 +13921,54 @@ fn controlled_cache_probe_fields(
     Vec::new()
 }
 
-fn isolated_options_probe_requested(
-    controlled_probe_fields: &[ProviderCacheCapabilityField],
-) -> bool {
-    isolated_options_probe_requested_with_env(
+fn isolated_cache_control_probe_field(
+    config: &AppConfig,
+    decision: &RouteDecision,
+    channel: &Channel,
+    key_id: Option<&str>,
+) -> Option<ProviderCacheCapabilityField> {
+    let field = isolated_cache_control_probe_test_field_with_env(
         std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
             .ok()
             .as_deref(),
         std::env::var("ATOAPI_FORCE_ISOLATED_CACHE_CONTROL_FIELD")
             .ok()
             .as_deref(),
-        controlled_probe_fields,
+    )?;
+    let accepted_for_selected_key = config.cache_capability_probe_accepted_for_key(
+        &decision.provider.id,
+        &decision.model,
+        channel,
+        key_id,
+        field,
+    );
+    accepted_for_selected_key.then_some(field)
+}
+
+fn isolated_cache_control_probe_test_field() -> Option<ProviderCacheCapabilityField> {
+    isolated_cache_control_probe_test_field_with_env(
+        std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
+            .ok()
+            .as_deref(),
+        std::env::var("ATOAPI_FORCE_ISOLATED_CACHE_CONTROL_FIELD")
+            .ok()
+            .as_deref(),
     )
 }
 
-fn isolated_options_probe_requested_with_env(
+fn isolated_cache_control_probe_test_field_with_env(
     isolated_test_instance: Option<&str>,
     forced_field: Option<&str>,
-    controlled_probe_fields: &[ProviderCacheCapabilityField],
-) -> bool {
-    isolated_test_instance == Some("1")
-        && forced_field == Some("prompt-cache-options")
-        && matches!(
-            controlled_probe_fields,
-            [ProviderCacheCapabilityField::PromptCacheOptions]
-        )
+) -> Option<ProviderCacheCapabilityField> {
+    if isolated_test_instance != Some("1") {
+        return None;
+    }
+    match forced_field {
+        Some("prompt-cache-key") => Some(ProviderCacheCapabilityField::PromptCacheKey),
+        Some("prompt-cache-options") => Some(ProviderCacheCapabilityField::PromptCacheOptions),
+        Some("prompt-cache-retention") => Some(ProviderCacheCapabilityField::PromptCacheRetention),
+        _ => None,
+    }
 }
 
 /// A cache-validation candidate is only evidence when its one selected
@@ -13314,10 +13998,21 @@ fn controlled_cache_probe_fields_on_final_wire(
             {
                 return false;
             }
+            if *field == ProviderCacheCapabilityField::PromptCacheOptions
+                && final_wire_receipt
+                    .cache_controls
+                    .prompt_cache_options_ttl()
+                    .is_none()
+            {
+                return false;
+            }
             application.is_none_or(|receipt| {
                 receipt.injected_fields().contains(field)
                     && (*field != ProviderCacheCapabilityField::PromptCacheBreakpoint
                         || receipt.injected_breakpoint())
+                    && (*field != ProviderCacheCapabilityField::PromptCacheOptions
+                        || receipt.injected_prompt_cache_options_ttl()
+                            == final_wire_receipt.cache_controls.prompt_cache_options_ttl())
             })
         })
         .collect()
@@ -13491,6 +14186,40 @@ fn generated_prompt_cache_key(
     format!("{:x}", hasher.finalize())
 }
 
+/// Derive a disposable thread-primary placement for a trusted explicit thread
+/// identity. Session/conversation ids are intentionally excluded so a relay
+/// reconnect or injection-layer session rebuild can keep the same upstream
+/// cache lane. The caller must still enforce the native FullReplay, provider,
+/// model, channel, agent, and selected-Key realm gates before using it.
+fn generated_prompt_cache_key_thread_bridge(
+    session_identity: &SessionIdentity,
+    identity_request: &Value,
+    decision: &RouteDecision,
+    selected_provider_key: &SelectedProviderKey,
+) -> Option<String> {
+    let thread_id = unambiguous_explicit_thread_id(identity_request)?;
+    let key_realm = affinity_identity::realm_id(decision, selected_provider_key);
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-generated-prompt-cache-key-thread-bridge-v1\0");
+    hasher.update(decision.provider.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(decision.model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(decision.upstream_channel.label().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key_realm.as_bytes());
+    hasher.update(b"\0");
+    // `provider_cache_key` is the legacy primary identity and deliberately
+    // prefers an explicit thread id over session/conversation ids. Reuse that
+    // already scoped material instead of `anchor_key`, whose strict composite
+    // intentionally changes when a session id changes. The raw thread id is
+    // hashed, never persisted.
+    hasher.update(session_identity.provider_cache_key.as_bytes());
+    hasher.update(b"\0thread-id\0");
+    hasher.update(thread_id.as_bytes());
+    Some(format!("{:x}", hasher.finalize()))
+}
+
 /// Persisted capability evidence uses a distinct one-way digest. It binds the
 /// exact generated placement key without storing the key itself in config.
 fn generated_prompt_cache_key_session_scope_id(cache_key: &str) -> String {
@@ -13540,30 +14269,47 @@ fn stabilize_responses_tool_call_ids(value: &mut Value) {
     }
 }
 
-/// Rebind fresh Codex call ids only when the current request is a proven
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeCodexReplayedToolIdRebindPlan {
+    replacements: Vec<NativeCodexReplayedToolIdReplacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeCodexReplayedToolIdReplacement {
+    index: usize,
+    expected_current_call_id: String,
+}
+
+/// Build a read-only rebind plan only when the current input is a proven
 /// append-only replay of a prior local wire and every affected top-level tool
-/// item is identical except for its root `call_id`.  Unknown/nested link
+/// item is identical except for its root `call_id`. Unknown/nested link
 /// fields, duplicate ids, missing outputs or any content drift fail open.
-fn rebind_native_codex_replayed_tool_ids_to_predecessor(
-    request: &mut Value,
+///
+/// The plan owns only the small set of changed item indexes and opaque call
+/// ids used to validate application. It deliberately borrows both large JSON
+/// inputs while proving equivalence, so recovery does not clone a potentially
+/// large FullReplay body merely to answer whether a rebind is possible.
+fn plan_native_codex_replayed_tool_id_rebind(
     previous_input: &Value,
-) -> bool {
+    current_input: &Value,
+) -> Option<NativeCodexReplayedToolIdRebindPlan> {
     let Some(previous_items) = previous_input.as_array() else {
-        return false;
+        return None;
     };
-    let Some(current_items) = request.get_mut("input").and_then(Value::as_array_mut) else {
-        return false;
+    let Some(current_items) = current_input.as_array() else {
+        return None;
     };
     if previous_items.is_empty() || previous_items.len() >= current_items.len() {
-        return false;
+        return None;
     }
 
     // `current call id -> (previous exact call id, seen call/output count)`.
     // A result may be rebound only after its matching function call was
     // proven at the same prefix position.
-    let mut pairs = HashMap::<String, (String, u8)>::new();
-    let mut prior_call_ids = HashSet::<String>::new();
+    let mut pairs = HashMap::<&str, (&str, u8)>::new();
+    let mut prior_call_ids = HashSet::<&str>::new();
     let mut changed_item_indexes = HashSet::new();
+    let mut replacements = Vec::new();
     for (index, (previous, current)) in previous_items.iter().zip(current_items.iter()).enumerate()
     {
         if previous == current {
@@ -13574,44 +14320,50 @@ fn rebind_native_codex_replayed_tool_ids_to_predecessor(
         if previous_type != current_type
             || !matches!(
                 previous_type,
-                Some("function_call") | Some("function_call_output")
+                Some("function_call")
+                    | Some("function_call_output")
+                    | Some("custom_tool_call")
+                    | Some("custom_tool_call_output")
             )
             || native_codex_item_has_unsafe_tool_link(previous)
             || native_codex_item_has_unsafe_tool_link(current)
             || !native_codex_items_equal_ignoring_root_call_id(previous, current)
         {
-            return false;
+            return None;
         }
         let Some(prior_call_id) = native_codex_root_call_id(previous) else {
-            return false;
+            return None;
         };
         let Some(current_call_id) = native_codex_root_call_id(current) else {
-            return false;
+            return None;
         };
 
         match previous_type {
-            Some("function_call") => {
-                if pairs.contains_key(current_call_id)
-                    || !prior_call_ids.insert(prior_call_id.to_string())
-                {
-                    return false;
+            Some("function_call") | Some("custom_tool_call") => {
+                if pairs.contains_key(current_call_id) || !prior_call_ids.insert(prior_call_id) {
+                    return None;
                 }
-                pairs.insert(current_call_id.to_string(), (prior_call_id.to_string(), 1));
+                pairs.insert(current_call_id, (prior_call_id, 1));
             }
-            Some("function_call_output") => {
+            Some("function_call_output") | Some("custom_tool_call_output") => {
                 let Some((expected_prior_call_id, count)) = pairs.get_mut(current_call_id) else {
-                    return false;
+                    return None;
                 };
-                if expected_prior_call_id != prior_call_id || *count != 1 {
-                    return false;
+                if *expected_prior_call_id != prior_call_id || *count != 1 {
+                    return None;
                 }
                 *count = 2;
             }
-            _ => return false,
+            _ => return None,
         }
         changed_item_indexes.insert(index);
+        replacements.push(NativeCodexReplayedToolIdReplacement {
+            index,
+            expected_current_call_id: current_call_id.to_string(),
+        });
     }
 
+    let rebound_current_call_ids = pairs.keys().copied().collect::<HashSet<_>>();
     if pairs.is_empty()
         || pairs.values().any(|(_, count)| *count != 2)
         // A fresh id must never shadow an unchanged pair, a new tail item, or
@@ -13619,27 +14371,97 @@ fn rebind_native_codex_replayed_tool_ids_to_predecessor(
         // preserve the caller's exact wire.
         || current_items.iter().enumerate().any(|(index, item)| {
             !changed_item_indexes.contains(&index)
-                && native_codex_item_references_rebound_call_id(item, &pairs)
+                && native_codex_item_references_rebound_call_id(item, &rebound_current_call_ids)
         })
     {
+        return None;
+    }
+
+    Some(NativeCodexReplayedToolIdRebindPlan { replacements })
+}
+
+/// Apply a plan produced by `plan_native_codex_replayed_tool_id_rebind`.
+///
+/// Application revalidates the planned positions and opaque current ids before
+/// making any mutation, so a stale or mismatched plan fails closed. The caller
+/// must keep both inputs unchanged between planning and application; production
+/// uses this immediately after removing only `previous_response_id`.
+fn apply_native_codex_replayed_tool_id_rebind_plan(
+    request: &mut Value,
+    previous_input: &Value,
+    plan: &NativeCodexReplayedToolIdRebindPlan,
+) -> bool {
+    let Some(previous_items) = previous_input.as_array() else {
+        return false;
+    };
+    let Some(current_items) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    if plan.replacements.is_empty() || previous_items.len() >= current_items.len() {
         return false;
     }
 
-    for index in changed_item_indexes {
-        let Some(item) = current_items.get_mut(index) else {
+    // Validate all mutable targets up front. A rejected plan must leave the
+    // caller-owned recovered wire untouched just like the legacy rebinder.
+    let mut planned_indexes = HashSet::with_capacity(plan.replacements.len());
+    let mut predecessor_call_ids = Vec::with_capacity(plan.replacements.len());
+    for replacement in &plan.replacements {
+        if !planned_indexes.insert(replacement.index) {
+            return false;
+        }
+        let Some(prior_call_id) = previous_items
+            .get(replacement.index)
+            .and_then(native_codex_root_call_id)
+        else {
+            return false;
+        };
+        let Some(current_call_id) = current_items
+            .get(replacement.index)
+            .and_then(native_codex_root_call_id)
+        else {
+            return false;
+        };
+        if current_call_id != replacement.expected_current_call_id {
+            return false;
+        }
+        predecessor_call_ids.push(prior_call_id);
+    }
+
+    for (replacement, prior_call_id) in plan.replacements.iter().zip(predecessor_call_ids) {
+        let Some(item) = current_items.get_mut(replacement.index) else {
             return false;
         };
         let Some(item) = item.as_object_mut() else {
             return false;
         };
-        let Some(current_call_id) = item.get("call_id").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Some((prior_call_id, _)) = pairs.get(current_call_id) {
-            item.insert("call_id".to_string(), Value::String(prior_call_id.clone()));
-        }
+        item.insert(
+            "call_id".to_string(),
+            Value::String(prior_call_id.to_string()),
+        );
     }
     true
+}
+
+/// A locally owned `previous_response_id` can be removed after we recover a
+/// safe FullReplay body.  Once it is gone from the final outbound request, it
+/// is no longer an external-continuation boundary: replayed tool call ids may
+/// be rebound to their proven predecessor so the upstream prefix stays
+/// byte-equivalent.  Any remaining external id, ambiguity, route switch or
+/// compaction continues to fail open.
+fn should_rebind_native_codex_replayed_tool_ids(
+    native_responses_passthrough: bool,
+    trusted_codex_metadata: bool,
+    final_body_has_no_external_previous_response_id: bool,
+    full_replay_ambiguous_local_lineage: bool,
+    stale_external_continuation_after_route_switch: bool,
+    response_session_starts_compaction_epoch: bool,
+) -> bool {
+    native_responses_passthrough
+        && trusted_codex_metadata
+        && final_body_has_no_external_previous_response_id
+        && !full_replay_ambiguous_local_lineage
+        && !stale_external_continuation_after_route_switch
+        && !response_session_starts_compaction_epoch
 }
 
 fn native_codex_root_call_id(item: &Value) -> Option<&str> {
@@ -13683,23 +14505,23 @@ fn native_codex_item_has_unsafe_tool_link(item: &Value) -> bool {
 /// they create an ambiguous `call_id` relationship.
 fn native_codex_item_references_rebound_call_id(
     item: &Value,
-    rebound_pairs: &HashMap<String, (String, u8)>,
+    rebound_call_ids: &HashSet<&str>,
 ) -> bool {
-    fn visit(value: &Value, rebound_pairs: &HashMap<String, (String, u8)>) -> bool {
+    fn visit(value: &Value, rebound_call_ids: &HashSet<&str>) -> bool {
         match value {
             Value::Object(map) => map.iter().any(|(key, child)| {
                 ((key == "call_id" || key == "tool_call_id")
                     && child
                         .as_str()
-                        .is_some_and(|call_id| rebound_pairs.contains_key(call_id)))
-                    || visit(child, rebound_pairs)
+                        .is_some_and(|call_id| rebound_call_ids.contains(call_id)))
+                    || visit(child, rebound_call_ids)
             }),
-            Value::Array(items) => items.iter().any(|item| visit(item, rebound_pairs)),
+            Value::Array(items) => items.iter().any(|item| visit(item, rebound_call_ids)),
             _ => false,
         }
     }
 
-    visit(item, rebound_pairs)
+    visit(item, rebound_call_ids)
 }
 
 fn assign_deterministic_function_call_ids(
@@ -13709,7 +14531,16 @@ fn assign_deterministic_function_call_ids(
 ) {
     match value {
         Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("function_call") {
+            // Codex can replay both function and custom-tool pairs.  The
+            // provider-prefix projection is an internal clone, so assigning
+            // the same deterministic id to either call kind is safe and
+            // keeps local prefix/session keys stable when the client
+            // regenerates opaque ids between turns.  The type remains in the
+            // payload, so function and custom-tool ids can never collide.
+            if matches!(
+                map.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) {
                 if let Some(old_call_id) = map.get("call_id").and_then(Value::as_str) {
                     let payload = stable_function_call_payload(map);
                     let occurrence = occurrences.entry(payload.clone()).or_insert(0);
@@ -18036,36 +18867,60 @@ mod tests {
     }
 
     #[test]
-    fn isolated_options_probe_requires_exact_test_gate_and_single_planned_field() {
-        let options = [ProviderCacheCapabilityField::PromptCacheOptions];
-        assert!(isolated_options_probe_requested_with_env(
-            Some("1"),
-            Some("prompt-cache-options"),
-            &options,
-        ));
-        assert!(!isolated_options_probe_requested_with_env(
-            None,
-            Some("prompt-cache-options"),
-            &options,
-        ));
-        assert!(!isolated_options_probe_requested_with_env(
-            Some("0"),
-            Some("prompt-cache-options"),
-            &options,
-        ));
-        assert!(!isolated_options_probe_requested_with_env(
-            Some("1"),
-            Some("prompt-cache-key"),
-            &options,
-        ));
-        assert!(!isolated_options_probe_requested_with_env(
-            Some("1"),
-            Some("prompt-cache-options"),
-            &[
-                ProviderCacheCapabilityField::PromptCacheKey,
+    fn isolated_cache_control_probe_requires_an_exact_test_field() {
+        assert_eq!(
+            isolated_cache_control_probe_test_field_with_env(
+                Some("1"),
+                Some("prompt-cache-options"),
+            ),
+            Some(ProviderCacheCapabilityField::PromptCacheOptions)
+        );
+        assert_eq!(
+            isolated_cache_control_probe_test_field_with_env(
+                Some("1"),
+                Some("prompt-cache-retention"),
+            ),
+            Some(ProviderCacheCapabilityField::PromptCacheRetention)
+        );
+        assert_eq!(
+            isolated_cache_control_probe_test_field_with_env(Some("1"), Some("prompt-cache-key")),
+            Some(ProviderCacheCapabilityField::PromptCacheKey)
+        );
+        assert_eq!(
+            isolated_cache_control_probe_test_field_with_env(None, Some("prompt-cache-options")),
+            None
+        );
+    }
+
+    #[test]
+    fn isolated_options_24h_diagnostic_is_distinct_and_payload_free() {
+        assert_eq!(
+            isolated_cache_control_probe_diagnostic_signal(
                 ProviderCacheCapabilityField::PromptCacheOptions,
-            ],
-        ));
+                true,
+                true,
+                Some(crate::config::PromptCacheOptionsTtl::TwentyFourHours),
+            ),
+            Some("cache-options-24h-injected")
+        );
+        assert_eq!(
+            isolated_cache_control_probe_diagnostic_signal(
+                ProviderCacheCapabilityField::PromptCacheOptions,
+                true,
+                false,
+                Some(crate::config::PromptCacheOptionsTtl::ThirtyMinutes),
+            ),
+            Some("cache-options-injected")
+        );
+        assert_eq!(
+            isolated_cache_control_probe_diagnostic_signal(
+                ProviderCacheCapabilityField::PromptCacheRetention,
+                true,
+                true,
+                None,
+            ),
+            Some("cache-retention-injected")
+        );
     }
 
     #[test]
@@ -18210,11 +19065,13 @@ mod tests {
                 responses_cache_maturity_static_projection_digest: Some(
                     "semantic-maturity-wire".to_string(),
                 ),
+                prompt_cache_options_sibling_proof: None,
                 atoapi_mutated_static_categories: Vec::new(),
                 outbound_prefix_fingerprints: None,
             },
             cache_controls: FinalCacheControls {
                 present_field_mask: 0,
+                prompt_cache_options_ttl: None,
                 breakpoint_provenance: ProtocolBreakpointProvenance::Absent,
             },
         };
@@ -20889,6 +21746,84 @@ mod tests {
     }
 
     #[test]
+    fn options_candidate_requires_the_injected_ttl_to_match_the_frozen_wire() {
+        let mut provider = test_responses_provider("https://responses.example/v1".to_string());
+        provider.id = "provider-a".to_string();
+        let scope = "cache-effect-v2:test-realm:stream:no-store:bp=none";
+        let mut config = AppConfig::default();
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-test",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            crate::config::ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-test",
+            &Channel::Responses,
+            None,
+            Some("cache-effect-v5:test-realm:stream:no-store:pco=implicit-24h:bp=none"),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            crate::config::ProviderCacheEffectStatus::Promoted,
+            None,
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        let mut body = PreparedResponseBody::responses(json!({
+            "model":"gpt-test",
+            "input":[]
+        }));
+        let application = cache_capability::apply_prepared_with_receipt(
+            &mut body,
+            &Channel::Responses,
+            cache_capability::plan_with_effect_scope_and_probe_fields(
+                &config,
+                &provider,
+                "gpt-test",
+                &Channel::Responses,
+                None,
+                Some(scope),
+                &[],
+            ),
+        );
+        assert_eq!(
+            application.injected_prompt_cache_options_ttl(),
+            Some(crate::config::PromptCacheOptionsTtl::TwentyFourHours)
+        );
+        assert!(body.set_root(
+            "prompt_cache_options",
+            json!({"mode":"implicit","ttl":"30m"}),
+        ));
+        let envelope = GenerationEnvelope::freeze(
+            &provider,
+            "https://responses.example/v1/responses",
+            Channel::Responses,
+            body,
+        );
+        let receipt = CacheControlCore::plan(CacheControlPlanInput {
+            action_scope: None,
+            active_channel: &Channel::Responses,
+            context_mode: CacheContextMode::FullReplay,
+            lineage_epoch: None,
+        })
+        .seal(&envelope);
+        assert_eq!(
+            receipt.cache_controls.prompt_cache_options_ttl(),
+            Some(crate::config::PromptCacheOptionsTtl::ThirtyMinutes)
+        );
+        assert!(controlled_cache_probe_fields_on_final_wire(
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            &receipt,
+            Some(&application),
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn smart_hit_disabled_strips_provider_cache_fields_and_session_features() {
         let mut config = AppConfig::default();
         config.cache.enabled = false;
@@ -20991,7 +21926,8 @@ mod tests {
         assert!(smart_hit_enabled(&config));
         assert_eq!(
             prefix_guard_wait_budget_for_channel(&Channel::Responses, TokioDuration::from_secs(1)),
-            Some(TokioDuration::from_millis(500))
+            Some(TokioDuration::ZERO),
+            "the live Responses cache observer must have no foreground wait budget"
         );
         assert_eq!(
             remaining_responses_prefix_wait_budget(TokioDuration::from_millis(300)),
@@ -21010,6 +21946,416 @@ mod tests {
         assert_eq!(remaining, one_nanosecond);
         assert_eq!(already_waited.as_millis(), 499);
         assert!(already_waited.saturating_add(remaining) <= cap);
+    }
+
+    #[test]
+    fn responses_foreground_settle_policy_preserves_champion_cap() {
+        assert_eq!(
+            responses_foreground_wait_cap(),
+            TokioDuration::from_millis(500),
+            "release candidates must retain the champion's bounded maturity path"
+        );
+    }
+
+    #[test]
+    fn local_full_replay_skips_only_duplicate_material_tool_tail_wait() {
+        let guard = PrefixGuardWaitDiagnostics {
+            skip_reason: Some("no_avoidable_gap".to_string()),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        assert!(should_suppress_duplicate_local_full_replay_material_tail_wait(true, &guard, true));
+
+        let mut actionable_gap = guard.clone();
+        actionable_gap.pre_request_avoidable_tokens = 128;
+        assert!(
+            !should_suppress_duplicate_local_full_replay_material_tail_wait(
+                true,
+                &actionable_gap,
+                true,
+            )
+        );
+
+        let mut already_waited = guard.clone();
+        already_waited.wait_duration = TokioDuration::from_millis(1);
+        assert!(
+            !should_suppress_duplicate_local_full_replay_material_tail_wait(
+                true,
+                &already_waited,
+                true,
+            )
+        );
+
+        assert!(
+            !should_suppress_duplicate_local_full_replay_material_tail_wait(true, &guard, false)
+        );
+        assert!(
+            !should_suppress_duplicate_local_full_replay_material_tail_wait(false, &guard, true)
+        );
+    }
+
+    #[test]
+    fn local_unambiguous_ordinary_full_replay_skips_duplicate_material_tool_tail_wait() {
+        let previous = json!([
+            {
+                "type": "function_call",
+                "call_id": "call-stable",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-stable",
+                "output": "stable result"
+            }
+        ]);
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp-local".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
+            input: previous.clone(),
+            output_items: vec![],
+            finished_at: Instant::now(),
+        };
+        let current = json!([
+                {
+                    "type": "function_call",
+                    "call_id": "call-stable",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-stable",
+                    "output": "stable result"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "continue after the material tool tail"
+                }
+        ]);
+        let guard = PrefixGuardWaitDiagnostics {
+            skip_reason: Some("no_avoidable_gap".to_string()),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let recovery = recover_full_replay_input(&session, Some(&current))
+            .expect("a complete local history should be recoverable");
+
+        assert!(
+            !recovery.ambiguous_local_lineage,
+            "the unchanged full replay is a safe local recovery"
+        );
+        let ordinary_full_replay = json!({ "input": recovery.input });
+        let before = serde_json::to_vec(&ordinary_full_replay["input"]).unwrap();
+        let local_tool_id_rebind_applied =
+            plan_native_codex_replayed_tool_id_rebind(&previous, &ordinary_full_replay["input"])
+                .is_some();
+
+        assert!(
+            !local_tool_id_rebind_applied,
+            "an unchanged FullReplay is not an id rebind"
+        );
+        assert_eq!(
+            serde_json::to_vec(&ordinary_full_replay["input"]).unwrap(),
+            before,
+            "a no-op rebind must leave the recovered full replay byte-identical"
+        );
+        assert!(
+            should_suppress_duplicate_local_full_replay_material_tail_wait(
+                !recovery.ambiguous_local_lineage,
+                &guard,
+                true,
+            ),
+            "an already-unambiguous local FullReplay must not pay a duplicate material-tail wait"
+        );
+    }
+
+    #[test]
+    fn local_rebind_reallocated_call_ids_keep_narrow_material_tool_tail_suppression() {
+        let previous = json!([
+            {
+                "type": "function_call",
+                "call_id": "call-old",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-old",
+                "output": "stable result"
+            }
+        ]);
+        let session = ResponseSessionState {
+            generation: 1,
+            parent_generation: None,
+            response_id: "resp-local".to_string(),
+            static_projection_digest: None,
+            output_items_complete: false,
+            input: previous.clone(),
+            output_items: vec![],
+            finished_at: Instant::now(),
+        };
+        let current = json!([
+            {
+                "type": "function_call",
+                "call_id": "call-new",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-new",
+                "output": "stable result"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "continue after the material tool tail"
+            }
+        ]);
+        let guard = PrefixGuardWaitDiagnostics {
+            skip_reason: Some("no_avoidable_gap".to_string()),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        let mut recovery = recover_full_replay_input(&session, Some(&current))
+            .expect("the caller's replay body should remain recoverable");
+
+        assert!(
+            recovery.ambiguous_local_lineage,
+            "regenerated ids require the native-Codex equivalence proof"
+        );
+        let rebind_plan = plan_native_codex_replayed_tool_id_rebind(&previous, &recovery.input)
+            .expect("only a closed equivalent tool graph may clear the local ambiguity");
+        recovery.ambiguous_local_lineage = false;
+        let mut replay = json!({ "input": recovery.input });
+        let local_tool_id_rebind_applied =
+            apply_native_codex_replayed_tool_id_rebind_plan(&mut replay, &previous, &rebind_plan);
+
+        assert!(local_tool_id_rebind_applied);
+        assert_eq!(
+            replay.pointer("/input/0/call_id").and_then(Value::as_str),
+            Some("call-old")
+        );
+        assert_eq!(
+            replay.pointer("/input/1/call_id").and_then(Value::as_str),
+            Some("call-old")
+        );
+        assert!(
+            should_suppress_duplicate_local_full_replay_material_tail_wait(
+                local_tool_id_rebind_applied,
+                &guard,
+                true,
+            )
+        );
+    }
+
+    #[test]
+    fn local_rebind_plan_apply_preserves_native_tool_safety_contract() {
+        let function_previous = json!([
+            {
+                "type": "function_call",
+                "call_id": "function-old",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "function-old",
+                "output": {"ok": true}
+            }
+        ]);
+        let ordinary_full_replay = json!([
+            {
+                "type": "function_call",
+                "call_id": "function-old",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "function-old",
+                "output": {"ok": true}
+            },
+            {"type": "message", "role": "user", "content": "continue"}
+        ]);
+        assert!(
+            plan_native_codex_replayed_tool_id_rebind(&function_previous, &ordinary_full_replay)
+                .is_none(),
+            "unchanged FullReplay input must not fabricate a rebind plan"
+        );
+
+        let mut function_request = json!({
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "function-fresh",
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "function-fresh",
+                    "output": {"ok": true}
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        let function_plan = plan_native_codex_replayed_tool_id_rebind(
+            &function_previous,
+            &function_request["input"],
+        )
+        .expect("a closed regenerated function pair must produce a plan");
+        assert!(apply_native_codex_replayed_tool_id_rebind_plan(
+            &mut function_request,
+            &function_previous,
+            &function_plan,
+        ));
+        assert_eq!(
+            &function_request["input"].as_array().unwrap()[..2],
+            function_previous.as_array().unwrap(),
+            "applying the function plan must restore the predecessor wire"
+        );
+
+        let custom_previous = json!([
+            {
+                "type": "custom_tool_call",
+                "call_id": "custom-old",
+                "name": "shell",
+                "input": "dir"
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-old",
+                "output": {"stdout": "stable", "exit_code": 0}
+            }
+        ]);
+        let mut custom_request = json!({
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "custom-fresh",
+                    "name": "shell",
+                    "input": "dir"
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "custom-fresh",
+                    "output": {"stdout": "stable", "exit_code": 0}
+                },
+                {"type": "message", "role": "user", "content": "continue"}
+            ]
+        });
+        let custom_plan =
+            plan_native_codex_replayed_tool_id_rebind(&custom_previous, &custom_request["input"])
+                .expect("a closed regenerated custom-tool pair must produce a plan");
+        assert!(apply_native_codex_replayed_tool_id_rebind_plan(
+            &mut custom_request,
+            &custom_previous,
+            &custom_plan,
+        ));
+        assert_eq!(
+            &custom_request["input"].as_array().unwrap()[..2],
+            custom_previous.as_array().unwrap(),
+            "applying the custom plan must restore the predecessor wire"
+        );
+
+        let unsafe_request = json!([
+            {
+                "type": "function_call",
+                "call_id": "function-fresh",
+                "tool_call_id": "unsafe-vendor-link",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "function-fresh",
+                "output": {"ok": true}
+            },
+            {"type": "message", "role": "user", "content": "continue"}
+        ]);
+        assert!(
+            plan_native_codex_replayed_tool_id_rebind(&function_previous, &unsafe_request)
+                .is_none(),
+            "unknown tool links must remain fail-closed"
+        );
+
+        let extra_reference_request = json!([
+            {
+                "type": "function_call",
+                "call_id": "function-fresh",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "function-fresh",
+                "output": {"ok": true}
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": "continue",
+                "call_id": "function-fresh"
+            }
+        ]);
+        assert!(
+            plan_native_codex_replayed_tool_id_rebind(
+                &function_previous,
+                &extra_reference_request,
+            )
+            .is_none(),
+            "an unproven tail reference to a regenerated id must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn local_rebind_does_not_suppress_other_guard_reasons() {
+        let guard = PrefixGuardWaitDiagnostics {
+            skip_reason: Some("provider_prefix_settle".to_string()),
+            ..PrefixGuardWaitDiagnostics::default()
+        };
+        assert!(
+            !should_suppress_duplicate_local_full_replay_material_tail_wait(true, &guard, true)
+        );
+    }
+
+    #[test]
+    fn isolated_options_sibling_settle_hint_requires_a_fresh_stable_sibling() {
+        let mut exact = prefix_state(200_000, 199_800, 0);
+        exact.finished_at = Instant::now()
+            .checked_sub(StdDuration::from_millis(501))
+            .expect("the test clock supports a bounded stale state");
+        let mut sibling = prefix_state(200_000, 199_800, 0);
+
+        assert!(isolated_options_sibling_should_supply_settle_hint(
+            Some(&exact),
+            Some(&sibling),
+        ));
+
+        exact.finished_at = Instant::now();
+        assert!(
+            !isolated_options_sibling_should_supply_settle_hint(Some(&exact), Some(&sibling)),
+            "a fresh exact state must remain authoritative over a sibling"
+        );
+
+        exact.finished_at = Instant::now()
+            .checked_sub(StdDuration::from_millis(501))
+            .expect("the test clock supports a bounded stale state");
+        sibling.settle_after_cold_read = true;
+        assert!(
+            !isolated_options_sibling_should_supply_settle_hint(Some(&exact), Some(&sibling)),
+            "a cold-read sibling must never trigger the proactive wait"
+        );
+
+        sibling.settle_after_cold_read = false;
+        sibling.cache_instability_score = 3;
+        assert!(
+            !isolated_options_sibling_should_supply_settle_hint(Some(&exact), Some(&sibling)),
+            "an unstable sibling must fail open"
+        );
     }
 
     #[tokio::test]
@@ -22097,11 +23443,20 @@ mod tests {
     }
 
     #[test]
-    fn upstream_affinity_cookie_is_disabled_for_normal_dispatch() {
+    fn upstream_affinity_cookie_requires_an_isolated_explicit_test_flag() {
         assert!(
-            !upstream_affinity_enabled_for_dispatch(),
+            !upstream_affinity_enabled_for_dispatch_with_env(false, Some("1")),
             "normal traffic must not inherit an unproven third-party placement cookie"
         );
+        assert!(!upstream_affinity_enabled_for_dispatch_with_env(true, None));
+        assert!(!upstream_affinity_enabled_for_dispatch_with_env(
+            true,
+            Some("0")
+        ));
+        assert!(upstream_affinity_enabled_for_dispatch_with_env(
+            true,
+            Some("1")
+        ));
     }
 
     #[test]
@@ -24848,6 +26203,64 @@ mod tests {
     }
 
     #[test]
+    fn responses_prefix_optimizer_stabilizes_self_contained_custom_tools() {
+        let stable_prefix = "stable project context ".repeat(900);
+        let mut left = json!({
+            "model": "gpt-route",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": stable_prefix }]
+            }, {
+                "type": "custom_tool_call",
+                "id": "custom-left",
+                "call_id": "custom-call-left",
+                "name": "shell",
+                "input": "dir"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-call-left",
+                "output": "stable output"
+            }]
+        });
+        let mut right = json!({
+            "model": "gpt-route",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": stable_prefix }]
+            }, {
+                "type": "custom_tool_call",
+                "id": "custom-right",
+                "call_id": "custom-call-right",
+                "name": "shell",
+                "input": "dir"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-call-right",
+                "output": "stable output"
+            }]
+        });
+
+        normalize_responses_request(&mut left);
+        normalize_responses_request(&mut right);
+        stabilize_responses_provider_prefix(&mut left);
+        stabilize_responses_provider_prefix(&mut right);
+        canonicalize_object_keys(&mut left, "$.responses_prefix");
+        canonicalize_object_keys(&mut right, "$.responses_prefix");
+
+        assert_eq!(left, right);
+        assert_eq!(
+            left.pointer("/input/1/call_id").and_then(Value::as_str),
+            right.pointer("/input/1/call_id").and_then(Value::as_str)
+        );
+        assert_eq!(
+            left.pointer("/input/2/call_id").and_then(Value::as_str),
+            right.pointer("/input/2/call_id").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
     fn responses_prefix_optimizer_preserves_external_tool_output_call_id() {
         let mut request = json!({
             "model": "gpt-route",
@@ -24899,9 +26312,13 @@ mod tests {
             }]
         });
 
-        assert!(rebind_native_codex_replayed_tool_ids_to_predecessor(
+        let rebind_plan =
+            plan_native_codex_replayed_tool_id_rebind(&previous["input"], &replay["input"])
+                .expect("the function-call pair should produce a rebind plan");
+        assert!(apply_native_codex_replayed_tool_id_rebind_plan(
             &mut replay,
-            &previous["input"]
+            &previous["input"],
+            &rebind_plan,
         ));
 
         let replay_prefix = &replay["input"].as_array().unwrap()[..2];
@@ -24924,8 +26341,147 @@ mod tests {
     }
 
     #[test]
+    fn native_codex_full_replay_rebinds_custom_tool_pairs_without_rewriting_payload() {
+        let previous = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "custom-first",
+                "name": "shell",
+                "input": "dir"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-first",
+                "output": {"stdout": "stable", "exit_code": 0}
+            }]
+        });
+        let mut replay = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "custom-reallocated",
+                "name": "shell",
+                "input": "dir"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-reallocated",
+                "output": {"stdout": "stable", "exit_code": 0}
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "continue after custom tool"
+            }]
+        });
+
+        let rebind_plan =
+            plan_native_codex_replayed_tool_id_rebind(&previous["input"], &replay["input"])
+                .expect("the custom-tool pair should produce a rebind plan");
+        assert!(apply_native_codex_replayed_tool_id_rebind_plan(
+            &mut replay,
+            &previous["input"],
+            &rebind_plan,
+        ));
+        assert_eq!(
+            &replay["input"].as_array().unwrap()[..2],
+            previous["input"].as_array().unwrap()
+        );
+        assert_eq!(
+            replay.pointer("/input/0/call_id").and_then(Value::as_str),
+            Some("custom-first")
+        );
+        assert_eq!(
+            replay.pointer("/input/1/call_id").and_then(Value::as_str),
+            Some("custom-first")
+        );
+    }
+
+    #[test]
+    fn native_codex_full_replay_rebind_does_not_cross_function_and_custom_tool_types() {
+        let previous = json!({
+            "input": [{
+                "type": "function_call",
+                "call_id": "function-first",
+                "name": "shell",
+                "arguments": "{}"
+            }, {
+                "type": "function_call_output",
+                "call_id": "function-first",
+                "output": "stable"
+            }]
+        });
+        let replay = json!({
+            "input": [{
+                "type": "custom_tool_call",
+                "call_id": "custom-reallocated",
+                "name": "shell",
+                "input": "{}"
+            }, {
+                "type": "custom_tool_call_output",
+                "call_id": "custom-reallocated",
+                "output": "stable"
+            }, {
+                "type": "message",
+                "role": "user",
+                "content": "new tail"
+            }]
+        });
+        let before = serde_json::to_vec(&replay["input"]).unwrap();
+
+        assert!(
+            plan_native_codex_replayed_tool_id_rebind(&previous["input"], &replay["input"])
+                .is_none()
+        );
+        assert_eq!(serde_json::to_vec(&replay["input"]).unwrap(), before);
+    }
+
+    #[test]
+    fn native_codex_rebind_guard_allows_local_full_replay_after_p_r_is_removed() {
+        assert!(should_rebind_native_codex_replayed_tool_ids(
+            true, true, true, false, false, false,
+        ));
+
+        // A remaining p_r still denotes a caller-owned external continuation
+        // and must remain untouched.  The field must be absent, not merely
+        // non-string, on the final outbound body.
+        assert!(!should_rebind_native_codex_replayed_tool_ids(
+            true, true, false, false, false, false,
+        ));
+        assert!(!should_rebind_native_codex_replayed_tool_ids(
+            true, true, true, true, false, false,
+        ));
+        assert!(!should_rebind_native_codex_replayed_tool_ids(
+            true, true, true, false, true, false,
+        ));
+        assert!(!should_rebind_native_codex_replayed_tool_ids(
+            true, true, true, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn native_codex_replayed_tool_ids_plan_proves_equivalent_full_replay_without_mutating_input() {
+        let previous = json!([
+            {"type":"message","role":"user","content":"inspect"},
+            {"type":"function_call","call_id":"call-prior","name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"},
+            {"type":"function_call_output","call_id":"call-prior","output":{"ok":true}}
+        ]);
+        let current = json!([
+            {"type":"message","role":"user","content":"inspect"},
+            {"type":"function_call","call_id":"call-fresh","name":"read_file","arguments":"{\"path\":\"src/main.rs\"}"},
+            {"type":"function_call_output","call_id":"call-fresh","output":{"ok":true}},
+            {"type":"message","role":"user","content":"continue"}
+        ]);
+
+        let rebind_plan = plan_native_codex_replayed_tool_id_rebind(&previous, &current)
+            .expect("the closed function-call graph should produce a plan");
+        assert_eq!(rebind_plan.replacements.len(), 2);
+        assert_eq!(
+            current.pointer("/1/call_id").and_then(Value::as_str),
+            Some("call-fresh"),
+            "the recovery proof must not mutate the caller-owned input"
+        );
+    }
+
+    #[test]
     fn native_codex_full_replay_rebind_fails_open_for_unpaired_external_tool_output() {
-        let mut request = json!({
+        let request = json!({
             "input": [{
                 "type": "function_call_output",
                 "call_id": "call_from_external_response",
@@ -24942,10 +26498,7 @@ mod tests {
             "output": "caller-owned result"
         }]);
 
-        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
-            &mut request,
-            &previous
-        ));
+        assert!(plan_native_codex_replayed_tool_id_rebind(&previous, &request["input"]).is_none());
 
         assert_eq!(
             request.pointer("/input/0/call_id").and_then(Value::as_str),
@@ -24964,7 +26517,7 @@ mod tests {
             "role": "user",
             "content": {"z": 2, "a": 1}
         }]);
-        let mut request = json!({
+        let request = json!({
             "input": [{
                 "type": "message",
                 "role": "user",
@@ -24977,10 +26530,7 @@ mod tests {
         });
         let before = serde_json::to_vec(&request["input"]).unwrap();
 
-        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
-            &mut request,
-            &previous
-        ));
+        assert!(plan_native_codex_replayed_tool_id_rebind(&previous, &request["input"]).is_none());
         assert_eq!(serde_json::to_vec(&request["input"]).unwrap(), before);
     }
 
@@ -25000,7 +26550,7 @@ mod tests {
                 "output": "stable result"
             }
         ]);
-        let mut request = json!({
+        let request = json!({
             "input": [
                 {
                     "type": "function_call",
@@ -25018,10 +26568,7 @@ mod tests {
             ]
         });
 
-        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
-            &mut request,
-            &previous
-        ));
+        assert!(plan_native_codex_replayed_tool_id_rebind(&previous, &request["input"]).is_none());
         assert_eq!(
             request.pointer("/input/0/call_id").and_then(Value::as_str),
             Some("call-new")
@@ -25061,7 +26608,7 @@ mod tests {
         // The second logical pair was regenerated to the same opaque id as
         // the already unchanged first pair.  Atoapi must leave this ambiguous
         // caller-owned replay untouched instead of remapping either pair.
-        let mut request = json!({
+        let request = json!({
             "input": [
                 {
                     "type": "function_call",
@@ -25090,10 +26637,7 @@ mod tests {
         });
         let before = serde_json::to_vec(&request["input"]).unwrap();
 
-        assert!(!rebind_native_codex_replayed_tool_ids_to_predecessor(
-            &mut request,
-            &previous
-        ));
+        assert!(plan_native_codex_replayed_tool_id_rebind(&previous, &request["input"]).is_none());
         assert_eq!(serde_json::to_vec(&request["input"]).unwrap(), before);
     }
 
@@ -27843,6 +29387,7 @@ mod tests {
             recent_exact_warm_small_tail: false,
             avoidable_tokens: 0,
             fine_avoidable_tokens: 0,
+            known_exact_pending_residual: false,
             avoidable_shortfall_streak: 0,
             cache_instability_score: 3,
             tiny_instability_recovery_safe: false,
@@ -29187,7 +30732,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsafe_full_replay_is_rejected_locally_without_payload_leak_or_upstream_post() {
+    async fn large_full_replay_is_forwarded_once_without_local_payload_gate() {
         let config_dir = std::env::temp_dir().join(format!(
             "atoapi-full-replay-risk-gate-{}",
             Uuid::new_v4().simple()
@@ -29290,12 +30835,8 @@ mod tests {
             .await
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(text.matches("event: response.failed").count(), 1);
-        assert!(text.contains("\"type\":\"context_payload_unsafe\""));
-        assert!(text.contains("\"code\":\"compaction_required\""));
-        assert!(text.contains("full_replay=true"));
-        assert!(!text.contains(sensitive_marker));
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert!(text.contains("response.completed"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
 
         let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -29307,20 +30848,17 @@ mod tests {
             }
         })
         .await
-        .expect("local full-replay rejection must settle its inbound metrics");
-        assert_eq!(metrics.upstream_requests, 0);
-        assert!(metrics.recent_agent_upstream_attempts.is_empty());
+        .expect("forwarded full-replay request must settle its inbound metrics");
+        assert_eq!(metrics.upstream_requests, 1);
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 1);
         let inbound = &metrics.recent_agent_inbound_outcomes[0];
-        assert_eq!(inbound.attempt_count, 0);
-        assert_eq!(inbound.outcome, AgentInboundOutcome::LocalRejection);
-        assert_eq!(inbound.request.upstream_attempts, Some(0));
-        assert!(metrics
+        assert_eq!(inbound.attempt_count, 1);
+        assert_eq!(inbound.outcome, AgentInboundOutcome::Success);
+        assert_eq!(inbound.request.upstream_attempts, Some(1));
+        assert!(!metrics
             .recent_errors
             .iter()
             .any(|error| error.scope == "context_payload_unsafe"));
-        assert!(!serde_json::to_string(&metrics)
-            .unwrap()
-            .contains(sensitive_marker));
 
         // A normal small FullReplay still crosses the same single POST seam
         // and retains its ordinary Responses streaming behavior.
@@ -29349,7 +30887,11 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("response.completed"));
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            2,
+            "two independent inbounds must each produce exactly one upstream POST"
+        );
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -30865,7 +32407,7 @@ mod tests {
         fs::remove_dir_all(config_dir).ok();
     }
 
-    async fn exercise_tool_tail_direct_child(tool_output_text: &str, expect_maturity_wait: bool) {
+    async fn exercise_tool_tail_direct_child(tool_output_text: &str) {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let upstream_hits_for_route = upstream_hits.clone();
         let observed_full_replay = Arc::new(AtomicBool::new(true));
@@ -31105,24 +32647,12 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .expect("mock must observe the direct child");
-        if expect_maturity_wait {
-            assert_eq!(
-                quiet_child.prefix_guard_wait_reason.as_deref(),
-                Some("responses_material_tool_tail_maturity_pending")
-            );
-            assert!((1..=500).contains(&quiet_child.prefix_guard_wait_ms.unwrap_or_default()));
-            assert!(
-                child_elapsed >= TokioDuration::from_millis(350),
-                "the exact material parent must receive its one bounded maturity window"
-            );
-        } else {
-            assert_eq!(quiet_child.prefix_guard_wait_reason, None);
-            assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
-            assert!(
-                child_elapsed < TokioDuration::from_millis(350),
-                "a one-character tool child must not receive an unproven local wait"
-            );
-        }
+        assert_eq!(quiet_child.prefix_guard_wait_reason, None);
+        assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
+        assert!(
+            child_elapsed < TokioDuration::from_millis(350),
+            "cache maturity observation must never delay the direct child"
+        );
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -31131,23 +32661,23 @@ mod tests {
     async fn small_tool_tail_direct_child_stays_immediate_without_extra_post() {
         // Two balanced live cohorts found no aggregate cache gain from holding
         // a one-character tool tail locally. Preserve that immediate path.
-        exercise_tool_tail_direct_child("x", false).await;
+        exercise_tool_tail_direct_child("x").await;
     }
 
     #[tokio::test]
-    async fn medium_tool_tail_direct_child_waits_once_without_extra_post() {
-        // The first 12K result is real new context. Its exactly-bound direct
-        // child may wait once so the already-sent parent can materialise.
+    async fn medium_tool_tail_direct_child_stays_immediate_without_extra_post() {
+        // The 12K result is real new context, but cache observation must not
+        // delay its direct child.
         let medium_tool_output = "x".repeat(12_288);
-        exercise_tool_tail_direct_child(&medium_tool_output, true).await;
+        exercise_tool_tail_direct_child(&medium_tool_output).await;
     }
 
     #[tokio::test]
-    async fn large_tool_tail_direct_child_waits_once_without_extra_post() {
-        // This is the larger observed ordinary-tool band. It remains one
-        // inbound/one upstream request while its exact parent matures.
+    async fn large_tool_tail_direct_child_stays_immediate_without_extra_post() {
+        // This is the larger observed ordinary-tool band. It remains
+        // immediate and one inbound/one upstream request.
         let large_tool_output = "x".repeat(40_960);
-        exercise_tool_tail_direct_child(&large_tool_output, true).await;
+        exercise_tool_tail_direct_child(&large_tool_output).await;
     }
 
     #[tokio::test]
@@ -36996,6 +38526,44 @@ mod tests {
         assert_eq!(next.avoidable_shortfall_tokens_128, 384);
         assert_eq!(next.avoidable_shortfall_streak, 1);
 
+        // A clean dynamic text tail can exceed the old 1KiB gate while still
+        // carrying a trustworthy exact sent-waterline receipt. Preserve its
+        // 128-token evidence so the immediate direct successor can skip an
+        // unproductive 500ms proactive settle.
+        let text_tail_4157 = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 4_157,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let mut text_next = prefix_state(raw.input_tokens, raw.cache_read_tokens, 0);
+        text_next.seen_bucket_tokens = raw.cache_read_tokens;
+        text_next.seen_bucket_tokens_128 = raw.cache_read_tokens;
+        promote_exact_final_scope_sent_waterline(&mut text_next, &raw, &scope, &text_tail_4157);
+        assert_eq!(text_next.seen_bucket_tokens_128, 23_424);
+        assert_eq!(text_next.avoidable_shortfall_tokens_128, 384);
+
+        let text_tail_8193 = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 8_193,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let mut large_text_next = prefix_state(raw.input_tokens, raw.cache_read_tokens, 0);
+        large_text_next.seen_bucket_tokens = raw.cache_read_tokens;
+        large_text_next.seen_bucket_tokens_128 = raw.cache_read_tokens;
+        promote_exact_final_scope_sent_waterline(
+            &mut large_text_next,
+            &raw,
+            &scope,
+            &text_tail_8193,
+        );
+        assert_eq!(
+            large_text_next.seen_bucket_tokens_128,
+            raw.cache_read_tokens
+        );
+        assert_eq!(large_text_next.avoidable_shortfall_tokens_128, 0);
+
         // A later, smaller receipt can never lower the already proven
         // waterline or turn a settled shortfall into a fabricated regression.
         let smaller_scope = FinalScopeWaterlineLog {
@@ -37035,7 +38603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_final_scope_sent_waterline_reaches_next_request_settle_guard() {
+    async fn exact_final_scope_small_sent_waterline_skips_next_request_settle_guard() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-final-scope-sent-waterline-{}",
             Uuid::new_v4().simple()
@@ -37098,6 +38666,7 @@ mod tests {
             None,
             false,
             true,
+            None,
             Some(&scope),
         )
         .await;
@@ -37126,14 +38695,92 @@ mod tests {
             Some(parent),
         )
         .await;
-        assert!(guard.wait_ms > 0);
-        assert!(guard.wait_ms <= 500);
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(guard.reason, None);
         assert_eq!(
-            guard.reason.as_deref(),
-            Some("responses_first_exact_avoidable_settle")
+            guard.skip_reason.as_deref(),
+            Some("fresh_exact_pending_residual_too_small")
         );
         assert_eq!(guard.source.as_deref(), Some("exact"));
         assert_eq!(guard.pre_request_avoidable_tokens, 384);
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn local_rebind_success_suppresses_duplicate_exact_settle_without_gap() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-local-rebind-settle-suppression-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0local-rebind";
+        let parent = "local-rebind-parent";
+        let static_projection = "stable-wire";
+        let mut prior = prefix_state(64_512, 64_512, 0);
+        prior.responses_static_projection_digest = Some(static_projection.to_string());
+        seed_native_maturity_scope(&state, key, parent, prior).await;
+
+        let tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 32_000,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let guard =
+            wait_for_provider_prefix_settle_on_final_wire_with_scope_reason_and_options_proof(
+                &state,
+                &Channel::Responses,
+                Some(key),
+                None,
+                &tail,
+                false,
+                Some(TokioDuration::from_millis(1)),
+                FinalResponsesStaticProjection::Observed(Some(static_projection)),
+                Some(parent),
+                None,
+                None,
+                true,
+            )
+            .await;
+
+        assert_eq!(guard.wait_ms, 0);
+        assert_eq!(guard.reason, None);
+        assert_eq!(guard.skip_reason.as_deref(), Some("no_avoidable_gap"));
+        assert_eq!(guard.pre_request_avoidable_tokens, 0);
+
+        let gap_key = "prefix-v3\0realm\0policy\0provider\0model\0responses\0local-rebind-gap";
+        let mut gap = prefix_state(64_512, 62_464, 2_048);
+        gap.avoidable_shortfall_streak = 2;
+        gap.responses_static_projection_digest = Some(static_projection.to_string());
+        seed_native_maturity_scope(&state, gap_key, parent, gap).await;
+        let guarded =
+            wait_for_provider_prefix_settle_on_final_wire_with_scope_reason_and_options_proof(
+                &state,
+                &Channel::Responses,
+                Some(gap_key),
+                None,
+                &tail,
+                false,
+                Some(TokioDuration::from_millis(1)),
+                FinalResponsesStaticProjection::Observed(Some(static_projection)),
+                Some(parent),
+                None,
+                None,
+                true,
+            )
+            .await;
+        assert!(guarded.wait_ms > 0);
+        assert_eq!(
+            guarded.reason.as_deref(),
+            Some("responses_exact_avoidable_gap")
+        );
 
         fs::remove_dir_all(dir).ok();
     }
@@ -37814,7 +39461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn matching_final_scope_keeps_the_existing_bounded_prefix_wait() {
+    async fn matching_final_scope_skips_one_off_tiny_pending_residual() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
             "atoapi-final-maturity-scope-match-{}",
@@ -37840,10 +39487,13 @@ mod tests {
         )
         .await;
 
-        assert!(guard.wait_ms > 0);
-        assert!(guard.wait_ms <= 1);
+        assert_eq!(guard.wait_ms, 0);
         assert_eq!(guard.source.as_deref(), Some("exact"));
-        assert!(guard.skip_reason.is_none());
+        assert_eq!(
+            guard.skip_reason.as_deref(),
+            Some("fresh_exact_pending_residual_too_small")
+        );
+        assert_eq!(guard.pre_request_avoidable_tokens, 512);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -40158,31 +41808,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_body_gzip_fallback_cooldown_skips_repeated_attempts() {
-        let config = AppConfig::default();
-        let dir =
-            std::env::temp_dir().join(format!("atoapi-gzip-cooldown-{}", Uuid::new_v4().simple()));
-        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
-        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
-        let key = request_body_gzip_cooldown_key(
-            "https://example.test/v1/responses",
-            &Channel::Responses,
-        );
-
-        assert!(!request_body_gzip_cooldown_active(&state, &key).await);
-        note_request_body_gzip_fallback(&state, &key).await;
-        assert!(request_body_gzip_cooldown_active(&state, &key).await);
-        let same_provider_key = request_body_gzip_cooldown_key(
-            "https://EXAMPLE.test/v1/chat/completions",
-            &Channel::Responses,
-        );
-        assert_eq!(key, same_provider_key);
-        assert!(request_body_gzip_cooldown_active(&state, &same_provider_key).await);
-
-        fs::remove_dir_all(dir).ok();
-    }
-
-    #[tokio::test]
     async fn admin_probe_auth_precedes_json_parsing_and_body_is_bounded() {
         let mut config = AppConfig::default();
         config.local_key = "admin-local-key".to_string();
@@ -40214,6 +41839,154 @@ mod tests {
         )
         .await;
         assert_eq!(authorized_invalid.status(), StatusCode::BAD_REQUEST);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn isolated_response_continuation_admin_probe_requires_configured_local_key() {
+        let config = AppConfig::default();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-isolated-continuation-auth-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let response = authorize_and_parse_isolated_admin_json::<Value>(
+            &state,
+            admin_request_with_body("{}".to_string(), None),
+        )
+        .await
+        .expect_err("an empty administration key must fail closed");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn isolated_response_continuation_probe_is_one_shot_same_ua_and_sanitized() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let bodies_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured_bodies = bodies_for_route.clone();
+                async move {
+                    assert_eq!(
+                        headers
+                            .get(header::USER_AGENT)
+                            .and_then(|value| value.to_str().ok()),
+                        Some("Atoapi/continuation-test")
+                    );
+                    assert_eq!(
+                        headers
+                            .get(X_ATOAPI_REQUEST_KIND_HEADER)
+                            .and_then(|value| value.to_str().ok()),
+                        Some(isolated_response_continuation::REQUEST_KIND)
+                    );
+                    let index = hits.fetch_add(1, Ordering::SeqCst);
+                    captured_bodies.lock().await.push(body.clone());
+                    let response_id = if index == 0 {
+                        assert!(body.get("previous_response_id").is_none());
+                        "resp_seed_private"
+                    } else {
+                        assert_eq!(
+                            body.get("previous_response_id").and_then(Value::as_str),
+                            Some("resp_seed_private")
+                        );
+                        "resp_followup_private"
+                    };
+                    let sse = format!(
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"raw-output-sentinel\"}}\n\n",
+                            "event: response.completed\n",
+                            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{}\",\"status\":\"completed\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":1,\"total_tokens\":4}}}}}}\n\n",
+                            "data: [DONE]\n\n"
+                        ),
+                        response_id
+                    );
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        sse,
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "admin-local-key".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "isolated-continuation-provider".to_string();
+        provider.custom_user_agent = Some("Atoapi/continuation-test".to_string());
+        let expected_realm = isolated_response_continuation_probe_realm(
+            &provider,
+            "gpt-5.6-terra",
+            &SelectedProviderKey {
+                secret: provider.api_key_encrypted.clone().unwrap_or_default(),
+                key_id: None,
+                encrypted_material_digest: None,
+            },
+        );
+        assert_ne!(
+            expected_realm,
+            affinity_identity::key_realm_id(&SelectedProviderKey {
+                secret: provider.api_key_encrypted.clone().unwrap_or_default(),
+                key_id: None,
+                encrypted_material_digest: None,
+            })
+        );
+        config.providers = vec![provider];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-isolated-continuation-probe-{}",
+            Uuid::new_v4().simple()
+        ));
+        let cache = CacheStore::load(dir.join("cache.bin")).unwrap();
+        let state = AppState::for_test(config, dir.join("config.toml"), cache).unwrap();
+
+        let result = run_isolated_response_continuation_probe(
+            &state,
+            isolated_response_continuation::ProbeInput {
+                provider_id: "isolated-continuation-provider".to_string(),
+                model_id: "gpt-5.6-terra".to_string(),
+                key_id: None,
+                key_realm_hash: Some(expected_realm.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.ok);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(result.upstream_request_count, 2);
+        assert!(result.seed.response_id_present);
+        assert!(result.continuation.previous_response_id_sent);
+        assert!(result.continuation.accepted);
+        assert!(result.identity.same_user_agent);
+        assert_eq!(result.identity.key_realm_hash, expected_realm);
+        let captured = captured_bodies.lock().await;
+        assert_eq!(captured.len(), 2);
+        assert!(captured[0].get("previous_response_id").is_none());
+        assert_eq!(
+            captured[1]
+                .get("previous_response_id")
+                .and_then(Value::as_str),
+            Some("resp_seed_private")
+        );
+        drop(captured);
+        let sanitized = serde_json::to_string(&result).unwrap();
+        assert!(!sanitized.contains("resp_seed_private"));
+        assert!(!sanitized.contains("resp_followup_private"));
+        assert!(!sanitized.contains("raw-output-sentinel"));
+        assert!(!sanitized.contains("Bearer key"));
         fs::remove_dir_all(dir).ok();
     }
 
@@ -40288,6 +42061,7 @@ mod tests {
             "cache-capability-provider",
             "gpt-5.6-luna",
             Some(Channel::Responses),
+            None,
         )
         .await
         .unwrap();
@@ -40324,6 +42098,30 @@ mod tests {
             ProviderCacheCapabilityStatus::Unsupported
         );
         drop(saved);
+
+        let single_field = probe_and_record_provider_cache_capabilities(
+            &state,
+            "cache-capability-provider",
+            "gpt-5.6-luna",
+            Some(Channel::Responses),
+            Some(vec![ProviderCacheCapabilityField::PromptCacheKey]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            7,
+            "a one-field certificate must issue only baseline plus that field"
+        );
+        assert_eq!(single_field.fields.len(), 1);
+        assert_eq!(
+            single_field.fields[0].field,
+            ProviderCacheCapabilityField::PromptCacheKey
+        );
+        assert_eq!(
+            single_field.fields[0].status,
+            ProviderCacheCapabilityStatus::Verified
+        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -40937,6 +42735,7 @@ mod tests {
             &provider_id,
             &model_id,
             Some(requested_channel),
+            None,
         )
         .await
         .expect("live cache capability probe should complete");
@@ -43017,6 +44816,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_previous_response_id_rebinds_regenerated_tool_ids_on_frozen_full_replay() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let captured_bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let captured_for_route = captured_bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let captured = captured_for_route.clone();
+                async move {
+                    let turn = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                    captured.lock().await.push(body);
+                    let output = if turn == 1 {
+                        r#"[{"type":"message","id":"msg_regenerated_tool_seed","status":"completed","role":"assistant","content":[{"type":"output_text","text":"seed answer"}]}]"#
+                    } else {
+                        "[]"
+                    };
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        format!(
+                            r#"event: response.completed
+data: {{"type":"response.completed","response":{{"id":"resp_regenerated_tools_{turn}","model":"gpt-5.5","output":{output},"usage":{{"input_tokens":4096,"output_tokens":1,"input_tokens_details":{{"cached_tokens":3968}}}}}}}}
+
+"#
+                        )
+                        .into_bytes(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "local-regenerated-tool-replay";
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.5".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.5".to_string(),
+            context_window: Some(300_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-local-regenerated-tool-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"local-regenerated-session","thread_id":"local-regenerated-thread","request_kind":"turn"}"#,
+            ),
+        );
+        let tools = json!([
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        ]);
+        let first_input = json!([
+            { "type": "message", "role": "user", "content": "inspect the stable file" },
+            {
+                "type": "function_call",
+                "call_id": "call_stable",
+                "name": "read_file",
+                "arguments": "{\"path\":\"src/main.rs\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_stable",
+                "output": { "ok": true, "content": "stable source" }
+            }
+        ]);
+        let scope_seed = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": "establish the trusted local replay scope"
+                    }]
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(scope_seed.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(scope_seed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let continuation_scope_key = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let mut keys = state
+                    .continuation_lineage
+                    .snapshot_heads()
+                    .await
+                    .into_keys()
+                    .collect::<Vec<_>>();
+                if let Some(key) = keys.pop() {
+                    break key;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ordinary seed must establish the trusted local replay scope");
+        state
+            .continuation_lineage
+            .seed_for_test(
+                &continuation_scope_key,
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_regenerated_tools_1".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: true,
+                    input: first_input.clone(),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+
+        let mut replayed_input = first_input.as_array().unwrap().clone();
+        replayed_input[1]["call_id"] = json!("call_regenerated");
+        replayed_input[2]["call_id"] = json!("call_regenerated");
+        let new_tail = json!({
+            "type": "message",
+            "role": "user",
+            "content": "continue with one real dynamic tail"
+        });
+        replayed_input.push(new_tail.clone());
+        let replay = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_regenerated_tools_1",
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "input": replayed_input
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(replay.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let metrics = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_agent_upstream_attempts.len() == 2 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both full-replay requests must settle exactly once");
+        let captured = captured_bodies.lock().await.clone();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert_eq!(captured.len(), 2);
+        assert!(captured
+            .iter()
+            .all(|body| body.get("previous_response_id").is_none()));
+        assert_eq!(captured[1]["tools"], tools);
+        assert_eq!(captured[1]["tool_choice"], "auto");
+        let replay_wire_input = captured[1]["input"].as_array().unwrap();
+        let stored_input = first_input.as_array().unwrap();
+        assert_eq!(replay_wire_input.len(), stored_input.len() + 1);
+        assert_eq!(replay_wire_input.last(), Some(&new_tail));
+        assert_eq!(
+            replay_wire_input[1]["call_id"], replay_wire_input[2]["call_id"],
+            "the rebound function call and tool output must remain paired"
+        );
+        assert_ne!(
+            replay_wire_input[1]["call_id"], "call_regenerated",
+            "the regenerated function call id must be rebound to the frozen predecessor"
+        );
+        assert_eq!(metrics.retries, 0);
+        assert!(metrics
+            .recent_agent_upstream_attempts
+            .iter()
+            .all(|attempt| attempt.attempt_index == 1 && attempt.attempt_budget == 1));
+        assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn normal_full_replay_never_injects_previous_response_id_retries_or_blocks_after_failure()
     {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -43429,17 +45455,6 @@ mod tests {
         assert_eq!(metrics.retries, 0);
         assert_eq!(metrics.recent_agent_upstream_attempts.len(), 3);
         fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn gzip_rejection_only_marks_a_future_request_cooldown() {
-        assert!(should_retry_without_gzip(StatusCode::BAD_REQUEST));
-        assert!(should_retry_without_gzip(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE
-        ));
-        assert!(should_retry_without_gzip(StatusCode::NOT_IMPLEMENTED));
-        assert!(!should_retry_without_gzip(StatusCode::BAD_GATEWAY));
-        assert!(!should_retry_without_gzip(StatusCode::SERVICE_UNAVAILABLE));
     }
 
     #[test]
@@ -44250,9 +46265,21 @@ mod tests {
             .iter()
             .find(|item| item.id == provider_id)
             .expect("the Codex route provider must exist in the isolated copy");
-        let model = codex_route
-            .model_id
-            .filter(|value| !value.trim().is_empty())
+        // A Codex injection can deliberately inherit the model sent by the
+        // agent rather than storing one as its enabled Provider model.  The
+        // real-upstream affinity smoke test is therefore allowed one explicit
+        // test-only model value, supplied by the live-scope resolver.  This
+        // avoids silently probing a fallback model while leaving ordinary
+        // routing and saved configuration untouched.
+        let model = std::env::var("ATOAPI_REAL_UPSTREAM_AFFINITY_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                codex_route
+                    .model_id
+                    .filter(|value| !value.trim().is_empty())
+            })
             .or_else(|| {
                 provider
                     .models

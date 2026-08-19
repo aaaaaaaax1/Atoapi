@@ -177,11 +177,13 @@ mod tests {
                 responses_cache_maturity_static_projection_digest: Some(
                     "continuation-static-projection-a".to_string(),
                 ),
+                prompt_cache_options_sibling_proof: None,
                 atoapi_mutated_static_categories: Vec::new(),
                 outbound_prefix_fingerprints: None::<ResponsesWirePrefixFingerprints>,
             },
             cache_controls: FinalCacheControls {
                 present_field_mask: 1,
+                prompt_cache_options_ttl: None,
                 breakpoint_provenance:
                     crate::proxy::prepared_wire_request::ProtocolBreakpointProvenance::Absent,
             },

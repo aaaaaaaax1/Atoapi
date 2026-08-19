@@ -1,6 +1,7 @@
 use crate::{
-    config::{Channel, ProviderCacheCapabilityField},
+    config::{Channel, PromptCacheOptionsTtl, ProviderCacheCapabilityField},
     metrics::ResponsesWirePrefixFingerprints,
+    state::PromptCacheOptionsSiblingProof,
 };
 
 use super::{
@@ -67,6 +68,7 @@ pub(super) struct PreparedWireDigest {
     pub(super) canonical_member_count: u64,
     pub(super) responses_static_projection_digest: Option<String>,
     pub(super) responses_cache_maturity_static_projection_digest: Option<String>,
+    pub(super) prompt_cache_options_sibling_proof: Option<PromptCacheOptionsSiblingProof>,
     pub(super) atoapi_mutated_static_categories: Vec<String>,
     pub(super) outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
@@ -74,6 +76,9 @@ pub(super) struct PreparedWireDigest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FinalCacheControls {
     pub(super) present_field_mask: u8,
+    /// Exact value witnessed on the frozen JSON wire.  `None` means absent or
+    /// an unrecognized shape and can never authorize an Options effect.
+    pub(super) prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
     /// Source and exact placement are bound to the frozen wire. A caller's
     /// lookalike marker can therefore never authorize a cache rule.
     pub(super) breakpoint_provenance: ProtocolBreakpointProvenance,
@@ -103,6 +108,10 @@ impl FinalCacheControls {
 
     pub(super) fn breakpoint_placement_digest(&self) -> Option<&str> {
         self.breakpoint_provenance.placement_digest()
+    }
+
+    pub(super) const fn prompt_cache_options_ttl(&self) -> Option<PromptCacheOptionsTtl> {
+        self.prompt_cache_options_ttl
     }
 }
 
@@ -145,6 +154,7 @@ impl CacheControlPlan {
         let breakpoint_provenance = prepared.protocol_breakpoint_provenance().clone();
         let cache_controls = FinalCacheControls {
             present_field_mask: cache_control_mask(body, breakpoint_provenance.is_present()),
+            prompt_cache_options_ttl: prepared.prompt_cache_options_ttl(),
             breakpoint_provenance,
         };
         // This receipt intentionally carries only the strict lineage tuple.
@@ -166,6 +176,9 @@ impl CacheControlPlan {
             responses_cache_maturity_static_projection_digest: prepared
                 .responses_cache_maturity_static_projection_digest()
                 .map(ToOwned::to_owned),
+            prompt_cache_options_sibling_proof: prepared
+                .prompt_cache_options_sibling_proof()
+                .cloned(),
             atoapi_mutated_static_categories: prepared.atoapi_mutated_static_categories().to_vec(),
             outbound_prefix_fingerprints: prepared.outbound_prefix_fingerprints().cloned(),
         };
@@ -297,6 +310,51 @@ mod tests {
         assert_eq!(first.wire.version, 2);
         assert_eq!(first.wire.wire_bytes > 0, true);
         assert_eq!(first.cache_controls.present_field_mask, 0);
+    }
+
+    #[test]
+    fn frozen_cache_control_receipt_binds_only_exact_options_ttls() {
+        let receipt_30m = receipt(
+            json!({
+                "model":"gpt-test",
+                "prompt_cache_options":{"mode":"implicit","ttl":"30m"},
+                "input":[]
+            }),
+            CacheContextMode::FullReplay,
+        );
+        let receipt_24h = receipt(
+            json!({
+                "model":"gpt-test",
+                "prompt_cache_options":{"mode":"implicit","ttl":"24h"},
+                "input":[]
+            }),
+            CacheContextMode::FullReplay,
+        );
+        assert_eq!(
+            receipt_30m.cache_controls.prompt_cache_options_ttl(),
+            Some(PromptCacheOptionsTtl::ThirtyMinutes)
+        );
+        assert_eq!(
+            receipt_24h.cache_controls.prompt_cache_options_ttl(),
+            Some(PromptCacheOptionsTtl::TwentyFourHours)
+        );
+
+        for options in [
+            json!({"mode":"explicit","ttl":"24h"}),
+            json!({"mode":"implicit","ttl":"5m"}),
+            json!({"mode":"implicit","ttl":"24h","extra":true}),
+            json!("implicit"),
+        ] {
+            let invalid = receipt(
+                json!({
+                    "model":"gpt-test",
+                    "prompt_cache_options": options,
+                    "input":[]
+                }),
+                CacheContextMode::FullReplay,
+            );
+            assert_eq!(invalid.cache_controls.prompt_cache_options_ttl(), None);
+        }
     }
 
     #[test]

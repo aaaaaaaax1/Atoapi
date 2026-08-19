@@ -33,6 +33,19 @@ param(
     [ValidateRange(0, 60000)]
     [int]$PairDelayMs = 0,
 
+    # The selected upstream can legitimately spend several minutes waiting
+    # for headers on a 1M+ token seed. This verifier-only deadline is kept
+    # separate from Atoapi runtime behavior and never changes live traffic.
+    [ValidateRange(30000, 600000)]
+    [int]$ResponseTimeoutMs = 180000,
+
+    # Test-only horizon delay. It runs only after both seed SSE streams have
+    # completed and before the first changing tail, so a 24h retention field
+    # can be measured across the ordinary cache window without changing live
+    # desktop traffic.
+    [ValidateRange(0, 3600000)]
+    [int]$SeedToReuseDelayMs = 0,
+
     # Verifier-only pacing within a crossover pair. These delays do not alter
     # either arm's request body or cache policy; they only give a capacity-
     # sensitive upstream a bounded recovery window between streamed turns.
@@ -76,6 +89,23 @@ param(
     [ValidateSet('tool', 'text')]
     [string]$DynamicTailMode = 'tool',
 
+    # Select the verifier fixture protocol. Function is the historical wire;
+    # custom exercises Responses custom_tool_call/custom_tool_call_output.
+    [ValidateSet('function', 'custom')]
+    [string]$ToolProtocol = 'function',
+
+    # Narrow verifier-only fixture: exercise local previous_response_id
+    # continuation with regenerated closed tool call ids. It never changes
+    # normal desktop traffic and is invalid outside the three-turn dynamic
+    # tool scenario.
+    [switch]$ExerciseLocalPreviousResponseIdRebind,
+
+    # Narrow verifier-only fixture: exercise a local previous_response_id
+    # continuation while preserving every completed tool call id. This is
+    # intentionally separate from the rebind fixture and never changes normal
+    # desktop traffic.
+    [switch]$ExerciseLocalPreviousResponseIdFullReplay,
+
     [ValidateSet('natural', 'natural-dense', 'legacy-repeated')]
     [string]$FixtureProfile = 'natural',
 
@@ -97,6 +127,32 @@ param(
     [ValidateRange(0, 10000)]
     [int]$MaxInputTokenDelta = 128,
 
+    # The frozen stable prefix must be large enough to exercise maturity
+    # policies that deliberately decline tiny contexts. Keep the historical
+    # default intact, while allowing an explicit high-waterline probe.
+    [ValidateRange(1024, 2500000)]
+    [int]$StableInstructionChars = 16384,
+
+    # A candidate-only guard is an optimization under test, not an assumed
+    # result. This lets a live validation fail closed when its target path
+    # never actually ran.
+    [ValidateRange(0, 60)]
+    [int]$RequireCandidateGuardedRequests = 0,
+
+    # Target-only evidence gate for the candidate's 4-8KiB exact tool-tail
+    # maturity branch. Generic prefix waits must never stand in for it.
+    [switch]$RequireCandidateExactMediumToolTailMaturityWait,
+
+    # Target-only evidence gate for the candidate's exact large-message text
+    # tail lag branch. A generic prefix wait must never qualify this path.
+    [switch]$RequireCandidateExactLargeMessageTailLag,
+
+    # Target-only evidence gate for the late direct-child branch after a
+    # proven shallow provider-waterline rollback.  This remains an isolated
+    # candidate experiment: a generic prefix wait or ordinary waterline
+    # settle must never qualify it for a promotion result.
+    [switch]$RequireCandidateLateShallowProviderWaterlineRollbackWait,
+
     [ValidateRange(1024, 512000)]
     [int]$ToolChars = 0,
 
@@ -108,16 +164,77 @@ param(
     # changing the live Provider configuration.
     [string]$UpstreamUserAgent = '',
 
+    # Same-binary diagnostic only: compare the selected Provider's untouched
+    # versioned default User-Agent with one explicit stable User-Agent. This
+    # is intentionally non-promotable and must run with isolated cache lanes.
+    [switch]$DiagnosticUserAgentSplit,
+
+    [string]$ChampionUpstreamUserAgent = '',
+
+    [string]$CandidateUpstreamUserAgent = '',
+
     # By default the historical runner injects one generated client-owned
     # prompt_cache_key into both arms.  Native-policy comparisons must be able
     # to omit that test key so the candidate's own cache placement policy is
     # observable while retaining the same live-scope resolver and guards.
-    [switch]$NoClientPromptCacheKey,
+    [switch]$NoClientPromptCacheKey = $true,
+
+    # Isolated candidate-only experiment: inject Atoapi's generated native
+    # prompt_cache_key after the selected provider/model/Key scope has already
+    # accepted that field. It never changes the live desktop policy.
+    [switch]$CandidatePromptCacheKey,
+
+    # Isolated candidate-only subvariant: derive the generated prompt-cache key
+    # from a trusted explicit thread so session/conversation churn can reuse
+    # one placement. It still uses the native PCK capability gate.
+    [switch]$CandidateThreadStablePromptCacheKeyBridge,
+
+    # Isolated candidate-only experiment: replay a narrowly recognized
+    # upstream load-balancer placement cookie. Normal desktop traffic remains
+    # disabled in the executable and this switch never alters live config.
+    [switch]$CandidateUpstreamAffinity,
+
+    # Isolated candidate-only experiment: inject the compatibility-verified
+    # native prompt_cache_options field. Normal desktop traffic never receives
+    # this field until a dynamic A/B produces an exact-scope promotion result.
+    [switch]$CandidatePromptCacheOptions,
+
+    # Subvariant of CandidatePromptCacheOptions: the disposable candidate uses
+    # ttl=24h rather than the ordinary implicit/30m value. It is wire-witnessed
+    # and never changes the normal desktop process.
+    [switch]$CandidatePromptCacheOptions24h,
+
+    # Require the isolated 24h options candidate to exercise the bounded
+    # static-sibling settle hint at least once. This is an A/B evidence gate;
+    # it never enables the behavior in the live desktop process.
+    [switch]$RequireCandidateOptions24hSiblingSettle,
+
+    # Isolated candidate-only experiment: inject the compatibility-verified
+    # prompt_cache_retention field. It never changes the saved Provider setting
+    # or normal desktop traffic until an exact-scope promotion result exists.
+    [switch]$CandidatePromptCacheRetention,
+
+    # Isolated candidate-only transport experiment: force HTTP/1.1 to test
+    # whether an upstream HTTP/2 waterline rollback is multiplexing-related.
+    # Normal desktop traffic keeps the established negotiated HTTP/2 behavior.
+    [switch]$CandidateHttp1,
+
+    # Isolated candidate-only maturity experiment: after a proven shallow
+    # provider waterline rollback, spend at most the existing 500ms foreground
+    # settle window before the next exact safe successor.
+    # Production remains unchanged until a positive dynamic A/B is verified.
+    [switch]$CandidateProviderWaterlineRecoveryWait,
 
     # These values are refreshed from the latest successful live Codex request
     # before every run.  Supplying one is allowed only as an assertion: a stale
     # manual value fails closed instead of silently testing a previous upstream.
     [string]$Model = '',
+
+    # The verifier must replay the current Codex request's effective
+    # reasoning setting when the selected upstream rejects the implicit
+    # default. This remains identical for champion and candidate.
+    [ValidateSet('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')]
+    [string]$ReasoningEffort = '',
 
     [string]$KeyRealmHash = '',
 
@@ -133,11 +250,16 @@ param(
 
     [switch]$ResolveLiveScopeOnly,
 
+    # Machine-readable, secret-free variant for isolated verifier scripts.
+    # It emits the complete hashed realm so the verifier can bind the exact
+    # currently selected Key without exposing the Key id or secret.
+    [switch]$ResolveLiveScopeJson,
+
     [switch]$SelfTest,
 
     [string]$ConfigDir = (Join-Path $env:APPDATA 'Atoapi'),
 
-    [string]$ChampionExe = 'G:\Atoapi\releases\v1.4.33-exact-sent-waterline-maturity-20260807\Atoapi.exe',
+    [string]$ChampionExe = 'G:\Atoapi\releases\v1.5.0-thread-stable-pck-bridge-20260818\Atoapi.exe',
 
     [string]$CandidateExe = 'G:\Atoapi\src-tauri\target\release\atoapi.exe',
 
@@ -149,6 +271,201 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $verifier = Join-Path $PSScriptRoot 'verify-release-champion.mjs'
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $isDynamicTailMix = $Scenario -eq 'dynamic-tail-mix'
+$isExerciseLocalPreviousResponseIdRebind = $ExerciseLocalPreviousResponseIdRebind.IsPresent
+$isExerciseLocalPreviousResponseIdFullReplay = $ExerciseLocalPreviousResponseIdFullReplay.IsPresent
+$isExactMediumToolTailMaturity = $RequireCandidateExactMediumToolTailMaturityWait
+$isExactLargeMessageTailLag = $RequireCandidateExactLargeMessageTailLag
+$isLateShallowProviderWaterlineRollback = $RequireCandidateLateShallowProviderWaterlineRollbackWait
+
+if ($ToolProtocol -eq 'custom') {
+    if ($Scenario -eq 'dynamic-tail-mix' -and $DynamicTailMode -eq 'text') {
+        throw 'ToolProtocol=custom requires DynamicTailMode=tool so the request contains custom tool items.'
+    }
+    if (-not $IncludeToolSchema) {
+        throw 'ToolProtocol=custom requires IncludeToolSchema.'
+    }
+    if ($Scenario -notin @('dynamic-tail-mix', 'tool-burst', 'tool-tail-maturity')) {
+        throw 'ToolProtocol=custom requires a tool-history scenario.'
+    }
+}
+
+if ($isExerciseLocalPreviousResponseIdRebind -and $isExerciseLocalPreviousResponseIdFullReplay) {
+    throw 'ExerciseLocalPreviousResponseIdRebind and ExerciseLocalPreviousResponseIdFullReplay are mutually exclusive.'
+}
+
+if ($isExerciseLocalPreviousResponseIdRebind -or $isExerciseLocalPreviousResponseIdFullReplay) {
+    if ($Scenario -ne 'dynamic-tail-mix') {
+        throw 'The local previous_response_id fixture requires -Scenario dynamic-tail-mix.'
+    }
+    # Keep the historical two-pair default, but allow an explicit warm-up
+    # pair before the two scored crossover pairs.  Shared upstream lanes can
+    # otherwise make pair zero cold for one arm and warm for the other; the
+    # verifier must be able to exclude that pair without weakening the
+    # local-rebind witness on the scored pairs.
+    if ($PSBoundParameters.ContainsKey('Pairs') -and $Pairs -lt 2) {
+        throw 'The local previous_response_id fixture requires -Pairs at least 2.'
+    }
+    if (-not $PSBoundParameters.ContainsKey('Pairs')) {
+        $Pairs = 2
+    }
+    if ($PSBoundParameters.ContainsKey('Turns') -and $Turns -ne 3) {
+        throw 'The local previous_response_id fixture requires exactly -Turns 3.'
+    }
+    $Turns = 3
+    if ($DynamicTailMode -ne 'tool' -or -not $IncludeToolSchema) {
+        throw 'The local previous_response_id fixture requires DynamicTailMode=tool and IncludeToolSchema.'
+    }
+    if ($DiagnosticUserAgentSplit -or $CandidateUpstreamAffinity -or
+        $CandidatePromptCacheKey -or $CandidateThreadStablePromptCacheKeyBridge -or $CandidatePromptCacheOptions -or
+        $CandidatePromptCacheRetention -or $CandidateHttp1 -or
+        $CandidateProviderWaterlineRecoveryWait) {
+        throw 'The local previous_response_id fixture cannot be combined with another candidate-only or diagnostic treatment.'
+    }
+    if ($isExerciseLocalPreviousResponseIdFullReplay) {
+        if ($PSBoundParameters.ContainsKey('ToolChars') -and $ToolChars -lt 32768) {
+            throw 'ExerciseLocalPreviousResponseIdFullReplay requires ToolChars of at least 32768 so turn 1 has a material tool tail.'
+        }
+        if (-not $PSBoundParameters.ContainsKey('SeedContextChars')) {
+            $SeedContextChars = 65536
+        }
+        if (-not $PSBoundParameters.ContainsKey('MinimumPeakInputTokens')) {
+            $MinimumPeakInputTokens = 16384
+        } elseif ($MinimumPeakInputTokens -lt 16384) {
+            throw 'ExerciseLocalPreviousResponseIdFullReplay requires MinimumPeakInputTokens of at least 16384.'
+        }
+    }
+}
+
+if ($isExactMediumToolTailMaturity) {
+    if ($Scenario -ne 'tool-tail-maturity') {
+        throw 'RequireCandidateExactMediumToolTailMaturityWait requires -Scenario tool-tail-maturity.'
+    }
+    if ($PSBoundParameters.ContainsKey('Pairs') -and $Pairs -ne 2) {
+        throw 'Exact medium tool-tail maturity requires exactly -Pairs 2 for the reversed leader crossover.'
+    }
+    $Pairs = 2
+    if ($PSBoundParameters.ContainsKey('Turns') -and $Turns -ne 4) {
+        throw 'Exact medium tool-tail maturity requires exactly -Turns 4.'
+    }
+    if ($TurnDelayMs -ne 0 -or $InterArmDelayMs -ne 0) {
+        throw 'Exact medium tool-tail maturity requires zero TurnDelayMs and InterArmDelayMs.'
+    }
+    if (-not $IncludeToolSchema) {
+        throw 'Exact medium tool-tail maturity requires IncludeToolSchema.'
+    }
+    $RequireCandidateGuardedRequests = [Math]::Max($RequireCandidateGuardedRequests, 1)
+}
+
+if ($isExactLargeMessageTailLag) {
+    if ($Scenario -ne 'dynamic-tail-mix') {
+        throw 'RequireCandidateExactLargeMessageTailLag requires -Scenario dynamic-tail-mix.'
+    }
+    if ($PSBoundParameters.ContainsKey('Turns') -and $Turns -ne 3) {
+        throw 'Exact large message tail lag requires exactly -Turns 3.'
+    }
+    $Turns = 3
+    if ($MinimumSeedInputTokens -lt 262144 -or $MinimumPeakInputTokens -lt 262144) {
+        throw 'Exact large message tail lag requires MinimumSeedInputTokens and MinimumPeakInputTokens of at least 262144.'
+    }
+    if ($DynamicTailProfile -ne 'mixed' -or $DynamicTailMode -ne 'text' -or $FixtureProfile -ne 'natural') {
+        throw 'Exact large message tail lag requires DynamicTailProfile=mixed, DynamicTailMode=text, and FixtureProfile=natural.'
+    }
+    if ($ToolChars -ne 131072 -or $ToolCalls -ne 2 -or -not $IncludeToolSchema) {
+        throw 'Exact large message tail lag requires ToolChars=131072, ToolCalls=2, and IncludeToolSchema.'
+    }
+    if ($TurnDelayMs -ne 0 -or $InterArmDelayMs -ne 0) {
+        throw 'Exact large message tail lag requires zero TurnDelayMs and InterArmDelayMs.'
+    }
+    $RequireCandidateGuardedRequests = [Math]::Max($RequireCandidateGuardedRequests, 1)
+}
+
+if ($isLateShallowProviderWaterlineRollback) {
+    if (-not $CandidateProviderWaterlineRecoveryWait) {
+        throw 'RequireCandidateLateShallowProviderWaterlineRollbackWait requires CandidateProviderWaterlineRecoveryWait so the observation belongs to the isolated candidate treatment.'
+    }
+    if ($Scenario -ne 'dynamic-tail-mix') {
+        throw 'RequireCandidateLateShallowProviderWaterlineRollbackWait requires -Scenario dynamic-tail-mix.'
+    }
+    if ($PSBoundParameters.ContainsKey('Pairs') -and $Pairs -ne 2) {
+        throw 'Late shallow provider-waterline rollback requires exactly -Pairs 2 for the reversed leader crossover.'
+    }
+    $Pairs = 2
+    if ($PSBoundParameters.ContainsKey('Turns') -and $Turns -ne 4) {
+        throw 'Late shallow provider-waterline rollback requires exactly -Turns 4.'
+    }
+    $Turns = 4
+    if ($MinimumSeedInputTokens -lt 32768 -or $MinimumPeakInputTokens -lt 32768) {
+        throw 'Late shallow provider-waterline rollback requires MinimumSeedInputTokens and MinimumPeakInputTokens of at least 32768.'
+    }
+    if ($DynamicTailProfile -ne 'mixed' -or $DynamicTailMode -ne 'text' -or $FixtureProfile -ne 'natural') {
+        throw 'Late shallow provider-waterline rollback requires DynamicTailProfile=mixed, DynamicTailMode=text, and FixtureProfile=natural.'
+    }
+    if ($TurnDelayMs -lt 750 -or $InterArmDelayMs -ne 0) {
+        throw 'Late shallow provider-waterline rollback requires TurnDelayMs of at least 750 and InterArmDelayMs of exactly 0.'
+    }
+}
+
+if ($CandidateUpstreamAffinity) {
+    $CandidateExe = Join-Path $repoRoot 'src-tauri\target\release\atoapi.exe'
+    if (-not (Test-Path -LiteralPath $CandidateExe -PathType Leaf)) {
+        throw "candidate upstream-affinity executable is missing: $CandidateExe"
+    }
+}
+
+if ($NoClientPromptCacheKey -or $CandidatePromptCacheKey -or $CandidateThreadStablePromptCacheKeyBridge -or $CandidatePromptCacheOptions -or $CandidatePromptCacheRetention -or $CandidateHttp1 -or $CandidateProviderWaterlineRecoveryWait) {
+    $CandidateExe = Join-Path $repoRoot 'src-tauri\target\release\atoapi.exe'
+    if (-not (Test-Path -LiteralPath $CandidateExe -PathType Leaf)) {
+        throw "candidate cache-control executable is missing: $CandidateExe"
+    }
+}
+
+# Thread-stable bridge is a PCK subvariant, not a second independent
+# candidate treatment.  It intentionally requires CandidatePromptCacheKey
+# below, so count the pair as one experiment in the mutual-exclusion gate.
+$candidateCacheTreatmentCount = @(
+    $CandidateUpstreamAffinity,
+    ($CandidatePromptCacheKey -and -not $CandidateThreadStablePromptCacheKeyBridge),
+    $CandidateThreadStablePromptCacheKeyBridge,
+    $CandidatePromptCacheOptions,
+    $CandidatePromptCacheRetention,
+    $CandidateHttp1,
+    $CandidateProviderWaterlineRecoveryWait
+) | Where-Object { $_ } | Measure-Object | Select-Object -ExpandProperty Count
+if ($candidateCacheTreatmentCount -gt 1) {
+    throw 'Only one candidate-only cache experiment may run in one A/B.'
+}
+
+if (($CandidatePromptCacheKey -or $CandidateThreadStablePromptCacheKeyBridge) -and -not $NoClientPromptCacheKey) {
+    throw 'CandidatePromptCacheKey requires NoClientPromptCacheKey so a shared client key cannot confound the native-policy candidate.'
+}
+
+if ($CandidateThreadStablePromptCacheKeyBridge -and -not $CandidatePromptCacheKey) {
+    throw 'CandidateThreadStablePromptCacheKeyBridge requires CandidatePromptCacheKey so the native PCK capability gate remains explicit.'
+}
+
+if ($CandidatePromptCacheOptions24h -and -not $CandidatePromptCacheOptions) {
+    throw 'CandidatePromptCacheOptions24h requires CandidatePromptCacheOptions so the exact field and ttl variant are both explicit.'
+}
+
+if ($RequireCandidateOptions24hSiblingSettle -and -not $CandidatePromptCacheOptions24h) {
+    throw 'RequireCandidateOptions24hSiblingSettle requires CandidatePromptCacheOptions24h so the observed settle reason belongs to the isolated ttl=24h treatment.'
+}
+
+if ($DiagnosticUserAgentSplit) {
+    if ($SharedCacheCrossover) {
+        throw 'DiagnosticUserAgentSplit requires SharedCacheCrossover:$false so intentionally different User-Agents cannot share one cache lane.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpstreamUserAgent)) {
+        throw 'DiagnosticUserAgentSplit requires arm-specific User-Agent input; do not supply UpstreamUserAgent.'
+    }
+    $overrideCount = @($ChampionUpstreamUserAgent, $CandidateUpstreamUserAgent | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count
+    if ($overrideCount -ne 1) {
+        throw 'DiagnosticUserAgentSplit requires exactly one of ChampionUpstreamUserAgent or CandidateUpstreamUserAgent.'
+    }
+    if ((@($CandidateUpstreamAffinity, $CandidatePromptCacheKey, $CandidateThreadStablePromptCacheKeyBridge, $CandidatePromptCacheOptions, $CandidatePromptCacheRetention, $CandidateHttp1, $CandidateProviderWaterlineRecoveryWait) | Where-Object { $_ }).Count -gt 0) {
+        throw 'DiagnosticUserAgentSplit cannot be combined with another candidate-only cache experiment.'
+    }
+}
 
 if ($WarmupPairs -ge $Pairs) {
     throw 'WarmupPairs must be smaller than Pairs so at least one scored pair remains.'
@@ -644,6 +961,7 @@ function Get-LatestCodexMainRecord {
                 Status = [int](Get-TomlObjectValue -Object $record -Name 'status')
                 ProviderId = Get-TomlObjectValue -Object $record -Name 'provider_id'
                 Model = Get-TomlObjectValue -Object $record -Name 'model'
+                EffectiveReasoningEffort = Get-TomlObjectValue -Object $record -Name 'effective_reasoning_effort'
                 Realm = Get-TomlObjectValue -Object $record -Name 'shadow_affinity_realm_id'
                 SelectedKeyRef = Get-TomlObjectValue -Object $record -Name 'selected_provider_key_ref'
                 ClientChannel = Get-TomlObjectValue -Object $record -Name 'client_channel'
@@ -687,6 +1005,10 @@ function Resolve-LiveCodexScope {
         [string]::IsNullOrWhiteSpace($live.Model) -or
         $live.Realm -notmatch '^[0-9a-f]{64}$') {
         throw 'The latest completed Codex request has incomplete provider/model/realm evidence; live verification is refused.'
+    }
+    $reasoningEffort = $live.EffectiveReasoningEffort.Trim().ToLowerInvariant()
+    if (-not [string]::IsNullOrWhiteSpace($reasoningEffort) -and $reasoningEffort -notin @('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')) {
+        throw 'The latest completed Codex request has an invalid effective reasoning effort; live verification is refused.'
     }
     $ageSeconds = ([DateTimeOffset]::UtcNow - $live.At).TotalSeconds
     if ($ageSeconds -gt $MaximumAgeSeconds) {
@@ -821,6 +1143,7 @@ function Resolve-LiveCodexScope {
     return [pscustomobject]@{
         ProviderId = $live.ProviderId
         Model = $live.Model
+        ReasoningEffort = $reasoningEffort
         KeyRealmHash = $live.Realm
         KeyId = $pinnedKeyId
         KeyPoolPinned = -not [string]::IsNullOrWhiteSpace($pinnedKeyId)
@@ -1058,20 +1381,62 @@ if ($isDynamicTailMix) {
     }
 }
 
-$defaultTurns = if ($isDynamicTailMix) { 11 } else { 3 }
+$defaultTurns = if ($isExactMediumToolTailMaturity) { 4 } elseif ($isDynamicTailMix) { 11 } else { 3 }
 $turns = if ($Turns -gt 0) { $Turns } else { $defaultTurns }
-if ($isDynamicTailMix -and ($turns -lt 3 -or $turns % 2 -eq 0)) {
-    throw 'dynamic-tail-mix requires an odd -Turns value of at least 3 (seed, changing tail, direct follow-up).'
+if ($isDynamicTailMix -and (
+    $turns -lt 3 -or (
+        $turns % 2 -eq 0 -and -not $isLateShallowProviderWaterlineRollback
+    )
+)) {
+    throw 'dynamic-tail-mix requires an odd -Turns value of at least 3, except the late shallow provider-waterline rollback probe which requires exactly 4 turns.'
 }
+
+if ($SeedToReuseDelayMs -gt 0) {
+    if ($Scenario -ne 'dynamic-tail-mix' -or $turns -lt 3) {
+        throw 'SeedToReuseDelayMs requires dynamic-tail-mix with at least three turns (seed, changing tail, direct successor).'
+    }
+    if (($Pairs - $WarmupPairs) -lt 2) {
+        throw 'SeedToReuseDelayMs requires at least two scored pairs for reversed prime order.'
+    }
+    if (-not $SharedCacheCrossover) {
+        throw 'SeedToReuseDelayMs requires SharedCacheCrossover so both arms share the same upstream cache lane.'
+    }
+    if (-not $CandidatePromptCacheRetention) {
+        throw 'SeedToReuseDelayMs requires CandidatePromptCacheRetention as the only candidate treatment.'
+    }
+    if ($TurnDelayMs -ne 0 -or $InterArmDelayMs -ne 0) {
+        throw 'SeedToReuseDelayMs requires TurnDelayMs=0 and InterArmDelayMs=0 so the horizon is the only injected pacing.'
+    }
+}
+
 # Keep the default dense-tail probe below the current provider2 body ceiling;
 # a larger value is explicit and must be justified by a fresh capacity result.
-$toolChars = if ($ToolChars -gt 0) { $ToolChars } elseif ($isDynamicTailMix -and $DynamicTailProfile -eq 'natural-dense') { 80000 } elseif ($isDynamicTailMix) { 131072 } else { 40960 }
+$toolChars = if ($ToolChars -gt 0) { $ToolChars } elseif ($isExactMediumToolTailMaturity) { 6144 } elseif ($isDynamicTailMix -and $DynamicTailProfile -eq 'natural-dense') { 80000 } elseif ($isDynamicTailMix) { 131072 } else { 40960 }
 $toolCalls = if ($ToolCalls -gt 0) { $ToolCalls } elseif ($isDynamicTailMix) { 2 } else { 1 }
+
+if (($isExerciseLocalPreviousResponseIdRebind -or $isExerciseLocalPreviousResponseIdFullReplay) -and $toolCalls -lt 1) {
+    throw 'The local previous_response_id fixture requires at least one tool call.'
+}
+
+if ($isExactMediumToolTailMaturity) {
+    if ($turns -ne 4) {
+        throw 'Exact medium tool-tail maturity requires exactly -Turns 4.'
+    }
+    if ($toolChars -lt 4096 -or $toolChars -gt 8191 -or $toolCalls -ne 1) {
+        throw 'Exact medium tool-tail maturity requires ToolChars from 4096 through 8191 and ToolCalls 1.'
+    }
+    if ($MinimumPeakInputTokens -eq 0) {
+        $MinimumPeakInputTokens = 16384
+    }
+    if ($MinimumPeakInputTokens -lt 16384) {
+        throw 'Exact medium tool-tail maturity requires MinimumPeakInputTokens of at least 16384.'
+    }
+}
 
 foreach ($item in @(
     @{ Label = 'Atoapi config directory'; Path = $ConfigDir; Type = 'Container' },
     @{ Label = 'v1.4.33 hit-rate comparator executable'; Path = $ChampionExe; Type = 'Leaf' },
-    @{ Label = 'v1.4.38 development-base executable'; Path = $CandidateExe; Type = 'Leaf' },
+    @{ Label = 'v1.5.0 development-base executable'; Path = $CandidateExe; Type = 'Leaf' },
     @{ Label = 'release champion verifier'; Path = $verifier; Type = 'Leaf' }
 )) {
     if (-not (Test-Path -LiteralPath $item.Path -PathType $item.Type)) {
@@ -1091,6 +1456,9 @@ $liveScope = Resolve-LiveCodexScope -ConfigDir $ConfigDir -MaximumAgeSeconds $Li
 if ($PSBoundParameters.ContainsKey('Model') -and $Model -ne $liveScope.Model) {
     throw "Explicit Model '$Model' disagrees with the latest live Codex model '$($liveScope.Model)'; verification is refused."
 }
+if ($PSBoundParameters.ContainsKey('ReasoningEffort') -and $ReasoningEffort -ne $liveScope.ReasoningEffort) {
+    throw "Explicit ReasoningEffort '$ReasoningEffort' disagrees with the latest live Codex effective reasoning effort '$($liveScope.ReasoningEffort)'; verification is refused."
+}
 if ($PSBoundParameters.ContainsKey('ProviderId') -and $ProviderId -ne $liveScope.ProviderId) {
     throw "Explicit ProviderId '$ProviderId' disagrees with the latest live Codex Provider '$($liveScope.ProviderId)'; verification is refused."
 }
@@ -1102,11 +1470,23 @@ if (-not [string]::IsNullOrWhiteSpace($KeyId) -and $KeyId -ne $liveScope.KeyId) 
 }
 
 $Model = $liveScope.Model
+$ReasoningEffort = $liveScope.ReasoningEffort
 $ProviderId = $liveScope.ProviderId
 $KeyRealmHash = $liveScope.KeyRealmHash
 $KeyId = $liveScope.KeyId
 
-if ($ResolveLiveScopeOnly) {
+if ($ResolveLiveScopeOnly -or $ResolveLiveScopeJson) {
+    if ($ResolveLiveScopeJson) {
+        [pscustomobject]@{
+            provider_id = $ProviderId
+            model_id = $Model
+            reasoning_effort = $ReasoningEffort
+            key_realm_hash = $KeyRealmHash
+            observed_at = $liveScope.ObservedAt.UtcDateTime.ToString('o')
+            key_pool_pinned = [bool]$liveScope.KeyPoolPinned
+        } | ConvertTo-Json -Compress
+        exit 0
+    }
     Write-Host 'Live Codex scope resolved and configuration matched.'
     Write-Host "Provider: $ProviderId; model: $Model; Key realm: $($KeyRealmHash.Substring(0, 12))..."
     Write-Host "Observed at: $($liveScope.ObservedAt.UtcDateTime.ToString('o')); multi-Key pin: $($liveScope.KeyPoolPinned)"
@@ -1114,7 +1494,74 @@ if ($ResolveLiveScopeOnly) {
 }
 
 if ([string]::IsNullOrWhiteSpace($Output)) {
-    $Output = Join-Path $repoRoot "output\development-v1438-vs-champion-v1433-$Scenario-interactive-$stamp.json"
+    $reportStem = if ($DiagnosticUserAgentSplit) {
+        "diagnostic-user-agent-split-v1500-$Scenario-interactive-$stamp"
+    } elseif ($isExerciseLocalPreviousResponseIdFullReplay) {
+        "diagnostic-v1500-vs-champion-v1433-$Scenario-local-prid-full-replay-interactive-$stamp"
+    } elseif ($ToolProtocol -eq 'custom') {
+        "development-v1500-vs-champion-v1433-$Scenario-custom-tool-interactive-$stamp"
+    } elseif ($isExerciseLocalPreviousResponseIdRebind) {
+        "development-v1500-vs-champion-v1433-$Scenario-local-prid-rebind-interactive-$stamp"
+    } else {
+        "development-v1500-vs-champion-v1433-$Scenario-interactive-$stamp"
+    }
+    $Output = Join-Path $repoRoot "output\$reportStem.json"
+}
+
+# The embedded v1.5.0 desktop runner includes the capacity-aware dynamic
+# profile: it hard-codes one scored pair and therefore inherits this script's
+# 2.35M-character / 450k-token mixed default.  The currently selected live
+# upstream has explicitly rejected that seed before either arm can produce a
+# cache observation.  Detect only that fixed legacy caller shape and turn it
+# into a symmetric, capacity-reachable dynamic A/B.  Direct invocations keep
+# their explicit parameters unchanged, including the 500k-class profile.
+$desktopReleaseOutputDirectory = Join-Path (Join-Path $ConfigDir 'release') 'release-champion'
+$isLegacyDesktopRunner = $isDynamicTailMix `
+    -and $ToolProtocol -eq 'function' `
+    -and $Pairs -eq 1 `
+    -and $WarmupPairs -eq 0 `
+    -and -not $PSBoundParameters.ContainsKey('SeedContextChars') `
+    -and -not $PSBoundParameters.ContainsKey('MinimumSeedInputTokens') `
+    -and -not $PSBoundParameters.ContainsKey('MinimumPeakInputTokens') `
+    -and -not $PSBoundParameters.ContainsKey('MaximumPeakInputTokens') `
+    -and -not $PSBoundParameters.ContainsKey('DynamicTailProfile') `
+    -and -not $PSBoundParameters.ContainsKey('SeedToReuseDelayMs') `
+    -and -not $PSBoundParameters.ContainsKey('ToolChars') `
+    -and [string]::Equals(
+        [IO.Path]::GetFullPath((Split-Path -Parent $Output)),
+        [IO.Path]::GetFullPath($desktopReleaseOutputDirectory),
+        [StringComparison]::OrdinalIgnoreCase
+    ) `
+    -and (Split-Path -Leaf $Output).StartsWith('development-v1438-vs-champion-v1433-', [StringComparison]::OrdinalIgnoreCase)
+
+if ($isLegacyDesktopRunner) {
+    $Pairs = 3
+    $WarmupPairs = 1
+    $PairDelayMs = [Math]::Max($PairDelayMs, 1000)
+    $DynamicTailProfile = 'natural-dense'
+    $SeedContextChars = 900000
+    $MinimumSeedInputTokens = 120000
+    $MinimumPeakInputTokens = 0
+    $MaximumPeakInputTokens = 0
+    # The actual selected upstream accepted both large seed wires but rejected
+    # the first replayed function-call-output tail with a 400.  Keep that as
+    # a separate protocol-compatibility regression, and use changing text
+    # tails for this cache A/B so both arms can complete the same dynamic
+    # conversation instead of treating an upstream schema rejection as hit
+    # evidence.
+    $DynamicTailMode = 'text'
+    $IncludeToolSchema = $false
+    $toolChars = 80000
+    $toolCalls = 2
+
+    # Keep the fixed desktop route on the normal current candidate. The PCK
+    # path remains an explicit isolated switch because its dynamic A/B result
+    # must be positive and reproducible before it can influence a baseline.
+    # Reverse the legacy first-run defaults so this ordinary replay supplies a
+    # complementary ordering sample without altering either request body.
+    $FirstArm = 'candidate'
+    $PairOffset = 1
+    $PersistentRuntimeStartOrder = 'candidate'
 }
 
 $outputDirectory = Split-Path -Parent $Output
@@ -1125,17 +1572,40 @@ if (-not (Test-Path -LiteralPath $outputDirectory)) {
 Write-Host 'Runs a bounded, isolated A/B seed. The running 18883 instance is never stopped or signaled.'
 Write-Host "Windows identity: $(whoami)"
 Write-Host "Scenario: $Scenario; pairs: $Pairs; turns: $turns; model: $Model"
+Write-Host "Effective reasoning effort: $(if ([string]::IsNullOrWhiteSpace($ReasoningEffort)) { 'unset' } else { $ReasoningEffort })"
+if ($isLegacyDesktopRunner) {
+    Write-Host 'Desktop runner compatibility profile: capacity-reachable dynamic crossover (not a 500k-class claim)'
+}
 Write-Host "Warm-up pairs (excluded from scoring): $WarmupPairs"
 Write-Host "Pair cooldown: $PairDelayMs ms"
+Write-Host "Response deadline: $ResponseTimeoutMs ms"
 Write-Host "Turn delay: $TurnDelayMs ms; inter-arm delay: $InterArmDelayMs ms"
+Write-Host "Seed-to-reuse horizon delay: $SeedToReuseDelayMs ms"
 Write-Host "Seed context chars: $SeedContextChars; minimum seed input tokens: $MinimumSeedInputTokens; peak gate: $MinimumPeakInputTokens-$MaximumPeakInputTokens"
+Write-Host "Stable instruction chars: $StableInstructionChars; candidate guarded-request minimum: $RequireCandidateGuardedRequests"
+Write-Host "Require candidate exact medium tool-tail maturity wait: $isExactMediumToolTailMaturity"
+Write-Host "Require candidate exact large message tail lag: $isExactLargeMessageTailLag"
+Write-Host "Require candidate late shallow provider-waterline rollback wait: $isLateShallowProviderWaterlineRollback"
 Write-Host "Dynamic tail profile: $DynamicTailProfile; mode: $DynamicTailMode; tool chars: $toolChars; strict end-to-end TTFT gate: $RequireTtftNoRegression; local pre-upstream gate: 0ms; input-token delta: $MaxInputTokenDelta"
 Write-Host "Fixture profile: $FixtureProfile; tool output shape: $ToolOutputShape; include tool schema: $IncludeToolSchema"
+Write-Host "Tool protocol: $ToolProtocol"
+Write-Host "Exercise local previous_response_id rebind: $isExerciseLocalPreviousResponseIdRebind"
+Write-Host "Exercise local previous_response_id unchanged FullReplay: $isExerciseLocalPreviousResponseIdFullReplay"
 Write-Host "Provider: $ProviderId; Key realm: $($KeyRealmHash.Substring(0, 12))..."
 Write-Host "Provider scope: $ProviderScope"
 Write-Host "Pinned current multi-Key realm: $($liveScope.KeyPoolPinned)"
 Write-Host "Cache comparison mode: $(if ($SharedCacheCrossover) { 'shared turn crossover' } else { 'isolated per-arm lanes' })"
 Write-Host "Client prompt_cache_key: $(if ($NoClientPromptCacheKey) { 'not injected (native policy)' } else { 'generated common test key' })"
+Write-Host "Candidate isolated upstream affinity: $CandidateUpstreamAffinity"
+Write-Host "Candidate isolated generated prompt_cache_key: $CandidatePromptCacheKey"
+Write-Host "Candidate thread-stable prompt_cache_key bridge: $CandidateThreadStablePromptCacheKeyBridge"
+Write-Host "Candidate isolated prompt_cache_options: $CandidatePromptCacheOptions"
+Write-Host "Candidate isolated prompt_cache_options ttl=24h: $CandidatePromptCacheOptions24h"
+Write-Host "Require candidate options-24h sibling settle: $RequireCandidateOptions24hSiblingSettle"
+Write-Host "Candidate isolated prompt_cache_retention: $CandidatePromptCacheRetention"
+Write-Host "Candidate isolated upstream HTTP/1.1: $CandidateHttp1"
+Write-Host "Candidate isolated provider-waterline recovery wait: $CandidateProviderWaterlineRecoveryWait"
+Write-Host "Diagnostic same-binary User-Agent split: $DiagnosticUserAgentSplit"
 if ($SharedCacheCrossover) {
     Write-Host "Persistent runtime start order: $PersistentRuntimeStartOrder"
 }
@@ -1163,19 +1633,23 @@ $arguments = @(
     '--first-arm', $FirstArm,
     '--pair-offset', "$PairOffset",
     '--pair-delay-ms', "$PairDelayMs",
+    '--response-timeout-ms', "$ResponseTimeoutMs",
+    '--seed-to-reuse-delay-ms', "$SeedToReuseDelayMs",
     '--turn-delay-ms', "$TurnDelayMs",
     '--inter-arm-delay-ms', "$InterArmDelayMs",
     '--turns', "$turns",
     '--max-output-tokens', '16',
-    '--stable-instruction-chars', '16384',
+    '--stable-instruction-chars', "$StableInstructionChars",
     '--seed-context-chars', "$SeedContextChars",
     '--minimum-seed-input-tokens', "$MinimumSeedInputTokens",
     '--minimum-peak-input-tokens', "$MinimumPeakInputTokens",
     '--maximum-peak-input-tokens', "$MaximumPeakInputTokens",
     '--max-input-token-delta', "$MaxInputTokenDelta",
+    '--require-candidate-guarded-requests', "$RequireCandidateGuardedRequests",
     '--tool-chars', "$toolChars",
     '--tool-calls', "$toolCalls",
     '--tool-output-shape', $ToolOutputShape,
+    '--tool-protocol', $ToolProtocol,
     '--include-tool-schema', "$IncludeToolSchema".ToLowerInvariant(),
     '--dynamic-tail-profile', $DynamicTailProfile,
     '--dynamic-tail-mode', $DynamicTailMode,
@@ -1184,8 +1658,81 @@ $arguments = @(
     '--output', $Output
 )
 
+if ($isExerciseLocalPreviousResponseIdRebind) {
+    $arguments += '--exercise-local-previous-response-id-rebind'
+}
+
+if ($isExerciseLocalPreviousResponseIdFullReplay) {
+    $arguments += '--exercise-local-previous-response-id-full-replay'
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ReasoningEffort)) {
+    $arguments += @('--reasoning-effort', $ReasoningEffort)
+}
+
 if (-not $NoClientPromptCacheKey) {
     $arguments += @('--prompt-cache-key-prefix', "atoapi-release-champion-$stamp")
+}
+
+if ($CandidateUpstreamAffinity) {
+    $arguments += '--candidate-upstream-affinity'
+}
+
+if ($CandidatePromptCacheKey) {
+    $arguments += @('--candidate-cache-control-field', 'prompt-cache-key')
+}
+
+if ($CandidateThreadStablePromptCacheKeyBridge) {
+    $arguments += '--candidate-thread-stable-pck-bridge'
+}
+
+if ($CandidatePromptCacheOptions) {
+    $arguments += @('--candidate-cache-control-field', 'prompt-cache-options')
+}
+
+if ($CandidatePromptCacheOptions24h) {
+    $arguments += '--candidate-cache-options-24h'
+}
+
+if ($RequireCandidateOptions24hSiblingSettle) {
+    $arguments += '--require-candidate-options24h-sibling-settle'
+}
+
+if ($CandidatePromptCacheRetention) {
+    $arguments += @('--candidate-cache-control-field', 'prompt-cache-retention')
+}
+
+if ($CandidateHttp1) {
+    $arguments += '--candidate-http1'
+}
+
+if ($CandidateProviderWaterlineRecoveryWait) {
+    $arguments += '--candidate-provider-waterline-recovery-wait'
+}
+
+if ($isExactMediumToolTailMaturity) {
+    $arguments += '--require-candidate-exact-medium-tool-tail-maturity-wait'
+}
+
+if ($isExactLargeMessageTailLag) {
+    $arguments += '--require-candidate-exact-large-message-tail-lag'
+}
+
+if ($isLateShallowProviderWaterlineRollback) {
+    $arguments += '--require-candidate-late-shallow-provider-waterline-rollback-wait'
+}
+
+
+if ($DiagnosticUserAgentSplit) {
+    $arguments += '--diagnostic-user-agent-split'
+}
+
+if (-not [string]::IsNullOrWhiteSpace($ChampionUpstreamUserAgent)) {
+    $arguments += @('--champion-upstream-user-agent', $ChampionUpstreamUserAgent.Trim())
+}
+
+if (-not [string]::IsNullOrWhiteSpace($CandidateUpstreamUserAgent)) {
+    $arguments += @('--candidate-upstream-user-agent', $CandidateUpstreamUserAgent.Trim())
 }
 
 if ($SharedCacheCrossover) {

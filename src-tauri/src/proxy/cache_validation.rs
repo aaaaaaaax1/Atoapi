@@ -2,7 +2,9 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::{Channel, ProviderCacheCapabilityField, ProviderCacheEffectStatus};
+use crate::config::{
+    Channel, PromptCacheOptionsTtl, ProviderCacheCapabilityField, ProviderCacheEffectStatus,
+};
 
 use super::cache_affinity::{ShadowAffinityArm, ShadowAffinityDecision, ShadowCacheLane};
 
@@ -124,6 +126,32 @@ impl CacheValidationScope {
         )
     }
 
+    /// Options effects use a value-bound certificate.  The baseline scope
+    /// intentionally remains TTL-agnostic so a no-options/30m baseline can be
+    /// compared with a 24h candidate in the same selected-Key realm.
+    pub(super) fn prompt_cache_options_effect_scope_id(
+        &self,
+        ttl: PromptCacheOptionsTtl,
+    ) -> String {
+        let stream = match self.stream {
+            Some(true) => "stream",
+            Some(false) => "sync",
+            None => "stream-absent",
+        };
+        let store = match self.store {
+            Some(true) => "store",
+            Some(false) => "no-store",
+            None => "store-absent",
+        };
+        format!(
+            "cache-effect-v5:{}:{}:{}:pco={}:bp=none",
+            self.realm_id,
+            stream,
+            store,
+            ttl.effect_scope_value(),
+        )
+    }
+
     /// Prompt-cache keys use a distinct certificate because the field is
     /// generated from the selected Key realm and session identity, rather
     /// than forwarded from the caller or shared with another control.
@@ -153,6 +181,7 @@ pub(super) struct CacheValidationCompletion {
     pub(super) scope: Option<CacheValidationScope>,
     pub(super) candidate_fields: Vec<ProviderCacheCapabilityField>,
     pub(super) candidate_breakpoint_placement_digest: Option<String>,
+    pub(super) candidate_prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +222,13 @@ impl CacheValidationCompletion {
         {
             return None;
         }
+        if self
+            .candidate_fields
+            .contains(&ProviderCacheCapabilityField::PromptCacheOptions)
+            && self.candidate_prompt_cache_options_ttl.is_none()
+        {
+            return None;
+        }
 
         // Compare cache reads at the candidate's observed input volume, then
         // require one full 128-token bucket of real gain. This avoids calling
@@ -230,6 +266,11 @@ impl CacheValidationCompletion {
             .contains(&ProviderCacheCapabilityField::PromptCacheKey)
         {
             scope.generated_prompt_cache_key_effect_scope_id()?
+        } else if self
+            .candidate_fields
+            .contains(&ProviderCacheCapabilityField::PromptCacheOptions)
+        {
+            scope.prompt_cache_options_effect_scope_id(self.candidate_prompt_cache_options_ttl?)
         } else {
             scope.effect_scope_id(self.candidate_breakpoint_placement_digest.as_deref())
         };
@@ -302,6 +343,9 @@ pub(super) struct CacheValidationObservation {
     /// The exact final-wire placement for a breakpoint candidate. `None` is
     /// meaningful for non-breakpoint candidates and is bound on first use.
     pub candidate_breakpoint_placement_digest: Option<String>,
+    /// Exact Options TTL observed on the frozen final wire.  A planned value
+    /// is insufficient because a caller field or later mutation can differ.
+    pub candidate_prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +370,7 @@ struct ActiveValidationRun {
     scope: Option<CacheValidationScope>,
     candidate_fields: Option<Vec<ProviderCacheCapabilityField>>,
     candidate_breakpoint_placement_digest: Option<Option<String>>,
+    candidate_prompt_cache_options_ttl: Option<Option<PromptCacheOptionsTtl>>,
 }
 
 #[derive(Debug, Default)]
@@ -372,6 +417,7 @@ impl CacheValidationController {
             scope: None,
             candidate_fields: None,
             candidate_breakpoint_placement_digest: None,
+            candidate_prompt_cache_options_ttl: None,
         });
         Ok(self.status(now))
     }
@@ -464,8 +510,13 @@ impl CacheValidationController {
             }
             let breakpoint_candidate =
                 fields.contains(&ProviderCacheCapabilityField::PromptCacheBreakpoint);
+            let options_candidate =
+                fields.contains(&ProviderCacheCapabilityField::PromptCacheOptions);
             if breakpoint_candidate && observation.candidate_breakpoint_placement_digest.is_none() {
                 return self.finish_active("candidate_breakpoint_missing_placement", now);
+            }
+            if options_candidate && observation.candidate_prompt_cache_options_ttl.is_none() {
+                return self.finish_active("candidate_options_missing_ttl", now);
             }
             if active
                 .candidate_breakpoint_placement_digest
@@ -479,6 +530,17 @@ impl CacheValidationController {
             if active.candidate_breakpoint_placement_digest.is_none() {
                 active.candidate_breakpoint_placement_digest =
                     Some(observation.candidate_breakpoint_placement_digest);
+            }
+            if active
+                .candidate_prompt_cache_options_ttl
+                .as_ref()
+                .is_some_and(|previous| previous != &observation.candidate_prompt_cache_options_ttl)
+            {
+                return self.finish_active("candidate_options_ttl_changed", now);
+            }
+            if active.candidate_prompt_cache_options_ttl.is_none() {
+                active.candidate_prompt_cache_options_ttl =
+                    Some(observation.candidate_prompt_cache_options_ttl);
             }
             active.candidate_fields = Some(fields);
             active.candidate_applied_requests += 1;
@@ -653,6 +715,9 @@ impl CacheValidationController {
             candidate_fields: active.candidate_fields.unwrap_or_default(),
             candidate_breakpoint_placement_digest: active
                 .candidate_breakpoint_placement_digest
+                .unwrap_or(None),
+            candidate_prompt_cache_options_ttl: active
+                .candidate_prompt_cache_options_ttl
                 .unwrap_or(None),
             summary,
         })
@@ -1071,6 +1136,13 @@ mod tests {
             stream_no_store.effect_scope_id(None),
             stream_store.effect_scope_id(None)
         );
+        assert_ne!(
+            stream_no_store
+                .prompt_cache_options_effect_scope_id(PromptCacheOptionsTtl::ThirtyMinutes,),
+            stream_no_store
+                .prompt_cache_options_effect_scope_id(PromptCacheOptionsTtl::TwentyFourHours,),
+            "Options TTLs must issue different promotion certificates"
+        );
         assert_eq!(
             stream_no_store.generated_prompt_cache_key_effect_scope_id(),
             Some(
@@ -1152,6 +1224,7 @@ mod tests {
                     candidate_applied: true,
                     candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheRetention],
                     candidate_breakpoint_placement_digest: None,
+                    candidate_prompt_cache_options_ttl: None,
                     // A successful response that omits usage cannot establish
                     // a real cache gain and must remain inconclusive.
                     usage_observed: false,
@@ -1268,6 +1341,7 @@ mod tests {
             candidate_applied: true,
             candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheBreakpoint],
             candidate_breakpoint_placement_digest: Some("v2:placement-a".to_string()),
+            candidate_prompt_cache_options_ttl: None,
         };
         assert!(controller
             .observe(&candidate_run_id, first, now + Duration::minutes(2))
@@ -1283,6 +1357,7 @@ mod tests {
                 candidate_applied: true,
                 candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheBreakpoint],
                 candidate_breakpoint_placement_digest: None,
+                candidate_prompt_cache_options_ttl: None,
             }
         };
         let completed = controller
@@ -1295,6 +1370,76 @@ mod tests {
         assert_eq!(
             completed.summary.completion_reason,
             "candidate_breakpoint_placement_changed"
+        );
+    }
+
+    #[test]
+    fn options_candidate_requires_a_final_wire_ttl() {
+        let now = Utc::now();
+        let validation_scope = scope("realm-a");
+        let mut controller = CacheValidationController::default();
+        let baseline = controller
+            .configure(
+                input(CacheValidationMode::Baseline),
+                Some("A".to_string()),
+                now,
+            )
+            .unwrap();
+        let baseline_run_id = baseline.run_id.unwrap();
+        assert!(controller
+            .selection("provider-a", "gpt-main", validation_scope.clone(), now)
+            .is_some());
+        for index in 0..VALIDATION_TARGET_SUCCESSFUL_REQUESTS {
+            controller.observe(
+                &baseline_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 50_000,
+                    ttft_ms: 100,
+                    ..CacheValidationObservation::default()
+                },
+                now + Duration::seconds(index as i64),
+            );
+        }
+
+        let candidate = controller
+            .configure(
+                input(CacheValidationMode::Candidate),
+                Some("A".to_string()),
+                now + Duration::minutes(2),
+            )
+            .unwrap();
+        let candidate_run_id = candidate.run_id.unwrap();
+        assert!(controller
+            .selection(
+                "provider-a",
+                "gpt-main",
+                validation_scope,
+                now + Duration::minutes(2),
+            )
+            .is_some());
+        let completed = controller
+            .observe(
+                &candidate_run_id,
+                CacheValidationObservation {
+                    success: true,
+                    usage_observed: true,
+                    input_tokens: 100_000,
+                    cache_read_tokens: 60_000,
+                    ttft_ms: 100,
+                    candidate_applied: true,
+                    candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheOptions],
+                    candidate_breakpoint_placement_digest: None,
+                    candidate_prompt_cache_options_ttl: None,
+                },
+                now + Duration::minutes(2),
+            )
+            .expect("an Options candidate without a final-wire TTL must stop immediately");
+        assert_eq!(
+            completed.summary.completion_reason,
+            "candidate_options_missing_ttl"
         );
     }
 
@@ -1353,6 +1498,7 @@ mod tests {
                     candidate_applied: true,
                     candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheOptions],
                     candidate_breakpoint_placement_digest: None,
+                    candidate_prompt_cache_options_ttl: Some(PromptCacheOptionsTtl::ThirtyMinutes),
                 },
                 now + Duration::minutes(2) + Duration::seconds(index as i64),
             );
@@ -1366,6 +1512,10 @@ mod tests {
             vec![ProviderCacheCapabilityField::PromptCacheOptions]
         );
         assert_eq!(evidence.channel, Channel::Responses);
+        assert_eq!(
+            evidence.effect_scope_id,
+            "cache-effect-v5:realm-a:stream:no-store:pco=implicit-30m:bp=none"
+        );
     }
 
     #[test]
@@ -1423,6 +1573,7 @@ mod tests {
                     candidate_applied: true,
                     candidate_fields: vec![ProviderCacheCapabilityField::PromptCacheOptions],
                     candidate_breakpoint_placement_digest: None,
+                    candidate_prompt_cache_options_ttl: Some(PromptCacheOptionsTtl::ThirtyMinutes),
                 },
                 now + Duration::minutes(2) + Duration::seconds(index as i64),
             );

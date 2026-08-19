@@ -22,6 +22,8 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
 const extension = process.platform === "win32" ? ".exe" : "";
+const MAX_FIXED_CONTROL_FIELD_INPUT_TOKEN_OFFSET = 512;
+const PRESERVED_CONTROL_FIELD_PROBE_MAX_AGE_MS = 15 * 60 * 1_000;
 // `cache_metadata` is a final-wire fingerprint.  Its implementation redacts
 // prompt_cache_key values before hashing, but preserves the ordered presence
 // and shape of the cache-control fields.  Keep only known Atoapi projections;
@@ -49,6 +51,10 @@ const controlField = normalizeControlField(args.field ?? "prompt-cache-key");
 const preservedControlField = optionalControlField(args["preserve-control-field"]);
 if (preservedControlField === controlField) {
   throw new Error("--preserve-control-field must differ from --field");
+}
+const preservedControlFieldProbePath = optionalPath(args["preserve-control-field-probe"]);
+if (preservedControlFieldProbePath && !preservedControlField) {
+  throw new Error("--preserve-control-field-probe requires --preserve-control-field");
 }
 const bootstrapIsolatedOptions = booleanArg(args["bootstrap-isolated-options"]);
 if (bootstrapIsolatedOptions && controlField !== "prompt-cache-options") {
@@ -91,6 +97,13 @@ const maxInputTokenDelta = boundedInteger(
   0,
   10_000
 );
+// A final-wire cache-control field can make an upstream meter report a small,
+// fixed accounting offset even though the semantic request body is exactly
+// paired.  Permit that offset only when the single-field witness proves it is
+// present on every candidate wire, absent from every baseline wire, the
+// client body bytes are equal, and the signed delta is identical on every
+// pair.  This is intentionally much narrower than simply widening the normal
+// input-token symmetry tolerance.
 const firstArm = normalizeFirstArm(args["first-arm"] ?? "baseline");
 const expectedRealmHash = optionalRealmHash(args["key-realm-hash"]);
 const pinnedKeyId = optionalOpaqueIdentifier(args["key-id"], "--key-id");
@@ -224,6 +237,7 @@ try {
       model,
       control_field: controlField,
       preserved_control_field: preservedControlField,
+      preserved_control_field_evidence: source.preservedControlFieldEvidence,
       request_family: "responses-full-replay",
       turns_per_arm: turns,
       stable_prefix_lines: fixtureLines,
@@ -307,7 +321,7 @@ try {
   try {
     await stopRuntime(candidateRuntime);
     await stopRuntime(baselineRuntime);
-    if (root && !keepRunDir) await rm(root, { recursive: true, force: true });
+    if (root && !keepRunDir) await removeTemporaryDirectory(root);
   } catch (cleanupError) {
     if (!runFailure) throw cleanupError;
     console.error(JSON.stringify({ cleanup_error: safeError(cleanupError) }));
@@ -332,7 +346,7 @@ async function snapshotSourceConfig(directory) {
   if (pinnedKeyId) validatePinnedKeyConfiguration(configText, providerId, pinnedKeyId);
   const preserveSourceConfig = baselineCapabilityMode === "source" &&
     candidateCapabilityMode === "source";
-  const scopedConfigText = preserveSourceConfig || !bootstrapIsolatedOptions
+  let scopedConfigText = preserveSourceConfig || !bootstrapIsolatedOptions
     ? configText
     : bootstrapIsolatedCapabilityScope(configText, {
       providerId,
@@ -344,7 +358,12 @@ async function snapshotSourceConfig(directory) {
     return {
       configText,
       localKey,
-      keyPath: await fileExists(keyPath) ? keyPath : null
+      keyPath: await fileExists(keyPath) ? keyPath : null,
+      preservedControlFieldEvidence: {
+        state: "not_applicable",
+        field: preservedControlField,
+        source: "source_bundle"
+      }
     };
   }
   const blocks = tomlArrayBlocks(scopedConfigText, "provider_cache_capabilities");
@@ -360,6 +379,11 @@ async function snapshotSourceConfig(directory) {
     !bootstrapIsolatedOptions) {
     throw new Error("the active matching candidate capability must be verified before a cross A/B run");
   }
+  let preservedControlFieldEvidence = {
+    state: "not_requested",
+    field: null,
+    source: "none"
+  };
   if (preservedControlField) {
     const preservedMatches = blocks.filter((block) =>
       capabilityScopeMatches(block.body) &&
@@ -368,8 +392,33 @@ async function snapshotSourceConfig(directory) {
         ? extractTomlString(block.body, "key_id") === pinnedKeyId
         : !extractTomlString(block.body, "key_id"))
     );
-    if (preservedMatches.length !== 1 ||
-      extractTomlString(preservedMatches[0].body, "status") !== "verified") {
+    if (preservedMatches.length > 1) {
+      throw new Error(`expected exactly one preserved ${preservedControlField} capability in the active scope`);
+    }
+    if (preservedMatches.length === 1 &&
+      extractTomlString(preservedMatches[0].body, "status") === "verified") {
+      preservedControlFieldEvidence = {
+        state: "verified",
+        field: preservedControlField,
+        source: "source_config"
+      };
+    } else if (preservedControlFieldProbePath) {
+      preservedControlFieldEvidence = await readFreshPreservedControlFieldProbe(
+        preservedControlFieldProbePath,
+        preservedControlField
+      );
+      if (preservedMatches.length === 0) {
+        scopedConfigText = bootstrapIsolatedVerifiedCapabilityScope(scopedConfigText, {
+          providerId,
+          model,
+          keyId: pinnedKeyId
+        }, preservedControlField);
+        preservedControlFieldEvidence = {
+          ...preservedControlFieldEvidence,
+          temporary_scope_bootstrapped: true
+        };
+      }
+    } else {
       throw new Error(`the preserved ${preservedControlField} capability must be verified in the active scope`);
     }
   }
@@ -377,7 +426,8 @@ async function snapshotSourceConfig(directory) {
   return {
     configText: scopedConfigText,
     localKey,
-    keyPath: await fileExists(keyPath) ? keyPath : null
+    keyPath: await fileExists(keyPath) ? keyPath : null,
+    preservedControlFieldEvidence
   };
 }
 
@@ -412,11 +462,49 @@ function bootstrapIsolatedCapabilityScope(configText, scope) {
   return `${configText.trimEnd()}\n\n${records.join("\n\n")}\n`;
 }
 
+function bootstrapIsolatedVerifiedCapabilityScope(configText, scope, field) {
+  const existing = tomlArrayBlocks(configText, "provider_cache_capabilities").filter((block) =>
+    capabilityScopeExactlyMatches(block.body, scope) &&
+    extractTomlString(block.body, "field") === field
+  );
+  if (existing.length > 0) return configText;
+  const record = [
+    "[[provider_cache_capabilities]]",
+    `provider_id = ${JSON.stringify(scope.providerId)}`,
+    `model_id = ${JSON.stringify(scope.model)}`,
+    'channel = "responses"',
+    ...(scope.keyId ? [`key_id = ${JSON.stringify(scope.keyId)}`] : []),
+    `field = ${JSON.stringify(field)}`,
+    "evidence_version = 2",
+    "enabled = false",
+    'status = "verified"',
+    'effect_status = "unverified"',
+    `updated_at = ${JSON.stringify(new Date().toISOString())}`
+  ].join("\n");
+  return `${configText.trimEnd()}\n\n${record}\n`;
+}
+
 async function materializeConfig(source, directory, capabilityMode) {
   await mkdir(directory, { recursive: true });
   let configText = capabilityMode === "source"
     ? source.configText
-    : rewriteCapabilityScope(source.configText, capabilityMode);
+    : rewriteCapabilityScope(
+      source.configText,
+      capabilityMode,
+      source.preservedControlFieldEvidence?.state === "verified"
+    );
+  if (source.preservedControlFieldEvidence?.state === "verified" &&
+    preservedControlField === "prompt-cache-retention") {
+    // Capability acceptance alone does not enable the Provider's retention
+    // policy. Enable it only in this disposable copy so a PCK-only A/B keeps
+    // the exact same retention member on both final wires.
+    configText = replaceProviderTomlBoolean(
+      configText,
+      providerId,
+      "prompt_cache_retention_enabled",
+      true
+    );
+  }
   if (pinnedKeyId) configText = pinProviderKeyInToml(configText, providerId, pinnedKeyId);
   await writeFile(join(directory, "config.toml"), configText, "utf8");
   if (source.keyPath) {
@@ -424,17 +512,25 @@ async function materializeConfig(source, directory, capabilityMode) {
   }
 }
 
-function rewriteCapabilityScope(configText, targetStatus) {
+function rewriteCapabilityScope(configText, targetStatus, preserveVerifiedField = false) {
   return rewriteCapabilityScopeFor(
     configText,
     targetStatus,
     { providerId, model, keyId: pinnedKeyId },
     controlField,
-    preservedControlField
+    preservedControlField,
+    preserveVerifiedField
   );
 }
 
-function rewriteCapabilityScopeFor(configText, targetStatus, scope, field, preservedField = null) {
+function rewriteCapabilityScopeFor(
+  configText,
+  targetStatus,
+  scope,
+  field,
+  preservedField = null,
+  preserveVerifiedField = false
+) {
   const blocks = tomlArrayBlocks(configText, "provider_cache_capabilities");
   const scoped = blocks.filter((block) => capabilityScopeMatchesFor(block.body, scope));
   const targets = scoped.filter(
@@ -444,8 +540,9 @@ function rewriteCapabilityScopeFor(configText, targetStatus, scope, field, prese
   let rewrittenConfig = configText;
   for (const block of [...scoped].sort((left, right) => right.start - left.start)) {
     const blockField = extractTomlString(block.body, "field");
-    if (blockField === preservedField) continue;
-    const status = blockField === field ? targetStatus : "unsupported";
+    const status = blockField === preservedField
+      ? (preserveVerifiedField ? "verified" : extractTomlString(block.body, "status"))
+      : blockField === field ? targetStatus : "unsupported";
     let body = replaceCapabilityString(block.body, "status", status);
     body = replaceCapabilityString(body, "effect_status", "unverified");
     rewrittenConfig = `${rewrittenConfig.slice(0, block.start)}${body}${rewrittenConfig.slice(block.end)}`;
@@ -485,15 +582,46 @@ function replaceCapabilityString(block, key, value) {
   return field.test(block) ? block.replace(field, replacement) : `${block.trimEnd()}\n${replacement}\n`;
 }
 
+function replaceProviderTomlBoolean(configText, selectedProviderId, key, value) {
+  const marker = "[[providers]]";
+  const starts = [];
+  let offset = 0;
+  while ((offset = configText.indexOf(marker, offset)) >= 0) {
+    starts.push(offset);
+    offset += marker.length;
+  }
+  for (const start of starts) {
+    const next = configText.indexOf("\n[[", start + marker.length);
+    const end = next < 0 ? configText.length : next + 1;
+    const block = configText.slice(start, end);
+    if (extractTomlString(block, "id") !== selectedProviderId) continue;
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    const field = new RegExp(`^${escapedKey}\\s*=\\s*(?:true|false)\\s*$`, "mu");
+    const replacement = `${key} = ${value ? "true" : "false"}`;
+    const rewritten = field.test(block)
+      ? block.replace(field, replacement)
+      : `${block.trimEnd()}\n${replacement}\n`;
+    return `${configText.slice(0, start)}${rewritten}${configText.slice(end)}`;
+  }
+  throw new Error("the selected Provider is missing from the copied isolated config");
+}
+
 async function startRuntime(label, configDir, requestedPort, localKey, executable) {
   const port = await findAvailablePort(requestedPort);
+  // Each isolated arm must have its own disposable WebView2 profile.  The
+  // proxy is headless in this test, so this prevents a hidden renderer from
+  // colliding with the live desktop application's profile or GPU surface.
+  const webviewUserDataFolder = join(configDir, "webview2-profile");
+  await mkdir(webviewUserDataFolder, { recursive: true });
   const env = {
     ...process.env,
     ATOAPI_CONFIG_DIR: configDir,
     ATOAPI_ISOLATED_TEST_INSTANCE: "1",
+    ATOAPI_HEADLESS_ISOLATED_TEST: "1",
     ATOAPI_TEST_LISTEN_PORT: String(port),
     ATOAPI_PREFIX_DIAGNOSTICS: "1",
-    ATOAPI_AUTOMATIC_CACHE_CANARY: "0"
+    ATOAPI_AUTOMATIC_CACHE_CANARY: "0",
+    WEBVIEW2_USER_DATA_FOLDER: webviewUserDataFolder
   };
   // Never inherit a developer's ad-hoc force flag into either arm. Only the
   // candidate of an explicit Options A/B receives this test-only gate.
@@ -994,21 +1122,51 @@ function inputTokenSymmetry(baselineRecords, candidateRecords, allowedDelta = ma
   const candidateRecordCount = candidateRecords.length;
   const expectedPairCount = Math.max(baselineRecordCount, candidateRecordCount);
   const pairCount = Math.min(baselineRecords.length, candidateRecords.length);
-  const deltas = Array.from({ length: pairCount }, (_, index) =>
-    Math.abs(number(baselineRecords[index]?.input_tokens) - number(candidateRecords[index]?.input_tokens))
+  const signedDeltas = Array.from({ length: pairCount }, (_, index) =>
+    number(baselineRecords[index]?.input_tokens) - number(candidateRecords[index]?.input_tokens)
   );
+  const deltas = signedDeltas.map((value) => Math.abs(value));
   const maxDelta = deltas.length ? Math.max(...deltas) : Number.POSITIVE_INFINITY;
+  const fixedControlFieldOffset = fixedControlFieldInputTokenOffset(
+    baselineRecords,
+    candidateRecords,
+    signedDeltas
+  );
+  const semanticDeltas = fixedControlFieldOffset === null
+    ? deltas
+    : signedDeltas.map((value) => Math.abs(value - fixedControlFieldOffset));
+  const semanticMaxDelta = semanticDeltas.length
+    ? Math.max(...semanticDeltas)
+    : Number.POSITIVE_INFINITY;
   return {
     pair_count: pairCount,
     expected_pair_count: expectedPairCount,
     baseline_record_count: baselineRecordCount,
     candidate_record_count: candidateRecordCount,
     max_input_token_delta: maxDelta,
+    semantic_max_input_token_delta: semanticMaxDelta,
     allowed_input_token_delta: allowedDelta,
+    fixed_control_field_input_token_offset: fixedControlFieldOffset,
+    fixed_control_field_input_accounting: fixedControlFieldOffset !== null,
     pass: baselineRecordCount === candidateRecordCount &&
       pairCount === expectedPairCount &&
-      maxDelta <= allowedDelta
+      semanticMaxDelta <= allowedDelta
   };
+}
+
+function fixedControlFieldInputTokenOffset(baselineRecords, candidateRecords, signedDeltas) {
+  if (baselineRecords.length === 0 || baselineRecords.length !== candidateRecords.length) return null;
+  const candidateHasOnlyControlField = baselineRecords.every((baseline, index) =>
+    baseline?.candidate_control_field_wire_present === false &&
+    candidateRecords[index]?.candidate_control_field_wire_present === true &&
+    number(baseline?.request_body_bytes) === number(candidateRecords[index]?.request_body_bytes)
+  );
+  if (!candidateHasOnlyControlField) return null;
+  const offset = signedDeltas[0];
+  if (!Number.isFinite(offset) || offset === 0 || Math.abs(offset) > MAX_FIXED_CONTROL_FIELD_INPUT_TOKEN_OFFSET) {
+    return null;
+  }
+  return signedDeltas.every((value) => value === offset) ? offset : null;
 }
 
 function controlFieldJsonName(field) {
@@ -1490,6 +1648,63 @@ async function fileExists(path) {
   }
 }
 
+function optionalPath(value) {
+  if (value === undefined || value === null || value === true) return null;
+  const normalized = String(value).trim();
+  return normalized ? resolve(normalized) : null;
+}
+
+// A preserved field can remain constant in a disposable A/B only when a
+// fresh isolated probe has already established that this exact provider/model
+// route accepts it. The receipt never changes the saved config: it merely
+// lets the copied arm configs retain the already-probed capability state.
+async function readFreshPreservedControlFieldProbe(path, field) {
+  const raw = await readRequiredText(path, "preserved control-field probe artifact");
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    throw new Error("the preserved control-field probe artifact is not valid JSON");
+  }
+  return validatePreservedControlFieldProbePayload(payload, {
+    providerId,
+    model,
+    field,
+    nowMs: Date.now()
+  }, raw);
+}
+
+function validatePreservedControlFieldProbePayload(payload, expected, rawPayload = "") {
+  const checkedAt = Date.parse(String(payload?.checked_at ?? ""));
+  const ageMs = Number(expected?.nowMs) - checkedAt;
+  const matchingField = Array.isArray(payload?.fields)
+    ? payload.fields.find((entry) => String(entry?.field ?? "") === expected.field)
+    : null;
+  const verified = payload?.schema === "atoapi-isolated-cache-capability-probe-v1" &&
+    payload?.ok === true &&
+    payload?.isolated === true &&
+    payload?.live_18883_touched === false &&
+    String(payload?.provider_id ?? "") === expected.providerId &&
+    String(payload?.model_id ?? "") === expected.model &&
+    String(payload?.channel ?? "") === "responses" &&
+    matchingField?.status === "verified" &&
+    Number(matchingField?.http_status) === 200 &&
+    Number.isFinite(checkedAt) &&
+    ageMs >= -60_000 && ageMs <= PRESERVED_CONTROL_FIELD_PROBE_MAX_AGE_MS;
+  if (!verified) {
+    throw new Error(
+      `the preserved ${expected.field} probe must be a fresh successful isolated certificate for the active provider/model scope`
+    );
+  }
+  return {
+    state: "verified",
+    field: expected.field,
+    source: "fresh_isolated_probe",
+    checked_at: new Date(checkedAt).toISOString(),
+    payload_sha256: createHash("sha256").update(rawPayload).digest("hex")
+  };
+}
+
 function defaultConfigDir() {
   if (process.platform === "win32" && process.env.APPDATA) return join(process.env.APPDATA, "Atoapi");
   return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "Atoapi");
@@ -1638,6 +1853,18 @@ function round(value, digits) {
   return Math.round(value * scale) / scale;
 }
 
+// WebView2 can retain a disposable profile handle briefly after the isolated
+// proxy parent exits.  A bounded Windows-aware retry keeps that normal close
+// sequence from being reported as a cache-control test failure.
+async function removeTemporaryDirectory(path) {
+  await rm(path, {
+    recursive: true,
+    force: true,
+    maxRetries: 20,
+    retryDelay: 100
+  });
+}
+
 function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
 }
@@ -1723,6 +1950,7 @@ function printUsage() {
     "  node scripts/verify-generated-prompt-cache-key-cross-ab.mjs \\",
     "    --provider-id <id> --model <id> [--field prompt-cache-key|prompt-cache-retention|prompt-cache-options] \\",
     "    [--preserve-control-field prompt-cache-key|prompt-cache-retention|prompt-cache-options] \\",
+    "    [--preserve-control-field-probe <fresh-isolated-probe.json>] \\",
     "    [--exe <atoapi.exe>] [--baseline-exe <atoapi.exe>] [--candidate-exe <atoapi.exe>] \\",
     "    [--baseline-capability source|unsupported|verified] [--candidate-capability source|unsupported|verified] \\",
     "    [--source-config-dir <dir>] [--lines 1000] [--serial] [--between-arms-delay-ms 0] \\",
@@ -1753,6 +1981,102 @@ function runSelfTest() {
   assert.deepEqual(interleavedArmOrder(1, "candidate"), ["baseline", "candidate"]);
   assert.deepEqual(serialArmOrder("baseline"), ["baseline", "candidate"]);
   assert.deepEqual(serialArmOrder("candidate"), ["candidate", "baseline"]);
+  const preservedProbePayload = {
+    schema: "atoapi-isolated-cache-capability-probe-v1",
+    ok: true,
+    isolated: true,
+    live_18883_touched: false,
+    provider_id: "provider-a",
+    model_id: "model-a",
+    channel: "responses",
+    checked_at: "2026-08-16T10:00:00.000Z",
+    fields: [{
+      field: "prompt-cache-retention",
+      status: "verified",
+      http_status: 200
+    }]
+  };
+  const preservedProbeEvidence = validatePreservedControlFieldProbePayload(
+    preservedProbePayload,
+    {
+      providerId: "provider-a",
+      model: "model-a",
+      field: "prompt-cache-retention",
+      nowMs: Date.parse("2026-08-16T10:05:00.000Z")
+    },
+    JSON.stringify(preservedProbePayload)
+  );
+  assert.equal(preservedProbeEvidence.state, "verified");
+  assert.equal(preservedProbeEvidence.source, "fresh_isolated_probe");
+  assert.throws(
+    () => validatePreservedControlFieldProbePayload(
+      { ...preservedProbePayload, model_id: "other-model" },
+      {
+        providerId: "provider-a",
+        model: "model-a",
+        field: "prompt-cache-retention",
+        nowMs: Date.parse("2026-08-16T10:05:00.000Z")
+      },
+      JSON.stringify(preservedProbePayload)
+    ),
+    /fresh successful isolated certificate/u,
+    "a foreign preserved-field probe must fail closed"
+  );
+  const bootstrappedRetentionScope = bootstrapIsolatedVerifiedCapabilityScope(
+    [
+      '[[provider_cache_capabilities]]',
+      'provider_id = "provider-a"',
+      'model_id = "model-a"',
+      'channel = "responses"',
+      'field = "prompt-cache-key"',
+      'status = "verified"'
+    ].join("\n"),
+    { providerId: "provider-a", model: "model-a", keyId: null },
+    "prompt-cache-retention"
+  );
+  const bootstrappedRetention = tomlArrayBlocks(
+    bootstrappedRetentionScope,
+    "provider_cache_capabilities"
+  ).find((block) => extractTomlString(block.body, "field") === "prompt-cache-retention");
+  assert.equal(extractTomlString(bootstrappedRetention?.body ?? "", "status"), "verified");
+  assert.equal(
+    bootstrapIsolatedVerifiedCapabilityScope(
+      bootstrappedRetentionScope,
+      { providerId: "provider-a", model: "model-a", keyId: null },
+      "prompt-cache-retention"
+    ),
+    bootstrappedRetentionScope,
+    "a verified temporary preserved scope must not duplicate its capability record"
+  );
+  const retentionEnabledFixture = replaceProviderTomlBoolean(
+    [
+      '[[providers]]',
+      'id = "provider-a"',
+      'prompt_cache_retention_enabled = false',
+      '',
+      '[[providers]]',
+      'id = "provider-b"',
+      'prompt_cache_retention_enabled = false'
+    ].join("\n"),
+    "provider-a",
+    "prompt_cache_retention_enabled",
+    true
+  );
+  const retentionProviderBlocks = tomlArrayBlocks(retentionEnabledFixture, "providers");
+  assert.equal(
+    extractTomlBoolean(
+      retentionProviderBlocks.find((block) => extractTomlString(block.body, "id") === "provider-a")?.body ?? "",
+      "prompt_cache_retention_enabled"
+    ),
+    true
+  );
+  assert.equal(
+    extractTomlBoolean(
+      retentionProviderBlocks.find((block) => extractTomlString(block.body, "id") === "provider-b")?.body ?? "",
+      "prompt_cache_retention_enabled"
+    ),
+    false
+  );
 
   const keyPoolFixture = [
     '[[provider_key_pools]]\nprovider_id = "provider-test"\nenabled = true\n',
@@ -1780,6 +2104,32 @@ function runSelfTest() {
     128
   );
   assert.equal(excessDelta.pass, false);
+  const fixedFieldAccounting = inputTokenSymmetry(
+    [
+      { input_tokens: 330_345, request_body_bytes: 882_390, candidate_control_field_wire_present: false },
+      { input_tokens: 330_368, request_body_bytes: 882_538, candidate_control_field_wire_present: false }
+    ],
+    [
+      { input_tokens: 330_049, request_body_bytes: 882_390, candidate_control_field_wire_present: true },
+      { input_tokens: 330_072, request_body_bytes: 882_538, candidate_control_field_wire_present: true }
+    ],
+    128
+  );
+  assert.equal(fixedFieldAccounting.pass, true);
+  assert.equal(fixedFieldAccounting.fixed_control_field_input_token_offset, 296);
+  assert.equal(fixedFieldAccounting.semantic_max_input_token_delta, 0);
+  const inconsistentFieldAccounting = inputTokenSymmetry(
+    [
+      { input_tokens: 330_345, request_body_bytes: 882_390, candidate_control_field_wire_present: false },
+      { input_tokens: 330_368, request_body_bytes: 882_538, candidate_control_field_wire_present: false }
+    ],
+    [
+      { input_tokens: 330_049, request_body_bytes: 882_390, candidate_control_field_wire_present: true },
+      { input_tokens: 330_071, request_body_bytes: 882_538, candidate_control_field_wire_present: true }
+    ],
+    128
+  );
+  assert.equal(inconsistentFieldAccounting.pass, false);
   const unequalRecordCount = inputTokenSymmetry(
     [{ input_tokens: 100_000 }],
     [{ input_tokens: 100_000 }, { input_tokens: 100_000 }],

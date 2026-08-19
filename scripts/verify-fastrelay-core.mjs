@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -16,7 +16,7 @@ for (const option of options) {
 }
 
 prepareCargoPath();
-assertVersionParity();
+const expectedAppVersion = assertVersionParity();
 
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const cargo = process.platform === "win32" ? "cargo.exe" : "cargo";
@@ -71,6 +71,9 @@ if (includeCacheReplay) {
 
 for (const [label, command, args] of checks) {
   run(label, command, args);
+  if (!dryRun && label === "frontend build") {
+    assertBuiltFrontendVersionParity(expectedAppVersion);
+  }
 }
 
 console.log(JSON.stringify({
@@ -99,10 +102,34 @@ function assertVersionParity() {
   const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/mu)?.[1];
   const tauriVersion = JSON.parse(readFileSync(join(repoRoot, "src-tauri", "tauri.conf.json"), "utf8")).version;
   const controlPlane = readFileSync(join(repoRoot, "src", "useGraphiteControlPlane.ts"), "utf8");
-  const bubbleVersion = controlPlane.match(/const APP_VERSION\s*=\s*"v([^"]+)"/u)?.[1];
+  const literalBubbleVersion = controlPlane.match(/const APP_VERSION\s*=\s*"v([^"]+)"/u)?.[1];
+  const viteConfig = readFileSync(join(repoRoot, "vite.config.ts"), "utf8");
+  const buildInjectedBubbleVersion =
+    /const APP_VERSION\s*=\s*__ATOAPI_APP_VERSION__/u.test(controlPlane) &&
+    /__ATOAPI_APP_VERSION__\s*:\s*JSON\.stringify\(appVersion\)/u.test(viteConfig) &&
+    /const appVersion\s*=\s*`v\$\{packageJson\.version\}`/u.test(viteConfig) &&
+    /import packageJson from "\.\/package\.json"/u.test(viteConfig)
+      ? packageVersion
+      : undefined;
+  const bubbleVersion = literalBubbleVersion ?? buildInjectedBubbleVersion;
   const versions = [packageVersion, cargoVersion, tauriVersion, bubbleVersion];
   if (versions.some((version) => !version) || new Set(versions).size !== 1) {
     throw new Error(`Version mismatch: ${JSON.stringify({ packageVersion, cargoVersion, tauriVersion, bubbleVersion })}`);
+  }
+  return packageVersion;
+}
+
+function assertBuiltFrontendVersionParity(expectedVersion) {
+  const assetsDirectory = join(repoRoot, "dist", "assets");
+  if (!existsSync(assetsDirectory)) {
+    throw new Error("Built frontend assets are missing; run npm run build before packaging.");
+  }
+  const marker = `v${expectedVersion}`;
+  const bundles = readdirSync(assetsDirectory)
+    .filter((name) => name.endsWith(".js"))
+    .map((name) => join(assetsDirectory, name));
+  if (bundles.length === 0 || !bundles.some((path) => readFileSync(path, "utf8").includes(marker))) {
+    throw new Error(`Built frontend version bubble is stale or missing ${marker}. Rebuild the frontend before packaging.`);
   }
 }
 

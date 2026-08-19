@@ -14,6 +14,22 @@ pub(crate) struct TransportClients {
 
 const EXPLICIT_PROXY_POOL_LIMIT: usize = 16;
 
+/// A protocol diagnostic is meaningful only for an explicitly disposable
+/// verifier process. Normal desktop traffic keeps HTTP/2 negotiation and its
+/// established pooling behavior.
+fn isolated_upstream_http1_test_enabled() -> bool {
+    isolated_upstream_http1_test_enabled_with_env(
+        crate::config::isolated_test_instance(),
+        std::env::var("ATOAPI_EXPERIMENTAL_UPSTREAM_HTTP1")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn isolated_upstream_http1_test_enabled_with_env(isolated: bool, value: Option<&str>) -> bool {
+    isolated && value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExplicitProxyKey {
     url: String,
@@ -152,11 +168,16 @@ fn base_client_builder(
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(10 * 60))
         .tcp_keepalive(Duration::from_secs(30))
-        .tcp_nodelay(true)
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
-        .http2_keep_alive_while_idle(true);
+        .tcp_nodelay(true);
+    let builder = if isolated_upstream_http1_test_enabled() {
+        builder.http1_only()
+    } else {
+        builder
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_timeout(Duration::from_secs(10))
+            .http2_keep_alive_while_idle(true)
+    };
     let builder = match redirect_policy {
         // Ordinary API and administrator traffic retains reqwest's baseline
         // redirect behavior. It is outside the Agent generation attempt gate.
@@ -188,6 +209,23 @@ mod tests {
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
+
+    #[test]
+    fn upstream_http1_experiment_requires_an_isolated_explicit_flag() {
+        assert!(!isolated_upstream_http1_test_enabled_with_env(
+            false,
+            Some("1")
+        ));
+        assert!(!isolated_upstream_http1_test_enabled_with_env(true, None));
+        assert!(!isolated_upstream_http1_test_enabled_with_env(
+            true,
+            Some("0")
+        ));
+        assert!(isolated_upstream_http1_test_enabled_with_env(
+            true,
+            Some("1")
+        ));
+    }
 
     async fn redirect_server() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>, JoinHandle<()>) {
         let redirect_hits = Arc::new(AtomicUsize::new(0));

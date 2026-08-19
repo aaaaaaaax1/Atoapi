@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{BufReader, Read},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -454,6 +454,14 @@ struct PersistedMetricsHistory {
     /// than fabricating a historical version champion.
     #[serde(default)]
     release_cohorts: BTreeMap<String, ReleaseCohortEntry>,
+    /// Runtime-only retention watermark. The retention cutoff is rounded to
+    /// the hour, so re-scanning every bucket and release cohort for every
+    /// successful request within that hour only repeats identical work.
+    #[serde(skip)]
+    last_pruned_boundary: Option<i64>,
+    #[cfg(test)]
+    #[serde(skip)]
+    prune_runs: u64,
 }
 
 impl Default for PersistedMetricsHistory {
@@ -462,6 +470,9 @@ impl Default for PersistedMetricsHistory {
             version: METRICS_HISTORY_VERSION,
             buckets: BTreeMap::new(),
             release_cohorts: BTreeMap::new(),
+            last_pruned_boundary: None,
+            #[cfg(test)]
+            prune_runs: 0,
         }
     }
 }
@@ -478,7 +489,7 @@ impl PersistedMetricsHistory {
         if agent_id.is_empty() || provider_id.is_empty() {
             return false;
         }
-        self.prune(now);
+        self.prune_if_due(now);
         let bucket_start = hour_start_timestamp(observation.at);
         let oldest = hour_start_timestamp(now - Duration::hours(RETENTION_HOURS));
         if bucket_start < oldest {
@@ -566,6 +577,10 @@ impl PersistedMetricsHistory {
 
     fn prune(&mut self, now: DateTime<Utc>) {
         let oldest = hour_start_timestamp(now - Duration::hours(RETENTION_HOURS));
+        #[cfg(test)]
+        {
+            self.prune_runs = self.prune_runs.saturating_add(1);
+        }
         self.buckets.retain(|start, _| *start >= oldest);
         let oldest_at = DateTime::<Utc>::from_timestamp(oldest, 0)
             .expect("metrics history retention boundary must be representable");
@@ -579,6 +594,14 @@ impl PersistedMetricsHistory {
                     .last_observed_at
                     .is_some_and(|observed_at| observed_at >= oldest_at)
         });
+        self.last_pruned_boundary = Some(oldest);
+    }
+
+    fn prune_if_due(&mut self, now: DateTime<Utc>) {
+        let oldest = hour_start_timestamp(now - Duration::hours(RETENTION_HOURS));
+        if self.last_pruned_boundary != Some(oldest) {
+            self.prune(now);
+        }
     }
 
     fn query(
@@ -1363,8 +1386,18 @@ fn save_metrics_history(path: &Path, history: &PersistedMetricsHistory) -> Resul
         fs::create_dir_all(parent)?;
     }
     let temp = path.with_extension("json.tmp");
-    let raw = format!("{}\n", serde_json::to_string_pretty(history)?);
-    fs::write(&temp, raw).with_context(|| format!("failed to write {}", temp.display()))?;
+    let file =
+        fs::File::create(&temp).with_context(|| format!("failed to create {}", temp.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer(&mut writer, history)
+        .with_context(|| format!("failed to serialize {}", temp.display()))?;
+    writer
+        .write_all(b"\n")
+        .with_context(|| format!("failed to write {}", temp.display()))?;
+    writer
+        .flush()
+        .with_context(|| format!("failed to flush {}", temp.display()))?;
+    drop(writer);
     if fs::rename(&temp, path).is_err() {
         // Windows does not atomically replace an existing target with
         // `rename`. Stage the old file and restore it if the final move fails,
@@ -2004,6 +2037,29 @@ mod tests {
             (start + Duration::hours(2)).to_rfc3339_opts(SecondsFormat::Secs, true)
         );
         assert_eq!(normalized.points.len(), 2);
+    }
+
+    #[test]
+    fn observation_prunes_once_per_retention_boundary() {
+        let mut history = PersistedMetricsHistory::default();
+        let hour = hour_now();
+        let first = hour + Duration::minutes(1);
+
+        assert!(history.observe(observation(first, "provider-a", false), None, first,));
+        assert_eq!(history.prune_runs, 1);
+
+        for minute in [2, 15, 59] {
+            let now = hour + Duration::minutes(minute);
+            assert!(history.observe(observation(now, "provider-a", false), None, now,));
+        }
+        assert_eq!(
+            history.prune_runs, 1,
+            "the hourly retention cutoff is unchanged, so repeated successful observations must not rescan retained history"
+        );
+
+        let next_hour = hour + Duration::hours(1);
+        assert!(history.observe(observation(next_hour, "provider-a", false), None, next_hour,));
+        assert_eq!(history.prune_runs, 2);
     }
 
     #[tokio::test]

@@ -308,6 +308,31 @@ impl ProviderCacheCapabilityField {
     ];
 }
 
+/// Exact wire variant for `prompt_cache_options`.  The TTL is part of the
+/// measured effect contract: a certificate for one value must never authorize
+/// the other value on production traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptCacheOptionsTtl {
+    ThirtyMinutes,
+    TwentyFourHours,
+}
+
+impl PromptCacheOptionsTtl {
+    pub(crate) const fn wire_value(self) -> &'static str {
+        match self {
+            Self::ThirtyMinutes => "30m",
+            Self::TwentyFourHours => "24h",
+        }
+    }
+
+    pub(crate) const fn effect_scope_value(self) -> &'static str {
+        match self {
+            Self::ThirtyMinutes => "implicit-30m",
+            Self::TwentyFourHours => "implicit-24h",
+        }
+    }
+}
+
 const PROVIDER_CACHE_CAPABILITY_EVIDENCE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -417,6 +442,88 @@ fn provider_cache_effect_scope_is_current_v2(
     field != ProviderCacheCapabilityField::PromptCacheBreakpoint || breakpoint != "none"
 }
 
+/// New Options certificates bind the exact implicit TTL.  Historical v2
+/// certificates remain valid only as the legacy implicit/30m variant; 24h is
+/// never inferred from an environment flag or a generic field certificate.
+fn prompt_cache_options_ttl_from_effect_scope_v5(
+    scope: Option<&str>,
+) -> Option<PromptCacheOptionsTtl> {
+    let scope = scope?;
+    let (base, breakpoint) = scope.rsplit_once(":bp=")?;
+    if breakpoint != "none" {
+        return None;
+    }
+    let mut parts = base.split(':');
+    let version = parts.next();
+    let realm = parts.next();
+    let stream = parts.next();
+    let store = parts.next();
+    let options = parts.next();
+    if parts.next().is_some()
+        || version != Some("cache-effect-v5")
+        || realm.is_none_or(str::is_empty)
+        || !matches!(stream, Some("stream" | "sync" | "stream-absent"))
+        || !matches!(store, Some("store" | "no-store" | "store-absent"))
+    {
+        return None;
+    }
+    match options {
+        Some("pco=implicit-30m") => Some(PromptCacheOptionsTtl::ThirtyMinutes),
+        Some("pco=implicit-24h") => Some(PromptCacheOptionsTtl::TwentyFourHours),
+        _ => None,
+    }
+}
+
+/// Legacy Options evidence predates the value-bound v5 certificate and can
+/// only stand for the historical implicit/30m variant.  Options never uses a
+/// protocol breakpoint, so a v2 record carrying a placement digest belongs to
+/// a different treatment and must not authorize this field.
+fn prompt_cache_options_ttl_from_effect_scope_v2(
+    scope: Option<&str>,
+) -> Option<PromptCacheOptionsTtl> {
+    let scope = scope?;
+    let (_, breakpoint) = scope.rsplit_once(":bp=")?;
+    (breakpoint == "none"
+        && provider_cache_effect_scope_is_current_v2(
+            Some(scope),
+            ProviderCacheCapabilityField::PromptCacheOptions,
+        ))
+    .then_some(PromptCacheOptionsTtl::ThirtyMinutes)
+}
+
+pub(crate) fn prompt_cache_options_ttl_from_effect_scope(
+    scope: Option<&str>,
+) -> Option<PromptCacheOptionsTtl> {
+    prompt_cache_options_ttl_from_effect_scope_v5(scope)
+        .or_else(|| prompt_cache_options_ttl_from_effect_scope_v2(scope))
+}
+
+fn prompt_cache_options_effect_scope_family_id(scope: Option<&str>) -> Option<String> {
+    prompt_cache_options_ttl_from_effect_scope(scope)?;
+    let scope = scope?;
+    let (base, breakpoint) = scope.rsplit_once(":bp=")?;
+    let mut parts = base.split(':');
+    let version = parts.next()?;
+    let realm = parts.next()?;
+    let stream = parts.next()?;
+    let store = parts.next()?;
+    match version {
+        "cache-effect-v2" => {
+            if parts.next().is_some() {
+                return None;
+            }
+        }
+        "cache-effect-v5" => {
+            parts.next()?;
+            if parts.next().is_some() {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(format!("{realm}:{stream}:{store}:bp={breakpoint}"))
+}
+
 /// A generated `prompt_cache_key` has a different safety contract from every
 /// other cache control: its stable value is bound to the exact selected-Key
 /// realm and trusted session identity. Earlier records may have measured a
@@ -452,6 +559,8 @@ fn provider_cache_effect_scope_is_current(
 ) -> bool {
     if field == ProviderCacheCapabilityField::PromptCacheKey {
         generated_prompt_cache_key_effect_scope_is_current_v4(scope)
+    } else if field == ProviderCacheCapabilityField::PromptCacheOptions {
+        prompt_cache_options_ttl_from_effect_scope(scope).is_some()
     } else {
         provider_cache_effect_scope_is_current_v2(scope, field)
     }
@@ -486,6 +595,11 @@ pub struct ProviderCacheCapabilityProbeInput {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel: Option<Channel>,
+    /// Omit to retain the full diagnostic sweep. An isolated candidate may
+    /// request one exact field so its pre-scoring certificate does not spend
+    /// time probing unrelated upstream controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fields: Option<Vec<ProviderCacheCapabilityField>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1999,6 +2113,46 @@ impl AppConfig {
             })
     }
 
+    /// Resolve the exact promoted Options wire variant for one scope.  The
+    /// generic field gate intentionally remains available for other controls,
+    /// while Options callers must consume this typed value so a 30m record can
+    /// never turn into a 24h request later in the pipeline.
+    pub fn promoted_prompt_cache_options_ttl_for_scope(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+        channel: &Channel,
+        key_id: Option<&str>,
+        effect_scope_id: Option<&str>,
+    ) -> Option<PromptCacheOptionsTtl> {
+        let expected_family = prompt_cache_options_effect_scope_family_id(effect_scope_id)?;
+        let mut promoted_ttl = None;
+        for item in self.provider_cache_capabilities.iter().filter(|item| {
+            item.provider_id == provider_id
+                && item.model_id == model_id
+                && &item.channel == channel
+                && item.key_id.as_deref() == key_id
+                && item.field == ProviderCacheCapabilityField::PromptCacheOptions
+                && provider_cache_capability_evidence_is_current(item)
+                && item.status == ProviderCacheCapabilityStatus::Verified
+                && item.effect_status == ProviderCacheEffectStatus::Promoted
+        }) {
+            if prompt_cache_options_effect_scope_family_id(item.effect_scope_id.as_deref())
+                .as_deref()
+                != Some(expected_family.as_str())
+            {
+                continue;
+            }
+            let ttl = prompt_cache_options_ttl_from_effect_scope(item.effect_scope_id.as_deref())?;
+            match promoted_ttl {
+                None => promoted_ttl = Some(ttl),
+                Some(previous) if previous == ttl => {}
+                Some(_) => return None,
+            }
+        }
+        promoted_ttl
+    }
+
     /// Returns true only for a positive real-effect certificate generated by
     /// the realm/session key strategy used on the production wire.
     pub fn generated_prompt_cache_key_promoted_for_scope(
@@ -2190,8 +2344,16 @@ impl AppConfig {
                 && item.status == ProviderCacheCapabilityStatus::Verified
                 && provider_cache_capability_evidence_is_current(item)
         }) {
-            let preserve_promoted = effect_status == ProviderCacheEffectStatus::Error
-                && item.effect_status == ProviderCacheEffectStatus::Promoted;
+            let preserve_alternative_options_winner = item.field
+                == ProviderCacheCapabilityField::PromptCacheOptions
+                && item.effect_status == ProviderCacheEffectStatus::Promoted
+                && effect_status == ProviderCacheEffectStatus::NoBenefit
+                && prompt_cache_options_ttl_from_effect_scope(item.effect_scope_id.as_deref())
+                    .zip(prompt_cache_options_ttl_from_effect_scope(effect_scope_id))
+                    .is_some_and(|(current, candidate)| current != candidate);
+            let preserve_promoted = (effect_status == ProviderCacheEffectStatus::Error
+                && item.effect_status == ProviderCacheEffectStatus::Promoted)
+                || preserve_alternative_options_winner;
             item.effect_checked_at = Some(now);
             if preserve_promoted {
                 item.last_error = clean_optional_string(message.clone());
@@ -2211,8 +2373,8 @@ impl AppConfig {
                 .then(|| clean_optional_string(effect_scope_id.map(ToOwned::to_owned)))
                 .flatten();
             // Every field needs both acceptance and a positive measured
-            // effect. Prompt-cache keys additionally require the v3
-            // realm/session strategy scope checked above.
+            // effect. Generated keys and Options additionally require their
+            // strategy/value-bound scope checked above.
             item.enabled =
                 item.effect_status == ProviderCacheEffectStatus::Promoted && scope_is_current;
             item.effect_message = (!invalid_promoted_scope)
@@ -2224,7 +2386,7 @@ impl AppConfig {
             item.candidate_ttft_ms = candidate_ttft_ms;
             if invalid_promoted_scope {
                 item.last_error = Some(
-                    "cache effect promotion requires a v2 exact-scope certificate".to_string(),
+                    "cache effect promotion requires a current exact-scope certificate".to_string(),
                 );
             } else if effect_status == ProviderCacheEffectStatus::Error {
                 item.last_error = clean_optional_string(message.clone());
@@ -2980,6 +3142,18 @@ pub fn app_config_dir() -> Result<PathBuf> {
     Ok(current)
 }
 
+/// A stable, local-only WebView2 profile for normal desktop releases.
+///
+/// This intentionally does not follow `ATOAPI_CONFIG_DIR`: isolated test
+/// instances may redirect configuration, while a normal WebView browser
+/// profile must remain local to the desktop user and separate from Tauri's
+/// legacy default profile.
+pub fn release_webview2_user_data_dir() -> Result<PathBuf> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| anyhow!("failed to locate local application data directory"))?;
+    Ok(base.join("Atoapi").join("webview2-udf-v2"))
+}
+
 pub fn isolated_test_instance() -> bool {
     std::env::var("ATOAPI_ISOLATED_TEST_INSTANCE")
         .ok()
@@ -3509,6 +3683,114 @@ updated_at = "2026-06-21T00:00:00Z"
     }
 
     #[test]
+    fn options_ttl_certificates_are_exact_and_a_failed_alternative_keeps_the_winner() {
+        let mut config = AppConfig::default();
+        let legacy_scope = "cache-effect-v2:realm-a:stream:no-store:bp=none";
+        let options_24h_scope = "cache-effect-v5:realm-a:stream:no-store:pco=implicit-24h:bp=none";
+        assert_eq!(
+            prompt_cache_options_ttl_from_effect_scope(Some(
+                "cache-effect-v2:realm-a:stream:no-store:bp=v2:placement-a",
+            )),
+            None,
+            "Options legacy evidence must not inherit a breakpoint treatment"
+        );
+        config.record_cache_capability_probe(
+            "provider-a",
+            "gpt-5.6-luna",
+            Channel::Responses,
+            ProviderCacheCapabilityField::PromptCacheOptions,
+            ProviderCacheCapabilityStatus::Verified,
+            None,
+        );
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            Some(legacy_scope),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            Some("legacy implicit 30m benefit".to_string()),
+            Some(0),
+            Some(512),
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(
+            config.promoted_prompt_cache_options_ttl_for_scope(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some(legacy_scope),
+            ),
+            Some(PromptCacheOptionsTtl::ThirtyMinutes)
+        );
+
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            Some(options_24h_scope),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::NoBenefit,
+            Some("24h did not reproduce on this attempt".to_string()),
+            Some(0),
+            Some(0),
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(
+            config.promoted_prompt_cache_options_ttl_for_scope(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some(legacy_scope),
+            ),
+            Some(PromptCacheOptionsTtl::ThirtyMinutes),
+            "an unproven 24h variant must not erase the existing 30m winner"
+        );
+
+        config.record_cache_capability_effect_for_scope(
+            "provider-a",
+            "gpt-5.6-luna",
+            &Channel::Responses,
+            None,
+            Some(options_24h_scope),
+            &[ProviderCacheCapabilityField::PromptCacheOptions],
+            ProviderCacheEffectStatus::Promoted,
+            Some("24h exact-wire benefit".to_string()),
+            Some(0),
+            Some(1_024),
+            Some(100),
+            Some(100),
+        );
+        assert_eq!(
+            config.promoted_prompt_cache_options_ttl_for_scope(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some(legacy_scope),
+            ),
+            Some(PromptCacheOptionsTtl::TwentyFourHours)
+        );
+        assert_eq!(
+            config.promoted_prompt_cache_options_ttl_for_scope(
+                "provider-a",
+                "gpt-5.6-luna",
+                &Channel::Responses,
+                None,
+                Some("cache-effect-v2:other-realm:stream:no-store:bp=none"),
+            ),
+            None,
+            "realm changes must fail closed rather than reuse another certificate"
+        );
+    }
+
+    #[test]
     fn cache_capability_verification_is_key_scoped() {
         let mut config = AppConfig::default();
         config.record_cache_capability_probe_for_key(
@@ -3782,7 +4064,7 @@ updated_at = "2026-06-21T00:00:00Z"
         assert!(options
             .last_error
             .as_deref()
-            .is_some_and(|message| message.contains("v2 exact-scope")));
+            .is_some_and(|message| message.contains("current exact-scope certificate")));
 
         loaded.record_cache_capability_probe(
             "provider-a",

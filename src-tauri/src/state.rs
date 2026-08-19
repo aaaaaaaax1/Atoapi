@@ -95,7 +95,6 @@ pub struct AppState {
     pub warm_pending: Mutex<WarmPendingRegistry>,
     #[cfg(test)]
     pub prefix_prewarm_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
-    pub request_body_gzip_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_endpoint_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     pub compact_chat_compat_cooldowns: Mutex<HashMap<String, std::time::Instant>>,
     /// Bounded, process-local observations of an upstream rejecting a
@@ -270,6 +269,38 @@ impl PrefixWarmState {
     }
 }
 
+/// The only `prompt_cache_options` variants that may participate in the
+/// isolated Options settle experiment.  This is process-local evidence only:
+/// it is never persisted, sent upstream, or used as current-wire maturity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PromptCacheOptionsSiblingVariant {
+    Absent,
+    ImplicitThirtyMinutes,
+    ImplicitTwentyFourHours,
+}
+
+/// Attests that a frozen native Responses wire may differ from another frozen
+/// wire only at the strictly-recognised `prompt_cache_options` root.  Both
+/// digests are opaque SHA-256 values; no request content is retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptCacheOptionsSiblingProof {
+    /// The normal cache-maturity projection that keys the exact scope entry.
+    pub(crate) cache_maturity_static_projection_digest: String,
+    /// The stricter final-wire static projection with only `input` and the
+    /// allowed Options root removed.  A matching value proves every other
+    /// final static root is identical.
+    pub(crate) options_neutral_static_projection_digest: String,
+    pub(crate) variant: PromptCacheOptionsSiblingVariant,
+}
+
+#[derive(Debug, Clone)]
+struct PrefixMaturityScopeEntry {
+    state: PrefixWarmState,
+    /// Present only when the exact frozen wire supplied a strict Options
+    /// sibling proof.  Generic static siblings must never obtain this hint.
+    prompt_cache_options_sibling_proof: Option<PromptCacheOptionsSiblingProof>,
+}
+
 /// Bounded process-only maturity slots keyed by the broad provider prefix, an
 /// attested final parent scope, and the frozen static projection. A native
 /// FullReplay may alternate between several real static wire shapes inside one
@@ -278,7 +309,7 @@ impl PrefixWarmState {
 /// erase the previously verified A slot either.
 #[derive(Debug, Default)]
 pub struct PrefixMaturityScopeRegistry {
-    entries: HashMap<String, PrefixWarmState>,
+    entries: HashMap<String, PrefixMaturityScopeEntry>,
 }
 
 impl PrefixMaturityScopeRegistry {
@@ -296,12 +327,12 @@ impl PrefixMaturityScopeRegistry {
         let expired = self
             .entries
             .get(&key)
-            .is_some_and(|state| state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL);
+            .is_some_and(|entry| entry.state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL);
         if expired {
             self.entries.remove(&key);
             return None;
         }
-        self.entries.get(&key).cloned()
+        self.entries.get(&key).map(|entry| entry.state.clone())
     }
 
     /// Reports whether this exact trusted parent already has a different live
@@ -323,9 +354,9 @@ impl PrefixMaturityScopeRegistry {
         let expired = self
             .entries
             .iter()
-            .filter(|(entry_key, state)| {
+            .filter(|(entry_key, entry)| {
                 entry_key.starts_with(&parent_key)
-                    && state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL
+                    && entry.state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL
             })
             .map(|(entry_key, _)| entry_key.clone())
             .collect::<Vec<_>>();
@@ -337,11 +368,104 @@ impl PrefixMaturityScopeRegistry {
             .any(|entry_key| entry_key.starts_with(&parent_key) && entry_key != &current_key)
     }
 
+    /// Return the newest live sibling only when both frozen wires carry a
+    /// matching strict Options-neutral projection and different allowed
+    /// Options variants. The caller may use this only as a bounded
+    /// pre-dispatch settle hint; it must not inherit the sibling's maturity or
+    /// waterline as if it belonged to the current frozen wire.
+    pub fn newest_live_prompt_cache_options_sibling(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        static_projection_digest: Option<&str>,
+        current_proof: Option<&PromptCacheOptionsSiblingProof>,
+    ) -> Option<PrefixWarmState> {
+        let Some(current_proof) = current_proof else {
+            return None;
+        };
+        if static_projection_digest
+            != Some(
+                current_proof
+                    .cache_maturity_static_projection_digest
+                    .as_str(),
+            )
+        {
+            return None;
+        }
+        let parent_key = maturity_scope_parent_key(prefix_control_key, parent_scope_digest);
+        let current_key = maturity_scope_entry_key(
+            prefix_control_key,
+            parent_scope_digest,
+            static_projection_digest,
+        );
+        let expired = self
+            .entries
+            .iter()
+            .filter(|(entry_key, entry)| {
+                entry_key.starts_with(&parent_key)
+                    && entry.state.finished_at.elapsed() > PREFIX_RUNTIME_STATE_TTL
+            })
+            .map(|(entry_key, _)| entry_key.clone())
+            .collect::<Vec<_>>();
+        for entry_key in expired {
+            self.entries.remove(&entry_key);
+        }
+        // A sibling hint is valid only after the current frozen variant has
+        // its own live, proof-backed registry entry. Without this guard, an
+        // unknown or expired current key could borrow an unrelated same-parent
+        // sibling merely because the caller supplied a matching digest string.
+        let current_proof_matches = self
+            .entries
+            .get(&current_key)
+            .and_then(|entry| entry.prompt_cache_options_sibling_proof.as_ref())
+            == Some(current_proof);
+        if !current_proof_matches {
+            return None;
+        }
+        self.entries
+            .iter()
+            .filter(|(entry_key, entry)| {
+                entry_key.starts_with(&parent_key)
+                    && *entry_key != &current_key
+                    && entry
+                        .prompt_cache_options_sibling_proof
+                        .as_ref()
+                        .is_some_and(|sibling_proof| {
+                            sibling_proof.cache_maturity_static_projection_digest
+                                == entry
+                                    .state
+                                    .responses_static_projection_digest
+                                    .as_deref()
+                                    .unwrap_or_default()
+                                && sibling_proof.options_neutral_static_projection_digest
+                                    == current_proof.options_neutral_static_projection_digest
+                                && sibling_proof.variant != current_proof.variant
+                        })
+            })
+            .max_by_key(|(_, entry)| entry.state.finished_at)
+            .map(|(_, entry)| entry.state.clone())
+    }
+
     pub fn insert(
         &mut self,
         prefix_control_key: &str,
         parent_scope_digest: &str,
         state: PrefixWarmState,
+    ) {
+        self.insert_with_prompt_cache_options_proof(
+            prefix_control_key,
+            parent_scope_digest,
+            state,
+            None,
+        );
+    }
+
+    pub fn insert_with_prompt_cache_options_proof(
+        &mut self,
+        prefix_control_key: &str,
+        parent_scope_digest: &str,
+        state: PrefixWarmState,
+        prompt_cache_options_sibling_proof: Option<PromptCacheOptionsSiblingProof>,
     ) {
         let parent_key = maturity_scope_parent_key(prefix_control_key, parent_scope_digest);
         let key = maturity_scope_entry_key(
@@ -354,7 +478,7 @@ impl PrefixMaturityScopeRegistry {
                 .entries
                 .iter()
                 .filter(|(entry_key, _)| entry_key.starts_with(&parent_key))
-                .map(|(entry_key, entry_state)| (entry_key.clone(), entry_state.finished_at))
+                .map(|(entry_key, entry)| (entry_key.clone(), entry.state.finished_at))
                 .collect::<Vec<_>>();
             siblings.sort_unstable_by_key(|(_, finished_at)| *finished_at);
             let overflow = siblings
@@ -369,13 +493,19 @@ impl PrefixMaturityScopeRegistry {
             let oldest = self
                 .entries
                 .iter()
-                .min_by_key(|(_, state)| state.finished_at)
+                .min_by_key(|(_, entry)| entry.state.finished_at)
                 .map(|(key, _)| key.clone());
             if let Some(oldest) = oldest {
                 self.entries.remove(&oldest);
             }
         }
-        self.entries.insert(key, state);
+        self.entries.insert(
+            key,
+            PrefixMaturityScopeEntry {
+                state,
+                prompt_cache_options_sibling_proof,
+            },
+        );
     }
 
     pub fn remove(
@@ -747,7 +877,6 @@ impl AppState {
             warm_pending: Mutex::new(WarmPendingRegistry::default()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
-            request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             full_replay_risk_observations: Mutex::new(
@@ -802,7 +931,6 @@ impl AppState {
             warm_pending: Mutex::new(WarmPendingRegistry::default()),
             #[cfg(test)]
             prefix_prewarm_cooldowns: Mutex::new(HashMap::new()),
-            request_body_gzip_cooldowns: Mutex::new(HashMap::new()),
             compact_endpoint_cooldowns: Mutex::new(HashMap::new()),
             compact_chat_compat_cooldowns: Mutex::new(HashMap::new()),
             full_replay_risk_observations: Mutex::new(
@@ -1676,6 +1804,99 @@ mod tests {
 
         assert!(registry.get("prefix", "parent", Some("static-a")).is_some());
         assert!(registry.get("prefix", "parent", Some("static-b")).is_none());
+    }
+
+    #[test]
+    fn maturity_scope_registry_returns_only_a_matching_options_sibling() {
+        let now = Instant::now();
+        let mut registry = PrefixMaturityScopeRegistry::default();
+        let mut static_a = prefix_state_at(
+            now.checked_sub(StdDuration::from_millis(20))
+                .expect("the test clock supports a recent sibling"),
+        );
+        static_a.responses_static_projection_digest = Some("static-a".to_string());
+        registry.insert_with_prompt_cache_options_proof(
+            "prefix",
+            "parent",
+            static_a,
+            Some(PromptCacheOptionsSiblingProof {
+                cache_maturity_static_projection_digest: "static-a".to_string(),
+                options_neutral_static_projection_digest: "neutral".to_string(),
+                variant: PromptCacheOptionsSiblingVariant::ImplicitTwentyFourHours,
+            }),
+        );
+        let mut static_b = prefix_state_at(now);
+        static_b.responses_static_projection_digest = Some("static-b".to_string());
+        static_b.cache_read_tokens = 130_688;
+        registry.insert_with_prompt_cache_options_proof(
+            "prefix",
+            "parent",
+            static_b,
+            Some(PromptCacheOptionsSiblingProof {
+                cache_maturity_static_projection_digest: "static-b".to_string(),
+                options_neutral_static_projection_digest: "neutral".to_string(),
+                variant: PromptCacheOptionsSiblingVariant::ImplicitThirtyMinutes,
+            }),
+        );
+
+        let sibling = registry
+            .newest_live_prompt_cache_options_sibling(
+                "prefix",
+                "parent",
+                Some("static-a"),
+                Some(&PromptCacheOptionsSiblingProof {
+                    cache_maturity_static_projection_digest: "static-a".to_string(),
+                    options_neutral_static_projection_digest: "neutral".to_string(),
+                    variant: PromptCacheOptionsSiblingVariant::ImplicitTwentyFourHours,
+                }),
+            )
+            .expect("a distinct live static sibling should be available");
+        assert_eq!(sibling.cache_read_tokens, 130_688);
+        assert!(
+            registry
+                .newest_live_prompt_cache_options_sibling(
+                    "prefix",
+                    "parent",
+                    Some("static-b"),
+                    Some(&PromptCacheOptionsSiblingProof {
+                        cache_maturity_static_projection_digest: "static-b".to_string(),
+                        options_neutral_static_projection_digest: "neutral".to_string(),
+                        variant: PromptCacheOptionsSiblingVariant::ImplicitThirtyMinutes,
+                    }),
+                )
+                .is_some(),
+            "the current key is excluded but its other live sibling remains visible"
+        );
+        assert!(
+            registry
+                .newest_live_prompt_cache_options_sibling(
+                    "prefix",
+                    "parent",
+                    Some("static-only"),
+                    Some(&PromptCacheOptionsSiblingProof {
+                        cache_maturity_static_projection_digest: "static-only".to_string(),
+                        options_neutral_static_projection_digest: "neutral".to_string(),
+                        variant: PromptCacheOptionsSiblingVariant::ImplicitTwentyFourHours,
+                    }),
+                )
+                .is_none(),
+            "an unknown current key must not inspect an arbitrary existing sibling"
+        );
+        assert!(
+            registry
+                .newest_live_prompt_cache_options_sibling(
+                    "prefix",
+                    "parent",
+                    Some("static-a"),
+                    Some(&PromptCacheOptionsSiblingProof {
+                        cache_maturity_static_projection_digest: "static-a".to_string(),
+                        options_neutral_static_projection_digest: "different".to_string(),
+                        variant: PromptCacheOptionsSiblingVariant::ImplicitTwentyFourHours,
+                    }),
+                )
+                .is_none(),
+            "a different neutral projection must fail closed"
+        );
     }
 
     #[tokio::test]

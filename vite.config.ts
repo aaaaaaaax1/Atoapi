@@ -1,9 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import packageJson from "./package.json";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = fileURLToPath(new URL(".", import.meta.url));
+const appVersion = `v${packageJson.version}`;
 
 // Vite's development watcher must never recursively retain Rust build output
 // or release/QA artifacts. Those trees change during every package build and
@@ -21,6 +23,9 @@ const generatedWatchIgnores = [
 export default defineConfig({
   root: projectRoot,
   plugins: [react()],
+  define: {
+    __ATOAPI_APP_VERSION__: JSON.stringify(appVersion)
+  },
   clearScreen: false,
   server: {
     port: 1420,

@@ -451,7 +451,6 @@ pub(super) enum ResponsesFailureCode {
     UpstreamStreamError,
     UpstreamRequestBlocked,
     UpstreamWafBlocked,
-    ContextPayloadUnsafe,
 }
 
 impl ResponsesFailureCode {
@@ -463,15 +462,11 @@ impl ResponsesFailureCode {
             Self::UpstreamStreamError => "upstream_stream_error",
             Self::UpstreamRequestBlocked => "upstream_request_blocked",
             Self::UpstreamWafBlocked => "upstream_waf_blocked",
-            Self::ContextPayloadUnsafe => "compaction_required",
         }
     }
 
     pub(super) const fn error_type(self) -> &'static str {
-        match self {
-            Self::ContextPayloadUnsafe => "context_payload_unsafe",
-            _ => self.code(),
-        }
+        self.code()
     }
 
     const fn is_upstream_blocked(self) -> bool {
@@ -1411,7 +1406,7 @@ pub(super) async fn stream_upstream(
                 )
             })
             .flatten();
-        let prefix_observation = observe_provider_prefix_usage(
+        let prefix_observation = observe_provider_prefix_usage_with_final_scope(
             &state_for_stream,
             prefix_state_key.as_deref(),
             provider_prefix_family_key.as_deref(),
@@ -1459,6 +1454,11 @@ pub(super) async fn stream_upstream(
             stream_success_for_cache
                 && !confirmed_compaction
                 && local_full_replay_settlement_allowed,
+            upstream_request_diagnostics
+                .final_wire_receipt
+                .as_ref()
+                .and_then(|receipt| receipt.wire.prompt_cache_options_sibling_proof.as_ref()),
+            upstream_request_diagnostics.final_scope_waterline.as_ref(),
         )
         .await;
         let (gap_breakdown, final_scope_rollback_reclassified) =

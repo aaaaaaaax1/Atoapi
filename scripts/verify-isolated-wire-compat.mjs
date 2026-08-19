@@ -128,11 +128,10 @@ try {
       "cache-control": "no-cache",
       "content-type": "text/event-stream; charset=utf-8"
     });
-    const responseId = turn === 1
-      ? "resp_wire_seed"
-      : turn === 2
-        ? "resp_wire_followup"
-        : "resp_wire_terminal";
+    // Keep this downstream identifier arm-specific. The regenerated-tool-id
+    // fixture must parse it from the seed's real SSE completion before it
+    // builds the replay; a fixed literal would not exercise local lineage.
+    const responseId = `resp_wire_${String(arm).replace(/[^A-Za-z0-9_-]/gu, "_")}_${turn}`;
     const output = turn === 1
       ? [{
         type: "message",
@@ -254,8 +253,14 @@ try {
     : null;
   const regeneratedToolIds = scenario === "regenerated-tool-ids"
     ? {
-      baseline: summarizeRegeneratedToolIds(oldRun.upstreamRequests),
-      fastrelay: summarizeRegeneratedToolIds(newRun.upstreamRequests)
+      baseline: summarizeRegeneratedToolIds(
+        oldRun.upstreamRequests,
+        oldRun.regeneratedToolIdReplay
+      ),
+      fastrelay: summarizeRegeneratedToolIds(
+        newRun.upstreamRequests,
+        newRun.regeneratedToolIdReplay
+      )
     }
     : null;
   const rawSequenceEqual = sameRawWireSequence(oldRun.upstreamRequests, newRun.upstreamRequests);
@@ -323,6 +328,9 @@ try {
       sequentialFullReplay?.fastrelay?.pass === true,
     regenerated_tool_ids: scenario !== "regenerated-tool-ids" ||
       regeneratedToolIds?.fastrelay?.pass === true,
+    regenerated_tool_local_response_id: scenario !== "regenerated-tool-ids" ||
+      regeneratedToolIds?.fastrelay?.local_response_id_captured === true &&
+      regeneratedToolIds?.fastrelay?.local_response_id_reused_for_replay === true,
     commit_maturity: commitMaturityPass,
     provider_waterline_maturity: providerWaterlineMaturityPass,
     material_tool_tail_maturity: materialToolTailMaturityPass,
@@ -389,6 +397,11 @@ try {
   assert.equal(checks.final_wire, true, "final wire differs outside the explicitly attested caller cache-key correction");
   assert.equal(checks.sequential_full_replay, true, "sequential full replay did not retain a stable byte-level prefix");
   assert.equal(checks.regenerated_tool_ids, true, "regenerated Codex tool ids did not retain the prior wire prefix");
+  assert.equal(
+    checks.regenerated_tool_local_response_id,
+    true,
+    "regenerated-tool fixture did not dynamically capture and reuse the local response id"
+  );
   assert.equal(checks.commit_maturity, true, "commit-maturity behavior violated its bounded policy");
   assert.equal(
     checks.provider_waterline_maturity,
@@ -474,6 +487,16 @@ try {
       report.regenerated_tool_ids?.fastrelay?.no_previous_response_id,
       true,
       "FastRelay regenerated-id full replay must not forward previous_response_id"
+    );
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.local_response_id_captured,
+      true,
+      "FastRelay regenerated-id fixture must parse the first local response id from downstream SSE"
+    );
+    assert.equal(
+      report.regenerated_tool_ids?.fastrelay?.local_response_id_reused_for_replay,
+      true,
+      "FastRelay regenerated-id fixture must use the captured local response id in the second inbound"
     );
   } else if (scenario === "provider-waterline-rollback") {
     assert.equal(
@@ -588,6 +611,10 @@ async function runIsolatedCapture({
       ...process.env,
       ATOAPI_CONFIG_DIR: configDir,
       ATOAPI_ISOLATED_TEST_INSTANCE: "1",
+      // Newer candidates can bypass WebView2 completely for this disposable
+      // proxy-only verifier.  Older baselines ignore the opt-in, so retain it
+      // on both arms to keep the fixture cross-version compatible.
+      ATOAPI_HEADLESS_ISOLATED_TEST: "1",
       ATOAPI_TEST_LISTEN_PORT: String(port),
       ATOAPI_PREFIX_DIAGNOSTICS: "1",
       ATOAPI_AUTOMATIC_CACHE_CANARY: "0"
@@ -623,7 +650,10 @@ async function runIsolatedCapture({
       const responseBody = await response.text();
       assert.equal(response.status, 200, `${label}: local proxy rejected fixture`);
       assert.match(responseBody, /response\.completed/u, `${label}: terminal event missing`);
-      return response.status;
+      return {
+        status: response.status,
+        localResponseId: completedResponseIdFromSse(responseBody)
+      };
     };
     const expectedInbounds = scenario === "lineage-recovery"
       ? 3
@@ -653,14 +683,27 @@ async function runIsolatedCapture({
         })()
         : scenario === "regenerated-tool-ids"
           ? (async () => {
-            const results = [];
-            for (const body of syntheticRegeneratedToolIdBodies(
+            const first = await sendInbound(syntheticRegeneratedToolIdSeedBody(
               model,
               generatedControls,
               sequentialToolOutputChars
-            )) {
-              results.push(await sendInbound(body));
-            }
+            ));
+            assert.ok(
+              first.localResponseId,
+              `${label}: regenerated-id seed did not return a local response id`
+            );
+            const replayBody = syntheticRegeneratedToolIdReplayBody(
+              model,
+              first.localResponseId,
+              generatedControls,
+              sequentialToolOutputChars
+            );
+            const second = await sendInbound(replayBody);
+            const results = [first, second];
+            // This value remains transient: the report keeps only the
+            // boolean, never the response id supplied to the replay.
+            results.localResponseIdReusedForReplay =
+              replayBody.previous_response_id === first.localResponseId;
             return results;
           })()
           : scenario === "provider-waterline-rollback"
@@ -791,6 +834,14 @@ async function runIsolatedCapture({
     const materialToolTailMaturity = scenario === "material-tool-tail-maturity"
       ? summarizeMaterialToolTailMaturity(metrics.recent_requests, expectedInbounds)
       : null;
+    const regeneratedToolIdReplay = scenario === "regenerated-tool-ids"
+      ? {
+        local_response_id_captured: Boolean(downstream[0]?.localResponseId),
+        local_response_id_reused_for_replay:
+          downstream.localResponseIdReusedForReplay === true,
+        replay_response_completed: Boolean(downstream[1]?.localResponseId)
+      }
+      : null;
     return {
       upstreamBody,
       upstreamHeaders,
@@ -800,9 +851,10 @@ async function runIsolatedCapture({
       commitMaturity,
       providerWaterlineMaturity,
       materialToolTailMaturity,
+      regeneratedToolIdReplay,
       samePrefixReachedBeforeHeaders: !gate || gateResult.arrivalsBeforeRelease === concurrency,
       summary: {
-        local_status: downstream[0] ?? null,
+        local_status: downstream[0]?.status ?? null,
         completed_responses: downstream.length,
         concurrency: scenario === "ordinary" ? concurrency : 1,
         fixture_inbounds: expectedInbounds,
@@ -927,6 +979,31 @@ function syntheticRequestBase(model, input, previousResponseId = null, generated
   }
   if (previousResponseId) body.previous_response_id = previousResponseId;
   return body;
+}
+
+function completedResponseIdFromSse(responseBody) {
+  for (const line of String(responseBody ?? "").split(/\r?\n/u)) {
+    if (!line.startsWith("data:")) continue;
+    const payload = line.slice("data:".length).trim();
+    if (!payload || payload === "[DONE]") continue;
+    try {
+      const event = JSON.parse(payload);
+      const responseId = event?.type === "response.completed"
+        ? event?.response?.id
+        : null;
+      if (
+        typeof responseId === "string" &&
+        responseId.length > 0 &&
+        responseId.length <= 512 &&
+        !/[\r\n]/u.test(responseId)
+      ) {
+        return responseId;
+      }
+    } catch {
+      // Only response.completed is relevant to the local lineage fixture.
+    }
+  }
+  return null;
 }
 
 function syntheticOrdinaryBody(model, generatedControls = false) {
@@ -1114,12 +1191,8 @@ function syntheticSequentialFullReplayBodies(
   return bodies;
 }
 
-function syntheticRegeneratedToolIdBodies(
-  model,
-  generatedControls = false,
-  toolOutputChars = 0
-) {
-  const stableHistory = [
+function regeneratedToolIdStableHistory(toolOutputChars = 0) {
+  return [
     {
       type: "message",
       role: "user",
@@ -1151,12 +1224,38 @@ function syntheticRegeneratedToolIdBodies(
         }
     }
   ];
+}
+
+function syntheticRegeneratedToolIdSeedBody(
+  model,
+  generatedControls = false,
+  toolOutputChars = 0
+) {
+  const stableHistory = regeneratedToolIdStableHistory(toolOutputChars);
   const first = syntheticRequestBase(
     model,
     stableHistory.map((item) => structuredClone(item)),
     null,
     generatedControls
   );
+  // The rebind path is intentionally limited to attested Codex lineage.
+  // Model the real client carrier on both turns so the local response id can
+  // be recognized as belonging to the same FullReplay session.  It is
+  // consumed locally and stripped from the final native wire.
+  first.client_metadata = syntheticClientMetadataCarrier("first", 0);
+  return first;
+}
+
+function syntheticRegeneratedToolIdReplayBody(
+  model,
+  localResponseId,
+  generatedControls = false,
+  toolOutputChars = 0
+) {
+  if (typeof localResponseId !== "string" || !localResponseId || /[\r\n]/u.test(localResponseId)) {
+    throw new Error("regenerated tool id replay requires a captured local response id");
+  }
+  const stableHistory = regeneratedToolIdStableHistory(toolOutputChars);
   const replay = stableHistory.map((item) => structuredClone(item));
   // Codex can replay the same settled exchange with a fresh opaque id. The
   // candidate must bind this closed pair back to the exact prior wire before
@@ -1168,8 +1267,14 @@ function syntheticRegeneratedToolIdBodies(
     role: "user",
     content: [{ type: "input_text", text: "regenerated tool id real tail" }]
   });
-  const second = syntheticRequestBase(model, replay, null, generatedControls);
-  return [first, second];
+  // The first response id is local to Atoapi on third-party FullReplay
+  // routes. The candidate must recover the complete replay, remove this
+  // local-only p_r from the final wire, then rebind regenerated tool ids.
+  // This exercises the exact guard that would otherwise leave an equivalent
+  // tool prefix cache-distinct merely because the client included a local p_r.
+  const second = syntheticRequestBase(model, replay, localResponseId, generatedControls);
+  second.client_metadata = syntheticClientMetadataCarrier("first", 1);
+  return second;
 }
 
 function syntheticClientMetadataCarrier(position, turn) {
@@ -1403,7 +1508,7 @@ function summarizeMaterialToolTailMaturity(requests, expectedInbounds) {
   };
 }
 
-function summarizeRegeneratedToolIds(requests) {
+function summarizeRegeneratedToolIds(requests, localReplay = null) {
   if (requests.length !== 2) {
     return {
       pass: false,
@@ -1430,16 +1535,23 @@ function summarizeRegeneratedToolIds(requests) {
   const noPreviousResponseId = requests.every(
     (request) => request.body?.previous_response_id === undefined
   );
+  const localResponseIdCaptured = localReplay?.local_response_id_captured === true;
+  const localResponseIdReusedForReplay =
+    localReplay?.local_response_id_reused_for_replay === true;
   const onePostPerInbound = requests.length === 2;
   return {
     pass: onePostPerInbound && exactPriorPrefix && rawInputAppendOnly &&
-      inputItemsAppendOnly && toolOutputsUnchanged && noPreviousResponseId,
+      inputItemsAppendOnly && toolOutputsUnchanged && noPreviousResponseId &&
+      localResponseIdCaptured && localResponseIdReusedForReplay,
     turns: requests.length,
     exact_prior_prefix: exactPriorPrefix,
     raw_input_append_only: rawInputAppendOnly,
     input_items_append_only: inputItemsAppendOnly,
     tool_outputs_unchanged: toolOutputsUnchanged,
     no_previous_response_id: noPreviousResponseId,
+    local_response_id_captured: localResponseIdCaptured,
+    local_response_id_reused_for_replay: localResponseIdReusedForReplay,
+    replay_response_completed: localReplay?.replay_response_completed === true,
     one_post_per_inbound: onePostPerInbound,
     first_prefix_call_ids: firstInput
       .filter((item) => item?.type === "function_call" || item?.type === "function_call_output")

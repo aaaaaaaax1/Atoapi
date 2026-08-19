@@ -33,9 +33,16 @@ import {
   providersForGraphiteAgent
 } from "./graphite/providerScope";
 
-const APP_VERSION = "v1.4.39";
+// Keep the UI version badge tied to the package that is actually being built.
+// Vite injects this value from package.json, so candidate builds cannot silently
+// retain an old champion version when a new candidate is assembled.
+const APP_VERSION = __ATOAPI_APP_VERSION__;
 type MetricsRefreshPolicy = "visible-1s" | "5s" | "manual";
 type RequestLogEntry = MetricsSnapshot["recent_requests"][number];
+type MetricsSnapshotFetch = {
+  sequence: number;
+  snapshot: MetricsSnapshot;
+};
 const PROVIDER_BALANCE_REFRESH_MS = 15 * 60 * 1000;
 const CACHE_VALIDATION_REFRESH_MS = 5_000;
 const PROVIDER_BALANCE_BATCH_SIZE = 4;
@@ -169,6 +176,9 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
   const balanceProbeInFlightGeneration = useRef(0);
   const balanceProbeScopes = useRef<Record<string, string>>({});
   const startupConnectionProbeScope = useRef("");
+  const metricsRefreshInFlight = useRef<Promise<MetricsSnapshotFetch | null> | null>(null);
+  const metricsRefreshSequence = useRef(0);
+  const metricsAppliedSequence = useRef(0);
   const providerProbeScope = providerProbeScopeSignature(config);
 
   async function refreshAll() {
@@ -176,12 +186,12 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     try {
       const [nextConfig, nextMetrics, nextProxyStatus, nextCacheValidation] = await Promise.all([
         command<AppConfig>("reload_config"),
-        command<MetricsSnapshot>("get_metrics"),
+        loadMetricsSnapshot(),
         command<ProxyStatus>("get_proxy_status"),
         command<CacheValidationStatus>("get_cache_validation_status")
       ]);
       setConfig(nextConfig);
-      setMetrics(nextMetrics);
+      applyMetricsSnapshot(nextMetrics);
       setProxyStatus(nextProxyStatus);
       setCacheValidation((current) =>
         cacheValidationFingerprint(current) === cacheValidationFingerprint(nextCacheValidation)
@@ -198,13 +208,36 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
   }
 
-  async function refreshMetrics() {
-    try {
-      const nextMetrics = await command<MetricsSnapshot>("get_metrics");
-      setMetrics(nextMetrics);
-    } catch {
-      // Keep the last verified snapshot visible when a transient refresh fails.
+  function loadMetricsSnapshot(forceAfterCurrent = false): Promise<MetricsSnapshotFetch | null> {
+    const inFlight = metricsRefreshInFlight.current;
+    if (inFlight) {
+      // A post-mutation caller (for example clear-cache) must not accept a
+      // snapshot that began before the mutation. It waits, then starts one
+      // fresh read; normal 1s polling simply shares the in-flight request.
+      return forceAfterCurrent
+        ? inFlight.then(() => loadMetricsSnapshot(false))
+        : inFlight;
     }
+    const sequence = ++metricsRefreshSequence.current;
+    let task: Promise<MetricsSnapshotFetch | null>;
+    task = command<MetricsSnapshot>("get_metrics")
+      .then((snapshot) => ({ sequence, snapshot }))
+      .catch(() => null)
+      .finally(() => {
+        if (metricsRefreshInFlight.current === task) metricsRefreshInFlight.current = null;
+      });
+    metricsRefreshInFlight.current = task;
+    return task;
+  }
+
+  function applyMetricsSnapshot(result: MetricsSnapshotFetch | null) {
+    if (!result || result.sequence < metricsAppliedSequence.current) return;
+    metricsAppliedSequence.current = result.sequence;
+    setMetrics(result.snapshot);
+  }
+
+  async function refreshMetrics(forceAfterCurrent = false): Promise<void> {
+    applyMetricsSnapshot(await loadMetricsSnapshot(forceAfterCurrent));
   }
 
   async function refreshCacheValidation() {
@@ -993,7 +1026,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
     if (action === "clear-cache") {
       await command("clear_cache");
-      await refreshMetrics();
+      await refreshMetrics(true);
       return { notice: "缓存已清理" };
     }
     return { error: `暂未识别的 Graphite 操作：${action}` };

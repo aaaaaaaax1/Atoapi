@@ -157,11 +157,15 @@ const bridgeSource = String.raw`
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
       stopProviderKeyPoolHealthSync();
+      cancelReleaseChampionRefresh();
     } else if (isOpen("providerOverlay")) {
       startProviderKeyPoolHealthSync();
     }
   });
-  window.addEventListener("pagehide", stopProviderKeyPoolHealthSync, { once: true });
+  window.addEventListener("pagehide", () => {
+    stopProviderKeyPoolHealthSync();
+    cancelReleaseChampionRefresh();
+  }, { once: true });
   const REQUESTS_PER_PAGE = 20;
   const REQUEST_PAGE_LIMIT = 10;
   const DEFAULT_KEY_PRIORITY = 5;
@@ -171,8 +175,14 @@ const bridgeSource = String.raw`
   let lastTrendContextKey = "";
   let latestReleaseChampion = null;
   let latestReleaseChampionError = "";
+  let latestReleaseChampionContextKey = "";
   let lastReleaseChampionContextKey = "";
   let releaseChampionSequence = 0;
+  const RELEASE_CHAMPION_AUTO_REFRESH_MS = 5_000;
+  let releaseChampionRefreshTimer = 0;
+  let releaseChampionRequestInFlight = false;
+  let releaseChampionPendingRefresh = false;
+  let releaseChampionPendingImmediate = false;
   let draggingProviderId = "";
   let keyPointerDrag = null;
   let healthProbeProviderId = "";
@@ -244,7 +254,14 @@ const bridgeSource = String.raw`
       controller.request("context");
     }
     lastTrendContextKey = contextKey;
-    if (overviewVisible) requestReleaseChampion(loadWhenChanged);
+    if (!overviewVisible || !releaseChampionAutoRefreshAllowed()) return;
+    const championContextKey = releaseChampionContext(metricState, scope, agent);
+    const needsImmediateChampionLoad = !hasReleaseChampionResult(championContextKey);
+    if (needsImmediateChampionLoad) {
+      requestReleaseChampion(true);
+    } else if (loadWhenChanged) {
+      scheduleReleaseChampionRefresh();
+    }
   }
 
   function releaseChampionContext(metricState, scope, agent) {
@@ -257,14 +274,43 @@ const bridgeSource = String.raw`
     ].join("|");
   }
 
+  function hasReleaseChampionResult(contextKey) {
+    return contextKey === latestReleaseChampionContextKey &&
+      Boolean(latestReleaseChampion || latestReleaseChampionError);
+  }
+
+  function releaseChampionAutoRefreshAllowed() {
+    return !renderSuspended &&
+      document.visibilityState === "visible" &&
+      !$bridge("#metricsView")?.hidden &&
+      !$bridge("#overviewPanel")?.hidden;
+  }
+
+  function cancelReleaseChampionRefresh() {
+    if (!releaseChampionRefreshTimer) return;
+    window.clearTimeout(releaseChampionRefreshTimer);
+    releaseChampionRefreshTimer = 0;
+  }
+
   function requestReleaseChampion(force = false) {
     const metricState = host.state?.metrics || {};
     const scope = activeRequestScope(metricState);
     const agent = currentAgent();
     const contextKey = releaseChampionContext(metricState, scope, agent);
-    if (!force && contextKey === lastReleaseChampionContextKey && latestReleaseChampion) return;
+    if (!force && hasReleaseChampionResult(contextKey)) return;
+    if (releaseChampionRequestInFlight) {
+      // A changed scope must be read as soon as the older request settles.
+      // Repeated metrics deltas for the same scope deliberately coalesce.
+      if (contextKey !== lastReleaseChampionContextKey) {
+        releaseChampionPendingRefresh = true;
+        releaseChampionPendingImmediate = true;
+      }
+      return;
+    }
+    cancelReleaseChampionRefresh();
     lastReleaseChampionContextKey = contextKey;
     const sequence = ++releaseChampionSequence;
+    releaseChampionRequestInFlight = true;
     send("load-release-champion", {
       sequence,
       contextKey,
@@ -276,6 +322,27 @@ const bridgeSource = String.raw`
         ...exactHistoricalTrendScope(scope)
       }
     });
+  }
+
+  function scheduleReleaseChampionRefresh() {
+    const metricState = host.state?.metrics || {};
+    const scope = activeRequestScope(metricState);
+    const agent = currentAgent();
+    const contextKey = releaseChampionContext(metricState, scope, agent);
+    if (!hasReleaseChampionResult(contextKey)) {
+      requestReleaseChampion(true);
+      return;
+    }
+    if (releaseChampionRequestInFlight) {
+      releaseChampionPendingRefresh = true;
+      return;
+    }
+    if (releaseChampionRefreshTimer || !releaseChampionAutoRefreshAllowed()) return;
+    releaseChampionRefreshTimer = window.setTimeout(() => {
+      releaseChampionRefreshTimer = 0;
+      if (!releaseChampionAutoRefreshAllowed()) return;
+      requestReleaseChampion(true);
+    }, RELEASE_CHAMPION_AUTO_REFRESH_MS);
   }
 
   trendController()?.setExternalLoader((query) => {
@@ -997,10 +1064,12 @@ const bridgeSource = String.raw`
     const contextKey = releaseChampionContext(metricState, scope, agent);
     const title = banner.querySelector("b");
     const details = banner.querySelector("small");
-    const snapshot = contextKey === lastReleaseChampionContextKey ? latestReleaseChampion : null;
+    const hasLoadedCurrentContext = contextKey === latestReleaseChampionContextKey;
+    const snapshot = hasLoadedCurrentContext ? latestReleaseChampion : null;
+    const currentError = hasLoadedCurrentContext ? latestReleaseChampionError : "";
     banner.className = "release-champion-summary is-pending";
     if (!snapshot) {
-      if (title) title.textContent = latestReleaseChampionError || "读取可比版本 cohort…";
+      if (title) title.textContent = currentError || "读取可比版本 cohort…";
       if (details) details.textContent = "同 Provider · Key realm · 模型 · 请求族；历史旧桶不会冒充冠军";
       return;
     }
@@ -1198,6 +1267,7 @@ const bridgeSource = String.raw`
     document.documentElement.classList.toggle("performance-paused", next);
     if (next) {
       stopProviderKeyPoolHealthSync();
+      cancelReleaseChampionRefresh();
       return;
     }
     if (isOpen("providerOverlay")) startProviderKeyPoolHealthSync();
@@ -1246,10 +1316,19 @@ const bridgeSource = String.raw`
       }
       if (message.payload?.releaseChampion) {
         const comparison = message.payload.releaseChampion;
+        releaseChampionRequestInFlight = false;
         if (comparison.sequence === releaseChampionSequence && comparison.contextKey === lastReleaseChampionContextKey) {
           latestReleaseChampion = comparison.data || null;
           latestReleaseChampionError = comparison.error ? String(comparison.error) : "";
+          latestReleaseChampionContextKey = comparison.contextKey;
           applyMetrics(host.state);
+        }
+        if (releaseChampionPendingRefresh) {
+          const refreshImmediately = releaseChampionPendingImmediate;
+          releaseChampionPendingRefresh = false;
+          releaseChampionPendingImmediate = false;
+          if (refreshImmediately && releaseChampionAutoRefreshAllowed()) requestReleaseChampion(true);
+          else scheduleReleaseChampionRefresh();
         }
       }
       if (message.notice) showToast(message.notice);

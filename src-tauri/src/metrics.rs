@@ -18,6 +18,10 @@ const RECENT_USAGE_WINDOW_SECONDS: u64 = 30 * 60;
 // retain a generous hard ceiling without affecting request forwarding or the
 // persisted historical aggregates.
 const RECENT_USAGE_RECORD_LIMIT: usize = 50_000;
+const RECENT_UPSTREAM_CALL_LIMIT: usize = 400;
+const RECENT_REQUEST_LIMIT: usize = 200;
+const RECENT_ERROR_LIMIT: usize = 40;
+const RECENT_ERROR_MESSAGE_MAX_CHARS: usize = 1_024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
@@ -1511,7 +1515,11 @@ impl MetricsStore {
     async fn record_upstream_call(&self, log: RequestLog) {
         if request_log_is_successful_history(&log) {
             let mut inner = self.inner.write().await;
-            push_limited(&mut inner.recent_upstream_calls, log, 400);
+            push_limited(
+                &mut inner.recent_upstream_calls,
+                log,
+                RECENT_UPSTREAM_CALL_LIMIT,
+            );
         }
     }
 
@@ -1630,7 +1638,14 @@ impl MetricsStore {
             inner.repeatable_eligible_hits,
             inner.repeatable_eligible_lookups,
         );
-        let recent_usage = recent_usage_stats(&inner.recent_usage, None);
+        // Build the 30-minute view once. The control plane polls snapshots
+        // frequently, and rescanning the whole bounded recent-usage deque for
+        // every provider made this path grow with both request volume and the
+        // number of configured providers.
+        let RecentUsageBreakdown {
+            overall: recent_usage,
+            by_provider: recent_usage_by_provider,
+        } = recent_usage_breakdown(&inner.recent_usage, Utc::now());
         let provider_cache_request_hit_rate = ratio(
             inner.provider_cache_hit_requests,
             inner.provider_usage_requests,
@@ -1685,7 +1700,7 @@ impl MetricsStore {
             background_prewarm: sorted_background_prewarm(&inner.background_prewarm),
             gap_buckets: sorted_gap_buckets(&inner.gap_buckets),
             request_body_buckets: sorted_request_body_buckets(&inner.request_body_buckets),
-            provider_stats: sorted_provider_stats(&inner.provider_stats, &inner.recent_usage),
+            provider_stats: sorted_provider_stats(&inner.provider_stats, &recent_usage_by_provider),
             agent_provider_stats: sorted_agent_provider_stats(&inner.agent_provider_stats),
             recent_upstream_calls: inner.recent_upstream_calls.iter().cloned().collect(),
             recent_requests: inner.recent_requests.iter().cloned().collect(),
@@ -1794,7 +1809,11 @@ fn commit_metrics_transaction(
             let observation = record_request_inner(inner, request, false, cache_creation_tokens);
             record_upstream_attempts_inner(inner, &projection.provider, upstream_attempts);
             if successful {
-                push_limited(&mut inner.recent_upstream_calls, projection, 400);
+                push_limited(
+                    &mut inner.recent_upstream_calls,
+                    projection,
+                    RECENT_UPSTREAM_CALL_LIMIT,
+                );
             }
             observation
         }
@@ -2003,7 +2022,11 @@ fn finish_agent_inbound_inner(
     let history_observation =
         record_request_inner(inner, projection.clone(), false, cache_creation_tokens);
     if successful {
-        push_limited(&mut inner.recent_upstream_calls, projection, 400);
+        push_limited(
+            &mut inner.recent_upstream_calls,
+            projection,
+            RECENT_UPSTREAM_CALL_LIMIT,
+        );
     }
     push_limited(
         &mut inner.recent_agent_inbound_outcomes,
@@ -2194,10 +2217,23 @@ fn record_error_inner(inner: &mut MetricsInner, scope: &str, message: &str, at: 
         ErrorLog {
             at,
             scope: scope.to_string(),
-            message: message.to_string(),
+            message: bounded_error_message(message),
         },
-        40,
+        RECENT_ERROR_LIMIT,
     );
+}
+
+fn bounded_error_message(message: &str) -> String {
+    let mut chars = message.chars();
+    let bounded = chars
+        .by_ref()
+        .take(RECENT_ERROR_MESSAGE_MAX_CHARS)
+        .collect::<String>();
+    if chars.next().is_some() {
+        format!("{bounded}...truncated")
+    } else {
+        bounded
+    }
 }
 
 fn record_request_inner(
@@ -2256,9 +2292,9 @@ fn record_request_inner(
     upsert_provider_traffic(&mut inner.provider_stats, &log, upstream, count_cold_start);
     upsert_agent_provider_traffic(&mut inner.agent_provider_stats, &log);
     if request_log_is_successful_history(&log) {
-        push_limited(&mut inner.recent_requests, log, 200);
+        push_limited(&mut inner.recent_requests, log, RECENT_REQUEST_LIMIT);
     } else {
-        push_limited(&mut inner.recent_failed_requests, log, 200);
+        push_limited(&mut inner.recent_failed_requests, log, RECENT_REQUEST_LIMIT);
     }
     history_observation
 }
@@ -2343,7 +2379,7 @@ fn request_log_is_confirmed_compaction(log: &RequestLog) -> bool {
 }
 
 impl ProviderTrafficAccumulator {
-    fn snapshot(&self, recent_usage: &VecDeque<TimedUsageRecord>) -> ProviderTrafficStats {
+    fn snapshot(&self, recent_usage: RecentUsageStats) -> ProviderTrafficStats {
         let eligible = self.cache_hits + self.cache_misses;
         ProviderTrafficStats {
             provider: self.provider.clone(),
@@ -2363,7 +2399,7 @@ impl ProviderTrafficAccumulator {
             ttft_p95_ms: percentile(&self.ttft_samples, 0.95),
             total_p95_ms: percentile(&self.total_samples, 0.95),
             cache_hit_rate: ratio(self.cache_hits, eligible),
-            recent_usage: recent_usage_stats(recent_usage, Some(&self.provider)),
+            recent_usage,
             gap_buckets: sorted_gap_buckets(&self.gap_buckets),
             request_body_buckets: sorted_request_body_buckets(&self.request_body_buckets),
         }
@@ -2679,11 +2715,18 @@ fn record_upstream_attempts_inner(inner: &mut MetricsInner, provider: &str, atte
 
 fn sorted_provider_stats(
     groups: &[ProviderTrafficAccumulator],
-    recent_usage: &VecDeque<TimedUsageRecord>,
+    recent_usage_by_provider: &HashMap<&str, RecentUsageStats>,
 ) -> Vec<ProviderTrafficStats> {
     let mut stats = groups
         .iter()
-        .map(|group| group.snapshot(recent_usage))
+        .map(|group| {
+            group.snapshot(
+                recent_usage_by_provider
+                    .get(group.provider.as_str())
+                    .cloned()
+                    .unwrap_or_else(empty_recent_usage_stats),
+            )
+        })
         .collect::<Vec<_>>();
     stats.sort_by(|left, right| {
         right
@@ -2898,38 +2941,67 @@ fn trim_recent_usage_to_capacity(items: &mut VecDeque<TimedUsageRecord>, limit: 
     }
 }
 
-fn recent_usage_stats(
-    items: &VecDeque<TimedUsageRecord>,
-    provider: Option<&str>,
-) -> RecentUsageStats {
-    let cutoff = Utc::now() - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES);
-    let mut stats = RecentUsageStats {
+struct RecentUsageBreakdown<'a> {
+    overall: RecentUsageStats,
+    by_provider: HashMap<&'a str, RecentUsageStats>,
+}
+
+fn empty_recent_usage_stats() -> RecentUsageStats {
+    RecentUsageStats {
         window_seconds: RECENT_USAGE_WINDOW_SECONDS,
         ..RecentUsageStats::default()
-    };
+    }
+}
 
-    for item in items.iter().filter(|item| item.at >= cutoff) {
-        if provider.is_some_and(|provider| provider != item.record.provider) {
+fn recent_usage_breakdown<'a>(
+    items: &'a VecDeque<TimedUsageRecord>,
+    now: DateTime<Utc>,
+) -> RecentUsageBreakdown<'a> {
+    let cutoff = now - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES);
+    let mut overall = empty_recent_usage_stats();
+    let mut by_provider = HashMap::new();
+
+    for item in items {
+        if item.at < cutoff {
             continue;
         }
-        stats.requests += 1;
-        if item.record.cache_read_tokens > 0 {
-            stats.cache_hit_requests += 1;
-        }
-        stats.input_tokens += item.record.input_tokens;
-        stats.output_tokens += item.record.output_tokens;
-        stats.cache_read_tokens += item.record.cache_read_tokens;
-        stats.cache_creation_tokens += item.record.cache_creation_tokens;
-        if item.cold_start_counted {
-            stats.cold_start_requests += 1;
-            stats.cold_start_input_tokens += item.record.input_tokens;
-            stats.cold_start_output_tokens += item.record.output_tokens;
-            stats.cold_start_total_tokens += item.record.input_tokens + item.record.output_tokens;
-        }
+        add_recent_usage_record(&mut overall, item);
+        let provider = by_provider
+            .entry(item.record.provider.as_str())
+            .or_insert_with(empty_recent_usage_stats);
+        add_recent_usage_record(provider, item);
     }
+    finalize_recent_usage_stats(&mut overall);
+    for stats in by_provider.values_mut() {
+        finalize_recent_usage_stats(stats);
+    }
+
+    RecentUsageBreakdown {
+        overall,
+        by_provider,
+    }
+}
+
+fn add_recent_usage_record(stats: &mut RecentUsageStats, item: &TimedUsageRecord) {
+    stats.requests += 1;
+    if item.record.cache_read_tokens > 0 {
+        stats.cache_hit_requests += 1;
+    }
+    stats.input_tokens += item.record.input_tokens;
+    stats.output_tokens += item.record.output_tokens;
+    stats.cache_read_tokens += item.record.cache_read_tokens;
+    stats.cache_creation_tokens += item.record.cache_creation_tokens;
+    if item.cold_start_counted {
+        stats.cold_start_requests += 1;
+        stats.cold_start_input_tokens += item.record.input_tokens;
+        stats.cold_start_output_tokens += item.record.output_tokens;
+        stats.cold_start_total_tokens += item.record.input_tokens + item.record.output_tokens;
+    }
+}
+
+fn finalize_recent_usage_stats(stats: &mut RecentUsageStats) {
     stats.cache_token_ratio = ratio(stats.cache_read_tokens, stats.input_tokens);
     stats.cache_request_hit_rate = ratio(stats.cache_hit_requests, stats.requests);
-    stats
 }
 
 fn provider_usage_is_cold_start(record: &UsageRecord) -> bool {
@@ -3189,6 +3261,87 @@ mod tests {
             records.back().map(|record| record.record.model.as_str()),
             Some("model-1")
         );
+    }
+
+    #[test]
+    fn error_diagnostics_keep_a_bounded_window_and_message_size() {
+        let mut errors = VecDeque::new();
+        for index in 0..=RECENT_ERROR_LIMIT {
+            push_limited(&mut errors, index, RECENT_ERROR_LIMIT);
+        }
+        assert_eq!(errors.len(), RECENT_ERROR_LIMIT);
+        assert_eq!(errors.front(), Some(&RECENT_ERROR_LIMIT));
+
+        let message = "x".repeat(RECENT_ERROR_MESSAGE_MAX_CHARS + 32);
+        let bounded = bounded_error_message(&message);
+        assert!(bounded.ends_with("...truncated"));
+        assert_eq!(
+            bounded.chars().count(),
+            RECENT_ERROR_MESSAGE_MAX_CHARS + "...truncated".chars().count()
+        );
+    }
+
+    #[test]
+    fn recent_usage_breakdown_preserves_global_and_provider_totals() {
+        let now = Utc::now();
+        let mut records = VecDeque::new();
+        for (at, provider, input_tokens, cache_read_tokens, cold_start_counted) in [
+            (now - Duration::minutes(1), "provider-a", 100, 50, true),
+            (now - Duration::minutes(2), "provider-a", 200, 0, false),
+            (now - Duration::minutes(3), "provider-b", 100, 100, true),
+            (
+                now - Duration::minutes(RECENT_USAGE_WINDOW_MINUTES + 1),
+                "provider-b",
+                999,
+                999,
+                true,
+            ),
+        ] {
+            records.push_back(TimedUsageRecord {
+                at,
+                record: UsageRecord {
+                    provider: provider.to_string(),
+                    model: "model".to_string(),
+                    input_tokens,
+                    output_tokens: 10,
+                    cache_read_tokens,
+                    cache_creation_tokens: 1,
+                },
+                cold_start_counted,
+            });
+        }
+
+        let breakdown = recent_usage_breakdown(&records, now);
+        assert_eq!(
+            breakdown.overall.window_seconds,
+            RECENT_USAGE_WINDOW_SECONDS
+        );
+        assert_eq!(breakdown.overall.requests, 3);
+        assert_eq!(breakdown.overall.cache_hit_requests, 2);
+        assert_eq!(breakdown.overall.input_tokens, 400);
+        assert_eq!(breakdown.overall.cache_read_tokens, 150);
+        assert_eq!(breakdown.overall.cold_start_requests, 2);
+        assert_eq!(breakdown.overall.cache_token_ratio, 0.375);
+        assert_eq!(breakdown.overall.cache_request_hit_rate, 2.0 / 3.0);
+
+        let provider_a = breakdown
+            .by_provider
+            .get("provider-a")
+            .expect("provider-a must retain its 30-minute aggregate");
+        assert_eq!(provider_a.requests, 2);
+        assert_eq!(provider_a.cache_hit_requests, 1);
+        assert_eq!(provider_a.input_tokens, 300);
+        assert_eq!(provider_a.cache_read_tokens, 50);
+        assert_eq!(provider_a.cold_start_requests, 1);
+
+        let provider_b = breakdown
+            .by_provider
+            .get("provider-b")
+            .expect("expired usage must not replace the live provider aggregate");
+        assert_eq!(provider_b.requests, 1);
+        assert_eq!(provider_b.input_tokens, 100);
+        assert_eq!(provider_b.cache_read_tokens, 100);
+        assert_eq!(provider_b.cold_start_requests, 1);
     }
 
     #[test]

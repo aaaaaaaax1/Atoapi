@@ -23,7 +23,9 @@ enum PendingMaturityKind {
     MaterialToolTail,
     ExactMediumToolTail,
     ProviderWaterlineRollback,
+    LateShallowProviderWaterlineRollback,
     ExactPendingTailLag,
+    ExactLargeMessageTailLag,
     ToolCallOnlyExactPendingTailLag,
     ExactLargeLowNoiseMixedTailLag,
 }
@@ -46,10 +48,18 @@ impl PendingMaturityKind {
             // A proven upstream waterline rollback gets one direct successor.
             // Persistent provider loss must fail open after that one window.
             Self::ProviderWaterlineRollback => 1,
+            // A very shallow, otherwise high-hit rollback can materialise on
+            // the user's next quiet turn rather than within the immediate
+            // 500ms follow-up window. Keep it to one exact child.
+            Self::LateShallowProviderWaterlineRollback => 1,
             // An exact final-scope receipt can prove that a small portion of
             // the immediately preceding sent prefix has not yet materialised.
             // It is never a new waterline: only its one direct child may wait.
             Self::ExactPendingTailLag => 1,
+            // A bounded, message-only dynamic tail can still leave a proven
+            // indexing residue. Its quiet exact successor receives the same
+            // one-shot opportunity; material and noisy tails remain immediate.
+            Self::ExactLargeMessageTailLag => 1,
             // A tool-call-only parent is a separate, one-shot proof. Tool
             // output remains a hard semantic boundary and never uses it.
             Self::ToolCallOnlyExactPendingTailLag => 1,
@@ -73,7 +83,15 @@ impl PendingMaturityKind {
             Self::MaterialToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ExactMediumToolTail => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ProviderWaterlineRollback => now + WARM_PENDING_FOLLOWUP_WAIT,
+            // Unlike the historical generic rollback path, this narrowly
+            // proven shape stays eligible until its short TTL. The child still
+            // spends at most the caller's existing 500ms foreground budget.
+            Self::LateShallowProviderWaterlineRollback => expires_at,
             Self::ExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
+            // The observed dynamic residual can survive normal multi-second
+            // turn pacing. Keep only its one exact child eligible until the
+            // short-lived entry expires; that child's wait is still 500ms max.
+            Self::ExactLargeMessageTailLag => expires_at,
             Self::ToolCallOnlyExactPendingTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
             Self::ExactLargeLowNoiseMixedTailLag => now + WARM_PENDING_FOLLOWUP_WAIT,
         }
@@ -85,7 +103,11 @@ impl PendingMaturityKind {
             Self::MaterialToolTail => "responses_material_tool_tail_maturity_pending",
             Self::ExactMediumToolTail => "responses_exact_medium_tool_tail_maturity_pending",
             Self::ProviderWaterlineRollback => "responses_provider_waterline_rollback_pending",
+            Self::LateShallowProviderWaterlineRollback => {
+                "responses_late_shallow_provider_waterline_rollback_pending"
+            }
             Self::ExactPendingTailLag => "responses_exact_pending_tail_lag",
+            Self::ExactLargeMessageTailLag => "responses_exact_large_message_tail_lag",
             Self::ToolCallOnlyExactPendingTailLag => "responses_tool_call_exact_pending_tail_lag",
             Self::ExactLargeLowNoiseMixedTailLag => {
                 "responses_exact_large_low_noise_mixed_tail_lag"
@@ -146,6 +168,14 @@ impl WarmPendingClaim {
         self.kind.wait_reason()
     }
 
+    /// A local FullReplay rebind can already prove that the exact predecessor
+    /// was reconciled.  The caller may use this narrow label to suppress only
+    /// the duplicate foreground wait for a normal material tool-tail claim;
+    /// the claim itself is still retained for terminal settlement.
+    pub(super) fn is_material_tool_tail(&self) -> bool {
+        matches!(self.kind, PendingMaturityKind::MaterialToolTail)
+    }
+
     /// A proven provider rollback belongs to the exact predecessor, but a
     /// large or noisy direct child still has its own real new tail. Do not add
     /// latency to that child merely to chase a prior cache waterline.
@@ -160,14 +190,26 @@ impl WarmPendingClaim {
             | PendingMaturityKind::ProviderWaterlineRollback => {
                 !compaction_requested && direct_followup_is_settle_safe(tail)
             }
+            PendingMaturityKind::LateShallowProviderWaterlineRollback => {
+                !compaction_requested && exact_large_message_followup_is_settle_safe(tail)
+            }
             PendingMaturityKind::ExactPendingTailLag
             | PendingMaturityKind::ToolCallOnlyExactPendingTailLag => {
                 !compaction_requested && exact_pending_followup_is_settle_safe(tail)
             }
+            PendingMaturityKind::ExactLargeMessageTailLag => {
+                !compaction_requested && exact_large_message_followup_is_settle_safe(tail)
+            }
             PendingMaturityKind::ExactLargeLowNoiseMixedTailLag => {
                 !compaction_requested && exact_large_low_noise_followup_is_settle_safe(tail)
             }
-            PendingMaturityKind::GiantColdRoot => true,
+            // A giant cold root may still benefit from a short quiet-message
+            // settle, but a tool-bearing or large dynamic child is real new
+            // context. Waiting on that child only adds foreground latency and
+            // cannot make its new tail cacheable, so it must fail open.
+            PendingMaturityKind::GiantColdRoot => {
+                !compaction_requested && giant_cold_followup_is_settle_safe(tail)
+            }
         }
     }
 }
@@ -201,6 +243,7 @@ impl WarmPendingRegistry {
         })
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn settle(
         &mut self,
@@ -213,6 +256,38 @@ impl WarmPendingRegistry {
         tail: &TailInputDiagnostics,
         upstream_succeeded: bool,
         confirmed_compaction: bool,
+    ) {
+        self.settle_with_late_shallow_provider_waterline_rollback(
+            claim,
+            prefix_control_key,
+            scope_digest,
+            final_scope,
+            committed_head,
+            raw_usage,
+            tail,
+            upstream_succeeded,
+            confirmed_compaction,
+            false,
+        );
+    }
+
+    /// The late shallow rollback path is a disposable, isolated A/B
+    /// treatment.  Keeping the gate at the terminal arm point prevents a
+    /// candidate binary launched without its experiment flag from silently
+    /// extending the normal provider-rollback window.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn settle_with_late_shallow_provider_waterline_rollback(
+        &mut self,
+        claim: Option<&WarmPendingClaim>,
+        prefix_control_key: Option<&str>,
+        scope_digest: Option<&str>,
+        final_scope: Option<&FinalScopeWaterlineLog>,
+        committed_head: Option<&WaterlineControlHead>,
+        raw_usage: Option<&UsageRecord>,
+        tail: &TailInputDiagnostics,
+        upstream_succeeded: bool,
+        confirmed_compaction: bool,
+        late_shallow_provider_waterline_rollback_enabled: bool,
     ) {
         self.purge_expired();
         let Some(prefix_control_key) = prefix_control_key else {
@@ -257,7 +332,12 @@ impl WarmPendingRegistry {
             return;
         };
 
-        let Some(maturity) = pending_maturity(raw_usage, tail, final_scope) else {
+        let Some(maturity) = pending_maturity(
+            raw_usage,
+            tail,
+            final_scope,
+            late_shallow_provider_waterline_rollback_enabled,
+        ) else {
             return;
         };
         // Exact pending tail lag is deliberately a single direct-child
@@ -268,6 +348,8 @@ impl WarmPendingRegistry {
             matches!(
                 claim.kind,
                 PendingMaturityKind::ExactPendingTailLag
+                    | PendingMaturityKind::LateShallowProviderWaterlineRollback
+                    | PendingMaturityKind::ExactLargeMessageTailLag
                     | PendingMaturityKind::ToolCallOnlyExactPendingTailLag
                     | PendingMaturityKind::ExactLargeLowNoiseMixedTailLag
             )
@@ -401,6 +483,7 @@ fn pending_maturity(
     raw_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
     final_scope: &FinalScopeWaterlineLog,
+    late_shallow_provider_waterline_rollback_enabled: bool,
 ) -> Option<PendingMaturity> {
     if giant_cold_read(raw_usage) {
         Some(PendingMaturity {
@@ -414,6 +497,12 @@ fn pending_maturity(
         Some(PendingMaturity {
             kind: PendingMaturityKind::ExactMediumToolTail,
         })
+    } else if late_shallow_provider_waterline_rollback_enabled
+        && late_shallow_provider_waterline_rollback(raw_usage, tail, final_scope)
+    {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::LateShallowProviderWaterlineRollback,
+        })
     } else if provider_waterline_rollback(raw_usage, final_scope) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::ProviderWaterlineRollback,
@@ -421,6 +510,10 @@ fn pending_maturity(
     } else if exact_pending_tail_lag(raw_usage, tail, final_scope) {
         Some(PendingMaturity {
             kind: PendingMaturityKind::ExactPendingTailLag,
+        })
+    } else if exact_large_message_tail_lag(raw_usage, tail, final_scope) {
+        Some(PendingMaturity {
+            kind: PendingMaturityKind::ExactLargeMessageTailLag,
         })
     } else if tool_call_only_exact_pending_tail_lag(raw_usage, tail, final_scope) {
         Some(PendingMaturity {
@@ -453,6 +546,60 @@ fn provider_waterline_rollback(
         && !final_scope.continuity_reset
         && final_scope.rollback_tokens_128 >= 128
         && final_scope.raw_cache_read_tokens == record.cache_read_tokens
+}
+
+/// A small exact provider rollback may remain pending across a real user turn.
+/// This is intentionally a strict subset of `provider_waterline_rollback`:
+/// only a >=98%-warm, 32KiB+ message-only parent with a 128-1,024-token
+/// rollback may keep its one quiet child eligible through the short TTL.
+///
+/// The older rollback policy remains unchanged for immediate children and for
+/// every broader or noisier shape.
+fn late_shallow_provider_waterline_rollback(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MIN_INPUT_AND_CACHE_TOKENS: u64 = 32_000;
+    const MIN_CACHE_COVERAGE_PERCENT: u64 = 98;
+    const MIN_ROLLBACK_TOKENS_128: u64 = 128;
+    const MAX_ROLLBACK_TOKENS_128: u64 = 1_024;
+    const MAX_PARENT_INPUT_ITEMS: u64 = 6;
+    const MAX_PARENT_MESSAGE_CHARS: u64 = 512;
+
+    let Some(record) = raw_usage else {
+        return false;
+    };
+    let quiet_message_parent = tail.input_items <= MAX_PARENT_INPUT_ITEMS
+        && (1..=MAX_PARENT_MESSAGE_CHARS).contains(&tail.message_chars)
+        && tail.tool_call_chars == 0
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && tail.source.as_deref() == Some("message");
+
+    record.input_tokens >= MIN_INPUT_AND_CACHE_TOKENS
+        && record.cache_read_tokens >= MIN_INPUT_AND_CACHE_TOKENS
+        && record.cache_read_tokens.saturating_mul(100)
+            >= record
+                .input_tokens
+                .saturating_mul(MIN_CACHE_COVERAGE_PERCENT)
+        && final_scope.outcome == "settled"
+        && final_scope.sent_prediction_eligible
+        && final_scope.predecessor_exact
+        && final_scope.predecessor_bound
+        && !final_scope.continuity_reset
+        && (MIN_ROLLBACK_TOKENS_128..=MAX_ROLLBACK_TOKENS_128)
+            .contains(&final_scope.rollback_tokens_128)
+        && final_scope.raw_cache_read_tokens == record.cache_read_tokens
+        && quiet_message_parent
 }
 
 /// A small residual between an exact predecessor's sent prefix and the raw
@@ -537,6 +684,85 @@ fn exact_pending_parent_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
     tail.input_items <= MAX_INPUT_ITEMS && tail.message_chars <= MAX_MESSAGE_CHARS && !tool_bearing
 }
 
+/// A natural dynamic text tail is real input on its own request, but a tiny
+/// exact final-scope residual can still mean the upstream has not finished
+/// indexing the sent prefix. Keep this deliberately narrower than the small
+/// message path: a single, quiet 16-48 KiB message-only tail, at least 97.8%
+/// parent cache coverage, a tiny exact residual, and one very small direct successor
+/// only.
+///
+/// This is a latency-only opportunity. It neither rewrites the request nor
+/// advances any cache waterline, and tool/noisy/oversized histories remain on
+/// the immediate-send path.
+fn exact_large_message_tail_lag(
+    raw_usage: Option<&UsageRecord>,
+    tail: &TailInputDiagnostics,
+    final_scope: &FinalScopeWaterlineLog,
+) -> bool {
+    const MIN_INPUT_TOKENS: u64 = 262_144;
+    const MIN_MESSAGE_CHARS: u64 = 16_384;
+    const MAX_MESSAGE_CHARS: u64 = 49_152;
+    const REQUIRED_INPUT_ITEMS: u64 = 2;
+    // The observed exact parent was 274,176 / 280,136 = 97.8725% warm. Keep
+    // the gate immediately below that evidence point rather than broadly
+    // lowering it to 97%; all other exact-lineage and one-child bounds remain.
+    const CACHE_COVERAGE_BPS_SCALE: u64 = 10_000;
+    const MIN_CACHE_COVERAGE_BPS: u64 = 9_780;
+    const MAX_PENDING_TOKENS_128: u64 = 1_024;
+    const MAX_SENT_SETTLED_SPAN_TOKENS_128: u64 = 6_400;
+    const MAX_SETTLED_RAW_SLIP_TOKENS_128: u64 = 128;
+
+    let Some(record) = raw_usage else {
+        return false;
+    };
+    let tool_bearing = tail.tool_call_chars > 0
+        || tail.tool_output_chars > 0
+        || tail.largest_tool_output_chars > 0
+        || tail.tool_output_lines > 0
+        || tail.tool_output_repeated_line_chars > 0
+        || tail.tool_output_timestamp_like_count > 0
+        || tail.tool_output_path_like_count > 0
+        || tail.tool_output_url_like_count > 0
+        || tail.tool_output_hash_like_count > 0
+        || tail.tool_output_json_like_chars > 0
+        || tail.tool_output_noise_hint.is_some();
+
+    exact_pending_tail_lag_evidence(raw_usage, final_scope)
+        && record.input_tokens >= MIN_INPUT_TOKENS
+        && (128..=MAX_PENDING_TOKENS_128).contains(&final_scope.candidate_avoidable_tokens_128)
+        && record.cache_read_tokens
+            >= record.input_tokens.saturating_mul(MIN_CACHE_COVERAGE_BPS) / CACHE_COVERAGE_BPS_SCALE
+        && final_scope
+            .sent_prefix_bucket_tokens_128
+            .saturating_sub(final_scope.settled_prefix_bucket_tokens_128)
+            <= MAX_SENT_SETTLED_SPAN_TOKENS_128
+        && final_scope
+            .settled_prefix_bucket_tokens_128
+            .saturating_sub(final_scope.raw_cache_read_tokens)
+            <= MAX_SETTLED_RAW_SLIP_TOKENS_128
+        && tail.input_items == REQUIRED_INPUT_ITEMS
+        && (MIN_MESSAGE_CHARS..=MAX_MESSAGE_CHARS).contains(&tail.message_chars)
+        && !tool_bearing
+        && tail.source.as_deref() == Some("message")
+}
+
+fn exact_large_message_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    tail.input_items == 1
+        && (1..=256).contains(&tail.message_chars)
+        && tail.tool_call_chars == 0
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && tail.source.as_deref() == Some("message")
+}
+
 /// A model-produced tool call can be stable semantic history before any tool
 /// result exists. Admit only that narrow shape; an output, output noise, or a
 /// mixed message tail belongs to a different boundary and must send
@@ -574,6 +800,41 @@ fn direct_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
         && tail.tool_output_chars < 8_000
         && tail.largest_tool_output_chars < 8_000
         && tail.tool_output_noise_hint.is_none()
+}
+
+/// A giant cold root can still use the historical bounded settle for a small,
+/// quiet user-message successor. Tool calls/results, large message tails, and
+/// noisy metadata are genuine new context and should be dispatched immediately
+/// instead of inheriting the cold-root wait.
+fn giant_cold_followup_is_settle_safe(tail: &TailInputDiagnostics) -> bool {
+    let empty_probe = tail.input_items == 0
+        && tail.message_chars == 0
+        && tail.tool_call_chars == 0
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none();
+    let quiet_message = tail.input_items <= 10
+        && (1..=1_024).contains(&tail.message_chars)
+        && tail.tool_call_chars == 0
+        && tail.tool_output_chars == 0
+        && tail.largest_tool_output_chars == 0
+        && tail.tool_output_lines == 0
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 0
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.is_none()
+        && tail.source.as_deref() == Some("message");
+    empty_probe || quiet_message
 }
 
 /// The exact residual gate is intentionally stricter than the generic
@@ -684,10 +945,14 @@ fn material_tool_tail_has_exact_predecessor(
 
 /// A 4-8 KiB tool result is real context on its own request, so it must not
 /// be folded into the broad material-tail policy.  The final-scope ledger can
-/// nevertheless prove a small, already-sent residual on the exact same
-/// predecessor.  In that narrow case, allow one quiet direct child to wait
-/// for at most the existing 500ms cap.  This never rewrites either request or
-/// adds another upstream dispatch.
+/// nevertheless prove an already-sent residual on the exact same predecessor.
+///
+/// The normal branch remains deliberately tiny. A bounded r4-like residual is
+/// only admitted for one narrowly observed aggregate shape: one hash marker,
+/// no path/URL/timestamp/JSON/repetition noise, a >=95% parent cache read,
+/// and at most one 128-token local-waterline slip. This gives its one quiet
+/// direct child the existing 500ms window; it never rewrites either request
+/// or adds another upstream dispatch.
 fn exact_medium_tool_tail_has_pending_residual(
     raw_usage: Option<&UsageRecord>,
     tail: &TailInputDiagnostics,
@@ -696,6 +961,10 @@ fn exact_medium_tool_tail_has_pending_residual(
     const MIN_TOOL_OUTPUT_CHARS: u64 = 4_096;
     const MAX_TOOL_OUTPUT_CHARS: u64 = 8_191;
     const MAX_PENDING_TOKENS_128: u64 = 1_024;
+    const MIN_HASH_TAGGED_PENDING_TOKENS_128: u64 = 2_048;
+    const MAX_HASH_TAGGED_PENDING_TOKENS_128: u64 = 12_288;
+    const MAX_HASH_TAGGED_SENT_SETTLED_SPAN_TOKENS_128: u64 = 12_288;
+    const MAX_HASH_TAGGED_SETTLED_RAW_SLIP_TOKENS_128: u64 = 512;
 
     let Some(record) = raw_usage else {
         return false;
@@ -705,7 +974,7 @@ fn exact_medium_tool_tail_has_pending_residual(
         tail.source.as_deref(),
         Some("tool_output") | Some("mixed") | Some("tool_call")
     );
-    record.input_tokens >= 16_384
+    let exact_pending_residual = record.input_tokens >= 16_384
         && tail.input_items > 0
         && tool_or_mixed
         && (MIN_TOOL_OUTPUT_CHARS..=MAX_TOOL_OUTPUT_CHARS).contains(&tool_output_chars)
@@ -716,8 +985,43 @@ fn exact_medium_tool_tail_has_pending_residual(
         && !final_scope.continuity_reset
         && final_scope.rollback_tokens_128 == 0
         && final_scope.raw_cache_read_tokens == record.cache_read_tokens
-        && final_scope.sent_prefix_bucket_tokens_128 > final_scope.settled_prefix_bucket_tokens_128
-        && (128..=MAX_PENDING_TOKENS_128).contains(&final_scope.candidate_avoidable_tokens_128)
+        && final_scope.sent_prefix_bucket_tokens_128 > final_scope.settled_prefix_bucket_tokens_128;
+
+    if !exact_pending_residual {
+        return false;
+    }
+
+    let pending_tokens = final_scope.candidate_avoidable_tokens_128;
+    if (128..=MAX_PENDING_TOKENS_128).contains(&pending_tokens) {
+        return true;
+    }
+
+    // This extension intentionally matches only the r4-like aggregate tail
+    // shape. A single hash marker is commonly a bounded tool correlation id;
+    // any other noise class (or a second marker) remains immediate-send.
+    (MIN_HASH_TAGGED_PENDING_TOKENS_128..=MAX_HASH_TAGGED_PENDING_TOKENS_128)
+        .contains(&pending_tokens)
+        && record.cache_read_tokens >= record.input_tokens.saturating_mul(95) / 100
+        && final_scope
+            .sent_prefix_bucket_tokens_128
+            .saturating_sub(final_scope.settled_prefix_bucket_tokens_128)
+            <= MAX_HASH_TAGGED_SENT_SETTLED_SPAN_TOKENS_128
+        && final_scope
+            .settled_prefix_bucket_tokens_128
+            .saturating_sub(final_scope.raw_cache_read_tokens)
+            <= MAX_HASH_TAGGED_SETTLED_RAW_SLIP_TOKENS_128
+        && tail.input_items <= 4
+        && tail.message_chars <= 256
+        && tail.tool_call_chars <= 64
+        && tool_output_chars <= 6_144
+        && tail.tool_output_lines <= 64
+        && tail.tool_output_repeated_line_chars == 0
+        && tail.tool_output_timestamp_like_count == 0
+        && tail.tool_output_path_like_count == 0
+        && tail.tool_output_url_like_count == 0
+        && tail.tool_output_hash_like_count == 1
+        && tail.tool_output_json_like_chars == 0
+        && tail.tool_output_noise_hint.as_deref() == Some("hash_like")
 }
 
 #[cfg(test)]
@@ -827,6 +1131,24 @@ mod tests {
         }
     }
 
+    fn quiet_message_parent() -> TailInputDiagnostics {
+        TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 39,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        }
+    }
+
+    fn quiet_message_child() -> TailInputDiagnostics {
+        TailInputDiagnostics {
+            input_items: 1,
+            message_chars: 39,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        }
+    }
+
     #[test]
     fn root_cold_read_allows_only_three_direct_exact_children() {
         let mut registry = WarmPendingRegistry::default();
@@ -881,6 +1203,58 @@ mod tests {
                 .is_none(),
             "the controller must stop after its bounded three successors"
         );
+    }
+
+    #[test]
+    fn giant_cold_root_does_not_wait_on_a_real_tool_tail() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&root_log(scope)),
+            Some(&root),
+            Some(&cold()),
+            &TailInputDiagnostics::default(),
+            true,
+            false,
+        );
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("the giant cold root must still produce a bounded claim");
+
+        assert!(
+            !claim.followup_is_settle_safe(&material_tool_tail(), false),
+            "a real tool tail must dispatch immediately instead of inheriting the cold-root wait"
+        );
+    }
+
+    #[test]
+    fn giant_cold_root_keeps_wait_for_a_quiet_message_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&root_log(scope)),
+            Some(&root),
+            Some(&cold()),
+            &TailInputDiagnostics::default(),
+            true,
+            false,
+        );
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("the giant cold root must still produce a bounded claim");
+
+        assert!(claim.followup_is_settle_safe(&quiet_message_child(), false));
+        assert!(!claim.followup_is_settle_safe(&quiet_message_child(), true));
     }
 
     #[test]
@@ -1132,6 +1506,130 @@ mod tests {
     }
 
     #[test]
+    fn exact_medium_hash_tagged_high_hit_tail_with_large_residual_arms_once() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        // Aggregate-only reproduction of the r4 tail: one bounded correlation
+        // hash, no other noise class, and a high-hit exact final-scope receipt.
+        let hash_tagged_tail = TailInputDiagnostics {
+            input_items: 3,
+            message_chars: 50,
+            tool_call_chars: 22,
+            tool_output_chars: 6_144,
+            largest_tool_output_chars: 6_144,
+            tool_output_lines: 39,
+            tool_output_hash_like_count: 1,
+            tool_output_noise_hint: Some("hash_like".to_string()),
+            source: Some("mixed".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let high_hit = UsageRecord {
+            input_tokens: 366_607,
+            cache_read_tokens: 353_792,
+            ..UsageRecord::default()
+        };
+        let final_scope = FinalScopeWaterlineLog {
+            raw_cache_read_tokens: high_hit.cache_read_tokens,
+            candidate_avoidable_tokens_128: 11_648,
+            sent_prefix_bucket_tokens_128: 366_592,
+            settled_prefix_bucket_tokens_128: 354_304,
+            ..exact_log(scope)
+        };
+
+        assert!(exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &hash_tagged_tail,
+            &final_scope,
+        ));
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&root),
+            Some(&high_hit),
+            &hash_tagged_tail,
+            true,
+            false,
+        );
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root))
+            .expect("the bounded hash-tagged medium tail gets one direct child only");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_exact_medium_tool_tail_maturity_pending"
+        );
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 39,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+
+        let double_hash = TailInputDiagnostics {
+            tool_output_hash_like_count: 2,
+            ..hash_tagged_tail.clone()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &double_hash,
+            &final_scope,
+        ));
+        let path_like = TailInputDiagnostics {
+            tool_output_path_like_count: 1,
+            ..hash_tagged_tail.clone()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &path_like,
+            &final_scope,
+        ));
+        let not_high_hit = UsageRecord {
+            input_tokens: 366_607,
+            cache_read_tokens: 345_000,
+            ..UsageRecord::default()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&not_high_hit),
+            &hash_tagged_tail,
+            &exact_pending_tail_lag_log(scope, not_high_hit.cache_read_tokens, 11_648),
+        ));
+        let too_wide_residual = FinalScopeWaterlineLog {
+            candidate_avoidable_tokens_128: 12_416,
+            sent_prefix_bucket_tokens_128: 366_720,
+            ..final_scope.clone()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &hash_tagged_tail,
+            &too_wide_residual,
+        ));
+        let too_wide_sent_settled_span = FinalScopeWaterlineLog {
+            sent_prefix_bucket_tokens_128: 366_720,
+            ..final_scope.clone()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &hash_tagged_tail,
+            &too_wide_sent_settled_span,
+        ));
+        let too_large_local_waterline_slip = FinalScopeWaterlineLog {
+            settled_prefix_bucket_tokens_128: 354_432,
+            ..final_scope.clone()
+        };
+        assert!(!exact_medium_tool_tail_has_pending_residual(
+            Some(&high_hit),
+            &hash_tagged_tail,
+            &too_large_local_waterline_slip,
+        ));
+    }
+
+    #[test]
     fn exact_provider_waterline_rollback_arms_one_safe_direct_child() {
         let mut registry = WarmPendingRegistry::default();
         let prefix = "realm\0provider\0model\0responses\0control";
@@ -1192,6 +1690,137 @@ mod tests {
                 .claim(Some(prefix), Some(scope), true, &exact(root))
                 .is_none(),
             "the provider-rollback window is one-shot and cannot queue siblings"
+        );
+    }
+
+    #[test]
+    fn late_shallow_provider_rollback_arms_one_late_quiet_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let rollback = UsageRecord {
+            input_tokens: 200_000,
+            cache_read_tokens: 198_400,
+            ..UsageRecord::default()
+        };
+        let final_scope = exact_rollback_log(scope, rollback.cache_read_tokens, 512);
+
+        let mut ordinary_registry = WarmPendingRegistry::default();
+        ordinary_registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&root),
+            Some(&rollback),
+            &quiet_message_parent(),
+            true,
+            false,
+        );
+        let ordinary_claim = ordinary_registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect(
+                "the legacy immediate rollback policy remains available without the candidate flag",
+            );
+        assert_eq!(
+            ordinary_claim.wait_reason(),
+            "responses_provider_waterline_rollback_pending",
+            "an ordinary candidate process must not receive the late-rollback target path"
+        );
+
+        registry.settle_with_late_shallow_provider_waterline_rollback(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&root),
+            Some(&rollback),
+            &quiet_message_parent(),
+            true,
+            false,
+            true,
+        );
+
+        let key = entry_key(prefix, scope);
+        let entry = registry
+            .entries
+            .get(&key)
+            .expect("the narrow late rollback must arm its exact scope");
+        assert_eq!(
+            entry.kind,
+            PendingMaturityKind::LateShallowProviderWaterlineRollback
+        );
+        assert_eq!(
+            entry.ready_at, entry.deadline_at,
+            "the narrow late rollback remains eligible through its short TTL"
+        );
+        assert!(
+            entry.ready_at.saturating_duration_since(Instant::now()) > WARM_PENDING_FOLLOWUP_WAIT,
+            "the late-ready window must outlive the old immediate 500ms window"
+        );
+
+        let claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("only the exact direct child may consume the late rollback window");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_late_shallow_provider_waterline_rollback_pending"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        assert!(claim.followup_is_settle_safe(&quiet_message_child(), false));
+
+        for unsafe_child in [
+            TailInputDiagnostics {
+                message_chars: 257,
+                ..quiet_message_child()
+            },
+            TailInputDiagnostics {
+                tool_call_chars: 1,
+                ..quiet_message_child()
+            },
+            TailInputDiagnostics {
+                tool_output_noise_hint: Some("hash_like".to_string()),
+                ..quiet_message_child()
+            },
+            TailInputDiagnostics {
+                source: Some("mixed".to_string()),
+                ..quiet_message_child()
+            },
+        ] {
+            assert!(
+                !claim.followup_is_settle_safe(&unsafe_child, false),
+                "only a quiet <=256-character message child may use the late rollback wait"
+            );
+        }
+        assert!(
+            !claim.followup_is_settle_safe(&quiet_message_child(), true),
+            "compaction must never consume the late rollback wait"
+        );
+
+        registry.settle_with_late_shallow_provider_waterline_rollback(
+            Some(&claim),
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&head(2)),
+            Some(&rollback),
+            &quiet_message_child(),
+            true,
+            false,
+            true,
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "a consumed late rollback must not restart a second wait chain"
+        );
+        assert!(
+            registry
+                .claim(Some(prefix), Some(scope), true, &exact(root))
+                .is_none(),
+            "the late rollback remains one exact child only"
         );
     }
 
@@ -1301,6 +1930,257 @@ mod tests {
             0,
             "an exact pending tail-lag child must not restart a wait chain"
         );
+    }
+
+    #[test]
+    fn exact_large_message_tail_lag_arms_one_quiet_direct_child() {
+        let mut registry = WarmPendingRegistry::default();
+        let prefix = "realm\0provider\0model\0responses\0control";
+        let scope = "final-scope";
+        let root = head(1);
+        let replay = UsageRecord {
+            input_tokens: 334_481,
+            cache_read_tokens: 328_448,
+            ..UsageRecord::default()
+        };
+        let dynamic_message_tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 32_829,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        let final_scope = FinalScopeWaterlineLog {
+            raw_cache_read_tokens: replay.cache_read_tokens,
+            candidate_avoidable_tokens_128: 384,
+            sent_prefix_bucket_tokens_128: 334_464,
+            settled_prefix_bucket_tokens_128: 328_448,
+            ..exact_log(scope)
+        };
+
+        assert!(exact_large_message_tail_lag(
+            Some(&replay),
+            &dynamic_message_tail,
+            &final_scope,
+        ));
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(22);
+        assert_eq!(
+            PendingMaturityKind::ExactLargeMessageTailLag.ready_at(now, expires_at),
+            expires_at,
+            "a late direct child keeps the one 500ms opportunity during the short TTL"
+        );
+        // Reproduce the observed dynamic sequence: a giant cold root gets
+        // one bounded direct child, that child is the large message parent,
+        // and only its quiet exact successor may receive the new one-shot
+        // residual wait.
+        let root_cold = cold();
+        registry.settle(
+            None,
+            Some(prefix),
+            Some(scope),
+            Some(&root_log(scope)),
+            Some(&root),
+            Some(&root_cold),
+            &TailInputDiagnostics::default(),
+            true,
+            false,
+        );
+        let giant_claim = registry
+            .claim(Some(prefix), Some(scope), true, &exact(root.clone()))
+            .expect("the giant cold root arms its direct dynamic child");
+        assert_eq!(
+            giant_claim.wait_reason(),
+            "responses_giant_cold_prefix_warm_pending"
+        );
+        let dynamic_parent = head(2);
+        registry.settle(
+            Some(&giant_claim),
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&dynamic_parent),
+            Some(&replay),
+            &dynamic_message_tail,
+            true,
+            false,
+        );
+        let claim = registry
+            .claim(
+                Some(prefix),
+                Some(scope),
+                true,
+                &exact(dynamic_parent.clone()),
+            )
+            .expect("a proven large message residual gets one direct child");
+        assert_eq!(
+            claim.wait_reason(),
+            "responses_exact_large_message_tail_lag"
+        );
+        assert!(claim.wait_duration() > Duration::ZERO);
+        assert!(claim.wait_duration() <= WARM_PENDING_FOLLOWUP_WAIT);
+        assert!(claim.followup_is_settle_safe(
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 39,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            false,
+        ));
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 1,
+                    message_chars: 32_829,
+                    source: Some("message".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                false,
+            ),
+            "a second large message must not inherit the residual wait"
+        );
+        assert!(
+            !claim.followup_is_settle_safe(
+                &TailInputDiagnostics {
+                    input_items: 1,
+                    message_chars: 39,
+                    source: Some("message".to_string()),
+                    ..TailInputDiagnostics::default()
+                },
+                true,
+            ),
+            "compaction remains outside the large-message pending path"
+        );
+        let child = head(3);
+        registry.settle(
+            Some(&claim),
+            Some(prefix),
+            Some(scope),
+            Some(&final_scope),
+            Some(&child),
+            Some(&replay),
+            &TailInputDiagnostics {
+                input_items: 1,
+                message_chars: 39,
+                source: Some("message".to_string()),
+                ..TailInputDiagnostics::default()
+            },
+            true,
+            false,
+        );
+        assert_eq!(
+            registry.len(),
+            0,
+            "the large-message residual never restarts a wait chain"
+        );
+
+        let noisy_tail = TailInputDiagnostics {
+            tool_output_chars: 1,
+            source: Some("mixed".to_string()),
+            ..dynamic_message_tail.clone()
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&replay),
+            &noisy_tail,
+            &final_scope,
+        ));
+        let oversized_tail = TailInputDiagnostics {
+            message_chars: 65_537,
+            ..dynamic_message_tail.clone()
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&replay),
+            &oversized_tail,
+            &final_scope,
+        ));
+        let low_coverage = UsageRecord {
+            cache_read_tokens: 327_000,
+            ..replay.clone()
+        };
+        let low_coverage_scope = FinalScopeWaterlineLog {
+            raw_cache_read_tokens: low_coverage.cache_read_tokens,
+            candidate_avoidable_tokens_128: 384,
+            sent_prefix_bucket_tokens_128: low_coverage.cache_read_tokens + 384,
+            settled_prefix_bucket_tokens_128: low_coverage.cache_read_tokens,
+            ..exact_log(scope)
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&low_coverage),
+            &dynamic_message_tail,
+            &low_coverage_scope,
+        ));
+        let wide_span = FinalScopeWaterlineLog {
+            settled_prefix_bucket_tokens_128: 320_000,
+            ..final_scope.clone()
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&replay),
+            &dynamic_message_tail,
+            &wide_span,
+        ));
+        let too_large_residual = FinalScopeWaterlineLog {
+            candidate_avoidable_tokens_128: 1_025,
+            sent_prefix_bucket_tokens_128: 329_473,
+            settled_prefix_bucket_tokens_128: replay.cache_read_tokens,
+            ..final_scope
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&replay),
+            &dynamic_message_tail,
+            &too_large_residual,
+        ));
+    }
+
+    #[test]
+    fn exact_large_message_tail_lag_requires_the_9780_basis_point_coverage_boundary() {
+        let scope = "final-scope";
+        let dynamic_message_tail = TailInputDiagnostics {
+            input_items: 2,
+            message_chars: 32_829,
+            source: Some("message".to_string()),
+            ..TailInputDiagnostics::default()
+        };
+        // This is the real large-tail observation that was just below the old
+        // 98% gate: exact/bound lineage, a 256-token residual, and a 5,888
+        // token sent-to-settled span.
+        let observed = UsageRecord {
+            input_tokens: 280_136,
+            cache_read_tokens: 274_176,
+            ..UsageRecord::default()
+        };
+        let observed_scope = FinalScopeWaterlineLog {
+            raw_cache_read_tokens: observed.cache_read_tokens,
+            candidate_avoidable_tokens_128: 256,
+            sent_prefix_bucket_tokens_128: 280_064,
+            settled_prefix_bucket_tokens_128: observed.cache_read_tokens,
+            ..exact_log(scope)
+        };
+        assert!(exact_large_message_tail_lag(
+            Some(&observed),
+            &dynamic_message_tail,
+            &observed_scope,
+        ));
+
+        // 280,136 * 9,780 / 10,000 = 273,973. Keep the gate exact: one
+        // token below it must remain immediate rather than gaining a 500ms
+        // foreground wait. A coarse 97% relaxation would incorrectly admit
+        // this request.
+        let below_boundary = UsageRecord {
+            cache_read_tokens: 273_972,
+            ..observed.clone()
+        };
+        let below_boundary_scope = FinalScopeWaterlineLog {
+            raw_cache_read_tokens: below_boundary.cache_read_tokens,
+            candidate_avoidable_tokens_128: 256,
+            sent_prefix_bucket_tokens_128: 280_064,
+            settled_prefix_bucket_tokens_128: below_boundary.cache_read_tokens,
+            ..exact_log(scope)
+        };
+        assert!(!exact_large_message_tail_lag(
+            Some(&below_boundary),
+            &dynamic_message_tail,
+            &below_boundary_scope,
+        ));
     }
 
     #[test]
@@ -1911,6 +2791,99 @@ mod tests {
         let mut no_rollback = exact;
         no_rollback.rollback_tokens_128 = 0;
         assert!(!provider_waterline_rollback(Some(&rollback), &no_rollback));
+    }
+
+    #[test]
+    fn late_shallow_provider_rollback_rejects_boundary_and_evidence_drift() {
+        let high_hit = UsageRecord {
+            input_tokens: 100_000,
+            cache_read_tokens: 98_000,
+            ..UsageRecord::default()
+        };
+        let final_scope = exact_rollback_log("scope", high_hit.cache_read_tokens, 128);
+        assert!(late_shallow_provider_waterline_rollback(
+            Some(&high_hit),
+            &quiet_message_parent(),
+            &final_scope,
+        ));
+
+        let too_small_input = UsageRecord {
+            input_tokens: 31_999,
+            cache_read_tokens: 31_999,
+            ..UsageRecord::default()
+        };
+        let too_small_input_scope =
+            exact_rollback_log("scope", too_small_input.cache_read_tokens, 128);
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&too_small_input),
+            &quiet_message_parent(),
+            &too_small_input_scope,
+        ));
+
+        let too_small_cache = UsageRecord {
+            input_tokens: 40_000,
+            cache_read_tokens: 31_999,
+            ..UsageRecord::default()
+        };
+        let too_small_cache_scope =
+            exact_rollback_log("scope", too_small_cache.cache_read_tokens, 128);
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&too_small_cache),
+            &quiet_message_parent(),
+            &too_small_cache_scope,
+        ));
+
+        let below_coverage = UsageRecord {
+            cache_read_tokens: 97_999,
+            ..high_hit.clone()
+        };
+        let below_coverage_scope =
+            exact_rollback_log("scope", below_coverage.cache_read_tokens, 128);
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&below_coverage),
+            &quiet_message_parent(),
+            &below_coverage_scope,
+        ));
+
+        for rollback_tokens_128 in [127, 1_025] {
+            let out_of_range =
+                exact_rollback_log("scope", high_hit.cache_read_tokens, rollback_tokens_128);
+            assert!(!late_shallow_provider_waterline_rollback(
+                Some(&high_hit),
+                &quiet_message_parent(),
+                &out_of_range,
+            ));
+        }
+
+        let mut unbound = final_scope.clone();
+        unbound.predecessor_bound = false;
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&high_hit),
+            &quiet_message_parent(),
+            &unbound,
+        ));
+        let mut reset = final_scope.clone();
+        reset.continuity_reset = true;
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&high_hit),
+            &quiet_message_parent(),
+            &reset,
+        ));
+        let mut raw_mismatch = final_scope.clone();
+        raw_mismatch.raw_cache_read_tokens = raw_mismatch.raw_cache_read_tokens.saturating_add(128);
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&high_hit),
+            &quiet_message_parent(),
+            &raw_mismatch,
+        ));
+        assert!(!late_shallow_provider_waterline_rollback(
+            Some(&high_hit),
+            &TailInputDiagnostics {
+                tool_output_chars: 1,
+                ..quiet_message_parent()
+            },
+            &final_scope,
+        ));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -7,6 +7,10 @@ import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const args = parseArgs(process.argv.slice(2));
+// The isolated endpoint sends one baseline plus one request for each cache
+// field serially. A 45-second client ceiling can expire while a healthy but
+// slow upstream is still processing those independent probes.
+const PROBE_TIMEOUT_MS = 180_000;
 
 if (args["self-test"] === true) {
   runSelfTest();
@@ -20,7 +24,9 @@ const executable = resolve(String(
 const providerId = requiredText(args.provider, "--provider");
 const modelId = requiredText(args.model, "--model");
 const channel = String(args.channel ?? "responses").trim();
+const requestedFields = optionalRequestedFields(args.field);
 const keepRunDir = args["keep-run-dir"] === true;
+const outputPath = optionalOutputPath(args.output);
 
 if (!new Set(["responses", "chat"]).has(channel)) {
   throw new Error("--channel must be responses or chat");
@@ -47,6 +53,7 @@ try {
       ...process.env,
       ATOAPI_CONFIG_DIR: configDir,
       ATOAPI_ISOLATED_TEST_INSTANCE: "1",
+      ATOAPI_HEADLESS_ISOLATED_TEST: "1",
       ATOAPI_TEST_LISTEN_PORT: String(port),
       ATOAPI_PREFIX_DIAGNOSTICS: "1",
       ATOAPI_AUTOMATIC_CACHE_CANARY: "0"
@@ -54,37 +61,53 @@ try {
   });
   await waitForHealth(baseUrl, child);
 
+  const probeRequest = { provider_id: providerId, model_id: modelId, channel };
+  if (requestedFields) probeRequest.fields = requestedFields;
   const response = await fetch(`${baseUrl}/admin/cache-capabilities/probe`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${localKey}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify({ provider_id: providerId, model_id: modelId, channel }),
-    signal: AbortSignal.timeout(45_000)
+    body: JSON.stringify(probeRequest),
+    signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
   });
-  const payload = await response.json().catch(() => null);
-  if (!response.ok || !payload || typeof payload !== "object") {
-    throw new Error(`isolated cache capability probe failed with HTTP ${response.status}`);
-  }
-
-  const fields = Array.isArray(payload.fields)
+  const responseText = await response.text();
+  const payload = parseJsonObject(responseText);
+  const fields = Array.isArray(payload?.fields)
     ? payload.fields.map(sanitizeField).filter(Boolean)
     : [];
-  const result = {
-    schema: "atoapi-isolated-cache-capability-probe-v1",
-    ok: fields.length === 4 && fields.every((field) => field.status !== "error"),
-    isolated: true,
-    live_18883_touched: false,
-    provider_id: String(payload.provider_id ?? ""),
-    model_id: String(payload.model_id ?? ""),
-    channel: String(payload.channel ?? ""),
-    selected_key_mapped: typeof payload.key_id === "string" && payload.key_id.length > 0,
-    baseline_status: finiteStatus(payload.baseline_status),
-    management_request_count: 1 + fields.length,
-    fields,
-    checked_at: String(payload.checked_at ?? "")
-  };
+  const result = !response.ok || !payload
+    ? {
+      schema: "atoapi-isolated-cache-capability-probe-v1",
+      ok: false,
+      isolated: true,
+      live_18883_touched: false,
+      provider_id: providerId,
+      model_id: modelId,
+      channel,
+      requested_fields: requestedFields ?? null,
+      http_status: finiteStatus(response.status),
+      diagnostic_category: isolatedProbeFailureCategory(payload, responseText),
+      fields: [],
+      checked_at: ""
+    }
+    : {
+      schema: "atoapi-isolated-cache-capability-probe-v1",
+      ok: fields.length === (requestedFields?.length ?? 4) &&
+        fields.every((field) => field.status !== "error"),
+      isolated: true,
+      live_18883_touched: false,
+      provider_id: String(payload.provider_id ?? ""),
+      model_id: String(payload.model_id ?? ""),
+      channel: String(payload.channel ?? ""),
+      selected_key_mapped: typeof payload.key_id === "string" && payload.key_id.length > 0,
+      baseline_status: finiteStatus(payload.baseline_status),
+      management_request_count: 1 + fields.length,
+      fields,
+      checked_at: String(payload.checked_at ?? "")
+    };
+  if (outputPath) await writeSanitizedResult(outputPath, result);
   console.log(JSON.stringify(result, null, 2));
   if (!result.ok) process.exitCode = 1;
   if (keepRunDir) retainedConfigDir = configDir;
@@ -202,6 +225,62 @@ function requiredText(value, label) {
   return normalized;
 }
 
+function optionalOutputPath(value) {
+  if (value === undefined || value === null || value === true) return null;
+  const normalized = String(value).trim();
+  return normalized ? resolve(normalized) : null;
+}
+
+function optionalRequestedFields(value) {
+  if (value === undefined || value === null || value === true) return null;
+  const field = String(value).trim();
+  if (!field) return null;
+  if (!new Set([
+    "prompt-cache-key",
+    "prompt-cache-retention",
+    "prompt-cache-options",
+    "prompt-cache-breakpoint"
+  ]).has(field)) {
+    throw new Error(`unsupported --field value: ${field}`);
+  }
+  return [field];
+}
+
+function parseJsonObject(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// Do not persist the server's detailed error text: it can include deployment
+// information. These categories distinguish a transient transport failure
+// from an isolated admin/config failure without changing probe semantics.
+function isolatedProbeFailureCategory(payload, responseText) {
+  const message = String(payload?.error?.message ?? "").trim().toLowerCase();
+  if (!message) return String(responseText ?? "").trim() ? "non_json_admin_error" : "empty_admin_error";
+  if (message.includes("provider settings changed while cache capability verification")) {
+    return "provider_configuration_changed";
+  }
+  if (message.includes("config snapshot") || message.includes("persist")) {
+    return "isolated_config_persistence_failure";
+  }
+  if (message.includes("provider api key") || message.includes("provider key")) {
+    return "selected_key_unavailable";
+  }
+  if (/(timeout|timed out|proxy|connect|connection|dns|transport|request failed)/.test(message)) {
+    return "upstream_transport_failure";
+  }
+  return "other_local_probe_failure";
+}
+
+async function writeSanitizedResult(path, result) {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(result, null, 2) + "\n", "utf8");
+}
+
 function finiteStatus(value) {
   const status = Number(value);
   return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
@@ -233,9 +312,18 @@ function parseArgs(values) {
 }
 
 function runSelfTest() {
-  const parsed = parseArgs(["--provider", "provider-a", "--self-test"]);
-  if (parsed.provider !== "provider-a" || parsed["self-test"] !== true) {
+  const parsed = parseArgs(["--provider", "provider-a", "--self-test", "--output", "probe.json"]);
+  if (parsed.provider !== "provider-a" || parsed["self-test"] !== true || parsed.output !== "probe.json") {
     throw new Error("argument parsing self-test failed");
+  }
+  if (optionalOutputPath("  ") !== null) throw new Error("blank output path must be ignored");
+  if (JSON.stringify(optionalRequestedFields("prompt-cache-retention")) !==
+    JSON.stringify(["prompt-cache-retention"])) {
+    throw new Error("single-field probe selection self-test failed");
+  }
+  if (isolatedProbeFailureCategory({ error: { message: "proxy connection timed out" } }, "") !==
+    "upstream_transport_failure") {
+    throw new Error("probe failure classification self-test failed");
   }
   const field = sanitizeField({
     field: "prompt-cache-breakpoint",

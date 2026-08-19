@@ -8,7 +8,11 @@ use std::{
     time::Instant,
 };
 
-use crate::{config::Channel, metrics::ResponsesWirePrefixFingerprints};
+use crate::{
+    config::{Channel, PromptCacheOptionsTtl},
+    metrics::ResponsesWirePrefixFingerprints,
+    state::{PromptCacheOptionsSiblingProof, PromptCacheOptionsSiblingVariant},
+};
 
 use super::{cache_capability, maybe_responses_wire_prefix_fingerprints, request_body_stream_flag};
 
@@ -740,6 +744,98 @@ mod tests {
     }
 
     #[test]
+    fn options_sibling_proof_allows_only_the_recognized_options_root_to_differ() {
+        let base = json!({
+            "model": "gpt-test",
+            "instructions": "same static instruction",
+            "tools": [{"type":"function","name":"write_file"}],
+            "input": [{"type":"message","role":"user","content":"anchor"}],
+            "stream": true
+        });
+        let absent = PreparedWireRequest::from_value(&Channel::Responses, &base);
+        let absent_proof = responses_prompt_cache_options_sibling_proof(
+            &base,
+            absent.responses_cache_maturity_static_projection_digest(),
+        )
+        .expect("a wire without Options has a strict sibling proof");
+
+        let mut options_24h = base.clone();
+        options_24h["prompt_cache_options"] = json!({"mode":"implicit","ttl":"24h"});
+        let options = PreparedWireRequest::from_value(&Channel::Responses, &options_24h);
+        let options_proof = options
+            .prompt_cache_options_sibling_proof()
+            .cloned()
+            .expect("a strict implicit 24h Options shape has a sibling proof");
+
+        assert_eq!(
+            absent_proof.options_neutral_static_projection_digest,
+            options_proof.options_neutral_static_projection_digest,
+            "the allowed Options root is the only neutralized static member"
+        );
+        assert_ne!(absent_proof.variant, options_proof.variant);
+        assert_ne!(
+            absent_proof.cache_maturity_static_projection_digest,
+            options_proof.cache_maturity_static_projection_digest,
+            "the normal maturity namespace still distinguishes the actual wire"
+        );
+
+        let mut semantic_change = options_24h.clone();
+        semantic_change["tools"] = json!([{"type":"function","name":"delete_file"}]);
+        let changed = PreparedWireRequest::from_value(&Channel::Responses, &semantic_change);
+        assert_ne!(
+            options_proof.options_neutral_static_projection_digest,
+            changed
+                .prompt_cache_options_sibling_proof()
+                .expect("a changed but valid Options wire still has a proof")
+                .options_neutral_static_projection_digest,
+            "any other static root drift must reject sibling reuse"
+        );
+
+        let mut invalid = base;
+        invalid["prompt_cache_options"] = json!({"mode":"implicit","ttl":"24h","unexpected":true});
+        assert!(
+            PreparedWireRequest::from_value(&Channel::Responses, &invalid)
+                .prompt_cache_options_sibling_proof()
+                .is_none(),
+            "ambiguous Options shapes cannot supply sibling evidence"
+        );
+    }
+
+    #[test]
+    fn absent_options_skip_the_sibling_hash_on_normal_responses_wires() {
+        let body = json!({
+            "model": "gpt-test",
+            "instructions": "same static instruction",
+            "input": [{"type":"message","role":"user","content":"anchor"}],
+            "stream": true
+        });
+        let wire = PreparedWireRequest::from_value(&Channel::Responses, &body);
+        assert!(
+            wire.prompt_cache_options_sibling_proof().is_none(),
+            "normal absent-Options traffic must not pay for the isolated sibling digest"
+        );
+    }
+
+    #[test]
+    fn isolated_ab_keeps_an_absent_options_sibling_witness() {
+        let body = json!({
+            "model": "gpt-test",
+            "instructions": "same static instruction",
+            "input": [{"type":"message","role":"user","content":"anchor"}],
+            "stream": true
+        });
+
+        assert!(
+            should_capture_prompt_cache_options_sibling_proof(&body, true),
+            "both isolated arms need the absent-Options witness before the candidate adds 24h Options"
+        );
+        assert!(
+            !should_capture_prompt_cache_options_sibling_proof(&body, false),
+            "normal absent-Options traffic remains outside the isolated sibling experiment"
+        );
+    }
+
+    #[test]
     fn pending_responses_freezes_cache_controls_before_the_first_wire_draft() {
         let initial = json!({
             "model": "gpt-test",
@@ -918,6 +1014,18 @@ mod tests {
     }
 }
 
+fn strict_prompt_cache_options_ttl(body: &Value) -> Option<PromptCacheOptionsTtl> {
+    let options = body.get("prompt_cache_options")?.as_object()?;
+    if options.len() != 2 || options.get("mode")?.as_str()? != "implicit" {
+        return None;
+    }
+    match options.get("ttl")?.as_str()? {
+        "30m" => Some(PromptCacheOptionsTtl::ThirtyMinutes),
+        "24h" => Some(PromptCacheOptionsTtl::TwentyFourHours),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PreparedWireRequest {
     channel: Channel,
@@ -941,6 +1049,13 @@ pub(super) struct PreparedWireRequest {
     /// the initial Responses wire draft. No values, request text, tool output,
     /// keys, or hashes are retained here.
     atoapi_mutated_static_categories: Vec<String>,
+    /// Strict Options value captured from the exact body at the same boundary
+    /// that creates the immutable wire bytes.
+    prompt_cache_options_ttl: Option<PromptCacheOptionsTtl>,
+    /// A process-only witness for the isolated Options sibling-settle probe.
+    /// It is present only for an array-input Responses wire whose Options root
+    /// is absent or exactly `{mode: implicit, ttl: 30m|24h}`.
+    prompt_cache_options_sibling_proof: Option<PromptCacheOptionsSiblingProof>,
     protocol_breakpoint_provenance: ProtocolBreakpointProvenance,
     outbound_prefix_fingerprints: Option<ResponsesWirePrefixFingerprints>,
 }
@@ -986,6 +1101,8 @@ impl PreparedWireRequest {
         let finalize_started = Instant::now();
         let outbound_prefix_fingerprints = maybe_responses_wire_prefix_fingerprints(channel, body);
         let stream = request_body_stream_flag(body);
+        let responses_cache_maturity_static_projection_digest =
+            responses_cache_maturity_static_projection_digest(body);
         Self {
             channel: channel.clone(),
             body: encoded,
@@ -993,9 +1110,26 @@ impl PreparedWireRequest {
             stream,
             encode_ms: encode_ms.saturating_add(finalize_started.elapsed().as_millis() as u64),
             responses_static_projection_digest,
-            responses_cache_maturity_static_projection_digest:
-                responses_cache_maturity_static_projection_digest(body),
+            // The sibling witness is only consumed by the isolated Options
+            // treatment. Normal Responses traffic has no Options root, so
+            // avoid hashing the entire static wire on that hot path. In an
+            // isolated A/B process both arms must retain the absent-variant
+            // witness: the 24h switch belongs only to the candidate arm, but
+            // the champion arm is the sibling needed for a strict settle.
+            prompt_cache_options_sibling_proof: if should_capture_prompt_cache_options_sibling_proof(
+                body,
+                crate::config::isolated_test_instance(),
+            ) {
+                responses_prompt_cache_options_sibling_proof(
+                    body,
+                    responses_cache_maturity_static_projection_digest.as_deref(),
+                )
+            } else {
+                None
+            },
+            responses_cache_maturity_static_projection_digest,
             atoapi_mutated_static_categories: Vec::new(),
+            prompt_cache_options_ttl: strict_prompt_cache_options_ttl(body),
             protocol_breakpoint_provenance: protocol_breakpoint_provenance(
                 channel,
                 body,
@@ -1025,6 +1159,10 @@ impl PreparedWireRequest {
         self.encode_ms
     }
 
+    pub(super) const fn prompt_cache_options_ttl(&self) -> Option<PromptCacheOptionsTtl> {
+        self.prompt_cache_options_ttl
+    }
+
     pub(super) fn responses_static_projection_digest(&self) -> Option<&str> {
         self.responses_static_projection_digest.as_deref()
     }
@@ -1032,6 +1170,12 @@ impl PreparedWireRequest {
     pub(super) fn responses_cache_maturity_static_projection_digest(&self) -> Option<&str> {
         self.responses_cache_maturity_static_projection_digest
             .as_deref()
+    }
+
+    pub(super) fn prompt_cache_options_sibling_proof(
+        &self,
+    ) -> Option<&PromptCacheOptionsSiblingProof> {
+        self.prompt_cache_options_sibling_proof.as_ref()
     }
 
     pub(super) fn atoapi_mutated_static_categories(&self) -> &[String] {
@@ -1245,6 +1389,66 @@ pub(super) fn responses_cache_maturity_static_projection_digest(body: &Value) ->
         });
         hasher.update(b"}");
         format!("{:x}", hasher.finalize())
+    })
+}
+
+fn should_capture_prompt_cache_options_sibling_proof(
+    body: &Value,
+    isolated_test_instance: bool,
+) -> bool {
+    body.get("prompt_cache_options").is_some() || isolated_test_instance
+}
+
+/// Build the strict Options-sibling witness used only by the isolated
+/// pre-dispatch settle experiment.  Unlike the broader maturity projection,
+/// this hashes every final static Responses root except `input` and the
+/// strictly-recognised `prompt_cache_options` root.  Therefore a matching
+/// witness proves that the two frozen wires differ only by the allowed
+/// Options variant (absent, implicit 30m, or implicit 24h).
+pub(super) fn responses_prompt_cache_options_sibling_proof(
+    body: &Value,
+    cache_maturity_static_projection_digest: Option<&str>,
+) -> Option<PromptCacheOptionsSiblingProof> {
+    let map = body.as_object()?;
+    if !map.get("input").is_some_and(Value::is_array) {
+        return None;
+    }
+    let variant = match map.get("prompt_cache_options") {
+        None => PromptCacheOptionsSiblingVariant::Absent,
+        Some(_) => match strict_prompt_cache_options_ttl(body)? {
+            PromptCacheOptionsTtl::ThirtyMinutes => {
+                PromptCacheOptionsSiblingVariant::ImplicitThirtyMinutes
+            }
+            PromptCacheOptionsTtl::TwentyFourHours => {
+                PromptCacheOptionsSiblingVariant::ImplicitTwentyFourHours
+            }
+        },
+    };
+    let cache_maturity_static_projection_digest =
+        cache_maturity_static_projection_digest?.to_owned();
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"responses-options-sibling-static-v1\0{");
+    let mut first = true;
+    for_each_responses_wire_member(map, |key, value| {
+        if key == "input" || key == "prompt_cache_options" {
+            return;
+        }
+        if !first {
+            hasher.update(b",");
+        }
+        first = false;
+        let mut encoded = Vec::new();
+        let mut member_first = true;
+        let _ = write_json_member(&mut encoded, &mut member_first, key, value);
+        hasher.update(encoded);
+    });
+    hasher.update(b"}");
+
+    Some(PromptCacheOptionsSiblingProof {
+        cache_maturity_static_projection_digest,
+        options_neutral_static_projection_digest: format!("{:x}", hasher.finalize()),
+        variant,
     })
 }
 

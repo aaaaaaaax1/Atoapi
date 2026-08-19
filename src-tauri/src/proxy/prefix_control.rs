@@ -17,6 +17,13 @@ use super::{
 const MAX_FOREGROUND_WAIT: Duration = Duration::from_millis(500);
 const MAX_EXACT_EVIDENCE_AGE: Duration = Duration::from_secs(30);
 const MIN_REPEATED_AVOIDABLE_STREAK: u32 = 2;
+// A fresh exact prefix can benefit from a short provider commit window. Once
+// local evidence already identifies only a sub-1KiB residual, however, a
+// full foreground wait has repeatedly traded roughly 500ms of TTFT for less
+// than one KiB of uncertain cache movement. Let that small tail send
+// immediately; larger residuals and fully caught-up prefixes retain the
+// champion-compatible proactive settle path.
+const MIN_PENDING_RESIDUAL_TOKENS_FOR_PROACTIVE_SETTLE: u64 = 1_024;
 pub(super) const MIN_CLEAN_TINY_RECOVERY_STREAK: u32 = 2;
 const MAX_STABLE_INSTABILITY_SCORE: u32 = 2;
 const STABLE_RECOVERY_MIN_INPUT_TOKENS: u64 = 32_000;
@@ -37,6 +44,10 @@ pub(super) struct PrefixControlInput {
     pub recent_exact_warm_small_tail: bool,
     pub avoidable_tokens: u64,
     pub fine_avoidable_tokens: u64,
+    /// True only when the final frozen wire proved that the preceding exact
+    /// request was sent beyond its settled cache waterline.  Generic small
+    /// cache gaps must retain their existing recovery policy.
+    pub known_exact_pending_residual: bool,
     pub avoidable_shortfall_streak: u32,
     pub cache_instability_score: u32,
     pub tiny_instability_recovery_safe: bool,
@@ -194,6 +205,21 @@ impl PrefixController {
                 recovery_applicable: true,
             };
         }
+        // This fine-grained exact sent-waterline residual is known before the
+        // request starts.  A sub-1KiB amount cannot repay the foreground
+        // 500ms settle window, even when the coarse accounting rounds it up
+        // to one visible cache bucket.
+        if input.known_exact_pending_residual
+            && input.fine_avoidable_tokens > 0
+            && input.fine_avoidable_tokens < MIN_PENDING_RESIDUAL_TOKENS_FOR_PROACTIVE_SETTLE
+            // A first/one-off sub-bucket residual is not worth spending the
+            // full foreground window on. Once the same exact residual has
+            // repeated, retain the established actionable-gap recovery path
+            // so a real persistent shortfall is not silently ignored.
+            && input.avoidable_shortfall_streak < MIN_REPEATED_AVOIDABLE_STREAK
+        {
+            return skip("fresh_exact_pending_residual_too_small", false);
+        }
         if input.avoidable_tokens == 0 {
             // A fresh exact high-hit can still be racing the provider's cache
             // commit even though the prior response had no visible gap. This
@@ -256,6 +282,33 @@ impl PrefixController {
             return skip("avoidable_gap_current_tail_unreliable", false);
         }
         settle_for_observed_gap_window(input, "responses_exact_avoidable_gap")
+    }
+
+    /// A shallow provider waterline rollback is not locally actionable by
+    /// default: ordinary traffic must not pay a delay merely because an
+    /// upstream reported a transient lower cache bucket.  A disposable A/B
+    /// candidate may opt into one already-bounded settle window after the
+    /// caller has independently proven that exact, shallow shape.  The normal
+    /// policy still wins whenever it has an actionable reason to wait.
+    pub fn before_request_with_provider_waterline_recovery(
+        input: PrefixControlInput,
+        provider_waterline_recovery_eligible: bool,
+    ) -> PrefixControlDecision {
+        let baseline = Self::before_request(input);
+        if !provider_waterline_recovery_eligible
+            || !baseline.wait.is_zero()
+            || baseline.skip_reason != Some("no_avoidable_gap")
+            || !input.source_is_exact
+            || input.compaction_requested
+            || !input.current_tail_is_settle_safe
+            || input.settle_after_cold_read
+            || input.avoidable_tokens != 0
+            || input.state_age >= MAX_FOREGROUND_WAIT
+        {
+            return baseline;
+        }
+
+        settle_for_remaining_window(input, "responses_provider_waterline_recovery_settle")
     }
 
     pub fn classify_gap(input: PrefixGapInput<'_>) -> ProviderCacheGapBreakdown {
@@ -926,6 +979,7 @@ mod tests {
             recent_exact_warm_small_tail: false,
             avoidable_tokens,
             fine_avoidable_tokens: avoidable_tokens,
+            known_exact_pending_residual: false,
             avoidable_shortfall_streak: 0,
             cache_instability_score: 0,
             tiny_instability_recovery_safe: false,
@@ -982,6 +1036,62 @@ mod tests {
             Some("responses_fresh_exact_prefix_settle")
         );
         assert_eq!(unsafe_tail.skip_reason, None);
+    }
+
+    #[test]
+    fn tiny_pending_residual_does_not_spend_the_full_proactive_settle_window() {
+        let tiny_residual = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            fine_avoidable_tokens: 896,
+            known_exact_pending_residual: true,
+            ..input(0)
+        });
+        assert_eq!(tiny_residual.wait, Duration::ZERO);
+        assert_eq!(
+            tiny_residual.skip_reason,
+            Some("fresh_exact_pending_residual_too_small")
+        );
+
+        let material_residual = PrefixController::before_request(PrefixControlInput {
+            recent_exact_high_hit: true,
+            fine_avoidable_tokens: MIN_PENDING_RESIDUAL_TOKENS_FOR_PROACTIVE_SETTLE,
+            known_exact_pending_residual: true,
+            ..input(0)
+        });
+        assert_eq!(material_residual.wait, MAX_FOREGROUND_WAIT);
+        assert_eq!(
+            material_residual.reason,
+            Some("responses_fresh_exact_prefix_settle")
+        );
+    }
+
+    #[test]
+    fn fine_sub_bucket_residual_skips_even_when_coarse_bucket_is_nonzero() {
+        let rounded_coarse_residual = PrefixController::before_request(PrefixControlInput {
+            avoidable_tokens: 1_024,
+            fine_avoidable_tokens: 128,
+            known_exact_pending_residual: true,
+            recent_exact_high_hit: true,
+            ..input(1_024)
+        });
+        assert_eq!(rounded_coarse_residual.wait, Duration::ZERO);
+        assert_eq!(
+            rounded_coarse_residual.skip_reason,
+            Some("fresh_exact_pending_residual_too_small")
+        );
+
+        let exact_boundary = PrefixController::before_request(PrefixControlInput {
+            avoidable_tokens: 1_024,
+            fine_avoidable_tokens: MIN_PENDING_RESIDUAL_TOKENS_FOR_PROACTIVE_SETTLE,
+            known_exact_pending_residual: true,
+            recent_exact_high_hit: true,
+            ..input(1_024)
+        });
+        assert_eq!(exact_boundary.wait, MAX_FOREGROUND_WAIT);
+        assert_eq!(
+            exact_boundary.reason,
+            Some("responses_first_exact_avoidable_settle")
+        );
     }
 
     #[test]
@@ -1244,6 +1354,47 @@ mod tests {
             assert!(decision.wait <= MAX_FOREGROUND_WAIT);
             assert_eq!(decision.reason, Some("responses_exact_avoidable_gap"));
         }
+    }
+
+    #[test]
+    fn provider_waterline_recovery_candidate_only_uses_idle_exact_settle_window() {
+        let input = PrefixControlInput {
+            source_is_exact: true,
+            recent_exact_high_hit: false,
+            recent_exact_warm_small_tail: false,
+            avoidable_tokens: 0,
+            fine_avoidable_tokens: 0,
+            known_exact_pending_residual: false,
+            avoidable_shortfall_streak: 0,
+            cache_instability_score: 1,
+            tiny_instability_recovery_safe: false,
+            current_tail_is_settle_safe: true,
+            settle_after_cold_read: false,
+            compaction_requested: false,
+            state_age: Duration::from_millis(100),
+            request_budget: Duration::from_millis(500),
+        };
+        let baseline = PrefixController::before_request(input);
+        assert_eq!(baseline.wait, Duration::ZERO);
+        assert_eq!(baseline.skip_reason, Some("no_avoidable_gap"));
+
+        let recovery =
+            PrefixController::before_request_with_provider_waterline_recovery(input, true);
+        assert_eq!(recovery.wait, Duration::from_millis(400));
+        assert_eq!(
+            recovery.reason,
+            Some("responses_provider_waterline_recovery_settle")
+        );
+
+        let non_exact = PrefixController::before_request_with_provider_waterline_recovery(
+            PrefixControlInput {
+                source_is_exact: false,
+                ..input
+            },
+            true,
+        );
+        assert_eq!(non_exact.wait, Duration::ZERO);
+        assert_eq!(non_exact.skip_reason, Some("non_exact_prefix_state"));
     }
 
     #[test]
@@ -1678,6 +1829,7 @@ mod tests {
                 .avoidable_shortfall_tokens
                 .max(next.avoidable_shortfall_tokens_128),
             fine_avoidable_tokens: next.avoidable_shortfall_tokens_128,
+            known_exact_pending_residual: false,
             avoidable_shortfall_streak: next.avoidable_shortfall_streak,
             cache_instability_score: next.cache_instability_score,
             tiny_instability_recovery_safe: next.recent_clean_tiny_gap_streak

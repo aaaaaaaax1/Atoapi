@@ -20,6 +20,30 @@ pub(super) struct SessionIdentity {
     pub source: &'static str,
 }
 
+/// Return a thread id only when every explicitly supplied thread id agrees.
+/// This is intentionally narrower than the full composite identity: a stable
+/// thread may bridge session/conversation churn, but conflicting thread ids
+/// must never authorize shared upstream placement.
+pub(super) fn unambiguous_explicit_thread_id(request: &Value) -> Option<String> {
+    let mut values = Vec::new();
+    for object in [
+        Some(request),
+        request.get("metadata"),
+        request.get("context"),
+        request.get("client_context"),
+    ] {
+        let Some(object) = object.and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(value) = object.get("thread_id").and_then(non_empty_identity_value) {
+            values.push(value);
+        }
+    }
+    values.sort();
+    values.dedup();
+    (values.len() == 1).then(|| values.remove(0))
+}
+
 impl SessionIdentity {
     #[cfg(test)]
     pub fn derive(
@@ -730,6 +754,58 @@ mod tests {
         assert_eq!(main.anchor_key, review.anchor_key);
         assert_eq!(main.provider_cache_key, review.provider_cache_key);
         assert_eq!(main.source, "content-anchor");
+    }
+
+    #[test]
+    fn fallback_identity_stabilizes_regenerated_custom_tool_ids() {
+        let (config, decision) = context();
+        let left = json!({
+            "instructions": "stable",
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor" },
+                {
+                    "id": "ctc-left",
+                    "type": "custom_tool_call",
+                    "call_id": "call-left",
+                    "name": "shell",
+                    "input": "dir"
+                },
+                {
+                    "id": "ctco-left",
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-left",
+                    "output": "stable output"
+                }
+            ]
+        });
+        let right = json!({
+            "instructions": "stable",
+            "input": [
+                { "type": "message", "role": "user", "content": "anchor" },
+                {
+                    "id": "ctc-right",
+                    "type": "custom_tool_call",
+                    "call_id": "call-right",
+                    "name": "shell",
+                    "input": "dir"
+                },
+                {
+                    "id": "ctco-right",
+                    "type": "custom_tool_call_output",
+                    "call_id": "call-right",
+                    "output": "stable output"
+                }
+            ]
+        });
+
+        let left = SessionIdentity::derive(&config, &decision, &left, &left).unwrap();
+        let right = SessionIdentity::derive(&config, &decision, &right, &right).unwrap();
+
+        assert_eq!(left.source, "content-anchor");
+        assert_eq!(left.anchor_key, right.anchor_key);
+        assert_eq!(left.scope_key, right.scope_key);
+        assert_eq!(left.provider_cache_key, right.provider_cache_key);
+        assert_eq!(left.control_fingerprint, right.control_fingerprint);
     }
 
     #[test]

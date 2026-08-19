@@ -32,8 +32,9 @@ use admin::{
     test_provider_connection_paths, test_provider_key, test_provider_key_pool,
     update_agent_injection_route,
 };
-use config::{isolated_test_instance, isolated_test_listen_port};
+use config::{isolated_test_instance, isolated_test_listen_port, release_webview2_user_data_dir};
 use state::AppState;
+use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -77,30 +78,115 @@ fn spawn_exit_shutdown(
     });
 }
 
-/// A port-isolated desktop instance must not reuse the live application's
-/// WebView2 profile.  Sharing it prevents a second renderer from starting and
-/// makes UI/GPU validation silently exercise the wrong process.  Keep a
-/// caller-supplied profile intact, but otherwise derive a per-process temporary
-/// directory before Tauri creates its first WebView2 environment.
-fn configure_isolated_webview_profile() {
-    if !isolated_test_instance() || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some() {
-        return;
+/// Chooses a browser profile before Tauri creates the first WebView2
+/// environment. A caller-provided folder always wins. Isolated release tests
+/// stay process-scoped; ordinary releases share only their own stable v2
+/// profile instead of inheriting the legacy Tauri-default profile.
+fn webview2_profile_for_launch(
+    caller_supplied: bool,
+    isolated: bool,
+    isolated_port: Option<u16>,
+    process_id: u32,
+    release_profile: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if caller_supplied {
+        return None;
     }
-    let port = isolated_test_listen_port().unwrap_or_default();
-    let profile = std::env::temp_dir().join(format!(
-        "atoapi-isolated-webview2-{port}-{}",
-        std::process::id()
-    ));
+    if isolated {
+        let port = isolated_port.unwrap_or_default();
+        return Some(
+            std::env::temp_dir().join(format!("atoapi-isolated-webview2-{port}-{process_id}")),
+        );
+    }
+    release_profile
+}
+
+/// Prepare the selected WebView2 data folder without migrating or deleting a
+/// prior profile. If the local location cannot be prepared, safely leave
+/// WebView2 at Tauri's default rather than preventing the desktop app from
+/// opening.
+fn configure_webview2_profile() {
+    let caller_supplied = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_some();
+    let isolated = isolated_test_instance();
+    let release_profile = if caller_supplied || isolated {
+        None
+    } else {
+        match release_webview2_user_data_dir() {
+            Ok(profile) => Some(profile),
+            Err(err) => {
+                eprintln!("failed to locate release WebView2 profile: {err}");
+                None
+            }
+        }
+    };
+    let Some(profile) = webview2_profile_for_launch(
+        caller_supplied,
+        isolated,
+        isolated_test_listen_port(),
+        std::process::id(),
+        release_profile,
+    ) else {
+        return;
+    };
     if let Err(err) = std::fs::create_dir_all(&profile) {
-        eprintln!("failed to prepare isolated WebView2 profile {profile:?}: {err}");
+        eprintln!("failed to prepare WebView2 profile {profile:?}: {err}");
         return;
     }
     std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", profile);
 }
 
+/// The release-comparison runner is intentionally port-isolated and never
+/// touches the live desktop instance.  In a non-interactive test host there
+/// may be no usable WebView2 desktop at all, though the proxy itself is fully
+/// headless.  This explicit double opt-in starts only that isolated proxy
+/// surface and leaves ordinary launches unchanged.
+fn headless_isolated_test_requested() -> bool {
+    headless_isolated_test_requested_with_env(
+        isolated_test_instance(),
+        std::env::var("ATOAPI_HEADLESS_ISOLATED_TEST")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn headless_isolated_test_requested_with_env(isolated: bool, value: Option<&str>) -> bool {
+    isolated && value.is_some_and(|value| matches!(value.trim(), "1" | "true" | "on" | "enabled"))
+}
+
+fn run_headless_isolated_test() {
+    let state = Arc::new(
+        AppState::load()
+            .unwrap_or_else(|err| panic!("failed to initialize isolated test state: {err:?}")),
+    );
+    let startup_state = state.clone();
+    let startup = tauri::async_runtime::block_on(async move {
+        if let Err(err) = startup_state.cache.load_from_disk().await {
+            startup_state
+                .metrics
+                .record_error("cache_load", &err.to_string())
+                .await;
+        }
+        startup_state.start_proxy().await
+    });
+    if let Err(err) = startup {
+        panic!("failed to start isolated headless proxy: {err:?}");
+    }
+
+    // Keep the state and its server handles alive until the verifier ends the
+    // disposable child process.  Normal desktop shutdown remains unchanged.
+    let _state = state;
+    loop {
+        std::thread::park();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    configure_isolated_webview_profile();
+    if headless_isolated_test_requested() {
+        run_headless_isolated_test();
+        return;
+    }
+    configure_webview2_profile();
     let state = Arc::new(
         AppState::load()
             .unwrap_or_else(|err| panic!("failed to initialize application state: {err:?}")),
@@ -243,7 +329,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::ExitCoordinator;
+    use super::{
+        headless_isolated_test_requested_with_env, webview2_profile_for_launch, ExitCoordinator,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn exit_coordinator_runs_cleanup_once_before_allowing_exit() {
@@ -253,5 +342,47 @@ mod tests {
         assert!(!coordinator.begin_shutdown());
         coordinator.allow_final_exit();
         assert!(coordinator.final_exit_is_ready());
+    }
+
+    #[test]
+    fn headless_isolated_mode_requires_both_explicit_test_flags() {
+        assert!(headless_isolated_test_requested_with_env(true, Some("1")));
+        assert!(headless_isolated_test_requested_with_env(
+            true,
+            Some("enabled")
+        ));
+        assert!(!headless_isolated_test_requested_with_env(false, Some("1")));
+        assert!(!headless_isolated_test_requested_with_env(true, Some("0")));
+        assert!(!headless_isolated_test_requested_with_env(true, None));
+    }
+
+    #[test]
+    fn webview2_profile_selection_preserves_caller_override_and_isolates_launch_modes() {
+        let release = PathBuf::from(r"C:\Users\tester\AppData\Local\Atoapi\webview2-udf-v2");
+        assert_eq!(
+            webview2_profile_for_launch(true, false, None, 42, Some(release.clone())),
+            None,
+            "an explicit caller profile must never be replaced"
+        );
+        assert_eq!(
+            webview2_profile_for_launch(false, false, None, 42, Some(release.clone())),
+            Some(release.clone()),
+            "normal releases must use the stable local v2 profile"
+        );
+        assert_ne!(
+            release.file_name().and_then(|value| value.to_str()),
+            Some("local.atoapi.desktop"),
+            "the new normal profile must not reuse Tauri's legacy default"
+        );
+        assert_eq!(
+            webview2_profile_for_launch(false, true, Some(18883), 42, Some(release)),
+            Some(std::env::temp_dir().join("atoapi-isolated-webview2-18883-42")),
+            "isolated validation must remain per-port and per-process"
+        );
+        assert_eq!(
+            webview2_profile_for_launch(false, false, None, 42, None),
+            None,
+            "an unavailable local directory must fail open to Tauri's default"
+        );
     }
 }

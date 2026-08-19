@@ -1062,6 +1062,7 @@ pub async fn probe_provider_cache_capabilities(
         input.provider_id.trim(),
         input.model_id.trim(),
         input.channel,
+        input.fields,
     )
     .await
     .map_err(to_command_error)
