@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     fs::OpenOptions,
     io::Write,
@@ -61,6 +61,27 @@ pub struct CacheEntry {
     pub workspace_fingerprint: Option<String>,
 }
 
+/// The semantic matcher can only compare entries from the same provider,
+/// model, workspace, and request shape. Keep that partition as an index so a
+/// cache miss does not scan every retained response before dispatching
+/// upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SemanticCacheScope {
+    provider_id: String,
+    model: String,
+    workspace_fingerprint: String,
+    semantic_shape: String,
+}
+
+fn semantic_cache_scope(entry: &CacheEntry) -> Option<SemanticCacheScope> {
+    Some(SemanticCacheScope {
+        provider_id: entry.provider_id.clone(),
+        model: entry.model.clone(),
+        workspace_fingerprint: entry.workspace_fingerprint.clone()?,
+        semantic_shape: entry.semantic_shape.clone()?,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheLookup {
     pub entry: CacheEntry,
@@ -77,6 +98,7 @@ pub enum CacheLookupStatus {
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     entries: Arc<RwLock<HashMap<String, Arc<CacheEntry>>>>,
+    semantic_index: Arc<RwLock<HashMap<SemanticCacheScope, HashSet<String>>>>,
     // Maintained under the entries write lock. Keeping the total incrementally
     // avoids rescanning a large cache for every ordinary insert.
     retained_bytes: Arc<AtomicUsize>,
@@ -236,6 +258,7 @@ impl CacheStore {
         let store = Self {
             persistence: CacheWriteCoordinator::new(path.clone()),
             entries,
+            semantic_index: Arc::new(RwLock::new(HashMap::new())),
             retained_bytes: Arc::new(AtomicUsize::new(0)),
             path,
             #[cfg(test)]
@@ -261,6 +284,7 @@ impl CacheStore {
     ) -> Result<Self> {
         Ok(Self {
             entries: Arc::new(RwLock::new(HashMap::new())),
+            semantic_index: Arc::new(RwLock::new(HashMap::new())),
             retained_bytes: Arc::new(AtomicUsize::new(0)),
             path,
             persistence: CacheWriteCoordinator::new_with_job(write_job),
@@ -315,15 +339,19 @@ impl CacheStore {
             }
         }
         let retained_bytes = cache_entries_retained_bytes(&loaded);
+        let mut removed_keys = Vec::new();
         let retained_bytes = trim_cache_entries(
             &mut loaded,
             usize::MAX,
             MAX_RESPONSE_CACHE_BYTES,
             RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
             retained_bytes,
+            &mut removed_keys,
         );
         let mut guard = self.entries.write().await;
         *guard = loaded;
+        let mut semantic_index = self.semantic_index.write().await;
+        *semantic_index = build_semantic_index(&guard);
         self.retained_bytes.store(retained_bytes, Ordering::Release);
         // A previous file only survives when the process stopped after the new
         // snapshot was promoted but before cleanup. Remove it only after the
@@ -365,26 +393,36 @@ impl CacheStore {
         if config.semantic_enabled {
             if let (Some(query_text), Some(query_shape)) = (semantic_text, semantic_shape) {
                 let now = Utc::now();
-                let guard = self.entries.read().await;
+                // Writers update the source map and index under the same lock
+                // order. Keep the source read lock while consulting the index
+                // so a concurrent clear or replacement cannot expose stale
+                // semantic candidates.
+                let _entries_guard = self.entries.read().await;
+                let guard = self.semantic_index.read().await;
                 let query_vector = hashed_ngram_embedding(query_text);
                 let mut best: Option<(f32, CacheEntry)> = None;
-                for entry in guard.values().filter(|entry| entry.expires_at > now) {
-                    if entry.provider_id != provider_id
-                        || entry.model != model
-                        || entry.workspace_fingerprint.as_deref() != Some(workspace_fingerprint)
-                        || entry.semantic_shape.as_deref() != Some(query_shape)
-                    {
+                let scope = SemanticCacheScope {
+                    provider_id: provider_id.to_string(),
+                    model: model.to_string(),
+                    workspace_fingerprint: workspace_fingerprint.to_string(),
+                    semantic_shape: query_shape.to_string(),
+                };
+                for key in guard.get(&scope).into_iter().flat_map(HashSet::iter) {
+                    let Some(entry) = _entries_guard.get(key) else {
+                        continue;
+                    };
+                    if entry.expires_at <= now {
                         continue;
                     }
                     let Some(entry_text) = entry.semantic_text.as_deref() else {
                         continue;
                     };
-                    let entry_vector = if entry.semantic_vector.is_empty() {
-                        hashed_ngram_embedding(entry_text)
+                    let score = if entry.semantic_vector.is_empty() {
+                        let entry_vector = hashed_ngram_embedding(entry_text);
+                        cosine_similarity(&query_vector, &entry_vector)
                     } else {
-                        entry.semantic_vector.clone()
+                        cosine_similarity(&query_vector, &entry.semantic_vector)
                     };
-                    let score = cosine_similarity(&query_vector, &entry_vector);
                     if score >= config.semantic_threshold
                         && best.as_ref().map(|(best, _)| score > *best).unwrap_or(true)
                     {
@@ -435,23 +473,32 @@ impl CacheStore {
             ensure_semantic_vector(entry);
         }
         let mut guard = self.entries.write().await;
+        let mut semantic_index = self.semantic_index.write().await;
         let mut persistence_gate = self.persistence.begin_mutation()?;
         let mut retained_bytes = self.retained_bytes.load(Ordering::Acquire);
         for entry in entries.into_iter().filter(cache_entry_fits_budget) {
             let entry_bytes = cache_entry_retained_bytes(&entry);
-            if let Some(previous) = guard.insert(entry.key.clone(), Arc::new(entry)) {
+            let entry = Arc::new(entry);
+            if let Some(previous) = guard.insert(entry.key.clone(), entry.clone()) {
                 retained_bytes =
                     retained_bytes.saturating_sub(cache_entry_retained_bytes(&previous));
+                remove_semantic_index_entry(&mut semantic_index, &previous);
             }
+            add_semantic_index_entry(&mut semantic_index, &entry);
             retained_bytes = retained_bytes.saturating_add(entry_bytes);
         }
+        let mut removed_keys = Vec::new();
         retained_bytes = trim_cache_entries(
             &mut guard,
             config.max_entries,
             MAX_RESPONSE_CACHE_BYTES,
             RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
             retained_bytes,
+            &mut removed_keys,
         );
+        for key in removed_keys {
+            remove_semantic_index_key(&mut semantic_index, &key);
+        }
         self.retained_bytes.store(retained_bytes, Ordering::Release);
         if config.persist_encrypted {
             let snapshot = guard.values().cloned().collect::<Vec<_>>();
@@ -469,8 +516,10 @@ impl CacheStore {
     pub async fn clear(&self) -> Result<()> {
         let version = {
             let mut entries = self.entries.write().await;
+            let mut semantic_index = self.semantic_index.write().await;
             let mut persistence_gate = self.persistence.begin_mutation()?;
             entries.clear();
+            semantic_index.clear();
             self.retained_bytes.store(0, Ordering::Release);
             #[cfg(test)]
             self.before_publication(WriteOperation::Delete);
@@ -528,12 +577,64 @@ fn cache_entries_retained_bytes(entries: &HashMap<String, Arc<CacheEntry>>) -> u
     })
 }
 
+fn build_semantic_index(
+    entries: &HashMap<String, Arc<CacheEntry>>,
+) -> HashMap<SemanticCacheScope, HashSet<String>> {
+    let mut index = HashMap::new();
+    for entry in entries.values() {
+        add_semantic_index_entry(&mut index, entry);
+    }
+    index
+}
+
+fn add_semantic_index_entry(
+    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    entry: &Arc<CacheEntry>,
+) {
+    let Some(scope) = semantic_cache_scope(entry) else {
+        return;
+    };
+    index.entry(scope).or_default().insert(entry.key.clone());
+}
+
+fn remove_semantic_index_entry(
+    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    entry: &CacheEntry,
+) {
+    let Some(scope) = semantic_cache_scope(entry) else {
+        return;
+    };
+    remove_semantic_index_key_from_scope(index, &scope, &entry.key);
+}
+
+fn remove_semantic_index_key(index: &mut HashMap<SemanticCacheScope, HashSet<String>>, key: &str) {
+    let scopes = index.keys().cloned().collect::<Vec<_>>();
+    for scope in scopes {
+        remove_semantic_index_key_from_scope(index, &scope, key);
+    }
+}
+
+fn remove_semantic_index_key_from_scope(
+    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    scope: &SemanticCacheScope,
+    key: &str,
+) {
+    let remove_scope = index.get_mut(scope).is_some_and(|entries| {
+        entries.remove(key);
+        entries.is_empty()
+    });
+    if remove_scope {
+        index.remove(scope);
+    }
+}
+
 fn trim_cache_entries(
     entries: &mut HashMap<String, Arc<CacheEntry>>,
     max_entries: usize,
     max_bytes: usize,
     reclaim_target_bytes: usize,
     mut retained_bytes: usize,
+    removed_keys: &mut Vec<String>,
 ) -> usize {
     if entries.len() <= max_entries && retained_bytes <= max_bytes {
         return retained_bytes;
@@ -551,6 +652,7 @@ fn trim_cache_entries(
     for (key, entry_bytes) in expired {
         if entries.remove(&key).is_some() {
             retained_bytes = retained_bytes.saturating_sub(entry_bytes);
+            removed_keys.push(key);
         }
     }
     if entries.len() <= max_entries && retained_bytes <= max_bytes {
@@ -579,6 +681,7 @@ fn trim_cache_entries(
         }
         if entries.remove(&key).is_some() {
             retained_bytes = retained_bytes.saturating_sub(entry_bytes);
+            removed_keys.push(key);
         }
     }
     retained_bytes
@@ -840,11 +943,18 @@ pub fn is_cache_eligible(request: &Value) -> bool {
 }
 
 pub fn is_fuzzy_cache_safe(request: &Value) -> bool {
+    fuzzy_cache_text(request).is_some()
+}
+
+/// Returns the semantic text only when the request passes the conservative
+/// fuzzy-cache safety policy. Callers that need both the decision and the text
+/// can therefore avoid traversing a large request twice.
+pub fn fuzzy_cache_text(request: &Value) -> Option<String> {
     if has_tool_or_function_context(request) {
-        return false;
+        return None;
     }
     let Some(text) = semantic_text(request) else {
-        return false;
+        return None;
     };
     let lower = text.to_lowercase();
     let risk_text = format!(
@@ -888,7 +998,7 @@ pub fn is_fuzzy_cache_safe(request: &Value) -> bool {
         .iter()
         .any(|marker| risk_text.contains(marker) || lower.contains(marker))
     {
-        return false;
+        return None;
     }
     let cjk_risk_markers = [
         "不要",
@@ -908,10 +1018,10 @@ pub fn is_fuzzy_cache_safe(request: &Value) -> bool {
         "当前",
     ];
     if cjk_risk_markers.iter().any(|marker| text.contains(marker)) {
-        return false;
+        return None;
     }
     if text.lines().any(|line| line.len() > 240) {
-        return false;
+        return None;
     }
 
     let total = text.chars().count().max(1);
@@ -924,7 +1034,7 @@ pub fn is_fuzzy_cache_safe(request: &Value) -> bool {
             )
         })
         .count();
-    syntax * 100 / total < 8
+    (syntax * 100 / total < 8).then_some(text)
 }
 
 fn has_tool_or_function_context(value: &Value) -> bool {
@@ -1356,12 +1466,14 @@ mod tests {
         ]);
 
         let total_bytes = cache_entries_retained_bytes(&entries);
+        let mut removed_keys = Vec::new();
         let retained_bytes = trim_cache_entries(
             &mut entries,
             usize::MAX,
             oldest_bytes + middle_bytes + newest_bytes - 1,
             newest_bytes,
             total_bytes,
+            &mut removed_keys,
         );
 
         assert_eq!(entries.len(), 1);

@@ -3042,7 +3042,11 @@ async fn run_generation_for_authorized_agent(
             }
 
             let mut cache_keys = vec![key];
-            let fuzzy_safe = cache::is_fuzzy_cache_safe(&client_request);
+            // Keep the safety decision and semantic text together. Both are
+            // derived from the same request traversal; re-running the text
+            // collector here needlessly adds work to the foreground path.
+            let fuzzy_text = cache::fuzzy_cache_text(&client_request);
+            let fuzzy_safe = fuzzy_text.is_some();
             if fuzzy_safe {
                 let near_exact_key = cache::near_exact_cache_key(
                     &key_material,
@@ -3076,7 +3080,7 @@ async fn run_generation_for_authorized_agent(
             }
             let metrics_cache_key = metrics_cache_key(&cache_keys);
             let semantic_text = if config.cache.semantic_enabled && fuzzy_safe {
-                cache::semantic_text(&client_request)
+                fuzzy_text
             } else {
                 None
             };
