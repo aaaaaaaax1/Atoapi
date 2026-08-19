@@ -942,6 +942,7 @@ pub fn is_cache_eligible(request: &Value) -> bool {
     temperature <= 0.3 && !has_no_store
 }
 
+#[allow(dead_code)]
 pub fn is_fuzzy_cache_safe(request: &Value) -> bool {
     fuzzy_cache_text(request).is_some()
 }
