@@ -477,7 +477,6 @@ const bridgeSource = String.raw`
         : "";
     }
     setKeyPoolEnabled(detail?.key_pool?.enabled === true);
-    applyCacheValidation(detail);
     applyNetworkDiagnostic(detail?.network_diagnostic);
     renderModelCandidates();
     renderMappings();
@@ -695,66 +694,6 @@ const bridgeSource = String.raw`
         recovery_minutes: Number(detail?.key_pool?.recovery_minutes) || 10
       }
     };
-  }
-
-  function cacheValidationModelId() {
-    const input = $bridge("#providerCacheValidationModelInput");
-    return String(input?.value || mappings[0]?.actual || "").trim();
-  }
-
-  function ensureCacheValidationPanel() {
-    const existing = $bridge("#providerCacheValidationSection");
-    if (existing) return existing;
-    const transport = $bridge("#providerTransport");
-    if (!transport) return null;
-    const section = document.createElement("div");
-    section.className = "form-section";
-    section.id = "providerCacheValidationSection";
-    section.innerHTML = '<div class="form-section-head"><div><h3>缓存规则验证</h3><p>仅在手动点击时探测；普通转发不会附加缓存键或增加请求。</p></div></div>'
-      + '<div class="compatibility-model-control"><div class="field wide compatibility-model-field"><label for="providerCacheValidationModelInput">实际模型 ID</label><span class="compatibility-model-input-row"><input id="providerCacheValidationModelInput" list="providerModelCandidates" placeholder="选择已获取模型或直接输入" autocomplete="off" spellcheck="false" /><button class="secondary-button" id="fetchCacheValidationModelsButton" type="button"><i class="icon" data-lucide="refresh-cw"></i>获取模型</button></span><small>先探测字段支持，再依次运行基线与候选；候选每次只验证一个字段。</small></div></div>'
-      + '<div class="status-band" id="providerCacheValidationStatus"><span class="status-icon"><i class="icon" data-lucide="shield-check"></i></span><div><b>尚未验证</b><small>选择实际模型后手动探测缓存字段。</small></div><button class="secondary-button" id="probeCacheCapabilitiesButton" type="button"><i class="icon" data-lucide="scan-search"></i>探测字段</button></div>'
-      + '<div class="key-pool-actions"><button class="secondary-button" id="startCacheBaselineButton" type="button">基线</button><button class="secondary-button" id="startCacheCandidateButton" type="button">候选</button><button class="secondary-button" id="stopCacheValidationButton" type="button">停止</button></div>';
-    transport.append(section);
-    return section;
-  }
-
-  function applyCacheValidation(detail) {
-    const section = ensureCacheValidationPanel();
-    if (!section) return;
-    const modelInput = $bridge("#providerCacheValidationModelInput", section);
-    if (modelInput && !modelInput.value) modelInput.value = mappings[0]?.actual || detail?.models?.[0]?.id || "";
-    const modelId = cacheValidationModelId();
-    const validation = host.state?.cacheValidation || {};
-    const providerId = selectedProviderId();
-    const active = validation.mode && validation.mode !== "auto" && validation.provider_id === providerId && validation.model === modelId;
-    const records = (detail?.cache_capabilities || []).filter((record) => record.model_id === modelId);
-    const accepted = records.filter((record) => record.status === "verified");
-    const baselineReady = validation?.baseline_reference?.provider_id === providerId
-      && validation?.baseline_reference?.model === modelId
-      && validation?.baseline_reference?.completion_reason === "target_reached";
-    const status = $bridge("#providerCacheValidationStatus", section);
-    const title = status?.querySelector("b");
-    const detailText = status?.querySelector("small");
-    const success = Number(validation.successful_requests || 0);
-    const usage = Number(validation.usage_observations || 0);
-    const inputTokens = Number(validation.input_tokens || 0);
-    if (title) title.textContent = active
-      ? (validation.mode === "baseline" ? "正在记录基线" : "正在验证候选")
-      : accepted.length ? "字段已探测" : "尚未验证";
-    if (detailText) {
-      if (active) detailText.textContent = usage + "/" + (validation.target_successful_requests || 50) + " 条真实 usage · " + inputTokens.toLocaleString("zh-CN") + "/" + Number(validation.target_input_tokens || 5000000).toLocaleString("zh-CN") + " tokens";
-      else if (baselineReady) detailText.textContent = "基线已完成，可开始候选；候选仅测试一个已探测字段。";
-      else if (accepted.length) detailText.textContent = "已探测 " + accepted.length + " 个字段；先完成基线后才可启动候选。";
-      else detailText.textContent = modelId ? "先探测字段支持；探测结果不会自动改变普通请求。" : "选择实际模型后手动探测缓存字段。";
-    }
-    const probe = $bridge("#probeCacheCapabilitiesButton", section);
-    const baseline = $bridge("#startCacheBaselineButton", section);
-    const candidate = $bridge("#startCacheCandidateButton", section);
-    const stop = $bridge("#stopCacheValidationButton", section);
-    if (probe) probe.disabled = !modelId || active;
-    if (baseline) baseline.disabled = !modelId || active;
-    if (candidate) candidate.disabled = !modelId || active || !baselineReady || !accepted.length;
-    if (stop) stop.disabled = !active;
   }
 
   function applyNetworkDiagnostic(diagnostic) {
@@ -1232,7 +1171,6 @@ const bridgeSource = String.raw`
       renderAll();
     }
     applyMetrics(nextState);
-    applyCacheValidation(host.state?.providerDetails?.[selectedProviderId()] || {});
     applySettings(nextState);
     applyProxyStatus(nextState);
     syncTrendController(true);
@@ -1516,24 +1454,6 @@ const bridgeSource = String.raw`
     if (target.id === "saveProviderButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("save-provider", serializeEditor()); return;
     }
-    if (target.id === "fetchCacheValidationModelsButton") {
-      event.preventDefault(); event.stopImmediatePropagation(); send("fetch-models", { provider: serializeEditor() }); return;
-    }
-    if (target.id === "probeCacheCapabilitiesButton") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      send("probe-cache-capabilities", { providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
-    }
-    if (target.id === "startCacheBaselineButton") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      send("set-cache-validation", { mode: "baseline", providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
-    }
-    if (target.id === "startCacheCandidateButton") {
-      event.preventDefault(); event.stopImmediatePropagation();
-      send("set-cache-validation", { mode: "candidate", providerId: selectedProviderId(), modelId: cacheValidationModelId() }); return;
-    }
-    if (target.id === "stopCacheValidationButton") {
-      event.preventDefault(); event.stopImmediatePropagation(); send("set-cache-validation", { mode: "auto" }); return;
-    }
     if (target.id === "addKeyButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBlankKey(); return;
     }
@@ -1611,9 +1531,6 @@ const bridgeSource = String.raw`
       target.removeAttribute("data-saved-secret");
       const key = keyPool.find((item) => item.id === target.dataset.keySecret);
       if (key) key.hasSavedSecret = false;
-    }
-    if (target.id === "providerCacheValidationModelInput") {
-      applyCacheValidation(host.state?.providerDetails?.[selectedProviderId()] || {});
     }
   }, true);
 

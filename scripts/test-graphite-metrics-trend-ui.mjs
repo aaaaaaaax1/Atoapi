@@ -237,15 +237,10 @@ assert.doesNotMatch(
   /probe-session-reuse|set-session-reuse|compatibilityModelId/,
   "the Graphite bridge must not retain automatic or manual session-reuse qualification actions"
 );
-assert.match(
+assert.doesNotMatch(
   host,
-  /const transport = \$bridge\("#providerTransport"\)/,
-  "cache validation must target the transport-and-cache panel after removing session reuse"
-);
-assert.match(
-  host,
-  /transport\.append\(section\)/,
-  "cache validation must remain available after removing session reuse"
+  /providerCacheValidation|probeCacheCapabilitiesButton|startCacheBaselineButton|startCacheCandidateButton|stopCacheValidationButton/,
+  "manual cache validation controls must not remain in the ordinary provider editor"
 );
 
 assert.match(
