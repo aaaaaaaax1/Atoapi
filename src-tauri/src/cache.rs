@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     fs::OpenOptions,
     io::Write,
@@ -98,7 +98,9 @@ pub enum CacheLookupStatus {
 #[derive(Debug, Clone)]
 pub struct CacheStore {
     entries: Arc<RwLock<HashMap<String, Arc<CacheEntry>>>>,
-    semantic_index: Arc<RwLock<HashMap<SemanticCacheScope, HashSet<String>>>>,
+    // Keep references to the retained entries instead of duplicating every
+    // cache key as a second owned String in a per-scope hash set.
+    semantic_index: Arc<RwLock<HashMap<SemanticCacheScope, Vec<Arc<CacheEntry>>>>>,
     // Maintained under the entries write lock. Keeping the total incrementally
     // avoids rescanning a large cache for every ordinary insert.
     retained_bytes: Arc<AtomicUsize>,
@@ -339,14 +341,14 @@ impl CacheStore {
             }
         }
         let retained_bytes = cache_entries_retained_bytes(&loaded);
-        let mut removed_keys = Vec::new();
+        let mut removed_entries = Vec::new();
         let retained_bytes = trim_cache_entries(
             &mut loaded,
             usize::MAX,
             MAX_RESPONSE_CACHE_BYTES,
             RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
             retained_bytes,
-            &mut removed_keys,
+            &mut removed_entries,
         );
         let mut guard = self.entries.write().await;
         *guard = loaded;
@@ -407,10 +409,7 @@ impl CacheStore {
                     workspace_fingerprint: workspace_fingerprint.to_string(),
                     semantic_shape: query_shape.to_string(),
                 };
-                for key in guard.get(&scope).into_iter().flat_map(HashSet::iter) {
-                    let Some(entry) = _entries_guard.get(key) else {
-                        continue;
-                    };
+                for entry in guard.get(&scope).into_iter().flatten() {
                     if entry.expires_at <= now {
                         continue;
                     }
@@ -487,17 +486,17 @@ impl CacheStore {
             add_semantic_index_entry(&mut semantic_index, &entry);
             retained_bytes = retained_bytes.saturating_add(entry_bytes);
         }
-        let mut removed_keys = Vec::new();
+        let mut removed_entries = Vec::new();
         retained_bytes = trim_cache_entries(
             &mut guard,
             config.max_entries,
             MAX_RESPONSE_CACHE_BYTES,
             RESPONSE_CACHE_BYTES_RECLAIM_TARGET,
             retained_bytes,
-            &mut removed_keys,
+            &mut removed_entries,
         );
-        for key in removed_keys {
-            remove_semantic_index_key(&mut semantic_index, &key);
+        for entry in removed_entries {
+            remove_semantic_index_entry(&mut semantic_index, entry.as_ref());
         }
         self.retained_bytes.store(retained_bytes, Ordering::Release);
         if config.persist_encrypted {
@@ -579,7 +578,7 @@ fn cache_entries_retained_bytes(entries: &HashMap<String, Arc<CacheEntry>>) -> u
 
 fn build_semantic_index(
     entries: &HashMap<String, Arc<CacheEntry>>,
-) -> HashMap<SemanticCacheScope, HashSet<String>> {
+) -> HashMap<SemanticCacheScope, Vec<Arc<CacheEntry>>> {
     let mut index = HashMap::new();
     for entry in entries.values() {
         add_semantic_index_entry(&mut index, entry);
@@ -588,17 +587,17 @@ fn build_semantic_index(
 }
 
 fn add_semantic_index_entry(
-    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    index: &mut HashMap<SemanticCacheScope, Vec<Arc<CacheEntry>>>,
     entry: &Arc<CacheEntry>,
 ) {
     let Some(scope) = semantic_cache_scope(entry) else {
         return;
     };
-    index.entry(scope).or_default().insert(entry.key.clone());
+    index.entry(scope).or_default().push(entry.clone());
 }
 
 fn remove_semantic_index_entry(
-    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    index: &mut HashMap<SemanticCacheScope, Vec<Arc<CacheEntry>>>,
     entry: &CacheEntry,
 ) {
     let Some(scope) = semantic_cache_scope(entry) else {
@@ -607,20 +606,13 @@ fn remove_semantic_index_entry(
     remove_semantic_index_key_from_scope(index, &scope, &entry.key);
 }
 
-fn remove_semantic_index_key(index: &mut HashMap<SemanticCacheScope, HashSet<String>>, key: &str) {
-    let scopes = index.keys().cloned().collect::<Vec<_>>();
-    for scope in scopes {
-        remove_semantic_index_key_from_scope(index, &scope, key);
-    }
-}
-
 fn remove_semantic_index_key_from_scope(
-    index: &mut HashMap<SemanticCacheScope, HashSet<String>>,
+    index: &mut HashMap<SemanticCacheScope, Vec<Arc<CacheEntry>>>,
     scope: &SemanticCacheScope,
     key: &str,
 ) {
     let remove_scope = index.get_mut(scope).is_some_and(|entries| {
-        entries.remove(key);
+        entries.retain(|entry| entry.key != key);
         entries.is_empty()
     });
     if remove_scope {
@@ -634,7 +626,7 @@ fn trim_cache_entries(
     max_bytes: usize,
     reclaim_target_bytes: usize,
     mut retained_bytes: usize,
-    removed_keys: &mut Vec<String>,
+    removed_entries: &mut Vec<Arc<CacheEntry>>,
 ) -> usize {
     if entries.len() <= max_entries && retained_bytes <= max_bytes {
         return retained_bytes;
@@ -650,9 +642,9 @@ fn trim_cache_entries(
         .map(|(key, entry)| (key.clone(), cache_entry_retained_bytes(entry)))
         .collect::<Vec<_>>();
     for (key, entry_bytes) in expired {
-        if entries.remove(&key).is_some() {
+        if let Some(entry) = entries.remove(&key) {
             retained_bytes = retained_bytes.saturating_sub(entry_bytes);
-            removed_keys.push(key);
+            removed_entries.push(entry);
         }
     }
     if entries.len() <= max_entries && retained_bytes <= max_bytes {
@@ -679,9 +671,9 @@ fn trim_cache_entries(
         if entries.len() <= max_entries && retained_bytes <= target_bytes {
             break;
         }
-        if entries.remove(&key).is_some() {
+        if let Some(entry) = entries.remove(&key) {
             retained_bytes = retained_bytes.saturating_sub(entry_bytes);
-            removed_keys.push(key);
+            removed_entries.push(entry);
         }
     }
     retained_bytes
@@ -1467,14 +1459,14 @@ mod tests {
         ]);
 
         let total_bytes = cache_entries_retained_bytes(&entries);
-        let mut removed_keys = Vec::new();
+        let mut removed_entries = Vec::new();
         let retained_bytes = trim_cache_entries(
             &mut entries,
             usize::MAX,
             oldest_bytes + middle_bytes + newest_bytes - 1,
             newest_bytes,
             total_bytes,
-            &mut removed_keys,
+            &mut removed_entries,
         );
 
         assert_eq!(entries.len(), 1);
