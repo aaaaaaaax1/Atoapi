@@ -1759,8 +1759,11 @@ function buildCompactedSummary(targetChars, suffix) {
   return line.repeat(Math.ceil(targetChars / line.length)).slice(0, targetChars);
 }
 
-async function getJson(url, timeout = 15_000) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeout) });
+async function getJson(url, timeout = 15_000, localKey = runtime?.localKey) {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(timeout)
+  });
   if (!response.ok) throw new Error(`GET ${url} failed: HTTP ${response.status}`);
   return response.json();
 }

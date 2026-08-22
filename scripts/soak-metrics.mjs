@@ -4,6 +4,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const args = parseArgs(process.argv.slice(2));
 const baseUrl = String(args.url ?? "http://127.0.0.1:3456").replace(/\/+$/u, "");
+const localKey = String(args.key ?? process.env.ATOAPI_LOCAL_KEY ?? "").trim();
 const intervalMs = Number(args.interval ?? 10_000);
 const targetInputTokens = Number(args.tokens ?? 50_000_000);
 const maxMinutes = Number(args.minutes ?? 120);
@@ -13,6 +14,10 @@ fs.mkdirSync(outDir, { recursive: true });
 
 const jsonlFile = path.join(outDir, `real-soak-${label}.jsonl`);
 const summaryFile = path.join(outDir, `real-soak-${label}-summary.json`);
+
+if (!localKey) {
+  throw new Error("Set ATOAPI_LOCAL_KEY or pass --key to read protected /admin/metrics.");
+}
 
 const startedAt = Date.now();
 let first = null;
@@ -25,7 +30,7 @@ console.log(
 console.log(`Writing ${jsonlFile}`);
 
 while (true) {
-  const snapshot = await fetchMetrics(baseUrl);
+  const snapshot = await fetchMetrics(baseUrl, localKey);
   const compact = compactSnapshot(snapshot);
   samples += 1;
   if (!first) first = compact;
@@ -69,8 +74,10 @@ function parseArgs(items) {
   return parsed;
 }
 
-async function fetchMetrics(url) {
-  const response = await fetch(`${url}/admin/metrics`);
+async function fetchMetrics(url, key) {
+  const response = await fetch(`${url}/admin/metrics`, {
+    headers: { authorization: `Bearer ${key}` }
+  });
   if (!response.ok) {
     throw new Error(`GET /admin/metrics failed: HTTP ${response.status}`);
   }

@@ -985,9 +985,12 @@ function Resolve-LiveCodexScope {
 
     $configPath = Join-Path $ConfigDir 'config.toml'
     $toml = Get-Content -LiteralPath $configPath -Raw
-    $localKey = Get-TomlScalar -Block $toml -Name 'local_key'
+    $localKey = (Get-TomlScalar -Block $toml -Name 'local_key').Trim()
+    if ([string]::IsNullOrWhiteSpace($localKey)) {
+        throw 'The saved config has no local_key; live metrics verification cannot authenticate safely.'
+    }
     $workspaceFingerprint = Get-TomlScalar -Block $toml -Name 'workspace_fingerprint'
-    $metrics = Invoke-RestMethod -Uri 'http://127.0.0.1:18883/admin/metrics' -Method Get -TimeoutSec 8
+    $metrics = Invoke-RestMethod -Uri 'http://127.0.0.1:18883/admin/metrics' -Method Get -Headers @{ Authorization = "Bearer $localKey" } -TimeoutSec 8
     $live = Get-LatestCodexMainRecord -Metrics $metrics
     if ($null -eq $live) {
         throw 'No recent terminal Codex main request is available; live comparison is refused.'

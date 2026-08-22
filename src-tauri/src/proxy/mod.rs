@@ -28,7 +28,8 @@ use anyhow::{anyhow, Context, Result};
 use axum::{
     body::{to_bytes, Body},
     extract::{DefaultBodyLimit, Path, Request, State as AxumState},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -173,7 +174,6 @@ const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_LIMIT: usize = 1_024;
 const REDACTED_CLIENT_PROMPT_CACHE_KEY: &str = "[redacted prompt_cache_key]";
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REASONING_EFFORT_REJECTION_LIMIT: usize = 2_048;
-const PROXY_TOKEN_PLACEHOLDER: &str = "PROXY_MANAGED";
 const X_CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
@@ -951,8 +951,43 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v1/messages", post(messages))
         .layer(DefaultBodyLimit::max(200 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            preauthorize_generation_request,
+        ))
         .with_state(state)
 }
+
+/// Reject invalid remote generation requests before Axum's `Bytes` extractor
+/// buffers a potentially large full-replay body. The handlers repeat the
+/// authorization check after extraction so this guard is only a resource
+/// boundary, not a second authorization policy.
+async fn preauthorize_generation_request(
+    AxumState(state): AxumState<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if request.method() != Method::POST
+        || !(path.starts_with("/v1/") || path.starts_with("/codex/v1/"))
+    {
+        return next.run(request).await;
+    }
+    let forced_agent_id = path.starts_with("/codex/").then_some("codex");
+    if let Err(response) = authorize_for_agent(&state, request.headers(), forced_agent_id).await {
+        let body = request.into_body();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(TokioDuration::from_secs(2), async move {
+                let mut stream = body.into_data_stream();
+                while stream.next().await.is_some() {}
+            })
+            .await;
+        });
+        return response;
+    }
+    next.run(request).await
+}
+
 async fn health() -> impl IntoResponse {
     Json(json!({
         "ok": true,
@@ -960,25 +995,53 @@ async fn health() -> impl IntoResponse {
         "time": Utc::now()
     }))
 }
-async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.metrics.snapshot().await)
+async fn admin_metrics(AxumState(state): AxumState<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    Json(state.metrics.snapshot().await).into_response()
 }
 
-async fn admin_final_scope_shadow(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.final_scope_observations.snapshot())
+async fn admin_final_scope_shadow(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    Json(state.final_scope_observations.snapshot()).into_response()
 }
-async fn admin_cache_validation(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.cache_validation.lock().await.status(Utc::now()))
+async fn admin_cache_validation(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
+    Json(state.cache_validation.lock().await.status(Utc::now())).into_response()
 }
 
-async fn admin_cache_affinity(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+async fn admin_cache_affinity(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
     let mut store = state.shadow_affinity.lock().await;
     Json(cache_affinity::post_burst_evidence_status(
         &mut store,
         Utc::now(),
     ))
+    .into_response()
 }
-async fn admin_cache_capabilities(AxumState(state): AxumState<Arc<AppState>>) -> impl IntoResponse {
+async fn admin_cache_capabilities(
+    AxumState(state): AxumState<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = authorize_admin(&state, &headers).await {
+        return response;
+    }
     Json(
         state
             .config
@@ -987,6 +1050,7 @@ async fn admin_cache_capabilities(AxumState(state): AxumState<Arc<AppState>>) ->
             .provider_cache_capabilities
             .clone(),
     )
+    .into_response()
 }
 
 async fn admin_release_champion_status(
@@ -3440,6 +3504,25 @@ async fn run_generation_for_authorized_agent(
                 );
             }
         }
+    }
+    // Codex can also regenerate the Responses item id while a streamed turn
+    // is being interrupted and replayed.  A provider validates the root item
+    // namespace independently from `call_id` (`ctc_`/`ctco_` for custom
+    // tools, `fc_`/`fco_` for function tools).  Repair only the known
+    // namespace mismatch on a trusted native FullReplay; arbitrary caller
+    // ids and external continuations remain untouched.
+    let native_codex_full_replay_is_proven = (local_response_session_recovered_unambiguously
+        || full_replay_after_local_lineage
+        || local_tool_id_rebind_applied)
+        && !full_replay_ambiguous_local_lineage
+        && !stale_external_continuation_after_route_switch;
+    if native_responses_passthrough
+        && trusted_codex_metadata.is_some()
+        && native_codex_full_replay_is_proven
+        && final_body_has_no_external_previous_response_id
+        && !response_session_starts_compaction_epoch
+    {
+        normalize_native_codex_tool_item_id_prefixes(&mut upstream_body);
     }
     let full_response_input = upstream_body.get("input").cloned();
     let tail_input_analysis = analyze_tail_input_for_session(
@@ -12991,8 +13074,7 @@ async fn authorize_for_agent(
             return Ok(Some(agent.id.clone()));
         }
         let scoped_key = agent_injection::agent_local_key(&config.local_key, &agent.id);
-        let accepted = presented_key == Some(PROXY_TOKEN_PLACEHOLDER)
-            || presented_key == Some(config.local_key.as_str())
+        let accepted = presented_key == Some(config.local_key.as_str())
             || presented_key == Some(scoped_key.as_str());
         if accepted {
             return Ok(Some(agent.id.clone()));
@@ -13021,7 +13103,10 @@ async fn authorize_for_agent(
 async fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let config = state.config.read().await;
     if config.local_key.trim().is_empty() {
-        return Ok(());
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "local administration key is not configured",
+        ));
     }
     let presented_key = headers
         .get(header::AUTHORIZATION)
@@ -14281,12 +14366,13 @@ struct NativeCodexReplayedToolIdRebindPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NativeCodexReplayedToolIdReplacement {
     index: usize,
+    expected_current_item_id: Option<String>,
     expected_current_call_id: String,
 }
 
 /// Build a read-only rebind plan only when the current input is a proven
 /// append-only replay of a prior local wire and every affected top-level tool
-/// item is identical except for its root `call_id`. Unknown/nested link
+/// item is identical except for its root `id`/`call_id`. Unknown/nested link
 /// fields, duplicate ids, missing outputs or any content drift fail open.
 ///
 /// The plan owns only the small set of changed item indexes and opaque call
@@ -14331,10 +14417,11 @@ fn plan_native_codex_replayed_tool_id_rebind(
             )
             || native_codex_item_has_unsafe_tool_link(previous)
             || native_codex_item_has_unsafe_tool_link(current)
-            || !native_codex_items_equal_ignoring_root_call_id(previous, current)
+            || !native_codex_items_equal_ignoring_root_ids(previous, current)
         {
             return None;
         }
+        let current_item_id = native_codex_root_item_id(current).map(ToOwned::to_owned);
         let Some(prior_call_id) = native_codex_root_call_id(previous) else {
             return None;
         };
@@ -14363,6 +14450,7 @@ fn plan_native_codex_replayed_tool_id_rebind(
         changed_item_indexes.insert(index);
         replacements.push(NativeCodexReplayedToolIdReplacement {
             index,
+            expected_current_item_id: current_item_id,
             expected_current_call_id: current_call_id.to_string(),
         });
     }
@@ -14413,6 +14501,10 @@ fn apply_native_codex_replayed_tool_id_rebind_plan(
         if !planned_indexes.insert(replacement.index) {
             return false;
         }
+        let prior_item_id = previous_items
+            .get(replacement.index)
+            .and_then(native_codex_root_item_id)
+            .map(ToOwned::to_owned);
         let Some(prior_call_id) = previous_items
             .get(replacement.index)
             .and_then(native_codex_root_call_id)
@@ -14425,23 +14517,37 @@ fn apply_native_codex_replayed_tool_id_rebind_plan(
         else {
             return false;
         };
+        let current_item_id = current_items
+            .get(replacement.index)
+            .and_then(native_codex_root_item_id)
+            .map(ToOwned::to_owned);
+        if current_item_id != replacement.expected_current_item_id {
+            return false;
+        }
         if current_call_id != replacement.expected_current_call_id {
             return false;
         }
-        predecessor_call_ids.push(prior_call_id);
+        predecessor_call_ids.push((prior_item_id, prior_call_id.to_string()));
     }
 
-    for (replacement, prior_call_id) in plan.replacements.iter().zip(predecessor_call_ids) {
+    for (replacement, (prior_item_id, prior_call_id)) in
+        plan.replacements.iter().zip(predecessor_call_ids)
+    {
         let Some(item) = current_items.get_mut(replacement.index) else {
             return false;
         };
         let Some(item) = item.as_object_mut() else {
             return false;
         };
-        item.insert(
-            "call_id".to_string(),
-            Value::String(prior_call_id.to_string()),
-        );
+        match prior_item_id {
+            Some(item_id) => {
+                item.insert("id".to_string(), Value::String(item_id));
+            }
+            None => {
+                item.remove("id");
+            }
+        }
+        item.insert("call_id".to_string(), Value::String(prior_call_id));
     }
     true
 }
@@ -14472,21 +14578,94 @@ fn native_codex_root_call_id(item: &Value) -> Option<&str> {
     item.get("call_id").and_then(Value::as_str)
 }
 
-fn native_codex_items_equal_ignoring_root_call_id(left: &Value, right: &Value) -> bool {
+fn native_codex_root_item_id(item: &Value) -> Option<&str> {
+    item.get("id").and_then(Value::as_str)
+}
+
+fn native_codex_items_equal_ignoring_root_ids(left: &Value, right: &Value) -> bool {
     let (Some(left), Some(right)) = (left.as_object(), right.as_object()) else {
         return false;
     };
     let left_len = left
         .len()
-        .saturating_sub(usize::from(left.contains_key("call_id")));
+        .saturating_sub(usize::from(left.contains_key("call_id")))
+        .saturating_sub(usize::from(left.contains_key("id")));
     let right_len = right
         .len()
-        .saturating_sub(usize::from(right.contains_key("call_id")));
+        .saturating_sub(usize::from(right.contains_key("call_id")))
+        .saturating_sub(usize::from(right.contains_key("id")));
     left_len == right_len
         && left
             .iter()
-            .filter(|(key, _)| key.as_str() != "call_id")
+            .filter(|(key, _)| key.as_str() != "call_id" && key.as_str() != "id")
             .all(|(key, value)| right.get(key) == Some(value))
+}
+
+fn normalize_native_codex_tool_item_id_prefixes(request: &mut Value) -> usize {
+    let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let item_ids = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let existing_ids = item_ids.iter().cloned().collect::<HashSet<_>>();
+    if existing_ids.len() != item_ids.len() {
+        return 0;
+    }
+    let mut planned_ids = HashSet::new();
+    let mut repaired = 0usize;
+    for item in items {
+        if native_codex_item_has_unsafe_tool_link(item) {
+            continue;
+        }
+        let Some(object) = item.as_object_mut() else {
+            continue;
+        };
+        let Some(item_type) = object.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let expected_prefix = match item_type {
+            "function_call" => "fc_",
+            "function_call_output" => "fco_",
+            "custom_tool_call" => "ctc_",
+            "custom_tool_call_output" => "ctco_",
+            _ => continue,
+        };
+        let Some(current_id) = object.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if object
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            continue;
+        }
+        if current_id.starts_with(expected_prefix) {
+            continue;
+        }
+        let Some((_, suffix)) = ["fc_", "fco_", "ctc_", "ctco_"].iter().find_map(|prefix| {
+            current_id
+                .strip_prefix(prefix)
+                .map(|suffix| (*prefix, suffix))
+        }) else {
+            continue;
+        };
+        if suffix.is_empty() {
+            continue;
+        }
+        let repaired_id = format!("{expected_prefix}{suffix}");
+        if (existing_ids.contains(&repaired_id) && repaired_id != current_id)
+            || !planned_ids.insert(repaired_id.clone())
+        {
+            continue;
+        }
+        object.insert("id".to_string(), Value::String(repaired_id));
+        repaired += 1;
+    }
+    repaired
 }
 
 fn native_codex_item_has_unsafe_tool_link(item: &Value) -> bool {
@@ -19959,6 +20138,7 @@ mod tests {
         assert_eq!(epochs.len(), 2);
         let admin_snapshot: Value = client
             .get(format!("http://{proxy_addr}/admin/final-scope-shadow"))
+            .bearer_auth("private-local-key-sentinel")
             .send()
             .await
             .unwrap()
@@ -21933,6 +22113,10 @@ mod tests {
             Some(TokioDuration::ZERO),
             "the live Responses cache observer must have no foreground wait budget"
         );
+        assert!(
+            !responses_foreground_wait_enabled(),
+            "native Responses forwarding must never enable a foreground cache wait"
+        );
         assert_eq!(
             remaining_responses_prefix_wait_budget(TokioDuration::from_millis(300)),
             TokioDuration::from_millis(200)
@@ -22080,12 +22264,14 @@ mod tests {
     fn local_rebind_reallocated_call_ids_keep_narrow_material_tool_tail_suppression() {
         let previous = json!([
             {
+                "id": "fc-old",
                 "type": "function_call",
                 "call_id": "call-old",
                 "name": "read_file",
                 "arguments": "{\"path\":\"README.md\"}"
             },
             {
+                "id": "fco-old",
                 "type": "function_call_output",
                 "call_id": "call-old",
                 "output": "stable result"
@@ -22103,12 +22289,14 @@ mod tests {
         };
         let current = json!([
             {
+                "id": "fc-new",
                 "type": "function_call",
                 "call_id": "call-new",
                 "name": "read_file",
                 "arguments": "{\"path\":\"README.md\"}"
             },
             {
+                "id": "fco-new",
                 "type": "function_call_output",
                 "call_id": "call-new",
                 "output": "stable result"
@@ -22145,6 +22333,14 @@ mod tests {
         assert_eq!(
             replay.pointer("/input/1/call_id").and_then(Value::as_str),
             Some("call-old")
+        );
+        assert_eq!(
+            replay.pointer("/input/0/id").and_then(Value::as_str),
+            Some("fc-old")
+        );
+        assert_eq!(
+            replay.pointer("/input/1/id").and_then(Value::as_str),
+            Some("fco-old")
         );
         assert!(
             should_suppress_duplicate_local_full_replay_material_tail_wait(
@@ -22224,12 +22420,14 @@ mod tests {
 
         let custom_previous = json!([
             {
+                "id": "ctc-old",
                 "type": "custom_tool_call",
                 "call_id": "custom-old",
                 "name": "shell",
                 "input": "dir"
             },
             {
+                "id": "ctco-old",
                 "type": "custom_tool_call_output",
                 "call_id": "custom-old",
                 "output": {"stdout": "stable", "exit_code": 0}
@@ -22238,12 +22436,14 @@ mod tests {
         let mut custom_request = json!({
             "input": [
                 {
+                    "id": "fc-new",
                     "type": "custom_tool_call",
                     "call_id": "custom-fresh",
                     "name": "shell",
                     "input": "dir"
                 },
                 {
+                    "id": "fco-new",
                     "type": "custom_tool_call_output",
                     "call_id": "custom-fresh",
                     "output": {"stdout": "stable", "exit_code": 0}
@@ -22263,6 +22463,89 @@ mod tests {
             &custom_request["input"].as_array().unwrap()[..2],
             custom_previous.as_array().unwrap(),
             "applying the custom plan must restore the predecessor wire"
+        );
+
+        let mut namespace_repair = json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "fc_interrupted", "call_id": "call-interrupted", "name": "shell", "input": "dir"},
+                {"type": "custom_tool_call_output", "id": "fco_interrupted", "call_id": "call-interrupted", "output": "done"}
+            ]
+        });
+        assert_eq!(
+            normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair),
+            2
+        );
+        assert_eq!(
+            namespace_repair
+                .pointer("/input/0/id")
+                .and_then(Value::as_str),
+            Some("ctc_interrupted")
+        );
+        assert_eq!(
+            namespace_repair
+                .pointer("/input/1/id")
+                .and_then(Value::as_str),
+            Some("ctco_interrupted")
+        );
+
+        let mut namespace_repair_noop = json!({
+            "input": [
+                {"type": "function_call", "id": "fc_function", "call_id": "function-call"},
+                {"type": "function_call_output", "id": "fco_function", "call_id": "function-call"},
+                {"type": "custom_tool_call", "id": "vendor_custom", "call_id": "custom-call"},
+                {"type": "message", "id": "vendor_message", "role": "user", "content": "keep"}
+            ]
+        });
+        assert_eq!(
+            normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_noop),
+            0
+        );
+        assert_eq!(
+            namespace_repair_noop
+                .pointer("/input/2/id")
+                .and_then(Value::as_str),
+            Some("vendor_custom")
+        );
+        assert_eq!(
+            namespace_repair_noop
+                .pointer("/input/3/id")
+                .and_then(Value::as_str),
+            Some("vendor_message")
+        );
+
+        let mut namespace_repair_collision = json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "fc_shared", "call_id": "custom-a", "name": "shell", "input": "dir"},
+                {"type": "custom_tool_call", "id": "ctc_shared", "call_id": "custom-b", "name": "shell", "input": "dir"}
+            ]
+        });
+        assert_eq!(
+            normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_collision),
+            0,
+            "a namespace repair must fail open when its target id already exists"
+        );
+        assert_eq!(
+            namespace_repair_collision
+                .pointer("/input/0/id")
+                .and_then(Value::as_str),
+            Some("fc_shared")
+        );
+
+        let mut namespace_repair_unsafe = json!({
+            "input": [
+                {"type": "custom_tool_call", "id": "fc_linked", "call_id": "custom-linked", "tool_call_id": "vendor-link", "name": "shell", "input": "dir"}
+            ]
+        });
+        assert_eq!(
+            normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_unsafe),
+            0,
+            "nested tool links must keep the original opaque id"
+        );
+        assert_eq!(
+            namespace_repair_unsafe
+                .pointer("/input/0/id")
+                .and_then(Value::as_str),
+            Some("fc_linked")
         );
 
         let unsafe_request = json!([
@@ -32416,10 +32699,6 @@ mod tests {
         let upstream_hits_for_route = upstream_hits.clone();
         let observed_full_replay = Arc::new(AtomicBool::new(true));
         let observed_full_replay_for_route = observed_full_replay.clone();
-        let tool_tail_received_at = Arc::new(std::sync::Mutex::new(None));
-        let tool_tail_received_at_for_route = tool_tail_received_at.clone();
-        let quiet_child_elapsed = Arc::new(std::sync::Mutex::new(None));
-        let quiet_child_elapsed_for_route = quiet_child_elapsed.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let upstream_addr = upstream_listener.local_addr().unwrap();
         let upstream_app = Router::new().route(
@@ -32427,8 +32706,6 @@ mod tests {
             post(move |body: Bytes| {
                 let hits = upstream_hits_for_route.clone();
                 let observed_full_replay = observed_full_replay_for_route.clone();
-                let tool_tail_received_at = tool_tail_received_at_for_route.clone();
-                let quiet_child_elapsed = quiet_child_elapsed_for_route.clone();
                 async move {
                     let attempt = hits.fetch_add(1, Ordering::SeqCst);
                     let request = serde_json::from_slice::<Value>(&body).ok();
@@ -32450,26 +32727,8 @@ mod tests {
 
                     let (response_id, input_tokens, cached_tokens) = match attempt {
                         0 => ("resp_small_tool_base", 249_984, 249_472),
-                        1 => {
-                            *tool_tail_received_at
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(std::time::Instant::now());
-                            ("resp_small_tool_tail", 251_264, 249_472)
-                        }
-                        _ => {
-                            let elapsed = tool_tail_received_at
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .as_ref()
-                                .map(std::time::Instant::elapsed)
-                                .unwrap_or_default();
-                            *quiet_child_elapsed
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(elapsed);
-                            ("resp_small_tool_child", 251_392, 251_264)
-                        }
+                        1 => ("resp_small_tool_tail", 251_264, 249_472),
+                        _ => ("resp_small_tool_child", 251_392, 251_264),
                     };
                     let created = json!({
                         "type": "response.created",
@@ -32647,16 +32906,12 @@ mod tests {
             .expect("direct child must be logged");
         assert_eq!(quiet_child.cache_read_tokens, Some(251_264));
         assert_eq!(quiet_child.tail_tool_output_chars, Some(0));
-        let child_elapsed = quiet_child_elapsed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .expect("mock must observe the direct child");
         assert_eq!(quiet_child.prefix_guard_wait_reason, None);
         assert_eq!(quiet_child.prefix_guard_wait_ms.unwrap_or_default(), 0);
-        assert!(
-            child_elapsed < TokioDuration::from_millis(350),
-            "cache maturity observation must never delay the direct child"
-        );
+        // The production path has foreground settling disabled for native
+        // Responses. Assert the deterministic no-wait contract instead of a
+        // wall-clock threshold, which becomes flaky when the full suite runs
+        // several 1 MB request fixtures in parallel.
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -41847,6 +42102,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_read_routes_require_a_configured_local_key() {
+        let mut config = AppConfig::default();
+        config.local_key.clear();
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-admin-read-auth-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let headers = HeaderMap::new();
+
+        assert_eq!(
+            admin_metrics(AxumState(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_final_scope_shadow(AxumState(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_cache_validation(AxumState(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_cache_affinity(AxumState(state.clone()), headers.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            admin_cache_capabilities(AxumState(state), headers)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn forced_agent_route_rejects_proxy_managed_placeholder() {
+        let config = test_codex_compact_config(
+            "http://127.0.0.1:9/v1".to_string(),
+            "proxy-managed-placeholder-provider",
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-proxy-managed-placeholder-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer PROXY_MANAGED"),
+        );
+
+        let response = authorize_for_agent(&state, &headers, Some("codex"))
+            .await
+            .expect_err("the published placeholder must not authorize an agent route");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
     async fn isolated_response_continuation_admin_probe_requires_configured_local_key() {
         let config = AppConfig::default();
         let dir = std::env::temp_dir().join(format!(
@@ -45043,6 +45378,209 @@ data: {{"type":"response.completed","response":{{"id":"resp_regenerated_tools_{t
             .iter()
             .all(|attempt| attempt.attempt_index == 1 && attempt.attempt_budget == 1));
         assert_eq!(metrics.recent_agent_upstream_attempts.len(), 2);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn native_codex_custom_tool_item_id_namespace_is_repaired_before_dispatch() {
+        let captured = Arc::new(tokio::sync::Mutex::new(None::<Value>));
+        let captured_for_route = captured.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().await = Some(body);
+                    let completed = json!({
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_namespace_repair",
+                            "status": "completed",
+                            "output": [],
+                            "usage": {
+                                "input_tokens": 32,
+                                "output_tokens": 1,
+                                "input_tokens_details": {"cached_tokens": 0}
+                            }
+                        }
+                    });
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        format!(
+                            "event: response.completed\\ndata: {}\\n\\n",
+                            serde_json::to_string(&completed).unwrap()
+                        )
+                        .into_bytes(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let provider_id = "native-custom-id-repair";
+        let config = test_codex_compact_config(format!("http://{upstream_addr}/v1"), provider_id);
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-native-custom-id-repair-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"namespace-session","thread_id":"namespace-thread","request_kind":"turn"}"#,
+            ),
+        );
+        let config_snapshot = state.config.read().await.clone();
+        let decision = RouteDecision {
+            provider: config_snapshot.providers[0].clone(),
+            upstream_channel: Channel::Responses,
+            model: "gpt-5.5".to_string(),
+        };
+        let metadata = trusted_codex_request_metadata(&headers, true)
+            .expect("the adapter metadata must be trusted");
+        let selected_key = SelectedProviderKey {
+            secret: "key".to_string(),
+            key_id: None,
+            encrypted_material_digest: None,
+        };
+        let continuation_scope = ContinuationScope::from_action_scope(
+            &CompositeActionScope::derive(ActionScopeInput {
+                workspace_fingerprint: &config_snapshot.workspace_fingerprint,
+                agent_id: Some("codex"),
+                provider_id: &decision.provider.id,
+                endpoint: &upstream_url(&decision.provider.base_url, &Channel::Responses),
+                resolved_model: &decision.model,
+                channel: &Channel::Responses,
+                key_realm_id: &affinity_identity::key_realm_id(&selected_key),
+                thread_id: metadata.thread_id.as_deref(),
+                conversation_id: metadata.conversation_id.as_deref(),
+                session_id: metadata.session_id.as_deref(),
+                adapter_attested: metadata.source.action_scope_attested(),
+                identity_source: metadata.source.label(),
+            })
+            .expect("attested metadata must derive the lineage key"),
+        );
+        state
+            .continuation_lineage
+            .seed_for_test(
+                &continuation_scope.anchor_key,
+                ResponseSessionState {
+                    generation: 1,
+                    parent_generation: None,
+                    response_id: "resp_namespace_repair".to_string(),
+                    static_projection_digest: None,
+                    output_items_complete: true,
+                    input: json!([
+                        {"type": "message", "role": "user", "content": "seed before interruption"}
+                    ]),
+                    output_items: Vec::new(),
+                    finished_at: Instant::now(),
+                },
+            )
+            .await;
+        let request = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "session_id": "namespace-session",
+            "thread_id": "namespace-thread",
+            "previous_response_id": "resp_namespace_repair",
+            "input": [
+                {"type": "message", "role": "user", "content": "seed before interruption"},
+                {"type": "custom_tool_call", "id": "fc_interrupted", "call_id": "call_interrupted", "name": "shell", "input": "dir"},
+                {"type": "custom_tool_call_output", "id": "fco_interrupted", "call_id": "call_interrupted", "output": "done"},
+                {"type": "message", "role": "user", "content": "new message while the previous turn was streaming"}
+            ]
+        });
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(serde_json::to_vec(&request).unwrap()),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        let body = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if let Some(body) = captured.lock().await.clone() {
+                    break body;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the repaired request must reach the upstream once");
+        assert_eq!(
+            body.pointer("/input/1/id").and_then(Value::as_str),
+            Some("ctc_interrupted")
+        );
+        assert_eq!(
+            body.pointer("/input/2/id").and_then(Value::as_str),
+            Some("ctco_interrupted")
+        );
+
+        let ordinary_request = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "session_id": "namespace-session",
+            "thread_id": "namespace-thread",
+            "input": [
+                {"type": "message", "role": "user", "content": "ordinary first turn"},
+                {"type": "custom_tool_call", "id": "fc_ordinary", "call_id": "call_ordinary", "name": "shell", "input": "dir"},
+                {"type": "custom_tool_call_output", "id": "fco_ordinary", "call_id": "call_ordinary", "output": "done"}
+            ]
+        });
+        let ordinary_response = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(serde_json::to_vec(&ordinary_request).unwrap()),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(ordinary_response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(ordinary_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ordinary_body = tokio::time::timeout(TokioDuration::from_secs(2), async {
+            loop {
+                if let Some(body) = captured.lock().await.clone() {
+                    if body.pointer("/input/0/content").and_then(Value::as_str)
+                        == Some("ordinary first turn")
+                    {
+                        break body;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the ordinary request must reach the upstream once");
+        assert_eq!(
+            ordinary_body.pointer("/input/1/id").and_then(Value::as_str),
+            Some("fc_ordinary")
+        );
+        assert_eq!(
+            ordinary_body.pointer("/input/2/id").and_then(Value::as_str),
+            Some("fco_ordinary")
+        );
         fs::remove_dir_all(dir).ok();
     }
 

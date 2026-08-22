@@ -690,7 +690,7 @@ function buildEqualLengthTail(turn) {
 
 async function sendTurn(arm, turn) {
   arm.input.push(message(buildEqualLengthTail(turn)));
-  const before = await getJson(`${arm.runtime.baseUrl}/admin/metrics`, 5_000);
+  const before = await getJson(`${arm.runtime.baseUrl}/admin/metrics`, 5_000, arm.runtime.localKey);
   const countersBefore = requestCounters(before);
   const knownIds = new Set(requestLogRows(before)
     .map((item) => String(item?.inbound_request_id ?? ""))
@@ -724,7 +724,12 @@ async function sendTurn(arm, turn) {
   const responseFailureCode = responseErrorCode(sse);
   const failureClass = safeFailureClass(response.status, sse, responseFailed);
   const failureReceipt = safeFailureReceipt(sse);
-  const after = await waitForFinalization(arm.runtime.baseUrl, countersBefore, knownIds);
+  const after = await waitForFinalization(
+    arm.runtime.baseUrl,
+    countersBefore,
+    knownIds,
+    arm.runtime.localKey
+  );
   const metric = selectNewRequestLog(after, knownIds);
   const counters = subtractCounters(requestCounters(after), countersBefore);
   const completed = response.ok && /\bresponse\.completed\b/u.test(sse) && !responseFailed;
@@ -916,11 +921,11 @@ function safeFailureReceipt(body) {
   };
 }
 
-async function waitForFinalization(baseUrl, before, knownIds) {
+async function waitForFinalization(baseUrl, before, knownIds, localKey) {
   const deadline = Date.now() + 15_000;
   let latest = null;
   while (Date.now() < deadline) {
-    latest = await getJson(`${baseUrl}/admin/metrics`, 5_000);
+    latest = await getJson(`${baseUrl}/admin/metrics`, 5_000, localKey);
     const counters = requestCounters(latest);
     const hasNew = hasNewRequestLog(latest, knownIds);
     if (
@@ -1620,8 +1625,11 @@ function processIsAlive(pid) {
   }
 }
 
-async function getJson(url, timeoutMs) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+async function getJson(url, timeoutMs, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(timeoutMs)
+  });
   if (!response.ok) throw new Error(`admin endpoint returned HTTP ${response.status}`);
   return response.json();
 }

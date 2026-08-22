@@ -107,7 +107,7 @@ try {
       assert.equal(response.status, 200, `turn ${turn}: local proxy rejected the request`);
       assert.match(text, /response\.completed/u, `turn ${turn}: missing completed event`);
       await waitFor(async () => {
-        const metrics = await getJson(`${baseUrl}/admin/metrics`);
+        const metrics = await getJson(`${baseUrl}/admin/metrics`, localKey);
         if (Number(metrics.upstream_requests) < turn + 1) return false;
         const recent = metrics.recent_requests ?? [];
         const settled = recent.find((request) =>
@@ -193,7 +193,7 @@ try {
       `recovered child inherited a stale warm delay: ${elapsedMs[4]}ms; ${JSON.stringify(turnDiagnostics)}`
     );
 
-    const metrics = await getJson(`${baseUrl}/admin/metrics`);
+    const metrics = await getJson(`${baseUrl}/admin/metrics`, localKey);
     const generation = metrics.agent_generation ?? {};
     assert.equal(Number(generation.inbound_requests), usageSequence.length);
     assert.equal(Number(generation.generation_attempts), usageSequence.length);
@@ -331,8 +331,11 @@ async function readRequestBody(request) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function getJson(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+async function getJson(url, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(5_000)
+  });
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
   return response.json();
 }

@@ -390,31 +390,29 @@ pub async fn save_config(
     state: State<'_, Arc<AppState>>,
     input: GeneralConfigInput,
 ) -> CommandResult<PublicConfig> {
-    let version = {
-        let mut config = state.config.write().await;
-        config.host = input.host;
-        config.port = input.port;
-        if let Some(proxy_auto_start) = input.proxy_auto_start {
-            config.proxy_auto_start = proxy_auto_start;
-        }
-        if let Some(upstream_proxy_url) = input.upstream_proxy_url {
-            config.upstream_proxy_url =
-                normalize_upstream_proxy_url(Some(upstream_proxy_url)).map_err(to_command_error)?;
-        }
-        config.local_key = input.local_key;
-        config.default_channel = input.default_channel;
-        config.workspace_fingerprint = input.workspace_fingerprint;
-        if let Some(cache) = input.cache {
-            config.cache = cache;
-            config.cache.normalize_fast_forwarding_hit_policy();
-        }
-        config.updated_at = Utc::now();
-        state
-            .publish_config_snapshot(&config)
-            .map_err(to_command_error)?
-    };
     state
-        .wait_for_config_snapshot(version)
+        .commit_config_update(|config| {
+            let mut next = config.clone();
+            next.host = input.host;
+            next.port = input.port;
+            if let Some(proxy_auto_start) = input.proxy_auto_start {
+                next.proxy_auto_start = proxy_auto_start;
+            }
+            if let Some(upstream_proxy_url) = input.upstream_proxy_url {
+                next.upstream_proxy_url = normalize_upstream_proxy_url(Some(upstream_proxy_url))
+                    .map_err(|error| anyhow!(error))?;
+            }
+            next.local_key = input.local_key;
+            next.default_channel = input.default_channel;
+            next.workspace_fingerprint = input.workspace_fingerprint;
+            if let Some(cache) = input.cache {
+                next.cache = cache;
+                next.cache.normalize_fast_forwarding_hit_policy();
+            }
+            next.updated_at = Utc::now();
+            next.validate_listener_config()?;
+            Ok(next)
+        })
         .await
         .map_err(to_command_error)?;
     Ok(state.public_config().await)
@@ -426,30 +424,59 @@ pub async fn save_proxy_mode_config(
     input: ProxyModeConfigInput,
 ) -> CommandResult<PublicConfig> {
     let was_running = state.proxy_mode_status().await.running;
+    let (previous, committed) = state
+        .commit_config_update(|config| {
+            let mut next = config.clone();
+            next.proxy_mode_host = input.host.trim().to_string();
+            next.proxy_mode_port = input.port;
+            next.updated_at = Utc::now();
+            next.validate_listener_config()?;
+            Ok(next)
+        })
+        .await
+        .map_err(to_command_error)?;
     if was_running {
         state
             .stop_proxy_mode_proxy()
             .await
             .map_err(to_command_error)?;
     }
-    let version = {
-        let mut config = state.config.write().await;
-        config.proxy_mode_host = input.host.trim().to_string();
-        config.proxy_mode_port = input.port;
-        config.updated_at = Utc::now();
-        state
-            .publish_config_snapshot(&config)
-            .map_err(to_command_error)?
-    };
-    state
-        .wait_for_config_snapshot(version)
-        .await
-        .map_err(to_command_error)?;
     if was_running {
-        state
-            .start_proxy_mode_proxy()
-            .await
-            .map_err(to_command_error)?;
+        if let Err(start_error) = state.start_proxy_mode_proxy().await {
+            let rollback = {
+                let mut config = state.config.write().await;
+                if config.proxy_mode_host == committed.proxy_mode_host
+                    && config.proxy_mode_port == committed.proxy_mode_port
+                    && config.updated_at == committed.updated_at
+                {
+                    let version = state
+                        .publish_config_snapshot(&previous)
+                        .map_err(to_command_error)?;
+                    match state.wait_for_config_snapshot(version).await {
+                        Ok(()) => {
+                            *config = previous.clone();
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                } else {
+                    false
+                }
+            };
+            if rollback {
+                if let Err(restore_error) = state.start_proxy_mode_proxy().await {
+                    return Err(format!(
+                        "Proxy Mode 新地址启动失败：{start_error}；旧地址恢复也失败：{restore_error}"
+                    ));
+                }
+                return Err(format!(
+                    "Proxy Mode 新地址启动失败，已恢复旧地址：{start_error}"
+                ));
+            }
+            return Err(format!(
+                "Proxy Mode 新地址启动失败，旧配置恢复失败或已被其他操作更新：{start_error}"
+            ));
+        }
     }
     Ok(state.public_config().await)
 }
@@ -3387,26 +3414,39 @@ pub async fn set_agent_injection_enabled(
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let enabled = input.enabled;
     let agent_id = input.id.clone();
-    let (mut results, version) = {
-        let mut config = state.config.write().await;
-        let results = agent_injection::set_enabled(&mut config, &input.id, input.enabled)
-            .map_err(to_command_error)?;
-        config.updated_at = Utc::now();
-        let version = state
-            .publish_config_snapshot(&config)
-            .map_err(to_command_error)?;
-        (results, version)
-    };
-    state
-        .wait_for_config_snapshot(version)
-        .await
+    let previous = state.config.read().await.clone();
+    let mut committed = previous.clone();
+    let mut results = agent_injection::set_enabled(&mut committed, &input.id, input.enabled)
         .map_err(to_command_error)?;
+    committed.updated_at = Utc::now();
+    if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
+        let restore_error = restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+        return Err(match restore_error {
+            Ok(()) => format!("配置保存失败，已恢复 Agent 注入文件：{commit_error}"),
+            Err(error) => {
+                format!("配置保存失败，Agent 注入文件恢复也失败：{commit_error}; {error}")
+            }
+        });
+    }
     if agent_id == "proxy-mode" {
         if enabled {
-            state
-                .start_proxy_mode_proxy()
-                .await
-                .map_err(to_command_error)?;
+            if let Err(start_error) = state.start_proxy_mode_proxy().await {
+                let restore_error =
+                    restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+                let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+                let file_status = match restore_error {
+                    Ok(()) => "成功".to_string(),
+                    Err(error) => format!("失败：{error}"),
+                };
+                return Err(format!(
+                    "Proxy Mode 启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                    config_error
+                        .map(|error| format!("失败：{error}"))
+                        .unwrap_or_else(|| "成功".to_string()),
+                    file_status,
+                    start_error
+                ));
+            }
         } else {
             state
                 .stop_proxy_mode_proxy()
@@ -3414,7 +3454,22 @@ pub async fn set_agent_injection_enabled(
                 .map_err(to_command_error)?;
         }
     } else if enabled {
-        state.start_proxy().await.map_err(to_command_error)?;
+        if let Err(start_error) = state.start_proxy().await {
+            let restore_error = restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+            let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+            let file_status = match restore_error {
+                Ok(()) => "成功".to_string(),
+                Err(error) => format!("失败：{error}"),
+            };
+            return Err(format!(
+                "Agent 代理启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                config_error
+                    .map(|error| format!("失败：{error}"))
+                    .unwrap_or_else(|| "成功".to_string()),
+                file_status,
+                start_error
+            ));
+        }
     }
     if agent_id == "codex" && !enabled && codex_ui_patch::has_managed_patch() {
         let patch_status = codex_ui_patch_notice(false, codex_ui_patch::set_enabled(false));
@@ -3428,27 +3483,54 @@ pub async fn apply_agent_injection(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
-    let (results, version) = {
-        let mut config = state.config.write().await;
-        let results =
-            agent_injection::apply_one_by_id(&mut config, &id).map_err(to_command_error)?;
-        config.updated_at = Utc::now();
-        let version = state
-            .publish_config_snapshot(&config)
-            .map_err(to_command_error)?;
-        (results, version)
-    };
-    state
-        .wait_for_config_snapshot(version)
-        .await
-        .map_err(to_command_error)?;
+    let previous = state.config.read().await.clone();
+    let mut committed = previous.clone();
+    let results =
+        agent_injection::apply_one_by_id(&mut committed, &id).map_err(to_command_error)?;
+    committed.updated_at = Utc::now();
+    if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
+        let restore_error = restore_agent_injection_artifacts(&previous, &committed, &id);
+        return Err(match restore_error {
+            Ok(()) => format!("配置保存失败，已恢复 Agent 注入文件：{commit_error}"),
+            Err(error) => {
+                format!("配置保存失败，Agent 注入文件恢复也失败：{commit_error}; {error}")
+            }
+        });
+    }
     if id == "proxy-mode" {
-        state
-            .start_proxy_mode_proxy()
-            .await
-            .map_err(to_command_error)?;
+        if let Err(start_error) = state.start_proxy_mode_proxy().await {
+            let restore_error = restore_agent_injection_artifacts(&previous, &committed, &id);
+            let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+            let file_status = match restore_error {
+                Ok(()) => "成功".to_string(),
+                Err(error) => format!("失败：{error}"),
+            };
+            return Err(format!(
+                "Proxy Mode 启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                config_error
+                    .map(|error| format!("失败：{error}"))
+                    .unwrap_or_else(|| "成功".to_string()),
+                file_status,
+                start_error
+            ));
+        }
     } else {
-        state.start_proxy().await.map_err(to_command_error)?;
+        if let Err(start_error) = state.start_proxy().await {
+            let restore_error = restore_agent_injection_artifacts(&previous, &committed, &id);
+            let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+            let file_status = match restore_error {
+                Ok(()) => "成功".to_string(),
+                Err(error) => format!("失败：{error}"),
+            };
+            return Err(format!(
+                "Agent 代理启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                config_error
+                    .map(|error| format!("失败：{error}"))
+                    .unwrap_or_else(|| "成功".to_string()),
+                file_status,
+                start_error
+            ));
+        }
     }
     Ok(results)
 }
@@ -3520,42 +3602,89 @@ fn attach_codex_ui_patch_status(
     });
 }
 
+fn restore_agent_injection_artifacts(
+    previous: &AppConfig,
+    committed: &AppConfig,
+    agent_id: &str,
+) -> Result<()> {
+    let previous_enabled = previous
+        .agent_injections
+        .iter()
+        .find(|item| item.id == agent_id)
+        .is_some_and(|item| item.enabled);
+    if previous_enabled {
+        let mut restore = previous.clone();
+        agent_injection::apply_one_by_id(&mut restore, agent_id)?;
+    } else {
+        let mut remove = committed.clone();
+        agent_injection::set_enabled(&mut remove, agent_id, false)?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn update_agent_injection_route(
     state: State<'_, Arc<AppState>>,
     input: AgentInjectionRouteUpdate,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let agent_id = input.id.clone();
-    let should_start_proxy = {
-        let config = state.config.read().await;
-        config
-            .agent_injections
-            .iter()
-            .any(|item| item.id == input.id && item.enabled)
-    };
-    let (results, version) = {
-        let mut config = state.config.write().await;
+    let previous = state.config.read().await.clone();
+    let should_start_proxy = previous
+        .agent_injections
+        .iter()
+        .any(|item| item.id == input.id && item.enabled);
+    let (committed, results) = {
         let (mut staged, results) =
-            stage_agent_injection_route_update(&config, input).map_err(to_command_error)?;
+            stage_agent_injection_route_update(&previous, input).map_err(to_command_error)?;
         staged.updated_at = Utc::now();
-        let version = state
-            .publish_config_snapshot(&staged)
-            .map_err(to_command_error)?;
-        *config = staged;
-        (results, version)
+        (staged, results)
     };
-    state
-        .wait_for_config_snapshot(version)
-        .await
-        .map_err(to_command_error)?;
+    if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
+        let restore_error = restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+        return Err(match restore_error {
+            Ok(()) => format!("配置保存失败，已恢复 Agent 注入文件：{commit_error}"),
+            Err(error) => {
+                format!("配置保存失败，Agent 注入文件恢复也失败：{commit_error}; {error}")
+            }
+        });
+    }
     if should_start_proxy && !results.is_empty() {
         if agent_id == "proxy-mode" {
-            state
-                .start_proxy_mode_proxy()
-                .await
-                .map_err(to_command_error)?;
+            if let Err(start_error) = state.start_proxy_mode_proxy().await {
+                let restore_error =
+                    restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+                let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+                let file_status = match restore_error {
+                    Ok(()) => "成功".to_string(),
+                    Err(error) => format!("失败：{error}"),
+                };
+                return Err(format!(
+                    "Proxy Mode 路由更新后启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                    config_error
+                        .map(|error| format!("失败：{error}"))
+                        .unwrap_or_else(|| "成功".to_string()),
+                    file_status,
+                    start_error
+                ));
+            }
         } else {
-            state.start_proxy().await.map_err(to_command_error)?;
+            if let Err(start_error) = state.start_proxy().await {
+                let restore_error =
+                    restore_agent_injection_artifacts(&previous, &committed, &agent_id);
+                let config_error = state.commit_config_snapshot(previous.clone()).await.err();
+                let file_status = match restore_error {
+                    Ok(()) => "成功".to_string(),
+                    Err(error) => format!("失败：{error}"),
+                };
+                return Err(format!(
+                    "Agent 路由更新后代理启动失败，配置回滚结果：{}；文件回滚结果：{}；启动错误：{}",
+                    config_error
+                        .map(|error| format!("失败：{error}"))
+                        .unwrap_or_else(|| "成功".to_string()),
+                    file_status,
+                    start_error
+                ));
+            }
         }
     }
     Ok(results)

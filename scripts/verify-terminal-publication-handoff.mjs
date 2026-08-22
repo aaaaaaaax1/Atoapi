@@ -116,7 +116,7 @@ try {
 
   const seedInput = [message("terminal-handoff-seed")];
   await completeRequest(baseUrl, localKey, model, seedInput);
-  await waitFor(async () => Number((await getJson(`${baseUrl}/admin/metrics`)).agent_generation?.inbound_requests) === 1,
+  await waitFor(async () => Number((await getJson(`${baseUrl}/admin/metrics`, localKey)).agent_generation?.inbound_requests) === 1,
     10_000,
     "seed request did not settle"
   );
@@ -145,7 +145,7 @@ try {
   await delay(tailDelayMs);
   parentTail.resolve();
   await parent.drain;
-  await waitFor(async () => Number((await getJson(`${baseUrl}/admin/metrics`)).agent_generation?.inbound_requests) >= 2,
+  await waitFor(async () => Number((await getJson(`${baseUrl}/admin/metrics`, localKey)).agent_generation?.inbound_requests) >= 2,
     10_000,
     "parent request did not settle before child tail release"
   );
@@ -155,7 +155,7 @@ try {
 
   const metrics = await waitForValue(
     async () => {
-      const value = await getJson(`${baseUrl}/admin/metrics`);
+      const value = await getJson(`${baseUrl}/admin/metrics`, localKey);
       return Number(value.agent_generation?.inbound_requests) === 3 ? value : null;
     },
     10_000,
@@ -449,8 +449,11 @@ async function readRequestBody(request) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function getJson(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+async function getJson(url, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(5_000)
+  });
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
   return response.json();
 }

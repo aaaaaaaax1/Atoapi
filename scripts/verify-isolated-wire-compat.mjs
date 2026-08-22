@@ -744,7 +744,7 @@ async function runIsolatedCapture({
       5_000,
       `${label}: expected ${expectedInbounds} upstream POSTs`
     );
-    const metrics = await getJson(`${baseUrl}/admin/metrics`);
+    const metrics = await getJson(`${baseUrl}/admin/metrics`, 5_000, localKey);
     const upstreamRequests = captured.slice(before);
     const upstreamBody = upstreamRequests.at(-1)?.body;
     const upstreamHeaders = upstreamRequests.at(-1)?.headers ?? {};
@@ -1740,8 +1740,11 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
-async function getJson(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+async function getJson(url, timeoutMs = 5_000, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(timeoutMs)
+  });
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
   return response.json();
 }

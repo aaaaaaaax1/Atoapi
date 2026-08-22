@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
     net::IpAddr,
     path::{Path, PathBuf},
 };
@@ -1213,6 +1214,61 @@ fn sanitize_agent_provider_id_part_for_migration(value: &str) -> String {
     }
 }
 
+fn write_config_atomically(path: &Path, raw: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to create {}", temp_path.display()))?;
+        temp.write_all(raw)
+            .with_context(|| format!("failed to write {}", temp_path.display()))?;
+        temp.sync_all()
+            .with_context(|| format!("failed to sync {}", temp_path.display()))?;
+        drop(temp);
+
+        match fs::rename(&temp_path, path) {
+            Ok(()) => {}
+            Err(first_error) if path.exists() => {
+                // Windows cannot rename over an existing file. Keep the old
+                // config beside it until the new snapshot has been promoted,
+                // and restore it if the second move fails.
+                let previous_path = parent.join(format!(".{file_name}.previous"));
+                if previous_path.exists() {
+                    fs::remove_file(&previous_path)
+                        .with_context(|| format!("failed to remove {}", previous_path.display()))?;
+                }
+                fs::rename(path, &previous_path).with_context(|| {
+                    format!("failed to stage {} for replacement", path.display())
+                })?;
+                if let Err(replace_error) = fs::rename(&temp_path, path) {
+                    let restore_result = fs::rename(&previous_path, path);
+                    return Err(anyhow!(
+                        "failed to replace {} after {first_error}: {replace_error}; restore result: {restore_result:?}",
+                        path.display()
+                    ));
+                }
+                fs::remove_file(previous_path).ok();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to atomically replace {}", path.display()));
+            }
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        fs::remove_file(&temp_path).ok();
+    }
+    result
+}
+
 impl AppConfig {
     pub fn upstream_proxy_url_for(&self, use_system_proxy: bool) -> Option<&str> {
         use_system_proxy
@@ -1243,6 +1299,10 @@ impl AppConfig {
                 .take()
                 .is_some()
             {
+                changed = true;
+            }
+            #[cfg(windows)]
+            if config.migrate_legacy_plaintext_secrets()? {
                 changed = true;
             }
             if config.normalize_provider_cache_capability_effect_state() {
@@ -1286,36 +1346,69 @@ impl AppConfig {
         }
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    fn migrate_legacy_plaintext_secrets(&mut self) -> Result<bool> {
+        fn migrate(value: &mut Option<String>) -> Result<bool> {
+            let Some(secret) = value.clone() else {
+                return Ok(false);
+            };
+            if secret.trim().is_empty() || secret.starts_with("dpapi:") {
+                return Ok(false);
+            }
+            *value = Some(encrypt_secret(&secret)?);
+            Ok(true)
+        }
+
+        let mut changed = false;
+        for provider in &mut self.providers {
+            changed |= migrate(&mut provider.api_key_encrypted)?;
+        }
+        for pool in &mut self.provider_key_pools {
+            for key in &mut pool.keys {
+                changed |= migrate(&mut key.key_encrypted)?;
+            }
+        }
+        Ok(changed)
+    }
+
+    pub fn validate_listener_auth(&self) -> Result<()> {
         let host_ip = self.host.parse::<IpAddr>()?;
         let proxy_mode_ip = self.proxy_mode_host.parse::<IpAddr>()?;
-        if host_ip.is_unspecified() && self.local_key.trim().is_empty() {
+        if !host_ip.is_loopback() && self.local_key.trim().is_empty() {
             return Err(anyhow!(
-                "binding to 0.0.0.0 requires a non-empty local authentication key"
+                "binding to a non-loopback address requires a non-empty local authentication key"
             ));
         }
-        if proxy_mode_ip.is_unspecified() && self.local_key.trim().is_empty() {
+        if !proxy_mode_ip.is_loopback() && self.local_key.trim().is_empty() {
             return Err(anyhow!(
-                "binding proxy mode to 0.0.0.0 requires a non-empty local authentication key"
+                "binding proxy mode to a non-loopback address requires a non-empty local authentication key"
             ));
         }
-        let proxy_mode_conflicts_with_main = proxy_bind_conflicts(
+        Ok(())
+    }
+
+    pub fn validate_listener_config(&self) -> Result<()> {
+        self.validate_listener_auth()?;
+        if proxy_bind_conflicts(
             &self.host,
             self.port,
             &self.proxy_mode_host,
             self.proxy_mode_port,
-        )?;
-        if proxy_mode_conflicts_with_main {
+        )? {
             return Err(anyhow!(
                 "proxy mode address must be different from the main agent proxy address"
             ));
         }
+        Ok(())
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        self.validate_listener_config()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let raw = toml::to_string_pretty(self)?;
-        fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))?;
-        Ok(())
+        write_config_atomically(path, raw.as_bytes())
     }
 
     fn normalize_legacy_static_default_user_agents(&mut self) -> bool {
@@ -4189,6 +4282,34 @@ prewarm_enabled = true
             .contains("proxy mode address must be different"));
         std::fs::remove_dir_all(dir).ok();
     }
+
+    #[test]
+    fn non_loopback_bindings_require_local_authentication() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-non-loopback-auth-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut main_config = AppConfig::default();
+        main_config.local_key.clear();
+        main_config.host = "192.168.1.20".to_string();
+        let main_error = main_config.save(&dir.join("main.toml")).unwrap_err();
+        assert!(main_error.to_string().contains("non-loopback address"));
+
+        let mut proxy_mode_config = AppConfig::default();
+        proxy_mode_config.local_key.clear();
+        proxy_mode_config.proxy_mode_host = "192.168.1.21".to_string();
+        let proxy_mode_error = proxy_mode_config
+            .save(&dir.join("proxy-mode.toml"))
+            .unwrap_err();
+        assert!(proxy_mode_error
+            .to_string()
+            .contains("proxy mode to a non-loopback address"));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn unknown_legacy_agent_injection_kind_is_ignored() {
         let raw = r#"
@@ -4267,6 +4388,68 @@ enabled = true
                 .as_deref(),
             Some("sk-first-secret")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn loading_legacy_plaintext_provider_secrets_migrates_to_dpapi() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-legacy-secret-migration-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let provider_id = config.upsert_provider(provider_input(None)).unwrap();
+        config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+            .unwrap()
+            .api_key_encrypted = Some("legacy-provider-key".to_string());
+        config
+            .upsert_provider_key_pool(
+                &provider_id,
+                ProviderKeyPoolInput {
+                    enabled: true,
+                    strategy: KeyLoadBalanceStrategy::Sequential,
+                    failure_threshold: 1,
+                    recovery_minutes: 5,
+                    keys: vec![key_input("key-a", Some("temporary-key"), true, 5)],
+                },
+            )
+            .unwrap();
+        config
+            .provider_key_pools
+            .iter_mut()
+            .find(|pool| pool.provider_id == provider_id)
+            .unwrap()
+            .keys[0]
+            .key_encrypted = Some("legacy-pool-key".to_string());
+        config.save(&path).unwrap();
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert!(loaded
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .and_then(|provider| provider.api_key_encrypted.as_deref())
+            .is_some_and(|value| value.starts_with("dpapi:")));
+        assert_eq!(
+            loaded.provider_api_key(&provider_id).unwrap().as_deref(),
+            Some("legacy-provider-key")
+        );
+        assert_eq!(
+            loaded
+                .provider_key_secret(&provider_id, "key-a")
+                .unwrap()
+                .as_deref(),
+            Some("legacy-pool-key")
+        );
+        let persisted = fs::read_to_string(&path).unwrap();
+        assert!(!persisted.contains("legacy-provider-key"));
+        assert!(!persisted.contains("legacy-pool-key"));
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

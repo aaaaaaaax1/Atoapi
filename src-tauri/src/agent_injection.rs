@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 use toml_edit::{value, DocumentMut};
@@ -172,6 +173,7 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
 
 pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
+    let before = config.clone();
     let ids = config
         .agent_injections
         .iter()
@@ -192,7 +194,30 @@ pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>
             continue;
         }
         let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
-        let result = apply_item(&config.agent_injections[index], &context)?;
+        let result = match apply_item(&config.agent_injections[index], &context) {
+            Ok(result) => result,
+            Err(error) => {
+                // A batch apply is one user action: restore every artifact
+                // already changed by this batch before returning the error.
+                for current_item in config.agent_injections.iter() {
+                    if let Some(previous_item) = before
+                        .agent_injections
+                        .iter()
+                        .find(|item| item.id == current_item.id)
+                    {
+                        if previous_item.enabled {
+                            let prior_context =
+                                InjectionContext::from_config(&before, Some(previous_item));
+                            let _ = apply_item(previous_item, &prior_context);
+                        } else {
+                            let _ = remove_item(current_item);
+                        }
+                    }
+                }
+                *config = before;
+                return Err(error);
+            }
+        };
         let item = &mut config.agent_injections[index];
         item.enabled = true;
         item.target_path = result.target_path.clone();
@@ -310,7 +335,57 @@ fn remove_item(item: &AgentInjectionConfig) -> Result<Option<PathBuf>> {
             remove_codex_config_injection(&target)?;
             Ok(Some(target))
         }
-        _ => Ok(item.target_path.clone()),
+        AgentInjectionKind::ClaudeDesktop => {
+            let paths = claude_desktop_paths();
+            for target in [
+                paths.normal_config_path,
+                paths.threep_config_path,
+                paths.profile_path,
+                paths.meta_path,
+            ] {
+                restore_injection_backup(&target)?;
+            }
+            Ok(item.target_path.clone())
+        }
+        AgentInjectionKind::ClaudeCode => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(|| home_dir().join(".claude").join("settings.json"));
+            restore_injection_backup(&target)?;
+            Ok(Some(target))
+        }
+        AgentInjectionKind::OpenCode => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(opencode_config_path);
+            restore_injection_backup(&target)?;
+            Ok(Some(target))
+        }
+        AgentInjectionKind::OpenClaw => {
+            let target = item
+                .target_path
+                .clone()
+                .unwrap_or_else(openclaw_config_path);
+            restore_injection_backup(&target)?;
+            Ok(Some(target))
+        }
+        AgentInjectionKind::Hermes => {
+            let target = item.target_path.clone().unwrap_or_else(hermes_config_path);
+            restore_injection_backup(&target)?;
+            Ok(Some(target))
+        }
+        AgentInjectionKind::ProxyMode => {
+            let target = item.target_path.clone().unwrap_or_else(|| {
+                app_config_dir()
+                    .unwrap_or_else(|_| home_dir().join(".atoapi"))
+                    .join("atoapi-proxy-mode.json")
+            });
+            restore_injection_backup(&target)?;
+            Ok(Some(target))
+        }
+        AgentInjectionKind::Gemini | AgentInjectionKind::Unknown => Ok(item.target_path.clone()),
     }
 }
 
@@ -619,7 +694,10 @@ fn apply_item(
                 .clone()
                 .unwrap_or_else(|| home_dir().join(".claude").join("settings.json"));
             let backup = backup_file(&target)?;
-            write_claude_code_settings(&target, context)?;
+            if let Err(error) = write_claude_code_settings(&target, context) {
+                discard_injection_backup(&target).ok();
+                return Err(error);
+            }
             (
                 Some(target),
                 backup,
@@ -646,12 +724,24 @@ fn apply_item(
                 &paths.profile_path,
                 &paths.meta_path,
             ];
-            let backups = targets
+            let backups = match targets
                 .iter()
                 .map(|path| Ok(((*path).to_path_buf(), backup_file(path)?)))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>>>()
+            {
+                Ok(backups) => backups,
+                Err(error) => {
+                    for path in targets {
+                        discard_injection_backup(path).ok();
+                    }
+                    return Err(error);
+                }
+            };
             if let Err(err) = write_claude_desktop(&paths, context) {
                 let _ = restore_backups(&backups);
+                for (path, _) in &backups {
+                    discard_injection_backup(path).ok();
+                }
                 return Err(err);
             }
             (
@@ -671,7 +761,10 @@ fn apply_item(
                 .clone()
                 .unwrap_or_else(opencode_config_path);
             let backup = backup_file(&target)?;
-            write_opencode_config(&target, context)?;
+            if let Err(error) = write_opencode_config(&target, context) {
+                discard_injection_backup(&target).ok();
+                return Err(error);
+            }
             (
                 Some(target),
                 backup,
@@ -684,7 +777,10 @@ fn apply_item(
                 .clone()
                 .unwrap_or_else(openclaw_config_path);
             let backup = backup_file(&target)?;
-            write_openclaw_config(&target, context)?;
+            if let Err(error) = write_openclaw_config(&target, context) {
+                discard_injection_backup(&target).ok();
+                return Err(error);
+            }
             (
                 Some(target),
                 backup,
@@ -694,7 +790,10 @@ fn apply_item(
         AgentInjectionKind::Hermes => {
             let target = item.target_path.clone().unwrap_or_else(hermes_config_path);
             let backup = backup_file(&target)?;
-            write_hermes_config(&target, context)?;
+            if let Err(error) = write_hermes_config(&target, context) {
+                discard_injection_backup(&target).ok();
+                return Err(error);
+            }
             (
                 Some(target),
                 backup,
@@ -708,7 +807,10 @@ fn apply_item(
                     .join("atoapi-proxy-mode.json")
             });
             let backup = backup_file(&target)?;
-            write_proxy_mode_profile(&target, context)?;
+            if let Err(error) = write_proxy_mode_profile(&target, context) {
+                discard_injection_backup(&target).ok();
+                return Err(error);
+            }
             (Some(target), backup, "本地代理模式配置已生成".to_string())
         }
         AgentInjectionKind::Unknown => {
@@ -746,12 +848,7 @@ impl InjectionContext {
         } else {
             config.port
         };
-        let host = if source_host == "0.0.0.0" {
-            "127.0.0.1"
-        } else {
-            source_host
-        };
-        let base = format!("http://{}:{}", host, source_port);
+        let base = local_base_url(source_host, source_port);
         let configured_provider_id = item.and_then(|item| item.provider_id.as_deref());
         let provider = configured_provider_id.as_deref().and_then(|id| {
             config
@@ -804,6 +901,21 @@ impl InjectionContext {
                 .and_then(|provider| config.auto_compact_token_limit_for_provider(&provider.id)),
             codex_models,
         }
+    }
+}
+
+/// Build a URL for an agent configuration from an IP listener. IPv6 literals
+/// must be enclosed in brackets in URLs, and wildcard listeners are not valid
+/// client destinations, so route those through the local loopback address.
+fn local_base_url(host: &str, port: u16) -> String {
+    let client_host = match host.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        Ok(ip) => ip,
+        Err(_) => return format!("http://{host}:{port}"),
+    };
+    match client_host {
+        IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
+        IpAddr::V4(ip) => format!("http://{ip}:{port}"),
     }
 }
 
@@ -1674,22 +1786,126 @@ fn restore_backups(items: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
 }
 
 fn backup_file(path: &Path) -> Result<Option<PathBuf>> {
-    if !path.exists() {
-        return Ok(None);
+    if let Some(previous) = injection_backup_for(path)? {
+        return Ok(previous);
     }
     let backup_dir = app_config_dir()?
         .join("backups")
         .join("injections")
         .join(Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string());
-    fs::create_dir_all(&backup_dir)?;
-    let file_name = path
-        .to_string_lossy()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect::<String>();
-    let backup = backup_dir.join(file_name);
-    fs::copy(path, &backup).with_context(|| format!("failed to back up {}", path.display()))?;
-    Ok(Some(backup))
+    let backup = if path.exists() {
+        fs::create_dir_all(&backup_dir)?;
+        let file_name = path
+            .to_string_lossy()
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>();
+        let backup = backup_dir.join(file_name);
+        fs::copy(path, &backup).with_context(|| format!("failed to back up {}", path.display()))?;
+        Some(backup)
+    } else {
+        None
+    };
+    if let Err(error) = record_injection_backup(path, backup.clone()) {
+        if let Some(backup) = backup {
+            fs::remove_file(backup).ok();
+        }
+        return Err(error);
+    }
+    Ok(backup)
+}
+
+fn injection_backup_manifest_path() -> Result<PathBuf> {
+    Ok(app_config_dir()?
+        .join("backups")
+        .join("injections")
+        .join("manifest.json"))
+}
+
+fn load_injection_backup_manifest() -> Result<HashMap<String, Option<PathBuf>>> {
+    let path = injection_backup_manifest_path()?;
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_injection_backup_manifest(manifest: &HashMap<String, Option<PathBuf>>) -> Result<()> {
+    let path = injection_backup_manifest_path()?;
+    if manifest.is_empty() {
+        fs::remove_file(&path).ok();
+        return Ok(());
+    }
+    let raw = serde_json::to_string_pretty(manifest)?;
+    write_text(&path, &format!("{raw}\n"))
+}
+
+fn injection_backup_key(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn injection_backup_for(path: &Path) -> Result<Option<Option<PathBuf>>> {
+    let manifest = load_injection_backup_manifest()?;
+    Ok(manifest.get(&injection_backup_key(path)).cloned())
+}
+
+fn record_injection_backup(path: &Path, backup: Option<PathBuf>) -> Result<()> {
+    let mut manifest = load_injection_backup_manifest()?;
+    manifest.insert(injection_backup_key(path), backup);
+    write_injection_backup_manifest(&manifest)
+}
+
+fn discard_injection_backup(path: &Path) -> Result<()> {
+    let mut manifest = load_injection_backup_manifest()?;
+    let Some(backup) = manifest.remove(&injection_backup_key(path)) else {
+        return Ok(());
+    };
+    if let Some(backup) = backup {
+        fs::remove_file(backup).ok();
+    }
+    write_injection_backup_manifest(&manifest)
+}
+
+fn restore_injection_backup(path: &Path) -> Result<()> {
+    let mut manifest = load_injection_backup_manifest()?;
+    let Some(backup) = manifest.get(&injection_backup_key(path)).cloned() else {
+        return Ok(());
+    };
+    let backup_to_delete = backup.clone();
+    match backup {
+        Some(backup) => {
+            if !backup.exists() {
+                return Err(anyhow!(
+                    "injection backup for {} is missing: {}",
+                    path.display(),
+                    backup.display()
+                ));
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&backup, path).with_context(|| {
+                format!(
+                    "failed to restore injection backup {} to {}",
+                    backup.display(),
+                    path.display()
+                )
+            })?;
+        }
+        None => {
+            if path.exists() {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove injected {}", path.display()))?;
+            }
+        }
+    }
+    manifest.remove(&injection_backup_key(path));
+    if let Some(backup) = backup_to_delete {
+        fs::remove_file(backup).ok();
+    }
+    write_injection_backup_manifest(&manifest)
 }
 
 fn read_json_or_empty(path: &Path) -> Result<Value> {
@@ -1762,7 +1978,7 @@ fn write_text(path: &Path, text: &str) -> Result<()> {
 fn write_text_with_replace(
     path: &Path,
     text: &str,
-    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    mut replace: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1771,6 +1987,27 @@ fn write_text_with_replace(
     fs::write(&tmp, text)?;
     match replace(&tmp, path) {
         Ok(()) => Ok(()),
+        Err(first_error) if path.exists() => {
+            let previous = path.with_extension(format!("{}.previous", Uuid::new_v4().simple()));
+            let result = (|| -> Result<()> {
+                replace(path, &previous).with_context(|| {
+                    format!("failed to stage {} for replacement", path.display())
+                })?;
+                if let Err(replace_error) = replace(&tmp, path) {
+                    let restore_result = replace(&previous, path);
+                    return Err(anyhow!(
+                        "failed to replace {} after {first_error}: {replace_error}; restore result: {restore_result:?}",
+                        path.display()
+                    ));
+                }
+                fs::remove_file(&previous).ok();
+                Ok(())
+            })();
+            if result.is_err() {
+                fs::remove_file(&tmp).ok();
+            }
+            result
+        }
         Err(error) => {
             fs::remove_file(&tmp).ok();
             Err(error).with_context(|| format!("failed to write {}", path.display()))
@@ -1825,6 +2062,20 @@ fn home_dir() -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::ProviderConfig;
+
+    #[test]
+    fn local_base_url_formats_ipv6_and_wildcards_for_clients() {
+        assert_eq!(local_base_url("::1", 18_883), "http://[::1]:18883");
+        assert_eq!(
+            local_base_url("2001:db8::10", 18_883),
+            "http://[2001:db8::10]:18883"
+        );
+        assert_eq!(local_base_url("0.0.0.0", 18_883), "http://127.0.0.1:18883");
+        assert_eq!(
+            local_base_url("127.0.0.1", 18_883),
+            "http://127.0.0.1:18883"
+        );
+    }
 
     #[test]
     fn codex_injection_preserves_other_tables() {
@@ -2344,6 +2595,48 @@ command = "npx"
         assert!(error.is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "model = \"before\"\n");
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn non_codex_injection_disable_restores_the_original_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-agent-backup-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let config_root = dir.join("config-root");
+        let path = dir.join("opencode.json");
+        fs::create_dir_all(&dir).unwrap();
+        let previous_config_root = std::env::var_os("ATOAPI_CONFIG_DIR");
+        std::env::set_var("ATOAPI_CONFIG_DIR", &config_root);
+        let original = "{\"provider\":\"native\"}\n";
+        write_text(&path, original).unwrap();
+
+        let item = AgentInjectionConfig {
+            id: "opencode".to_string(),
+            label: "OpenCode".to_string(),
+            kind: AgentInjectionKind::OpenCode,
+            enabled: true,
+            provider_id: None,
+            model_id: None,
+            target_path: Some(path.clone()),
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        };
+        let backup = backup_file(&path).unwrap().unwrap();
+        write_text(&path, "{\"provider\":\"atoapi\"}\n").unwrap();
+        assert_eq!(backup_file(&path).unwrap(), Some(backup.clone()));
+
+        remove_item(&item).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        fs::remove_file(backup).ok();
+        match previous_config_root {
+            Some(value) => std::env::set_var("ATOAPI_CONFIG_DIR", value),
+            None => std::env::remove_var("ATOAPI_CONFIG_DIR"),
+        }
         fs::remove_dir_all(dir).ok();
     }
 

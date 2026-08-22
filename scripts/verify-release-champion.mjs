@@ -750,7 +750,8 @@ async function runLiveComparison(options) {
       join(sourceSnapshot.configDir, "config.toml"),
       "snapshotted source config.toml"
     );
-    if (!extractTomlString(configText, "local_key")) {
+    const liveCodexMetricsKey = extractTomlString(configText, "local_key");
+    if (!liveCodexMetricsKey) {
       throw new FailClosedError(
         "missing_local_key",
         "source config.toml has no local_key; live verification cannot authenticate safely"
@@ -856,6 +857,7 @@ async function runLiveComparison(options) {
       if (!liveCodexMetricsUrl) return;
       await assertLiveCodexMetricsScopeUnchanged({
         metricsUrl: liveCodexMetricsUrl,
+        localKey: liveCodexMetricsKey,
         expectedProviderId: cohort.provider_id,
         expectedModel: cohort.model,
         expectedRealm: cohort.key_realm_hash,
@@ -2936,7 +2938,11 @@ async function runInterleavedToolTailMaturityPair(specs) {
 }
 
 async function sendOneInbound(spec) {
-  const before = await getJson(`${spec.runtime.baseUrl}/admin/metrics`, 10_000);
+  const before = await getJson(
+    `${spec.runtime.baseUrl}/admin/metrics`,
+    10_000,
+    spec.runtime.localKey
+  );
   const beforeCounters = requestCounters(before);
   const knownRawInboundIds = new Set(
     requestLogRows(before)
@@ -3001,6 +3007,7 @@ async function sendOneInbound(spec) {
   }
   const after = await waitForSettledInbound({
     baseUrl: spec.runtime.baseUrl,
+    localKey: spec.runtime.localKey,
     beforeCounters,
     knownRawInboundIds
   });
@@ -3307,11 +3314,11 @@ function releaseFixtureToolsForScenario(
   }];
 }
 
-async function waitForSettledInbound({ baseUrl, beforeCounters, knownRawInboundIds }) {
+async function waitForSettledInbound({ baseUrl, localKey, beforeCounters, knownRawInboundIds }) {
   const deadline = Date.now() + 15_000;
   let latest = null;
   do {
-    latest = await getJson(`${baseUrl}/admin/metrics`, 5_000);
+    latest = await getJson(`${baseUrl}/admin/metrics`, 5_000, localKey);
     const counters = requestCounters(latest);
     const hasNewRequest = requestLogRows(latest).some((item) => {
       const id = String(item?.inbound_request_id ?? "");
@@ -8545,6 +8552,7 @@ function validateLiveCodexMetricsScopeRecord({
 
 async function assertLiveCodexMetricsScopeUnchanged({
   metricsUrl,
+  localKey,
   expectedProviderId,
   expectedModel,
   expectedRealm,
@@ -8561,7 +8569,7 @@ async function assertLiveCodexMetricsScopeUnchanged({
   }
   let metrics;
   try {
-    metrics = await getJson(metricsUrl, 5_000);
+    metrics = await getJson(metricsUrl, 5_000, localKey);
   } catch (error) {
     const code = error instanceof FailClosedError
       ? error.code
@@ -8603,8 +8611,11 @@ async function assertLiveCodexMetricsScopeUnchanged({
   });
 }
 
-async function getJson(url, timeoutMs) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+async function getJson(url, timeoutMs, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(timeoutMs)
+  });
   if (!response.ok) {
     throw new FailClosedError("admin_endpoint_failed", `${url} returned HTTP ${response.status}`);
   }

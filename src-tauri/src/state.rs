@@ -5,7 +5,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs::{self, OpenOptions},
     io::Write,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -13,6 +13,18 @@ use std::{
     },
     time::{Duration as StdDuration, Instant},
 };
+
+/// Parse a configured listener host/port as a socket address.  Building the
+/// address from a string ("host:port") is ambiguous for IPv6 and produces an
+/// invalid address such as `::1:18883`.  Configuration validation already
+/// requires an IP literal, so keep the conversion in one place and let the
+/// standard library render IPv6 with brackets where appropriate.
+fn configured_listener_addr(host: &str, port: u16) -> Result<SocketAddr> {
+    let ip = host
+        .parse::<IpAddr>()
+        .with_context(|| format!("invalid listener host {host:?}"))?;
+    Ok(SocketAddr::new(ip, port))
+}
 use tokio::{
     net::TcpListener,
     sync::{oneshot, Mutex, RwLock},
@@ -985,6 +997,7 @@ impl AppState {
         let mut current = self.config.write().await;
         self.flush_config().await?;
         let (config, agent_defaults_changed) = load_config_with_agent_defaults(&self.config_path)?;
+        config.validate_listener_auth()?;
         if agent_defaults_changed {
             self.persist_config_snapshot(&config).await?;
         }
@@ -1021,6 +1034,7 @@ impl AppState {
     pub async fn start_proxy(self: &Arc<Self>) -> Result<ProxyStatus> {
         let mut server_guard = self.server.lock().await;
         if let Some(server) = server_guard.as_ref() {
+            self.config.read().await.validate_listener_auth()?;
             self.set_proxy_auto_start(true).await?;
             return Ok(ProxyStatus {
                 running: true,
@@ -1029,8 +1043,9 @@ impl AppState {
         }
 
         let config = self.config.read().await.clone();
-        let bind = format!("{}:{}", config.host, config.port);
-        let listener = TcpListener::bind(&bind)
+        config.validate_listener_auth()?;
+        let bind = configured_listener_addr(&config.host, config.port)?;
+        let listener = TcpListener::bind(bind)
             .await
             .with_context(|| format!("failed to bind local proxy at {bind}"))?;
         let address = listener.local_addr()?.to_string();
@@ -1067,6 +1082,7 @@ impl AppState {
     pub async fn start_proxy_mode_proxy(self: &Arc<Self>) -> Result<ProxyStatus> {
         let mut server_guard = self.proxy_mode_server.lock().await;
         if let Some(server) = server_guard.as_ref() {
+            self.config.read().await.validate_listener_auth()?;
             return Ok(ProxyStatus {
                 running: true,
                 address: Some(server.address.clone()),
@@ -1074,8 +1090,9 @@ impl AppState {
         }
 
         let config = self.config.read().await.clone();
-        let bind = format!("{}:{}", config.proxy_mode_host, config.proxy_mode_port);
-        let listener = TcpListener::bind(&bind)
+        config.validate_listener_auth()?;
+        let bind = configured_listener_addr(&config.proxy_mode_host, config.proxy_mode_port)?;
+        let listener = TcpListener::bind(bind)
             .await
             .with_context(|| format!("failed to bind proxy mode at {bind}"))?;
         let address = listener.local_addr()?.to_string();
@@ -1217,6 +1234,53 @@ impl AppState {
 
     pub async fn wait_for_config_snapshot(&self, version: u64) -> Result<()> {
         self.config_persistence.wait_for(version).await
+    }
+
+    /// Persist a complete configuration snapshot before publishing it as the
+    /// live runtime configuration. Holding the config write lock across the
+    /// short persistence wait keeps concurrent commands ordered and, more
+    /// importantly, leaves the in-memory config untouched when the write
+    /// fails.
+    pub async fn commit_config_update<F>(&self, update: F) -> Result<(AppConfig, AppConfig)>
+    where
+        F: FnOnce(&AppConfig) -> Result<AppConfig>,
+    {
+        let mut current = self.config.write().await;
+        let previous = current.clone();
+        let next = update(&current)?;
+        let version = self.publish_config_snapshot(&next)?;
+        if let Err(error) = self.wait_for_config_snapshot(version).await {
+            let rollback_version = self.publish_config_snapshot(&previous)?;
+            if let Err(rollback_error) = self.wait_for_config_snapshot(rollback_version).await {
+                return Err(anyhow::anyhow!(
+                    "config persistence failed: {error}; rollback failed: {rollback_error}"
+                ));
+            }
+            return Err(error);
+        }
+        *current = next.clone();
+        Ok((previous, next))
+    }
+
+    /// Commit a snapshot that was prepared outside the config lock (for
+    /// example, while updating an Agent's external config file). The caller
+    /// owns the snapshot and uses the returned value to restore a prior
+    /// runtime state when a later startup step fails.
+    pub async fn commit_config_snapshot(&self, next: AppConfig) -> Result<AppConfig> {
+        let mut current = self.config.write().await;
+        let previous = current.clone();
+        let version = self.publish_config_snapshot(&next)?;
+        if let Err(error) = self.wait_for_config_snapshot(version).await {
+            let rollback_version = self.publish_config_snapshot(&previous)?;
+            if let Err(rollback_error) = self.wait_for_config_snapshot(rollback_version).await {
+                return Err(anyhow::anyhow!(
+                    "config persistence failed: {error}; rollback failed: {rollback_error}"
+                ));
+            }
+            return Err(error);
+        }
+        *current = next;
+        Ok(previous)
     }
 
     pub async fn persist_config_snapshot(&self, config: &AppConfig) -> Result<()> {
@@ -1688,6 +1752,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn configured_listener_addr_supports_ipv6_without_string_ambiguity() {
+        assert_eq!(
+            configured_listener_addr("::1", 18_883).unwrap(),
+            "[::1]:18883".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            configured_listener_addr("127.0.0.1", 18_883).unwrap(),
+            "127.0.0.1:18883".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
     fn canonical_config_load_does_not_reserialize_without_a_semantic_migration() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-canonical-config-load-{}",
@@ -1715,6 +1791,43 @@ mod tests {
         );
         fs::remove_dir_all(dir).ok();
     }
+
+    #[tokio::test]
+    async fn reload_rejects_invalid_listener_auth_without_replacing_runtime_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-reload-listener-auth-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        let mut valid = AppConfig::default();
+        valid.local_key = "reload-valid-key".to_string();
+        valid.save(&config_path).unwrap();
+        let state = Arc::new(
+            AppState::for_test(
+                valid.clone(),
+                config_path.clone(),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let mut invalid = valid.clone();
+        invalid.host = "192.168.1.20".to_string();
+        invalid.local_key.clear();
+        fs::write(&config_path, toml::to_string(&invalid).unwrap()).unwrap();
+
+        let error = state.reload_config().await.unwrap_err();
+        assert!(error.to_string().contains("non-loopback address"));
+        let current = state.config.read().await;
+        assert_eq!(current.host, valid.host);
+        assert_eq!(current.local_key, valid.local_key);
+        drop(current);
+
+        state.shutdown_for_exit().await.unwrap();
+        fs::remove_dir_all(dir).ok();
+    }
+
     use crate::config::{AgentInjectionKind, CacheConfig, Channel, ModelConfig, ProviderConfig};
     use crate::proxy::cache_affinity::{
         PostBurstEvidence, PostBurstWindow, ShadowAffinityArm, ShadowAffinityAssignment,

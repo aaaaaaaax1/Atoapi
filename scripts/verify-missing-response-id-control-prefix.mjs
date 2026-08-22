@@ -91,7 +91,7 @@ try {
   ];
   await completeRequest(baseUrl, localKey, model, seedInput, promptCacheKey);
   await waitFor(
-    async () => Number((await getJson(`${baseUrl}/admin/metrics`)).agent_generation?.inbound_requests) === 1,
+    async () => Number((await getJson(`${baseUrl}/admin/metrics`, localKey)).agent_generation?.inbound_requests) === 1,
     10_000,
     "idless seed request did not settle"
   );
@@ -99,7 +99,7 @@ try {
   const followUp = [...seedInput, message("idless-control-prefix-follow-up")];
   await completeRequest(baseUrl, localKey, model, followUp, promptCacheKey);
   const metrics = await waitForValue(async () => {
-    const value = await getJson(`${baseUrl}/admin/metrics`);
+    const value = await getJson(`${baseUrl}/admin/metrics`, localKey);
     return Number(value.agent_generation?.inbound_requests) === 2 ? value : null;
   }, 10_000, "idless follow-up request did not settle");
 
@@ -337,8 +337,11 @@ async function readRequestBody(request) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-async function getJson(url) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+async function getJson(url, localKey = "") {
+  const response = await fetch(url, {
+    headers: localKey ? { authorization: `Bearer ${localKey}` } : undefined,
+    signal: AbortSignal.timeout(5_000)
+  });
   assert.equal(response.ok, true, `${url} returned ${response.status}`);
   return response.json();
 }

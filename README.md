@@ -11,6 +11,9 @@ The app exposes:
 - `GET /health`
 - `GET /admin/metrics`
 
+All `/admin/*` routes require `Authorization: Bearer <local-key>`. A non-loopback
+listener also requires a non-empty local key.
+
 Default local address:
 
 ```text

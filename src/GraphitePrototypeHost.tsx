@@ -1087,7 +1087,11 @@ const bridgeSource = String.raw`
     const status = nextState?.proxyStatus;
     const running = status?.running === true;
     const configuredAddress = nextState?.settings
-      ? String(nextState.settings.host || "127.0.0.1") + ":" + String(nextState.settings.port || "18883")
+      ? (() => {
+          const host = String(nextState.settings.host || "127.0.0.1");
+          const displayHost = host.includes(":") && !host.startsWith("[") ? "[" + host + "]" : host;
+          return displayHost + ":" + String(nextState.settings.port || "18883");
+        })()
       : "";
     const address = status?.address || configuredAddress || "—";
     const runtime = $bridge(".runtime-state");
@@ -1216,7 +1220,7 @@ const bridgeSource = String.raw`
 
   window.addEventListener("message", (event) => {
     const message = event.data || {};
-    if (message.channel !== CHANNEL) return;
+    if (event.source !== window.parent || message.channel !== CHANNEL) return;
     if (message.kind === "state") applyState(message.state);
     if (message.kind === "metrics-delta") applyMetricsDelta(message.metrics, message.requests);
     if (message.kind === "render-suspension") applyRenderSuspended(message.suspended);
@@ -1832,6 +1836,17 @@ function protoAgentId(agent: AgentInjectionConfig): string {
   return agent.kind === "proxy-mode" ? "proxy" : agent.id;
 }
 
+function localBaseUrl(host: string | undefined, port: number | undefined, suffix: string): string {
+  const rawHost = String(host || "127.0.0.1").trim();
+  const clientHost = rawHost === "0.0.0.0" || rawHost === "::"
+    ? "127.0.0.1"
+    : rawHost;
+  const bracketedHost = clientHost.includes(":") && !clientHost.startsWith("[")
+    ? `[${clientHost}]`
+    : clientHost;
+  return `http://${bracketedHost}:${Number(port || 18883)}${suffix}`;
+}
+
 function iconForAgent(kind: AgentInjectionConfig["kind"]): string {
   const icons: Record<AgentInjectionConfig["kind"], string> = {
     "claude-code": "code-2",
@@ -2095,8 +2110,8 @@ function buildState(
         : "未选择上游",
       endpoint: agent.kind === "codex" ? "/codex/v1" : agent.kind === "proxy-mode" ? "/v1" : "/v1",
       localBaseUrl: agent.kind === "proxy-mode"
-        ? `http://${config?.proxy_mode_host ?? "127.0.0.1"}:${config?.proxy_mode_port ?? 18884}/v1`
-        : `http://${config?.host ?? "127.0.0.1"}:${config?.port ?? 18883}${agent.kind === "codex" ? "/codex/v1" : "/v1"}`,
+        ? localBaseUrl(config?.proxy_mode_host, config?.proxy_mode_port, "/v1")
+        : localBaseUrl(config?.host, config?.port, agent.kind === "codex" ? "/codex/v1" : "/v1"),
       localKey: agent.local_key ?? config?.local_key ?? ""
     };
   });
