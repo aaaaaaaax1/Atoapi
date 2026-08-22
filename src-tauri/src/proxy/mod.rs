@@ -1770,6 +1770,8 @@ async fn run_responses_compact_for_authorized_agent(
         &decision.upstream_channel,
     );
     let native_responses_passthrough = matches!(decision.upstream_channel, Channel::Responses);
+    let native_codex_route = native_responses_passthrough
+        && (authorized_agent.as_deref() == Some("codex") || forced_agent_id == Some("codex"));
     // Codex uses the same stable placement key when it asks the official
     // compact endpoint to establish a new context anchor.  This is still a
     // caller-owned routing hint, not continuation state: it may pass only on
@@ -1811,6 +1813,12 @@ async fn run_responses_compact_for_authorized_agent(
         normalize_responses_request(&mut provider_prefix_body);
         optimize_provider_prefix(&mut provider_prefix_body, &config, &decision);
         strip_root_provider_cache_metadata_for_native(&mut upstream_body);
+    }
+    // Compaction also carries the replayed input array. Apply the same narrow
+    // Codex item-id namespace repair here so a compact request cannot reintroduce
+    // an fc_/fco_ id on a custom_tool_call/custom_tool_call_output item.
+    if native_codex_route {
+        normalize_native_codex_tool_item_id_prefixes(&mut upstream_body);
     }
     // Compaction is a new context epoch, not a new Key realm.  Reuse the
     // same stable selection scope as normal FullReplay so a sequential or
@@ -2925,6 +2933,12 @@ async fn run_generation_for_authorized_agent(
     let native_responses_passthrough = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Responses)
         && !codex_responses_chat_compat;
+    // The Codex Responses route is known even when a particular recovery
+    // request has no attested turn-metadata carrier. Keep this route fact
+    // separate from the optional lineage proof: item-id namespace repair is
+    // a wire-schema normalization, not a continuation-state decision.
+    let native_codex_route = native_responses_passthrough
+        && (authorized_agent.as_deref() == Some("codex") || forced_agent_id == Some("codex"));
     let client_request_starts_compaction_epoch = responses_request_starts_compaction_epoch(
         &client_channel,
         &client_request,
@@ -3505,23 +3519,15 @@ async fn run_generation_for_authorized_agent(
             }
         }
     }
-    // Codex can also regenerate the Responses item id while a streamed turn
-    // is being interrupted and replayed.  A provider validates the root item
-    // namespace independently from `call_id` (`ctc_`/`ctco_` for custom
-    // tools, `fc_`/`fco_` for function tools).  Repair only the known
-    // namespace mismatch on a trusted native FullReplay; arbitrary caller
-    // ids and external continuations remain untouched.
-    let native_codex_full_replay_is_proven = (local_response_session_recovered_unambiguously
-        || full_replay_after_local_lineage
-        || local_tool_id_rebind_applied)
-        && !full_replay_ambiguous_local_lineage
-        && !stale_external_continuation_after_route_switch;
-    if native_responses_passthrough
-        && trusted_codex_metadata.is_some()
-        && native_codex_full_replay_is_proven
-        && final_body_has_no_external_previous_response_id
-        && !response_session_starts_compaction_epoch
-    {
+    // Codex validates the Responses root item namespace independently from
+    // call_id (ctc_/ctco_ for custom tools, fc_/fco_ for function tools). A
+    // streamed interruption/recovery can replay a custom-tool item with a
+    // function-call prefix, and that can happen before local lineage metadata
+    // is available. Repair only the known four-prefix mismatch, never
+    // arbitrary opaque ids or payload links. This is a schema repair at the
+    // final Codex wire boundary, so it must not depend on the separate
+    // FullReplay proof.
+    if native_codex_route {
         normalize_native_codex_tool_item_id_prefixes(&mut upstream_body);
     }
     let full_response_input = upstream_body.get("input").cloned();
@@ -45549,7 +45555,11 @@ data: {{"type":"response.completed","response":{{"id":"resp_regenerated_tools_{t
         });
         let ordinary_response = handle_generation_for_agent(
             state.clone(),
-            headers.clone(),
+            // This second request intentionally omits the attested turn
+            // metadata. The route is still explicitly Codex, so the final
+            // wire-schema repair must protect it even when lineage recovery
+            // is unavailable.
+            test_local_auth_headers(),
             Bytes::from(serde_json::to_vec(&ordinary_request).unwrap()),
             Channel::Responses,
             Some("codex"),
@@ -45575,11 +45585,12 @@ data: {{"type":"response.completed","response":{{"id":"resp_regenerated_tools_{t
         .expect("the ordinary request must reach the upstream once");
         assert_eq!(
             ordinary_body.pointer("/input/1/id").and_then(Value::as_str),
-            Some("fc_ordinary")
+            Some("ctc_ordinary"),
+            "the no-metadata Codex request still receives type-correct custom-tool ids"
         );
         assert_eq!(
             ordinary_body.pointer("/input/2/id").and_then(Value::as_str),
-            Some("fco_ordinary")
+            Some("ctco_ordinary")
         );
         fs::remove_dir_all(dir).ok();
     }
