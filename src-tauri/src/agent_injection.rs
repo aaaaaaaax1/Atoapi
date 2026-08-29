@@ -22,7 +22,7 @@ const CODEX_MODEL_CATALOG_LEGACY_FILE: &str = "atoapi-model-catalog.json";
 const CODEX_MODEL_CATALOG_FILE_PREFIX: &str = "atoapi-model-catalog-";
 const CODEX_RESTORE_STATE_FILE: &str = "atoapi-codex-restore-state.json";
 const CODEX_RESTORE_STATE_VERSION: u32 = 1;
-const CODEX_MANAGED_ROOT_FIELDS: [&str; 7] = [
+const CODEX_MANAGED_ROOT_FIELDS: [&str; 8] = [
     "model_provider",
     "model_catalog_json",
     "disable_response_storage",
@@ -30,6 +30,7 @@ const CODEX_MANAGED_ROOT_FIELDS: [&str; 7] = [
     "model_reasoning_effort",
     "model_context_window",
     "model_auto_compact_token_limit",
+    "model_auto_compact_token_limit_scope",
 ];
 const CODEX_MANAGED_MODEL_FIELDS: [&str; 3] =
     ["model", "model_reasoning_effort", "model_context_window"];
@@ -533,12 +534,15 @@ fn capture_codex_legacy_managed_fragment(doc: &DocumentMut) -> DocumentMut {
             fragment.as_table_mut().insert(field, item.clone());
         }
     }
-    // Older Atoapi injections never wrote this key, so on a legacy restore
+    // Older Atoapi injections never wrote these keys, so on a legacy restore
     // path any current value is caller-owned and must survive removal.
-    if let Some(item) = doc.as_table().get("model_auto_compact_token_limit") {
-        fragment
-            .as_table_mut()
-            .insert("model_auto_compact_token_limit", item.clone());
+    for field in [
+        "model_auto_compact_token_limit",
+        "model_auto_compact_token_limit_scope",
+    ] {
+        if let Some(item) = doc.as_table().get(field) {
+            fragment.as_table_mut().insert(field, item.clone());
+        }
     }
     fragment
 }
@@ -633,23 +637,35 @@ fn migrate_codex_restore_state_for_auto_compaction(
     state: &mut CodexRestoreState,
     live_doc: &DocumentMut,
 ) -> Result<()> {
-    const FIELD: &str = "model_auto_compact_token_limit";
-    if state.managed_root_fields.iter().any(|field| field == FIELD) {
-        return Ok(());
-    }
-
     let mut fragment = parse_codex_restore_fragment(state)?;
-    if !fragment.as_table().contains_key(FIELD) {
-        if let Some(original) = live_doc.as_table().get(FIELD) {
-            // Existing restore state means this file was managed by an older
-            // Atoapi build. That build did not own this root field, so its
-            // pre-upgrade value belongs to the user.
-            fragment.as_table_mut().insert(FIELD, original.clone());
+    let mut changed = false;
+    for field in [
+        "model_auto_compact_token_limit",
+        "model_auto_compact_token_limit_scope",
+    ] {
+        if state
+            .managed_root_fields
+            .iter()
+            .any(|managed| managed == field)
+        {
+            continue;
         }
+        if !fragment.as_table().contains_key(field) {
+            if let Some(original) = live_doc.as_table().get(field) {
+                // Existing restore state means this file was managed by an
+                // older Atoapi build. That build did not own this root field,
+                // so its pre-upgrade value belongs to the user.
+                fragment.as_table_mut().insert(field, original.clone());
+            }
+        }
+        state.managed_root_fields.push(field.to_string());
+        changed = true;
     }
-    state.fragment_toml = fragment.to_string();
-    state.managed_root_fields.push(FIELD.to_string());
-    save_codex_restore_state(state_path, state)
+    if changed {
+        state.fragment_toml = fragment.to_string();
+        save_codex_restore_state(state_path, state)?;
+    }
+    Ok(())
 }
 
 fn restore_codex_custom_provider(doc: &mut DocumentMut, fragment: &DocumentMut) {
@@ -1068,8 +1084,19 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
     if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
         doc["model_auto_compact_token_limit"] = value(i64::from(limit));
+        // Count only the content that has accumulated after the compacted
+        // prefix. Counting the summary prefix itself (`total`) can immediately
+        // retrigger compaction on an otherwise unchanged FullReplay turn.
+        doc["model_auto_compact_token_limit_scope"] = value("body_after_prefix");
     } else if let Some(fragment) = restore_fragment.as_ref() {
-        restore_codex_root_fields(&mut doc, fragment, &["model_auto_compact_token_limit"]);
+        restore_codex_root_fields(
+            &mut doc,
+            fragment,
+            &[
+                "model_auto_compact_token_limit",
+                "model_auto_compact_token_limit_scope",
+            ],
+        );
     }
     if context.default_model_is_explicit {
         doc["model"] = value(context.default_model.as_str());
@@ -2406,7 +2433,7 @@ command = "npx"
         fs::create_dir_all(&dir).unwrap();
         write_text(
             &path,
-            "model_auto_compact_token_limit = 246000\n[mcp_servers.context7]\ncommand = \"npx\"\n",
+            "model_auto_compact_token_limit = 246000\nmodel_auto_compact_token_limit_scope = \"total\"\n[mcp_servers.context7]\ncommand = \"npx\"\n",
         )
         .unwrap();
 
@@ -2420,6 +2447,12 @@ command = "npx"
                 .and_then(toml::Value::as_integer),
             Some(120_000)
         );
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit_scope")
+                .and_then(toml::Value::as_str),
+            Some("body_after_prefix")
+        );
 
         context.auto_compact_token_limit = None;
         write_codex_config(&path, &context).unwrap();
@@ -2430,6 +2463,12 @@ command = "npx"
                 .get("model_auto_compact_token_limit")
                 .and_then(toml::Value::as_integer),
             Some(246_000)
+        );
+        assert_eq!(
+            restored_while_managed
+                .get("model_auto_compact_token_limit_scope")
+                .and_then(toml::Value::as_str),
+            Some("total")
         );
 
         context.auto_compact_token_limit = Some(140_000);
@@ -2442,6 +2481,12 @@ command = "npx"
                 .get("model_auto_compact_token_limit")
                 .and_then(toml::Value::as_integer),
             Some(246_000)
+        );
+        assert_eq!(
+            restored_after_removal
+                .get("model_auto_compact_token_limit_scope")
+                .and_then(toml::Value::as_str),
+            Some("total")
         );
         assert!(restored_after_removal.get("mcp_servers").is_some());
 
@@ -2460,6 +2505,7 @@ command = "npx"
             &path,
             r#"model_provider = "custom"
 model_auto_compact_token_limit = 246000
+model_auto_compact_token_limit_scope = "total"
 
 [model_providers.custom]
 name = "Atoapi"
@@ -2491,6 +2537,12 @@ wire_api = "responses"
                 .and_then(toml::Value::as_integer),
             Some(246_000)
         );
+        assert_eq!(
+            parsed
+                .get("model_auto_compact_token_limit_scope")
+                .and_then(toml::Value::as_str),
+            Some("total")
+        );
         let migrated = load_codex_restore_state(&restore_path, &path)
             .unwrap()
             .expect("restore state must remain present");
@@ -2498,6 +2550,10 @@ wire_api = "responses"
             .managed_root_fields
             .iter()
             .any(|field| field == "model_auto_compact_token_limit"));
+        assert!(migrated
+            .managed_root_fields
+            .iter()
+            .any(|field| field == "model_auto_compact_token_limit_scope"));
 
         fs::remove_dir_all(dir).ok();
     }

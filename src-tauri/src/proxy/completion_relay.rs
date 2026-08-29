@@ -451,6 +451,7 @@ pub(super) enum ResponsesFailureCode {
     UpstreamStreamError,
     UpstreamRequestBlocked,
     UpstreamWafBlocked,
+    RequestBodyTooLarge,
 }
 
 impl ResponsesFailureCode {
@@ -462,6 +463,7 @@ impl ResponsesFailureCode {
             Self::UpstreamStreamError => "upstream_stream_error",
             Self::UpstreamRequestBlocked => "upstream_request_blocked",
             Self::UpstreamWafBlocked => "upstream_waf_blocked",
+            Self::RequestBodyTooLarge => "request_body_too_large",
         }
     }
 

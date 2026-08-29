@@ -18,9 +18,9 @@ use crate::{
     },
     metrics::{
         AgentAttemptFinish, AgentAttemptOutcome, AgentAttemptStart, AgentInboundOutcome,
-        AgentInboundStart, AgentOwnerFailureSettlement, AgentTerminalSettlement,
-        FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore, MetricsTransaction, RequestLog,
-        ResponsesWirePrefixFingerprints, UsageRecord,
+        AgentInboundStart, AgentLocalRejectionSettlement, AgentOwnerFailureSettlement,
+        AgentTerminalSettlement, FinalScopeWaterlineLog, MetricsCommitResult, MetricsStore,
+        MetricsTransaction, RequestLog, ResponsesWirePrefixFingerprints, UsageRecord,
     },
     state::{AppState, PrefixWarmState, PromptCacheOptionsSiblingProof},
 };
@@ -100,7 +100,9 @@ use cache_control_core::{
 };
 pub(crate) use cache_directed_relay::{DispatchDrainOutcome, DispatchTracker};
 use cache_validation::CacheValidationObservation;
-use completion_relay::stream_upstream;
+use completion_relay::{
+    canonical_responses_failure_payload, stream_upstream, ResponsesFailureCode,
+};
 #[cfg(test)]
 use completion_relay::{
     relay_chunk_parts, BoundedCacheCapture, STREAM_CACHE_CAPTURE_BYTE_LIMIT,
@@ -157,6 +159,12 @@ const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
+// A native Responses FullReplay is already a complete conversation, so an
+// unusually large frozen wire is not made safer by sending it to a provider
+// that may reject the entity while parsing or decompressing it.  Keep this
+// cap well above normal Codex turns (and model context windows) while stopping
+// pathological replay uploads locally, before gzip and the one-shot POST.
+const MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES: usize = 16 * 1024 * 1024;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 // These maps are local compatibility hints, not durable routing state. Bound
@@ -2849,6 +2857,143 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn local_oversized_native_full_replay_response(
+    state: &AppState,
+    request_id: &str,
+    started: &Instant,
+    client_channel: &Channel,
+    active_request_channel: &Channel,
+    decision: &RouteDecision,
+    eligible: bool,
+    metrics_cache_key: &str,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_fingerprint: Option<&str>,
+    local_prepare_ms: u64,
+    diagnostics: &BodyDiagnostics,
+    body: &Value,
+    body_bytes: u64,
+    used_response_session: bool,
+    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    requested_model: Option<String>,
+    tail_input_diagnostics: &TailInputDiagnostics,
+    session_anchor_diagnostics: &SessionAnchorDiagnostics,
+    client_requested_stream: bool,
+    agent_generation: bool,
+    agent_id: Option<&str>,
+    response_handoff: Option<cache_directed_relay::DispatchHandoff<Response>>,
+) -> Response {
+    let limit_bytes = MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES as u64;
+    let diagnostic = format!(
+        "reason=native_full_replay_body_too_large; full_replay=true; body_bytes={body_bytes}; limit_bytes={limit_bytes}"
+    );
+    let client_message = format!(
+        "native Responses FullReplay request body is too large ({body_bytes} bytes; local limit {limit_bytes} bytes); compact this conversation or start a new clean continuation"
+    );
+    let mut request_log = upstream_transport_failure_log_with_body_bytes(
+        request_id,
+        started,
+        client_channel,
+        active_request_channel,
+        decision,
+        eligible.then_some(metrics_cache_key),
+        provider_prefix_key,
+        provider_prefix_fingerprint,
+        &PrefixGuardWaitDiagnostics::default(),
+        local_prepare_ms,
+        diagnostics,
+        body,
+        Some(body_bytes),
+        used_response_session,
+        response_session_reuse_diagnostics,
+        requested_model,
+        "responses_full_replay_size_gate",
+        None,
+        None,
+    );
+    request_log.status = if client_requested_stream {
+        StatusCode::OK.as_u16()
+    } else {
+        StatusCode::PAYLOAD_TOO_LARGE.as_u16()
+    };
+    request_log.agent_id = agent_id.map(str::to_string);
+    request_log.agent_label = agent_id.map(str::to_string);
+    request_log.upstream_request_id = None;
+    request_log.upstream_attempt_index = None;
+    request_log.upstream_attempt_total = Some(0);
+    request_log.upstream_attempts = Some(0);
+    request_log.upstream_call_kind = Some(
+        if client_requested_stream {
+            "stream"
+        } else {
+            "sync"
+        }
+        .to_string(),
+    );
+    request_log.upstream_call_source = Some("responses_full_replay_size_gate".to_string());
+    request_log.upstream_header_wait_class = Some("local:request_body_too_large".to_string());
+    request_log.provider_cache_diagnostic = Some(format!(
+        "native_full_replay_body_too_large:limit_bytes={limit_bytes}"
+    ));
+    request_log.sse_end_reason = Some("request_body_too_large".to_string());
+    request_log.downstream_disconnected = Some(false);
+    request_log.downstream_disconnect_stage = None;
+    apply_tail_input_diagnostics(&mut request_log, tail_input_diagnostics);
+    apply_session_anchor_diagnostics(&mut request_log, session_anchor_diagnostics);
+
+    if agent_generation {
+        let mut transaction =
+            MetricsTransaction::agent_local_rejection(AgentLocalRejectionSettlement {
+                inbound_request_id: request_id.to_string(),
+                request: request_log,
+                inbound_outcome: AgentInboundOutcome::LocalRejection,
+                terminal_state: Some("request_body_too_large".to_string()),
+            });
+        transaction.observe_error("request_body_too_large", diagnostic.clone());
+        state.metrics.commit(transaction).await;
+    } else {
+        let mut transaction = MetricsTransaction::local_rejection(request_log);
+        transaction.observe_error("request_body_too_large", diagnostic.clone());
+        state.metrics.commit(transaction).await;
+    }
+
+    let failure_payload = canonical_responses_failure_payload(
+        &decision.model,
+        None,
+        ResponsesFailureCode::RequestBodyTooLarge,
+        client_message,
+        request_id,
+        None,
+        None,
+    );
+    let (status, content_type, response_body) = if client_requested_stream {
+        let payload = serde_json::to_string(&failure_payload).unwrap_or_else(|_| {
+            "{\"type\":\"response.failed\",\"response\":{\"status\":\"failed\"}}".to_string()
+        });
+        (
+            StatusCode::OK.as_u16(),
+            "text/event-stream",
+            Bytes::from(format!("event: response.failed\ndata: {payload}\n\n")),
+        )
+    } else {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+            "application/json",
+            Bytes::from(
+                serde_json::to_vec(&failure_payload)
+                    .unwrap_or_else(|_| b"{\"type\":\"response.failed\"}".to_vec()),
+            ),
+        )
+    };
+    let response = raw_bytes_response(status, content_type, response_body);
+    if let Some(handoff) = response_handoff {
+        let _ = handoff.send(response);
+        Response::new(Body::empty())
+    } else {
+        response
+    }
+}
+
 async fn run_generation_for_authorized_agent(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -4233,6 +4378,57 @@ async fn run_generation_for_authorized_agent(
             })
             .await;
         assert!(began, "a fresh Agent inbound id must begin exactly once");
+    }
+    // A provider-facing FullReplay body above the hard cap is almost always a
+    // pathological history for the configured model.  More importantly, the
+    // upstream route has already demonstrated that an ~82 MiB entity can be
+    // rejected as a generic `Failed to parse request body` after a long upload
+    // (and after gzip work).  Reject the frozen wire locally before any prefix
+    // wait, compression, or one-shot POST.  This is one O(1) length check; it
+    // does not retry, probe, or add a background request.
+    let oversized_native_full_replay = native_responses_passthrough
+        && final_scope_waterline_is_full_replay
+        && remaining_external_previous_response_id.is_none()
+        && generation_plan.request_plan().body_len() > MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES;
+    if oversized_native_full_replay {
+        retire_native_maturity_scope(
+            &state,
+            provider_prefix_control_key.as_deref(),
+            final_maturity_parent_scope_digest(
+                upstream_request_diagnostics.final_scope_shadow.as_ref(),
+            ),
+            final_wire_receipt
+                .wire
+                .responses_cache_maturity_static_projection_digest
+                .as_deref(),
+        )
+        .await;
+        return local_oversized_native_full_replay_response(
+            &state,
+            &request_id,
+            &started,
+            &client_channel,
+            &active_request_channel,
+            &decision,
+            eligible,
+            &metrics_cache_key,
+            provider_prefix_key.as_deref(),
+            provider_prefix_fingerprint.as_deref(),
+            local_prepare_ms,
+            &diagnostics,
+            generation_plan.body(),
+            generation_plan.request_plan().body_len() as u64,
+            active_used_response_session,
+            &response_session_reuse_diagnostics,
+            requested_model_for_log.clone(),
+            &tail_input_diagnostics,
+            &session_anchor_diagnostics,
+            client_requested_stream,
+            agent_generation,
+            authorized_agent.as_deref(),
+            response_handoff,
+        )
+        .await;
     }
     let final_responses_static_projection = final_responses_maturity_projection(
         native_responses_passthrough && matches!(&active_request_channel, Channel::Responses),
@@ -11062,8 +11258,54 @@ fn upstream_transport_failure_log(
     upstream_diagnostics: Option<&UpstreamRequestDiagnostics>,
     transport_error_category: Option<&str>,
 ) -> RequestLog {
+    upstream_transport_failure_log_with_body_bytes(
+        request_id,
+        started,
+        client_channel,
+        upstream_channel,
+        decision,
+        cache_key,
+        provider_prefix_key,
+        provider_prefix_fingerprint,
+        prefix_guard_wait,
+        local_prepare_ms,
+        body_diagnostics,
+        body,
+        None,
+        used_response_session,
+        response_session_reuse_diagnostics,
+        requested_model,
+        source,
+        upstream_diagnostics,
+        transport_error_category,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upstream_transport_failure_log_with_body_bytes(
+    request_id: &str,
+    started: &Instant,
+    client_channel: &Channel,
+    upstream_channel: &Channel,
+    decision: &RouteDecision,
+    cache_key: Option<&str>,
+    provider_prefix_key: Option<&str>,
+    provider_prefix_fingerprint: Option<&str>,
+    prefix_guard_wait: &PrefixGuardWaitDiagnostics,
+    local_prepare_ms: u64,
+    body_diagnostics: &BodyDiagnostics,
+    body: &Value,
+    body_bytes_override: Option<u64>,
+    used_response_session: bool,
+    response_session_reuse_diagnostics: &ResponseSessionReuseDiagnostics,
+    requested_model: Option<String>,
+    source: &str,
+    upstream_diagnostics: Option<&UpstreamRequestDiagnostics>,
+    transport_error_category: Option<&str>,
+) -> RequestLog {
     let elapsed = started.elapsed().as_millis() as u64;
-    let body_bytes = serialized_body_len(upstream_channel, body);
+    let body_bytes =
+        body_bytes_override.unwrap_or_else(|| serialized_body_len(upstream_channel, body));
     let original_body_bytes = if body_diagnostics.original_body_bytes > 0 {
         body_diagnostics.original_body_bytes
     } else {
@@ -31185,6 +31427,125 @@ mod tests {
             2,
             "two independent inbounds must each produce exactly one upstream POST"
         );
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_native_full_replay_is_rejected_locally_without_upstream_post() {
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-oversized-full-replay-size-gate-{}",
+            Uuid::new_v4().simple()
+        ));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_server = upstream_hits.clone();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move || {
+                let upstream_hits = upstream_hits_for_server.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    raw_response(
+                        500,
+                        "application/json",
+                        br#"{"error":{"message":"the upstream must not receive this body"}}"#
+                            .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config =
+            test_codex_compact_config(format!("http://{upstream_addr}/v1"), "size-gate-provider");
+        config.providers[0].models = vec![ModelConfig {
+            id: "gpt-5.6-terra".to_string(),
+            request_model_id: None,
+            display_name: "gpt-5.6-terra".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"size-gate-session","thread_id":"size-gate-thread","request_kind":"turn"}"#,
+            ),
+        );
+
+        let oversized_output = "oversized replay payload "
+            .repeat(MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES / 24 + 1024);
+        let body = Bytes::from(
+            serde_json::to_vec(&json!({
+                "model": "gpt-5.6-terra",
+                "stream": true,
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_oversized_replay",
+                    "output": oversized_output,
+                }],
+            }))
+            .unwrap(),
+        );
+        assert!(body.len() >= MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES);
+
+        let response = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            body,
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(response_body.to_vec()).unwrap();
+        assert!(text.contains("event: response.failed"));
+        assert!(text.contains("\"code\":\"request_body_too_large\""));
+        assert!(!text.contains("the upstream must not receive this body"));
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let metrics = state.metrics.snapshot().await;
+                if metrics.recent_agent_inbound_outcomes.len() == 1 {
+                    break metrics;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("local size-gate rejection must settle its inbound metrics");
+        assert_eq!(metrics.upstream_requests, 0);
+        assert!(metrics.recent_agent_upstream_attempts.is_empty());
+        let inbound = &metrics.recent_agent_inbound_outcomes[0];
+        assert_eq!(inbound.attempt_count, 0);
+        assert_eq!(inbound.outcome, AgentInboundOutcome::LocalRejection);
+        assert_eq!(inbound.request.upstream_attempts, Some(0));
+        assert!(metrics
+            .recent_errors
+            .iter()
+            .any(|error| error.scope == "request_body_too_large"));
 
         fs::remove_dir_all(config_dir).ok();
     }
