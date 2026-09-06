@@ -34,7 +34,6 @@ const CODEX_MANAGED_ROOT_FIELDS: [&str; 8] = [
 ];
 const CODEX_MANAGED_MODEL_FIELDS: [&str; 3] =
     ["model", "model_reasoning_effort", "model_context_window"];
-const OFFICIAL_CODEX_MODELS_JSON: &str = include_str!("../resources/codex-models.json");
 const CLAUDE_DESKTOP_PROFILE_ID: &str = "00000000-0000-4000-8000-000000345600";
 const CLAUDE_DESKTOP_PROFILE_NAME: &str = "Atoapi";
 
@@ -418,6 +417,7 @@ fn remove_codex_config_injection(path: &Path) -> Result<()> {
     };
     let fragment = parse_codex_restore_fragment(&restore_state)?;
     restore_codex_root_fields(&mut doc, &fragment, &CODEX_MANAGED_ROOT_FIELDS);
+    drop_managed_codex_catalog_field(&mut doc, path);
     restore_codex_custom_provider(&mut doc, &fragment);
     write_text(path, &doc.to_string())?;
     if let Some(catalog_path) = managed_catalog_path {
@@ -446,6 +446,11 @@ fn codex_document_has_atoapi_provider(doc: &DocumentMut) -> bool {
 }
 
 fn managed_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<PathBuf> {
+    let path = configured_codex_catalog_path(doc, config_path)?;
+    is_managed_codex_catalog_path(&path).then_some(path)
+}
+
+fn configured_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<PathBuf> {
     let configured = doc
         .as_table()
         .get("model_catalog_json")
@@ -455,15 +460,14 @@ fn managed_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<P
         return None;
     }
     let path = PathBuf::from(configured);
-    let path = if path.is_absolute() {
+    Some(if path.is_absolute() {
         path
     } else {
         config_path
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(path)
-    };
-    is_managed_codex_catalog_path(&path).then_some(path)
+    })
 }
 
 fn is_managed_codex_catalog_path(path: &Path) -> bool {
@@ -629,6 +633,14 @@ fn restore_codex_root_fields(doc: &mut DocumentMut, fragment: &DocumentMut, fiel
         if let Some(original) = fragment.as_table().get(field) {
             doc.as_table_mut().insert(field, original.clone());
         }
+    }
+}
+
+fn drop_managed_codex_catalog_field(doc: &mut DocumentMut, config_path: &Path) {
+    if configured_codex_catalog_path(doc, config_path)
+        .is_some_and(|path| is_managed_codex_catalog_path(&path))
+    {
+        doc.as_table_mut().remove("model_catalog_json");
     }
 }
 
@@ -1076,12 +1088,18 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         .as_ref()
         .map(parse_codex_restore_fragment)
         .transpose()?;
-    let previous_catalog_path = managed_codex_catalog_path(&doc, path);
-    let (model_catalog_path, catalog_created) = write_codex_model_catalog(path, context)?;
-
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["disable_response_storage"] = value(true);
-    doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().as_ref());
+    // model_catalog_json is an optional Codex-owned override. Do not replace
+    // it with an Atoapi snapshot, otherwise every new official model requires
+    // an Atoapi catalog update. Restore the user's original value, or remove
+    // the field so Codex can use its current built-in catalog.
+    if let Some(fragment) = restore_fragment.as_ref() {
+        restore_codex_root_fields(&mut doc, fragment, &["model_catalog_json"]);
+    } else {
+        doc.as_table_mut().remove("model_catalog_json");
+    }
+    drop_managed_codex_catalog_field(&mut doc, path);
     if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
         doc["model_auto_compact_token_limit"] = value(i64::from(limit));
         // Count only the content that has accumulated after the compacted
@@ -1140,132 +1158,13 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
 
     let rendered = doc.to_string();
     if rendered == text {
-        return Ok(catalog_created);
+        return Ok(false);
     }
     if let Err(error) = write_text(path, &rendered) {
-        // A failed config replacement must never delete a catalog that the
-        // existing Codex config may still reference.
-        if catalog_created {
-            fs::remove_file(&model_catalog_path).ok();
-        }
         return Err(error);
     }
-    cleanup_unreferenced_codex_catalogs(
-        path,
-        &model_catalog_path,
-        previous_catalog_path.as_deref(),
-    );
+    cleanup_all_codex_catalogs(path);
     Ok(true)
-}
-
-fn write_codex_model_catalog(
-    config_path: &Path,
-    context: &InjectionContext,
-) -> Result<(PathBuf, bool)> {
-    let mut catalog = serde_json::from_str::<Value>(OFFICIAL_CODEX_MODELS_JSON)
-        .context("bundled Codex model catalog is invalid")?;
-    let models = catalog
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow!("bundled Codex model catalog has no models array"))?;
-    let fallback_template = models
-        .iter()
-        .find(|model| model.get("slug").and_then(Value::as_str) == Some("gpt-5.2"))
-        .or_else(|| models.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("bundled Codex model catalog is empty"))?;
-    for model in models.iter_mut() {
-        sanitize_codex_catalog_transport(model);
-    }
-    let mut priority = models
-        .iter()
-        .filter_map(|model| model.get("priority").and_then(Value::as_i64))
-        .max()
-        .unwrap_or(100);
-
-    for model in context.codex_models.iter().filter(|model| model.enabled) {
-        let slug = model_request_alias(model)
-            .or_else(|| codex_model_alias(&model.id))
-            .unwrap_or_else(|| model.id.trim().to_string());
-        if slug.is_empty() {
-            continue;
-        }
-        let actual_slug =
-            codex_model_alias(&model.id).unwrap_or_else(|| model.id.trim().to_ascii_lowercase());
-        let official_template = models
-            .iter()
-            .find(|entry| {
-                entry
-                    .get("slug")
-                    .and_then(Value::as_str)
-                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&actual_slug))
-            })
-            .cloned();
-        let inherits_official_capabilities = official_template.is_some();
-        let template = official_template.unwrap_or_else(|| fallback_template.clone());
-        priority += 1;
-        let catalog_model = codex_catalog_model(
-            &template,
-            model,
-            &slug,
-            priority,
-            inherits_official_capabilities,
-        );
-        if let Some(index) = models.iter().position(|entry| {
-            entry
-                .get("slug")
-                .and_then(Value::as_str)
-                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&slug))
-        }) {
-            models[index] = catalog_model;
-        } else {
-            models.push(catalog_model);
-        }
-    }
-
-    let catalog_text = format!("{}\n", serde_json::to_string_pretty(&catalog)?);
-    let digest = Sha256::digest(catalog_text.as_bytes());
-    let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
-    let catalog_path = parent.join(format!(
-        "{}{digest:x}.json",
-        CODEX_MODEL_CATALOG_FILE_PREFIX,
-    ));
-    let catalog_path = if catalog_path.is_absolute() {
-        catalog_path
-    } else {
-        std::env::current_dir()
-            .context("failed to resolve Codex model catalog path")?
-            .join(catalog_path)
-    };
-    let needs_write = fs::read_to_string(&catalog_path)
-        .map(|existing| existing != catalog_text)
-        .unwrap_or(true);
-    if needs_write {
-        write_text(&catalog_path, &catalog_text)?;
-    }
-    Ok((catalog_path, needs_write))
-}
-
-fn cleanup_unreferenced_codex_catalogs(
-    config_path: &Path,
-    active_catalog_path: &Path,
-    previous_catalog_path: Option<&Path>,
-) {
-    let Some(parent) = config_path.parent() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let candidate = entry.path();
-        if candidate != active_catalog_path
-            && previous_catalog_path != Some(candidate.as_path())
-            && is_managed_codex_catalog_path(&candidate)
-        {
-            fs::remove_file(candidate).ok();
-        }
-    }
 }
 
 fn cleanup_all_codex_catalogs(config_path: &Path) {
@@ -1287,9 +1186,8 @@ fn cleanup_all_codex_catalogs(config_path: &Path) {
 /// the current Codex config.  It never changes Codex's config.toml, its active
 /// catalog, or the encrypted restore state for an active Atoapi injection.
 ///
-/// This reconciliation is deliberately separate from injection writes: the
-/// write path keeps one previous catalog as a short handoff guard, while a
-/// later startup can safely remove the now-unreferenced file.
+/// This reconciliation is deliberately separate from injection writes so a
+/// stale legacy snapshot can be removed without touching Codex's own catalog.
 pub fn cleanup_stale_codex_artifacts(config: &AppConfig) {
     let Some(codex) = config
         .agent_injections
@@ -1346,129 +1244,6 @@ fn cleanup_codex_catalogs_except(config_path: &Path, keep: Option<&Path>) {
             fs::remove_file(candidate).ok();
         }
     }
-}
-
-fn codex_catalog_model(
-    template: &Value,
-    model: &ModelConfig,
-    slug: &str,
-    priority: i64,
-    inherits_official_capabilities: bool,
-) -> Value {
-    let mut catalog_model = template.clone();
-    sanitize_codex_catalog_transport(&mut catalog_model);
-    catalog_model["slug"] = json!(slug);
-    let display_name = if model_request_alias(model).is_some() {
-        slug
-    } else {
-        let configured = model.display_name.trim();
-        if configured.is_empty() {
-            slug
-        } else {
-            configured
-        }
-    };
-    catalog_model["display_name"] = json!(display_name);
-    catalog_model["description"] = json!("Model supplied by the active Atoapi upstream.");
-    catalog_model["visibility"] = json!("list");
-    catalog_model["supported_in_api"] = json!(true);
-    catalog_model["priority"] = json!(priority);
-    catalog_model["availability_nux"] = Value::Null;
-    catalog_model["upgrade"] = Value::Null;
-    catalog_model["auto_review_model_override"] = Value::Null;
-    if !inherits_official_capabilities {
-        catalog_model["multi_agent_version"] = Value::Null;
-        catalog_model["auto_compact_token_limit"] = Value::Null;
-    }
-    catalog_model["supports_parallel_tool_calls"] = json!(model.supports_tools);
-    if let Some(context_window) = model.context_window.filter(|value| *value > 0) {
-        catalog_model["context_window"] = json!(context_window);
-        catalog_model["max_context_window"] = json!(context_window);
-    }
-
-    let supported =
-        if inherits_official_capabilities && model.supported_reasoning_efforts.is_empty() {
-            catalog_model["supported_reasoning_levels"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            model
-                .supported_reasoning_efforts
-                .iter()
-                .filter_map(|effort| crate::config::normalize_reasoning_effort(effort))
-                .map(|effort| {
-                    json!({
-                        "effort": effort,
-                        "description": format!("Use {effort} reasoning for this model")
-                    })
-                })
-                .collect::<Vec<_>>()
-        };
-    let default_effort = model
-        .reasoning_effort_override_enabled
-        .then_some(model.reasoning_effort.as_deref())
-        .flatten()
-        .and_then(crate::config::normalize_reasoning_effort)
-        .filter(|effort| {
-            supported
-                .iter()
-                .any(|item| item.get("effort").and_then(Value::as_str) == Some(effort.as_str()))
-        })
-        .or_else(|| {
-            inherits_official_capabilities
-                .then(|| {
-                    catalog_model
-                        .get("default_reasoning_level")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
-                .flatten()
-        })
-        .or_else(|| {
-            model
-                .reasoning_effort
-                .as_deref()
-                .and_then(crate::config::normalize_reasoning_effort)
-                .filter(|effort| {
-                    supported.iter().any(|item| {
-                        item.get("effort").and_then(Value::as_str) == Some(effort.as_str())
-                    })
-                })
-        })
-        .or_else(|| {
-            supported
-                .iter()
-                .find(|item| item.get("effort").and_then(Value::as_str) == Some("medium"))
-                .and_then(|item| item.get("effort"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .or_else(|| {
-            supported
-                .first()
-                .and_then(|item| item.get("effort"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        });
-    let supports_reasoning = !supported.is_empty();
-    catalog_model["supported_reasoning_levels"] = Value::Array(supported);
-    catalog_model["default_reasoning_level"] =
-        default_effort.map(Value::String).unwrap_or(Value::Null);
-    catalog_model["supports_reasoning_summaries"] = json!(supports_reasoning);
-    catalog_model
-}
-
-/// The catalog is a local UI/capability declaration. Transport-specific flags
-/// from an official template must never make a custom Atoapi provider attempt
-/// an official Responses Lite or websocket route.
-fn sanitize_codex_catalog_transport(model: &mut Value) {
-    model["use_responses_lite"] = json!(false);
-    model["prefer_websockets"] = json!(false);
-    model["additional_speed_tiers"] = json!([]);
-    model["service_tiers"] = json!([]);
-    model["default_service_tier"] = Value::Null;
-    model["comp_hash"] = Value::Null;
 }
 
 fn write_opencode_config(path: &Path, context: &InjectionContext) -> Result<()> {
@@ -2152,11 +1927,7 @@ command = "npx"
         assert!(write_codex_config(&path, &context).unwrap());
         let first_document: toml::Value =
             toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let first_catalog_path = first_document
-            .get("model_catalog_json")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from)
-            .expect("first Codex injection should write model_catalog_json");
+        assert!(first_document.get("model_catalog_json").is_none());
         assert!(!write_codex_config(&path, &context).unwrap());
         let text = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -2180,80 +1951,101 @@ command = "npx"
             Some(128_000)
         );
         assert!(parsed.get("mcp_servers").is_some());
-        let catalog_path = parsed
-            .get("model_catalog_json")
-            .and_then(toml::Value::as_str)
-            .map(PathBuf::from)
-            .expect("Codex injection should write model_catalog_json");
-        assert!(catalog_path.is_absolute());
-        assert!(is_managed_codex_catalog_path(&catalog_path));
-        assert_eq!(catalog_path, first_catalog_path);
-        assert!(first_catalog_path.exists());
+        assert!(parsed.get("model_catalog_json").is_none());
         let active_catalogs = fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
             .filter(|candidate| is_managed_codex_catalog_path(candidate))
             .collect::<Vec<_>>();
-        assert_eq!(active_catalogs.len(), 1);
-        assert!(active_catalogs.contains(&first_catalog_path));
-        let catalog: Value =
-            serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
-        let models = catalog["models"].as_array().unwrap();
-        let sol = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.6-sol")
-            .expect("official GPT-5.6 Sol should be present");
-        assert!(sol["supported_reasoning_levels"]
-            .as_array()
+        assert!(active_catalogs.is_empty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_injection_preserves_native_model_catalog_without_creating_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-native-catalog-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        let native_catalog = dir.join("native-models.json");
+        write_text(&native_catalog, "{\"models\":[]}\n").unwrap();
+        write_text(&path, "model_catalog_json = \"native-models.json\"\n").unwrap();
+
+        let context = InjectionContext {
+            anthropic_base_url: "http://127.0.0.1:18883".to_string(),
+            openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
+            local_key: "ato-native-catalog".to_string(),
+            default_channel: "responses".to_string(),
+            default_model: "gpt-5.5".to_string(),
+            default_model_is_explicit: false,
+            model_context_window: None,
+            auto_compact_token_limit: None,
+            codex_models: Vec::new(),
+        };
+
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some("native-models.json")
+        );
+        assert!(native_catalog.exists());
+        let managed_catalogs = fs::read_dir(&dir)
             .unwrap()
-            .iter()
-            .any(|level| level["effort"] == "ultra"));
-        assert!(sol["service_tiers"].as_array().unwrap().is_empty());
-        assert_eq!(sol["use_responses_lite"], false);
-        assert_eq!(sol["prefer_websockets"], false);
-        let terra = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.6-terra")
-            .expect("official GPT-5.6 Terra should be present");
-        assert!(terra["service_tiers"].as_array().unwrap().is_empty());
-        assert_eq!(terra["use_responses_lite"], false);
-        assert_eq!(terra["prefer_websockets"], false);
-        let luna = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.6-luna")
-            .expect("official GPT-5.6 Luna should be present");
-        assert!(luna["supported_reasoning_levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|level| level["effort"] == "max"));
-        assert!(!luna["supported_reasoning_levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|level| level["effort"] == "ultra"));
-        assert!(luna["service_tiers"].as_array().unwrap().is_empty());
-        assert_eq!(luna["use_responses_lite"], false);
-        assert_eq!(luna["prefer_websockets"], false);
-        let custom = models
-            .iter()
-            .filter(|model| model["slug"] == "gpt-custom")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|candidate| is_managed_codex_catalog_path(candidate))
             .collect::<Vec<_>>();
-        assert_eq!(custom.len(), 1);
-        assert_eq!(custom[0]["context_window"], 256_000);
-        assert!(custom[0]["supported_reasoning_levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|level| level["effort"] == "ultra"));
-        assert!(custom[0]["service_tiers"].as_array().unwrap().is_empty());
-        assert!(custom[0]["additional_speed_tiers"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(custom[0]["use_responses_lite"], false);
-        assert_eq!(custom[0]["prefer_websockets"], false);
+        assert!(managed_catalogs.is_empty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_injection_drops_legacy_atoapi_catalog_from_restore_state() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-legacy-catalog-upgrade-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        let legacy_catalog = dir.join("atoapi-model-catalog.json");
+        write_text(&legacy_catalog, "{\"models\":[]}\n").unwrap();
+        write_text(
+            &path,
+            r#"model_provider = "custom"
+model_catalog_json = "atoapi-model-catalog.json"
+
+[model_providers.custom]
+name = "Atoapi"
+base_url = "http://127.0.0.1:18883/codex/v1"
+"#,
+        )
+        .unwrap();
+        let legacy_doc: DocumentMut = fs::read_to_string(&path).unwrap().parse().unwrap();
+        let restore_path = codex_restore_state_path(&path).unwrap();
+        capture_codex_restore_state(&restore_path, &path, true, &legacy_doc).unwrap();
+
+        let context = InjectionContext {
+            anthropic_base_url: "http://127.0.0.1:18883".to_string(),
+            openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
+            local_key: "ato-legacy-catalog".to_string(),
+            default_channel: "responses".to_string(),
+            default_model: "gpt-5.5".to_string(),
+            default_model_is_explicit: false,
+            model_context_window: None,
+            auto_compact_token_limit: None,
+            codex_models: Vec::new(),
+        };
+
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert!(!legacy_catalog.exists());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -3022,28 +2814,7 @@ model_reasoning_effort = "max"
             Some("ultra")
         );
 
-        let catalog_path = parsed
-            .get("model_catalog_json")
-            .and_then(toml::Value::as_str)
-            .unwrap();
-        let catalog: Value =
-            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
-        let mapped = catalog["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.5")
-            .unwrap();
-        assert_eq!(mapped["display_name"], "gpt-5.5");
-        assert_eq!(mapped["context_window"], 372_000);
-        assert!(mapped["supported_reasoning_levels"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|level| level["effort"] == "ultra"));
-        assert!(mapped["service_tiers"].as_array().unwrap().is_empty());
-        assert_eq!(mapped["use_responses_lite"], false);
-        assert_eq!(mapped["prefer_websockets"], false);
+        assert!(parsed.get("model_catalog_json").is_none());
         std::fs::remove_dir_all(dir).ok();
     }
 

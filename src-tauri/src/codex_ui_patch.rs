@@ -154,7 +154,7 @@ fn enable_patch() -> Result<String> {
         },
     )?;
     fs::remove_file(patched_path).ok();
-    Ok("Codex UI 已显示 GPT-5.6、Max/Ultra 与 Fast".to_string())
+    Ok("Codex UI 已保留官方模型目录，并启用 Max/Ultra 与 Fast".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -506,7 +506,8 @@ mod tests {
     #[test]
     fn bundled_patcher_contains_required_features() {
         let text = std::str::from_utf8(PATCHER_SOURCE).unwrap();
-        assert!(text.contains("gpt-5\\\\.6-(?:sol|terra|luna)"));
+        assert!(!text.contains("model-list-filter"));
+        assert!(!text.contains("gpt-5\\\\.6-(?:sol|terra|luna)"));
         assert!(text.contains("API Key Fast UI"));
         assert!(text.contains("Max and Ultra reasoning"));
         assert!(text.contains("Metadata generation context isolation"));

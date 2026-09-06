@@ -5656,7 +5656,6 @@ try {
   extractAll(input, workPath);
   const assetsPath = join(workPath, "webview", "assets");
   const viteBuildPath = join(workPath, ".vite", "build");
-  const modelFilter = await findAsset(assetsPath, "model-list-filter", "useHiddenModels");
   const modelQueries = await findAsset(assetsPath, "model-queries", [
     "1186680773",
     "l=i"
@@ -5671,12 +5670,6 @@ try {
     assetsPath,
     "read-service-tier-for-request",
     "Failed to read service tier for request"
-  );
-  await replaceFeature(
-    modelFilter,
-    "u?n.has(r.model):!r.hidden",
-    "u?n.has(r.model):!r.hidden||/^gpt-5\\.6-(?:sol|terra|luna)$/u.test(r.model)",
-    "GPT-5.6 visibility"
   );
   await replaceFeature(
     modelQueries,

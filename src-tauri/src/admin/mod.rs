@@ -5262,7 +5262,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_enabled_agent_catalog_after_bound_model_update() {
+    fn refreshes_enabled_agent_injection_without_overriding_official_catalog() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-agent-model-refresh-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -5300,19 +5300,8 @@ mod tests {
 
         let parsed: toml::Value =
             toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        let catalog_path = parsed
-            .get("model_catalog_json")
-            .and_then(toml::Value::as_str)
-            .unwrap();
-        let catalog: Value =
-            serde_json::from_str(&std::fs::read_to_string(catalog_path).unwrap()).unwrap();
-        let custom = catalog["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "gpt-custom")
-            .unwrap();
-        assert_eq!(custom["context_window"], 256_000);
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(config.providers[0].models[0].context_window, Some(256_000));
         std::fs::remove_dir_all(dir).ok();
     }
 
