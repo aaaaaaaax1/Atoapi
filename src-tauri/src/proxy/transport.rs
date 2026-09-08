@@ -14,6 +14,12 @@ pub(crate) struct TransportClients {
 
 const EXPLICIT_PROXY_POOL_LIMIT: usize = 16;
 
+// This is an idle timeout, not a total request deadline.  Reqwest resets it
+// after every successful body read, so a long-lived SSE response can continue
+// indefinitely while a provider that stops sending bytes eventually releases
+// the task and connection.
+const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// A protocol diagnostic is meaningful only for an explicitly disposable
 /// verifier process. Normal desktop traffic keeps HTTP/2 negotiation and its
 /// established pooling behavior.
@@ -165,6 +171,7 @@ fn base_client_builder(
     let builder = reqwest::Client::builder()
         .user_agent(user_agent)
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(UPSTREAM_READ_IDLE_TIMEOUT)
         .pool_max_idle_per_host(32)
         .pool_idle_timeout(Duration::from_secs(10 * 60))
         .tcp_keepalive(Duration::from_secs(30))
@@ -179,14 +186,12 @@ fn base_client_builder(
             .http2_keep_alive_while_idle(true)
     };
     let builder = match redirect_policy {
-        // Ordinary API and administrator traffic retains reqwest's baseline
-        // redirect behavior. It is outside the Agent generation attempt gate.
-        RedirectPolicy::Baseline => builder,
-        // A redirect can issue another HTTP request, so Agent generation must
-        // return the original 30x response without following it. Reqwest also
-        // retries selected low-level protocol NACKs by default; disable that
-        // policy here so the transport cannot create a hidden second POST.
-        RedirectPolicy::StrictOneShot => builder
+        // A 307/308 redirect preserves the method and body, which can issue a
+        // second generation POST and duplicate provider-side work.  All
+        // upstream clients therefore return the original 30x response.  The
+        // retry policy is disabled as well so a low-level protocol retry cannot
+        // create a hidden second POST outside the application attempt gate.
+        RedirectPolicy::Baseline | RedirectPolicy::StrictOneShot => builder
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never()),
     };
@@ -428,7 +433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_client_retains_baseline_redirect_behavior() {
+    async fn ordinary_client_does_not_follow_get_redirects() {
         let (base_url, redirect_hits, target_hits, server) = redirect_server().await;
         let clients = TransportClients::new("AtoapiOrdinaryRedirectTest/0.1").unwrap();
 
@@ -439,9 +444,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(redirect_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
         server.abort();
         let _ = server.await;
     }
@@ -475,7 +480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_client_follows_post_307_and_308_redirects() {
+    async fn ordinary_client_does_not_follow_post_307_or_308_redirects() {
         let (base_url, redirect_hits, target_hits, server) = redirect_server().await;
         let clients = TransportClients::new("AtoapiOrdinaryPostRedirectTest/0.1").unwrap();
 
@@ -486,7 +491,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(temporary.status(), reqwest::StatusCode::OK);
+        assert_eq!(temporary.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
 
         let permanent = clients
             .client(false)
@@ -495,9 +500,9 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(permanent.status(), reqwest::StatusCode::OK);
+        assert_eq!(permanent.status(), reqwest::StatusCode::PERMANENT_REDIRECT);
         assert_eq!(redirect_hits.load(Ordering::SeqCst), 2);
-        assert_eq!(target_hits.load(Ordering::SeqCst), 2);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
         server.abort();
         let _ = server.await;
     }

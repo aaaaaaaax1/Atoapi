@@ -876,6 +876,11 @@ export interface ProviderInput {
   enabled: boolean;
 }
 
+export interface ProviderConfigSaveInput {
+  provider: ProviderInput;
+  models: ModelConfig[];
+}
+
 export interface FetchModelsInput {
   provider_id?: string;
   name?: string;
@@ -1054,16 +1059,12 @@ const fallbackProviderKeySecrets = new Map<string, string>();
 
 export async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!hasTauriRuntime()) {
-    return fallback(name, args) as T;
-  }
-  try {
-    return await invoke<T>(name, args);
-  } catch (error) {
-    if (import.meta.env.DEV) {
+    if (isExplicitPreviewMode()) {
       return fallback(name, args) as T;
     }
-    throw error;
+    throw new Error("Tauri runtime is unavailable. Start the desktop app, or use explicit preview mode.");
   }
+  return invoke<T>(name, args);
 }
 
 function hasTauriRuntime() {
@@ -1074,6 +1075,10 @@ function hasTauriRuntime() {
     };
   };
   return typeof runtime.__TAURI_INTERNALS__?.invoke === "function";
+}
+
+function isExplicitPreviewMode() {
+  return import.meta.env.VITE_ATOAPI_MOCK === "true";
 }
 
 function fallback(name: string, args?: Record<string, unknown>) {
@@ -1403,6 +1408,66 @@ function fallback(name: string, args?: Record<string, unknown>) {
         agentId,
         id
       ),
+      updated_at: now
+    };
+    return fallbackConfig;
+  }
+  if (name === "save_provider_config") {
+    const input = args?.input as ProviderConfigSaveInput | undefined;
+    if (!input?.provider) return fallbackConfig;
+    const providerInput = input.provider;
+    const ownerAgentId = providerInput.owner_agent_id?.trim() || "";
+    const id = providerInput.id || (ownerAgentId
+      ? uniquePreviewProviderId(`agent-${slugify(ownerAgentId)}-${slugify(providerInput.name)}`)
+      : slugify(providerInput.name));
+    const existing = fallbackConfig.providers.find((item) => item.id === id);
+    const now = new Date().toISOString();
+    if (providerInput.api_key) fallbackProviderSecrets.set(id, providerInput.api_key);
+    for (const item of providerInput.key_pool?.keys ?? []) {
+      if (item.id && item.key) fallbackProviderKeySecrets.set(providerKeySecretId(id, item.id), item.key);
+    }
+    const provider: ProviderConfig = {
+      id,
+      name: providerInput.name,
+      base_url: providerInput.base_url,
+      models_url: providerInput.models_url ?? existing?.models_url ?? null,
+      is_full_url: providerInput.is_full_url,
+      custom_user_agent: providerInput.custom_user_agent ?? existing?.custom_user_agent ?? null,
+      channel_mode: providerInput.channel_mode ?? existing?.channel_mode ?? "auto",
+      channel: providerInput.channel,
+      prompt_cache_retention_enabled: providerInput.prompt_cache_retention_enabled ?? true,
+      request_body_gzip_enabled: providerInput.request_body_gzip_enabled ?? existing?.request_body_gzip_enabled ?? true,
+      use_system_proxy: providerInput.use_system_proxy ?? existing?.use_system_proxy ?? true,
+      non_sse_compact_compat_enabled: providerInput.non_sse_compact_compat_enabled ?? existing?.non_sse_compact_compat_enabled ?? false,
+      auto_compact_token_limit: providerInput.auto_compact_token_limit_configured || "auto_compact_token_limit" in providerInput
+        ? providerInput.auto_compact_token_limit ?? null
+        : existing?.auto_compact_token_limit ?? null,
+      has_api_key: Boolean(providerInput.api_key) || existing?.has_api_key || false,
+      key_pool: providerInput.key_pool
+        ? previewKeyPool(providerInput.key_pool, existing?.key_pool ?? null)
+        : existing?.key_pool ?? null,
+      models: input.models.map((item) => ({ ...item, id: item.id.trim() })).filter((item, index, all) =>
+        item.id && all.findIndex((candidate) => candidate.id === item.id) === index
+      ),
+      enabled: providerInput.enabled,
+      created_at: existing?.created_at ?? now,
+      updated_at: now
+    };
+    fallbackConfig = {
+      ...fallbackConfig,
+      active_provider_id: fallbackConfig.active_provider_id ?? id,
+      provider_key_pools: providerInput.key_pool
+        ? [
+            ...(fallbackConfig.provider_key_pools ?? []).filter((item) => item.provider_id !== id),
+            { provider_id: id, pool: previewKeyPool(providerInput.key_pool, existing?.key_pool ?? null) }
+          ]
+        : fallbackConfig.provider_key_pools,
+      providers: existing
+        ? fallbackConfig.providers.map((item) => (item.id === id ? provider : item))
+        : [...fallbackConfig.providers, provider],
+      agent_provider_orders: ownerAgentId
+        ? updatePreviewAgentProviderOrder(fallbackConfig.agent_provider_orders, ownerAgentId, id)
+        : fallbackConfig.agent_provider_orders,
       updated_at: now
     };
     return fallbackConfig;

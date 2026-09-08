@@ -43,6 +43,15 @@ const MAX_VISIBLE_REQUESTS = 200;
 const bridgeSource = String.raw`
 (() => {
   const CHANNEL = "atoapi.graphite.bridge.v1";
+  // srcDoc normally inherits the shell origin, but some WebView versions
+  // expose it as an opaque null origin. The source-window and channel checks
+  // below remain the trust boundary; a wildcard target is required for opaque targets.
+  const BRIDGE_ORIGIN = window.location.origin;
+  const BRIDGE_TARGET_ORIGIN = BRIDGE_ORIGIN === "null" ? "*" : BRIDGE_ORIGIN;
+  // An opaque srcDoc has no stable origin; source identity remains the trust
+  // boundary in that case, while normal frames stay origin-checked.
+  const isAcceptedOrigin = (origin) => BRIDGE_ORIGIN === "null" || origin === BRIDGE_ORIGIN || origin === "null";
+  const postToParent = (message) => window.parent.postMessage(message, BRIDGE_TARGET_ORIGIN);
   const host = { state: null };
   let renderSuspended = false;
   let deferredMetricsDelta = null;
@@ -86,7 +95,7 @@ const bridgeSource = String.raw`
       source.setAttribute("aria-busy", "true");
       source.disabled = true;
     }
-    window.parent.postMessage({ channel: CHANNEL, kind: "action", action, payload, requestId }, "*");
+    postToParent({ channel: CHANNEL, kind: "action", action, payload, requestId });
     return requestId;
   };
   const settle = (requestId) => {
@@ -1220,7 +1229,7 @@ const bridgeSource = String.raw`
 
   window.addEventListener("message", (event) => {
     const message = event.data || {};
-    if (event.source !== window.parent || message.channel !== CHANNEL) return;
+    if (event.source !== window.parent || !isAcceptedOrigin(event.origin) || message.channel !== CHANNEL) return;
     if (message.kind === "state") applyState(message.state);
     if (message.kind === "metrics-delta") applyMetricsDelta(message.metrics, message.requests);
     if (message.kind === "render-suspension") applyRenderSuspended(message.suspended);
@@ -1236,7 +1245,15 @@ const bridgeSource = String.raw`
         if (list) list.innerHTML = fetchedModelIds.map((model) => "<option value=\"" + escape(model) + "\"></option>").join("");
         renderModelCandidates();
       }
-      if (message.payload?.secret) {
+      if (message.payload?.secret && message.payload?.purpose === "copy-local-key") {
+        const secret = String(message.payload.secret);
+        void navigator.clipboard.writeText(secret).then(
+          () => showToast("已复制本地 Key"),
+          () => showToast("复制失败，请检查剪贴板权限")
+        ).finally(() => {
+          if (message.payload) delete message.payload.secret;
+        });
+      } else if (message.payload?.secret) {
         const input = message.payload.targetId ? document.getElementById(message.payload.targetId) : null;
         if (input) {
           input.value = message.payload.secret;
@@ -1457,6 +1474,11 @@ const bridgeSource = String.raw`
     }
     if (target.id === "saveProviderButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("save-provider", serializeEditor()); return;
+    }
+    if (target.dataset.secretCopy === "local-key") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("reveal-local-key", { purpose: "copy-local-key" });
+      return;
     }
     if (target.id === "addKeyButton") {
       event.preventDefault(); event.stopImmediatePropagation(); addBlankKey(); return;
@@ -1738,7 +1760,7 @@ const bridgeSource = String.raw`
       : '<code>' + escape(baseUrl) + '</code>';
     endpointList.innerHTML =
       '<div class="endpoint-item ' + (agent.id === "proxy" ? "editable-endpoint" : "") + '"><span>Base URL</span>' + endpointValue + '<button class="copy-button" id="proxyBaseUrlCopy" type="button" data-copy="' + escape(baseUrl) + '" aria-label="复制 Base URL" title="复制">' + icon("copy", 14) + '</button></div>' +
-      '<div class="endpoint-item"><span>Local Key</span><code>' + escape(agent.localKey || "未设置") + '</code><button class="copy-button" type="button" data-copy="' + escape(agent.localKey || "") + '" aria-label="复制本地 Key" title="复制">' + icon("copy", 14) + '</button></div>';
+      '<div class="endpoint-item"><span>Local Key</span><code>' + (agent.hasLocalKey ? "已设置" : "未设置") + '</code><button class="copy-button" type="button" data-secret-copy="local-key" aria-label="复制本地 Key" title="复制本地 Key">' + icon("copy", 14) + '</button></div>';
     bindCopyButtons();
     hydrateIcons();
   };
@@ -1824,7 +1846,7 @@ const bridgeSource = String.raw`
     }
   });
 
-  window.parent.postMessage({ channel: CHANNEL, kind: "ready" }, "*");
+  postToParent({ channel: CHANNEL, kind: "ready" });
 })();`;
 
 // The embedded prototype and bridge are static build assets. Keeping one
@@ -2112,7 +2134,7 @@ function buildState(
       localBaseUrl: agent.kind === "proxy-mode"
         ? localBaseUrl(config?.proxy_mode_host, config?.proxy_mode_port, "/v1")
         : localBaseUrl(config?.host, config?.port, agent.kind === "codex" ? "/codex/v1" : "/v1"),
-      localKey: agent.local_key ?? config?.local_key ?? ""
+      hasLocalKey: Boolean(agent.local_key ?? config?.local_key)
     };
   });
   const providerState = visibleProviders.map((provider) => ({
@@ -2589,6 +2611,9 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   );
 
   const send = useCallback((message: Record<string, unknown>) => {
+    // srcDoc may expose an opaque origin in WebView, so concrete target
+    // origins can silently drop messages. The receiver verifies the exact
+    // iframe window and channel before handling anything.
     frameRef.current?.contentWindow?.postMessage({ channel: GRAPHITE_BRIDGE_CHANNEL, ...message }, "*");
   }, []);
 
@@ -2704,7 +2729,11 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
 
   useEffect(() => {
     const onMessage = (event: MessageEvent<GraphiteMessage>) => {
-      if (event.source !== frameRef.current?.contentWindow || event.data?.channel !== GRAPHITE_BRIDGE_CHANNEL) return;
+      if (
+        event.source !== frameRef.current?.contentWindow ||
+        (event.origin !== window.location.origin && event.origin !== "null") ||
+        event.data?.channel !== GRAPHITE_BRIDGE_CHANNEL
+      ) return;
       if (event.data.kind === "ready") {
         setReady(true);
         return;

@@ -37,6 +37,12 @@ pub(super) struct StreamSummary {
     pub done_marker_seen: bool,
     pub error_event_seen: bool,
     pub error_summary: Option<String>,
+    /// A `response.completed` event is only a successful Responses terminal
+    /// when its embedded response was actually completed. Some compatible
+    /// upstreams use that event envelope for a failed or incomplete response.
+    /// Keep this separate from the event name so settlement cannot promote a
+    /// bad continuation just because the outer event looked terminal.
+    pub responses_terminal_failure_seen: bool,
     pub canonical_responses_failure_seen: bool,
     pub provider_health_failure_event_seen: bool,
     pub cache_capability_rejection_fields: HashSet<ProviderCacheCapabilityField>,
@@ -414,12 +420,24 @@ impl ResponsesStreamState {
             self.process_event_type(event_type, sequence);
         }
         let effective_event_type = payload_event_type.or(frame.event.as_deref());
+        let completed_response_failed = effective_event_type == Some("response.completed")
+            && responses_completion_has_failure(&value);
         if effective_event_type == Some("response.failed")
             && value.get("response").is_some_and(Value::is_object)
         {
             self.summary.canonical_responses_failure_seen = true;
         }
-        let frame_has_error = value.get("error").is_some_and(|error| !error.is_null())
+        if completed_response_failed {
+            self.summary.responses_terminal_failure_seen = true;
+            self.summary.canonical_responses_failure_seen = true;
+            self.summary.error_event_seen = true;
+            self.summary.error_event_sequence.get_or_insert(sequence);
+        }
+        let frame_has_error = completed_response_failed
+            || value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
             || frame.event.as_deref().is_some_and(is_error_event_type)
             || payload_event_type.is_some_and(is_error_event_type);
         if frame_has_error && provider_health_failure_event(&value, effective_event_type) {
@@ -430,7 +448,11 @@ impl ResponsesStreamState {
         self.summary.visible_text_output_seen |=
             value_has_visible_text_output_with_event(&value, effective_event_type);
         self.summary.compaction_output_seen |= value_has_compaction_output(&value);
-        if value.get("error").is_some_and(|error| !error.is_null()) {
+        if value.get("error").is_some_and(|error| !error.is_null())
+            || value
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+        {
             self.summary.error_event_seen = true;
             self.summary.error_event_sequence.get_or_insert(sequence);
         }
@@ -503,6 +525,32 @@ impl ResponsesStreamState {
             self.summary.output_items.push(item.clone());
         }
     }
+}
+
+/// A few compatibility providers emit `response.completed` as an envelope
+/// even when the embedded response has `failed`/`incomplete` status. Treat
+/// those as terminal failures. Older providers that omit a status entirely
+/// remain compatible, but an explicit status other than `completed` never
+/// becomes a continuation/cache success.
+pub(super) fn responses_completion_has_failure(value: &Value) -> bool {
+    let response = value
+        .get("response")
+        .filter(|response| response.is_object());
+    let status = response
+        .and_then(|response| response.get("status"))
+        .or_else(|| value.get("status"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty());
+    let explicit_non_completed_status = status
+        .map(|status| !status.eq_ignore_ascii_case("completed"))
+        .unwrap_or(false);
+    let embedded_error = response
+        .and_then(|response| response.get("error"))
+        .is_some_and(|error| !error.is_null())
+        || value.get("error").is_some_and(|error| !error.is_null());
+
+    explicit_non_completed_status || embedded_error
 }
 
 pub(super) fn value_has_compaction_output(value: &Value) -> bool {
@@ -1272,6 +1320,48 @@ data: {"id":"resp-top-level","object":"response","output":[{"type":"function_cal
                 StreamEnd::CleanEof,
             )
             .success
+        );
+    }
+
+    #[test]
+    fn completed_envelope_with_failed_nested_response_is_not_a_success() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"message\":\"provider failed\"}}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.responses_completed_event_seen);
+        assert!(summary.responses_terminal_failure_seen);
+        assert!(summary.canonical_responses_failure_seen);
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::ErrorEvent)
+        );
+    }
+
+    #[test]
+    fn completed_envelope_with_incomplete_nested_response_is_not_a_success() {
+        let mut state = ResponsesStreamState::default();
+        state.ingest(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+        );
+
+        let summary = state.finish();
+        assert!(summary.responses_terminal_failure_seen);
+        assert_eq!(
+            evaluate_terminal(
+                &Channel::Responses,
+                TerminalCompatibility::Strict,
+                &summary,
+                StreamEnd::CleanEof,
+            ),
+            terminal_failure(TerminalFailure::ErrorEvent)
         );
     }
 

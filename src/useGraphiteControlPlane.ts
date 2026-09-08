@@ -28,10 +28,7 @@ import type {
   GraphitePrototypeHostProps,
   GraphiteProviderPayload
 } from "./graphite/frameProtocol";
-import {
-  providerIsTrustedPrivateToAgent,
-  providersForGraphiteAgent
-} from "./graphite/providerScope";
+import { providersForGraphiteAgent } from "./graphite/providerScope";
 
 // Keep the UI version badge tied to the package that is actually being built.
 // Vite injects this value from package.json, so candidate builds cannot silently
@@ -427,14 +424,6 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     setNotice("");
     const editablePayload = payload;
     let existing = config?.providers.find((provider) => provider.id === editablePayload.id) ?? null;
-    const editingAgent = config?.agent_injections.find((agent) => agent.id === agentId);
-    const editingOrder = config?.agent_provider_orders
-      ?.find((order) => order.agent_id === agentId)?.provider_ids ?? [];
-    const editingBoundLegacyProvider = Boolean(
-      agentId && existing && editingAgent
-        && !providerIsTrustedPrivateToAgent(existing.id, editingAgent, editingOrder)
-    );
-
     const existingKeys = new Map((existing?.key_pool?.keys ?? []).map((key) => [key.id, key]));
     const input: ProviderInput = {
       id: editablePayload.id ?? undefined,
@@ -480,18 +469,6 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     };
 
     try {
-      let nextConfig = await command<AppConfig>("add_or_update_provider", { input });
-      let savedProvider =
-        nextConfig.providers.find((provider) => provider.id === editablePayload.id) ??
-        (editingBoundLegacyProvider
-          ? nextConfig.providers.find((provider) =>
-              provider.id === nextConfig.agent_injections.find((agent) => agent.id === agentId)?.provider_id
-            )
-          : undefined) ??
-        nextConfig.providers.find((provider) => provider.name === name && provider.base_url === baseUrl);
-      if (!savedProvider) throw new Error("上游保存后未返回配置记录");
-
-      const previousModelIds = new Set(existing?.models.map((item) => item.id) ?? []);
       const nextModels = normalizeGraphiteModels(editablePayload.models).map((item) => {
         const prior = existing?.models.find((modelItem) => modelItem.id === item.id);
         return {
@@ -506,21 +483,9 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
           enabled: prior?.enabled ?? true
         };
       });
-      for (const modelItem of nextModels) {
-        nextConfig = await command<AppConfig>("add_or_update_model", {
-          input: { provider_id: savedProvider.id, model: modelItem }
-        });
-      }
-      for (const modelId of previousModelIds) {
-        if (!nextModels.some((item) => item.id === modelId)) {
-          nextConfig = await command<AppConfig>("delete_model", {
-            providerId: savedProvider.id,
-            provider_id: savedProvider.id,
-            modelId,
-            model_id: modelId
-          });
-        }
-      }
+      const nextConfig = await command<AppConfig>("save_provider_config", {
+        input: { provider: input, models: nextModels }
+      });
       setConfig(nextConfig);
       setNotice("上游配置已保存，当前 Agent 的使用上游未改变");
     } catch (cause) {

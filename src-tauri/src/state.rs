@@ -46,8 +46,9 @@ use crate::{
         cache_affinity::ShadowAffinityStore,
         cache_validation::CacheValidationController,
         final_scope_waterline::{FinalScopeObservationRegistry, FinalScopeWaterlineLedger},
-        DispatchDrainOutcome, DispatchTracker, ResponsesFullReplayRiskObservations,
-        TransportClients, UpstreamCacheAffinity, WarmPendingRegistry,
+        DispatchDrainOutcome, DispatchTracker, GzipRequestBodyCapabilityStore,
+        ResponsesFullReplayRiskObservations, TransportClients, UpstreamCacheAffinity,
+        WarmPendingRegistry,
     },
     release_champion_runner::ReleaseChampionRunner,
 };
@@ -117,6 +118,10 @@ pub struct AppState {
     /// intentionally excluded from config, metrics, runtime journals, and
     /// downstream responses because its values are opaque upstream cookies.
     pub upstream_cache_affinity: StdMutex<UpstreamCacheAffinity>,
+    /// Bounded, process-only request-body gzip compatibility observations.
+    /// Scope keys are opaque local digests and never enter config, metrics,
+    /// runtime journals, logs, or outbound requests.
+    pub gzip_request_body_capabilities: StdMutex<GzipRequestBodyCapabilityStore>,
     /// Process-local, opaque cooldowns for caller-provided native Responses
     /// placement keys rejected by an upstream. These must never be persisted:
     /// a caller key is wire-only data and a new process gets one fresh chance
@@ -895,6 +900,7 @@ impl AppState {
                 ResponsesFullReplayRiskObservations::default(),
             ),
             upstream_cache_affinity: StdMutex::new(UpstreamCacheAffinity::default()),
+            gzip_request_body_capabilities: StdMutex::new(GzipRequestBodyCapabilityStore::default()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
@@ -949,6 +955,7 @@ impl AppState {
                 ResponsesFullReplayRiskObservations::default(),
             ),
             upstream_cache_affinity: StdMutex::new(UpstreamCacheAffinity::default()),
+            gzip_request_body_capabilities: StdMutex::new(GzipRequestBodyCapabilityStore::default()),
             client_prompt_cache_key_rejection_cooldowns: Mutex::new(HashMap::new()),
             reasoning_effort_rejections: Mutex::new(HashMap::new()),
             continuation_lineage,
@@ -2610,7 +2617,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_reapplies_enabled_agent_injection_route() {
+    async fn startup_rejects_an_enabled_agent_injection_outside_its_controlled_root() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-startup-agent-inject-{}",
             Uuid::new_v4().simple()
@@ -2669,29 +2676,15 @@ mod tests {
         )
         .unwrap();
 
-        state
+        let error = state
             .apply_enabled_agent_injections_on_startup()
             .await
-            .unwrap();
+            .unwrap_err();
 
-        let value: toml::Value =
-            toml::from_str(&fs::read_to_string(&target_path).unwrap()).unwrap();
-        assert_eq!(
-            value.get("model").and_then(toml::Value::as_str),
-            Some("gpt-5.5")
-        );
-        assert_eq!(
-            value.get("model_provider").and_then(toml::Value::as_str),
-            Some("custom")
-        );
-        assert_eq!(
-            value
-                .get("model_providers")
-                .and_then(|providers| providers.get("custom"))
-                .and_then(|provider| provider.get("base_url"))
-                .and_then(toml::Value::as_str),
-            Some("http://127.0.0.1:18883/codex/v1")
-        );
+        assert!(error
+            .to_string()
+            .contains("outside its controlled directory"));
+        assert!(!target_path.exists());
         let config = state.config.read().await;
         let item = config
             .agent_injections
@@ -2701,7 +2694,7 @@ mod tests {
         assert!(item.enabled);
         assert_eq!(item.provider_id.as_deref(), Some("share"));
         assert_eq!(item.model_id.as_deref(), Some("gpt-5.5"));
-        assert!(item.last_injected_at.is_some());
+        assert!(item.last_injected_at.is_none());
 
         fs::remove_dir_all(dir).ok();
     }

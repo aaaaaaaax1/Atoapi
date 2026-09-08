@@ -7545,9 +7545,9 @@
     function renderAgents() {
       const strip = $("#agentStrip");
       strip.innerHTML = agents.map((agent) => `
-        <button class="agent-tab" type="button" role="tab" aria-selected="${agent.id === selectedAgentId}" data-enabled="${agent.enabled}" data-agent-id="${agent.id}" title="${agent.label}">
+        <button class="agent-tab" type="button" role="tab" aria-selected="${agent.id === selectedAgentId}" data-enabled="${agent.enabled}" data-agent-id="${escapeHtml(agent.id)}" title="${escapeHtml(agent.label)}">
           <span class="tab-icon">${icon(agent.icon, 16)}</span>
-          <span><b>${agent.label}</b><small>${agent.enabled ? "已启用" : "已关闭"}</small></span>
+          <span><b>${escapeHtml(agent.label)}</b><small>${agent.enabled ? "已启用" : "已关闭"}</small></span>
           <span class="agent-status-dot" aria-hidden="true"></span>
         </button>
       `).join("");

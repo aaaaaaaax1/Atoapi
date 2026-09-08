@@ -1,0 +1,137 @@
+   Compiling atoapi v1.5.5 (G:\Atoapi\src-tauri)
+src\continuation_lineage.rs:40:9: warning: fields `static_projection_digest` and `output_items_complete` are never read
+src\metrics_history.rs:1151:19: warning: associated function `load` is never used
+src\proxy\mod.rs:5920:10: warning: function `wait_for_provider_prefix_settle_on_final_wire` is never used
+src\proxy\mod.rs:5951:10: warning: function `wait_for_provider_prefix_settle_on_final_wire_with_scope_reason` is never used
+src\proxy\mod.rs:7555:4: warning: function `begin_final_scope_waterline` is never used
+src\proxy\mod.rs:7911:10: warning: function `observe_provider_prefix_usage` is never used
+src\proxy\affinity_identity.rs:84:15: warning: function `selected_key_ref_id_v2` is never used
+src\proxy\full_replay_continuity.rs:31:19: warning: struct `NativeWebsocketDelta` is never constructed
+src\proxy\full_replay_continuity.rs:36:15: warning: function `native_websocket_delta_from_full_replay` is never used
+src\proxy\full_replay_continuity.rs:78:4: warning: function `native_delta_input_starts_with_exact_prefix` is never used
+src\proxy\full_replay_continuity.rs:87:4: warning: function `native_delta_suffix_is_safe` is never used
+src\proxy\full_replay_continuity.rs:105:4: warning: function `native_delta_instruction_and_user_suffix_is_safe` is never used
+src\proxy\responses_full_replay_risk.rs:76:5: warning: field `shape` is never read
+src\proxy\responses_full_replay_risk.rs:80:19: warning: method `recent_blocked_shape` is never used
+src\state.rs:461:12: warning: method `insert` is never used
+src\admin\mod.rs:157:1: warning: this `impl` can be derived
+src\admin\mod.rs:194:1: warning: this `impl` can be derived
+src\admin\mod.rs:1504:13: warning: redundant redefinition of a binding `state`
+src\admin\mod.rs:1510:47: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `state`
+src\admin\mod.rs:2444:13: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let data = recognized_new_api_token_usage(value)?;`
+src\agent_injection.rs:881:24: warning: derefed type is same as origin: help: try: `configured_provider_id`
+src\agent_injection.rs:1163:5: warning: this block may be rewritten with the `?` operator: help: replace it with: `write_text(path, &rendered)?;`
+src\cache.rs:376:5: warning: this function has too many arguments (8/7)
+src\cache.rs:949:5: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let text = semantic_text(request)?;`
+src\cache.rs:1329:42: warning: this `if` has identical blocks
+src\config\mod.rs:240:1: warning: this `impl` can be derived
+src\config\mod.rs:271:1: warning: this `impl` can be derived
+src\config\mod.rs:287:1: warning: all variants have the same prefix: `PromptCache`
+src\config\mod.rs:348:1: warning: this `impl` can be derived
+src\config\mod.rs:363:1: warning: this `impl` can be derived
+src\config\mod.rs:437:18: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\config\mod.rs:465:18: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\config\mod.rs:627:1: warning: this `impl` can be derived
+src\config\mod.rs:641:1: warning: this `impl` can be derived
+src\config\mod.rs:2317:5: warning: this function has too many arguments (8/7)
+src\continuation_lineage.rs:503:44: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\continuation_lineage.rs:827:13: warning: unnecessary closure used with `bool::then`
+src\crypto.rs:114:13: warning: the function `CryptProtectData` doesn't need a mutable reference
+src\crypto.rs:154:13: warning: the function `CryptUnprotectData` doesn't need a mutable reference
+src\metrics.rs:483:12: warning: comparison to empty slice: help: using `is_empty` is clearer and more explicit: `self.model.is_empty()`
+src\metrics.rs:2076:1: warning: this function has too many arguments (8/7)
+src\metrics_history.rs:545:5: warning: this function has too many arguments (8/7)
+src\metrics_history.rs:607:5: warning: this function has too many arguments (9/7)
+src\proxy\cache_affinity.rs:76:1: warning: this `impl` can be derived
+src\proxy\cache_affinity.rs:838:18: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\cache_affinity.rs:912:22: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\cache_affinity.rs:927:9: warning: usage of `contains_key` followed by `insert` on a `HashMap`
+src\proxy\cache_validation.rs:440:49: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\cache_validation.rs:474:9: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let active = self.active.as_mut().filter(|run| run.run_id == run_id)?;`
+src\proxy\cache_validation.rs:678:9: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let active = self.active.take()?;`
+src\proxy\completion_relay.rs:565:1: warning: this function has too many arguments (9/7)
+src\proxy\completion_relay.rs:587:1: warning: this function has too many arguments (46/7)
+src\proxy\final_scope_waterline.rs:804:64: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\prefix_control.rs:272:9: warning: this `if` statement can be collapsed
+src\proxy\prefix_control.rs:805:27: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if !suppress_avoidable { direct_avoidable_tokens } else { 0 }`
+src\proxy\prefix_control.rs:808:31: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if !suppress_avoidable { direct_avoidable_tokens_128 } else { 0 }`
+src\proxy\prefix_control.rs:863:12: warning: manual `!Range::contains` implementation: help: use: `!(1024..32_000).contains(&current_bucket)`
+src\proxy\prefix_control.rs:861:8: warning: manual `!Range::contains` implementation: help: use: `!(1024..32_000).contains(&previous_seen)`
+src\proxy\prefix_control.rs:897:12: warning: manual `!Range::contains` implementation: help: use: `!(1024..32_000).contains(&current_bucket)`
+src\proxy\prefix_control.rs:895:8: warning: manual `!Range::contains` implementation: help: use: `!(1024..32_000).contains(&previous_seen)`
+src\proxy\responses_stream.rs:127:30: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\responses_stream.rs:564:23: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\settlement_pipeline.rs:304:1: warning: this function has too many arguments (9/7)
+src\proxy\streaming_responses_anthropic.rs:893:9: warning: stripping a prefix manually
+src\proxy\streaming_responses_chat.rs:730:9: warning: stripping a prefix manually
+src\proxy\transport.rs:193:5: warning: returning the result of a `let` binding from a block
+src\proxy\upstream_affinity.rs:61:1: warning: this `impl` can be derived
+src\proxy\warm_pending.rs:365:17: warning: this `if` can be collapsed into the outer `match`
+src\proxy\mod.rs:1172:5: warning: this block may be rewritten with the `?` operator: help: replace it with: `authorize_admin(state, request.headers()).await?;`
+src\proxy\mod.rs:1468:5: warning: this block may be rewritten with the `?` operator: help: replace it with: `authorize_admin(state, request.headers()).await?;`
+src\proxy\mod.rs:1953:10: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\mod.rs:2350:44: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if !compact_success_for_cache { cache_capability_rejection_fields_from_error_bytes(&bytes) } else { Default::default() }`
+src\proxy\mod.rs:2997:1: warning: this function has too many arguments (10/7)
+src\proxy\mod.rs:3860:5: warning: field assignment outside of initializer for an instance created with Default::default()
+src\proxy\mod.rs:3701:10: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\mod.rs:4639:31: warning: manual implementation of `Option::map`
+src\proxy\mod.rs:4698:21: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:4742:21: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:4834:25: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:4911:46: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:4929:9: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:5022:25: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:5062:25: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:5171:44: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if !is_success_status { cache_capability_rejection_fields_from_error_bytes(settlement_bytes) } else { Default::default() }`
+src\proxy\mod.rs:5583:41: warning: this expression creates a reference which is immediately dereferenced by the compiler: help: change this to: `active_upstream_body`
+src\proxy\mod.rs:6560:5: warning: returning the result of a `let` binding from a block
+src\proxy\mod.rs:6531:70: warning: this `if` has identical blocks
+src\proxy\mod.rs:6544:71: warning: this `if` has identical blocks
+src\proxy\mod.rs:6583:51: warning: this `if` has identical blocks
+src\proxy\mod.rs:6585:41: warning: this `if` has identical blocks
+src\proxy\mod.rs:6587:41: warning: this `if` has identical blocks
+src\proxy\mod.rs:6589:40: warning: this `if` has identical blocks
+src\proxy\mod.rs:6822:1: warning: this function has too many arguments (8/7)
+src\proxy\mod.rs:8534:8: warning: manual `!RangeInclusive::contains` implementation: help: use: `!(128..=4096).contains(&current_shortfall)`
+src\proxy\mod.rs:8582:8: warning: manual `!RangeInclusive::contains` implementation: help: use: `!(128..=8192).contains(&current_shortfall)`
+src\proxy\mod.rs:8662:83: warning: this `if` has identical blocks
+src\proxy\mod.rs:8731:8: warning: manual `!RangeInclusive::contains` implementation: help: use: `!(128..=12_288).contains(&current_shortfall)`
+src\proxy\mod.rs:9520:1: warning: this function has too many arguments (9/7)
+src\proxy\mod.rs:9545:1: warning: this function has too many arguments (9/7)
+src\proxy\mod.rs:9556:5: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let lease = session_lease?;`
+src\proxy\mod.rs:9967:9: warning: some ranges overlap
+src\proxy\mod.rs:11547:1: warning: this function has too many arguments (9/7)
+src\proxy\mod.rs:12290:40: warning: using `clone` on type `ProviderCacheEffectStatus` which implements the `Copy` trait: help: try removing the `clone` call: `saved.effect_status`
+src\proxy\mod.rs:14346:25: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\mod.rs:14634:5: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let previous_items = previous_input.as_array()?;`
+src\proxy\mod.rs:14637:5: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let current_items = current_input.as_array()?;`
+src\proxy\mod.rs:14673:9: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let prior_call_id = native_codex_root_call_id(previous)?;`
+src\proxy\mod.rs:14676:9: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let current_call_id = native_codex_root_call_id(current)?;`
+src\proxy\mod.rs:14688:17: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let (expected_prior_call_id, count) = pairs.get_mut(current_call_id)?;`
+src\proxy\mod.rs:14890:14: warning: current MSRV (Minimum Supported Rust Version) is `1.78.0` but this item is stable since `1.82.0`
+src\proxy\mod.rs:15239:5: warning: consider using `sort_by_key`
+src\proxy\mod.rs:15275:5: warning: consider using `sort_by_key`
+src\proxy\mod.rs:15451:84: warning: this `if` has identical blocks
+src\proxy\mod.rs:16153:5: warning: consider using `sort_by_key`
+src\proxy\mod.rs:17178:32: warning: useless use of `format!`: help: consider using `.to_string()`: `"Anthropic tool_result references unknown or already-consumed tool_use_id".to_string()`
+src\state.rs:162:1: warning: this `impl` can be derived
+src\state.rs:395:9: warning: this `let...else` may be rewritten with the `?` operator: help: replace it with: `let current_proof = current_proof?;`
+warning: `atoapi` (lib) generated 117 warnings (run `cargo clippy --fix --lib -p atoapi -- ` to apply 50 suggestions)
+src\admin\mod.rs:4589:27: warning: unneeded use of `concat!` macro: help: replace with: `"data: {\"id\":\"chatcmpl_probe\",\"choices\":[{\"delta\":{\"content\":\"h\"}}]}\n\n"`
+src\config\mod.rs:3344:9: warning: field assignment outside of initializer for an instance created with Default::default()
+src\config\mod.rs:4268:9: warning: field assignment outside of initializer for an instance created with Default::default()
+src\metrics_history.rs:1942:9: warning: field assignment outside of initializer for an instance created with Default::default()
+src\proxy\cache_affinity.rs:3179:35: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if has_usage { 30_000 } else { Default::default() }`
+src\proxy\cache_affinity.rs:3180:40: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if has_usage { 11_000 } else { Default::default() }`
+src\proxy\cache_capability.rs:1371:9: warning: for loop over a single element
+src\proxy\cache_control_core.rs:311:9: warning: used `assert_eq!` with a literal bool
+src\proxy\wire_fixture_tests.rs:9:49: warning: unneeded use of `concat!` macro: help: replace with: `"{\"model\":\"gpt-5.5\",\"prompt_cache_key\":\"stable-cache-key\",\"instructions\":\"stable system\",\"tools\":[{\"name\":\"read_file\",\"type\":\"function\"}],\"input\":[{\"content\":\"fresh\",\"role\":\"user\",\"type\":\"message\"}],\"reasoning\":{\"effort\":\"low\"},\"temperature\":0,\"include\":[\"reasoning.encrypted_content\"],\"stream\":true,\"store\":true,\"service_tier\":\"auto\",\"truncation\":\"auto\",\"previous_response_id\":\"resp_dynamic\",\"metadata\":{\"trace\":\"dynamic\"},\"z_vendor_extension\":{\"escaped\":\"line\\n\\\"雪\\\"\"}}"`
+src\proxy\mod.rs:7874:1: warning: this function has too many arguments (8/7)
+src\proxy\mod.rs:11891:75: warning: this `if` has identical blocks
+src\proxy\mod.rs:30778:9: warning: field assignment outside of initializer for an instance created with Default::default()
+src\proxy\mod.rs:31160:9: warning: field assignment outside of initializer for an instance created with Default::default()
+src\proxy\mod.rs:32543:55: warning: can be more succinctly written as a byte str: help: try: `b"abba"`
+src\proxy\mod.rs:37012:30: warning: unneeded use of `concat!` macro: help: replace with: `"data: {\"id\":\"chatcmpl_1\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n"`
+src\proxy\mod.rs:46952:41: warning: this method chain can be written more clearly with `if .. else ..`: help: try: `if request_index > 0 { WARM_CACHE_TOKENS } else { Default::default() }`
+warning: `atoapi` (lib test) generated 118 warnings (102 duplicates) (run `cargo clippy --fix --lib -p atoapi --tests -- ` to apply 9 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.05s

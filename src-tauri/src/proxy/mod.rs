@@ -47,7 +47,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Write,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Instant,
 };
 use tokio::{
@@ -136,8 +136,9 @@ pub(crate) use responses_full_replay_risk::{
     ResponsesFullReplayRiskObservations, ResponsesRouteScope,
 };
 use responses_stream::{
-    evaluate_terminal, value_has_compaction_output, value_has_model_output, ResponsesStreamState,
-    StreamEnd, TerminalCompatibility, TerminalFailure, TerminalPrecheckGuard,
+    evaluate_terminal, responses_completion_has_failure, value_has_compaction_output,
+    value_has_model_output, ResponsesStreamState, StreamEnd, TerminalCompatibility,
+    TerminalFailure, TerminalPrecheckGuard,
 };
 use session_identity::{
     strip_dynamic_invocation_fields, unambiguous_explicit_thread_id, SessionIdentity,
@@ -165,6 +166,12 @@ const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
 // cap well above normal Codex turns (and model context windows) while stopping
 // pathological replay uploads locally, before gzip and the one-shot POST.
 const MAX_NATIVE_RESPONSES_FULL_REPLAY_BODY_BYTES: usize = 16 * 1024 * 1024;
+// Buffered upstream responses are retained while protocol conversion and
+// settlement run. Keep that temporary allocation bounded independently from
+// the request-body gate above. SSE gets extra headroom for event framing and
+// repeated JSON metadata, but neither path is allowed to grow without limit.
+const MAX_UPSTREAM_BUFFERED_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_UPSTREAM_BUFFERED_SSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const COMPACT_CHAT_COMPAT_COOLDOWN_SECS: u64 = 15 * 60;
 const COMPACT_ENDPOINT_COOLDOWN_SECS: u64 = 15 * 60;
 // These maps are local compatibility hints, not durable routing state. Bound
@@ -179,6 +186,10 @@ const CLIENT_PROMPT_CACHE_KEY_REDACTION_WINDOW_CHARS: usize =
     LOG_MESSAGE_MAX_CHARS + CLIENT_PROMPT_CACHE_KEY_MAX_CHARS;
 const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_SECS: u64 = 15 * 60;
 const CLIENT_PROMPT_CACHE_KEY_REJECTION_COOLDOWN_LIMIT: usize = 1_024;
+// Request-body gzip support is a provider transport compatibility property,
+// not a user preference. Keep the learned, local-only map bounded and never
+// persist it: a provider deployment or key can change outside this process.
+const GZIP_REQUEST_BODY_CAPABILITY_LIMIT: usize = 512;
 const REDACTED_CLIENT_PROMPT_CACHE_KEY: &str = "[redacted prompt_cache_key]";
 const REASONING_EFFORT_REJECTION_COOLDOWN_SECS: u64 = 6 * 60 * 60;
 const REASONING_EFFORT_REJECTION_LIMIT: usize = 2_048;
@@ -187,6 +198,169 @@ const X_ATOAPI_REQUEST_KIND_HEADER: &str = "x-atoapi-request-kind";
 const CACHE_CAPABILITY_PROBE_REQUEST_KIND: &str = "cache-capability-probe";
 const PREFIX_DIAGNOSTICS_ENV: &str = "ATOAPI_PREFIX_DIAGNOSTICS";
 const ADMIN_PROBE_BODY_LIMIT: usize = 16 * 1024;
+// Codex polls `/models` to populate its selector. Keep discovery current
+// without turning that poll into a provider request on every open/reload.
+// These entries are process-local only and never become a configured catalog.
+const CODEX_MODEL_DISCOVERY_CACHE_TTL_SECS: u64 = 45;
+const CODEX_MODEL_DISCOVERY_FAILURE_CACHE_TTL_SECS: u64 = 5;
+const CODEX_MODEL_DISCOVERY_CACHE_LIMIT: usize = 64;
+const CODEX_MODEL_DISCOVERY_RESPONSE_LIMIT: usize = 512 * 1024;
+const CODEX_MODEL_DISCOVERY_TIMEOUT_SECS: u64 = 8;
+
+#[derive(Debug, Clone)]
+enum CodexModelDiscoveryResult {
+    Models(Vec<Value>),
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct CodexModelDiscoveryCacheEntry {
+    observed_at: Instant,
+    result: CodexModelDiscoveryResult,
+}
+
+#[derive(Debug, Clone)]
+struct CodexModelDiscoveryPlan {
+    provider: ProviderConfig,
+    selected_key: SelectedProviderKey,
+    explicit_proxy_url: Option<String>,
+}
+
+/// Opaque local digest of one provider/key/channel gzip capability scope.
+/// Its only stored member is a keyed digest; no provider URL, Key id, or Key
+/// material is retained in the process-local capability registry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct GzipRequestBodyCapabilityScope {
+    digest: String,
+}
+
+impl GzipRequestBodyCapabilityScope {
+    fn derive(
+        config: &AppConfig,
+        provider: &ProviderConfig,
+        channel: &Channel,
+        selected_key: &SelectedProviderKey,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"atoapi-gzip-request-body-capability-v1\0");
+        // The local key prevents the retained digest from becoming a reusable
+        // fingerprint of a short upstream Key. No source value is stored.
+        for value in [
+            config.local_key.as_str(),
+            config.workspace_fingerprint.as_str(),
+            provider.id.as_str(),
+            provider.base_url.as_str(),
+            if provider.is_full_url {
+                "full-url"
+            } else {
+                "path"
+            },
+            if provider.use_system_proxy {
+                "system-proxy"
+            } else {
+                "direct"
+            },
+            channel.label(),
+            selected_key.key_id.as_deref().unwrap_or_default(),
+            selected_key
+                .encrypted_material_digest
+                .as_deref()
+                .unwrap_or_default(),
+            selected_key.secret.as_str(),
+        ] {
+            hasher.update(value.as_bytes());
+            hasher.update(b"\0");
+        }
+        Self {
+            digest: format!("{:x}", hasher.finalize()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(label: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"atoapi-gzip-request-body-capability-test-v1\0");
+        hasher.update(label.as_bytes());
+        Self {
+            digest: format!("{:x}", hasher.finalize()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GzipRequestBodyCapability {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug)]
+struct GzipRequestBodyCapabilityEntry {
+    capability: GzipRequestBodyCapability,
+    last_used: Instant,
+}
+
+/// Process-only, bounded gzip transport compatibility observations.
+#[derive(Debug, Default)]
+pub(crate) struct GzipRequestBodyCapabilityStore {
+    entries: HashMap<GzipRequestBodyCapabilityScope, GzipRequestBodyCapabilityEntry>,
+}
+
+impl GzipRequestBodyCapabilityStore {
+    fn supports(&mut self, scope: &GzipRequestBodyCapabilityScope) -> bool {
+        let Some(entry) = self.entries.get_mut(scope) else {
+            return false;
+        };
+        entry.last_used = Instant::now();
+        entry.capability == GzipRequestBodyCapability::Supported
+    }
+
+    /// Unknown routes are eligible for a first gzip probe. Only an explicit
+    /// rejection disables future attempts for that scope; a successful probe
+    /// remains enabled as before.
+    fn allows_attempt(&mut self, scope: &GzipRequestBodyCapabilityScope) -> bool {
+        let Some(entry) = self.entries.get_mut(scope) else {
+            return true;
+        };
+        entry.last_used = Instant::now();
+        entry.capability != GzipRequestBodyCapability::Unsupported
+    }
+
+    fn record(
+        &mut self,
+        scope: GzipRequestBodyCapabilityScope,
+        capability: GzipRequestBodyCapability,
+    ) {
+        let now = Instant::now();
+        if let Some(entry) = self.entries.get_mut(&scope) {
+            entry.capability = capability;
+            entry.last_used = now;
+            return;
+        }
+
+        if self.entries.len() >= GZIP_REQUEST_BODY_CAPABILITY_LIMIT {
+            if let Some(oldest_scope) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(scope, _)| scope.clone())
+            {
+                self.entries.remove(&oldest_scope);
+            }
+        }
+        self.entries.insert(
+            scope,
+            GzipRequestBodyCapabilityEntry {
+                capability,
+                last_used: now,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 /// Cache-affinity state is an optional routing/measurement optimization, not
 /// semantic conversation state.  Never queue an inbound Agent request behind a
 /// background runtime snapshot: retain a truthful shadow-only receipt instead.
@@ -773,6 +947,7 @@ struct UpstreamBodyReadOutcome {
     sse_chunks: Option<u64>,
 }
 fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
+    let content_type = content_type.to_ascii_lowercase();
     let text_like = content_type.contains("json")
         || content_type.contains("event-stream")
         || content_type.contains("text");
@@ -783,6 +958,45 @@ fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
         return json_value_has_error(&value);
     }
     let text = String::from_utf8_lossy(bytes);
+    if content_type.contains("event-stream") {
+        let mut decoder = sse::SseFrameDecoder::default();
+        let mut frames = decoder.push(bytes);
+        frames.extend(decoder.finish());
+        for frame in frames {
+            if frame.event.as_deref().is_some_and(|event| {
+                matches!(event, "error" | "response.failed" | "response.incomplete")
+                    || event.ends_with(".failed")
+                    || event.ends_with(".incomplete")
+                    || event.ends_with(".error")
+            }) {
+                return true;
+            }
+            let payload = frame.data.trim();
+            if payload.is_empty() || payload == "[DONE]" {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                if json_value_has_error(&value)
+                    || (frame.event.as_deref() == Some("response.completed")
+                        && responses_completion_has_failure(&value))
+                {
+                    return true;
+                }
+            }
+        }
+        // A few gateways split one JSON `data:` payload over multiple SSE
+        // lines and leave it technically invalid JSON. Preserve the old
+        // compatibility signal for terminal status fields without treating
+        // arbitrary prose as an error.
+        let compact_text: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+        if compact_text.contains("\"status\":\"failed\"")
+            || compact_text.contains("\"status\":\"incomplete\"")
+            || compact_text.contains("\"status\":\"error\"")
+        {
+            return true;
+        }
+        return false;
+    }
     if text.contains("\"type\":\"error\"")
         || text.contains("\"type\":\"response.failed\"")
         || text.contains("\"type\":\"response.incomplete\"")
@@ -790,31 +1004,28 @@ fn upstream_body_has_error(bytes: &[u8], content_type: &str) -> bool {
     {
         return true;
     }
-    for line in text.lines() {
-        let Some(data) = line.trim_start().strip_prefix("data:") else {
-            continue;
-        };
-        if let Ok(value) = serde_json::from_str::<Value>(data.trim()) {
-            if json_value_has_error(&value) {
-                return true;
-            }
-        }
-    }
     false
 }
 fn json_value_has_error(value: &Value) -> bool {
-    if value.get("error").is_some_and(|error| !error.is_null()) {
+    if value.get("error").is_some_and(|error| !error.is_null())
+        || value
+            .pointer("/response/error")
+            .is_some_and(|error| !error.is_null())
+    {
         return true;
     }
-    value
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| {
-            matches!(kind, "error" | "response.failed" | "response.incomplete")
-                || kind.ends_with(".failed")
-                || kind.ends_with(".incomplete")
-                || kind.ends_with(".error")
-        })
+    let event_type = value.get("type").and_then(Value::as_str);
+    if event_type.is_some_and(|kind| {
+        matches!(kind, "error" | "response.failed" | "response.incomplete")
+            || kind.ends_with(".failed")
+            || kind.ends_with(".incomplete")
+            || kind.ends_with(".error")
+    }) {
+        return true;
+    }
+    let is_completed_response = event_type == Some("response.completed")
+        || value.get("object").and_then(Value::as_str) == Some("response");
+    is_completed_response && responses_completion_has_failure(value)
 }
 #[derive(Debug, Clone, Default)]
 struct TailInputDiagnostics {
@@ -1502,41 +1713,56 @@ async fn list_models_for_agent(
         Ok(agent_id) => agent_id,
         Err(response) => return response,
     };
-    let config = state.config.read().await;
-    let authorized_agent_config = authorized_agent.as_deref().and_then(|agent_id| {
-        config
-            .agent_injections
+    let (mut data, discovery_plan) = {
+        let config = state.config.read().await;
+        let authorized_agent_config = authorized_agent.as_deref().and_then(|agent_id| {
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == agent_id)
+        });
+        let agent_provider_id =
+            authorized_agent_config.and_then(|agent| agent.provider_id.as_deref());
+        let data = config
+            .providers
             .iter()
-            .find(|agent| agent.id == agent_id)
-    });
-    let agent_provider_id = authorized_agent_config.and_then(|agent| agent.provider_id.as_deref());
-    let data = config
-        .providers
-        .iter()
-        .filter(|provider| {
-            provider.enabled
-                && agent_provider_id
-                    .map(|provider_id| provider.id == provider_id)
-                    .unwrap_or(true)
+            .filter(|provider| {
+                provider.enabled
+                    && agent_provider_id
+                        .map(|provider_id| provider.id == provider_id)
+                        .unwrap_or(true)
+            })
+            .flat_map(|provider| {
+                provider_model_list_items(
+                    provider,
+                    authorized_agent.is_some(),
+                    authorized_agent_config.and_then(|agent| agent.model_id.as_deref()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // Only the explicit Codex route gets dynamic discovery. Other local
+        // agent endpoints retain their configured catalog behavior.
+        let discovery_plan = (forced_agent_id == Some("codex")
+            && authorized_agent.as_deref() == Some("codex"))
+        .then(|| {
+            authorized_agent_config.and_then(|agent| codex_model_discovery_plan(&config, agent))
         })
-        .flat_map(|provider| {
-            let fallback_model = authorized_agent_config
-                .filter(|_| provider.models.iter().all(|model| !model.enabled))
-                .and_then(|agent| agent.model_id.as_deref())
-                .or_else(|| {
-                    authorized_agent_config
-                        .filter(|_| provider.models.iter().all(|model| !model.enabled))
-                        .map(|_| "gpt-5.2")
-                });
-            provider_model_list_items(provider, authorized_agent.is_some(), fallback_model)
-        })
-        .collect::<Vec<_>>();
+        .flatten();
+        (data, discovery_plan)
+    };
+
+    if let Some(plan) = discovery_plan {
+        if let Ok(upstream_models) = discover_codex_provider_models(&state, &plan).await {
+            data = merge_model_list_items(upstream_models, data);
+        }
+    }
     Json(json!({ "object": "list", "data": data })).into_response()
 }
 fn provider_model_list_items(
     provider: &ProviderConfig,
     include_codex_aliases: bool,
-    fallback_model: Option<&str>,
+    configured_agent_model: Option<&str>,
 ) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -1574,22 +1800,302 @@ fn provider_model_list_items(
             }
         }
     }
-    if items.is_empty() {
-        if let Some(model_id) = fallback_model
-            .map(str::trim)
-            .filter(|model_id| !model_id.is_empty())
-        {
+    if let Some(model_id) = configured_agent_model
+        .map(str::trim)
+        .filter(|model_id| !model_id.is_empty())
+    {
+        let model_id = model_id.to_string();
+        if seen_ids.insert(model_id.clone()) {
             items.push(json!({
                 "id": model_id,
                 "object": "model",
                 "owned_by": provider.name,
                 "provider": provider.id,
                 "display_name": model_id,
-                "atoapi_fallback": true
+                "atoapi_configured_agent_model": true
             }));
         }
     }
     items
+}
+
+fn codex_model_discovery_plan(
+    config: &AppConfig,
+    agent: &AgentInjectionConfig,
+) -> Option<CodexModelDiscoveryPlan> {
+    let provider_id = agent.provider_id.as_deref()?.trim();
+    if provider_id.is_empty() {
+        return None;
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id && provider.enabled)?
+        .clone();
+
+    // A model-list poll must not advance a Key-pool cursor or alter Key
+    // health. Select from a private snapshot, while retaining the same
+    // eligibility rules and selected Key material as the normal route.
+    let mut selection = config.clone();
+    let selected_key = selection
+        .select_provider_key_for_request(&provider.id, None, None)
+        .ok()??;
+    if selected_key.secret.trim().is_empty() {
+        return None;
+    }
+
+    Some(CodexModelDiscoveryPlan {
+        explicit_proxy_url: config
+            .upstream_proxy_url_for(provider.use_system_proxy)
+            .map(ToOwned::to_owned),
+        provider,
+        selected_key,
+    })
+}
+
+async fn discover_codex_provider_models(
+    state: &AppState,
+    plan: &CodexModelDiscoveryPlan,
+) -> Result<Vec<Value>> {
+    let cache_key = codex_model_discovery_cache_key(plan);
+    if let Some(cached) = codex_model_discovery_cache_lookup(&cache_key) {
+        return match cached {
+            CodexModelDiscoveryResult::Models(models) => Ok(models),
+            CodexModelDiscoveryResult::Unavailable => {
+                Err(anyhow!("Codex model discovery is temporarily unavailable"))
+            }
+        };
+    }
+
+    let discovery = tokio::time::timeout(
+        TokioDuration::from_secs(CODEX_MODEL_DISCOVERY_TIMEOUT_SECS),
+        fetch_codex_provider_models(state, plan),
+    )
+    .await;
+    let result = match discovery {
+        Ok(Ok(models)) => CodexModelDiscoveryResult::Models(models),
+        Ok(Err(_)) | Err(_) => CodexModelDiscoveryResult::Unavailable,
+    };
+    codex_model_discovery_cache_insert(cache_key, result.clone());
+
+    match result {
+        CodexModelDiscoveryResult::Models(models) => Ok(models),
+        CodexModelDiscoveryResult::Unavailable => {
+            Err(anyhow!("Codex model discovery is temporarily unavailable"))
+        }
+    }
+}
+
+async fn fetch_codex_provider_models(
+    state: &AppState,
+    plan: &CodexModelDiscoveryPlan,
+) -> Result<Vec<Value>> {
+    let endpoints = codex_model_discovery_endpoints(&plan.provider)?;
+    let client = match plan.explicit_proxy_url.as_deref() {
+        Some(proxy_url) => state
+            .transport_clients
+            .explicit_proxy_client(proxy_url, false)?,
+        None => state
+            .upstream_client(plan.provider.use_system_proxy)
+            .clone(),
+    };
+    let headers = build_management_probe_headers(
+        &plan.selected_key.secret,
+        &plan.provider.channel,
+        false,
+        plan.provider.custom_user_agent.as_deref(),
+    );
+
+    for endpoint in endpoints {
+        let response = match client.get(&endpoint).headers(headers.clone()).send().await {
+            Ok(response) if response.status().is_success() => response,
+            Ok(_) | Err(_) => continue,
+        };
+        let body = match read_codex_model_discovery_body(response).await {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        let value = match serde_json::from_slice::<Value>(&body) {
+            Ok(value) if value.get("success").and_then(Value::as_bool) != Some(false) => value,
+            Ok(_) | Err(_) => continue,
+        };
+        if let Some(models) = upstream_model_list_items(&value, &plan.provider) {
+            return Ok(models);
+        }
+    }
+
+    Err(anyhow!("no compatible upstream model list was available"))
+}
+
+fn codex_model_discovery_endpoints(provider: &ProviderConfig) -> Result<Vec<String>> {
+    if let Some(models_url) = provider
+        .models_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        let url = reqwest::Url::parse(models_url)?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(anyhow!("models URL must use http or https"));
+        }
+        return Ok(vec![url.to_string()]);
+    }
+
+    let upstream = upstream_url(&provider.base_url, &provider.channel);
+    let mut url = reqwest::Url::parse(&upstream)?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(anyhow!("provider base URL must use http or https"));
+    }
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow!("provider URL cannot be used for model discovery"))?;
+    segments.pop_if_empty();
+    segments.pop();
+    segments.push("models");
+    drop(segments);
+    Ok(vec![url.to_string()])
+}
+
+async fn read_codex_model_discovery_body(response: reqwest::Response) -> Result<Bytes> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > CODEX_MODEL_DISCOVERY_RESPONSE_LIMIT as u64)
+    {
+        return Err(anyhow!("upstream model list exceeds the response limit"));
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > CODEX_MODEL_DISCOVERY_RESPONSE_LIMIT {
+            return Err(anyhow!("upstream model list exceeds the response limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
+}
+
+fn upstream_model_list_items(value: &Value, provider: &ProviderConfig) -> Option<Vec<Value>> {
+    let records = [
+        value.get("data"),
+        value.get("models"),
+        value.pointer("/data/models"),
+        value.as_array().map(|_| value),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_array)?;
+
+    let mut models = Vec::with_capacity(records.len());
+    for record in records {
+        let Value::Object(mut item) = record.clone() else {
+            continue;
+        };
+        let Some(id) = item
+            .get("id")
+            .or_else(|| item.get("name"))
+            .or_else(|| item.get("model"))
+            .and_then(Value::as_str)
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        item.insert("id".to_string(), Value::String(id.clone()));
+        item.entry("object".to_string())
+            .or_insert_with(|| Value::String("model".to_string()));
+        item.entry("owned_by".to_string())
+            .or_insert_with(|| Value::String(provider.name.clone()));
+        item.entry("provider".to_string())
+            .or_insert_with(|| Value::String(provider.id.clone()));
+        item.entry("display_name".to_string())
+            .or_insert_with(|| Value::String(id.clone()));
+        models.push(Value::Object(item));
+    }
+    Some(models)
+}
+
+fn merge_model_list_items(primary: Vec<Value>, secondary: Vec<Value>) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    primary
+        .into_iter()
+        .chain(secondary)
+        .filter(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| seen.insert(id.to_string()))
+        })
+        .collect()
+}
+
+fn codex_model_discovery_cache_key(plan: &CodexModelDiscoveryPlan) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-codex-model-discovery-v1\0");
+    let key_realm = affinity_identity::key_realm_id(&plan.selected_key);
+    for value in [
+        plan.provider.id.as_str(),
+        plan.provider.base_url.as_str(),
+        plan.provider.models_url.as_deref().unwrap_or_default(),
+        plan.provider.channel.label(),
+        plan.provider
+            .custom_user_agent
+            .as_deref()
+            .unwrap_or_default(),
+        plan.explicit_proxy_url.as_deref().unwrap_or_default(),
+        key_realm.as_str(),
+    ] {
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    hasher.update([plan.provider.is_full_url as u8]);
+    format!("{:x}", hasher.finalize())
+}
+
+fn codex_model_discovery_cache() -> &'static StdMutex<HashMap<String, CodexModelDiscoveryCacheEntry>>
+{
+    static CACHE: OnceLock<StdMutex<HashMap<String, CodexModelDiscoveryCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn codex_model_discovery_cache_lookup(scope: &str) -> Option<CodexModelDiscoveryResult> {
+    let now = Instant::now();
+    let mut cache = codex_model_discovery_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|_, entry| {
+        let ttl = match &entry.result {
+            CodexModelDiscoveryResult::Models(_) => CODEX_MODEL_DISCOVERY_CACHE_TTL_SECS,
+            CodexModelDiscoveryResult::Unavailable => CODEX_MODEL_DISCOVERY_FAILURE_CACHE_TTL_SECS,
+        };
+        now.saturating_duration_since(entry.observed_at) < TokioDuration::from_secs(ttl)
+    });
+    cache.get(scope).map(|entry| entry.result.clone())
+}
+
+fn codex_model_discovery_cache_insert(scope: String, result: CodexModelDiscoveryResult) {
+    let mut cache = codex_model_discovery_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !cache.contains_key(&scope) && cache.len() >= CODEX_MODEL_DISCOVERY_CACHE_LIMIT {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.observed_at)
+            .map(|(scope, _)| scope.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(
+        scope,
+        CodexModelDiscoveryCacheEntry {
+            observed_at: Instant::now(),
+            result,
+        },
+    );
 }
 async fn chat_completions(
     AxumState(state): AxumState<Arc<AppState>>,
@@ -1826,7 +2332,12 @@ async fn run_responses_compact_for_authorized_agent(
     // Codex item-id namespace repair here so a compact request cannot reintroduce
     // an fc_/fco_ id on a custom_tool_call/custom_tool_call_output item.
     if native_codex_route {
-        normalize_native_codex_tool_item_id_prefixes(&mut upstream_body);
+        if let Err(reason) = normalize_native_codex_tool_item_id_prefixes(&mut upstream_body) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid Codex custom-tool id namespace: {reason}"),
+            );
+        }
     }
     // Compaction is a new context epoch, not a new Key realm.  Reuse the
     // same stable selection scope as normal FullReplay so a sequential or
@@ -2032,6 +2543,17 @@ async fn run_responses_compact_for_authorized_agent(
     if compact_chat_fast_json {
         set_stream_flag(&mut active_upstream_body, false);
     }
+    let gzip_capability_scope = GzipRequestBodyCapabilityScope::derive(
+        &config,
+        &decision.provider,
+        &active_request_channel,
+        &selected_provider_key,
+    );
+    let gzip_enabled = gzip_request_body_enabled_for_scope(
+        &state,
+        decision.provider.request_body_gzip_enabled,
+        &gzip_capability_scope,
+    );
     let mut request_plan = Some(
         RequestPlan::new(
             &decision.provider,
@@ -2039,6 +2561,7 @@ async fn run_responses_compact_for_authorized_agent(
             active_request_channel.clone(),
             &active_upstream_body,
         )
+        .with_gzip_enabled(gzip_enabled)
         .with_selected_provider_key_ref(affinity_identity::selected_key_ref_id(
             &config.local_key,
             &config.workspace_fingerprint,
@@ -2239,6 +2762,12 @@ async fn run_responses_compact_for_authorized_agent(
     let is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
+    record_gzip_request_body_success(
+        &state,
+        &gzip_capability_scope,
+        upstream_request_diagnostics.gzip_attempted,
+        status,
+    );
     let body_read = match read_upstream_body_with_diagnostics(
         upstream,
         &content_type,
@@ -2339,6 +2868,12 @@ async fn run_responses_compact_for_authorized_agent(
         }
     };
     let bytes = body_read.bytes;
+    record_gzip_request_body_rejection(
+        &state,
+        &gzip_capability_scope,
+        upstream_request_diagnostics.gzip_attempted,
+        &bytes,
+    );
     let upstream_body_error = upstream_body_has_error(&bytes, &content_type);
     let compact_success_for_cache = is_success_status && !upstream_body_error;
     let key_error_summary = (!compact_success_for_cache).then(|| {
@@ -3673,7 +4208,12 @@ async fn run_generation_for_authorized_agent(
     // final Codex wire boundary, so it must not depend on the separate
     // FullReplay proof.
     if native_codex_route {
-        normalize_native_codex_tool_item_id_prefixes(&mut upstream_body);
+        if let Err(reason) = normalize_native_codex_tool_item_id_prefixes(&mut upstream_body) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid Codex custom-tool id namespace: {reason}"),
+            );
+        }
     }
     let full_response_input = upstream_body.get("input").cloned();
     let tail_input_analysis = analyze_tail_input_for_session(
@@ -4599,6 +5139,17 @@ async fn run_generation_for_authorized_agent(
         client_requested_stream,
         generation_plan.request_plan().body_len(),
     );
+    let gzip_capability_scope = GzipRequestBodyCapabilityScope::derive(
+        &config,
+        &decision.provider,
+        &active_request_channel,
+        &selected_provider_key,
+    );
+    let gzip_enabled = gzip_request_body_enabled_for_scope(
+        &state,
+        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+        &gzip_capability_scope,
+    );
     // Only an unchanged, adapter-attested route may inherit upstream
     // load-balancer placement. Compatibility reroutes have a different final
     // endpoint/channel and deliberately get no affinity scope.
@@ -4610,9 +5161,7 @@ async fn run_generation_for_authorized_agent(
         })
         .flatten();
     let mut frozen_generation = generation_plan
-        .with_gzip_enabled(
-            decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
-        )
+        .with_gzip_enabled(gzip_enabled)
         .with_selected_provider_key_ref(affinity_identity::selected_key_ref_id(
             &config.local_key,
             &config.workspace_fingerprint,
@@ -4779,6 +5328,12 @@ async fn run_generation_for_authorized_agent(
     let mut is_success_status = StatusCode::from_u16(status)
         .map(|status| status.is_success())
         .unwrap_or(false);
+    record_gzip_request_body_success(
+        &state,
+        &gzip_capability_scope,
+        current_send_diagnostics.gzip_attempted,
+        status,
+    );
     // A session-delta request is deliberately one-shot.  Its `previous_response_id`
     // changes the semantic context at the provider, so a retry with another
     // key, a full body, or another protocol would be a second generation for
@@ -5087,6 +5642,12 @@ async fn run_generation_for_authorized_agent(
         },
     };
     let bytes = body_read.bytes;
+    record_gzip_request_body_rejection(
+        &state,
+        &gzip_capability_scope,
+        current_send_diagnostics.gzip_attempted,
+        &bytes,
+    );
 
     // Buffered Responses -> Anthropic fallbacks can still receive an SSE body
     // from a non-streaming upstream.  Settle from the canonical Responses JSON,
@@ -7204,6 +7765,71 @@ fn should_skip_request_body_gzip_for_cold_stream(
         return false;
     }
     false
+}
+
+fn gzip_request_body_enabled_for_scope(
+    state: &AppState,
+    user_enabled: bool,
+    scope: &GzipRequestBodyCapabilityScope,
+) -> bool {
+    user_enabled
+        && state
+            .gzip_request_body_capabilities
+            .try_lock()
+            .ok()
+            .is_some_and(|mut capabilities| capabilities.allows_attempt(scope))
+}
+
+fn record_gzip_request_body_capability(
+    state: &AppState,
+    scope: &GzipRequestBodyCapabilityScope,
+    capability: GzipRequestBodyCapability,
+) {
+    // Compatibility learning is an optimization. A contended or poisoned
+    // registry must fail closed to raw JSON, never stall or duplicate a POST.
+    if let Ok(mut capabilities) = state.gzip_request_body_capabilities.try_lock() {
+        capabilities.record(scope.clone(), capability);
+    }
+}
+
+fn record_gzip_request_body_success(
+    state: &AppState,
+    scope: &GzipRequestBodyCapabilityScope,
+    gzip_attempted: bool,
+    status: u16,
+) {
+    if gzip_attempted
+        && StatusCode::from_u16(status)
+            .map(|status| status.is_success())
+            .unwrap_or(false)
+    {
+        record_gzip_request_body_capability(state, scope, GzipRequestBodyCapability::Supported);
+    }
+}
+
+fn record_gzip_request_body_rejection(
+    state: &AppState,
+    scope: &GzipRequestBodyCapabilityScope,
+    gzip_attempted: bool,
+    body: &[u8],
+) {
+    if gzip_attempted && gzip_request_body_rejection_message(body) {
+        record_gzip_request_body_capability(state, scope, GzipRequestBodyCapability::Unsupported);
+    }
+}
+
+fn gzip_request_body_rejection_message(body: &[u8]) -> bool {
+    let message = String::from_utf8_lossy(body).to_ascii_lowercase();
+    message.contains("failed to parse request body")
+        || message.contains("unsupported content-encoding")
+        || message.contains("unsupported content encoding")
+        || message.contains("unsupported content_encoding")
+        || message.contains("unsupported gzip")
+        || message.contains("gzip is not supported")
+        || message.contains("gzip not supported")
+        || (message.contains("content encoding")
+            && message.contains("gzip")
+            && message.contains("unsupported"))
 }
 
 fn request_body_gzip_compression(body_bytes: usize) -> Compression {
@@ -12755,6 +13381,11 @@ fn upstream_header_is_blocked(name: &str) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "cookie"
+            | "cookie2"
+            | "set-cookie"
+            | "origin"
+            | "referer"
             | "te"
             | "trailer"
             | "upgrade"
@@ -12766,6 +13397,10 @@ fn upstream_header_is_blocked(name: &str) -> bool {
             | "x-forwarded-host"
             | "x-forwarded-port"
             | "x-forwarded-proto"
+            | "x-real-ip"
+            | "x-client-ip"
+            | "x-cluster-client-ip"
+            | "x-envoy-external-address"
             | "cf-connecting-ip"
             | "cf-ipcountry"
             | "cf-ray"
@@ -12974,36 +13609,73 @@ async fn read_upstream_body_with_diagnostics(
     content_type: &str,
     started: Instant,
     headers_at_ms: u64,
-) -> reqwest::Result<UpstreamBodyReadOutcome> {
+) -> Result<UpstreamBodyReadOutcome> {
+    read_upstream_body_with_limit(
+        upstream,
+        content_type,
+        started,
+        headers_at_ms,
+        upstream_body_limit(content_type),
+    )
+    .await
+}
+
+fn upstream_body_limit(content_type: &str) -> usize {
     if is_text_event_stream(content_type) {
-        let mut stream = upstream.bytes_stream();
-        let mut body = Vec::new();
-        let mut first_chunk_at_ms = None;
-        let mut chunks = 0u64;
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
+        MAX_UPSTREAM_BUFFERED_SSE_BODY_BYTES
+    } else {
+        MAX_UPSTREAM_BUFFERED_BODY_BYTES
+    }
+}
+
+async fn read_upstream_body_with_limit(
+    upstream: reqwest::Response,
+    content_type: &str,
+    started: Instant,
+    headers_at_ms: u64,
+    limit: usize,
+) -> Result<UpstreamBodyReadOutcome> {
+    let is_sse = is_text_event_stream(content_type);
+    let kind = if is_sse { "SSE" } else { "non-SSE" };
+
+    // Reject an obviously oversized response before allocating a buffer. The
+    // streaming check below remains authoritative because providers may omit
+    // Content-Length or report a compressed length.
+    let declared_length = upstream.content_length();
+    if declared_length.is_some_and(|declared| declared > limit as u64) {
+        let declared = declared_length.unwrap_or_default();
+        return Err(anyhow!(
+            "upstream {kind} response body declares {declared} bytes, exceeding the local limit of {limit} bytes"
+        ));
+    }
+
+    let mut stream = upstream.bytes_stream();
+    let mut body = Vec::new();
+    let mut first_chunk_at_ms = None;
+    let mut chunks = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let next_len = body.len().saturating_add(chunk.len());
+        if next_len > limit {
+            return Err(anyhow!(
+                "upstream {kind} response body exceeded the local limit of {limit} bytes (received at least {next_len} bytes)"
+            ));
+        }
+        if is_sse {
             if first_chunk_at_ms.is_none() {
                 first_chunk_at_ms = Some(started.elapsed().as_millis() as u64);
             }
             chunks += 1;
-            body.extend_from_slice(&chunk);
         }
-        let aggregate_done_ms = started.elapsed().as_millis() as u64;
-        Ok(UpstreamBodyReadOutcome {
-            bytes: body,
-            first_chunk_ms: first_chunk_at_ms.map(|at| at.saturating_sub(headers_at_ms)),
-            aggregate_done_ms,
-            sse_chunks: Some(chunks),
-        })
-    } else {
-        let bytes = upstream.bytes().await?.to_vec();
-        Ok(UpstreamBodyReadOutcome {
-            bytes,
-            first_chunk_ms: None,
-            aggregate_done_ms: started.elapsed().as_millis() as u64,
-            sse_chunks: None,
-        })
+        body.extend_from_slice(&chunk);
     }
+    let aggregate_done_ms = started.elapsed().as_millis() as u64;
+    Ok(UpstreamBodyReadOutcome {
+        bytes: body,
+        first_chunk_ms: first_chunk_at_ms.map(|at| at.saturating_sub(headers_at_ms)),
+        aggregate_done_ms,
+        sse_chunks: is_sse.then_some(chunks),
+    })
 }
 
 fn responses_wire_prefix_fingerprints(
@@ -14849,9 +15521,18 @@ fn native_codex_items_equal_ignoring_root_ids(left: &Value, right: &Value) -> bo
             .all(|(key, value)| right.get(key) == Some(value))
 }
 
-fn normalize_native_codex_tool_item_id_prefixes(request: &mut Value) -> usize {
+/// Repair only an unambiguous known Responses item-id namespace mismatch.
+///
+/// Unknown opaque IDs are intentionally preserved. For the known `fc_` /
+/// `fco_` versus `ctc_` / `ctco_` mix-up, a collision or nested tool link
+/// means that changing the root ID could invalidate a caller-owned reference,
+/// so the final Codex wire is rejected before dispatch instead of relying on
+/// an opaque upstream validation error.
+fn normalize_native_codex_tool_item_id_prefixes(
+    request: &mut Value,
+) -> Result<usize, &'static str> {
     let Some(items) = request.get_mut("input").and_then(Value::as_array_mut) else {
-        return 0;
+        return Ok(0);
     };
     let item_ids = items
         .iter()
@@ -14859,16 +15540,22 @@ fn normalize_native_codex_tool_item_id_prefixes(request: &mut Value) -> usize {
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let existing_ids = item_ids.iter().cloned().collect::<HashSet<_>>();
-    if existing_ids.len() != item_ids.len() {
-        return 0;
-    }
     let mut planned_ids = HashSet::new();
-    let mut repaired = 0usize;
-    for item in items {
+    let mut replacements = Vec::new();
+    for (index, item) in items.iter().enumerate() {
         if native_codex_item_has_unsafe_tool_link(item) {
+            let item_type = item.get("type").and_then(Value::as_str);
+            let item_id = item.get("id").and_then(Value::as_str);
+            if matches!(
+                item_type,
+                Some("custom_tool_call") | Some("custom_tool_call_output")
+            ) && item_id.is_some_and(native_codex_item_id_has_known_wrong_prefix)
+            {
+                return Err("a custom-tool item has an unsafe nested tool reference");
+            }
             continue;
         }
-        let Some(object) = item.as_object_mut() else {
+        let Some(object) = item.as_object() else {
             continue;
         };
         let Some(item_type) = object.get("type").and_then(Value::as_str) else {
@@ -14884,13 +15571,6 @@ fn normalize_native_codex_tool_item_id_prefixes(request: &mut Value) -> usize {
         let Some(current_id) = object.get("id").and_then(Value::as_str) else {
             continue;
         };
-        if object
-            .get("call_id")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty)
-        {
-            continue;
-        }
         if current_id.starts_with(expected_prefix) {
             continue;
         }
@@ -14899,21 +15579,48 @@ fn normalize_native_codex_tool_item_id_prefixes(request: &mut Value) -> usize {
                 .strip_prefix(prefix)
                 .map(|suffix| (*prefix, suffix))
         }) else {
+            // IDs from other Responses extensions are opaque. Do not invent a
+            // replacement merely because an item happens to be a tool type.
             continue;
         };
+        if object
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err("a known tool-id prefix mismatch has no call_id");
+        }
         if suffix.is_empty() {
-            continue;
+            return Err("a known tool-id prefix mismatch has an empty identifier suffix");
         }
         let repaired_id = format!("{expected_prefix}{suffix}");
         if (existing_ids.contains(&repaired_id) && repaired_id != current_id)
             || !planned_ids.insert(repaired_id.clone())
         {
-            continue;
+            return Err("a tool-id namespace repair would collide with another root item");
         }
-        object.insert("id".to_string(), Value::String(repaired_id));
-        repaired += 1;
+        replacements.push((index, repaired_id));
     }
-    repaired
+
+    if replacements.is_empty() {
+        return Ok(0);
+    }
+    if existing_ids.len() != item_ids.len() {
+        return Err("duplicate root item ids make tool-id namespace repair ambiguous");
+    }
+    for (index, repaired_id) in replacements {
+        let Some(object) = items.get_mut(index).and_then(Value::as_object_mut) else {
+            return Err("a planned custom-tool item disappeared before final wire validation");
+        };
+        object.insert("id".to_string(), Value::String(repaired_id));
+    }
+    Ok(planned_ids.len())
+}
+
+fn native_codex_item_id_has_known_wrong_prefix(id: &str) -> bool {
+    ["fc_", "fco_", "ctc_", "ctco_"]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
 }
 
 fn native_codex_item_has_unsafe_tool_link(item: &Value) -> bool {
@@ -19141,7 +19848,13 @@ mod tests {
         },
         state::AppState,
     };
-    use axum::http::HeaderValue;
+    use axum::{
+        body::Body,
+        http::{HeaderValue, StatusCode as AxumStatusCode},
+        response::Response as AxumResponse,
+        routing::get,
+        Router,
+    };
     use serde_json::json;
     use std::{
         fs,
@@ -19171,6 +19884,83 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn chunked_body_limit_test_response(content_type: &'static str) -> AxumResponse {
+        let stream =
+            futures_util::stream::iter([Ok::<Bytes, Infallible>(Bytes::from_static(b"abcd"))]);
+        AxumResponse::builder()
+            .status(AxumStatusCode::OK)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    async fn buffered_body_limit_test_server() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route(
+                "/plain",
+                get(|| async { chunked_body_limit_test_response("application/json") }),
+            )
+            .route(
+                "/sse",
+                get(|| async { chunked_body_limit_test_response("text/event-stream") }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn buffered_upstream_body_limits_reject_plain_and_sse_overflow() {
+        let (base_url, server) = buffered_body_limit_test_server().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let plain = client
+            .get(format!("{base_url}/plain"))
+            .send()
+            .await
+            .unwrap();
+        assert!(plain.content_length().is_none());
+        let plain_error =
+            match read_upstream_body_with_limit(plain, "application/json", Instant::now(), 0, 3)
+                .await
+            {
+                Ok(_) => panic!("plain response over the limit must be rejected"),
+                Err(error) => error,
+            };
+        assert!(plain_error.to_string().contains("non-SSE"));
+        assert!(plain_error.to_string().contains("3 bytes"));
+
+        let sse = client.get(format!("{base_url}/sse")).send().await.unwrap();
+        assert!(sse.content_length().is_none());
+        let sse_error =
+            match read_upstream_body_with_limit(sse, "text/event-stream", Instant::now(), 0, 3)
+                .await
+            {
+                Ok(_) => panic!("SSE response over the limit must be rejected"),
+                Err(error) => error,
+            };
+        assert!(sse_error.to_string().contains("SSE"));
+        assert!(sse_error.to_string().contains("3 bytes"));
+
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[test]
+    fn buffered_upstream_body_limit_selects_sse_headroom_case_insensitively() {
+        assert_eq!(
+            upstream_body_limit("application/json"),
+            MAX_UPSTREAM_BUFFERED_BODY_BYTES
+        );
+        assert_eq!(
+            upstream_body_limit("Text/Event-Stream; charset=utf-8"),
+            MAX_UPSTREAM_BUFFERED_SSE_BODY_BYTES
+        );
     }
 
     #[test]
@@ -22715,19 +23505,21 @@ mod tests {
 
         let mut namespace_repair = json!({
             "input": [
-                {"type": "custom_tool_call", "id": "fc_interrupted", "call_id": "call-interrupted", "name": "shell", "input": "dir"},
+                // Regression fixture from the observed Codex wire failure:
+                // a custom tool item must not leave with an `fc_` root id.
+                {"type": "custom_tool_call", "id": "fc_03382b171062822d016a89bf19d3d887d285e16eb952ecfa7c", "call_id": "call-interrupted", "name": "shell", "input": "dir"},
                 {"type": "custom_tool_call_output", "id": "fco_interrupted", "call_id": "call-interrupted", "output": "done"}
             ]
         });
         assert_eq!(
             normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair),
-            2
+            Ok(2)
         );
         assert_eq!(
             namespace_repair
                 .pointer("/input/0/id")
                 .and_then(Value::as_str),
-            Some("ctc_interrupted")
+            Some("ctc_03382b171062822d016a89bf19d3d887d285e16eb952ecfa7c")
         );
         assert_eq!(
             namespace_repair
@@ -22746,7 +23538,7 @@ mod tests {
         });
         assert_eq!(
             normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_noop),
-            0
+            Ok(0)
         );
         assert_eq!(
             namespace_repair_noop
@@ -22769,8 +23561,8 @@ mod tests {
         });
         assert_eq!(
             normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_collision),
-            0,
-            "a namespace repair must fail open when its target id already exists"
+            Err("a tool-id namespace repair would collide with another root item"),
+            "a namespace repair must reject a known mismatch when its target id already exists"
         );
         assert_eq!(
             namespace_repair_collision
@@ -22786,8 +23578,8 @@ mod tests {
         });
         assert_eq!(
             normalize_native_codex_tool_item_id_prefixes(&mut namespace_repair_unsafe),
-            0,
-            "nested tool links must keep the original opaque id"
+            Err("a custom-tool item has an unsafe nested tool reference"),
+            "nested tool links must reject an unsafe known namespace mismatch"
         );
         assert_eq!(
             namespace_repair_unsafe
@@ -24309,6 +25101,18 @@ mod tests {
         inbound.insert(header::HOST, HeaderValue::from_static("127.0.0.1:18883"));
         inbound.insert(header::CONTENT_LENGTH, HeaderValue::from_static("123"));
         inbound.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        inbound.insert(header::COOKIE, HeaderValue::from_static("session=local"));
+        inbound.insert("cookie2", HeaderValue::from_static("$Version=1"));
+        inbound.insert(header::SET_COOKIE, HeaderValue::from_static("ignored=true"));
+        inbound.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:18883"),
+        );
+        inbound.insert(
+            header::REFERER,
+            HeaderValue::from_static("http://127.0.0.1:18883/"),
+        );
+        inbound.insert("x-real-ip", HeaderValue::from_static("127.0.0.1"));
         inbound.insert("x-request-id", HeaderValue::from_static("local-request"));
         inbound.insert("traceparent", HeaderValue::from_static("00-local-trace"));
         inbound.insert(
@@ -24379,6 +25183,12 @@ mod tests {
             header::HOST.as_str(),
             header::CONTENT_LENGTH.as_str(),
             header::CONNECTION.as_str(),
+            header::COOKIE.as_str(),
+            "cookie2",
+            header::SET_COOKIE.as_str(),
+            header::ORIGIN.as_str(),
+            header::REFERER.as_str(),
+            "x-real-ip",
             "x-request-id",
             "traceparent",
             X_CODEX_TURN_METADATA_HEADER,
@@ -28019,7 +28829,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_model_list_has_a_consistent_fallback_when_the_provider_catalog_is_empty() {
+    fn agent_model_list_keeps_the_explicit_configured_model_when_catalog_is_empty() {
         let provider = ProviderConfig {
             id: "empty-catalog".to_string(),
             name: "empty-catalog".to_string(),
@@ -28042,16 +28852,36 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].get("id").and_then(Value::as_str), Some("gpt-5.2"));
         assert_eq!(
-            items[0].get("atoapi_fallback").and_then(Value::as_bool),
+            items[0]
+                .get("atoapi_configured_agent_model")
+                .and_then(Value::as_bool),
             Some(true)
         );
     }
 
     #[tokio::test]
-    async fn scoped_agent_model_list_is_non_empty_without_an_upstream_model_fetch() {
+    async fn scoped_agent_model_list_keeps_local_models_when_codex_discovery_fails() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let upstream_hits = upstream_hits_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
         let mut config = AppConfig::default();
         config.local_key = "local-test-key".to_string();
-        let mut provider = test_responses_provider("http://127.0.0.1:9/v1".to_string());
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
         provider.id = "empty-catalog".to_string();
         provider.models.clear();
         config.providers = vec![provider];
@@ -28106,12 +28936,210 @@ mod tests {
                 .expect("model response should include data");
             assert!(models.iter().any(|model| {
                 model.get("id").and_then(Value::as_str) == Some(expected_model)
-                    && model.get("atoapi_fallback").and_then(Value::as_bool) == Some(true)
+                    && model
+                        .get("atoapi_configured_agent_model")
+                        .and_then(Value::as_bool)
+                        == Some(true)
             }));
         }
 
+        assert_eq!(
+            upstream_hits.load(Ordering::SeqCst),
+            1,
+            "only the explicit Codex route should attempt dynamic model discovery"
+        );
         server.abort();
+        upstream_server.abort();
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_model_discovery_prefers_the_provider_models_url_override() {
+        let mut provider = test_responses_provider("https://provider.example/v1".to_string());
+        provider.models_url = Some("https://catalog.example/models".to_string());
+
+        assert_eq!(
+            codex_model_discovery_endpoints(&provider).unwrap(),
+            vec!["https://catalog.example/models".to_string()]
+        );
+
+        provider.models_url = None;
+        assert_eq!(
+            codex_model_discovery_endpoints(&provider).unwrap(),
+            vec!["https://provider.example/v1/models".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_model_list_merges_upstream_models_and_reuses_the_short_ttl_catalog() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let upstream_hits_for_route = upstream_hits.clone();
+        let authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let authorizations_for_route = authorizations.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let upstream_hits = upstream_hits_for_route.clone();
+                let authorizations = authorizations_for_route.clone();
+                async move {
+                    upstream_hits.fetch_add(1, Ordering::SeqCst);
+                    if let Some(value) = headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        authorizations.lock().await.push(value.to_string());
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "object": "list",
+                            "data": [
+                                {"id": "gpt-6-astra", "owned_by": "upstream"},
+                                {"id": "gpt-shared", "owned_by": "upstream"}
+                            ]
+                        })),
+                    )
+                }
+            }),
+        );
+        let upstream_server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "codex-dynamic-catalog".to_string();
+        provider.name = "Codex Dynamic Catalog".to_string();
+        provider.api_key_encrypted = Some("upstream-model-key".to_string());
+        provider.models = vec![
+            ModelConfig {
+                id: "gpt-shared".to_string(),
+                request_model_id: None,
+                display_name: "Configured Shared".to_string(),
+                context_window: Some(128_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            },
+            ModelConfig {
+                id: "gpt-configured-local".to_string(),
+                request_model_id: None,
+                display_name: "Configured Local".to_string(),
+                context_window: Some(128_000),
+                output_window: None,
+                reasoning_effort_override_enabled: false,
+                reasoning_effort: None,
+                supported_reasoning_efforts: Vec::new(),
+                supports_tools: true,
+                supports_streaming: true,
+                enabled: true,
+            },
+        ];
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "codex-dynamic-catalog");
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .model_id = Some("gpt-configured-agent".to_string());
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-dynamic-model-list-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                dir.join("config.toml"),
+                CacheStore::load(dir.join("cache.bin")).unwrap(),
+            )
+            .unwrap(),
+        );
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_server = tokio::spawn(async move {
+            axum::serve(proxy_listener, router(state)).await.unwrap();
+        });
+        let scoped_key = agent_injection::agent_local_key("local-test-key", "codex");
+        let client = reqwest::Client::new();
+
+        for _ in 0..2 {
+            let response = client
+                .get(format!("http://{proxy_addr}/codex/v1/models"))
+                .bearer_auth(&scoped_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.json::<Value>().await.unwrap();
+            let ids = body
+                .get("data")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(|model| model.get("id").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            assert!(ids.contains(&"gpt-6-astra"));
+            assert!(ids.contains(&"gpt-configured-local"));
+            assert!(ids.contains(&"gpt-configured-agent"));
+            assert_eq!(
+                ids.iter().filter(|id| **id == "gpt-shared").count(),
+                1,
+                "upstream and configured copies of the same model must merge"
+            );
+            assert!(!ids.contains(&"gpt-5.2"));
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            authorizations.lock().await.as_slice(),
+            ["Bearer upstream-model-key"],
+            "dynamic discovery must use the selected provider Key"
+        );
+
+        proxy_server.abort();
+        upstream_server.abort();
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_bound_provider_keeps_unknown_model_requests_transparent() {
+        let mut config = AppConfig::default();
+        let mut provider = test_responses_provider("https://provider.example/v1".to_string());
+        provider.id = "transparent-codex-provider".to_string();
+        provider.models = vec![ModelConfig {
+            id: "gpt-configured".to_string(),
+            request_model_id: None,
+            display_name: "Configured".to_string(),
+            context_window: Some(128_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, "transparent-codex-provider");
+
+        let decision = decide_route(
+            &config,
+            &json!({ "model": "gpt-6-astra", "input": "ping" }),
+            &Channel::Responses,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(decision.model, "gpt-6-astra");
     }
 
     #[test]
@@ -29447,6 +30475,14 @@ mod tests {
         assert!(upstream_body_has_error(
             br#"{"error":{"message":"provider failed"}}"#,
             "application/json"
+        ));
+        assert!(upstream_body_has_error(
+            br#"{"type":"response.completed","response":{"status":"failed","error":{"message":"provider failed"}}}"#,
+            "application/json"
+        ));
+        assert!(upstream_body_has_error(
+            b"event: response.completed\ndata: {\"response\":\n data: {\"status\":\"incomplete\"}}\n\n",
+            "Text/Event-Stream; charset=utf-8"
         ));
     }
 
@@ -46626,6 +47662,226 @@ data: {{"type":"response.completed","response":{{"id":"resp_regenerated_tools_{t
         assert!(outcome.diagnostics.sent_body_bytes < outcome.diagnostics.request_body_bytes);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn gzip_request_body_capabilities_fail_closed_and_stay_bounded() {
+        let supported = GzipRequestBodyCapabilityScope::for_test("supported");
+        let unsupported = GzipRequestBodyCapabilityScope::for_test("unsupported");
+        let unknown = GzipRequestBodyCapabilityScope::for_test("unknown");
+        let mut capabilities = GzipRequestBodyCapabilityStore::default();
+
+        assert!(!capabilities.supports(&unknown));
+        assert!(capabilities.allows_attempt(&unknown));
+        capabilities.record(supported.clone(), GzipRequestBodyCapability::Supported);
+        assert!(capabilities.supports(&supported));
+        assert!(capabilities.allows_attempt(&supported));
+        capabilities.record(unsupported.clone(), GzipRequestBodyCapability::Unsupported);
+        assert!(!capabilities.supports(&unsupported));
+        assert!(!capabilities.allows_attempt(&unsupported));
+
+        for index in 0..=GZIP_REQUEST_BODY_CAPABILITY_LIMIT {
+            capabilities.record(
+                GzipRequestBodyCapabilityScope::for_test(&format!("scope-{index}")),
+                GzipRequestBodyCapability::Supported,
+            );
+        }
+        assert_eq!(
+            capabilities.len(),
+            GZIP_REQUEST_BODY_CAPABILITY_LIMIT,
+            "the process-only gzip registry must not grow without bound"
+        );
+        assert!(gzip_request_body_rejection_message(
+            br#"{"error":{"message":"Failed to parse request body"}}"#
+        ));
+        assert!(gzip_request_body_rejection_message(
+            br#"{"message":"Content-Encoding gzip is not supported"}"#
+        ));
+        assert!(!gzip_request_body_rejection_message(
+            br#"{"error":{"message":"invalid model"}}"#
+        ));
+
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-gzip-capability-state-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            AppConfig::default(),
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let lifecycle_scope = GzipRequestBodyCapabilityScope::for_test("lifecycle");
+        assert!(gzip_request_body_enabled_for_scope(
+            &state,
+            true,
+            &lifecycle_scope
+        ));
+        record_gzip_request_body_success(&state, &lifecycle_scope, true, StatusCode::OK.as_u16());
+        assert!(gzip_request_body_enabled_for_scope(
+            &state,
+            true,
+            &lifecycle_scope
+        ));
+        assert!(!gzip_request_body_enabled_for_scope(
+            &state,
+            false,
+            &lifecycle_scope
+        ));
+        record_gzip_request_body_rejection(
+            &state,
+            &lifecycle_scope,
+            true,
+            br#"{"error":{"message":"Failed to parse request body"}}"#,
+        );
+        assert!(!gzip_request_body_enabled_for_scope(
+            &state,
+            true,
+            &lifecycle_scope
+        ));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn gzip_rejection_marks_only_the_next_independent_request_raw_without_retry() {
+        let encodings = Arc::new(tokio::sync::Mutex::new(Vec::<bool>::new()));
+        let encodings_for_route = encodings.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |headers: HeaderMap| {
+                let encodings = encodings_for_route.clone();
+                async move {
+                    let gzip = headers
+                        .get(header::CONTENT_ENCODING)
+                        .and_then(|value| value.to_str().ok())
+                        == Some("gzip");
+                    encodings.lock().await.push(gzip);
+                    if gzip {
+                        raw_response(
+                            StatusCode::BAD_REQUEST.as_u16(),
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "error": { "message": "Failed to parse request body" }
+                            }))
+                            .unwrap(),
+                        )
+                    } else {
+                        raw_response(
+                            StatusCode::OK.as_u16(),
+                            "application/json",
+                            serde_json::to_vec(&json!({
+                                "id": "resp-gzip-raw",
+                                "object": "response",
+                                "status": "completed",
+                                "output": [],
+                                "usage": { "input_tokens": 1, "output_tokens": 1 }
+                            }))
+                            .unwrap(),
+                        )
+                    }
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "gzip-capability-workspace".to_string();
+        config.active_provider_id = Some("gzip-capability-provider".to_string());
+        config.default_channel = Channel::Responses;
+        config.cache.enabled = false;
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = "gzip-capability-provider".to_string();
+        provider.request_body_gzip_enabled = true;
+        provider.api_key_encrypted = Some("upstream-key".to_string());
+        provider.models = vec![ModelConfig {
+            id: "gzip-test-model".to_string(),
+            request_model_id: None,
+            display_name: "gzip-test-model".to_string(),
+            context_window: None,
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+        let scope = GzipRequestBodyCapabilityScope::derive(
+            &config,
+            &provider,
+            &Channel::Responses,
+            &SelectedProviderKey {
+                secret: "upstream-key".to_string(),
+                key_id: None,
+                encrypted_material_digest: None,
+            },
+        );
+        config.providers = vec![provider];
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-gzip-capability-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+
+        let request = || {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gzip-test-model",
+                    "stream": false,
+                    "temperature": 0,
+                    "input": [{
+                        "type": "message",
+                        "role": "user",
+                        "content": "x".repeat(300_000)
+                    }]
+                }))
+                .unwrap(),
+            )
+        };
+
+        let first = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !gzip_request_body_enabled_for_scope(&state, true, &scope),
+            "a clear gzip parser rejection must disable gzip only for this local scope"
+        );
+
+        let second = handle_generation(
+            state.clone(),
+            test_local_auth_headers(),
+            request(),
+            Channel::Responses,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_eq!(
+            encodings.lock().await.as_slice(),
+            [true, false],
+            "one rejected gzip POST must not be retried; the next inbound is raw JSON"
+        );
+        assert!(state.config.read().await.providers[0].request_body_gzip_enabled);
+
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        fs::remove_dir_all(config_dir).ok();
     }
 
     #[tokio::test]

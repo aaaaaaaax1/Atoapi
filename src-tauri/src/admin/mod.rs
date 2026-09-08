@@ -346,6 +346,16 @@ pub struct ModelInput {
     pub model: ModelConfig,
 }
 
+/// Complete provider-editor submission. Keeping the provider and its model
+/// catalog in one command lets the backend validate and persist the snapshot
+/// atomically, so a failed model update cannot leave a half-saved provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfigSaveInput {
+    pub provider: ProviderInput,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
+}
+
 #[tauri::command]
 pub async fn get_config(state: State<'_, Arc<AppState>>) -> CommandResult<PublicConfig> {
     Ok(state.public_config().await)
@@ -819,6 +829,89 @@ fn provider_clone_matches_source(provider_id: &str, source_id: &str, agent_id: &
         || provider_id
             .strip_prefix(&format!("{base}-"))
             .is_some_and(|suffix| suffix.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn normalize_model_config(mut model: ModelConfig) -> anyhow::Result<ModelConfig> {
+    model.id = model.id.trim().to_string();
+    if model.id.is_empty() {
+        anyhow::bail!("model id cannot be empty");
+    }
+    model.request_model_id =
+        clean_optional_string(model.request_model_id).filter(|alias| alias != &model.id);
+    model.display_name = model.display_name.trim().to_string();
+    if model.display_name.is_empty() {
+        model.display_name = model.id.clone();
+    }
+    model.reasoning_effort = model
+        .reasoning_effort
+        .as_deref()
+        .and_then(crate::config::normalize_reasoning_effort);
+    model.supported_reasoning_efforts =
+        crate::config::normalize_reasoning_efforts(&model.supported_reasoning_efforts);
+    if model.reasoning_effort_override_enabled && model.reasoning_effort.is_none() {
+        anyhow::bail!("reasoning effort override requires a valid effort");
+    }
+    Ok(model)
+}
+
+#[tauri::command]
+pub async fn save_provider_config(
+    state: State<'_, Arc<AppState>>,
+    mut input: ProviderConfigSaveInput,
+) -> CommandResult<PublicConfig> {
+    state
+        .commit_config_update(move |config| {
+            let mut next = config.clone();
+            let owner_agent_id = input
+                .provider
+                .owner_agent_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            prepare_agent_owned_provider_input(&mut next, &mut input.provider)?;
+            let provider_id = next.upsert_provider(input.provider.clone())?;
+            if let Some(agent_id) = owner_agent_id.as_deref() {
+                append_agent_provider_order(&mut next, agent_id, &provider_id);
+            }
+            if next.active_provider_id.is_none() {
+                next.active_provider_id = Some(provider_id.clone());
+            }
+
+            let old_models = next
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .map(|provider| provider.models.clone())
+                .ok_or_else(|| anyhow!("provider {provider_id} was not found after save"))?;
+            let mut seen = HashSet::with_capacity(input.models.len());
+            let mut models = Vec::with_capacity(input.models.len());
+            for raw_model in input.models {
+                let model = normalize_model_config(raw_model)?;
+                if !seen.insert(model.id.clone()) {
+                    anyhow::bail!("duplicate model id {}", model.id);
+                }
+                models.push(model);
+            }
+            for old_model in old_models {
+                if !seen.contains(&old_model.id) {
+                    next.clear_cache_capabilities_for_model(&provider_id, &old_model.id);
+                }
+            }
+            let provider = next
+                .providers
+                .iter_mut()
+                .find(|provider| provider.id == provider_id)
+                .ok_or_else(|| anyhow!("provider {provider_id} was not found after save"))?;
+            provider.models = models;
+            provider.updated_at = Utc::now();
+            next.updated_at = Utc::now();
+            refresh_enabled_injections_for_provider(&mut next, &provider_id)?;
+            Ok(next)
+        })
+        .await
+        .map_err(to_command_error)?;
+    Ok(state.public_config().await)
 }
 
 #[tauri::command]
@@ -5262,7 +5355,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshes_enabled_agent_injection_without_overriding_official_catalog() {
+    fn refresh_enabled_agent_injection_rejects_an_uncontrolled_target_path() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-agent-model-refresh-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -5294,14 +5387,12 @@ mod tests {
         codex.model_id = Some("vendor/gpt-custom".to_string());
         codex.target_path = Some(config_path.clone());
 
-        refresh_enabled_injections_for_provider(&mut config, "share").unwrap();
-        config.providers[0].models[0].context_window = Some(256_000);
-        refresh_enabled_injections_for_provider(&mut config, "share").unwrap();
+        let error = refresh_enabled_injections_for_provider(&mut config, "share").unwrap_err();
 
-        let parsed: toml::Value =
-            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert!(parsed.get("model_catalog_json").is_none());
-        assert_eq!(config.providers[0].models[0].context_window, Some(256_000));
+        assert!(error
+            .to_string()
+            .contains("outside its controlled directory"));
+        assert!(!config_path.exists());
         std::fs::remove_dir_all(dir).ok();
     }
 

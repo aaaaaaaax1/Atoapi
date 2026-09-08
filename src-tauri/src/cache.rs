@@ -911,20 +911,37 @@ pub fn semantic_text(request: &Value) -> Option<String> {
 }
 
 pub fn semantic_shape(request: &Value) -> Option<String> {
+    // A streamed response is a transport event sequence, not a stable
+    // response document. Never put it in the semantic index (or query that
+    // index); exact cache keys still retain their existing stream isolation.
+    if request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
     let mut parts = Vec::new();
     collect_shape(request, "$", &mut parts);
     if parts.is_empty() {
         None
     } else {
-        Some(parts.join("|"))
+        Some(format!(
+            "{}|output_contract:v1:{}",
+            parts.join("|"),
+            semantic_output_contract_discriminator(request)
+        ))
     }
 }
 
 pub fn is_cache_eligible(request: &Value) -> bool {
-    let temperature = request
-        .get("temperature")
-        .and_then(Value::as_f64)
-        .unwrap_or(0.0);
+    let Some(temperature) = request.get("temperature").and_then(Value::as_f64) else {
+        return false;
+    };
+    if !temperature.is_finite() {
+        return false;
+    }
     let has_no_store = request
         .get("metadata")
         .and_then(|metadata| metadata.get("cache"))
@@ -932,6 +949,61 @@ pub fn is_cache_eligible(request: &Value) -> bool {
         .map(|cache| cache.eq_ignore_ascii_case("no-store"))
         .unwrap_or(false);
     temperature <= 0.3 && !has_no_store
+}
+
+// These fields can change the response document while leaving the semantic
+// prompt shape unchanged. Keep the list explicit and version the digest so a
+// future expansion invalidates old semantic entries without touching exact
+// cache keys. Values are hashed rather than stored verbatim because response
+// format schemas and logit-bias maps can be large or contain user data.
+const SEMANTIC_OUTPUT_CONTRACT_FIELDS: &[&str] = &[
+    "stream",
+    "stream_options",
+    "response_format",
+    "text",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "top_k",
+    "n",
+    "stop",
+    "stop_sequences",
+    "presence_penalty",
+    "frequency_penalty",
+    "logit_bias",
+    "seed",
+    "logprobs",
+    "top_logprobs",
+    "reasoning",
+    "reasoning_effort",
+    "verbosity",
+    "modalities",
+    "audio",
+    "include",
+    "prediction",
+    "truncation",
+    "thinking",
+    "output_config",
+    "tool_choice",
+    "parallel_tool_calls",
+    "tools",
+];
+
+fn semantic_output_contract_discriminator(request: &Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"atoapi-semantic-output-contract-v1\0");
+    for field in SEMANTIC_OUTPUT_CONTRACT_FIELDS {
+        hasher.update(field.as_bytes());
+        hasher.update(b"=");
+        match request.get(*field) {
+            Some(value) => hasher.update(canonical_json(value).as_bytes()),
+            None => hasher.update(b"<missing>"),
+        }
+        hasher.update(b"\0");
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 #[allow(dead_code)]
@@ -1866,6 +1938,33 @@ mod tests {
     }
 
     #[test]
+    fn cache_eligibility_requires_explicit_finite_numeric_temperature() {
+        assert!(!is_cache_eligible(&json!({
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+        assert!(!is_cache_eligible(&json!({
+            "temperature": null,
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+        assert!(!is_cache_eligible(&json!({
+            "temperature": "0",
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+        assert!(!is_cache_eligible(&json!({
+            "temperature": true,
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+        assert!(is_cache_eligible(&json!({
+            "temperature": 0.3,
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+        assert!(!is_cache_eligible(&json!({
+            "temperature": 0.300_001,
+            "messages": [{ "role": "user", "content": "stable prompt" }]
+        })));
+    }
+
+    #[test]
     fn dynamic_or_code_context_requests_can_use_exact_but_not_fuzzy_cache() {
         let latest = json!({
             "temperature": 0,
@@ -1909,6 +2008,74 @@ mod tests {
         let different = json!({ "messages": [{ "role": "assistant", "content": "hello" }] });
         assert_eq!(semantic_shape(&left), semantic_shape(&right));
         assert_ne!(semantic_shape(&left), semantic_shape(&different));
+    }
+
+    #[test]
+    fn semantic_shape_separates_output_contract_values() {
+        let base = json!({
+            "temperature": 0,
+            "max_output_tokens": 128,
+            "response_format": { "type": "text" },
+            "stream_options": { "include_usage": false },
+            "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+        });
+        let changed_prompt = json!({
+            "temperature": 0,
+            "max_output_tokens": 128,
+            "response_format": { "type": "text" },
+            "stream_options": { "include_usage": false },
+            "messages": [{ "role": "user", "content": "a different semantic prompt with enough words" }]
+        });
+        assert_eq!(semantic_shape(&base), semantic_shape(&changed_prompt));
+
+        for changed in [
+            json!({
+                "temperature": 0.2,
+                "max_output_tokens": 128,
+                "response_format": { "type": "text" },
+                "stream_options": { "include_usage": false },
+                "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+            }),
+            json!({
+                "temperature": 0,
+                "max_output_tokens": 256,
+                "response_format": { "type": "text" },
+                "stream_options": { "include_usage": false },
+                "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+            }),
+            json!({
+                "temperature": 0,
+                "max_output_tokens": 128,
+                "response_format": { "type": "json_object" },
+                "stream_options": { "include_usage": false },
+                "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+            }),
+            json!({
+                "temperature": 0,
+                "max_output_tokens": 128,
+                "response_format": { "type": "text" },
+                "stream_options": { "include_usage": true },
+                "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+            }),
+        ] {
+            assert_ne!(
+                semantic_shape(&base),
+                semantic_shape(&changed),
+                "output contract changes must not share a semantic scope"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_shape_is_disabled_for_streaming_requests() {
+        let mut streaming = json!({
+            "temperature": 0,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "a stable semantic prompt with enough words" }]
+        });
+        assert!(semantic_shape(&streaming).is_none());
+        streaming["stream"] = json!(false);
+        assert!(semantic_shape(&streaming).is_some());
     }
 
     #[test]

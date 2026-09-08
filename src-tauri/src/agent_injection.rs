@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs,
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 use toml_edit::{value, DocumentMut};
 use uuid::Uuid;
@@ -96,6 +96,22 @@ struct CodexRestoreState {
     /// on every later injection refresh.
     #[serde(default)]
     managed_root_fields: Vec<String>,
+    /// Encrypted ownership manifest for catalogs created by Atoapi. A file
+    /// name alone is never enough evidence to remove a Codex catalog.
+    #[serde(default)]
+    catalog_manifest: CodexCatalogManifest,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CodexCatalogManifest {
+    #[serde(default)]
+    entries: Vec<CodexCatalogManifestEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CodexCatalogManifestEntry {
+    path: PathBuf,
+    sha256: String,
 }
 
 pub fn ensure_defaults(config: &mut AppConfig) {
@@ -325,18 +341,235 @@ fn ensure_agent_route_is_ready(config: &AppConfig, item: &AgentInjectionConfig) 
     Ok(())
 }
 
+/// Return the exact file(s) that an Agent integration is allowed to touch.
+/// `target_path` is persisted user data, so it must never be treated as an
+/// arbitrary filesystem destination. Keeping this list here also makes a
+/// future integration change explicit and reviewable.
+fn allowed_target_paths(kind: &AgentInjectionKind) -> Result<Vec<PathBuf>> {
+    match kind {
+        AgentInjectionKind::ClaudeCode => {
+            Ok(vec![home_dir().join(".claude").join("settings.json")])
+        }
+        AgentInjectionKind::Codex => Ok(vec![home_dir().join(".codex").join("config.toml")]),
+        AgentInjectionKind::ClaudeDesktop => {
+            let paths = claude_desktop_paths();
+            Ok(vec![
+                paths.normal_config_path,
+                paths.threep_config_path,
+                paths.profile_path,
+                paths.meta_path,
+            ])
+        }
+        AgentInjectionKind::OpenCode => Ok(vec![opencode_config_path()]),
+        AgentInjectionKind::OpenClaw => Ok(vec![openclaw_config_path()]),
+        AgentInjectionKind::Hermes => Ok(vec![hermes_config_path()]),
+        AgentInjectionKind::ProxyMode => Ok(vec![app_config_dir()
+            .unwrap_or_else(|_| home_dir().join(".atoapi"))
+            .join("atoapi-proxy-mode.json")]),
+        AgentInjectionKind::Gemini | AgentInjectionKind::Unknown => {
+            Err(anyhow!("unsupported Agent injection target kind: {kind:?}"))
+        }
+    }
+}
+
+fn default_target_path(kind: &AgentInjectionKind) -> Result<PathBuf> {
+    let paths = allowed_target_paths(kind)?;
+    match kind {
+        // The profile path is the artifact reported by the Claude Desktop
+        // adapter, although that adapter updates all four controlled files.
+        AgentInjectionKind::ClaudeDesktop => paths
+            .iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == format!("{CLAUDE_DESKTOP_PROFILE_ID}.json"))
+            })
+            .cloned()
+            .ok_or_else(|| anyhow!("Claude Desktop profile target is unavailable")),
+        _ => paths
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("Agent injection target is unavailable")),
+    }
+}
+
+fn resolve_injection_target(item: &AgentInjectionConfig) -> Result<PathBuf> {
+    let allowed = allowed_target_paths(&item.kind)?;
+    let default = default_target_path(&item.kind)?;
+    let requested = item.target_path.as_deref().unwrap_or(&default);
+    validate_target_against_allowed(&item.label, requested, &allowed)
+}
+
+fn validate_claude_desktop_targets(item: &AgentInjectionConfig) -> Result<ClaudeDesktopPaths> {
+    let paths = claude_desktop_paths();
+    let allowed = vec![
+        paths.normal_config_path.clone(),
+        paths.threep_config_path.clone(),
+        paths.profile_path.clone(),
+        paths.meta_path.clone(),
+    ];
+    if let Some(requested) = item.target_path.as_deref() {
+        // Validate the persisted value even though the Desktop adapter has
+        // several coordinated files and therefore does not use it directly.
+        validate_target_against_allowed(&item.label, requested, &allowed)?;
+    }
+    for target in &allowed {
+        validate_target_against_allowed(&item.label, target, &allowed)?;
+    }
+    Ok(paths)
+}
+
+fn validate_target_against_allowed(
+    label: &str,
+    candidate: &Path,
+    allowed: &[PathBuf],
+) -> Result<PathBuf> {
+    let candidate = absolute_lexical_path(candidate)?;
+    for expected in allowed {
+        let expected = absolute_lexical_path(expected)?;
+        if same_filesystem_path(&candidate, &expected) {
+            let root = expected
+                .parent()
+                .ok_or_else(|| anyhow!("{label} target has no parent directory"))?;
+            validate_controlled_file_path(&candidate, root)?;
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "{label} target_path is outside its controlled directory: {}",
+        candidate.display()
+    ))
+}
+
+/// Validate a file that must be a direct child of a controlled directory.
+/// Existing and newly-created paths are both checked for symlink/reparse-point
+/// components before any read, backup, write, restore, or delete operation.
+fn validate_controlled_file_path(path: &Path, root: &Path) -> Result<()> {
+    let path = absolute_lexical_path(path)?;
+    let root = absolute_lexical_path(root)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("controlled target has no parent directory"))?;
+    if !same_filesystem_path(parent, &root) {
+        return Err(anyhow!(
+            "target {} is not directly inside controlled directory {}",
+            path.display(),
+            root.display()
+        ));
+    }
+    ensure_no_symlink_components(&path)?;
+
+    // Canonicalize the existing root and parent as an additional boundary
+    // check. The symlink walk above also covers a target that does not exist
+    // yet, while this catches junctions/reparse points resolved by the OS.
+    if root.exists() {
+        let canonical_root = fs::canonicalize(&root).with_context(|| {
+            format!(
+                "failed to canonicalize controlled directory {}",
+                root.display()
+            )
+        })?;
+        let canonical_parent = fs::canonicalize(parent).with_context(|| {
+            format!(
+                "failed to canonicalize target directory {}",
+                parent.display()
+            )
+        })?;
+        if !same_filesystem_path(&canonical_root, &canonical_parent) {
+            return Err(anyhow!(
+                "target {} resolves outside controlled directory {}",
+                path.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
+    let input = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut output = PathBuf::new();
+    for component in input.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !output.pop() {
+                    return Err(anyhow!(
+                        "path escapes its filesystem root: {}",
+                        path.display()
+                    ));
+                }
+            }
+            Component::Prefix(prefix) => output.push(prefix.as_os_str()),
+            Component::RootDir | Component::Normal(_) => output.push(component.as_os_str()),
+        }
+    }
+    Ok(output)
+}
+
+fn ensure_no_symlink_components(path: &Path) -> Result<()> {
+    let absolute = absolute_lexical_path(path)?;
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(anyhow!(
+                    "refusing to use symlink target component {}",
+                    current.display()
+                ));
+            }
+            #[cfg(windows)]
+            Ok(metadata)
+                if {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                } =>
+            {
+                return Err(anyhow!(
+                    "refusing to use reparse-point target component {}",
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect target component {}", current.display())
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn same_filesystem_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
 fn remove_item(item: &AgentInjectionConfig) -> Result<Option<PathBuf>> {
     match item.kind {
         AgentInjectionKind::Codex => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+            let target = resolve_injection_target(item)?;
             remove_codex_config_injection(&target)?;
             Ok(Some(target))
         }
         AgentInjectionKind::ClaudeDesktop => {
-            let paths = claude_desktop_paths();
+            let paths = validate_claude_desktop_targets(item)?;
+            let reported_target = paths.profile_path.clone();
             for target in [
                 paths.normal_config_path,
                 paths.threep_config_path,
@@ -345,43 +578,30 @@ fn remove_item(item: &AgentInjectionConfig) -> Result<Option<PathBuf>> {
             ] {
                 restore_injection_backup(&target)?;
             }
-            Ok(item.target_path.clone())
+            Ok(Some(reported_target))
         }
         AgentInjectionKind::ClaudeCode => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(|| home_dir().join(".claude").join("settings.json"));
+            let target = resolve_injection_target(item)?;
             restore_injection_backup(&target)?;
             Ok(Some(target))
         }
         AgentInjectionKind::OpenCode => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(opencode_config_path);
+            let target = resolve_injection_target(item)?;
             restore_injection_backup(&target)?;
             Ok(Some(target))
         }
         AgentInjectionKind::OpenClaw => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(openclaw_config_path);
+            let target = resolve_injection_target(item)?;
             restore_injection_backup(&target)?;
             Ok(Some(target))
         }
         AgentInjectionKind::Hermes => {
-            let target = item.target_path.clone().unwrap_or_else(hermes_config_path);
+            let target = resolve_injection_target(item)?;
             restore_injection_backup(&target)?;
             Ok(Some(target))
         }
         AgentInjectionKind::ProxyMode => {
-            let target = item.target_path.clone().unwrap_or_else(|| {
-                app_config_dir()
-                    .unwrap_or_else(|_| home_dir().join(".atoapi"))
-                    .join("atoapi-proxy-mode.json")
-            });
+            let target = resolve_injection_target(item)?;
             restore_injection_backup(&target)?;
             Ok(Some(target))
         }
@@ -402,13 +622,23 @@ fn remove_codex_config_injection(path: &Path) -> Result<()> {
         .parse::<DocumentMut>()
         .map_err(|error| anyhow!("Codex config.toml parse error: {error}"))?;
     let managed_provider = codex_document_has_atoapi_provider(&doc);
-    let managed_catalog_path = managed_codex_catalog_path(&doc, path);
+    let restore_path = codex_restore_state_path(path)?;
+    let loaded_restore_state = match load_codex_restore_state(&restore_path, path) {
+        Ok(state) => state,
+        // A catalog-only cleanup needs an intact encrypted ownership record.
+        // If it is absent or corrupt, leave the user's configuration and
+        // files alone rather than treating a historical filename as proof.
+        Err(_) if !managed_provider => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let managed_catalog_path = loaded_restore_state
+        .as_ref()
+        .and_then(|state| managed_codex_catalog_path(&doc, path, &state.catalog_manifest));
     let managed_catalog = managed_catalog_path.is_some();
     if !managed_provider && !managed_catalog {
         return Ok(());
     }
-    let restore_path = codex_restore_state_path(path)?;
-    let restore_state = match load_codex_restore_state(&restore_path, path)? {
+    let mut restore_state = match loaded_restore_state {
         Some(state) => state,
         None => {
             let legacy_fragment = capture_codex_legacy_managed_fragment(&doc);
@@ -417,13 +647,9 @@ fn remove_codex_config_injection(path: &Path) -> Result<()> {
     };
     let fragment = parse_codex_restore_fragment(&restore_state)?;
     restore_codex_root_fields(&mut doc, &fragment, &CODEX_MANAGED_ROOT_FIELDS);
-    drop_managed_codex_catalog_field(&mut doc, path);
     restore_codex_custom_provider(&mut doc, &fragment);
     write_text(path, &doc.to_string())?;
-    if let Some(catalog_path) = managed_catalog_path {
-        fs::remove_file(catalog_path).ok();
-    }
-    cleanup_all_codex_catalogs(path);
+    cleanup_owned_codex_catalogs_except(path, &mut restore_state.catalog_manifest, None);
     fs::remove_file(restore_path).ok();
     Ok(())
 }
@@ -445,9 +671,13 @@ fn codex_document_has_atoapi_provider(doc: &DocumentMut) -> bool {
         })
 }
 
-fn managed_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<PathBuf> {
+fn managed_codex_catalog_path(
+    doc: &DocumentMut,
+    config_path: &Path,
+    manifest: &CodexCatalogManifest,
+) -> Option<PathBuf> {
     let path = configured_codex_catalog_path(doc, config_path)?;
-    is_managed_codex_catalog_path(&path).then_some(path)
+    catalog_manifest_owns(manifest, config_path, &path).then_some(path)
 }
 
 fn configured_codex_catalog_path(doc: &DocumentMut, config_path: &Path) -> Option<PathBuf> {
@@ -477,6 +707,77 @@ fn is_managed_codex_catalog_path(path: &Path) -> bool {
             file == CODEX_MODEL_CATALOG_LEGACY_FILE
                 || (file.starts_with(CODEX_MODEL_CATALOG_FILE_PREFIX) && file.ends_with(".json"))
         })
+}
+
+/// A catalog may be deleted only when it is registered in the encrypted
+/// restore state and still has the exact content Atoapi recorded.  Older
+/// filename-only catalogs are intentionally retained: users may have created
+/// a file with the same historical name themselves.
+fn catalog_manifest_owns(
+    manifest: &CodexCatalogManifest,
+    config_path: &Path,
+    candidate: &Path,
+) -> bool {
+    let Ok(candidate) = validate_codex_catalog_path(config_path, candidate) else {
+        return false;
+    };
+    let Ok(current_hash) = sha256_file(&candidate) else {
+        return false;
+    };
+    manifest.entries.iter().any(|entry| {
+        let Ok(recorded_path) = validate_codex_catalog_path(config_path, &entry.path) else {
+            return false;
+        };
+        same_filesystem_path(&candidate, &recorded_path) && entry.sha256 == current_hash
+    })
+}
+
+fn validate_codex_catalog_path(config_path: &Path, path: &Path) -> Result<PathBuf> {
+    let config_path = absolute_lexical_path(config_path)?;
+    let root = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("Codex config target has no parent directory"))?;
+    let path = absolute_lexical_path(path)?;
+    if !is_managed_codex_catalog_path(&path) {
+        return Err(anyhow!(
+            "catalog {} does not use an Atoapi-owned catalog name",
+            path.display()
+        ));
+    }
+    validate_controlled_file_path(&path, root)?;
+    Ok(path)
+}
+
+#[cfg(test)]
+fn register_owned_codex_catalog(
+    manifest: &mut CodexCatalogManifest,
+    config_path: &Path,
+    catalog_path: &Path,
+) -> Result<()> {
+    let catalog_path = validate_codex_catalog_path(config_path, catalog_path)?;
+    let sha256 = sha256_file(&catalog_path).with_context(|| {
+        format!(
+            "failed to fingerprint Atoapi Codex catalog {}",
+            catalog_path.display()
+        )
+    })?;
+    manifest.entries.retain(|entry| {
+        validate_codex_catalog_path(config_path, &entry.path)
+            .map(|path| !same_filesystem_path(&path, &catalog_path))
+            .unwrap_or(false)
+    });
+    manifest.entries.push(CodexCatalogManifestEntry {
+        path: catalog_path,
+        sha256,
+    });
+    Ok(())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(not(test))]
@@ -566,6 +867,7 @@ fn capture_codex_restore_state(
             .iter()
             .map(|field| (*field).to_string())
             .collect(),
+        catalog_manifest: CodexCatalogManifest::default(),
     };
     save_codex_restore_state(state_path, &state)?;
     Ok(state)
@@ -633,14 +935,6 @@ fn restore_codex_root_fields(doc: &mut DocumentMut, fragment: &DocumentMut, fiel
         if let Some(original) = fragment.as_table().get(field) {
             doc.as_table_mut().insert(field, original.clone());
         }
-    }
-}
-
-fn drop_managed_codex_catalog_field(doc: &mut DocumentMut, config_path: &Path) {
-    if configured_codex_catalog_path(doc, config_path)
-        .is_some_and(|path| is_managed_codex_catalog_path(&path))
-    {
-        doc.as_table_mut().remove("model_catalog_json");
     }
 }
 
@@ -717,10 +1011,7 @@ fn apply_item(
     let mut changed = true;
     let (target_path, backup_path, status) = match item.kind {
         AgentInjectionKind::ClaudeCode => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(|| home_dir().join(".claude").join("settings.json"));
+            let target = resolve_injection_target(item)?;
             let backup = backup_file(&target)?;
             if let Err(error) = write_claude_code_settings(&target, context) {
                 discard_injection_backup(&target).ok();
@@ -733,10 +1024,7 @@ fn apply_item(
             )
         }
         AgentInjectionKind::Codex => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+            let target = resolve_injection_target(item)?;
             changed = write_codex_config(&target, context)?;
             (
                 Some(target),
@@ -745,7 +1033,7 @@ fn apply_item(
             )
         }
         AgentInjectionKind::ClaudeDesktop => {
-            let paths = claude_desktop_paths();
+            let paths = validate_claude_desktop_targets(item)?;
             let targets = [
                 &paths.normal_config_path,
                 &paths.threep_config_path,
@@ -784,10 +1072,7 @@ fn apply_item(
             ));
         }
         AgentInjectionKind::OpenCode => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(opencode_config_path);
+            let target = resolve_injection_target(item)?;
             let backup = backup_file(&target)?;
             if let Err(error) = write_opencode_config(&target, context) {
                 discard_injection_backup(&target).ok();
@@ -800,10 +1085,7 @@ fn apply_item(
             )
         }
         AgentInjectionKind::OpenClaw => {
-            let target = item
-                .target_path
-                .clone()
-                .unwrap_or_else(openclaw_config_path);
+            let target = resolve_injection_target(item)?;
             let backup = backup_file(&target)?;
             if let Err(error) = write_openclaw_config(&target, context) {
                 discard_injection_backup(&target).ok();
@@ -816,7 +1098,7 @@ fn apply_item(
             )
         }
         AgentInjectionKind::Hermes => {
-            let target = item.target_path.clone().unwrap_or_else(hermes_config_path);
+            let target = resolve_injection_target(item)?;
             let backup = backup_file(&target)?;
             if let Err(error) = write_hermes_config(&target, context) {
                 discard_injection_backup(&target).ok();
@@ -829,11 +1111,7 @@ fn apply_item(
             )
         }
         AgentInjectionKind::ProxyMode => {
-            let target = item.target_path.clone().unwrap_or_else(|| {
-                app_config_dir()
-                    .unwrap_or_else(|_| home_dir().join(".atoapi"))
-                    .join("atoapi-proxy-mode.json")
-            });
+            let target = resolve_injection_target(item)?;
             let backup = backup_file(&target)?;
             if let Err(error) = write_proxy_mode_profile(&target, context) {
                 discard_injection_backup(&target).ok();
@@ -994,10 +1272,7 @@ pub(crate) fn codex_runtime_model_bindings(config: &AppConfig) -> HashMap<String
 }
 
 fn configured_codex_primary_model(item: &AgentInjectionConfig) -> Option<String> {
-    let target = item
-        .target_path
-        .clone()
-        .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+    let target = resolve_injection_target(item).ok()?;
     let text = fs::read_to_string(target).ok()?;
     let document = text.parse::<DocumentMut>().ok()?;
     document
@@ -1088,18 +1363,22 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         .as_ref()
         .map(parse_codex_restore_fragment)
         .transpose()?;
+    let current_catalog_is_owned = restore_state.as_ref().is_some_and(|state| {
+        configured_codex_catalog_path(&doc, path)
+            .is_some_and(|catalog| catalog_manifest_owns(&state.catalog_manifest, path, &catalog))
+    });
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     doc["disable_response_storage"] = value(true);
     // model_catalog_json is an optional Codex-owned override. Do not replace
     // it with an Atoapi snapshot, otherwise every new official model requires
-    // an Atoapi catalog update. Restore the user's original value, or remove
-    // the field so Codex can use its current built-in catalog.
+    // an Atoapi catalog update. Restore a value that was explicitly captured
+    // from the user. If an older injection has no ownership record, preserve
+    // the live value rather than guessing from its filename.
     if let Some(fragment) = restore_fragment.as_ref() {
-        restore_codex_root_fields(&mut doc, fragment, &["model_catalog_json"]);
-    } else {
-        doc.as_table_mut().remove("model_catalog_json");
+        if current_catalog_is_owned || fragment.as_table().contains_key("model_catalog_json") {
+            restore_codex_root_fields(&mut doc, fragment, &["model_catalog_json"]);
+        }
     }
-    drop_managed_codex_catalog_field(&mut doc, path);
     if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
         doc["model_auto_compact_token_limit"] = value(i64::from(limit));
         // Count only the content that has accumulated after the compacted
@@ -1163,23 +1442,13 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     if let Err(error) = write_text(path, &rendered) {
         return Err(error);
     }
-    cleanup_all_codex_catalogs(path);
-    Ok(true)
-}
-
-fn cleanup_all_codex_catalogs(config_path: &Path) {
-    let Some(parent) = config_path.parent() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let candidate = entry.path();
-        if is_managed_codex_catalog_path(&candidate) {
-            fs::remove_file(candidate).ok();
+    if let Some(state) = restore_state.as_mut() {
+        let keep = managed_codex_catalog_path(&doc, path, &state.catalog_manifest);
+        if cleanup_owned_codex_catalogs_except(path, &mut state.catalog_manifest, keep.as_deref()) {
+            save_codex_restore_state(&restore_path, state)?;
         }
     }
+    Ok(true)
 }
 
 /// Removes only Atoapi-owned Codex artifacts that are no longer referenced by
@@ -1196,17 +1465,21 @@ pub fn cleanup_stale_codex_artifacts(config: &AppConfig) {
     else {
         return;
     };
-    let target = codex
-        .target_path
-        .clone()
-        .unwrap_or_else(|| home_dir().join(".codex").join("config.toml"));
+    let Ok(target) = resolve_injection_target(codex) else {
+        return;
+    };
     let _ = cleanup_stale_codex_artifacts_for_target(&target);
 }
 
 fn cleanup_stale_codex_artifacts_for_target(config_path: &Path) -> Result<()> {
     let restore_path = codex_restore_state_path(config_path)?;
+    let Some(mut restore_state) = load_codex_restore_state(&restore_path, config_path)? else {
+        // Without an encrypted ownership manifest, filename-shaped files are
+        // user-owned by default and must not be removed.
+        return Ok(());
+    };
     if !config_path.exists() {
-        cleanup_codex_catalogs_except(config_path, None);
+        cleanup_owned_codex_catalogs_except(config_path, &mut restore_state.catalog_manifest, None);
         fs::remove_file(restore_path).ok();
         return Ok(());
     }
@@ -1214,36 +1487,70 @@ fn cleanup_stale_codex_artifacts_for_target(config_path: &Path) -> Result<()> {
     let text = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     if text.trim().is_empty() {
-        cleanup_codex_catalogs_except(config_path, None);
+        cleanup_owned_codex_catalogs_except(config_path, &mut restore_state.catalog_manifest, None);
         fs::remove_file(restore_path).ok();
         return Ok(());
     }
     let doc = text
         .parse::<DocumentMut>()
         .map_err(|error| anyhow!("Codex config.toml parse error: {error}"))?;
-    let active_catalog = managed_codex_catalog_path(&doc, config_path);
+    let active_catalog =
+        managed_codex_catalog_path(&doc, config_path, &restore_state.catalog_manifest);
     let managed_injection = codex_document_has_atoapi_provider(&doc) || active_catalog.is_some();
 
-    cleanup_codex_catalogs_except(config_path, active_catalog.as_deref());
+    let manifest_changed = cleanup_owned_codex_catalogs_except(
+        config_path,
+        &mut restore_state.catalog_manifest,
+        active_catalog.as_deref(),
+    );
     if !managed_injection {
         fs::remove_file(restore_path).ok();
+    } else if manifest_changed {
+        save_codex_restore_state(&restore_path, &restore_state)?;
     }
     Ok(())
 }
 
-fn cleanup_codex_catalogs_except(config_path: &Path, keep: Option<&Path>) {
-    let Some(parent) = config_path.parent() else {
-        return;
-    };
-    let Ok(entries) = fs::read_dir(parent) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let candidate = entry.path();
-        if keep != Some(candidate.as_path()) && is_managed_codex_catalog_path(&candidate) {
-            fs::remove_file(candidate).ok();
+fn cleanup_owned_codex_catalogs_except(
+    config_path: &Path,
+    manifest: &mut CodexCatalogManifest,
+    keep: Option<&Path>,
+) -> bool {
+    let keep = keep.and_then(|path| validate_codex_catalog_path(config_path, path).ok());
+    let mut changed = false;
+    let mut retained = Vec::with_capacity(manifest.entries.len());
+
+    for entry in std::mem::take(&mut manifest.entries) {
+        let Ok(path) = validate_codex_catalog_path(config_path, &entry.path) else {
+            // The manifest may be stale or tampered. Drop its record but never
+            // use it as authority to delete a path outside the Codex root.
+            changed = true;
+            continue;
+        };
+        if keep
+            .as_deref()
+            .is_some_and(|keep_path| same_filesystem_path(keep_path, &path))
+        {
+            retained.push(entry);
+            continue;
+        }
+        let hash_matches = sha256_file(&path)
+            .map(|hash| hash == entry.sha256)
+            .unwrap_or(false);
+        if !hash_matches {
+            // Do not remove a file that has changed since Atoapi created it.
+            // It may have become user-owned content under a historical name.
+            changed = true;
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => changed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => changed = true,
+            Err(_) => retained.push(entry),
         }
     }
+    manifest.entries = retained;
+    changed
 }
 
 fn write_opencode_config(path: &Path, context: &InjectionContext) -> Result<()> {
@@ -1865,6 +2172,16 @@ mod tests {
     use super::*;
     use crate::config::ProviderConfig;
 
+    #[cfg(windows)]
+    fn create_test_directory_link(link: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[cfg(unix)]
+    fn create_test_directory_link(link: &Path, target: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
     #[test]
     fn local_base_url_formats_ipv6_and_wildcards_for_clients() {
         assert_eq!(local_base_url("::1", 18_883), "http://[::1]:18883");
@@ -1877,6 +2194,95 @@ mod tests {
             local_base_url("127.0.0.1", 18_883),
             "http://127.0.0.1:18883"
         );
+    }
+
+    #[test]
+    fn controlled_target_rejects_a_persisted_path_outside_its_agent_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-injection-target-boundary-{}",
+            Uuid::new_v4().simple()
+        ));
+        let allowed = dir.join(".codex").join("config.toml");
+        let outside = dir.join("outside").join("config.toml");
+        fs::create_dir_all(allowed.parent().unwrap()).unwrap();
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+
+        let error = validate_target_against_allowed("Codex", &outside, &[allowed]).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("outside its controlled directory"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn remove_item_rejects_an_uncontrolled_persisted_target_before_accessing_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-injection-remove-boundary-{}",
+            Uuid::new_v4().simple()
+        ));
+        let target = dir.join("config.toml");
+        let item = AgentInjectionConfig {
+            id: "codex".to_string(),
+            label: "Codex".to_string(),
+            kind: AgentInjectionKind::Codex,
+            enabled: true,
+            provider_id: None,
+            model_id: None,
+            target_path: Some(target.clone()),
+            last_injected_at: None,
+            last_status: None,
+            local_key: None,
+            hidden_provider_ids: Vec::new(),
+        };
+
+        let error = remove_item(&item).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("outside its controlled directory"));
+        assert!(!target.exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn controlled_target_rejects_symlinked_agent_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-injection-target-symlink-{}",
+            Uuid::new_v4().simple()
+        ));
+        let target = dir.join("real-codex");
+        let link = dir.join(".codex");
+        fs::create_dir_all(&target).unwrap();
+
+        // Windows can deny symlink creation when Developer Mode / the
+        // privilege is unavailable. The production check is still exercised
+        // on environments where the OS permits creating a test link.
+        if create_test_directory_link(&link, &target).is_ok() {
+            let error =
+                validate_controlled_file_path(&link.join("config.toml"), &link).unwrap_err();
+            assert!(error.to_string().contains("symlink") || error.to_string().contains("reparse"));
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn catalog_manifest_refuses_catalogs_outside_the_codex_root() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-catalog-root-boundary-{}",
+            Uuid::new_v4().simple()
+        ));
+        let config = dir.join("codex").join("config.toml");
+        let external = dir.join("external").join("atoapi-model-catalog-user.json");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::create_dir_all(external.parent().unwrap()).unwrap();
+        write_text(&external, "{\"owner\":\"user\"}\n").unwrap();
+
+        let mut manifest = CodexCatalogManifest::default();
+        assert!(register_owned_codex_catalog(&mut manifest, &config, &external).is_err());
+        assert!(external.exists());
+        assert!(manifest.entries.is_empty());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -2006,7 +2412,7 @@ command = "npx"
     }
 
     #[test]
-    fn codex_injection_drops_legacy_atoapi_catalog_from_restore_state() {
+    fn codex_injection_preserves_unverified_legacy_catalog_from_restore_state() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-codex-legacy-catalog-upgrade-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2044,8 +2450,13 @@ base_url = "http://127.0.0.1:18883/codex/v1"
 
         write_codex_config(&path, &context).unwrap();
         let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(parsed.get("model_catalog_json").is_none());
-        assert!(!legacy_catalog.exists());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some("atoapi-model-catalog.json")
+        );
+        assert!(legacy_catalog.exists());
         fs::remove_dir_all(dir).ok();
     }
 
@@ -2059,17 +2470,12 @@ base_url = "http://127.0.0.1:18883/codex/v1"
         let active_catalog = dir.join("atoapi-model-catalog-active.json");
         let stale_catalog = dir.join("atoapi-model-catalog.json");
         let stale_unique_catalog = dir.join("atoapi-model-catalog-old.json");
-        let mut app_config = AppConfig::default();
-        app_config
-            .agent_injections
-            .iter_mut()
-            .find(|agent| agent.id == "codex")
-            .unwrap()
-            .target_path = Some(path.clone());
+        let user_named_catalog = dir.join("atoapi-model-catalog-user-owned.json");
         fs::create_dir_all(&dir).unwrap();
         write_text(&active_catalog, "{}\n").unwrap();
         write_text(&stale_catalog, "{}\n").unwrap();
         write_text(&stale_unique_catalog, "{}\n").unwrap();
+        write_text(&user_named_catalog, "{\"owner\":\"user\"}\n").unwrap();
 
         let mut doc = DocumentMut::new();
         doc["model_provider"] = value(CODEX_PROVIDER_ID);
@@ -2085,20 +2491,46 @@ base_url = "http://127.0.0.1:18883/codex/v1"
 
         let restore_path = codex_restore_state_path(&path).unwrap();
         capture_codex_restore_state(&restore_path, &path, true, &doc).unwrap();
-        cleanup_stale_codex_artifacts(&app_config);
+        let mut restore_state = load_codex_restore_state(&restore_path, &path)
+            .unwrap()
+            .expect("restore state must exist");
+        register_owned_codex_catalog(&mut restore_state.catalog_manifest, &path, &active_catalog)
+            .unwrap();
+        register_owned_codex_catalog(&mut restore_state.catalog_manifest, &path, &stale_catalog)
+            .unwrap();
+        register_owned_codex_catalog(
+            &mut restore_state.catalog_manifest,
+            &path,
+            &stale_unique_catalog,
+        )
+        .unwrap();
+        save_codex_restore_state(&restore_path, &restore_state).unwrap();
+        cleanup_stale_codex_artifacts_for_target(&path).unwrap();
 
         assert!(active_catalog.exists());
         assert!(!stale_catalog.exists());
         assert!(!stale_unique_catalog.exists());
+        assert!(user_named_catalog.exists());
         assert!(restore_path.exists());
 
         let later_stale_catalog = dir.join("atoapi-model-catalog-later.json");
         write_text(&later_stale_catalog, "{}\n").unwrap();
+        let mut restore_state = load_codex_restore_state(&restore_path, &path)
+            .unwrap()
+            .expect("restore state must remain present");
+        register_owned_codex_catalog(
+            &mut restore_state.catalog_manifest,
+            &path,
+            &later_stale_catalog,
+        )
+        .unwrap();
+        save_codex_restore_state(&restore_path, &restore_state).unwrap();
         write_text(&path, "model_provider = \"native\"\n").unwrap();
-        cleanup_stale_codex_artifacts(&app_config);
+        cleanup_stale_codex_artifacts_for_target(&path).unwrap();
 
         assert!(!active_catalog.exists());
         assert!(!later_stale_catalog.exists());
+        assert!(user_named_catalog.exists());
         assert!(!restore_path.exists());
         fs::remove_dir_all(dir).ok();
     }
@@ -2312,6 +2744,7 @@ wire_api = "responses"
             target_existed: true,
             fragment_toml: "model = \"user-model\"\n".to_string(),
             managed_root_fields: Vec::new(),
+            catalog_manifest: CodexCatalogManifest::default(),
         };
         let restore_path = codex_restore_state_path(&path).unwrap();
         save_codex_restore_state(&restore_path, &legacy_state).unwrap();
@@ -2447,7 +2880,7 @@ command = "npx"
     }
 
     #[test]
-    fn non_codex_injection_disable_restores_the_original_file() {
+    fn injection_backup_restore_restores_the_original_file() {
         let dir = std::env::temp_dir().join(format!(
             "atoapi-agent-backup-{}",
             Utc::now().timestamp_nanos_opt().unwrap_or_default()
@@ -2460,24 +2893,11 @@ command = "npx"
         let original = "{\"provider\":\"native\"}\n";
         write_text(&path, original).unwrap();
 
-        let item = AgentInjectionConfig {
-            id: "opencode".to_string(),
-            label: "OpenCode".to_string(),
-            kind: AgentInjectionKind::OpenCode,
-            enabled: true,
-            provider_id: None,
-            model_id: None,
-            target_path: Some(path.clone()),
-            last_injected_at: None,
-            last_status: None,
-            local_key: None,
-            hidden_provider_ids: Vec::new(),
-        };
         let backup = backup_file(&path).unwrap().unwrap();
         write_text(&path, "{\"provider\":\"atoapi\"}\n").unwrap();
         assert_eq!(backup_file(&path).unwrap(), Some(backup.clone()));
 
-        remove_item(&item).unwrap();
+        restore_injection_backup(&path).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         fs::remove_file(backup).ok();

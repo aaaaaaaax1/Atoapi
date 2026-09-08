@@ -1,10 +1,11 @@
 {
   "name": "atoapi",
-  "version": "1.5.5",
+  "version": "1.5.6",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
+    "dev:preview": "set VITE_ATOAPI_MOCK=true&& vite --host 127.0.0.1",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1",
     "analyze:metrics": "node scripts/analyze-metrics.mjs",
