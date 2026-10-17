@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::config::{
     app_config_dir, codex_model_alias, model_request_alias, normalize_agent_injections,
-    AgentInjectionConfig, AgentInjectionKind, AppConfig, ModelConfig,
+    AgentInjectionConfig, AgentInjectionKind, AppConfig, CodexContextSettings, ModelConfig,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
@@ -75,6 +75,7 @@ struct InjectionContext {
     default_model_is_explicit: bool,
     model_context_window: Option<u32>,
     auto_compact_token_limit: Option<u32>,
+    codex_context_settings: Option<CodexContextSettings>,
     codex_models: Vec<ModelConfig>,
 }
 
@@ -647,6 +648,8 @@ fn remove_codex_config_injection(path: &Path) -> Result<()> {
     };
     let fragment = parse_codex_restore_fragment(&restore_state)?;
     restore_codex_root_fields(&mut doc, &fragment, &CODEX_MANAGED_ROOT_FIELDS);
+    // Retire the obsolete flag even if an older restore record captured it.
+    doc.as_table_mut().remove("disable_response_storage");
     restore_codex_custom_provider(&mut doc, &fragment);
     write_text(path, &doc.to_string())?;
     cleanup_owned_codex_catalogs_except(path, &mut restore_state.catalog_manifest, None);
@@ -1205,6 +1208,7 @@ impl InjectionContext {
             model_context_window: model_config.and_then(|model| model.context_window),
             auto_compact_token_limit: provider
                 .and_then(|provider| config.auto_compact_token_limit_for_provider(&provider.id)),
+            codex_context_settings: config.codex_context_settings.clone(),
             codex_models,
         }
     }
@@ -1322,6 +1326,9 @@ fn write_claude_code_settings(path: &Path, context: &InjectionContext) -> Result
 }
 
 fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
+    if let Some(settings) = context.codex_context_settings.as_ref() {
+        settings.validate()?;
+    }
     let target_existed = path.exists();
     let text = fs::read_to_string(path).unwrap_or_default();
     let mut doc = if text.trim().is_empty() {
@@ -1368,7 +1375,9 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
             .is_some_and(|catalog| catalog_manifest_owns(&state.catalog_manifest, path, &catalog))
     });
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
-    doc["disable_response_storage"] = value(true);
+    // New Codex versions reject this retired root key. Storage behavior is
+    // handled by the relay request path, not this ignored configuration flag.
+    doc.as_table_mut().remove("disable_response_storage");
     // model_catalog_json is an optional Codex-owned override. Do not replace
     // it with an Atoapi snapshot, otherwise every new official model requires
     // an Atoapi catalog update. Restore a value that was explicitly captured
@@ -1416,6 +1425,28 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         }
     } else if let Some(fragment) = restore_fragment.as_ref() {
         restore_codex_root_fields(&mut doc, fragment, &CODEX_MANAGED_MODEL_FIELDS);
+    }
+    // Explicit agent-wide limits apply independently of a selected model and
+    // survive route switches. Empty fields remove only the managed overrides;
+    // the pre-injection user values remain in the restore record for disable.
+    if let Some(settings) = context.codex_context_settings.as_ref() {
+        for (field, configured) in [
+            ("model_context_window", settings.model_context_window),
+            (
+                "model_auto_compact_token_limit",
+                settings.model_auto_compact_token_limit,
+            ),
+        ] {
+            doc.as_table_mut().remove(field);
+            if let Some(configured) = configured {
+                doc[field] = value(i64::from(configured));
+            }
+        }
+        doc.as_table_mut()
+            .remove("model_auto_compact_token_limit_scope");
+        if settings.model_auto_compact_token_limit.is_some() {
+            doc["model_auto_compact_token_limit_scope"] = value("body_after_prefix");
+        }
     }
 
     if !doc.as_table().contains_key("model_providers") {
@@ -2311,6 +2342,7 @@ command = "npx"
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: vec![ModelConfig {
                 id: "vendor/gpt-custom".to_string(),
                 request_model_id: Some("gpt-custom".to_string()),
@@ -2389,6 +2421,7 @@ command = "npx"
             default_model_is_explicit: false,
             model_context_window: None,
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         };
 
@@ -2445,6 +2478,7 @@ base_url = "http://127.0.0.1:18883/codex/v1"
             default_model_is_explicit: false,
             model_context_window: None,
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         };
 
@@ -2574,6 +2608,7 @@ command = "npx"
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         };
         write_codex_config(&path, &context).unwrap();
@@ -2623,12 +2658,7 @@ command = "npx"
                 .and_then(toml::Value::as_str),
             Some("native-models.json")
         );
-        assert_eq!(
-            parsed
-                .get("disable_response_storage")
-                .and_then(toml::Value::as_bool),
-            Some(false)
-        );
+        assert!(parsed.get("disable_response_storage").is_none());
         assert_eq!(
             parsed
                 .get("model_providers")
@@ -3070,6 +3100,7 @@ model_reasoning_effort = "max"
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         };
 
@@ -3434,6 +3465,7 @@ model_reasoning_effort = "max"
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         };
 
@@ -3560,6 +3592,127 @@ model_reasoning_effort = "max"
         assert!(!gemini.enabled);
     }
 
+    #[test]
+    fn codex_context_settings_apply_without_model_binding_and_clear_to_native_defaults() {
+        let dir =
+            std::env::temp_dir().join(format!("atoapi-codex-limits-{}", Uuid::new_v4().simple()));
+        let path = dir.join("config.toml");
+        write_text(
+            &path,
+            concat!(
+                "model = \"official-next-model\"\n",
+                "model_context_window = 900000\n",
+                "model_auto_compact_token_limit = 600000\n",
+                "model_auto_compact_token_limit_scope = \"total\"\n",
+                "disable_response_storage = true\n",
+                "[features.guardianv2]\nthread_context = true\n",
+                "[mcp_servers.local]\ncommand = \"local-executor\"\n",
+            ),
+        )
+        .unwrap();
+        let mut context = test_context();
+        context.default_model_is_explicit = false;
+        context.auto_compact_token_limit = Some(111_000);
+        context.codex_context_settings = Some(CodexContextSettings {
+            model_context_window: Some(872_000),
+            model_auto_compact_token_limit: Some(740_000),
+        });
+        assert!(write_codex_config(&path, &context).unwrap());
+        assert!(!write_codex_config(&path, &context).unwrap());
+        let first: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(first["model"].as_str(), Some("official-next-model"));
+        assert_eq!(first["model_context_window"].as_integer(), Some(872_000));
+        assert_eq!(
+            first["model_auto_compact_token_limit"].as_integer(),
+            Some(740_000)
+        );
+        assert!(first.get("disable_response_storage").is_none());
+        assert!(first.get("model_catalog_json").is_none());
+        assert_eq!(
+            first["features"]["guardianv2"]["thread_context"].as_bool(),
+            Some(true)
+        );
+
+        // Simulate a different upstream/model mapping during reinjection.
+        context.default_model_is_explicit = true;
+        context.model_context_window = Some(128_000);
+        context.auto_compact_token_limit = Some(90_000);
+        context.local_key = "ato-other-route".to_string();
+        write_codex_config(&path, &context).unwrap();
+        let routed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(routed["model_context_window"].as_integer(), Some(872_000));
+        assert_eq!(
+            routed["model_auto_compact_token_limit"].as_integer(),
+            Some(740_000)
+        );
+
+        for (window, limit) in [(Some(872_000), None), (None, Some(740_000)), (None, None)] {
+            context.codex_context_settings = Some(CodexContextSettings {
+                model_context_window: window,
+                model_auto_compact_token_limit: limit,
+            });
+            write_codex_config(&path, &context).unwrap();
+            let doc: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            assert_eq!(
+                doc.get("model_context_window")
+                    .and_then(toml::Value::as_integer),
+                window.map(i64::from)
+            );
+            assert_eq!(
+                doc.get("model_auto_compact_token_limit")
+                    .and_then(toml::Value::as_integer),
+                limit.map(i64::from)
+            );
+            assert_eq!(
+                doc.get("model_auto_compact_token_limit_scope")
+                    .and_then(toml::Value::as_str),
+                limit.map(|_| "body_after_prefix")
+            );
+            assert!(!write_codex_config(&path, &context).unwrap());
+        }
+        remove_codex_config_injection(&path).unwrap();
+        let restored: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(restored["model_context_window"].as_integer(), Some(900_000));
+        assert_eq!(
+            restored["model_auto_compact_token_limit"].as_integer(),
+            Some(600_000)
+        );
+        assert_eq!(
+            restored["model_auto_compact_token_limit_scope"].as_str(),
+            Some("total")
+        );
+        assert!(restored.get("disable_response_storage").is_none());
+        assert!(restored.get("mcp_servers").is_some());
+        write_codex_config(&path, &context).unwrap();
+        assert!(
+            toml::from_str::<toml::Value>(&fs::read_to_string(&path).unwrap())
+                .unwrap()
+                .get("disable_response_storage")
+                .is_none()
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_codex_context_settings_do_not_modify_artifacts() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-invalid-limits-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("config.toml");
+        let original = "model = \"native\"\n";
+        write_text(&path, original).unwrap();
+        let mut context = test_context();
+        context.codex_context_settings = Some(CodexContextSettings {
+            model_context_window: Some(100),
+            model_auto_compact_token_limit: Some(101),
+        });
+        assert!(write_codex_config(&path, &context).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!codex_restore_state_path(&path).unwrap().exists());
+        fs::remove_dir_all(dir).ok();
+    }
+
     fn test_context() -> InjectionContext {
         InjectionContext {
             anthropic_base_url: "http://127.0.0.1:18883".to_string(),
@@ -3571,6 +3724,7 @@ model_reasoning_effort = "max"
             default_model_is_explicit: true,
             model_context_window: Some(128_000),
             auto_compact_token_limit: None,
+            codex_context_settings: None,
             codex_models: Vec::new(),
         }
     }

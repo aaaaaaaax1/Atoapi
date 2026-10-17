@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -121,6 +121,10 @@ impl Channel {
     }
 }
 
+fn default_tool_diagnostics_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub host: String,
@@ -143,6 +147,13 @@ pub struct AppConfig {
     pub cache: CacheConfig,
     #[serde(default = "default_agent_injections")]
     pub agent_injections: Vec<AgentInjectionConfig>,
+    /// None preserves pre-1.5.7 routing settings. Once saved, each empty
+    /// field explicitly uses Codex defaults, without a hidden provider fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context_settings: Option<CodexContextSettings>,
+    /// Temporary local-only metadata diagnostics. Defaults on in 1.5.7.
+    #[serde(default = "default_tool_diagnostics_enabled")]
+    pub tool_diagnostics_enabled: bool,
     #[serde(default)]
     pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
     #[serde(default)]
@@ -1046,6 +1057,31 @@ pub(crate) fn encrypted_provider_key_material_digest(encrypted: &str) -> Option<
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexContextSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_auto_compact_token_limit: Option<u32>,
+}
+
+impl CodexContextSettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.model_context_window == Some(0) || self.model_auto_compact_token_limit == Some(0) {
+            bail!("上下文和自动压缩上限必须为正整数，留空使用 Codex 默认值");
+        }
+        if let (Some(window), Some(limit)) = (
+            self.model_context_window,
+            self.model_auto_compact_token_limit,
+        ) {
+            if limit > window {
+                bail!("自动压缩上限不能大于上下文窗口");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicConfig {
     pub host: String,
@@ -1062,6 +1098,8 @@ pub struct PublicConfig {
     pub route_profiles: Vec<RouteProfile>,
     pub cache: CacheConfig,
     pub agent_injections: Vec<AgentInjectionConfig>,
+    pub codex_context_settings: Option<CodexContextSettings>,
+    pub tool_diagnostics_enabled: bool,
     pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
     pub provider_key_pools: Vec<PublicProviderKeyPoolEntry>,
     pub updated_at: DateTime<Utc>,
@@ -1119,6 +1157,8 @@ impl Default for AppConfig {
             ],
             cache: CacheConfig::smart_max_hit(),
             agent_injections: default_agent_injections(),
+            codex_context_settings: None,
+            tool_diagnostics_enabled: true,
             agent_provider_orders: Vec::new(),
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
@@ -1389,6 +1429,9 @@ impl AppConfig {
 
     pub fn validate_listener_config(&self) -> Result<()> {
         self.validate_listener_auth()?;
+        if let Some(settings) = self.codex_context_settings.as_ref() {
+            settings.validate()?;
+        }
         if proxy_bind_conflicts(
             &self.host,
             self.port,
@@ -1829,6 +1872,8 @@ impl AppConfig {
                 })
                 .collect(),
             agent_provider_orders: self.agent_provider_orders.clone(),
+            codex_context_settings: self.codex_context_settings.clone(),
+            tool_diagnostics_enabled: self.tool_diagnostics_enabled,
             provider_key_pools: self
                 .provider_key_pools
                 .iter()
@@ -3317,6 +3362,58 @@ fn slugify(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_diagnostics_default_on_for_upgrades_and_explicit_off_survives_roundtrip() {
+        let mut config = AppConfig::default();
+        assert!(config.tool_diagnostics_enabled);
+        let mut encoded = toml::to_string(&config).unwrap();
+        encoded = encoded
+            .lines()
+            .filter(|line| !line.starts_with("tool_diagnostics_enabled ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let upgraded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert!(upgraded.tool_diagnostics_enabled);
+        config.tool_diagnostics_enabled = false;
+        let saved: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(!saved.tool_diagnostics_enabled);
+    }
+
+    #[test]
+    fn codex_context_settings_round_trip_distinguishes_legacy_from_explicit_defaults() {
+        let mut config = AppConfig::default();
+        let legacy: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert!(legacy.codex_context_settings.is_none());
+        for settings in [
+            CodexContextSettings::default(),
+            CodexContextSettings {
+                model_context_window: Some(872_000),
+                model_auto_compact_token_limit: Some(740_000),
+            },
+            CodexContextSettings {
+                model_context_window: None,
+                model_auto_compact_token_limit: Some(740_000),
+            },
+        ] {
+            settings.validate().unwrap();
+            config.codex_context_settings = Some(settings.clone());
+            let roundtrip: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(roundtrip.codex_context_settings, Some(settings));
+        }
+        assert!(CodexContextSettings {
+            model_context_window: Some(0),
+            model_auto_compact_token_limit: None
+        }
+        .validate()
+        .is_err());
+        assert!(CodexContextSettings {
+            model_context_window: Some(100),
+            model_auto_compact_token_limit: Some(101)
+        }
+        .validate()
+        .is_err());
+    }
 
     #[test]
     fn explicit_upstream_proxy_url_is_optional_and_strictly_validated() {

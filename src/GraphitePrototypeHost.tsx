@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isTauri } from "@tauri-apps/api/core";
 import { command } from "./lib/api";
 import type {
   AgentInjectionConfig,
@@ -85,7 +86,7 @@ const bridgeSource = String.raw`
     syncKeyPoolSecretInputs();
   };
   const pendingActions = new Map();
-  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "fetch-health-probe-models", "run-health-probe", "probe-provider-balance", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "restart-main-proxy", "clear-cache"]);
+  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "fetch-health-probe-models", "run-health-probe", "probe-provider-balance", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "save-codex-context", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
     const requestId = "graphite-" + Date.now() + "-" + Math.random().toString(16).slice(2);
     const source = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
@@ -1075,6 +1076,9 @@ const bridgeSource = String.raw`
     if (refreshPolicy) refreshPolicy.value = settings.refreshPolicy || "visible-1s";
     if (appVersion) appVersion.value = settings.appVersion || "—";
     setSwitch("开机自动启动代理", Boolean(settings.proxyAutoStart));
+    setSwitch("工具传递诊断", settings.toolDiagnosticsEnabled !== false);
+    const diagnosticPath = $bridge("#toolDiagnosticsPath");
+    if (diagnosticPath) diagnosticPath.textContent = "日志：" + (settings.toolDiagnosticsPath || "Atoapi 配置目录 / tool-diagnostics.jsonl") + "（当前及上一卷共约 8 MiB）";
     const data = $bridge("#settingsData");
     if (data) {
       const fingerprint = Array.from(data.querySelectorAll(".detail-row code"))[0];
@@ -1410,6 +1414,19 @@ const bridgeSource = String.raw`
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("button, [data-bind-provider], [data-edit-provider], [data-delete-provider]") : null;
     if (!target) return;
+    if (target.id === "codexContextButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      const settings = host.state?.codexContextSettings || {};
+      $bridge("#codexContextWindowInput").value = settings.contextWindow ?? "";
+      $bridge("#codexAutoCompactInput").value = settings.autoCompactLimit ?? "";
+      $bridge("#codexContextLegacyNote").hidden = settings.configured === true || (settings.contextWindow == null && settings.autoCompactLimit == null);
+      openOverlay("codexContextOverlay");
+      return;
+    }
+    if (target.id === "saveCodexContextButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      saveCodexContext(); return;
+    }
     if (target.id === "refreshButton") {
       event.preventDefault(); event.stopImmediatePropagation(); send("refresh"); return;
     }
@@ -1570,6 +1587,7 @@ const bridgeSource = String.raw`
       default_channel: ({ Auto: "responses", Responses: "responses", Chat: "chat", Anthropic: "anthropic" }[byFieldLabel(app, "默认通道", "select")?.value || ""] || "responses"),
       refresh_policy: $bridge("#settingsRefreshPolicy")?.value || "visible-1s",
       proxy_auto_start: $bridge('[aria-label="开机自动启动代理"]')?.getAttribute("aria-checked") === "true",
+      tool_diagnostics_enabled: $bridge('[aria-label="工具传递诊断"]')?.getAttribute("aria-checked") === "true",
       upstream_proxy_url: $bridge("#settingsUpstreamProxyUrlInput")?.value.trim() || ""
     };
   }
@@ -1748,9 +1766,22 @@ const bridgeSource = String.raw`
   };
 
   const originalRenderContext = renderContext;
+  function saveCodexContext() {
+    const button = $bridge("#saveCodexContextButton");
+    if (button.disabled) return;
+    button.focus();
+    send("save-codex-context", {
+      contextWindow: $bridge("#codexContextWindowInput").value.trim(),
+      autoCompactLimit: $bridge("#codexAutoCompactInput").value.trim()
+    });
+  }
+  $bridge("#codexContextForm").addEventListener("submit", (event) => {
+    event.preventDefault(); saveCodexContext();
+  });
   renderContext = function() {
     originalRenderContext();
     const agent = currentAgent();
+    $bridge("#codexContextButton").hidden = agent?.sourceId !== "codex";
     if (!agent) return;
     const endpointList = $bridge("#endpointList");
     if (!endpointList) return;
@@ -2539,6 +2570,8 @@ function buildState(
     hasLocalKey: Boolean(config?.local_key),
     defaultChannel: config?.default_channel ?? "responses",
     proxyAutoStart: config?.proxy_auto_start ?? false,
+    toolDiagnosticsEnabled: config?.tool_diagnostics_enabled ?? true,
+    toolDiagnosticsPath: config?.config_path?.replace(/[^\\/]+$/, "tool-diagnostics.jsonl") ?? "",
     upstreamProxyUrl: config?.upstream_proxy_url ?? "",
     refreshPolicy: metricsRefreshPolicy,
     workspaceFingerprint: config?.workspace_fingerprint ?? "",
@@ -2547,8 +2580,23 @@ function buildState(
     appVersion
   };
   const selectedProtoId = agents.find((agent) => agent.sourceId === selectedAgentId)?.id ?? agents[0]?.id ?? "codex";
+  const codexAgent = agentConfigs.find((agent) => agent.id === "codex");
+  const codexProvider = providers.find((provider) => provider.id === codexAgent?.provider_id);
+  const codexModel = codexAgent?.model_id
+    ? codexProvider?.models.find((model) => model.id === codexAgent.model_id || model.request_model_id === codexAgent.model_id)
+    : undefined;
+  const codexContextSettings = {
+    configured: config?.codex_context_settings != null,
+    contextWindow: config?.codex_context_settings != null
+      ? config.codex_context_settings.model_context_window ?? null
+      : codexModel?.context_window ?? null,
+    autoCompactLimit: config?.codex_context_settings != null
+      ? config.codex_context_settings.model_auto_compact_token_limit ?? null
+      : codexProvider?.auto_compact_token_limit ?? null
+  };
   return {
     agents,
+    codexContextSettings,
     providers: providerState,
     providerDetails,
     requests: requestItems,
@@ -2621,6 +2669,7 @@ export function GraphitePrototypeHost(props: GraphitePrototypeHostProps) {
   const requestsFingerprint = useMemo(() => JSON.stringify(state.requests), [state.requests]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     const appWindow = getCurrentWindow();
     const unlisten: Array<() => void> = [];
     let disposed = false;

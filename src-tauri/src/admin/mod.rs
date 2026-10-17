@@ -17,8 +17,8 @@ use crate::{
     codex_ui_patch,
     config::{
         normalize_upstream_proxy_url, AgentInjectionConfig, AppConfig, CacheConfig, Channel,
-        ModelConfig, ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
-        ProviderInput, PublicConfig,
+        CodexContextSettings, ModelConfig, ProviderCacheCapabilityProbeInput,
+        ProviderCacheCapabilityProbeResult, ProviderInput, PublicConfig,
     },
     metrics::MetricsSnapshot,
     metrics_history::{
@@ -69,6 +69,8 @@ pub struct GeneralConfigInput {
     pub port: u16,
     #[serde(default)]
     pub proxy_auto_start: Option<bool>,
+    #[serde(default)]
+    pub tool_diagnostics_enabled: Option<bool>,
     #[serde(default)]
     pub upstream_proxy_url: Option<String>,
     pub local_key: String,
@@ -407,6 +409,9 @@ pub async fn save_config(
             next.port = input.port;
             if let Some(proxy_auto_start) = input.proxy_auto_start {
                 next.proxy_auto_start = proxy_auto_start;
+            }
+            if let Some(enabled) = input.tool_diagnostics_enabled {
+                next.tool_diagnostics_enabled = enabled;
             }
             if let Some(upstream_proxy_url) = input.upstream_proxy_url {
                 next.upstream_proxy_url = normalize_upstream_proxy_url(Some(upstream_proxy_url))
@@ -3713,6 +3718,39 @@ fn restore_agent_injection_artifacts(
         agent_injection::set_enabled(&mut remove, agent_id, false)?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn save_codex_context_settings(
+    state: State<'_, Arc<AppState>>,
+    input: CodexContextSettings,
+) -> CommandResult<PublicConfig> {
+    input.validate().map_err(to_command_error)?;
+    let previous = state.config.read().await.clone();
+    let mut committed = previous.clone();
+    committed.codex_context_settings = Some(input);
+    let enabled = committed
+        .agent_injections
+        .iter()
+        .any(|item| item.id == "codex" && item.enabled);
+    if enabled {
+        agent_injection::apply_one_by_id(&mut committed, "codex").map_err(to_command_error)?;
+    }
+    committed.updated_at = Utc::now();
+    if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
+        if enabled {
+            let restore_error = restore_agent_injection_artifacts(&previous, &committed, "codex");
+            return Err(match restore_error {
+                Ok(()) => format!("配置保存失败，已恢复 Codex 注入文件：{commit_error}"),
+                Err(error) => {
+                    format!("配置保存失败，Codex 注入文件恢复也失败：{commit_error}; {error}")
+                }
+            });
+        }
+        return Err(to_command_error(commit_error));
+    }
+    // Saving limits must not enable injection, restart a proxy, or probe upstreams.
+    Ok(state.public_config().await)
 }
 
 #[tauri::command]

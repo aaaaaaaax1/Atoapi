@@ -234,10 +234,17 @@ export interface AppConfig {
     background_prewarm_enabled: boolean;
   };
   agent_injections: AgentInjectionConfig[];
+  codex_context_settings?: CodexContextSettings | null;
+  tool_diagnostics_enabled?: boolean;
   agent_provider_orders?: AgentProviderOrderConfig[];
   provider_key_pools?: Array<{ provider_id: string; pool: PublicProviderKeyPool }>;
   updated_at: string;
   config_path: string;
+}
+
+export interface CodexContextSettings {
+  model_context_window?: number | null;
+  model_auto_compact_token_limit?: number | null;
 }
 
 export interface AgentInjectionConfig {
@@ -902,6 +909,7 @@ export interface GeneralConfigInput {
   host: string;
   port: number;
   proxy_auto_start?: boolean;
+  tool_diagnostics_enabled?: boolean;
   upstream_proxy_url?: string;
   local_key: string;
   default_channel: Channel;
@@ -1102,6 +1110,14 @@ function fallback(name: string, args?: Record<string, unknown>) {
     return fallbackProviderKeySecrets.get(providerKeySecretId(providerId, keyId)) ?? null;
   }
   if (name === "get_agent_injections") return fallbackConfig.agent_injections;
+  if (name === "save_codex_context_settings") {
+    fallbackConfig = {
+      ...fallbackConfig,
+      codex_context_settings: { ...(args?.input as CodexContextSettings) },
+      updated_at: new Date().toISOString()
+    };
+    return fallbackConfig;
+  }
   if (name === "set_agent_injection_enabled") {
     const input = args?.input as { id: string; enabled: boolean } | undefined;
     if (!input) return [];
@@ -1657,6 +1673,7 @@ function fallback(name: string, args?: Record<string, unknown>) {
       host: input.host,
       port: input.port,
       proxy_auto_start: input.proxy_auto_start ?? fallbackConfig.proxy_auto_start,
+      tool_diagnostics_enabled: input.tool_diagnostics_enabled ?? fallbackConfig.tool_diagnostics_enabled ?? true,
       upstream_proxy_url:
         input.upstream_proxy_url === undefined
           ? fallbackConfig.upstream_proxy_url

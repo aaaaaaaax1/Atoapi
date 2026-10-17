@@ -27,9 +27,9 @@ use admin::{
     get_proxy_status, get_release_champion, probe_provider_balance,
     probe_provider_cache_capabilities, probe_provider_health, reload_config,
     reorder_agent_providers, reveal_provider_api_key, reveal_provider_key, save_cache_policy,
-    save_config, save_provider_config, save_proxy_mode_config, select_provider,
-    set_agent_injection_enabled, set_cache_validation_mode, start_proxy, stop_proxy,
-    test_active_provider_key, test_provider_connection_paths, test_provider_key,
+    save_codex_context_settings, save_config, save_provider_config, save_proxy_mode_config,
+    select_provider, set_agent_injection_enabled, set_cache_validation_mode, start_proxy,
+    stop_proxy, test_active_provider_key, test_provider_connection_paths, test_provider_key,
     test_provider_key_pool, update_agent_injection_route,
 };
 use config::{isolated_test_instance, isolated_test_listen_port, release_webview2_user_data_dir};
@@ -231,6 +231,7 @@ pub fn run() {
             save_cache_policy,
             get_agent_injections,
             set_agent_injection_enabled,
+            save_codex_context_settings,
             update_agent_injection_route,
             apply_agent_injection,
             apply_enabled_agent_injections,

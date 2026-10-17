@@ -6569,6 +6569,12 @@
     .release-champion-summary.is-regressed > b { color: #f0a17d; }
     .release-champion-summary.is-tied { border-left-color: #d4bb72; }
     .release-champion-summary.is-tied > b { color: #e2ca82; }
+    .codex-context-button { margin-left: auto; flex-shrink: 0; }
+    .codex-context-button[hidden], #codexContextLegacyNote[hidden] { display: none !important; }
+    .codex-context-drawer { width: min(520px, 100vw); }
+    .codex-context-drawer .drawer-body { display: grid; align-content: start; gap: 20px; }
+    .codex-context-note { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 0; }
+    .codex-context-drawer .field small { color: var(--muted); font-size: 11px; }
   </style>
 </head>
 <body>
@@ -6623,6 +6629,9 @@
             <h2>上游路由</h2>
             <p>当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。</p>
           </div>
+          <button class="secondary-button codex-context-button" id="codexContextButton" type="button" hidden>
+            <i class="icon" data-lucide="sliders-horizontal"></i><span>上下文和自动压缩上限</span>
+          </button>
           <div class="provider-tags">
             <span class="tag success" id="providerCountTag">3 个可用上游</span>
             <span class="tag">一次入站 · 一次上游</span>
@@ -6841,6 +6850,11 @@
         </section>
 
         <section class="panel" id="settingsData" hidden>
+          <div class="option-row">
+            <div><b>工具传递诊断（临时）</b><small>1.5.7 默认开启。本地限量保存工具名称、类型、选择限制和调用标识，不保存聊天、参数或返回正文。关闭后停止采集；可整体移除。</small></div>
+            <button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="工具传递诊断"></button>
+          </div>
+          <p class="codex-context-note" id="toolDiagnosticsPath">日志：Atoapi 配置目录 / tool-diagnostics.jsonl，滚动保留约 8 MiB。</p>
           <div class="status-band">
             <span class="status-icon"><i class="icon" data-lucide="database"></i></span>
             <div><b>本地状态正常</b><small>缓存 42.8 MB · 运行状态 286 KB</small></div>
@@ -6858,6 +6872,26 @@
         <button class="primary-button" type="button" data-save-settings>保存设置</button>
       </footer>
     </aside>
+  </div>
+
+  <div class="overlay" id="codexContextOverlay" aria-hidden="true">
+    <section class="drawer codex-context-drawer" role="dialog" aria-modal="true" aria-labelledby="codexContextTitle">
+      <header class="drawer-head">
+        <div><h2 id="codexContextTitle">上下文和自动压缩上限</h2><p>Codex · Token 数</p></div>
+        <button class="close-button" type="button" data-close="codexContextOverlay" aria-label="关闭上下文设置"><i class="icon" data-lucide="x"></i></button>
+      </header>
+      <form class="drawer-body" id="codexContextForm" novalidate>
+        <label class="field"><span>上下文窗口（Token）</span><input id="codexContextWindowInput" type="text" inputmode="numeric" autocomplete="off" placeholder="留空使用 Codex 默认值" /><small>model_context_window</small></label>
+        <label class="field"><span>自动压缩上限（Token）</span><input id="codexAutoCompactInput" type="text" inputmode="numeric" autocomplete="off" placeholder="留空使用 Codex 默认值" /><small>model_auto_compact_token_limit</small></label>
+        <p class="codex-context-note">填写正整数，不使用 K / M 单位。两项可以单独填写；自动压缩上限不能大于已填写的上下文窗口。设置不会提升上游模型的实际容量，请按上游支持的范围填写。</p>
+        <p class="codex-context-note">保存后优先于旧版上游配置，每次注入和切换上游都会沿用。留空会移除对应覆盖值，交由 Codex 默认处理。只修改本地配置，不会额外发送上游请求。</p>
+        <p class="codex-context-note" id="codexContextLegacyNote" hidden>当前显示旧版路由的有效设置；尚未保存时不会改变原来的阈值。</p>
+      </form>
+      <footer class="drawer-foot">
+        <button class="secondary-button" type="button" data-close="codexContextOverlay">取消</button>
+        <button class="primary-button" id="saveCodexContextButton" type="submit" form="codexContextForm">保存设置</button>
+      </footer>
+    </section>
   </div>
 
   <div class="overlay" id="providerOverlay" aria-hidden="true">
@@ -6926,7 +6960,7 @@
                 <div class="option-row"><div><b>大请求体 gzip</b><small>单次编码后发送</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="大请求体 gzip"></button></div>
                 <div class="option-row"><div><b>prompt_cache_retention</b><small>第三方支持时保留</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="prompt cache retention"></button></div>
                 <div class="option-row"><div><b>非 SSE compact 兼容</b><small>仅兼容需要的上游</small></div><button class="switch mock-switch" type="button" role="switch" aria-checked="false" aria-label="非 SSE compact 兼容"></button></div>
-                <label class="field"><span>Codex 自动压缩阈值（tokens）</span><input id="providerAutoCompactTokenLimit" type="number" min="1" step="1" inputmode="numeric" placeholder="留空：使用 Codex/模型默认" autocomplete="off" /><small>填写正数后，在使用此上游的 Codex 路由上提前触发 Codex 原生压缩；不会为同一条消息额外发送上游请求。</small></label>
+                <label class="field"><span>Codex 自动压缩阈值（tokens）</span><input id="providerAutoCompactTokenLimit" type="number" min="1" step="1" inputmode="numeric" placeholder="留空：使用 Codex/模型默认" autocomplete="off" /><small>旧版按上游设置；若已保存 Codex 页的“上下文和自动压缩上限”，以该页为准。不会为同一条消息额外发送上游请求。</small></label>
                 <label class="field"><span>自定义 User-Agent</span><input placeholder="留空：自动使用当前 Atoapi 版本" autocomplete="off" /></label>
               </div>
             </section>

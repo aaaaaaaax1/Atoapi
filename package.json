@@ -1,6 +1,6 @@
 {
   "name": "atoapi",
-  "version": "1.5.6",
+  "version": "1.5.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -16,6 +16,7 @@
     "test:secret-field-ui": "node scripts/test-graphite-secret-field-ui.mjs",
     "test:key-pool-ui": "node scripts/test-graphite-key-pool-ui.mjs",
     "test:provider-auto-compaction-ui": "node scripts/test-provider-auto-compaction-ui.mjs",
+    "test:codex-context-settings": "node scripts/test-codex-context-settings.mjs",
     "test:provider-connection-path-ui": "node scripts/test-provider-connection-path-ui.mjs",
     "test:provider-health-probe-ui": "node scripts/test-provider-health-probe-ui.mjs",
     "test:graphite-frame-protocol": "node scripts/test-graphite-frame-protocol.mjs",

@@ -86,6 +86,10 @@ mod streaming_codex_anthropic;
 mod streaming_codex_chat;
 mod streaming_responses_anthropic;
 mod streaming_responses_chat;
+// TOOL_DIAGNOSTICS: temporary, observe-only 1.5.7 module.
+pub(crate) mod tool_diagnostics;
+#[cfg(test)]
+mod tool_registry_tests;
 mod transform_codex_chat;
 mod transport;
 mod upstream_affinity;
@@ -2258,6 +2262,13 @@ async fn run_responses_compact_for_authorized_agent(
         Ok(value) => value,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("invalid JSON: {err}")),
     };
+    // TOOL_DIAGNOSTICS: before any compact/input/ID normalization.
+    let tool_diagnostics_enabled = state.config.read().await.tool_diagnostics_enabled;
+    if tool_diagnostics_enabled {
+        state
+            .tool_diagnostics
+            .ingress(&request_id, &Channel::Responses, &client_request);
+    }
     let trusted_codex_metadata = trusted_codex_request_metadata_for_request(
         &headers,
         &client_request,
@@ -2575,6 +2586,15 @@ async fn run_responses_compact_for_authorized_agent(
         ),
     );
     let mut compact_metric_errors = Vec::<(String, String)>::new();
+    if tool_diagnostics_enabled {
+        let plan = request_plan.as_ref().expect("fresh compact plan");
+        state.tool_diagnostics.egress(
+            &request_id,
+            &active_request_channel,
+            plan.wire().body(),
+            &active_upstream_body,
+        );
+    }
     let compact_prefix_guard_wait = PrefixGuardWaitDiagnostics::default();
     let compact_response_session_reuse = ResponseSessionReuseDiagnostics::default();
     let mut active_agent_attempt_id = None;
@@ -3007,6 +3027,17 @@ async fn run_responses_compact_for_authorized_agent(
         non_sse_compact_compat_for_decision(&config, &decision),
     );
     let response_ready_ms = started.elapsed().as_millis() as u64;
+    if tool_diagnostics_enabled {
+        state.tool_diagnostics.response(
+            &request_id,
+            "upstream_response",
+            &bytes,
+            is_text_event_stream(&content_type),
+        );
+        state
+            .tool_diagnostics
+            .response(&request_id, "downstream_response", &response_bytes, false);
+    }
     let response = raw_response(status, "application/json", response_bytes);
     let response_for_return = if let Some(handoff) = response_handoff {
         let _ = handoff.send(response);
@@ -3557,6 +3588,12 @@ async fn run_generation_for_authorized_agent(
         &client_request,
         authorized_agent.as_deref(),
     );
+    // TOOL_DIAGNOSTICS: before model, history, tool, or call-ID mutations.
+    if config.tool_diagnostics_enabled {
+        state
+            .tool_diagnostics
+            .ingress(&request_id, &client_channel, &client_request);
+    }
     let mut decision = match decide_route_with_runtime_model(
         &config,
         &client_request,
@@ -5172,6 +5209,15 @@ async fn run_generation_for_authorized_agent(
         .into_dispatch();
     let mut request_plan = Some(frozen_generation.take_one_shot_plan());
     let active_upstream_body = frozen_generation.body();
+    if config.tool_diagnostics_enabled {
+        let plan = request_plan.as_ref().expect("fresh generation plan");
+        state.tool_diagnostics.egress(
+            &request_id,
+            &active_request_channel,
+            plan.wire().body(),
+            active_upstream_body,
+        );
+    }
     // Coordination guards protect request preparation only.  Once the wire
     // request is frozen, release them before any upstream network await so a
     // slow response header cannot serialize the next turn for this prefix.
@@ -5818,6 +5864,20 @@ async fn run_generation_for_authorized_agent(
         };
     }
     let response_bytes = Bytes::from(response_bytes);
+    if config.tool_diagnostics_enabled {
+        state.tool_diagnostics.response(
+            &request_id,
+            "upstream_response",
+            &bytes,
+            is_text_event_stream(&content_type),
+        );
+        state.tool_diagnostics.response(
+            &request_id,
+            "downstream_response",
+            &response_bytes,
+            is_text_event_stream(&response_content_type),
+        );
+    }
     let owned_response_handoff = response_handoff.is_some();
     let mut client_completed_ms = None;
     let mut client_response = None;
@@ -17399,7 +17459,7 @@ fn responses_tool_choice_to_anthropic(
                 .get("name")
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty())
-                .map(|name| json!({ "type": "tool", "name": name })),
+                .map(|name| json!({ "type": "tool", "name": tool_context.chat_name_for_response_function(name, object.get("namespace").and_then(Value::as_str)) })),
             Some("tool_search") => Some(json!({
                 "type": "tool",
                 "name": transform_codex_chat::TOOL_SEARCH_PROXY_NAME
@@ -17445,7 +17505,9 @@ fn responses_to_anthropic_messages(
                 }
             }
             Some("custom_tool_call") => {
-                if let Some(block) = responses_custom_tool_call_to_anthropic_tool_use(item) {
+                if let Some(block) =
+                    responses_custom_tool_call_to_anthropic_tool_use(item, tool_context)
+                {
                     pending_tool_uses.push(block);
                 }
             }
@@ -17525,7 +17587,10 @@ fn responses_function_call_to_anthropic_tool_use(
     }))
 }
 
-fn responses_custom_tool_call_to_anthropic_tool_use(item: &Value) -> Option<Value> {
+fn responses_custom_tool_call_to_anthropic_tool_use(
+    item: &Value,
+    tool_context: &transform_codex_chat::CodexToolContext,
+) -> Option<Value> {
     let call_id = item
         .get("call_id")
         .or_else(|| item.get("id"))
@@ -17535,10 +17600,12 @@ fn responses_custom_tool_call_to_anthropic_tool_use(item: &Value) -> Option<Valu
     if name.is_empty() {
         return None;
     }
+    let chat_name = tool_context
+        .chat_name_for_response_function(name, item.get("namespace").and_then(Value::as_str));
     Some(json!({
         "type": "tool_use",
         "id": call_id,
-        "name": name,
+        "name": chat_name,
         "input": { "input": item.get("input").cloned().unwrap_or_else(|| json!("")) }
     }))
 }
@@ -32314,9 +32381,18 @@ mod tests {
         let upstream_hits_for_server = upstream_hits.clone();
         let upstream_app = Router::new().route(
             "/v1/responses",
-            post(move || {
+            post(move |body: Bytes| {
                 let upstream_hits = upstream_hits_for_server.clone();
                 async move {
+                    // Drain the complete upload before responding. An early
+                    // response with an unread multi-MiB body can race a socket
+                    // close on Windows and test transport aborts, not forwarding.
+                    let received: Value = serde_json::from_slice(&body).unwrap();
+                    let input = received["input"].as_array().unwrap();
+                    if input.len() > 1 {
+                        assert_eq!(input.len(), 513);
+                        assert!(input.last().unwrap()["output"].as_str().unwrap().ends_with("SENSITIVE_FULL_REPLAY_TOOL_OUTPUT_MUST_NEVER_LEAK"));
+                    }
                     upstream_hits.fetch_add(1, Ordering::SeqCst);
                     raw_response(
                         200,
@@ -32330,7 +32406,7 @@ mod tests {
                     )
                 }
             }),
-        );
+        ).layer(axum::extract::DefaultBodyLimit::disable());
         tokio::spawn(async move {
             axum::serve(upstream_listener, upstream_app).await.unwrap();
         });

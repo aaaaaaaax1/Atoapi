@@ -44,6 +44,7 @@ const checks = [
   ["metrics trend UI regression", npm, ["run", "test:metrics-trend-ui"]],
   ["secret-field UI regression", npm, ["run", "test:secret-field-ui"]],
   ["key-pool UI regression", npm, ["run", "test:key-pool-ui"]],
+  ["Codex context settings regression", npm, ["run", "test:codex-context-settings"]],
   ["provider connection-path UI regression", npm, ["run", "test:provider-connection-path-ui"]],
   ["owned-dispatch acceptance", npm, ["run", "test:acceptance"]],
   ["release champion verifier self-test", npm, ["run", "test:release-champion"]],

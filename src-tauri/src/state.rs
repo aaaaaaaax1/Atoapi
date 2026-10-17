@@ -138,6 +138,8 @@ pub struct AppState {
     pub cache_validation: Mutex<CacheValidationController>,
     pub release_champion_runner: ReleaseChampionRunner,
     pub relay_tasks: DispatchTracker,
+    /// TOOL_DIAGNOSTICS: independent bounded local writer, never a routing input.
+    pub tool_diagnostics: proxy::tool_diagnostics::ToolDiagnostics,
     server: Mutex<Option<ProxyServer>>,
     proxy_mode_server: Mutex<Option<ProxyServer>>,
     config_persistence: ConfigWriteCoordinator,
@@ -909,6 +911,7 @@ impl AppState {
             cache_validation: Mutex::new(CacheValidationController::default()),
             release_champion_runner: ReleaseChampionRunner::default(),
             relay_tasks: DispatchTracker::default(),
+            tool_diagnostics: proxy::tool_diagnostics::ToolDiagnostics::new(&config_dir),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
             config_persistence,
@@ -964,6 +967,9 @@ impl AppState {
             cache_validation: Mutex::new(CacheValidationController::default()),
             release_champion_runner: ReleaseChampionRunner::default(),
             relay_tasks: DispatchTracker::default(),
+            tool_diagnostics: proxy::tool_diagnostics::ToolDiagnostics::new(
+                config_path.parent().unwrap_or(std::path::Path::new(".")),
+            ),
             server: Mutex::new(None),
             proxy_mode_server: Mutex::new(None),
             config_persistence,

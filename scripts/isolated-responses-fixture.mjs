@@ -18,6 +18,7 @@ export async function writeIsolatedResponsesConfig(configDir, upstreamPort, opti
     `host = "127.0.0.1"
 port = 18883
 proxy_auto_start = false
+${options.toolDiagnosticsEnabled === false ? "tool_diagnostics_enabled = false" : ""}
 proxy_mode_host = "127.0.0.1"
 proxy_mode_port = 18884
 local_key = "${localKey}"

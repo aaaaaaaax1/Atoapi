@@ -718,7 +718,27 @@ pub(super) async fn stream_upstream(
     };
 
     let relay = async move {
-        let raw_stream = upstream.bytes_stream();
+        // TOOL_DIAGNOSTICS: passive bounded taps before and after adapters.
+        let diagnostic_store = state.tool_diagnostics.clone();
+        let diagnostic_request_id = request_id.clone();
+        let diagnostic_enabled = config.tool_diagnostics_enabled;
+        let raw_stream = async_stream::stream! {
+            let source = upstream.bytes_stream();
+            futures_util::pin_mut!(source);
+            let mut observer = diagnostic_enabled.then(|| tool_diagnostics::ResponseObserver::new(diagnostic_store, &diagnostic_request_id, "upstream_response"));
+            while let Some(item) = source.next().await {
+                if let (Some(observer), Ok(bytes)) = (observer.as_mut(), &item) { observer.push(bytes); }
+                yield item;
+            }
+            if let Some(observer) = observer { observer.finish(); }
+        };
+        let mut downstream_tool_observer = diagnostic_enabled.then(|| {
+            tool_diagnostics::ResponseObserver::new(
+                state.tool_diagnostics.clone(),
+                &request_id,
+                "downstream_response",
+            )
+        });
         let mut responses_to_chat_stream_summary = None;
         let mut responses_to_anthropic_stream_summary = None;
         let mut chat_to_anthropic_stream_summary = None;
@@ -954,6 +974,11 @@ pub(super) async fn stream_upstream(
                         .saturating_add(client_backpressure_started.elapsed().as_millis() as u64);
                 }
                 let observation = stream_state.ingest(&state_chunk);
+                if accepted_by_relay {
+                    if let Some(observer) = downstream_tool_observer.as_mut() {
+                        observer.push(&relay_chunk);
+                    }
+                }
                 if replaces_upstream_error {
                     // The upstream failure frame is intentionally withheld from
                     // the client, but still observed for diagnostics. Ingesting
@@ -1125,6 +1150,9 @@ pub(super) async fn stream_upstream(
                         .as_deref(),
                     upstream_request_diagnostics.upstream_trace_id.as_deref(),
                 );
+                let diagnostic_failure_frame = downstream_tool_observer
+                    .as_ref()
+                    .map(|_| failure_frame.clone());
                 let send_failed = match downstream_byte_budget
                     .clone()
                     .acquire_many_owned(failure_frame.len() as u32)
@@ -1145,6 +1173,11 @@ pub(super) async fn stream_upstream(
                     downstream_disconnect_stage = Some("before_terminal".to_string());
                 } else {
                     canonical_failure_enqueued = true;
+                    if let (Some(observer), Some(frame)) =
+                        (downstream_tool_observer.as_mut(), diagnostic_failure_frame)
+                    {
+                        observer.push(&frame);
+                    }
                 }
             }
         }
@@ -1169,6 +1202,9 @@ pub(super) async fn stream_upstream(
                 downstream_disconnected = true;
                 downstream_disconnect_stage = Some("before_terminal".to_string());
             }
+        }
+        if let Some(observer) = downstream_tool_observer {
+            observer.finish();
         }
         let stream_success_for_cache = (200..300).contains(&status) && terminal_verdict.success;
         let confirmed_compaction = confirmed_responses_compaction(

@@ -29,6 +29,7 @@ import type {
   GraphiteProviderPayload
 } from "./graphite/frameProtocol";
 import { providersForGraphiteAgent } from "./graphite/providerScope";
+import { parseCodexContextSettings } from "./graphite/codexContextSettings";
 
 // Keep the UI version badge tied to the package that is actually being built.
 // Vite injects this value from package.json, so candidate builds cannot silently
@@ -654,6 +655,16 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
       if (!agent || !provider) throw new Error("未找到 Agent 或上游配置");
       return { notice: await activateAgentProvider(agent, provider) };
     }
+    if (action === "save-codex-context") {
+      const input = parseCodexContextSettings(payload.contextWindow, payload.autoCompactLimit);
+      const nextConfig = await command<AppConfig>("save_codex_context_settings", { input });
+      setConfig(nextConfig);
+      const enabled = nextConfig.agent_injections.some((agent) => agent.id === "codex" && agent.enabled);
+      return {
+        notice: enabled ? "Codex 上下文设置已保存并重新注入，重新打开 Codex 会话后生效" : "Codex 上下文设置已保存，下次注入时生效",
+        closeOverlay: "codexContextOverlay"
+      };
+    }
     if (action === "reorder-providers") {
       const agentId = text("agentId");
       const providerIds = Array.isArray(payload.providerIds)
@@ -968,6 +979,7 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
           host,
           port,
           proxy_auto_start: settings.proxy_auto_start === true,
+          tool_diagnostics_enabled: settings.tool_diagnostics_enabled !== false,
           upstream_proxy_url: upstreamProxyUrl,
           local_key: localKey,
           default_channel: defaultChannel,
