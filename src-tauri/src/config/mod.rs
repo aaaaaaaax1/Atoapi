@@ -151,7 +151,7 @@ pub struct AppConfig {
     /// field explicitly uses Codex defaults, without a hidden provider fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_context_settings: Option<CodexContextSettings>,
-    /// Temporary local-only metadata diagnostics. Defaults on in 1.5.7.
+    /// Temporary local-only metadata diagnostics. Defaults on in 1.5.8.
     #[serde(default = "default_tool_diagnostics_enabled")]
     pub tool_diagnostics_enabled: bool,
     #[serde(default)]

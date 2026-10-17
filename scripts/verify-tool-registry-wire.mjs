@@ -31,6 +31,24 @@ const tools = [
   { type: "custom", name: "apply_patch", format: { type: "text" } },
   { type: "tool_search", execution: "client" }
 ];
+const additionalTools = {
+  type: "additional_tools",
+  tools: [
+    {
+      type: "namespace",
+      name: "functions",
+      description: "SECRET_ADDITIONAL_NAMESPACE_SCHEMA",
+      tools: [
+        {
+          type: "custom",
+          name: "exec",
+          description: "SECRET_ADDITIONAL_EXEC_SCHEMA",
+          format: { type: "grammar", definition: "SECRET_ADDITIONAL_GRAMMAR" }
+        }
+      ]
+    }
+  ]
+};
 const toolChoice = { type: "allowed_tools", mode: "auto", tools: [
   { type: "function", namespace: "functions", name: "exec_command" },
   { type: "function", namespace: "browser", name: "open" },
@@ -87,7 +105,7 @@ try {
     await delay(100);
   }
   assert.ok(ready, "isolated proxy did not become healthy");
-  const input = [{ type: "message", role: "user", content: "SECRET_CHAT_MUST_NOT_BE_LOGGED" }];
+  const input = [additionalTools, { type: "message", role: "user", content: "SECRET_CHAT_MUST_NOT_BE_LOGGED" }];
   if (simulateMissingOutput) input.push(outputs[2], { type: "custom_tool_call_output", call_id: outputs[2].call_id, output: [{ type: "input_text", text: "SECRET_TOOL_OUTPUT_MUST_NOT_BE_LOGGED" }] });
   for (let turn = 0; turn < turnCount; turn += 1) {
     if (turn > 0) {
@@ -130,6 +148,9 @@ try {
     assert.deepEqual(egress.metadata.tool_choice, ingress.metadata.tool_choice);
     assert.equal(egress.metadata.source, "frozen_wire_tool_roots");
     assert.deepEqual(egress.metadata.history_links, ingress.metadata.history_links);
+    assert.equal(ingress.metadata.additional_tools_present, true);
+    assert.deepEqual(egress.metadata.additional_tools, ingress.metadata.additional_tools);
+    assert.equal(egress.metadata.additional_tools_complete, true);
     assert.deepEqual(egress.metadata.pairing.calls_without_results_in_this_request, []);
     for (const event of pair.filter((event) => event.stage.endsWith("response"))) {
       assert.equal(event.metadata.complete, true);

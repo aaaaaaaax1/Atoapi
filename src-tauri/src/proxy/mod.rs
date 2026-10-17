@@ -86,7 +86,7 @@ mod streaming_codex_anthropic;
 mod streaming_codex_chat;
 mod streaming_responses_anthropic;
 mod streaming_responses_chat;
-// TOOL_DIAGNOSTICS: temporary, observe-only 1.5.7 module.
+// TOOL_DIAGNOSTICS: temporary, observe-only 1.5.8 module.
 pub(crate) mod tool_diagnostics;
 #[cfg(test)]
 mod tool_registry_tests;

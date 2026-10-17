@@ -1,4 +1,4 @@
-//! Temporary 1.5.7 diagnostics. Remove this module and the TOOL_DIAGNOSTICS
+//! Temporary 1.5.8 diagnostics. Remove this module and the TOOL_DIAGNOSTICS
 //! hooks to remove the feature; it never participates in routing or retries.
 use super::sse::{SseDecodeEvent, SseFrameDecoder};
 use crate::config::Channel;
@@ -93,9 +93,15 @@ impl ToolDiagnostics {
                 ] {
                     metadata[key] = tools[key].clone();
                 }
+                // Newer Codex requests carry their callable registry in an
+                // input item named `additional_tools`. Keep that bounded
+                // metadata from the frozen semantic body alongside the
+                // top-level roots parsed from the actual wire.
+                metadata["additional_tools_source"] = json!("frozen_semantic_body");
                 metadata["source"] = json!("frozen_wire_tool_roots");
             }
             None => {
+                metadata["additional_tools_source"] = json!("semantic_fallback");
                 metadata["source"] = json!("frozen_semantic_fallback");
             }
         }
@@ -243,11 +249,39 @@ fn registry_metadata(body: &Value) -> Value {
         }
         _ => Value::Null,
     };
+    let additional = additional_tools_metadata(body);
     json!({
         "tools_present": body.get("tools").is_some(), "tools": tools,
         "tools_complete": complete, "tool_choice": choice,
-        "parallel_tool_calls": body.get("parallel_tool_calls").and_then(Value::as_bool)
+        "parallel_tool_calls": body.get("parallel_tool_calls").and_then(Value::as_bool),
+        "additional_tools_present": additional["present"],
+        "additional_tools": additional["tools"],
+        "additional_tools_complete": additional["complete"]
     })
+}
+
+/// Newer Codex Responses requests carry the callable registry in an
+/// `input` item named `additional_tools` instead of the top-level `tools`
+/// field. Keep only bounded identities here; descriptions, schemas and
+/// executable content never enter the diagnostic record.
+fn additional_tools_metadata(body: &Value) -> Value {
+    let mut tools = Vec::new();
+    let mut present = false;
+    let mut complete = true;
+    if let Some(items) = body.get("input").and_then(Value::as_array) {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            present = true;
+            if let Some(nested) = item.get("tools").and_then(Value::as_array) {
+                collect_tools(nested, "", 0, &mut tools, &mut complete);
+            } else {
+                complete = false;
+            }
+        }
+    }
+    json!({"present": present, "tools": tools, "complete": complete})
 }
 
 #[derive(Default)]
@@ -625,6 +659,33 @@ mod tests {
             json!([])
         );
         assert_eq!(result["history_links"].as_array().unwrap().len(), 2);
+    }
+    #[test]
+    fn metadata_records_codex_additional_tools_without_content() {
+        let body = json!({
+            "input": [{
+                "type": "additional_tools",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "SECRET_NAMESPACE_SCHEMA",
+                    "tools": [{
+                        "type": "custom",
+                        "name": "exec",
+                        "description": "SECRET_EXEC_SCHEMA",
+                        "format": {"type": "grammar", "definition": "SECRET_GRAMMAR"}
+                    }]
+                }]
+            }]
+        });
+        let result = request_metadata(&body);
+        let encoded = result.to_string();
+        assert!(!encoded.contains("SECRET"));
+        assert_eq!(result["tools_present"], false);
+        assert_eq!(result["additional_tools_present"], true);
+        assert_eq!(result["additional_tools_complete"], true);
+        assert_eq!(result["additional_tools"][1]["name"], "exec");
+        assert_eq!(result["additional_tools"][1]["namespace"], "functions");
     }
     #[test]
     fn missing_custom_output_and_wire_tool_loss_are_visible() {

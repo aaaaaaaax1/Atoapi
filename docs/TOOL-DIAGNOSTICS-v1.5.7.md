@@ -6,9 +6,18 @@
 
 按相同 request_id 对比四个 stage。跨请求比较工具名称时，还要考虑合法的动态工具加载及 tool_choice 限制。
 
+新版 Codex 可能把工具目录放在 `input` 的 `additional_tools` 项中，而不是顶层 `tools`。因此，判断工具是否存在必须同时查看：
+
+- `tools` / `tools_present`：传统顶层工具目录。
+- `additional_tools` / `additional_tools_present`：新版 Codex 的嵌套工具目录。
+- `additional_tools_complete`：嵌套目录是否在诊断上限内完整观察。
+
+`tools=[]` 只表示顶层目录为空，不能单独证明 Codex 没有提供工具。
+
 | 观察 | 可以得出的结论 | 不能据此断定 |
 | --- | --- | --- |
-| 完整 ingress 已缺少本地工具 | 代理收到的这次请求就没有该定义 | 客户端为什么没有提供、手机是否断连 |
+| `tools` 和 `additional_tools` 都缺少 | 代理收到的这次请求没有观察到工具目录 | 客户端为什么没有提供、手机是否断连 |
+| 顶层 `tools` 为空但 `additional_tools_present=true` | 工具通过新版 Codex 嵌套目录提供 | 不能把顶层 `tools=[]` 当成工具丢失 |
 | ingress 有、完整 egress 没有 | Atoapi 请求组装或转换需要排查 | 仅凭名称数量就认定丢失；跨协议名称可被扁平化 |
 | ingress 有调用结果、完整 egress 缺结果或 call_id 改变 | Atoapi 请求转换或历史处理需要排查 | 上游执行器故障 |
 | upstream_response 有调用、downstream_response 缺少 | Atoapi 响应转换、转发或客户端断连需要排查 | 客户端一定收到了下游已入队数据 |
