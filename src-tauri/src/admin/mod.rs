@@ -17,8 +17,10 @@ use crate::{
     codex_ui_patch,
     config::{
         normalize_upstream_proxy_url, AgentInjectionConfig, AppConfig, CacheConfig, Channel,
-        CodexContextSettings, ModelConfig, ProviderCacheCapabilityProbeInput,
-        ProviderCacheCapabilityProbeResult, ProviderInput, PublicConfig,
+        CodexContextSettings, CodexRouteGroupConfig, CodexSessionRouteConfig, CodexSessionRoutePin,
+        ModelConfig, ProviderCacheCapabilityProbeInput, ProviderCacheCapabilityProbeResult,
+        ProviderInput, PublicConfig, CODEX_DEFAULT_ROUTE_GROUP_ID, CODEX_DEFAULT_ROUTE_GROUP_NAME,
+        CODEX_RECENT_SESSION_LIMIT,
     },
     metrics::MetricsSnapshot,
     metrics_history::{
@@ -340,6 +342,16 @@ pub struct AgentProviderOrderInput {
     pub agent_id: String,
     #[serde(default)]
     pub provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodexRoutingConfigInput {
+    #[serde(default)]
+    pub groups: Vec<CodexRouteGroupConfig>,
+    #[serde(default)]
+    pub sessions: Vec<CodexSessionRouteConfig>,
+    #[serde(default)]
+    pub pins: Vec<CodexSessionRoutePin>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -893,13 +905,35 @@ pub async fn save_provider_config(
             let mut models = Vec::with_capacity(input.models.len());
             for raw_model in input.models {
                 let model = normalize_model_config(raw_model)?;
-                if !seen.insert(model.id.clone()) {
-                    anyhow::bail!("duplicate model id {}", model.id);
+                // The request-facing alias is part of the mapping identity.
+                // Different client model names may intentionally resolve to
+                // the same upstream model while carrying different context or
+                // reasoning settings. Only reject the exact same mapping.
+                let mapping_key = (
+                    model.id.clone(),
+                    model
+                        .request_model_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or(&model.id)
+                        .to_string(),
+                );
+                if !seen.insert(mapping_key) {
+                    anyhow::bail!("duplicate model mapping {}", model.id);
                 }
                 models.push(model);
             }
             for old_model in old_models {
-                if !seen.contains(&old_model.id) {
+                let old_key = (
+                    old_model.id.clone(),
+                    old_model
+                        .request_model_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or(&old_model.id)
+                        .to_string(),
+                );
+                if !seen.contains(&old_key) {
                     next.clear_cache_capabilities_for_model(&provider_id, &old_model.id);
                 }
             }
@@ -1037,6 +1071,260 @@ pub async fn reorder_agent_providers(
     Ok(state.public_config().await)
 }
 
+#[tauri::command]
+pub async fn save_codex_routing(
+    state: State<'_, Arc<AppState>>,
+    input: CodexRoutingConfigInput,
+) -> CommandResult<PublicConfig> {
+    state
+        .commit_config_update(|current| {
+            let groups = validate_codex_route_groups(current, input.groups)?;
+            let mut sessions = input.sessions;
+            let group_ids = groups
+                .iter()
+                .map(|group| group.id.as_str())
+                .collect::<HashSet<_>>();
+            for session in &mut sessions {
+                let previous = current
+                    .codex_session_routes
+                    .iter()
+                    .find(|previous| previous.session_id == session.session_id);
+                if session.display_name.is_none() {
+                    session.display_name =
+                        previous.and_then(|previous| previous.display_name.clone());
+                }
+                if session.consecutive_503_failures == 0 {
+                    session.consecutive_503_failures = previous
+                        .map(|previous| previous.consecutive_503_failures)
+                        .unwrap_or_default();
+                }
+                if previous.is_some_and(|previous| {
+                    previous.group_id != session.group_id
+                        || previous.last_provider_id != session.last_provider_id
+                }) {
+                    session.consecutive_503_failures = 0;
+                }
+                if !group_ids.contains(session.group_id.as_str()) {
+                    session.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
+                    session.last_provider_id = None;
+                    session.consecutive_503_failures = 0;
+                }
+                if groups
+                    .iter()
+                    .find(|group| group.id == session.group_id)
+                    .is_some_and(|group| {
+                        session
+                            .last_provider_id
+                            .as_ref()
+                            .is_some_and(|provider_id| !group.provider_ids.contains(provider_id))
+                    })
+                {
+                    session.last_provider_id = None;
+                }
+            }
+            let sessions = validate_codex_session_routes(&groups, sessions)?;
+            let mut next = current.clone();
+            next.codex_route_groups = groups;
+            next.codex_session_routes = sessions;
+            next.codex_session_route_pins = validate_codex_session_route_pins(&next, input.pins)?;
+            next.updated_at = Utc::now();
+            Ok(next)
+        })
+        .await
+        .map_err(to_command_error)?;
+    Ok(state.public_config().await)
+}
+
+#[tauri::command]
+pub async fn set_codex_fallback_enabled(
+    state: State<'_, Arc<AppState>>,
+    provider_id: String,
+    enabled: bool,
+) -> CommandResult<PublicConfig> {
+    let provider_id = provider_id.trim().to_string();
+    if provider_id.is_empty() {
+        return Err("上游 ID 不能为空".to_string());
+    }
+    state
+        .commit_config_update(|current| {
+            if !current
+                .providers
+                .iter()
+                .any(|provider| provider.id == provider_id)
+            {
+                anyhow::bail!("上游不存在");
+            }
+            if !visible_provider_ids_for_agent(current, "codex")?
+                .iter()
+                .any(|id| id == &provider_id)
+            {
+                anyhow::bail!("上游不在 Codex 可见列表中");
+            }
+            let mut next = current.clone();
+            if enabled {
+                next.codex_fallback_disabled_provider_ids
+                    .retain(|id| id != &provider_id);
+            } else if !next
+                .codex_fallback_disabled_provider_ids
+                .iter()
+                .any(|id| id == &provider_id)
+            {
+                next.codex_fallback_disabled_provider_ids
+                    .push(provider_id.clone());
+            }
+            next.updated_at = Utc::now();
+            Ok(next)
+        })
+        .await
+        .map_err(to_command_error)?;
+    Ok(state.public_config().await)
+}
+
+fn validate_codex_session_route_pins(
+    config: &AppConfig,
+    mut pins: Vec<CodexSessionRoutePin>,
+) -> anyhow::Result<Vec<CodexSessionRoutePin>> {
+    if pins.len() > crate::config::CODEX_SESSION_ROUTE_PIN_LIMIT {
+        anyhow::bail!(
+            "Codex 会话线路绑定不能超过 {} 条",
+            crate::config::CODEX_SESSION_ROUTE_PIN_LIMIT
+        );
+    }
+    let groups = config
+        .codex_route_groups
+        .iter()
+        .map(|group| (group.id.as_str(), group))
+        .collect::<std::collections::HashMap<_, _>>();
+    let visible = visible_provider_ids_for_agent(config, "codex")?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(pins.len());
+    for pin in pins.drain(..) {
+        let session_id = pin.session_id.trim().to_string();
+        if session_id.is_empty()
+            || session_id.len() > 512
+            || session_id.chars().any(char::is_control)
+            || !seen.insert(session_id.clone())
+        {
+            anyhow::bail!("会话线路绑定 ID 无效或重复");
+        }
+        let _group = groups
+            .get(pin.group_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("会话线路绑定的分组不存在"))?;
+        if !visible.contains(&pin.provider_id) {
+            anyhow::bail!("会话线路绑定的上游不属于 Codex 可见列表");
+        }
+        normalized.push(CodexSessionRoutePin { session_id, ..pin });
+    }
+    Ok(normalized)
+}
+
+fn validate_codex_route_groups(
+    config: &AppConfig,
+    mut groups: Vec<CodexRouteGroupConfig>,
+) -> anyhow::Result<Vec<CodexRouteGroupConfig>> {
+    const MAX_GROUPS: usize = 40;
+    const MAX_GROUP_NAME_CHARS: usize = 64;
+    if groups.is_empty() || groups.len() > MAX_GROUPS {
+        anyhow::bail!("Codex 分组数量必须在 1 到 {MAX_GROUPS} 之间");
+    }
+    let default = groups
+        .iter_mut()
+        .find(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+        .ok_or_else(|| anyhow::anyhow!("必须保留固定的默认分组"))?;
+    default.name = CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string();
+    groups.sort_by_key(|group| (group.id != CODEX_DEFAULT_ROUTE_GROUP_ID) as u8);
+
+    let visible = visible_provider_ids_for_agent(config, "codex")?
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut ids = HashSet::new();
+    let mut names = HashSet::from([CODEX_DEFAULT_ROUTE_GROUP_NAME.to_lowercase()]);
+    for group in &mut groups {
+        let id = group.id.trim();
+        if id.is_empty()
+            || id.len() > 80
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || !ids.insert(id.to_string())
+        {
+            anyhow::bail!("分组标识无效或重复");
+        }
+        group.id = id.to_string();
+        if group.id == CODEX_DEFAULT_ROUTE_GROUP_ID {
+            group.name = CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string();
+        } else {
+            group.name = group.name.trim().to_string();
+            if group.name.is_empty() || group.name.chars().count() > MAX_GROUP_NAME_CHARS {
+                anyhow::bail!("分组名称不能为空且不能超过 {MAX_GROUP_NAME_CHARS} 个字符");
+            }
+            if !names.insert(group.name.to_lowercase()) {
+                anyhow::bail!("分组名称不能重复");
+            }
+        }
+        let mut members = HashSet::new();
+        if group.provider_ids.len() > visible.len() {
+            anyhow::bail!("分组包含的上游数量超出当前可用列表");
+        }
+        for provider_id in &group.provider_ids {
+            if !visible.contains(provider_id) || !members.insert(provider_id.clone()) {
+                anyhow::bail!("分组只能包含当前 Codex 可见的上游，且不能重复");
+            }
+        }
+    }
+    Ok(groups)
+}
+
+fn validate_codex_session_routes(
+    groups: &[CodexRouteGroupConfig],
+    mut sessions: Vec<CodexSessionRouteConfig>,
+) -> anyhow::Result<Vec<CodexSessionRouteConfig>> {
+    const MAX_MANAGED_SESSIONS: usize = 2_000;
+    const MAX_SESSION_ID_BYTES: usize = 512;
+    if sessions.iter().filter(|session| session.managed).count() > MAX_MANAGED_SESSIONS
+        || sessions.len() > MAX_MANAGED_SESSIONS + CODEX_RECENT_SESSION_LIMIT
+    {
+        anyhow::bail!("管理的 Codex 会话不能超过 {MAX_MANAGED_SESSIONS} 条");
+    }
+    let groups = groups
+        .iter()
+        .map(|group| (group.id.as_str(), group))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut ids = HashSet::new();
+    let mut recent_count = 0usize;
+    for session in &mut sessions {
+        session.session_id = session.session_id.trim().to_string();
+        if session.session_id.is_empty()
+            || session.session_id.len() > MAX_SESSION_ID_BYTES
+            || session.session_id.chars().any(char::is_control)
+            || !ids.insert(session.session_id.clone())
+        {
+            anyhow::bail!("会话 ID 无效或重复");
+        }
+        session.display_name =
+            crate::config::normalize_codex_session_display_name(session.display_name.as_deref());
+        let group = groups
+            .get(session.group_id.as_str())
+            .ok_or_else(|| anyhow::anyhow!("会话绑定的分组不存在"))?;
+        if session
+            .last_provider_id
+            .as_ref()
+            .is_some_and(|provider_id| !group.provider_ids.contains(provider_id))
+        {
+            anyhow::bail!("会话最近使用的上游不属于当前分组");
+        }
+        if !session.managed {
+            recent_count += 1;
+            if recent_count > CODEX_RECENT_SESSION_LIMIT {
+                anyhow::bail!("未加入管理的最近会话最多保留 {CODEX_RECENT_SESSION_LIMIT} 条");
+            }
+        }
+    }
+    Ok(sessions)
+}
+
 fn reorder_agent_providers_config(
     config: &mut AppConfig,
     input: &AgentProviderOrderInput,
@@ -1113,19 +1401,44 @@ fn append_agent_provider_order(config: &mut AppConfig, agent_id: &str, provider_
         if !order.provider_ids.iter().any(|id| id == provider_id) {
             order.provider_ids.push(provider_id.to_string());
         }
-        return;
+    } else {
+        let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
+        if !provider_ids.iter().any(|id| id == provider_id) {
+            provider_ids.push(provider_id.to_string());
+        }
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: agent_id.to_string(),
+                provider_ids,
+            });
     }
-
-    let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
-    if !provider_ids.iter().any(|id| id == provider_id) {
-        provider_ids.push(provider_id.to_string());
+    if agent_id == "codex"
+        && config
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .is_some_and(|agent| !agent.hidden_provider_ids.contains(&provider_id.to_string()))
+    {
+        if let Some(group) = config
+            .codex_route_groups
+            .iter_mut()
+            .find(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+        {
+            if !group.provider_ids.iter().any(|id| id == provider_id) {
+                group.provider_ids.push(provider_id.to_string());
+            }
+        } else {
+            config.codex_route_groups.insert(
+                0,
+                CodexRouteGroupConfig {
+                    id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                    name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
+                    provider_ids: vec![provider_id.to_string()],
+                },
+            );
+        }
     }
-    config
-        .agent_provider_orders
-        .push(crate::config::AgentProviderOrderConfig {
-            agent_id: agent_id.to_string(),
-            provider_ids,
-        });
 }
 
 fn replace_or_append_agent_provider_order(
@@ -1152,19 +1465,44 @@ fn replace_or_append_agent_provider_order(
         {
             order.provider_ids.push(target_provider_id.to_string());
         }
-        return;
+    } else {
+        let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
+        if !provider_ids.iter().any(|id| id == target_provider_id) {
+            provider_ids.push(target_provider_id.to_string());
+        }
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: agent_id.to_string(),
+                provider_ids,
+            });
     }
 
-    let mut provider_ids = bound_provider_ids_for_agent(config, agent_id);
-    if !provider_ids.iter().any(|id| id == target_provider_id) {
-        provider_ids.push(target_provider_id.to_string());
+    if agent_id == "codex" {
+        if let Some(group) = config
+            .codex_route_groups
+            .iter_mut()
+            .find(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+        {
+            if let Some(source_index) = group
+                .provider_ids
+                .iter()
+                .position(|provider_id| provider_id == source_provider_id)
+            {
+                if group.provider_ids.iter().any(|id| id == target_provider_id) {
+                    group.provider_ids.remove(source_index);
+                } else {
+                    group.provider_ids[source_index] = target_provider_id.to_string();
+                }
+            } else if !group
+                .provider_ids
+                .iter()
+                .any(|provider_id| provider_id == target_provider_id)
+            {
+                group.provider_ids.push(target_provider_id.to_string());
+            }
+        }
     }
-    config
-        .agent_provider_orders
-        .push(crate::config::AgentProviderOrderConfig {
-            agent_id: agent_id.to_string(),
-            provider_ids,
-        });
 }
 
 fn bound_provider_ids_for_agent(config: &AppConfig, agent_id: &str) -> Vec<String> {
@@ -1360,6 +1698,26 @@ fn remove_provider_from_agent_order(config: &mut AppConfig, agent_id: &str, prov
     config
         .agent_provider_orders
         .retain(|order| !order.provider_ids.is_empty());
+    if agent_id == "codex" {
+        if let Some(group) = config
+            .codex_route_groups
+            .iter_mut()
+            .find(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+        {
+            group.provider_ids.retain(|id| id != provider_id);
+        }
+        for group in config.codex_route_groups.iter_mut() {
+            group.provider_ids.retain(|id| id != provider_id);
+        }
+        config
+            .codex_session_route_pins
+            .retain(|pin| pin.provider_id != provider_id);
+        for session in &mut config.codex_session_routes {
+            if session.last_provider_id.as_deref() == Some(provider_id) {
+                session.last_provider_id = None;
+            }
+        }
+    }
 }
 
 fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
@@ -1381,6 +1739,9 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
     config
         .provider_cache_capabilities
         .retain(|item| item.provider_id != provider_id);
+    config
+        .codex_fallback_disabled_provider_ids
+        .retain(|id| id != provider_id);
     for agent in &mut config.agent_injections {
         agent
             .hidden_provider_ids
@@ -1392,6 +1753,17 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
     config
         .agent_provider_orders
         .retain(|order| !order.provider_ids.is_empty());
+    for group in &mut config.codex_route_groups {
+        group.provider_ids.retain(|id| id != provider_id);
+    }
+    config
+        .codex_session_route_pins
+        .retain(|pin| pin.provider_id != provider_id);
+    for session in &mut config.codex_session_routes {
+        if session.last_provider_id.as_deref() == Some(provider_id) {
+            session.last_provider_id = None;
+        }
+    }
 }
 
 fn hide_provider_for_agent(agent: &mut AgentInjectionConfig, provider_id: &str) {
@@ -4186,6 +4558,125 @@ mod tests {
     }
 
     #[test]
+    fn codex_group_validation_keeps_default_fixed_and_limits_recent_history() {
+        let mut config = AppConfig::default();
+        config.providers = vec![test_provider("primary"), test_provider("backup")];
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some("primary".to_string());
+        config
+            .agent_provider_orders
+            .push(crate::config::AgentProviderOrderConfig {
+                agent_id: "codex".to_string(),
+                provider_ids: vec!["primary".to_string(), "backup".to_string()],
+            });
+
+        let groups = validate_codex_route_groups(
+            &config,
+            vec![
+                CodexRouteGroupConfig {
+                    id: "work".to_string(),
+                    name: "工作".to_string(),
+                    provider_ids: vec!["backup".to_string()],
+                },
+                CodexRouteGroupConfig {
+                    id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                    name: "用户试图改名".to_string(),
+                    provider_ids: vec!["primary".to_string()],
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(groups[0].id, CODEX_DEFAULT_ROUTE_GROUP_ID);
+        assert_eq!(groups[0].name, CODEX_DEFAULT_ROUTE_GROUP_NAME);
+
+        let managed = CodexSessionRouteConfig {
+            session_id: "managed-session".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            managed: true,
+            display_name: None,
+            last_provider_id: Some("primary".to_string()),
+            last_seen_at: None,
+            consecutive_503_failures: 0,
+        };
+        let mut sessions = vec![managed];
+        sessions.extend(
+            (0..CODEX_RECENT_SESSION_LIMIT).map(|index| CodexSessionRouteConfig {
+                session_id: format!("recent-{index}"),
+                group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                managed: false,
+                display_name: None,
+                last_provider_id: Some("primary".to_string()),
+                last_seen_at: None,
+                consecutive_503_failures: 0,
+            }),
+        );
+        assert_eq!(
+            validate_codex_session_routes(&groups, sessions.clone())
+                .unwrap()
+                .len(),
+            11
+        );
+        sessions.push(CodexSessionRouteConfig {
+            session_id: "recent-overflow".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            managed: false,
+            display_name: None,
+            last_provider_id: Some("primary".to_string()),
+            last_seen_at: None,
+            consecutive_503_failures: 0,
+        });
+        assert!(validate_codex_session_routes(&groups, sessions).is_err());
+    }
+
+    #[test]
+    fn codex_provider_removal_clears_only_its_routing_references() {
+        let mut config = AppConfig::default();
+        config.providers = vec![test_provider("primary"), test_provider("backup")];
+        config.codex_route_groups[0].provider_ids =
+            vec!["primary".to_string(), "backup".to_string()];
+        config.codex_route_groups.push(CodexRouteGroupConfig {
+            id: "work".to_string(),
+            name: "工作".to_string(),
+            provider_ids: vec!["primary".to_string()],
+        });
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: "managed-session".to_string(),
+            group_id: "work".to_string(),
+            managed: true,
+            display_name: None,
+            last_provider_id: Some("primary".to_string()),
+            last_seen_at: None,
+            consecutive_503_failures: 0,
+        });
+        config.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id: "managed-session".to_string(),
+            group_id: "work".to_string(),
+            provider_id: "primary".to_string(),
+            last_seen_at: None,
+        });
+        config.codex_fallback_disabled_provider_ids = vec!["primary".to_string()];
+
+        remove_provider_records(&mut config, "primary");
+
+        assert!(config
+            .providers
+            .iter()
+            .all(|provider| provider.id != "primary"));
+        assert!(config
+            .codex_route_groups
+            .iter()
+            .all(|group| !group.provider_ids.iter().any(|id| id == "primary")));
+        assert!(config.codex_session_route_pins.is_empty());
+        assert_eq!(config.codex_session_routes[0].last_provider_id, None);
+        assert_eq!(config.codex_route_groups[0].provider_ids, vec!["backup"]);
+        assert!(config.codex_fallback_disabled_provider_ids.is_empty());
+    }
+
+    #[test]
     fn key_pool_health_snapshot_exposes_live_toggle_and_status_only() {
         let now = Utc::now();
         let mut config = AppConfig::default();
@@ -5374,6 +5865,60 @@ mod tests {
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "gpt-5.5");
         assert_eq!(models[0].context_window, Some(800000));
+    }
+
+    #[test]
+    fn model_mapping_identity_includes_request_alias() {
+        let mapping = |request: &str, actual: &str| ModelConfig {
+            id: actual.to_string(),
+            request_model_id: Some(request.to_string()),
+            display_name: request.to_string(),
+            context_window: Some(128_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        };
+
+        let first = normalize_model_config(mapping("gpt-a", "vendor/shared")).unwrap();
+        let second = normalize_model_config(mapping("gpt-b", "vendor/shared")).unwrap();
+        assert_eq!(first.id, second.id);
+        assert_ne!(first.request_model_id, second.request_model_id);
+    }
+
+    #[test]
+    fn codex_session_name_is_preserved_through_routing_save() {
+        let mut config = AppConfig::default();
+        config.providers = vec![test_provider("primary")];
+        config.codex_route_groups[0].provider_ids = vec!["primary".to_string()];
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: "session-name".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            managed: true,
+            display_name: Some("旧名称".to_string()),
+            last_provider_id: None,
+            last_seen_at: None,
+            consecutive_503_failures: 1,
+        });
+        let input = CodexRoutingConfigInput {
+            groups: config.codex_route_groups.clone(),
+            sessions: vec![CodexSessionRouteConfig {
+                session_id: "session-name".to_string(),
+                group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                managed: true,
+                display_name: Some("  新名称  ".to_string()),
+                last_provider_id: None,
+                last_seen_at: None,
+                consecutive_503_failures: 0,
+            }],
+            pins: Vec::new(),
+        };
+        let sessions = validate_codex_session_routes(&input.groups, input.sessions).unwrap();
+        assert_eq!(sessions[0].display_name.as_deref(), Some("新名称"));
+        assert_eq!(sessions[0].session_id, "session-name");
     }
 
     #[test]

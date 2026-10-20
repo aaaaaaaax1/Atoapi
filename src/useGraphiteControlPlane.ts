@@ -665,6 +665,29 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
         closeOverlay: "codexContextOverlay"
       };
     }
+    if (action === "save-codex-routing") {
+      const groups = Array.isArray(payload.groups) ? payload.groups : [];
+      const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+      const pins = Array.isArray(payload.pins) ? payload.pins : [];
+      const nextConfig = await command<AppConfig>("save_codex_routing", {
+        input: { groups, sessions, pins }
+      });
+      setConfig(nextConfig);
+      return { notice: text("notice") || "Codex 分组和会话路由已保存" };
+    }
+    if (action === "set-codex-fallback-enabled") {
+      const providerId = text("providerId");
+      if (!providerId) throw new Error("未找到待设置的上游");
+      const nextConfig = await command<AppConfig>("set_codex_fallback_enabled", {
+        providerId,
+        provider_id: providerId,
+        enabled: payload.enabled === true
+      });
+      setConfig(nextConfig);
+      return {
+        notice: payload.enabled === true ? "上游已加入自动备选" : "上游已从自动备选中排除"
+      };
+    }
     if (action === "reorder-providers") {
       const agentId = text("agentId");
       const providerIds = Array.isArray(payload.providerIds)

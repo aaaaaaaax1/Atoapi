@@ -1221,6 +1221,12 @@ pub(super) async fn stream_upstream(
         // usage, cache, metrics, and persistence settlement continue.
         let client_completed_ms = started.elapsed().as_millis() as u64;
         drop(downstream_sender);
+        let stream_error_summary = (!stream_success_for_cache).then(|| {
+            stream_metadata
+                .error_summary
+                .as_deref()
+                .unwrap_or("upstream stream failed")
+        });
         note_selected_provider_key_stream_terminal(
             &state_for_stream,
             &decision.provider.id,
@@ -1228,9 +1234,46 @@ pub(super) async fn stream_upstream(
                 .cache_capability_key_id
                 .as_deref(),
             stream_success_for_cache,
-            stream_metadata.error_summary.as_deref(),
+            stream_error_summary,
         )
         .await;
+        if let Some(session_id) = upstream_request_diagnostics
+            .codex_route_session_id
+            .as_deref()
+        {
+            let stream_failure_requires_failover = terminal_failure_code.is_some_and(|code| {
+                matches!(
+                    code,
+                    ResponsesFailureCode::UpstreamIncompleteEof
+                        | ResponsesFailureCode::UpstreamStreamError
+                )
+            });
+            super::failover_codex_route_after_failure(
+                &state_for_stream,
+                Some(session_id),
+                upstream_request_diagnostics.codex_route_group_id.as_deref(),
+                &decision.provider.id,
+                Some(status),
+                stream_metadata.error_summary.as_deref(),
+                stream_failure_requires_failover,
+            )
+            .await;
+            if stream_success_for_cache {
+                if let (Some(session_id), Some(group_id)) = (
+                    upstream_request_diagnostics.codex_route_session_id.clone(),
+                    upstream_request_diagnostics.codex_route_group_id.clone(),
+                ) {
+                    super::observe_codex_route(
+                        state_for_stream.clone(),
+                        Some(super::CodexRouteSelection {
+                            session_id: Some(session_id),
+                            group_id,
+                            provider_id: decision.provider.id.clone(),
+                        }),
+                    );
+                }
+            }
+        }
         // Passive cache-control acceptance is evidence only for a normal,
         // completed native FullReplay turn.  A successful HTTP head is not
         // sufficient: an SSE error/WAF event, a compaction epoch, an external

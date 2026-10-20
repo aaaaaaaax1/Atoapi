@@ -464,6 +464,19 @@
       background: var(--bg);
     }
 
+    /* Codex settings own the viewport: the navigation stays fixed while the
+       selected page gets its own scroll surface. Other agents retain the
+       normal workspace scrolling behavior. */
+    .workspace.codex-route-mode {
+      overflow: hidden;
+    }
+
+    .workspace.codex-route-mode .agent-view,
+    .workspace.codex-route-mode .route-workspace {
+      height: 100%;
+      min-height: 0;
+    }
+
     .workspace-view {
       min-width: 0;
       max-width: 1500px;
@@ -603,6 +616,12 @@
       width: 32px;
       height: 32px;
     }
+    .codex-fallback-control { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 40px; }
+    .codex-fallback-control small { color: #94a19e; font-size: 8px; line-height: 1; }
+    .codex-fallback-switch { width: 30px; height: 18px; min-height: 18px; padding: 1px; border: 1px solid #4a555b; border-radius: 999px; background: #292f34; }
+    .codex-fallback-switch::after { width: 12px; height: 12px; background: #99a4a8; transform: translateX(0); }
+    .codex-fallback-switch[aria-checked="true"] { border-color: #5bc7a1; background: #356455; }
+    .codex-fallback-switch[aria-checked="true"]::after { background: #e5e9eb; transform: translateX(12px); }
 
     .empty-row {
       padding: 36px 18px;
@@ -670,6 +689,7 @@
 
     .metrics-view {
       min-width: 0;
+      min-height: 0;
     }
 
     .metrics-head {
@@ -4856,6 +4876,8 @@
 
     .app-shell.metrics-open .workspace {
       grid-row: 2;
+      overflow-y: auto;
+      overscroll-behavior: contain;
     }
 
     .utility-button[aria-pressed="true"] {
@@ -5841,14 +5863,20 @@
     }
 
     .workspace {
-      scrollbar-width: none;
-      -ms-overflow-style: none;
+      scrollbar-width: thin;
+      scrollbar-color: #4b555b transparent;
     }
 
     .workspace::-webkit-scrollbar {
-      width: 0;
-      height: 0;
-      display: none;
+      width: 8px;
+      height: 8px;
+    }
+
+    .workspace::-webkit-scrollbar-thumb {
+      border: 2px solid transparent;
+      border-radius: 999px;
+      background: #4b555b;
+      background-clip: padding-box;
     }
 
     .cache-trend-head {
@@ -6575,6 +6603,240 @@
     .codex-context-drawer .drawer-body { display: grid; align-content: start; gap: 20px; }
     .codex-context-note { color: var(--muted); font-size: 12px; line-height: 1.8; margin: 0; }
     .codex-context-drawer .field small { color: var(--muted); font-size: 11px; }
+
+    /* Codex route workspace: compact graphite surface with green state cues. */
+    .route-workspace {
+      min-width: 0;
+      min-height: 100%;
+      display: grid;
+      grid-template-columns: 176px minmax(0, 1fr);
+      overflow: hidden;
+      border: 1px solid #3a4247;
+      border-radius: 7px;
+      background: #1e2226;
+    }
+
+    .route-workspace:not(.route-sidebar-visible) {
+      display: block;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+    }
+
+    .route-sidebar {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 16px 9px 12px;
+      border-right: 1px solid #3a4247;
+      background: #202529;
+    }
+
+    .route-sidebar[hidden],
+    .route-group-delete[hidden] { display: none !important; }
+    .route-sidebar-title {
+      padding: 0 9px 6px;
+      color: #a3adb2;
+      font-size: 10px;
+    }
+    .route-sidebar-nav { display: grid; gap: 3px; }
+    .route-nav-item {
+      min-width: 0;
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 9px;
+      border: 1px solid transparent;
+      border-radius: 5px;
+      background: transparent;
+      color: #a3adb2;
+      cursor: pointer;
+      text-align: left;
+      font-size: 11px;
+    }
+    .route-nav-item:hover { background: #292f34; color: #e5e9eb; }
+    .route-nav-item.is-active { background: #2c3535; color: #e5e9eb; }
+    .route-nav-item.is-active .icon { color: #5bc7a1; }
+    .route-nav-item .icon { width: 15px; height: 15px; color: #89949a; }
+    .route-sidebar-status {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: auto;
+      padding: 10px 9px 0;
+      border-top: 1px solid #3a4247;
+      color: #8fa09a;
+      font-size: 10px;
+    }
+    .route-sidebar-status i { width: 6px; height: 6px; border-radius: 50%; background: #5bc7a1; }
+    .route-pages { min-width: 0; min-height: 0; overflow: auto; padding: 17px 20px 20px; }
+    .route-workspace:not(.route-sidebar-visible) .route-pages { min-height: 100%; padding: 0; overflow: visible; }
+    .route-page { min-width: 0; }
+    .route-page[hidden] { display: none !important; }
+    .route-page-head { display: flex; align-items: flex-end; justify-content: space-between; min-height: 38px; padding-bottom: 11px; border-bottom: 1px solid #3a4247; }
+    .route-page-head h2 { margin: 0; color: #e5e9eb; font-size: 15px; font-weight: 550; }
+    .route-page-head p { margin: 4px 0 0; color: #a3adb2; font-size: 10px; }
+    .route-page[data-route-page="groups"] { min-height: 100%; display: flex; flex-direction: column; }
+    .route-group-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 13px 0 12px; padding: 10px 12px; border: 1px solid #3c474b; border-radius: 6px; background: #252c30; }
+    .route-group-summary-primary { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .route-group-name-host { min-width: 0; }
+    .route-group-name { color: #eef1f2; font-size: 13px; font-weight: 650; }
+    .route-group-name-host:not(.is-fixed) .route-group-name { cursor: text; border-bottom: 1px dashed #7c9f92; }
+    .route-group-name-host:not(.is-fixed) .route-group-name:hover { color: #8ed7b8; }
+    .route-group-name-edit { width: min(320px, 48vw); height: 28px; padding: 0 7px; border: 1px solid #5bc7a1; border-radius: 4px; background: #1c2326; color: #eef1f2; font-size: 12px; }
+    .route-group-summary small { color: #b1bcc0; font-size: 10px; }
+    .route-group-list { display: grid; gap: 5px; }
+    .route-group-row { min-width: 0; display: grid; grid-template-columns: 22px 24px minmax(0,1fr) auto; align-items: center; gap: 6px; height: 50px; min-height: 50px; max-height: 50px; padding: 5px 8px; border: 1px solid #343e42; border-radius: 7px; background: #20272a; transition: background 120ms ease, border-color 120ms ease; }
+    .route-group-row:hover { border-color: #46545a; background: #242d30; }
+    .route-group-row.is-dragging { opacity: .5; }
+    .route-group-row.is-drag-over { border-color: #5bc7a1; background: #293834; }
+    .route-group-order { color: #809097; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; }
+    .route-group-drag-handle { display: grid; place-items: center; width: 22px; height: 30px; border-radius: 4px; color: #7f8b90; cursor: grab; touch-action: none; user-select: none; }
+    .route-group-drag-handle:hover { background: #30393d; color: #dce5e4; }
+    .route-group-drag-handle:active { cursor: grabbing; }
+    .route-group-provider { min-width: 0; display: grid; gap: 1px; line-height: 1.18; }
+    .route-group-provider b, .route-group-provider small { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .route-group-provider b { color: #e7ecee; font-size: 11px; font-weight: 650; }
+    .route-group-provider small { color: #9ba8ad; font-size: 9px; font-family: "Cascadia Code", Consolas, monospace; }
+    .route-provider-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #98a6aa; font-size: 9px; line-height: 1.25; }
+    .route-group-actions { display: flex; align-items: center; gap: 4px; }
+    .route-group-fallback-control { flex: 0 0 34px; min-width: 34px; }
+    .route-group-fallback-control small { font-size: 8px; }
+    .route-group-actions .icon-button { width: 26px; height: 26px; }
+    .route-group-actions .icon-button:hover { border-color: #607077; background: #303a3e; }
+    .route-group-actions .balance-probe-chip { max-width: 150px; min-height: 26px; padding: 0 6px; font-size: 9px; }
+    .route-provider-test { min-height: 26px; padding: 0 7px; border-color: #455257; background: #2b3438; color: #d8e0e2; font-size: 9px; }
+    .route-provider-test:hover { border-color: #688d7e; background: #303e3b; }
+    .route-provider-health { border-color: #59634b; background: #33382e; color: #e1d19a; }
+    .route-provider-health:hover { border-color: #a18b4e; background: #3e3b2e; }
+    .route-group-section-head { display: flex; justify-content: space-between; gap: 10px; margin: 12px 2px 6px; color: #d6dfe1; font-size: 10px; font-weight: 600; }
+    .route-group-section-head small { color: #849297; font-size: 9px; font-weight: 400; }
+    .route-group-footer { position: sticky; bottom: -20px; display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: auto -20px -20px; padding: 10px 20px; border-top: 1px solid #384347; background: #1d2427; }
+    .route-group-footer-actions { display: flex; align-items: center; gap: 7px; }
+    .route-group-footer .secondary-button, .route-group-footer .primary-button { min-height: 30px; padding: 0 10px; font-size: 10px; }
+    .route-group-footer .primary-button { border-color: #5bc7a1; background: #5bc7a1; color: #14231e; }
+    .route-group-footer .primary-button:disabled { opacity: .45; cursor: default; }
+    .route-group-delete { border-color: #704c4d !important; background: #332728 !important; color: #e5aaaa !important; }
+    .route-group-delete:hover { background: #473132 !important; }
+    .route-group-pending { color: #8fa19a; font-size: 9px; }
+    .route-group-pending.is-pending { color: #e2b25c; }
+    .route-group-select-label { display: flex; flex: 1; align-items: center; gap: 9px; min-width: 0; color: #9ba8ad; font-size: 10px; }
+    .route-group-select-label select { flex: 1; max-width: 370px; }
+    .route-group-editor.is-saving { pointer-events: none; opacity: .76; }
+    .codex-routing-list .bind-button { display: none !important; }
+    .route-create-dialog { position: absolute; left: 50%; top: 50%; width: min(420px, calc(100vw - 28px)); transform: translate(-50%, -50%); overflow: hidden; border: 1px solid #465257; border-radius: 7px; background: #222a2d; box-shadow: 0 20px 60px rgba(0,0,0,.42); }
+    .route-create-dialog-head, .route-create-dialog-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px; background: #293235; }
+    .route-create-dialog-head { border-bottom: 1px solid #3b464a; }
+    .route-create-dialog-head h2 { margin: 0; color: #edf1f2; font-size: 14px; font-weight: 650; }
+    .route-create-dialog-body { display: grid; gap: 7px; padding: 15px 14px; }
+    .route-create-dialog-body label { color: #c6d0d2; font-size: 10px; }
+    .route-create-dialog-body input { width: 100%; height: 34px; padding: 0 9px; border: 1px solid #47555a; border-radius: 4px; background: #1b2225; color: #eef1f2; font-size: 11px; }
+    .route-create-dialog-foot { justify-content: flex-end; border-top: 1px solid #3b464a; }
+    .route-create-dialog-foot button { min-height: 29px; padding: 0 10px; font-size: 10px; }
+    .route-create-dialog-foot .primary-button { border-color: #5bc7a1; background: #5bc7a1; color: #14231e; }
+    .route-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 11px 0 9px; }
+    .route-toolbar select, .route-toolbar input, .route-inline-form select, .route-inline-form input, .route-session-row select { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid #465057; border-radius: 4px; background: #292f34; color: #e5e9eb; font-size: 10px; }
+    .route-toolbar select { flex: 1; max-width: 370px; }
+    .route-toolbar .secondary-button, .route-inline-form .secondary-button { min-height: 29px; padding: 0 8px; font-size: 10px; }
+    .route-inline-form { display: flex; align-items: center; gap: 6px; margin: 8px 0; }
+    .route-inline-form input { flex: 1; }
+    .route-inline-form select { flex: 1; }
+    .route-session-list { display: grid; }
+    .route-session-section { margin-top: 15px; }
+    .route-session-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 2px; border-bottom: 1px solid #3a4247; color: #a3adb2; font-size: 10px; }
+    .route-session-row { min-width: 0; display: grid; grid-template-columns: minmax(120px, 1.1fr) minmax(100px, 1fr) minmax(100px, 1fr) auto; align-items: center; gap: 8px; min-height: 39px; padding: 5px 2px; border-bottom: 1px solid #30373b; }
+    .route-session-id { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e5e9eb; font: 10px "Cascadia Code", Consolas, monospace; }
+    .route-session-name { font-family: inherit; font-weight: 600; cursor: text; }
+    .route-session-name-input { min-width: 0; width: 100%; height: 26px; padding: 0 7px; border: 1px solid #5bc7a1; border-radius: 4px; background: #1b2225; color: #eef1f2; font: 10px "Cascadia Code", Consolas, monospace; }
+    .route-session-provider { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #89949a; font-size: 10px; }
+    .route-session-actions { display: flex; gap: 3px; }
+    .route-session-actions .icon-button { width: 25px; height: 25px; }
+    .route-session-empty { padding: 12px 2px; color: #89949a; font-size: 10px; }
+    .route-session-history-button { min-height: 30px; padding: 0 9px; font-size: 10px; }
+    .route-history-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 11px 0 8px; }
+    .route-history-toolbar select { min-width: 150px; height: 30px; padding: 0 8px; border: 1px solid #465057; border-radius: 4px; background: #292f34; color: #e5e9eb; font-size: 10px; }
+    .route-history-list { display: grid; border-top: 1px solid #3a4247; }
+    .route-history-row { min-width: 0; display: grid; grid-template-columns: 22px minmax(150px, 1.5fr) minmax(90px, .8fr) minmax(90px, .8fr) minmax(120px, 1fr) auto; align-items: center; gap: 8px; min-height: 38px; padding: 5px 2px; border-bottom: 1px solid #30373b; }
+    .route-history-checkbox { width: 14px; height: 14px; accent-color: #5bc7a1; }
+    .route-history-group, .route-history-provider, .route-history-time { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #a9b4b8; font-size: 10px; }
+    .route-history-time { color: #89949a; }
+    .route-history-empty { padding: 14px 2px; color: #89949a; font-size: 10px; }
+    .route-history-footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; }
+    .route-history-selection-status { color: #a3adb2; font-size: 10px; }
+    .route-history-footer .primary-button { min-height: 30px; padding: 0 10px; font-size: 10px; }
+    .route-history-footer .primary-button:disabled { opacity: .45; cursor: default; }
+    .route-page-note { margin: 11px 0 0; color: #89949a; font-size: 10px; line-height: 1.5; }
+    .route-empty-state { display: flex; align-items: flex-start; gap: 10px; margin-top: 16px; padding: 15px; border: 1px solid #3a4247; border-radius: 5px; background: #22272b; color: #a3adb2; }
+    .route-empty-state > .icon { flex: 0 0 auto; color: #5bc7a1; }
+    .route-empty-state b { color: #e5e9eb; font-size: 11px; font-weight: 600; }
+    .route-empty-state p { margin: 5px 0 0; font-size: 10px; line-height: 1.5; }
+    .route-context-form { max-width: 560px; display: grid; gap: 15px; padding-top: 16px; }
+    .route-context-form .field { display: grid; gap: 5px; }
+    .route-context-form .field > span { color: #e5e9eb; font-size: 11px; font-weight: 600; }
+    .route-context-form .field input { min-width: 0; height: 34px; padding: 0 9px; border: 1px solid #465057; border-radius: 4px; background: #292f34; color: #e5e9eb; font-size: 11px; }
+    .route-context-form .field small { color: #89949a; font-size: 9px; font-family: "Cascadia Code", Consolas, monospace; }
+    .route-context-form .codex-context-note { margin: 0; font-size: 10px; line-height: 1.6; }
+    .route-context-actions { display: flex; justify-content: flex-end; padding-top: 2px; }
+    .route-context-actions .primary-button { min-height: 31px; background: #5bc7a1; border-color: #5bc7a1; color: #14231e; }
+
+    :root {
+      --bg: #1b1f22;
+      --surface: #22272b;
+      --surface-2: #292f34;
+      --surface-3: #30373c;
+      --line: #3a4247;
+      --line-strong: #4a555b;
+      --text: #e5e9eb;
+      --muted: #a3adb2;
+      --faint: #89949a;
+      --accent: #5bc7a1;
+      --accent-strong: #78d6b5;
+      --success: #5bc7a1;
+      --warning: #e2b25c;
+      --focus: #78d6b5;
+    }
+    body, .app-shell { background: #1b1f22; }
+    .command-bar { background: #252a2e; border-bottom-color: #3a4247; }
+    .context-band { background: #202529; border-bottom-color: #3a4247; }
+    .workspace { background: #1b1f22; }
+    .agent-tab[aria-selected="true"] { background: #30373c; border-color: #4a555b; box-shadow: inset 0 -2px 0 #5bc7a1; }
+    .switch[aria-checked="true"] { border-color: #5bc7a1; background: #356455; }
+    .switch[aria-checked="true"]::after { background: #e5e9eb; }
+    .primary-button { border-color: #d3d9da; background: #d3d9da; color: #17231e; }
+    .provider-row.active { box-shadow: inset 3px 0 0 #5bc7a1; background: #252e2d; }
+
+    @media (max-width: 760px) {
+      .route-workspace { grid-template-columns: 1fr; }
+      .route-sidebar { padding: 9px; border-right: 0; border-bottom: 1px solid #3a4247; }
+      .route-sidebar-title { padding: 0 7px 5px; }
+      .route-sidebar-nav { display: flex; flex-wrap: wrap; gap: 3px; }
+      .route-nav-item { min-height: 30px; padding: 0 8px; }
+      .route-sidebar-status { display: none; }
+      .route-pages { padding: 13px 14px 16px; }
+      .route-group-summary { align-items: flex-start; flex-direction: column; gap: 4px; }
+      .route-group-row { grid-template-columns: 20px 20px minmax(0,1fr); grid-template-areas: "drag order info" ". . actions"; align-items: start; gap: 5px; height: auto; min-height: 0; max-height: none; }
+      .route-group-drag-handle { grid-area: drag; }
+      .route-group-order { grid-area: order; padding-top: 7px; }
+      .route-group-provider { grid-area: info; }
+      .route-group-actions { grid-area: actions; justify-self: end; flex-wrap: wrap; }
+      .route-history-row { grid-template-columns: 20px minmax(120px, 1.3fr) minmax(80px, 1fr) auto; }
+      .route-history-provider, .route-history-time { display: none; }
+      .route-group-footer { bottom: -16px; margin: auto -14px -16px; padding: 9px 14px; }
+    }
+
+    @media (max-width: 520px) {
+      .route-pages { padding: 11px 10px 14px; }
+      .route-page-head h2 { font-size: 14px; }
+      .route-page-head p { font-size: 9px; }
+      .route-group-row { grid-template-columns: 20px 20px minmax(0,1fr); grid-template-areas: "drag order info" ". . actions"; gap: 5px; height: auto; min-height: 0; max-height: none; }
+      .route-group-actions .icon-button { width: 24px; height: 24px; }
+      .route-group-footer { bottom: -14px; margin: auto -10px -14px; padding: 8px 10px; }
+      .route-group-pending { max-width: 84px; line-height: 1.3; }
+      .route-group-footer-actions { gap: 4px; }
+      .route-group-footer .secondary-button, .route-group-footer .primary-button { padding: 0 7px; }
+    }
   </style>
 </head>
 <body>
@@ -6624,20 +6886,75 @@
 
     <main class="workspace">
       <section class="workspace-view agent-view" id="agentView">
-        <div class="workspace-head">
-          <div>
-            <h2>上游路由</h2>
-            <p>当前 Agent 未命中模型映射时，保留 Agent 原始模型参数。</p>
-          </div>
-          <button class="secondary-button codex-context-button" id="codexContextButton" type="button" hidden>
-            <i class="icon" data-lucide="sliders-horizontal"></i><span>上下文和自动压缩上限</span>
-          </button>
-          <div class="provider-tags">
-            <span class="tag success" id="providerCountTag">3 个可用上游</span>
-            <span class="tag">一次入站 · 一次上游</span>
+        <div class="route-workspace" id="routeWorkspace">
+          <aside class="route-sidebar" id="codexRouteSidebar" aria-label="Codex 设置导航" hidden>
+            <div class="route-sidebar-title">Codex 设置</div>
+            <nav class="route-sidebar-nav" role="tablist" aria-label="Codex 设置页面">
+              <button class="route-nav-item is-active" type="button" role="tab" aria-selected="true" data-route-view="upstream"><i class="icon" data-lucide="server"></i><span>上游</span></button>
+              <button class="route-nav-item" type="button" role="tab" aria-selected="false" data-route-view="groups"><i class="icon" data-lucide="layers-2"></i><span>分组管理</span></button>
+              <button class="route-nav-item" type="button" role="tab" aria-selected="false" data-route-view="sessions"><i class="icon" data-lucide="messages-square"></i><span>会话管理</span></button>
+              <button class="route-nav-item" type="button" role="tab" aria-selected="false" data-route-view="context"><i class="icon" data-lucide="sliders-horizontal"></i><span>上下文设置</span></button>
+            </nav>
+            <div class="route-sidebar-status"><i></i><span id="routeProxyStatus">代理状态同步中</span></div>
+          </aside>
+
+          <div class="route-pages">
+            <section class="route-page" data-route-page="upstream">
+              <div class="workspace-head">
+                <div>
+                  <h2>上游路由</h2>
+                  <p>连接、余额、Key 池、测活和模型映射均沿用现有配置。</p>
+                </div>
+                <button class="secondary-button codex-context-button" id="codexContextButton" type="button" hidden>
+                  <i class="icon" data-lucide="sliders-horizontal"></i><span>上下文和自动压缩上限</span>
+                </button>
+                <div class="provider-tags">
+                  <span class="tag success" id="providerCountTag">3 个可用上游</span>
+                  <span class="tag">一次入站 · 一次上游</span>
+                </div>
+              </div>
+              <div class="provider-list" id="providerList"></div>
+            </section>
+
+            <section class="route-page" data-route-page="groups" hidden>
+              <div class="route-page-head"><div><h2>分组管理</h2><p>设置新会话默认上游与其他会话可选线路。</p></div></div>
+              <div class="route-group-editor" id="routeGroupEditor">
+                <div class="route-toolbar">
+                  <label class="route-group-select-label"><span>当前分组</span><select id="routeGroupPicker" aria-label="选择上游分组"></select></label>
+                  <button class="secondary-button route-new-group-button" id="createRouteGroupButton" type="button"><i class="icon" data-lucide="plus"></i><span>新建分组</span></button>
+                </div>
+                <div class="route-group-summary"><div class="route-group-summary-primary"><div class="route-group-name-host" id="routeGroupNameHost"><span class="route-group-name" id="routeGroupNameLabel">默认分组</span></div><span class="tag" id="routeGroupKindTag">新对话默认</span></div><small id="routeGroupSummary">正在读取分组</small></div>
+                <div class="route-group-section-head"><span>分组上游</span><small>拖动调整使用顺序</small></div>
+                <div class="route-group-list" id="routeGroupProviders"></div>
+                <form class="route-inline-form" id="routeGroupAddProviderForm"><select id="routeGroupAddProviderSelect" aria-label="添加上游"></select><button class="secondary-button" type="submit"><i class="icon" data-lucide="plus"></i><span>添加上游</span></button></form>
+                <p class="route-page-note" id="routeGroupNote">新会话按顺序使用本组上游；续接中的会话不会跨上游重放。</p>
+              </div>
+              <footer class="route-group-footer"><span class="route-group-pending" id="routeGroupPendingStatus">配置已保存</span><div class="route-group-footer-actions"><button class="secondary-button route-group-delete" id="deleteRouteGroupButton" type="button" hidden><i class="icon" data-lucide="trash-2"></i><span>删除分组</span></button><button class="primary-button" id="saveRouteGroupChangesButton" type="button" disabled><i class="icon" data-lucide="save"></i><span>保存配置</span></button></div></footer>
+            </section>
+
+            <section class="route-page" data-route-page="sessions" hidden>
+              <div class="route-page-head"><div><h2>会话管理</h2><p>只显示已纳入管理的 Codex 会话。</p><button class="secondary-button route-session-history-button" id="openRouteSessionHistoryButton" type="button"><i class="icon" data-lucide="history"></i><span>历史会话</span><b id="routeHistoryButtonCount">0</b></button></div></div>
+              <section class="route-session-section"><div class="route-session-section-head"><span>已管理会话</span><span id="routeManagedSessionCount">0</span></div><div class="route-session-list" id="routeManagedSessions"></div></section>
+            </section>
+
+            <section class="route-page" data-route-page="sessions-history" hidden>
+              <div class="route-page-head"><div><h2>历史会话</h2><p>勾选会话后纳入管理；历史记录最多保留 10 条。</p><button class="secondary-button route-session-history-button" id="backToRouteSessionsButton" type="button"><i class="icon" data-lucide="arrow-left"></i><span>返回会话管理</span></button></div></div>
+              <div class="route-history-toolbar"><label class="route-group-select-label"><span>纳入分组</span><select id="routeHistoryGroupSelect" aria-label="历史会话分组"></select></label><button class="text-button" id="clearRouteSessionHistoryButton" type="button">清空历史</button></div>
+              <div class="route-history-list" id="routeHistorySessions"></div>
+              <div class="route-history-footer"><span class="route-history-selection-status" id="routeHistorySelectionStatus">请选择要纳入管理的会话</span><button class="primary-button" id="manageSelectedRouteSessionsButton" type="button" disabled><i class="icon" data-lucide="user-round-plus"></i><span>纳入管理</span></button></div>
+            </section>
+
+            <section class="route-page" data-route-page="context" hidden>
+              <div class="route-page-head"><div><h2>上下文设置</h2><p>保留现有 Codex 注入设置；留空时使用 Codex 默认值。</p></div></div>
+              <form class="route-context-form" id="codexContextPageForm" novalidate>
+                <label class="field"><span>上下文窗口（Token）</span><input id="codexContextPageWindowInput" type="text" inputmode="numeric" autocomplete="off" placeholder="留空使用 Codex 默认值" /><small>model_context_window</small></label>
+                <label class="field"><span>自动压缩上限（Token）</span><input id="codexContextPageAutoCompactInput" type="text" inputmode="numeric" autocomplete="off" placeholder="留空使用 Codex 默认值" /><small>model_auto_compact_token_limit</small></label>
+                <p class="codex-context-note">填写正整数；自动压缩上限不能大于上下文窗口。留空会移除对应覆盖值，交由 Codex 默认处理。</p>
+                <div class="route-context-actions"><button class="primary-button" id="saveCodexContextPageButton" type="submit"><i class="icon" data-lucide="save"></i><span>保存设置</span></button></div>
+              </form>
+            </section>
           </div>
         </div>
-        <div class="provider-list" id="providerList"></div>
       </section>
 
       <section class="workspace-view metrics-view" id="metricsView" hidden>
@@ -6851,7 +7168,7 @@
 
         <section class="panel" id="settingsData" hidden>
           <div class="option-row">
-            <div><b>工具传递诊断（临时）</b><small>1.5.8 默认开启。本地限量保存工具名称、类型、选择限制和调用标识，不保存聊天、参数或返回正文。关闭后停止采集；可整体移除。</small></div>
+            <div><b>工具传递诊断（临时）</b><small>默认开启并沿用 1.5.8 设置。本地限量保存工具名称、类型、选择限制和调用标识，不保存聊天、参数或返回正文。关闭后停止采集；可整体移除。</small></div>
             <button class="switch mock-switch" type="button" role="switch" aria-checked="true" aria-label="工具传递诊断"></button>
           </div>
           <p class="codex-context-note" id="toolDiagnosticsPath">日志：Atoapi 配置目录 / tool-diagnostics.jsonl，滚动保留约 8 MiB。</p>
@@ -6892,6 +7209,14 @@
         <button class="primary-button" id="saveCodexContextButton" type="submit" form="codexContextForm">保存设置</button>
       </footer>
     </section>
+  </div>
+
+  <div class="overlay" id="routeGroupCreateOverlay" aria-hidden="true">
+    <form class="route-create-dialog" id="routeGroupCreateForm" role="dialog" aria-modal="true" aria-labelledby="routeGroupCreateTitle">
+      <header class="route-create-dialog-head"><h2 id="routeGroupCreateTitle">新建分组</h2><button class="close-button" type="button" data-close="routeGroupCreateOverlay" aria-label="关闭"><i class="icon" data-lucide="x"></i></button></header>
+      <div class="route-create-dialog-body"><label for="routeGroupCreateInput">分组名称</label><input id="routeGroupCreateInput" maxlength="64" autocomplete="off" placeholder="输入分组名称" required /></div>
+      <footer class="route-create-dialog-foot"><button class="secondary-button" type="button" data-close="routeGroupCreateOverlay">取消</button><button class="primary-button" type="submit"><i class="icon" data-lucide="save"></i><span>保存</span></button></footer>
+    </form>
   </div>
 
   <div class="overlay" id="providerOverlay" aria-hidden="true">
@@ -7614,15 +7939,17 @@
 
     function renderProviders() {
       const agent = selectedAgent();
-      providers.forEach((provider) => provider.active = provider.id === agent.provider);
+      const isCodex = agent.id === "codex";
+      providers.forEach((provider) => provider.active = !isCodex && provider.id === agent.provider);
       $("#providerCountTag").textContent = `${providers.length} 个可用上游`;
+      $("#providerList").classList.toggle("codex-routing-list", isCodex);
       $("#providerList").innerHTML = providers.length ? providers.map((provider) => `
         <article class="provider-row ${provider.active ? "active" : ""}" data-provider-id="${provider.id}">
           <span class="provider-mark">${icon(provider.active ? "route" : "server", 15)}</span>
           <div class="provider-copy"><b>${provider.name}</b><small>${provider.url}</small></div>
           <div class="provider-meta"><div class="provider-tags">${provider.mappings ? `<span class="tag">${provider.mappings} 个映射</span>` : ""}</div><small class="provider-latency"><span>最近连通</span><b>${provider.latency}</b></small></div>
           <div class="provider-actions">
-            <button class="tool-button bind-button" type="button" data-bind-provider="${provider.id}" title="设为当前上游">${icon(provider.active ? "check" : "route", 14)}${provider.active ? "当前" : "使用"}</button>
+            ${isCodex ? "" : `<button class="tool-button bind-button" type="button" data-bind-provider="${provider.id}" title="设为当前上游">${icon(provider.active ? "check" : "route", 14)}${provider.active ? "当前" : "使用"}</button>`}
             <button class="icon-button" type="button" data-test-provider="${provider.id}" aria-label="测试 ${provider.name} 连通性" title="测试连通性">${icon("activity", 14)}</button>
             <button class="icon-button" type="button" data-edit-provider="${provider.id}" aria-label="编辑 ${provider.name}" title="编辑">${icon("pencil", 14)}</button>
             <button class="icon-button" type="button" data-delete-provider="${provider.id}" aria-label="删除 ${provider.name}" title="删除">${icon("trash-2", 14)}</button>
@@ -7809,6 +8136,22 @@
         renderMappings();
         hydrateIcons();
       }));
+    }
+
+    function syncMappingsFromDom() {
+      const rows = $$("#mappingList .mapping-row");
+      if (!rows.length) return;
+      rows.forEach((row, index) => {
+        const inputs = $$("input", row);
+        const previous = mappings[Number(row.dataset.mappingIndex)] || {};
+        mappings[index] = {
+          ...previous,
+          request: inputs[0]?.value || "",
+          actual: inputs[1]?.value || "",
+          context: inputs[2]?.value || "",
+          reasoning: $("select", row)?.value || ""
+        };
+      });
     }
 
     function renderKeyPool() {
@@ -8123,6 +8466,7 @@
     $$(".editor-tab").forEach((tab) => tab.addEventListener("click", () => activatePanel(".editor-tab", tab.dataset.panel)));
 
     $("#addMappingButton").addEventListener("click", () => {
+      syncMappingsFromDom();
       mappings.push({ request: "", actual: "", context: "128000", reasoning: "high" });
       renderMappings();
       hydrateIcons();

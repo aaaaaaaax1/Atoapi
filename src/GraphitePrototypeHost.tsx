@@ -86,7 +86,7 @@ const bridgeSource = String.raw`
     syncKeyPoolSecretInputs();
   };
   const pendingActions = new Map();
-  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "fetch-models", "fetch-health-probe-models", "run-health-probe", "probe-provider-balance", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "save-codex-context", "restart-main-proxy", "clear-cache"]);
+  const asynchronousActions = new Set(["refresh", "toggle-agent", "bind-provider", "save-provider", "delete-provider", "reorder-providers", "save-codex-routing", "set-codex-fallback-enabled", "fetch-models", "fetch-health-probe-models", "run-health-probe", "probe-provider-balance", "test-provider", "test-provider-key", "test-provider-key-pool", "diagnose-network-paths", "probe-cache-capabilities", "set-cache-validation", "save-cache-enabled", "save-settings", "save-codex-context", "restart-main-proxy", "clear-cache"]);
   const send = (action, payload = {}) => {
     const requestId = "graphite-" + Date.now() + "-" + Math.random().toString(16).slice(2);
     const source = document.activeElement instanceof HTMLButtonElement ? document.activeElement : null;
@@ -200,6 +200,22 @@ const bridgeSource = String.raw`
   let healthProbeTarget = "current";
   let healthProbeModels = [];
   let healthProbePrompt = "hi";
+  let activeCodexRouteView = "upstream";
+  let activeCodexRouteGroupId = "default";
+  let pendingCodexRouteGroups = null;
+  let deletedCodexRouteGroupIds = new Set();
+  let editingCodexRouteGroupName = false;
+  let editingCodexRouteGroupId = "";
+  let editingCodexRouteGroupNameValue = "";
+  let draggingCodexRouteProviderId = "";
+  let codexRoutePointerDrag = null;
+  let pendingCodexRouteSaveRequestId = "";
+  let pendingCodexRouteSaveSnapshot = null;
+  let routeViewAfterCodexSave = "";
+  let activeCodexRouteSubview = "";
+  let routeSessionHistoryAfterSave = false;
+  let selectedCodexHistorySessionIds = new Set();
+  let codexHistoryTargetGroupId = "default";
 
   const trendController = () => window.__atoapiTrend;
 
@@ -406,6 +422,7 @@ const bridgeSource = String.raw`
       event.preventDefault();
       const model = select.value.trim();
       if (!model) return;
+      syncMappingsFromDom();
       mappings.push({ request: model, actual: model, context: "", reasoning: "", supportedReasoningEfforts: [] });
       renderMappings();
       select.value = "";
@@ -634,6 +651,368 @@ const bridgeSource = String.raw`
       agentId: agent?.sourceId || agent?.id || "",
       providerIds
     });
+  }
+
+  function renderCodexGroupPage() {
+    const list = $bridge("#routeGroupProviders");
+    const summary = $bridge("#routeGroupSummary");
+    if (!list || !summary) return;
+    const agent = currentAgent();
+    if (!agent || agent.sourceId !== "codex") {
+      list.innerHTML = "";
+      summary.textContent = "仅在 Codex Agent 下显示当前真实上游顺序";
+      return;
+    }
+    const savedGroups = Array.isArray(host.state?.codexRouteGroups) ? host.state.codexRouteGroups : [];
+    const groups = pendingCodexRouteGroups || savedGroups;
+    const sessions = Array.isArray(host.state?.codexSessionRoutes) ? host.state.codexSessionRoutes : [];
+    const groupPicker = $bridge("#routeGroupPicker");
+    if (!groups.some((group) => group.id === activeCodexRouteGroupId)) activeCodexRouteGroupId = "default";
+    const group = groups.find((item) => item.id === activeCodexRouteGroupId) || groups[0];
+    if (!group) {
+      summary.textContent = "暂无分组";
+      list.innerHTML = "";
+      return;
+    }
+    groupPicker.innerHTML = groups.map((item) =>
+      '<option value="' + escape(item.id) + '"' + (item.id === group.id ? " selected" : "") + '>' + escape(item.name) + '</option>'
+    ).join("");
+    if (!savedGroups.some((item) => item.id === codexHistoryTargetGroupId)) codexHistoryTargetGroupId = "default";
+    $bridge("#routeHistoryGroupSelect").innerHTML = savedGroups.map((item) =>
+      '<option value="' + escape(item.id) + '"' + (item.id === codexHistoryTargetGroupId ? " selected" : "") + '>' + escape(item.name) + '</option>'
+    ).join("");
+    const memberProviders = group.provider_ids.map((id) => providers.find((item) => item.id === id)).filter(Boolean);
+    summary.textContent = group.id === "default"
+      ? memberProviders.length + " 个上游 · 新会话默认"
+      : memberProviders.length + " 个上游 · 会话可选分组";
+    const groupNameHost = $bridge("#routeGroupNameHost");
+    if (groupNameHost) {
+      groupNameHost.classList.toggle("is-fixed", group.id === "default");
+      const nameInput = $bridge("#routeGroupNameEditInput");
+      const preserveEditingNameInput = editingCodexRouteGroupName && group.id === editingCodexRouteGroupId && nameInput === document.activeElement;
+      if (!preserveEditingNameInput) {
+        groupNameHost.innerHTML = editingCodexRouteGroupName && group.id === editingCodexRouteGroupId && group.id !== "default"
+          ? '<input class="route-group-name-edit" id="routeGroupNameEditInput" maxlength="64" aria-label="分组名称" value="' + escape(editingCodexRouteGroupNameValue) + '">'
+          : '<span class="route-group-name" id="routeGroupNameLabel"' + (group.id === "default" ? '' : ' title="双击修改分组名称"') + '>' + escape(group.name) + '</span>';
+      }
+    }
+    $bridge("#routeGroupKindTag").textContent = group.id === "default" ? "新对话默认" : "自定义分组";
+    $bridge("#deleteRouteGroupButton").hidden = group.id === "default";
+    const groupPending = pendingCodexRouteGroups !== null;
+    const groupSaving = Boolean(pendingCodexRouteSaveRequestId);
+    $bridge("#routeGroupPendingStatus").textContent = groupSaving ? "正在保存" : groupPending ? "有未保存更改" : "配置已保存";
+    $bridge("#routeGroupPendingStatus").classList.toggle("is-pending", groupPending);
+    $bridge("#saveRouteGroupChangesButton").disabled = !groupPending || groupSaving;
+    $bridge("#routeGroupEditor")?.classList.toggle("is-saving", groupSaving);
+    $bridge("#deleteRouteGroupButton").disabled = groupSaving;
+    const addProviderSelect = $bridge("#routeGroupAddProviderSelect");
+    const addable = providers.filter((provider) => !group.provider_ids.includes(provider.id));
+    addProviderSelect.innerHTML = addable.length
+      ? addable.map((provider) => '<option value="' + escape(provider.id) + '">' + escape(provider.name) + '</option>').join("")
+      : '<option value="">没有可添加的上游</option>';
+    addProviderSelect.disabled = !addable.length;
+    list.innerHTML = memberProviders.length
+      ? memberProviders.map((provider, index) =>
+          '<div class="route-group-row" data-route-group-provider="' + escape(provider.id) + '" data-provider-id="' + escape(provider.id) + '">' +
+            '<span class="route-group-drag-handle" data-route-group-drag="' + escape(provider.id) + '" role="button" tabindex="0" aria-label="拖动调整上游顺序" title="拖动排序">' + icon("grip-vertical", 14) + '</span>' +
+            '<span class="route-group-order">' + String(index + 1).padStart(2, "0") + '</span>' +
+            '<div class="route-group-provider"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small><span class="route-provider-detail">' + escape(provider.channel || "Responses") + ' · ' + escape(provider.keys || 0) + ' 个可用 Key · ' + escape(provider.mappings || 0) + ' 个模型 · 最近连通 ' + escape(provider.latency || "未检测") + '</span></div>' +
+            '<div class="route-group-actions">' +
+              '<span class="codex-fallback-control route-group-fallback-control"><small>备选</small><button class="switch codex-fallback-switch" type="button" role="switch" data-codex-fallback-toggle="' + escape(provider.id) + '" aria-checked="' + String(!(host.state?.codexFallbackDisabledProviderIds || []).includes(provider.id)) + '" aria-label="参与自动备选" title="控制新会话分组选路时是否将此上游作为备用；排在分组首位时仍可作首选。不会在单次请求失败后自动重试，已绑定会话也不会因此切线"></button></span>' +
+              '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button>' +
+              '<button class="secondary-button route-provider-test" type="button" data-test-provider="' + escape(provider.id) + '" title="测试上游连通性">' + icon("plug-zap", 13) + '<span>测试连通</span></button>' +
+              '<button class="secondary-button route-provider-test route-provider-health" type="button" data-health-probe-provider="' + escape(provider.id) + '" title="发送轻量请求测活">' + icon("activity", 13) + '<span>测活</span></button>' +
+              '<button class="icon-button route-provider-edit" type="button" data-edit-provider="' + escape(provider.id) + '" aria-label="编辑 ' + escape(provider.name) + '" title="编辑上游">' + icon("pencil", 13) + '</button>' +
+              '<button class="icon-button" type="button" data-route-group-remove="' + escape(provider.id) + '" aria-label="从分组移除 ' + escape(provider.name) + '" title="从分组移除">' + icon("x", 13) + '</button>' +
+            '</div></div>'
+        ).join("")
+      : '<div class="empty-row">此分组还没有上游</div>';
+    $bridge("#routeGroupEditor")?.querySelectorAll("button, select, input").forEach((control) => { control.disabled = groupSaving; });
+    const note = $bridge("#routeGroupNote");
+    if (note) note.textContent = groupPending
+      ? "更改尚未保存；保存后新会话将按此顺序选路。"
+      : "新会话按顺序使用本组上游；续接中的会话不会跨上游重放。";
+    const managed = sessions.filter((session) => session.managed);
+    const recent = sessions.filter((session) => !session.managed).slice(-10).reverse();
+    const recentIds = new Set(recent.map((session) => session.session_id));
+    selectedCodexHistorySessionIds = new Set([...selectedCodexHistorySessionIds].filter((id) => recentIds.has(id)));
+    const groupOptions = groups.map((item) => '<option value="' + escape(item.id) + '">' + escape(item.name) + '</option>').join("");
+    const sessionLabel = (session) => String(session.display_name || "").trim() || session.session_id;
+    const renderManagedSession = (session) => {
+      const routePin = (host.state?.codexSessionRoutePins || []).find((item) => item.session_id === session.session_id);
+      const actualProvider = providers.find((item) => item.id === session.last_provider_id)
+        || providers.find((item) => item.id === routePin?.provider_id);
+      const groupName = groups.find((item) => item.id === session.group_id)?.name || "默认分组";
+      const seen = session.last_seen_at ? new Date(session.last_seen_at).toLocaleString("zh-CN") : "";
+      return '<div class="route-session-row" data-session-id="' + escape(session.session_id) + '">' +
+        '<span class="route-session-id route-session-name" data-session-name="' + escape(session.session_id) + '" title="双击重命名；会话 ID：' + escape(session.session_id) + '">' + escape(sessionLabel(session)) + '</span>' +
+        '<select data-session-group="' + escape(session.session_id) + '" aria-label="会话分组">' + groupOptions.replace('value="' + escape(session.group_id) + '"', 'value="' + escape(session.group_id) + '" selected') + '</select>' +
+        '<span class="route-session-provider" title="' + escape(actualProvider?.name || groupName) + '">' + escape(actualProvider?.name || groupName) + (seen ? ' · ' + escape(seen) : '') + '</span>' +
+        '<div class="route-session-actions">' +
+          '<button class="icon-button" type="button" data-session-rename="' + escape(session.session_id) + '" aria-label="重命名会话" title="重命名会话">' + icon("pencil", 13) + '</button>' +
+          '<button class="icon-button" type="button" data-session-remove="' + escape(session.session_id) + '" aria-label="移出管理" title="移出管理">' + icon("user-round-minus", 13) + '</button>' +
+          '<button class="icon-button" type="button" data-session-delete="' + escape(session.session_id) + '" aria-label="删除会话记录" title="删除记录">' + icon("trash-2", 13) + '</button>' +
+        '</div></div>';
+    };
+    const renderHistorySession = (session) => {
+      const routePin = (host.state?.codexSessionRoutePins || []).find((item) => item.session_id === session.session_id);
+      const actualProvider = providers.find((item) => item.id === session.last_provider_id)
+        || providers.find((item) => item.id === routePin?.provider_id);
+      const groupName = groups.find((item) => item.id === session.group_id)?.name || "默认分组";
+      const seen = session.last_seen_at ? new Date(session.last_seen_at).toLocaleString("zh-CN") : "时间未知";
+      const checked = selectedCodexHistorySessionIds.has(session.session_id);
+      return '<div class="route-history-row" data-session-id="' + escape(session.session_id) + '">' +
+        '<input class="route-history-checkbox" type="checkbox" data-route-history-select="' + escape(session.session_id) + '" aria-label="选择会话 ' + escape(session.session_id) + '"' + (checked ? ' checked' : '') + '>' +
+        '<span class="route-session-id route-session-name" data-session-name="' + escape(session.session_id) + '" title="双击重命名；会话 ID：' + escape(session.session_id) + '">' + escape(sessionLabel(session)) + '</span>' +
+        '<span class="route-history-group" title="' + escape(groupName) + '">' + escape(groupName) + '</span>' +
+        '<span class="route-history-provider" title="' + escape(actualProvider?.name || "尚无上游记录") + '">' + escape(actualProvider?.name || "尚无上游记录") + '</span>' +
+        '<time class="route-history-time">' + escape(seen) + '</time>' +
+        '<button class="icon-button" type="button" data-session-delete="' + escape(session.session_id) + '" aria-label="删除会话历史" title="删除记录">' + icon("trash-2", 13) + '</button>' +
+        '</div>';
+    };
+    $bridge("#routeManagedSessionCount").textContent = String(managed.length);
+    $bridge("#routeManagedSessions").innerHTML = managed.length
+      ? managed.map(renderManagedSession).join("")
+      : '<div class="route-session-empty">还没有管理中的会话</div>';
+    $bridge("#routeHistoryButtonCount").textContent = String(recent.length);
+    $bridge("#routeHistorySessions").innerHTML = recent.length
+      ? recent.map(renderHistorySession).join("")
+      : '<div class="route-session-empty">最近会话会在 Codex 发起请求后自动出现</div>';
+    const selectedCount = selectedCodexHistorySessionIds.size;
+    $bridge("#routeHistorySelectionStatus").textContent = selectedCount ? '已选择 ' + selectedCount + ' 条会话' : '请选择要纳入管理的会话';
+    $bridge("#manageSelectedRouteSessionsButton").disabled = selectedCount === 0 || Boolean(pendingCodexRouteSaveRequestId);
+    groupPicker.onchange = () => {
+      if (editingCodexRouteGroupName) commitCodexGroupName($bridge("#routeGroupNameEditInput")?.value);
+      activeCodexRouteGroupId = groupPicker.value || "default";
+      syncCodexRouteWorkspace();
+      hydrateIcons();
+    };
+  }
+
+  function saveCodexRouting(groups, sessions, notice, pins = clone(host.state?.codexSessionRoutePins || [])) {
+    return send("save-codex-routing", { groups, sessions, pins, notice });
+  }
+
+  function beginCodexSessionRename(sessionId) {
+    if (!sessionId || pendingCodexRouteSaveRequestId) return;
+    const row = document.querySelector('.route-session-row[data-session-id="' + CSS.escape(sessionId) + '"], .route-history-row[data-session-id="' + CSS.escape(sessionId) + '"]');
+    const label = row?.querySelector("[data-session-name]");
+    if (!row || !label || row.querySelector("[data-session-name-input]")) return;
+    const session = (host.state?.codexSessionRoutes || []).find((item) => item.session_id === sessionId);
+    if (!session) return;
+    const input = document.createElement("input");
+    input.className = "route-session-name-input";
+    input.setAttribute("data-session-name-input", sessionId);
+    input.maxLength = 64;
+    input.value = String(session.display_name || "");
+    input.placeholder = session.session_id;
+    input.setAttribute("aria-label", "会话名称，留空恢复显示会话 ID");
+    label.replaceWith(input);
+    input.focus();
+    input.select();
+    let settled = false;
+    const finish = (save) => {
+      if (settled) return;
+      settled = true;
+      if (!save) { renderCodexGroupPage(); hydrateIcons(); return; }
+      const name = input.value.trim();
+      const sessions = clone(host.state?.codexSessionRoutes || []);
+      const target = sessions.find((item) => item.session_id === sessionId);
+      if (!target) return;
+      target.display_name = name || null;
+      pendingCodexRouteSaveSnapshot = { groups: clone(host.state?.codexRouteGroups || []), sessions, pins: clone(host.state?.codexSessionRoutePins || []) };
+      pendingCodexRouteSaveRequestId = saveCodexRouting(
+        pendingCodexRouteSaveSnapshot.groups,
+        sessions,
+        name ? "会话名称已保存" : "会话名称已恢复为 ID",
+        pendingCodexRouteSaveSnapshot.pins
+      );
+      renderCodexGroupPage();
+    };
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") { event.preventDefault(); finish(true); }
+      if (event.key === "Escape") { event.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  function openCodexSessionHistory() {
+    if (pendingCodexRouteGroups) {
+      showToast("请先保存分组配置");
+      return;
+    }
+    activeCodexRouteView = "sessions";
+    activeCodexRouteSubview = "history";
+    syncCodexRouteWorkspace();
+    hydrateIcons();
+  }
+
+  function closeCodexSessionHistory() {
+    activeCodexRouteView = "sessions";
+    activeCodexRouteSubview = "";
+    selectedCodexHistorySessionIds.clear();
+    syncCodexRouteWorkspace();
+    hydrateIcons();
+  }
+
+  function manageSelectedCodexHistorySessions() {
+    const selected = [...selectedCodexHistorySessionIds];
+    if (!selected.length || pendingCodexRouteSaveRequestId) return;
+    const groupId = $bridge("#routeHistoryGroupSelect")?.value || "default";
+    const sessions = clone(host.state?.codexSessionRoutes || []);
+    const groups = clone(host.state?.codexRouteGroups || []);
+    const pins = clone(host.state?.codexSessionRoutePins || []);
+    let changed = false;
+    for (const session of sessions) {
+      if (!selected.includes(session.session_id)) continue;
+      session.managed = true;
+      session.group_id = groupId;
+      changed = true;
+    }
+    if (!changed) return;
+    routeSessionHistoryAfterSave = true;
+    pendingCodexRouteSaveSnapshot = { groups, sessions, pins };
+    pendingCodexRouteSaveRequestId = saveCodexRouting(groups, sessions, "已纳入管理", pins);
+    renderCodexGroupPage();
+  }
+
+  function updateCodexGroup(mutator, notice) {
+    const groups = pendingCodexRouteGroups || clone(host.state?.codexRouteGroups || []);
+    pendingCodexRouteGroups = groups;
+    const group = groups.find((item) => item.id === activeCodexRouteGroupId);
+    if (!group) return;
+    mutator(group, groups);
+    renderCodexGroupPage();
+    hydrateIcons();
+    if (notice) showToast(notice + "，保存后生效");
+  }
+
+  function moveCodexRouteProvider(draggedId, targetId) {
+    if (!draggedId || !targetId || draggedId === targetId) return;
+    const groups = pendingCodexRouteGroups || clone(host.state?.codexRouteGroups || []);
+    const group = groups.find((item) => item.id === activeCodexRouteGroupId);
+    if (!group) return;
+    const from = group.provider_ids.indexOf(draggedId);
+    const target = group.provider_ids.indexOf(targetId);
+    if (from < 0 || target < 0 || from === target) return;
+    const activeElementId = document.activeElement?.id || "";
+    pendingCodexRouteGroups = groups;
+    const [providerId] = group.provider_ids.splice(from, 1);
+    group.provider_ids.splice(target, 0, providerId);
+    renderCodexGroupPage();
+    hydrateIcons();
+    if (activeElementId === "routeGroupNameEditInput") $bridge("#routeGroupNameEditInput")?.focus();
+    showToast("上游顺序已调整，保存配置后生效");
+  }
+
+  function commitCodexGroupName(value) {
+    const name = String(value || "").trim();
+    const editingGroupId = editingCodexRouteGroupId;
+    editingCodexRouteGroupName = false;
+    editingCodexRouteGroupId = "";
+    if (!name) {
+      renderCodexGroupPage();
+      return;
+    }
+    const groups = pendingCodexRouteGroups || clone(host.state?.codexRouteGroups || []);
+    const group = groups.find((item) => item.id === editingGroupId);
+    if (!group || group.id === "default") return;
+    if (groups.some((item) => item.id !== group.id && item.name.toLowerCase() === name.toLowerCase())) {
+      showToast("分组名称不能重复");
+      renderCodexGroupPage();
+      return;
+    }
+    if (group.name !== name) {
+      pendingCodexRouteGroups = groups;
+      group.name = name;
+      showToast("分组名称已修改，保存配置后生效");
+    }
+    renderCodexGroupPage();
+  }
+
+  function commitCodexGroupConfiguration() {
+    if (!pendingCodexRouteGroups || pendingCodexRouteSaveRequestId) return;
+    const validGroupIds = new Set(pendingCodexRouteGroups.map((group) => group.id));
+    const sessions = clone(host.state?.codexSessionRoutes || []).map((session) =>
+      deletedCodexRouteGroupIds.has(session.group_id) && !validGroupIds.has(session.group_id)
+        ? { ...session, group_id: "default", last_provider_id: null }
+        : session
+    );
+    const pins = clone(host.state?.codexSessionRoutePins || []).map((pin) =>
+      deletedCodexRouteGroupIds.has(pin.group_id) && !validGroupIds.has(pin.group_id)
+        ? { ...pin, group_id: "default" }
+        : pin
+    );
+    pendingCodexRouteSaveSnapshot = { groups: clone(pendingCodexRouteGroups), sessions, pins };
+    pendingCodexRouteSaveRequestId = saveCodexRouting(
+      pendingCodexRouteSaveSnapshot.groups,
+      sessions,
+      "分组配置已保存",
+      pins
+    );
+    renderCodexGroupPage();
+  }
+
+  function syncCodexRouteWorkspace() {
+    const workspace = $bridge("#routeWorkspace");
+    const sidebar = $bridge("#codexRouteSidebar");
+    const shellWorkspace = $bridge(".workspace");
+    const agent = currentAgent();
+    const isCodex = agent?.sourceId === "codex";
+    if (!workspace || !sidebar) return;
+    sidebar.hidden = !isCodex;
+    workspace.classList.toggle("route-sidebar-visible", isCodex);
+    shellWorkspace?.classList.toggle("codex-route-mode", isCodex);
+    if (!isCodex) activeCodexRouteView = "upstream";
+    document.querySelectorAll("[data-route-view]").forEach((button) => {
+      const active = isCodex && button.getAttribute("data-route-view") === activeCodexRouteView;
+      button.setAttribute("aria-selected", String(active));
+      button.classList.toggle("is-active", active);
+    });
+    document.querySelectorAll("[data-route-page]").forEach((page) => {
+      const pageView = page.getAttribute("data-route-page");
+      const showingHistory = activeCodexRouteView === "sessions" && activeCodexRouteSubview === "history";
+      page.hidden = isCodex
+        ? pageView === "sessions-history"
+          ? !showingHistory
+          : pageView !== activeCodexRouteView || showingHistory
+        : pageView !== "upstream";
+    });
+    const settings = host.state?.codexContextSettings || {};
+    const contextWindow = $bridge("#codexContextPageWindowInput");
+    const autoCompactLimit = $bridge("#codexContextPageAutoCompactInput");
+    if (contextWindow && document.activeElement !== contextWindow) contextWindow.value = settings.contextWindow ?? "";
+    if (autoCompactLimit && document.activeElement !== autoCompactLimit) autoCompactLimit.value = settings.autoCompactLimit ?? "";
+    renderCodexGroupPage();
+  }
+
+  function selectCodexRouteView(view) {
+    const allowed = new Set(["upstream", "groups", "sessions", "context"]);
+    if (!allowed.has(view) || currentAgent()?.sourceId !== "codex") return;
+    if (pendingCodexRouteGroups && view !== "groups") {
+      if (!window.confirm("分组配置有未保存更改。保存后再切换页面吗？")) return;
+      routeViewAfterCodexSave = view;
+      commitCodexGroupConfiguration();
+      return;
+    }
+    editingCodexRouteGroupName = false;
+    activeCodexRouteView = view;
+    activeCodexRouteSubview = "";
+    syncCodexRouteWorkspace();
+    hydrateIcons();
+  }
+
+  function moveCodexProvider(providerId, direction) {
+    if (currentAgent()?.sourceId !== "codex") return;
+    const group = (host.state?.codexRouteGroups || []).find((item) => item.id === activeCodexRouteGroupId);
+    if (!group) return;
+    const fromIndex = group.provider_ids.indexOf(providerId);
+    const targetIndex = fromIndex + direction;
+    if (fromIndex < 0 || targetIndex < 0 || targetIndex >= group.provider_ids.length) return;
+    const providerIds = [...group.provider_ids];
+    const [moved] = providerIds.splice(fromIndex, 1);
+    providerIds.splice(targetIndex, 0, moved);
+    updateCodexGroup((target) => { target.provider_ids = providerIds; }, "分组上游顺序已保存");
   }
 
   function serializeEditor() {
@@ -925,6 +1304,7 @@ const bridgeSource = String.raw`
     if (!provider) return;
     provider.balance = result;
     renderProviders();
+    renderCodexGroupPage();
     hydrateIcons();
   }
 
@@ -1132,6 +1512,8 @@ const bridgeSource = String.raw`
       if (title) title.textContent = "Atoapi " + (nextState?.appVersion || "");
       if (detail) detail.textContent = "Graphite Control Desk · 已接入真实 Agent、上游、模型映射、Key 池、缓存与请求诊断。";
     }
+    const routeStatus = $bridge("#routeProxyStatus");
+    if (routeStatus) routeStatus.textContent = running ? "代理运行中 · " + address : "代理未运行";
   }
 
   function reasoningEffortRank(value) {
@@ -1272,6 +1654,34 @@ const bridgeSource = String.raw`
       if (message.payload?.healthProbeModels) applyHealthProbeModels(message.payload.healthProbeModels);
       if (message.payload?.healthProbe) applyHealthProbeResult(message.payload.healthProbe);
       if (message.payload?.balanceProbe) applyBalanceProbe(message.payload.balanceProbe);
+      if (message.requestId === pendingCodexRouteSaveRequestId) {
+        pendingCodexRouteSaveRequestId = "";
+        if (!message.error && pendingCodexRouteSaveSnapshot) {
+          host.state.codexRouteGroups = pendingCodexRouteSaveSnapshot.groups;
+          host.state.codexSessionRoutes = pendingCodexRouteSaveSnapshot.sessions;
+          host.state.codexSessionRoutePins = pendingCodexRouteSaveSnapshot.pins;
+          pendingCodexRouteGroups = null;
+          deletedCodexRouteGroupIds.clear();
+          renderCodexGroupPage();
+          if (routeViewAfterCodexSave) {
+            activeCodexRouteView = routeViewAfterCodexSave;
+            routeViewAfterCodexSave = "";
+            syncCodexRouteWorkspace();
+          }
+          if (routeSessionHistoryAfterSave) {
+            routeSessionHistoryAfterSave = false;
+            activeCodexRouteView = "sessions";
+            activeCodexRouteSubview = "";
+            selectedCodexHistorySessionIds.clear();
+            syncCodexRouteWorkspace();
+          }
+        } else {
+          routeViewAfterCodexSave = "";
+          routeSessionHistoryAfterSave = false;
+          renderCodexGroupPage();
+        }
+        pendingCodexRouteSaveSnapshot = null;
+      }
       if (message.payload?.metricsTrend) {
         const trend = message.payload.metricsTrend;
         if (trend.error) trendController()?.setError(trend.error, trend.sequence, trend.rangeKey);
@@ -1358,6 +1768,49 @@ const bridgeSource = String.raw`
     event.stopPropagation();
   }, true);
 
+  function clearCodexRoutePointerDrag() {
+    codexRoutePointerDrag = null;
+    draggingCodexRouteProviderId = "";
+    document.querySelectorAll(".route-group-row.is-dragging, .route-group-row.is-drag-over").forEach((item) => {
+      item.classList.remove("is-dragging", "is-drag-over");
+    });
+  }
+
+  document.addEventListener("pointerdown", (event) => {
+    const handle = event.target instanceof Element ? event.target.closest("[data-route-group-drag]") : null;
+    const providerId = handle?.getAttribute("data-route-group-drag") || "";
+    if (!providerId || event.button !== 0) return;
+    codexRoutePointerDrag = { pointerId: event.pointerId, providerId };
+    draggingCodexRouteProviderId = providerId;
+    handle.closest(".route-group-row")?.classList.add("is-dragging");
+    try { handle.setPointerCapture?.(event.pointerId); } catch (_) {}
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("pointermove", (event) => {
+    if (!codexRoutePointerDrag || event.pointerId !== codexRoutePointerDrag.pointerId) return;
+    const node = document.elementFromPoint(event.clientX, event.clientY);
+    const row = node instanceof Element ? node.closest(".route-group-row[data-provider-id]") : null;
+    const targetId = row?.getAttribute("data-provider-id") || "";
+    document.querySelectorAll(".route-group-row.is-drag-over").forEach((item) => item.classList.remove("is-drag-over"));
+    if (targetId && targetId !== draggingCodexRouteProviderId) row?.classList.add("is-drag-over");
+    event.preventDefault();
+  }, true);
+
+  document.addEventListener("pointerup", (event) => {
+    if (!codexRoutePointerDrag || event.pointerId !== codexRoutePointerDrag.pointerId) return;
+    const draggedId = codexRoutePointerDrag.providerId;
+    const node = document.elementFromPoint(event.clientX, event.clientY);
+    const row = node instanceof Element ? node.closest(".route-group-row[data-provider-id]") : null;
+    const targetId = row?.getAttribute("data-provider-id") || "";
+    clearCodexRoutePointerDrag();
+    if (!targetId || targetId === draggedId) return;
+    event.preventDefault();
+    moveCodexRouteProvider(draggedId, targetId);
+  }, true);
+
+  document.addEventListener("pointercancel", clearCodexRoutePointerDrag, true);
+
   document.addEventListener("dragstart", (event) => {
     const handle = event.target instanceof Element ? event.target.closest("[data-provider-drag]") : null;
     const providerId = handle?.getAttribute("data-provider-drag") || "";
@@ -1414,6 +1867,97 @@ const bridgeSource = String.raw`
   document.addEventListener("click", (event) => {
     const target = event.target instanceof Element ? event.target.closest("button, [data-bind-provider], [data-edit-provider], [data-delete-provider]") : null;
     if (!target) return;
+    if (target.dataset.routeView) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      selectCodexRouteView(target.dataset.routeView); return;
+    }
+    if (target.dataset.codexFallbackToggle) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      send("set-codex-fallback-enabled", {
+        providerId: target.dataset.codexFallbackToggle,
+        enabled: target.getAttribute("aria-checked") !== "true"
+      });
+      return;
+    }
+    if (target.dataset.routeGroupRemove) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      updateCodexGroup((group) => {
+        group.provider_ids = group.provider_ids.filter((id) => id !== target.dataset.routeGroupRemove);
+      }, "已从分组移除上游");
+      return;
+    }
+    if (target.id === "createRouteGroupButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      $bridge("#routeGroupCreateForm")?.reset();
+      openOverlay("routeGroupCreateOverlay");
+      window.setTimeout(() => $bridge("#routeGroupCreateInput")?.focus(), 0);
+      return;
+    }
+    if (target.id === "saveRouteGroupChangesButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      commitCodexGroupConfiguration();
+      return;
+    }
+    if (target.id === "deleteRouteGroupButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (activeCodexRouteGroupId === "default") return;
+      if (!window.confirm("删除此分组？保存配置后，其中会话将回到默认分组。")) return;
+      const groups = pendingCodexRouteGroups || clone(host.state?.codexRouteGroups || []);
+      if ((host.state?.codexRouteGroups || []).some((group) => group.id === activeCodexRouteGroupId)) {
+        deletedCodexRouteGroupIds.add(activeCodexRouteGroupId);
+      }
+      pendingCodexRouteGroups = groups.filter((group) => group.id !== activeCodexRouteGroupId);
+      activeCodexRouteGroupId = "default";
+      editingCodexRouteGroupName = false;
+      renderCodexGroupPage();
+      hydrateIcons();
+      showToast("分组已移除，保存配置后生效");
+      return;
+    }
+    if (target.id === "openRouteSessionHistoryButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      openCodexSessionHistory();
+      return;
+    }
+    if (target.id === "backToRouteSessionsButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      closeCodexSessionHistory();
+      return;
+    }
+    if (target.id === "manageSelectedRouteSessionsButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      manageSelectedCodexHistorySessions();
+      return;
+    }
+    if (target.dataset.sessionManage || target.dataset.sessionRemove || target.dataset.sessionDelete) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      const sessionId = target.dataset.sessionManage || target.dataset.sessionRemove || target.dataset.sessionDelete;
+      if (target.dataset.sessionDelete && !window.confirm("删除这条会话记录？线路绑定也将解除，之后再次请求会按默认分组选路。")) return;
+      const sessions = clone(host.state?.codexSessionRoutes || []);
+      let pins = clone(host.state?.codexSessionRoutePins || []);
+      const index = sessions.findIndex((session) => session.session_id === sessionId);
+      if (index < 0) return;
+      if (target.dataset.sessionDelete) {
+        sessions.splice(index, 1);
+        pins = pins.filter((pin) => pin.session_id !== sessionId);
+      }
+      else sessions[index].managed = Boolean(target.dataset.sessionManage);
+      saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, target.dataset.sessionDelete ? "会话记录已删除" : (target.dataset.sessionManage ? "会话已加入管理" : "会话已移出管理"), pins);
+      return;
+    }
+    if (target.dataset.sessionRename) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      beginCodexSessionRename(target.dataset.sessionRename);
+      return;
+    }
+    if (target.id === "clearRouteSessionHistoryButton") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (!window.confirm("清空最近 10 条会话历史？已管理会话和续接线路绑定会保留。")) return;
+      const sessions = clone(host.state?.codexSessionRoutes || []).filter((session) => session.managed);
+      saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "最近会话历史已清空");
+      selectedCodexHistorySessionIds.clear();
+      return;
+    }
     if (target.id === "codexContextButton") {
       event.preventDefault(); event.stopImmediatePropagation();
       const settings = host.state?.codexContextSettings || {};
@@ -1566,9 +2110,56 @@ const bridgeSource = String.raw`
     }
   }, true);
 
+  document.addEventListener("dblclick", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("#routeGroupNameLabel") : null;
+    if (!target || currentAgent()?.sourceId !== "codex" || activeCodexRouteGroupId === "default") return;
+    const group = (pendingCodexRouteGroups || host.state?.codexRouteGroups || []).find((item) => item.id === activeCodexRouteGroupId);
+    if (!group) return;
+    event.preventDefault();
+    editingCodexRouteGroupName = true;
+    editingCodexRouteGroupId = activeCodexRouteGroupId;
+    editingCodexRouteGroupNameValue = group.name;
+    renderCodexGroupPage();
+    const input = $bridge("#routeGroupNameEditInput");
+    input?.focus();
+    input?.select();
+  }, true);
+
+  document.addEventListener("keydown", (event) => {
+    const input = event.target instanceof HTMLInputElement && event.target.id === "routeGroupNameEditInput"
+      ? event.target
+      : null;
+    if (!input) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      commitCodexGroupName(input.value);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      editingCodexRouteGroupName = false;
+      editingCodexRouteGroupId = "";
+      renderCodexGroupPage();
+    }
+  }, true);
+
+  document.addEventListener("focusout", (event) => {
+    const input = event.target instanceof HTMLInputElement && event.target.id === "routeGroupNameEditInput"
+      ? event.target
+      : null;
+    if (!input || !editingCodexRouteGroupName) return;
+    window.setTimeout(() => {
+      if (document.activeElement !== input && document.getElementById("routeGroupNameEditInput") === input) {
+        commitCodexGroupName(input.value);
+      }
+    }, 0);
+  }, true);
+
   document.addEventListener("input", (event) => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
+    if (target.id === "routeGroupNameEditInput") {
+      editingCodexRouteGroupNameValue = target.value;
+      return;
+    }
     if (target.matches("[data-saved-secret=true]") && target.value) {
       target.classList.remove("has-saved-secret");
       target.removeAttribute("data-saved-secret");
@@ -1594,14 +2185,16 @@ const bridgeSource = String.raw`
 
   renderProviders = function() {
     const agent = currentAgent();
-    providers.forEach((provider) => provider.active = provider.id === agent.provider);
+    const isCodex = agent?.sourceId === "codex";
+    providers.forEach((provider) => provider.active = !isCodex && provider.id === agent?.provider);
     $bridge("#providerCountTag").textContent = providers.length + " 个可用上游";
+    $bridge("#providerList")?.classList.toggle("codex-routing-list", isCodex);
     $bridge("#providerList").innerHTML = providers.length ? providers.map((provider) =>
       '<article class="provider-row ' + (provider.active ? "active" : "") + '" data-provider-id="' + escape(provider.id) + '">' +
       '<span class="provider-mark" draggable="true" data-provider-drag="' + escape(provider.id) + '" title="拖动调整上游顺序" style="cursor:grab">' + icon(provider.active ? "route" : "server", 15) + '</span>' +
       '<div class="provider-copy"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small></div>' +
       '<div class="provider-meta"><div class="provider-tags">' + (provider.mappings ? '<span class="tag">' + escape(provider.mappings + " 个映射") + '</span>' : '') + keyPoolCountBadge(provider) + '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button></div><small class="provider-latency"><span>最近连通</span><b>' + escape(provider.latency) + '</b></small></div>' +
-      '<div class="provider-actions"><button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>' +
+      '<div class="provider-actions">' + (isCodex ? '' : '<button class="tool-button bind-button" type="button" data-bind-provider="' + escape(provider.id) + '" title="设为当前上游">' + icon(provider.active ? "check" : "route", 14) + (provider.active ? "当前" : "使用") + '</button>') +
       '<button class="tool-button connection-test-button" type="button" data-test-provider="' + escape(provider.id) + '" aria-label="测试 ' + escape(provider.name) + ' 连通性" title="测试当前 Key 连通性">' + icon("plug-zap", 14) + '连通</button>' +
       '<button class="tool-button health-probe-button" type="button" data-health-probe-provider="' + escape(provider.id) + '" aria-label="测活 ' + escape(provider.name) + '" title="测活">' + icon("activity", 14) + '测活</button>' +
       '<button class="icon-button" type="button" data-edit-provider="' + escape(provider.id) + '" aria-label="编辑 ' + escape(provider.name) + '" title="编辑">' + icon("pencil", 14) + '</button>' +
@@ -1739,6 +2332,21 @@ const bridgeSource = String.raw`
     });
   };
 
+  function syncMappingsFromDom() {
+    const rows = Array.from(document.querySelectorAll("#mappingList .mapping-row"));
+    if (!rows.length) return;
+    replace(mappings, rows.map((row) => {
+      const inputs = row.querySelectorAll("input");
+      return {
+        request: inputs[0]?.value || "",
+        actual: inputs[1]?.value || "",
+        context: inputs[2]?.value || "",
+        reasoning: row.querySelector("select")?.value || "",
+        supportedReasoningEfforts: mappings[Number(row.dataset.mappingIndex)]?.supportedReasoningEfforts || []
+      };
+    }));
+  }
+
   renderMappings = function() {
     const allEfforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
     const effortsFor = (mapping) => {
@@ -1761,27 +2369,114 @@ const bridgeSource = String.raw`
       '<button class="icon-button" type="button" data-remove-mapping="' + index + '" aria-label="删除模型映射" title="删除">' + icon("trash-2", 13) + '</button></div>'
     ).join("");
     Array.from(document.querySelectorAll("[data-remove-mapping]")).forEach((button) => button.addEventListener("click", () => {
+      syncMappingsFromDom();
       mappings.splice(Number(button.dataset.removeMapping), 1); renderMappings(); hydrateIcons();
     }));
   };
 
   const originalRenderContext = renderContext;
+  function sendCodexContextSettings(contextWindow, autoCompactLimit, button) {
+    if (button?.disabled) return;
+    button?.focus();
+    send("save-codex-context", {
+      contextWindow: String(contextWindow ?? "").trim(),
+      autoCompactLimit: String(autoCompactLimit ?? "").trim()
+    });
+  }
   function saveCodexContext() {
     const button = $bridge("#saveCodexContextButton");
-    if (button.disabled) return;
-    button.focus();
-    send("save-codex-context", {
-      contextWindow: $bridge("#codexContextWindowInput").value.trim(),
-      autoCompactLimit: $bridge("#codexAutoCompactInput").value.trim()
-    });
+    sendCodexContextSettings(
+      $bridge("#codexContextWindowInput").value,
+      $bridge("#codexAutoCompactInput").value,
+      button
+    );
   }
   $bridge("#codexContextForm").addEventListener("submit", (event) => {
     event.preventDefault(); saveCodexContext();
   });
+  $bridge("#codexContextPageForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendCodexContextSettings(
+      $bridge("#codexContextPageWindowInput").value,
+      $bridge("#codexContextPageAutoCompactInput").value,
+      $bridge("#saveCodexContextPageButton")
+    );
+  });
+  $bridge("#routeGroupCreateForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = $bridge("#routeGroupCreateInput").value.trim();
+    if (!name) return;
+    const groups = pendingCodexRouteGroups || clone(host.state?.codexRouteGroups || []);
+    if (groups.some((group) => group.name.toLowerCase() === name.toLowerCase())) {
+      showToast("分组名称不能重复");
+      return;
+    }
+    const id = "group-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    groups.push({ id, name, provider_ids: [] });
+    pendingCodexRouteGroups = groups;
+    activeCodexRouteGroupId = id;
+    editingCodexRouteGroupName = false;
+    closeOverlay("routeGroupCreateOverlay");
+    renderCodexGroupPage();
+    hydrateIcons();
+    showToast("分组已创建，保存配置后生效");
+  });
+  $bridge("#routeGroupAddProviderForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    const providerId = $bridge("#routeGroupAddProviderSelect").value;
+    if (!providerId) return;
+    updateCodexGroup((group) => {
+      if (!group.provider_ids.includes(providerId)) group.provider_ids.push(providerId);
+    }, "上游已添加到分组");
+  });
+  $bridge("#routeHistoryGroupSelect").addEventListener("change", (event) => {
+    codexHistoryTargetGroupId = event.target.value || "default";
+  });
+  $bridge("#routeHistorySessions").addEventListener("change", (event) => {
+    const checkbox = event.target instanceof HTMLInputElement
+      ? event.target.closest("[data-route-history-select]")
+      : null;
+    if (!checkbox) return;
+    const sessionId = checkbox.getAttribute("data-route-history-select") || "";
+    if (!sessionId) return;
+    if (checkbox.checked) selectedCodexHistorySessionIds.add(sessionId);
+    else selectedCodexHistorySessionIds.delete(sessionId);
+    const count = selectedCodexHistorySessionIds.size;
+    $bridge("#routeHistorySelectionStatus").textContent = count ? '已选择 ' + count + ' 条会话' : '请选择要纳入管理的会话';
+    $bridge("#manageSelectedRouteSessionsButton").disabled = count === 0;
+  });
+  document.addEventListener("change", (event) => {
+    const target = event.target instanceof HTMLSelectElement ? event.target.closest("[data-session-group]") : null;
+    if (!target) return;
+    const sessionId = target.getAttribute("data-session-group") || "";
+    const groupId = target.value || "default";
+    const sessions = clone(host.state?.codexSessionRoutes || []);
+    const session = sessions.find((item) => item.session_id === sessionId);
+    if (!session) return;
+    session.group_id = groupId;
+    session.managed = true;
+    session.consecutive_503_failures = 0;
+    const pins = clone(host.state?.codexSessionRoutePins || []);
+    const pin = pins.find((item) => item.session_id === sessionId);
+    // Keep the continuity pin on its original group; changing the managed
+    // group only affects new sessions or turns without a previous response ID.
+    const targetGroup = (host.state?.codexRouteGroups || []).find((item) => item.id === groupId);
+    session.last_provider_id = pin && targetGroup?.provider_ids.includes(pin.provider_id)
+      ? pin.provider_id
+      : null;
+    saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "会话分组已保存", pins);
+  }, true);
+  document.addEventListener("dblclick", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-session-name]") : null;
+    if (!target) return;
+    event.preventDefault(); event.stopImmediatePropagation();
+    beginCodexSessionRename(target.getAttribute("data-session-name") || "");
+  }, true);
   renderContext = function() {
     originalRenderContext();
     const agent = currentAgent();
     $bridge("#codexContextButton").hidden = agent?.sourceId !== "codex";
+    syncCodexRouteWorkspace();
     if (!agent) return;
     const endpointList = $bridge("#endpointList");
     if (!endpointList) return;
@@ -1826,6 +2521,7 @@ const bridgeSource = String.raw`
     const replacement = addMappingButton.cloneNode(true);
     addMappingButton.replaceWith(replacement);
     replacement.addEventListener("click", () => {
+      syncMappingsFromDom();
       mappings.push({ request: "", actual: "", context: "", reasoning: "", supportedReasoningEfforts: [] });
       renderMappings();
       hydrateIcons();
@@ -2597,6 +3293,10 @@ function buildState(
   return {
     agents,
     codexContextSettings,
+    codexRouteGroups: config?.codex_route_groups ?? [{ id: "default", name: "默认分组", provider_ids: [] }],
+    codexFallbackDisabledProviderIds: config?.codex_fallback_disabled_provider_ids ?? [],
+    codexSessionRoutes: config?.codex_session_routes ?? [],
+    codexSessionRoutePins: config?.codex_session_route_pins ?? [],
     providers: providerState,
     providerDetails,
     requests: requestItems,

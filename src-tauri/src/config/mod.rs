@@ -61,6 +61,17 @@ fn default_new_key_pool_strategy() -> KeyLoadBalanceStrategy {
     KeyLoadBalanceStrategy::Sequential
 }
 
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+pub fn normalize_codex_session_display_name(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && !name.chars().any(char::is_control))
+        .map(|name| name.chars().take(64).collect())
+}
+
 // v1.4.12 exposed this as a built-in default rather than a user-authored
 // provider override.  Leaving it persisted pins later releases to an old
 // upstream User-Agent/cache lane.  Migrate only this exact historical value;
@@ -156,6 +167,16 @@ pub struct AppConfig {
     pub tool_diagnostics_enabled: bool,
     #[serde(default)]
     pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
+    #[serde(default)]
+    pub codex_route_groups: Vec<CodexRouteGroupConfig>,
+    /// Codex providers excluded from automatic backup selection. Entries not
+    /// present retain the existing fallback behavior.
+    #[serde(default)]
+    pub codex_fallback_disabled_provider_ids: Vec<String>,
+    #[serde(default)]
+    pub codex_session_routes: Vec<CodexSessionRouteConfig>,
+    #[serde(default)]
+    pub codex_session_route_pins: Vec<CodexSessionRoutePin>,
     #[serde(default)]
     pub provider_key_pools: Vec<ProviderKeyPoolConfig>,
     #[serde(default)]
@@ -987,6 +1008,46 @@ pub struct AgentProviderOrderConfig {
     pub provider_ids: Vec<String>,
 }
 
+pub const CODEX_DEFAULT_ROUTE_GROUP_ID: &str = "default";
+pub const CODEX_DEFAULT_ROUTE_GROUP_NAME: &str = "默认分组";
+pub const CODEX_RECENT_SESSION_LIMIT: usize = 10;
+pub const CODEX_SESSION_ROUTE_PIN_LIMIT: usize = 5_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexRouteGroupConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub provider_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexSessionRouteConfig {
+    pub session_id: String,
+    pub group_id: String,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub last_provider_id: Option<String>,
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+    /// A single HTTP 503 is often an upstream transient blip. Keep the session
+    /// on its current provider until the same route fails twice consecutively.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub consecutive_503_failures: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexSessionRoutePin {
+    pub session_id: String,
+    pub group_id: String,
+    pub provider_id: String,
+    #[serde(default)]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicProvider {
     pub id: String,
@@ -1101,6 +1162,10 @@ pub struct PublicConfig {
     pub codex_context_settings: Option<CodexContextSettings>,
     pub tool_diagnostics_enabled: bool,
     pub agent_provider_orders: Vec<AgentProviderOrderConfig>,
+    pub codex_route_groups: Vec<CodexRouteGroupConfig>,
+    pub codex_fallback_disabled_provider_ids: Vec<String>,
+    pub codex_session_routes: Vec<CodexSessionRouteConfig>,
+    pub codex_session_route_pins: Vec<CodexSessionRoutePin>,
     pub provider_key_pools: Vec<PublicProviderKeyPoolEntry>,
     pub updated_at: DateTime<Utc>,
     pub config_path: PathBuf,
@@ -1160,6 +1225,14 @@ impl Default for AppConfig {
             codex_context_settings: None,
             tool_diagnostics_enabled: true,
             agent_provider_orders: Vec::new(),
+            codex_route_groups: vec![CodexRouteGroupConfig {
+                id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
+                provider_ids: Vec::new(),
+            }],
+            codex_fallback_disabled_provider_ids: Vec::new(),
+            codex_session_routes: Vec::new(),
+            codex_session_route_pins: Vec::new(),
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
             provider_auto_compaction_limits: Vec::new(),
@@ -1370,6 +1443,55 @@ impl AppConfig {
                 changed = true;
             }
             if config.migrate_legacy_agent_provider_bindings() {
+                changed = true;
+            }
+            if !raw.contains("codex_route_groups") {
+                let codex_agent = config
+                    .agent_injections
+                    .iter()
+                    .find(|agent| agent.id == "codex");
+                let mut legacy_provider_ids = codex_agent
+                    .and_then(|agent| agent.provider_id.as_ref())
+                    .cloned()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if let Some(order) = config
+                    .agent_provider_orders
+                    .iter()
+                    .find(|order| order.agent_id == "codex")
+                {
+                    for provider_id in &order.provider_ids {
+                        if !legacy_provider_ids.contains(provider_id) {
+                            legacy_provider_ids.push(provider_id.clone());
+                        }
+                    }
+                }
+                let visible_provider_ids = codex_agent
+                    .map(|agent| {
+                        config
+                            .providers
+                            .iter()
+                            .filter(|provider| {
+                                !agent.hidden_provider_ids.contains(&provider.id)
+                                    && (agent.provider_id.as_deref() == Some(&provider.id)
+                                        || config.agent_provider_orders.iter().any(|order| {
+                                            order.agent_id == "codex"
+                                                && order.provider_ids.contains(&provider.id)
+                                        }))
+                            })
+                            .map(|provider| provider.id.clone())
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                legacy_provider_ids
+                    .retain(|provider_id| visible_provider_ids.contains(provider_id));
+                if let Some(group) = config
+                    .codex_route_groups
+                    .iter_mut()
+                    .find(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+                {
+                    group.provider_ids = legacy_provider_ids;
+                }
                 changed = true;
             }
             if config.prune_orphaned_references() {
@@ -1708,7 +1830,7 @@ impl AppConfig {
     /// capability evidence are deliberately retained: a user may restore a
     /// provider with the same id and should not lose its saved credentials or
     /// verified compatibility state merely because it is temporarily absent.
-    fn prune_orphaned_references(&mut self) -> bool {
+    pub(crate) fn prune_orphaned_references(&mut self) -> bool {
         let provider_ids = self
             .providers
             .iter()
@@ -1720,6 +1842,15 @@ impl AppConfig {
             .map(|agent| agent.id.clone())
             .collect::<HashSet<_>>();
         let mut changed = false;
+
+        let previous_fallback_exclusions = self.codex_fallback_disabled_provider_ids.clone();
+        let mut seen_fallback_exclusions = HashSet::new();
+        self.codex_fallback_disabled_provider_ids
+            .retain(|provider_id| {
+                provider_ids.contains(provider_id)
+                    && seen_fallback_exclusions.insert(provider_id.clone())
+            });
+        changed |= self.codex_fallback_disabled_provider_ids != previous_fallback_exclusions;
 
         if self
             .active_provider_id
@@ -1814,6 +1945,209 @@ impl AppConfig {
             changed = true;
         }
 
+        let codex_agent = self
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex");
+        let codex_visible_provider_ids = codex_agent
+            .map(|agent| {
+                self.providers
+                    .iter()
+                    .filter(|provider| {
+                        !agent.hidden_provider_ids.contains(&provider.id)
+                            && (agent.provider_id.as_deref() == Some(provider.id.as_str())
+                                || self.agent_provider_orders.iter().any(|order| {
+                                    order.agent_id == "codex"
+                                        && order.provider_ids.iter().any(|id| id == &provider.id)
+                                }))
+                    })
+                    .map(|provider| provider.id.clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let previous_groups = self.codex_route_groups.clone();
+        let mut normalized_groups = Vec::with_capacity(previous_groups.len().min(40) + 1);
+        let mut group_ids = HashSet::new();
+        let mut group_names = HashSet::new();
+        for mut group in previous_groups {
+            let id = group.id.trim();
+            if id.is_empty()
+                || id.len() > 80
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                || !group_ids.insert(id.to_string())
+                || normalized_groups.len() >= 40
+            {
+                continue;
+            }
+            group.id = id.to_string();
+            if group.id == CODEX_DEFAULT_ROUTE_GROUP_ID {
+                group.name = CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string();
+            } else if group.name.trim().is_empty() {
+                continue;
+            } else {
+                group.name = group.name.trim().chars().take(64).collect();
+                if !group_names.insert(group.name.to_lowercase()) {
+                    continue;
+                }
+            }
+            let mut seen = HashSet::new();
+            group.provider_ids.retain(|provider_id| {
+                codex_visible_provider_ids.contains(provider_id) && seen.insert(provider_id.clone())
+            });
+            normalized_groups.push(group);
+        }
+        if !normalized_groups
+            .iter()
+            .any(|group| group.id == CODEX_DEFAULT_ROUTE_GROUP_ID)
+        {
+            let mut default_provider_ids = codex_agent
+                .and_then(|agent| agent.provider_id.clone())
+                .into_iter()
+                .filter(|provider_id| codex_visible_provider_ids.contains(provider_id))
+                .collect::<Vec<_>>();
+            if let Some(order) = self
+                .agent_provider_orders
+                .iter()
+                .find(|order| order.agent_id == "codex")
+            {
+                for provider_id in &order.provider_ids {
+                    if codex_visible_provider_ids.contains(provider_id)
+                        && !default_provider_ids.contains(provider_id)
+                    {
+                        default_provider_ids.push(provider_id.clone());
+                    }
+                }
+            }
+            normalized_groups.insert(
+                0,
+                CodexRouteGroupConfig {
+                    id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+                    name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
+                    provider_ids: default_provider_ids,
+                },
+            );
+        }
+        normalized_groups.sort_by_key(|group| (group.id != CODEX_DEFAULT_ROUTE_GROUP_ID) as u8);
+        if normalized_groups != self.codex_route_groups {
+            self.codex_route_groups = normalized_groups;
+            changed = true;
+        }
+
+        let provider_ids = self
+            .providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect::<HashSet<_>>();
+        let previous_fallback_exclusions = self.codex_fallback_disabled_provider_ids.clone();
+        let mut seen_fallback_exclusions = HashSet::new();
+        self.codex_fallback_disabled_provider_ids
+            .retain(|provider_id| {
+                provider_ids.contains(provider_id)
+                    && seen_fallback_exclusions.insert(provider_id.clone())
+            });
+        if self.codex_fallback_disabled_provider_ids != previous_fallback_exclusions {
+            changed = true;
+        }
+
+        let group_ids = self
+            .codex_route_groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        let group_provider_ids = self
+            .codex_route_groups
+            .iter()
+            .map(|group| {
+                (
+                    group.id.as_str(),
+                    group.provider_ids.iter().collect::<HashSet<_>>(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let previous_sessions = self.codex_session_routes.clone();
+        let mut normalized_sessions = Vec::new();
+        let mut seen_sessions = HashSet::new();
+        for session in previous_sessions.into_iter().rev() {
+            if session.session_id.trim().is_empty()
+                || session.session_id.len() > 512
+                || session.session_id.chars().any(char::is_control)
+                || !seen_sessions.insert(session.session_id.clone())
+            {
+                continue;
+            }
+            let mut session = session;
+            session.display_name =
+                normalize_codex_session_display_name(session.display_name.as_deref());
+            if !session.managed {
+                session.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
+            }
+            if !group_ids.contains(session.group_id.as_str()) {
+                session.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
+            }
+            let valid_provider_ids = group_provider_ids
+                .get(session.group_id.as_str())
+                .expect("the default Codex route group is always present");
+            if session
+                .last_provider_id
+                .as_ref()
+                .is_some_and(|provider_id| !valid_provider_ids.contains(&provider_id))
+            {
+                session.last_provider_id = None;
+            }
+            normalized_sessions.push(session);
+        }
+        let mut recent_count = 0usize;
+        let mut managed_count = 0usize;
+        normalized_sessions.retain(|session| {
+            if session.managed {
+                managed_count += 1;
+                managed_count <= 2_000
+            } else if recent_count < CODEX_RECENT_SESSION_LIMIT {
+                recent_count += 1;
+                true
+            } else {
+                false
+            }
+        });
+        normalized_sessions.reverse();
+        if normalized_sessions != self.codex_session_routes {
+            self.codex_session_routes = normalized_sessions;
+            changed = true;
+        }
+
+        let group_ids = self
+            .codex_route_groups
+            .iter()
+            .map(|group| group.id.as_str())
+            .collect::<HashSet<_>>();
+        let previous_pins = self.codex_session_route_pins.clone();
+        let mut normalized_pins = Vec::new();
+        let mut seen_pins = HashSet::new();
+        for mut pin in previous_pins.into_iter().rev() {
+            if pin.session_id.trim().is_empty()
+                || pin.session_id.len() > 512
+                || pin.session_id.chars().any(char::is_control)
+                || pin.provider_id.trim().is_empty()
+                || pin.provider_id.len() > 512
+                || pin.provider_id.chars().any(char::is_control)
+                || !seen_pins.insert(pin.session_id.clone())
+            {
+                continue;
+            }
+            if !group_ids.contains(pin.group_id.as_str()) {
+                pin.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
+            }
+            normalized_pins.push(pin);
+        }
+        normalized_pins.truncate(CODEX_SESSION_ROUTE_PIN_LIMIT);
+        normalized_pins.reverse();
+        if normalized_pins != self.codex_session_route_pins {
+            self.codex_session_route_pins = normalized_pins;
+            changed = true;
+        }
+
         if changed {
             self.updated_at = Utc::now();
         }
@@ -1872,6 +2206,10 @@ impl AppConfig {
                 })
                 .collect(),
             agent_provider_orders: self.agent_provider_orders.clone(),
+            codex_route_groups: self.codex_route_groups.clone(),
+            codex_fallback_disabled_provider_ids: self.codex_fallback_disabled_provider_ids.clone(),
+            codex_session_routes: self.codex_session_routes.clone(),
+            codex_session_route_pins: self.codex_session_route_pins.clone(),
             codex_context_settings: self.codex_context_settings.clone(),
             tool_diagnostics_enabled: self.tool_diagnostics_enabled,
             provider_key_pools: self
@@ -2028,6 +2366,71 @@ impl AppConfig {
             key.updated_at = now;
             self.updated_at = now;
         }
+    }
+
+    /// Clears only a transient circuit breaker after a confirmed success from
+    /// that same Key. Ordinary successes must not undo a quota-disabled Key.
+    pub fn clear_provider_key_cooldown_after_success(
+        &mut self,
+        provider_id: &str,
+        key_id: Option<&str>,
+    ) {
+        let Some(key_id) = key_id else {
+            return;
+        };
+        let now = Utc::now();
+        if let Some(key) = self.provider_key_mut(provider_id, key_id) {
+            if key.enabled && key.disabled_until.is_some() {
+                key.disabled_until = None;
+                key.updated_at = now;
+                self.updated_at = now;
+            }
+        }
+    }
+
+    /// Per-request Key affinity: retain the last proven Key while it remains
+    /// enabled and its cooldown has expired. Load-balancing strategies still
+    /// own the first selection and any replacement after exhaustion.
+    pub fn sticky_provider_key_id(&self, provider_id: &str) -> Option<String> {
+        let now = Utc::now();
+        let pool = self
+            .provider_key_pools
+            .iter()
+            .find(|pool| pool.provider_id == provider_id && pool.enabled)?;
+        let eligible = |key: &&ProviderKeyConfig| {
+            key.enabled
+                && key.key_encrypted.is_some()
+                && key.disabled_until.map(|until| until <= now).unwrap_or(true)
+        };
+        // A fresh pool has no proven Key yet. Let the user's configured
+        // strategy and order choose the first request; otherwise an arbitrary
+        // equal-load tie could bypass the first configured Key.
+        if !pool.keys.iter().any(|key| key.successes > 0) {
+            return None;
+        }
+        pool.keys
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| eligible(key))
+            .filter(|(_, key)| key.successes > 0)
+            .max_by_key(|(index, key)| {
+                (
+                    key.last_checked_at,
+                    key.successes,
+                    std::cmp::Reverse(*index),
+                )
+            })
+            .map(|(_, key)| key.id.clone())
+            .or_else(|| {
+                // The last successful Key is cooling down. Stay in the pool,
+                // but let its configured order decide the eligible fallback.
+                pool.keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, key)| eligible(key))
+                    .min_by_key(|(index, key)| (key.total_requests, *index))
+                    .map(|(_, key)| key.id.clone())
+            })
     }
 
     pub fn mark_provider_key_failure(
@@ -2710,6 +3113,10 @@ impl AppConfig {
         }
 
         if let Some(key_pool) = input.key_pool {
+            // Always run the pool upsert. It preserves runtime health for
+            // unchanged keys, while also accepting a replacement secret under
+            // an existing key id. Skipping the call here could silently drop a
+            // newly entered API key.
             self.upsert_provider_key_pool(&id, key_pool)?;
         }
         self.upsert_provider_compact_mode(
@@ -3413,6 +3820,85 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn codex_session_display_name_and_503_count_round_trip() {
+        let mut config = AppConfig::default();
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: "session-name".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            managed: true,
+            display_name: Some("  工作会话  ".to_string()),
+            last_provider_id: None,
+            last_seen_at: None,
+            consecutive_503_failures: 1,
+        });
+
+        let roundtrip: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        let session = roundtrip
+            .codex_session_routes
+            .iter()
+            .find(|session| session.session_id == "session-name")
+            .unwrap();
+        assert_eq!(session.display_name.as_deref(), Some("  工作会话  "));
+        assert_eq!(session.consecutive_503_failures, 1);
+        assert_eq!(
+            normalize_codex_session_display_name(session.display_name.as_deref()).as_deref(),
+            Some("工作会话")
+        );
+        assert_eq!(normalize_codex_session_display_name(Some("  ")), None);
+    }
+
+    #[test]
+    fn codex_route_groups_migrate_legacy_binding_once_without_repopulating_explicit_empty_groups() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-route-migration-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let provider_id = config.upsert_provider(provider_input(None)).unwrap();
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some(provider_id.clone());
+        config.agent_provider_orders.push(AgentProviderOrderConfig {
+            agent_id: "codex".to_string(),
+            provider_ids: vec![provider_id.clone()],
+        });
+        config.save(&path).unwrap();
+
+        let mut legacy: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let legacy_table = legacy.as_table_mut().unwrap();
+        legacy_table.remove("codex_route_groups");
+        legacy_table.remove("codex_session_routes");
+        legacy_table.remove("codex_session_route_pins");
+        fs::write(&path, toml::to_string(&legacy).unwrap()).unwrap();
+
+        let upgraded = AppConfig::load_or_create(&path).unwrap();
+        let migrated_provider_id = upgraded
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .and_then(|agent| agent.provider_id.clone())
+            .expect("legacy Codex binding should remain available after migration");
+        assert_eq!(
+            upgraded.codex_route_groups[0].provider_ids,
+            vec![migrated_provider_id]
+        );
+        let mut intentionally_empty = upgraded;
+        intentionally_empty.codex_route_groups[0]
+            .provider_ids
+            .clear();
+        intentionally_empty.save(&path).unwrap();
+
+        let reloaded = AppConfig::load_or_create(&path).unwrap();
+        assert!(reloaded.codex_route_groups[0].provider_ids.is_empty());
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -4328,6 +4814,113 @@ updated_at = "2026-06-21T00:00:00Z"
             provider_model_cache_key(&provider, "gpt-5.6-sol"),
             "gpt-5.6-sol"
         );
+    }
+
+    #[test]
+    fn sticky_key_keeps_last_success_and_never_resurrects_quota_disabled_key() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(Some(ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::RoundRobin,
+            failure_threshold: 3,
+            recovery_minutes: 5,
+            keys: vec![
+                ProviderKeyInput {
+                    id: Some("key-a".to_string()),
+                    alias: None,
+                    key: Some("secret-a".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                },
+                ProviderKeyInput {
+                    id: Some("key-b".to_string()),
+                    alias: None,
+                    key: Some("secret-b".to_string()),
+                    enabled: true,
+                    priority: 5,
+                    status: ProviderKeyStatus::Unknown,
+                    total_requests: 0,
+                    successes: 0,
+                    failures: 0,
+                    last_checked_at: None,
+                    last_error: None,
+                    disabled_until: None,
+                },
+            ],
+        }));
+        input.id = Some("sticky".to_string());
+        let provider_id = config.upsert_provider(input).unwrap();
+        config.mark_provider_key_success(&provider_id, Some("key-b"));
+        assert_eq!(
+            config.sticky_provider_key_id(&provider_id).as_deref(),
+            Some("key-b")
+        );
+
+        // Even a full editor round-trip with unchanged secrets and ordering
+        // must not reset the runtime health receipt and send the next request
+        // back to the first Key.
+        let mut roundtrip = provider_input(Some(ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::RoundRobin,
+            failure_threshold: 3,
+            recovery_minutes: 5,
+            keys: vec![
+                key_input("key-a", None, true, 5),
+                key_input("key-b", None, true, 5),
+            ],
+        }));
+        roundtrip.id = Some(provider_id.clone());
+        config.upsert_provider(roundtrip).unwrap();
+        assert_eq!(
+            config.sticky_provider_key_id(&provider_id).as_deref(),
+            Some("key-b")
+        );
+
+        config.mark_provider_key_failure(&provider_id, Some("key-b"), "insufficient balance", true);
+        assert_eq!(
+            config.sticky_provider_key_id(&provider_id).as_deref(),
+            Some("key-a")
+        );
+        config.clear_provider_key_cooldown_after_success(&provider_id, Some("key-b"));
+        let key_b = config.provider_key(&provider_id, "key-b").unwrap();
+        assert!(!key_b.enabled);
+    }
+
+    #[test]
+    fn replacing_secret_with_existing_key_id_persists_the_new_secret() {
+        let mut config = AppConfig::default();
+        let mut input = provider_input(Some(ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 3,
+            recovery_minutes: 5,
+            keys: vec![key_input("key-a", Some("secret-old"), true, 5)],
+        }));
+        input.id = Some("replace-secret".to_string());
+        let provider_id = config.upsert_provider(input).unwrap();
+
+        let mut replacement = provider_input(Some(ProviderKeyPoolInput {
+            enabled: true,
+            strategy: KeyLoadBalanceStrategy::Sequential,
+            failure_threshold: 3,
+            recovery_minutes: 5,
+            keys: vec![key_input("key-a", Some("secret-new"), true, 5)],
+        }));
+        replacement.id = Some(provider_id.clone());
+        config.upsert_provider(replacement).unwrap();
+
+        let encrypted = config
+            .provider_key(&provider_id, "key-a")
+            .and_then(|key| key.key_encrypted.as_deref())
+            .expect("the replacement secret should be stored");
+        assert_eq!(decrypt_secret(encrypted).unwrap(), "secret-new");
     }
 
     #[test]

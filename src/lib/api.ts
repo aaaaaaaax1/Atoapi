@@ -237,6 +237,10 @@ export interface AppConfig {
   codex_context_settings?: CodexContextSettings | null;
   tool_diagnostics_enabled?: boolean;
   agent_provider_orders?: AgentProviderOrderConfig[];
+  codex_route_groups?: CodexRouteGroupConfig[];
+  codex_fallback_disabled_provider_ids?: string[];
+  codex_session_routes?: CodexSessionRouteConfig[];
+  codex_session_route_pins?: CodexSessionRoutePin[];
   provider_key_pools?: Array<{ provider_id: string; pool: PublicProviderKeyPool }>;
   updated_at: string;
   config_path: string;
@@ -264,6 +268,29 @@ export interface AgentInjectionConfig {
 export interface AgentProviderOrderConfig {
   agent_id: string;
   provider_ids: string[];
+}
+
+export interface CodexRouteGroupConfig {
+  id: string;
+  name: string;
+  provider_ids: string[];
+}
+
+export interface CodexSessionRouteConfig {
+  session_id: string;
+  group_id: string;
+  managed: boolean;
+  display_name?: string | null;
+  last_provider_id?: string | null;
+  last_seen_at?: string | null;
+  consecutive_503_failures?: number;
+}
+
+export interface CodexSessionRoutePin {
+  session_id: string;
+  group_id: string;
+  provider_id: string;
+  last_seen_at?: string | null;
 }
 
 export interface AgentInjectionResult {
@@ -956,6 +983,10 @@ let fallbackConfig: AppConfig = {
     injection("hermes", "Hermes", "hermes"),
     injection("proxy-mode", "本地代理模式", "proxy-mode")
   ],
+  codex_route_groups: [{ id: "default", name: "默认分组", provider_ids: [] }],
+  codex_fallback_disabled_provider_ids: [],
+  codex_session_routes: [],
+  codex_session_route_pins: [],
   provider_key_pools: [],
   updated_at: new Date().toISOString(),
   config_path: "%APPDATA%/Atoapi/config.toml"
@@ -1114,6 +1145,34 @@ function fallback(name: string, args?: Record<string, unknown>) {
     fallbackConfig = {
       ...fallbackConfig,
       codex_context_settings: { ...(args?.input as CodexContextSettings) },
+      updated_at: new Date().toISOString()
+    };
+    return fallbackConfig;
+  }
+  if (name === "save_codex_routing") {
+    const input = (args?.input ?? {}) as {
+      groups?: CodexRouteGroupConfig[];
+      sessions?: CodexSessionRouteConfig[];
+      pins?: CodexSessionRoutePin[];
+    };
+    fallbackConfig = {
+      ...fallbackConfig,
+      codex_route_groups: input.groups ?? fallbackConfig.codex_route_groups,
+      codex_session_routes: input.sessions ?? fallbackConfig.codex_session_routes,
+      codex_session_route_pins: input.pins ?? fallbackConfig.codex_session_route_pins,
+      updated_at: new Date().toISOString()
+    };
+    return fallbackConfig;
+  }
+  if (name === "set_codex_fallback_enabled") {
+    const providerId = String(args?.providerId ?? args?.provider_id ?? "").trim();
+    const enabled = args?.enabled === true;
+    const disabled = new Set(fallbackConfig.codex_fallback_disabled_provider_ids ?? []);
+    if (enabled) disabled.delete(providerId);
+    else if (providerId) disabled.add(providerId);
+    fallbackConfig = {
+      ...fallbackConfig,
+      codex_fallback_disabled_provider_ids: [...disabled],
       updated_at: new Date().toISOString()
     };
     return fallbackConfig;
