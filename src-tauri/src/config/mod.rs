@@ -175,6 +175,10 @@ pub struct AppConfig {
     pub codex_fallback_disabled_provider_ids: Vec<String>,
     #[serde(default)]
     pub codex_session_routes: Vec<CodexSessionRouteConfig>,
+    /// Managed sessions whose group was explicitly changed but has not yet
+    /// completed a request on the selected group.
+    #[serde(default)]
+    pub codex_pending_group_switches: Vec<String>,
     #[serde(default)]
     pub codex_session_route_pins: Vec<CodexSessionRoutePin>,
     #[serde(default)]
@@ -1019,6 +1023,8 @@ pub struct CodexRouteGroupConfig {
     pub name: String,
     #[serde(default)]
     pub provider_ids: Vec<String>,
+    /// Providers switched off in this group are excluded from every route,
+    /// including the first position and existing session pins.
     #[serde(default)]
     pub fallback_disabled_provider_ids: Vec<String>,
 }
@@ -1167,6 +1173,7 @@ pub struct PublicConfig {
     pub codex_route_groups: Vec<CodexRouteGroupConfig>,
     pub codex_fallback_disabled_provider_ids: Vec<String>,
     pub codex_session_routes: Vec<CodexSessionRouteConfig>,
+    pub codex_pending_group_switches: Vec<String>,
     pub codex_session_route_pins: Vec<CodexSessionRoutePin>,
     pub provider_key_pools: Vec<PublicProviderKeyPoolEntry>,
     pub updated_at: DateTime<Utc>,
@@ -1235,6 +1242,7 @@ impl Default for AppConfig {
             }],
             codex_fallback_disabled_provider_ids: Vec::new(),
             codex_session_routes: Vec::new(),
+            codex_pending_group_switches: Vec::new(),
             codex_session_route_pins: Vec::new(),
             provider_key_pools: Vec::new(),
             provider_compact_modes: Vec::new(),
@@ -2151,6 +2159,22 @@ impl AppConfig {
             changed = true;
         }
 
+        let managed_session_ids = self
+            .codex_session_routes
+            .iter()
+            .filter(|session| session.managed)
+            .map(|session| session.session_id.as_str())
+            .collect::<HashSet<_>>();
+        let previous_pending_switches = self.codex_pending_group_switches.clone();
+        let mut seen_pending_switches = HashSet::new();
+        self.codex_pending_group_switches.retain(|session_id| {
+            managed_session_ids.contains(session_id.as_str())
+                && seen_pending_switches.insert(session_id.clone())
+        });
+        if self.codex_pending_group_switches != previous_pending_switches {
+            changed = true;
+        }
+
         let group_ids = self
             .codex_route_groups
             .iter()
@@ -2243,6 +2267,7 @@ impl AppConfig {
             codex_route_groups: self.codex_route_groups.clone(),
             codex_fallback_disabled_provider_ids: self.codex_fallback_disabled_provider_ids.clone(),
             codex_session_routes: self.codex_session_routes.clone(),
+            codex_pending_group_switches: self.codex_pending_group_switches.clone(),
             codex_session_route_pins: self.codex_session_route_pins.clone(),
             codex_context_settings: self.codex_context_settings.clone(),
             tool_diagnostics_enabled: self.tool_diagnostics_enabled,

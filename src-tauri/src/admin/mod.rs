@@ -1080,6 +1080,7 @@ pub async fn save_codex_routing(
         .commit_config_update(|current| {
             let groups = validate_codex_route_groups(current, input.groups)?;
             let mut sessions = input.sessions;
+            let mut pending_group_switches = current.codex_pending_group_switches.clone();
             let group_ids = groups
                 .iter()
                 .map(|group| group.id.as_str())
@@ -1104,6 +1105,12 @@ pub async fn save_codex_routing(
                 }) {
                     session.consecutive_503_failures = 0;
                 }
+                if previous.is_some_and(|previous| previous.group_id != session.group_id) {
+                    session.last_provider_id = None;
+                    if session.managed && !pending_group_switches.contains(&session.session_id) {
+                        pending_group_switches.push(session.session_id.clone());
+                    }
+                }
                 if !group_ids.contains(session.group_id.as_str()) {
                     session.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
                     session.last_provider_id = None;
@@ -1123,10 +1130,16 @@ pub async fn save_codex_routing(
                 }
             }
             let sessions = validate_codex_session_routes(&groups, sessions)?;
+            pending_group_switches.retain(|session_id| {
+                sessions
+                    .iter()
+                    .any(|session| session.managed && session.session_id == *session_id)
+            });
             let mut next = current.clone();
             next.codex_route_groups = groups;
             next.codex_fallback_disabled_provider_ids.clear();
             next.codex_session_routes = sessions;
+            next.codex_pending_group_switches = pending_group_switches;
             next.codex_session_route_pins = validate_codex_session_route_pins(&next, input.pins)?;
             next.updated_at = Utc::now();
             Ok(next)

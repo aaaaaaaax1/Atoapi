@@ -240,6 +240,7 @@ export interface AppConfig {
   codex_route_groups?: CodexRouteGroupConfig[];
   codex_fallback_disabled_provider_ids?: string[];
   codex_session_routes?: CodexSessionRouteConfig[];
+  codex_pending_group_switches?: string[];
   codex_session_route_pins?: CodexSessionRoutePin[];
   provider_key_pools?: Array<{ provider_id: string; pool: PublicProviderKeyPool }>;
   updated_at: string;

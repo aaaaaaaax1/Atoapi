@@ -720,7 +720,7 @@ const bridgeSource = String.raw`
             '<span class="route-group-order">' + String(index + 1).padStart(2, "0") + '</span>' +
             '<div class="route-group-provider"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small><span class="route-provider-detail">' + escape(provider.channel || "Responses") + ' · ' + escape(provider.keys || 0) + ' 个可用 Key · ' + escape(provider.mappings || 0) + ' 个模型 · 最近连通 ' + escape(provider.latency || "未检测") + '</span></div>' +
             '<div class="route-group-actions">' +
-              '<span class="codex-fallback-control route-group-fallback-control"><small>备选</small><button class="switch codex-fallback-switch" type="button" role="switch" data-codex-fallback-toggle="' + escape(provider.id) + '" data-route-group-id="' + escape(group.id) + '" aria-checked="' + String(!(group.fallback_disabled_provider_ids || []).includes(provider.id)) + '" aria-label="参与自动备选" title="此开关只影响当前分组。排在首位的上游始终作为首选"></button></span>' +
+              '<span class="codex-fallback-control route-group-fallback-control"><small>备选</small><button class="switch codex-fallback-switch" type="button" role="switch" data-codex-fallback-toggle="' + escape(provider.id) + '" data-route-group-id="' + escape(group.id) + '" aria-checked="' + String(!(group.fallback_disabled_provider_ids || []).includes(provider.id)) + '" aria-label="参与当前分组选路" title="仅影响当前分组；关闭后该上游完全不参与此分组选路"></button></span>' +
               '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button>' +
               '<button class="secondary-button route-provider-test" type="button" data-test-provider="' + escape(provider.id) + '" title="测试上游连通性">' + icon("plug-zap", 13) + '<span>测试连通</span></button>' +
               '<button class="secondary-button route-provider-test route-provider-health" type="button" data-health-probe-provider="' + escape(provider.id) + '" title="发送轻量请求测活">' + icon("activity", 13) + '<span>测活</span></button>' +
@@ -733,7 +733,7 @@ const bridgeSource = String.raw`
     const note = $bridge("#routeGroupNote");
     if (note) note.textContent = groupPending
       ? "更改尚未保存；保存后新会话将按此顺序选路。"
-      : "新会话按顺序使用本组上游；续接中的会话不会跨上游重放。";
+      : "开启的上游按顺序选路；关闭备选后，该上游不会用于当前分组。续接中的会话不会跨上游重放。";
     const managed = sessions.filter((session) => session.managed);
     const recent = sessions.filter((session) => !session.managed).slice(-10).reverse();
     const recentIds = new Set(recent.map((session) => session.session_id));
@@ -1874,8 +1874,32 @@ const bridgeSource = String.raw`
   document.addEventListener("dragend", clearProviderDragState, true);
 
   document.addEventListener("click", (event) => {
+    const routeGroupMenu = $bridge("#requestRouteGroupMenu");
+    const routeGroupWrap = $bridge(".request-route-group-filter-wrap");
+    const routeGroupTrigger = $bridge("#requestRouteGroupTrigger");
+    if (routeGroupMenu && routeGroupWrap && event.target instanceof Node && !routeGroupWrap.contains(event.target)) {
+      routeGroupMenu.hidden = true;
+      routeGroupTrigger?.setAttribute("aria-expanded", "false");
+    }
     const target = event.target instanceof Element ? event.target.closest("button, [data-bind-provider], [data-edit-provider], [data-delete-provider]") : null;
     if (!target) return;
+    if (target.id === "requestRouteGroupTrigger") {
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (!target.hasAttribute("disabled") && routeGroupMenu) {
+        routeGroupMenu.hidden = !routeGroupMenu.hidden;
+        target.setAttribute("aria-expanded", String(!routeGroupMenu.hidden));
+      }
+      return;
+    }
+    if (target.hasAttribute("data-request-route-group-option")) {
+      event.preventDefault(); event.stopImmediatePropagation();
+      requestRouteGroupId = target.getAttribute("data-request-route-group-option") || "";
+      requestPage = 1;
+      if (routeGroupMenu) routeGroupMenu.hidden = true;
+      routeGroupTrigger?.setAttribute("aria-expanded", "false");
+      renderRequests();
+      return;
+    }
     if (target.dataset.routeView) {
       event.preventDefault(); event.stopImmediatePropagation();
       selectCodexRouteView(target.dataset.routeView); return;
@@ -2289,16 +2313,51 @@ const bridgeSource = String.raw`
         successfulGroups.set(request.routeGroupId, request.routeGroupName || request.routeGroupId);
       }
       if (!successfulGroups.has(requestRouteGroupId)) requestRouteGroupId = "";
-      groupFilter.innerHTML = '<option value="">全部分组</option>' + [...successfulGroups]
-        .sort((left, right) => left[1].localeCompare(right[1], "zh-CN"))
-        .map(([id, name]) => '<option value="' + escape(id) + '"' + (id === requestRouteGroupId ? ' selected' : '') + '>' + escape(name) + '</option>')
+      const options = [["", "全部分组"], ...[...successfulGroups]
+        .sort((left, right) => left[1].localeCompare(right[1], "zh-CN"))];
+      groupFilter.innerHTML = options
+        .map(([id, name]) => '<option value="' + escape(id) + '">' + escape(name) + '</option>')
         .join("");
-      groupFilter.onchange = () => {
-        requestRouteGroupId = groupFilter.value;
-        requestPage = 1;
-        renderRequests();
+      groupFilter.value = requestRouteGroupId;
+      const trigger = $bridge("#requestRouteGroupTrigger");
+      const triggerLabel = trigger?.querySelector("span");
+      const menu = $bridge("#requestRouteGroupMenu");
+      const selectedName = options.find(([id]) => id === requestRouteGroupId)?.[1] || "全部分组";
+      if (triggerLabel) triggerLabel.textContent = selectedName;
+      if (menu) {
+        menu.innerHTML = options.map(([id, name]) =>
+          '<button class="request-route-group-option" type="button" role="option" data-request-route-group-option="' + escape(id) + '" aria-selected="' + String(id === requestRouteGroupId) + '">' + escape(name) + '</button>'
+        ).join("");
+        menu.onkeydown = (event) => {
+          const items = [...menu.getElementsByTagName("button")];
+          const activeIndex = items.findIndex((item) => item === document.activeElement);
+          if (event.key === "Escape") {
+            menu.hidden = true;
+            trigger?.setAttribute("aria-expanded", "false");
+            trigger?.focus();
+          } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            event.preventDefault();
+            const delta = event.key === "ArrowDown" ? 1 : -1;
+            items[(activeIndex + delta + items.length) % items.length]?.focus();
+          }
+        };
+      }
+      if (trigger) trigger.onkeydown = (event) => {
+        if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+        event.preventDefault();
+        if (!menu) return;
+        menu.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        [...menu.getElementsByTagName("button")]
+          .find((item) => item.getAttribute("aria-selected") === "true")
+          ?.focus();
       };
       groupFilter.disabled = successfulGroups.size === 0;
+      if (trigger) trigger.disabled = groupFilter.disabled;
+      if (groupFilter.disabled && menu) {
+        menu.hidden = true;
+        trigger?.setAttribute("aria-expanded", "false");
+      }
     }
     const columnLabels = document.querySelectorAll(".request-column-head span");
     if (columnLabels[2]) columnLabels[2].textContent = "传输";
@@ -2488,13 +2547,13 @@ const bridgeSource = String.raw`
     session.consecutive_503_failures = 0;
     const pins = clone(host.state?.codexSessionRoutePins || []);
     const pin = pins.find((item) => item.session_id === sessionId);
-    // Keep the continuity pin on its original group; changing the managed
-    // group only affects new sessions or turns without a previous response ID.
+    // Keep the old pin as provenance; the next request switches only after
+    // the backend can rebuild the continuation from locally verified history.
     const targetGroup = (host.state?.codexRouteGroups || []).find((item) => item.id === groupId);
     session.last_provider_id = pin && targetGroup?.provider_ids.includes(pin.provider_id)
       ? pin.provider_id
       : null;
-    saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "会话分组已保存", pins);
+    saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "会话分组已保存；当前回复不切换，下一次请求按新分组生效", pins);
   }, true);
   document.addEventListener("dblclick", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-session-name]") : null;

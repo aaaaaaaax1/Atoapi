@@ -5408,7 +5408,88 @@
 
     .request-pager { margin-left: auto; }
 
+    .request-route-group-filter-wrap {
+      position: relative;
+      width: min(180px, 100%);
+      min-width: 116px;
+      height: 30px;
+    }
+
     .request-route-group-filter {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .request-route-group-trigger {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      width: 100%;
+      height: 30px;
+      padding: 0 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 5px;
+      background: var(--surface-2);
+      color: var(--text);
+      font: inherit;
+      font-size: 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .request-route-group-trigger:disabled { opacity: 0.55; cursor: default; }
+    .request-route-group-chevron { width: 7px; height: 7px; margin: -3px 2px 0 0; border-right: 1px solid var(--muted); border-bottom: 1px solid var(--muted); transform: rotate(45deg); }
+
+    .request-route-group-menu {
+      position: absolute;
+      z-index: 40;
+      top: calc(100% + 4px);
+      left: 0;
+      width: max(100%, 150px);
+      max-height: 220px;
+      overflow: auto;
+      padding: 4px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: #171b20;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.42);
+    }
+
+    .request-route-group-menu[hidden] { display: none; }
+    .request-route-group-option {
+      display: flex;
+      align-items: center;
+      width: 100%;
+      min-height: 29px;
+      padding: 0 8px;
+      border: 0;
+      border-radius: 4px;
+      background: transparent;
+      color: #e8edef;
+      font: inherit;
+      font-size: 10px;
+      text-align: left;
+      cursor: pointer;
+    }
+    .request-route-group-option:hover,
+    .request-route-group-option[aria-selected="true"] { background: #2b3337; color: #fff; }
+
+    .request-route-group-filter:disabled {
+      opacity: 0.55;
+    }
+
+    .request-route-group-filter:disabled + .request-route-group-trigger {
+      opacity: 0.55;
+      cursor: default;
+    }
+
+    /* Kept for native select fallback on older WebViews. */
+    .request-route-group-filter-native {
       min-width: 116px;
       max-width: 180px;
       height: 26px;
@@ -5419,6 +5500,7 @@
       color: var(--text);
       font: inherit;
       font-size: 10px;
+      color-scheme: dark;
     }
 
     .request-route-group-filter:disabled { opacity: 0.55; }
@@ -5845,13 +5927,30 @@
       border-color: rgba(88, 209, 155, 0.94);
     }
 
-    :where(.field select, .mapping-row select, #providerModelCandidateSelect) {
+    :where(.field select, .mapping-row select, #providerModelCandidateSelect, .request-route-group-filter, .route-toolbar select, .route-inline-form select, .route-session-row select, .route-history-toolbar select) {
       color-scheme: dark;
     }
 
-    :where(.field select, .mapping-row select, #providerModelCandidateSelect) option {
+    :where(.field select, .mapping-row select, #providerModelCandidateSelect, .request-route-group-filter, .route-toolbar select, .route-inline-form select, .route-session-row select, .route-history-toolbar select) option {
       background: #181c25;
       color: #edf0f8;
+    }
+
+    #requestRouteGroupFilter,
+    #routeGroupPicker,
+    #routeGroupAddProviderSelect,
+    #routeHistoryGroupSelect,
+    .route-session-row select {
+      color-scheme: dark;
+    }
+
+    #requestRouteGroupFilter option,
+    #routeGroupPicker option,
+    #routeGroupAddProviderSelect option,
+    #routeHistoryGroupSelect option,
+    .route-session-row select option {
+      background-color: #181c25 !important;
+      color: #edf0f8 !important;
     }
 
     .cache-trend-card {
@@ -7112,7 +7211,11 @@
               <div class="request-record-toolbar">
                 <div class="request-record-controls">
                   <div class="request-scope-tabs" id="requestScopeTabs" role="tablist" aria-label="请求记录上游筛选"></div>
-                <select class="request-route-group-filter" id="requestRouteGroupFilter" aria-label="按成功使用的分组筛选请求记录"><option value="">全部分组</option></select>
+                <div class="request-route-group-filter-wrap">
+                  <select class="request-route-group-filter" id="requestRouteGroupFilter" aria-label="按成功使用的分组筛选请求记录" tabindex="-1" aria-hidden="true"><option value="">全部分组</option></select>
+                  <button class="request-route-group-trigger" id="requestRouteGroupTrigger" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="requestRouteGroupMenu"><span>全部分组</span><i class="request-route-group-chevron" aria-hidden="true"></i></button>
+                  <div class="request-route-group-menu" id="requestRouteGroupMenu" role="listbox" aria-label="按成功使用的分组筛选请求记录" hidden></div>
+                </div>
                   <div class="request-pager" id="requestPager" aria-label="请求记录分页"></div>
                 </div>
                 <div class="request-column-head" aria-hidden="true"><span>上游 / Agent</span><span>模型 / 思考</span><span>传输</span><span>Tokens</span><span>首字 / 耗时</span><span>命中</span><span>状态</span></div>
