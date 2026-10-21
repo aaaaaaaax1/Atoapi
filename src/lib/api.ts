@@ -274,6 +274,7 @@ export interface CodexRouteGroupConfig {
   id: string;
   name: string;
   provider_ids: string[];
+  fallback_disabled_provider_ids?: string[];
 }
 
 export interface CodexSessionRouteConfig {
@@ -439,6 +440,9 @@ export interface MetricsSnapshot {
     cache_status: string;
     agent_id?: string | null;
     agent_label?: string | null;
+    codex_route_group_id?: string | null;
+    codex_route_group_name?: string | null;
+    codex_session_display_name?: string | null;
     upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
     upstream_call_source?: string | null;
     status: number;
@@ -547,6 +551,9 @@ export interface MetricsSnapshot {
     cache_status: string;
     agent_id?: string | null;
     agent_label?: string | null;
+    codex_route_group_id?: string | null;
+    codex_route_group_name?: string | null;
+    codex_session_display_name?: string | null;
     upstream_call_kind?: "stream" | "sync" | "prewarm-sync" | "cache" | string | null;
     upstream_call_source?: string | null;
     status: number;
@@ -1165,14 +1172,19 @@ function fallback(name: string, args?: Record<string, unknown>) {
     return fallbackConfig;
   }
   if (name === "set_codex_fallback_enabled") {
+    const groupId = String(args?.groupId ?? args?.group_id ?? "").trim();
     const providerId = String(args?.providerId ?? args?.provider_id ?? "").trim();
     const enabled = args?.enabled === true;
-    const disabled = new Set(fallbackConfig.codex_fallback_disabled_provider_ids ?? []);
-    if (enabled) disabled.delete(providerId);
-    else if (providerId) disabled.add(providerId);
+    const groups = (fallbackConfig.codex_route_groups ?? []).map((group) => {
+      if (group.id !== groupId) return group;
+      const disabled = new Set(group.fallback_disabled_provider_ids ?? []);
+      if (enabled) disabled.delete(providerId);
+      else if (providerId && group.provider_ids.includes(providerId)) disabled.add(providerId);
+      return { ...group, fallback_disabled_provider_ids: [...disabled] };
+    });
     fallbackConfig = {
       ...fallbackConfig,
-      codex_fallback_disabled_provider_ids: [...disabled],
+      codex_route_groups: groups,
       updated_at: new Date().toISOString()
     };
     return fallbackConfig;

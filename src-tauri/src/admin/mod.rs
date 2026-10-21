@@ -1125,6 +1125,7 @@ pub async fn save_codex_routing(
             let sessions = validate_codex_session_routes(&groups, sessions)?;
             let mut next = current.clone();
             next.codex_route_groups = groups;
+            next.codex_fallback_disabled_provider_ids.clear();
             next.codex_session_routes = sessions;
             next.codex_session_route_pins = validate_codex_session_route_pins(&next, input.pins)?;
             next.updated_at = Utc::now();
@@ -1138,12 +1139,14 @@ pub async fn save_codex_routing(
 #[tauri::command]
 pub async fn set_codex_fallback_enabled(
     state: State<'_, Arc<AppState>>,
+    group_id: String,
     provider_id: String,
     enabled: bool,
 ) -> CommandResult<PublicConfig> {
+    let group_id = group_id.trim().to_string();
     let provider_id = provider_id.trim().to_string();
-    if provider_id.is_empty() {
-        return Err("上游 ID 不能为空".to_string());
+    if group_id.is_empty() || provider_id.is_empty() {
+        return Err("分组和上游 ID 不能为空".to_string());
     }
     state
         .commit_config_update(|current| {
@@ -1161,15 +1164,25 @@ pub async fn set_codex_fallback_enabled(
                 anyhow::bail!("上游不在 Codex 可见列表中");
             }
             let mut next = current.clone();
+            let group = next
+                .codex_route_groups
+                .iter_mut()
+                .find(|group| group.id == group_id)
+                .ok_or_else(|| anyhow::anyhow!("分组不存在"))?;
+            if !group.provider_ids.contains(&provider_id) {
+                anyhow::bail!("上游不属于所选分组");
+            }
             if enabled {
-                next.codex_fallback_disabled_provider_ids
+                group
+                    .fallback_disabled_provider_ids
                     .retain(|id| id != &provider_id);
-            } else if !next
-                .codex_fallback_disabled_provider_ids
+            } else if !group
+                .fallback_disabled_provider_ids
                 .iter()
                 .any(|id| id == &provider_id)
             {
-                next.codex_fallback_disabled_provider_ids
+                group
+                    .fallback_disabled_provider_ids
                     .push(provider_id.clone());
             }
             next.updated_at = Utc::now();
@@ -1273,6 +1286,10 @@ fn validate_codex_route_groups(
                 anyhow::bail!("分组只能包含当前 Codex 可见的上游，且不能重复");
             }
         }
+        let mut disabled = HashSet::new();
+        group.fallback_disabled_provider_ids.retain(|provider_id| {
+            members.contains(provider_id) && disabled.insert(provider_id.clone())
+        });
     }
     Ok(groups)
 }
@@ -1435,6 +1452,7 @@ fn append_agent_provider_order(config: &mut AppConfig, agent_id: &str, provider_
                     id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
                     name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
                     provider_ids: vec![provider_id.to_string()],
+                    fallback_disabled_provider_ids: Vec::new(),
                 },
             );
         }
@@ -1708,6 +1726,9 @@ fn remove_provider_from_agent_order(config: &mut AppConfig, agent_id: &str, prov
         }
         for group in config.codex_route_groups.iter_mut() {
             group.provider_ids.retain(|id| id != provider_id);
+            group
+                .fallback_disabled_provider_ids
+                .retain(|id| id != provider_id);
         }
         config
             .codex_session_route_pins
@@ -1755,6 +1776,9 @@ fn remove_provider_records(config: &mut AppConfig, provider_id: &str) {
         .retain(|order| !order.provider_ids.is_empty());
     for group in &mut config.codex_route_groups {
         group.provider_ids.retain(|id| id != provider_id);
+        group
+            .fallback_disabled_provider_ids
+            .retain(|id| id != provider_id);
     }
     config
         .codex_session_route_pins
@@ -4581,11 +4605,13 @@ mod tests {
                     id: "work".to_string(),
                     name: "工作".to_string(),
                     provider_ids: vec!["backup".to_string()],
+                    fallback_disabled_provider_ids: Vec::new(),
                 },
                 CodexRouteGroupConfig {
                     id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
                     name: "用户试图改名".to_string(),
                     provider_ids: vec!["primary".to_string()],
+                    fallback_disabled_provider_ids: Vec::new(),
                 },
             ],
         )
@@ -4642,6 +4668,7 @@ mod tests {
             id: "work".to_string(),
             name: "工作".to_string(),
             provider_ids: vec!["primary".to_string()],
+            fallback_disabled_provider_ids: Vec::new(),
         });
         config.codex_session_routes.push(CodexSessionRouteConfig {
             session_id: "managed-session".to_string(),
@@ -4658,7 +4685,7 @@ mod tests {
             provider_id: "primary".to_string(),
             last_seen_at: None,
         });
-        config.codex_fallback_disabled_provider_ids = vec!["primary".to_string()];
+        config.codex_route_groups[0].fallback_disabled_provider_ids = vec!["primary".to_string()];
 
         remove_provider_records(&mut config, "primary");
 
@@ -4674,6 +4701,9 @@ mod tests {
         assert_eq!(config.codex_session_routes[0].last_provider_id, None);
         assert_eq!(config.codex_route_groups[0].provider_ids, vec!["backup"]);
         assert!(config.codex_fallback_disabled_provider_ids.is_empty());
+        assert!(config.codex_route_groups.iter().all(|group| !group
+            .fallback_disabled_provider_ids
+            .contains(&"primary".to_string())));
     }
 
     #[test]

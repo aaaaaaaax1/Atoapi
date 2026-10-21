@@ -1019,6 +1019,8 @@ pub struct CodexRouteGroupConfig {
     pub name: String,
     #[serde(default)]
     pub provider_ids: Vec<String>,
+    #[serde(default)]
+    pub fallback_disabled_provider_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1229,6 +1231,7 @@ impl Default for AppConfig {
                 id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
                 name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
                 provider_ids: Vec::new(),
+                fallback_disabled_provider_ids: Vec::new(),
             }],
             codex_fallback_disabled_provider_ids: Vec::new(),
             codex_session_routes: Vec::new(),
@@ -2026,10 +2029,26 @@ impl AppConfig {
                     id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
                     name: CODEX_DEFAULT_ROUTE_GROUP_NAME.to_string(),
                     provider_ids: default_provider_ids,
+                    fallback_disabled_provider_ids: Vec::new(),
                 },
             );
         }
         normalized_groups.sort_by_key(|group| (group.id != CODEX_DEFAULT_ROUTE_GROUP_ID) as u8);
+        let legacy_fallback_exclusions = self.codex_fallback_disabled_provider_ids.clone();
+        for group in &mut normalized_groups {
+            let members = group.provider_ids.iter().collect::<HashSet<_>>();
+            let mut seen = HashSet::new();
+            group.fallback_disabled_provider_ids.retain(|provider_id| {
+                members.contains(provider_id) && seen.insert(provider_id.clone())
+            });
+            for provider_id in &legacy_fallback_exclusions {
+                if members.contains(provider_id) && seen.insert(provider_id.clone()) {
+                    group
+                        .fallback_disabled_provider_ids
+                        .push(provider_id.clone());
+                }
+            }
+        }
         if normalized_groups != self.codex_route_groups {
             self.codex_route_groups = normalized_groups;
             changed = true;
@@ -2048,6 +2067,21 @@ impl AppConfig {
                     && seen_fallback_exclusions.insert(provider_id.clone())
             });
         if self.codex_fallback_disabled_provider_ids != previous_fallback_exclusions {
+            changed = true;
+        }
+        for group in &mut self.codex_route_groups {
+            let mut seen = HashSet::new();
+            let members = group.provider_ids.iter().collect::<HashSet<_>>();
+            let previous = group.fallback_disabled_provider_ids.clone();
+            group.fallback_disabled_provider_ids.retain(|provider_id| {
+                provider_ids.contains(provider_id)
+                    && members.contains(provider_id)
+                    && seen.insert(provider_id.clone())
+            });
+            changed |= group.fallback_disabled_provider_ids != previous;
+        }
+        if !self.codex_fallback_disabled_provider_ids.is_empty() {
+            self.codex_fallback_disabled_provider_ids.clear();
             changed = true;
         }
 
@@ -3898,6 +3932,78 @@ mod tests {
 
         let reloaded = AppConfig::load_or_create(&path).unwrap();
         assert!(reloaded.codex_route_groups[0].provider_ids.is_empty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn legacy_fallback_exclusions_migrate_to_group_local_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-fallback-migration-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = AppConfig::default();
+        let mut input = provider_input(None);
+        input.id = Some("agent-codex-share".to_string());
+        let provider_id = config.upsert_provider(input).unwrap();
+        config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap()
+            .provider_id = Some(provider_id.clone());
+        config.agent_provider_orders.push(AgentProviderOrderConfig {
+            agent_id: "codex".to_string(),
+            provider_ids: vec![provider_id.clone()],
+        });
+        let mut second_input = provider_input(None);
+        second_input.id = Some("agent-codex-other".to_string());
+        let second_provider_id = config.upsert_provider(second_input).unwrap();
+        config
+            .agent_provider_orders
+            .iter_mut()
+            .find(|order| order.agent_id == "codex")
+            .unwrap()
+            .provider_ids
+            .push(second_provider_id.clone());
+        config.codex_route_groups[0].provider_ids = vec![provider_id.clone()];
+        config.codex_route_groups.push(CodexRouteGroupConfig {
+            id: "work".to_string(),
+            name: "工作".to_string(),
+            provider_ids: vec![provider_id.clone(), second_provider_id.clone()],
+            fallback_disabled_provider_ids: Vec::new(),
+        });
+        config.codex_fallback_disabled_provider_ids = vec![provider_id.clone()];
+        config.save(&path).unwrap();
+
+        let mut upgraded = AppConfig::load_or_create(&path).unwrap();
+        assert!(upgraded.codex_fallback_disabled_provider_ids.is_empty());
+        assert_eq!(
+            upgraded.codex_route_groups[0].fallback_disabled_provider_ids,
+            vec![provider_id.clone()]
+        );
+        assert_eq!(
+            upgraded.codex_route_groups[1].fallback_disabled_provider_ids,
+            vec![provider_id.clone()]
+        );
+        assert!(upgraded.codex_route_groups[1]
+            .fallback_disabled_provider_ids
+            .iter()
+            .all(|id| id != &second_provider_id));
+
+        upgraded.codex_route_groups[0]
+            .fallback_disabled_provider_ids
+            .clear();
+        upgraded.save(&path).unwrap();
+        let reloaded = AppConfig::load_or_create(&path).unwrap();
+        assert!(reloaded.codex_route_groups[0]
+            .fallback_disabled_provider_ids
+            .is_empty());
+        assert_eq!(
+            reloaded.codex_route_groups[1].fallback_disabled_provider_ids,
+            vec![provider_id]
+        );
         fs::remove_dir_all(dir).ok();
     }
 

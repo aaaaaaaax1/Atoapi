@@ -740,6 +740,12 @@ pub struct RequestLog {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_route_group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_route_group_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_session_display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_call_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_call_source: Option<String>,
@@ -3110,6 +3116,9 @@ mod tests {
             cold_start: None,
             agent_id: None,
             agent_label: None,
+            codex_route_group_id: None,
+            codex_route_group_name: None,
+            codex_session_display_name: None,
             upstream_call_kind: None,
             upstream_call_source: None,
             cache_key: cache_key.map(ToOwned::to_owned),

@@ -29,6 +29,7 @@ import type {
   GraphiteProviderPayload
 } from "./graphite/frameProtocol";
 import { providersForGraphiteAgent } from "./graphite/providerScope";
+import { modelMappingKey, normalizeGraphiteModels } from "./graphite/modelMappings";
 import { parseCodexContextSettings } from "./graphite/codexContextSettings";
 
 // Keep the UI version badge tied to the package that is actually being built.
@@ -471,7 +472,10 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
 
     try {
       const nextModels = normalizeGraphiteModels(editablePayload.models).map((item) => {
-        const prior = existing?.models.find((modelItem) => modelItem.id === item.id);
+        const mappingKey = modelMappingKey(item.id, item.request_model_id);
+        const prior = existing?.models.find((modelItem) =>
+          modelMappingKey(modelItem.id, modelItem.request_model_id) === mappingKey
+        );
         return {
           ...model(item.id),
           ...prior,
@@ -677,8 +681,11 @@ export function useGraphiteControlPlane(): GraphitePrototypeHostProps {
     }
     if (action === "set-codex-fallback-enabled") {
       const providerId = text("providerId");
-      if (!providerId) throw new Error("未找到待设置的上游");
+      const groupId = text("groupId");
+      if (!providerId || !groupId) throw new Error("未找到待设置的分组上游");
       const nextConfig = await command<AppConfig>("set_codex_fallback_enabled", {
+        groupId,
+        group_id: groupId,
         providerId,
         provider_id: providerId,
         enabled: payload.enabled === true
@@ -1091,23 +1098,6 @@ function graphiteKeyPoolHealth(config: AppConfig, providerId: string) {
       status: key.status
     }))
   };
-}
-
-function normalizeGraphiteModels(models: GraphiteProviderPayload["models"]) {
-  const byId = new Map<string, GraphiteProviderPayload["models"][number]>();
-  for (const source of models) {
-    const id = source.id.trim();
-    if (!id) continue;
-    const requestModelId = cleanOptionalText(source.request_model_id);
-    byId.set(id, {
-      ...source,
-      id,
-      request_model_id: requestModelId === id ? null : requestModelId,
-      context_window: source.context_window ?? null,
-      reasoning_effort: cleanOptionalText(source.reasoning_effort)
-    });
-  }
-  return [...byId.values()];
 }
 
 function isChannel(value: string): value is Channel {

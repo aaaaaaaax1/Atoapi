@@ -1630,6 +1630,11 @@ pub(super) async fn stream_upstream(
             cold_start: None,
             agent_id: agent_log_id.clone(),
             agent_label: agent_log_label.clone(),
+            codex_route_group_id: upstream_request_diagnostics.codex_route_group_id.clone(),
+            codex_route_group_name: upstream_request_diagnostics.codex_route_group_name.clone(),
+            codex_session_display_name: upstream_request_diagnostics
+                .codex_session_display_name
+                .clone(),
             upstream_call_kind: Some("stream".to_string()),
             upstream_call_source: Some(
                 if confirmed_compaction {

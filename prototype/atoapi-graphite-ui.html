@@ -5408,6 +5408,21 @@
 
     .request-pager { margin-left: auto; }
 
+    .request-route-group-filter {
+      min-width: 116px;
+      max-width: 180px;
+      height: 26px;
+      padding: 0 8px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      background: var(--surface-2);
+      color: var(--text);
+      font: inherit;
+      font-size: 10px;
+    }
+
+    .request-route-group-filter:disabled { opacity: 0.55; }
+
     .request-scope-button,
     .request-page-button {
       min-height: 26px;
@@ -5541,6 +5556,11 @@
       font-size: 10.5px;
       font-weight: 560;
       line-height: 13px;
+    }
+
+    .request-identity .request-route-context {
+      color: var(--muted);
+      font-size: 9px;
     }
 
     .request-time {
@@ -7092,6 +7112,7 @@
               <div class="request-record-toolbar">
                 <div class="request-record-controls">
                   <div class="request-scope-tabs" id="requestScopeTabs" role="tablist" aria-label="请求记录上游筛选"></div>
+                <select class="request-route-group-filter" id="requestRouteGroupFilter" aria-label="按成功使用的分组筛选请求记录"><option value="">全部分组</option></select>
                   <div class="request-pager" id="requestPager" aria-label="请求记录分页"></div>
                 </div>
                 <div class="request-column-head" aria-hidden="true"><span>上游 / Agent</span><span>模型 / 思考</span><span>传输</span><span>Tokens</span><span>首字 / 耗时</span><span>命中</span><span>状态</span></div>

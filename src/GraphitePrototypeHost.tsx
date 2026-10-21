@@ -30,6 +30,7 @@ import {
   requestTransportDisplay
 } from "./lib/request-record-state";
 import { providerDisplayName, requestAgentBadge } from "./graphite/providerDisplay";
+import { modelMappingKey } from "./graphite/modelMappings";
 import {
   GRAPHITE_BRIDGE_CHANNEL,
   type GraphiteBridgeResponse,
@@ -182,6 +183,7 @@ const bridgeSource = String.raw`
   let fetchedModelIds = [];
   let requestScopeId = "";
   let requestPage = 1;
+  let requestRouteGroupId = "";
   let lastTrendContextKey = "";
   let latestReleaseChampion = null;
   let latestReleaseChampionError = "";
@@ -718,7 +720,7 @@ const bridgeSource = String.raw`
             '<span class="route-group-order">' + String(index + 1).padStart(2, "0") + '</span>' +
             '<div class="route-group-provider"><b>' + escape(provider.name) + '</b><small>' + escape(provider.url) + '</small><span class="route-provider-detail">' + escape(provider.channel || "Responses") + ' · ' + escape(provider.keys || 0) + ' 个可用 Key · ' + escape(provider.mappings || 0) + ' 个模型 · 最近连通 ' + escape(provider.latency || "未检测") + '</span></div>' +
             '<div class="route-group-actions">' +
-              '<span class="codex-fallback-control route-group-fallback-control"><small>备选</small><button class="switch codex-fallback-switch" type="button" role="switch" data-codex-fallback-toggle="' + escape(provider.id) + '" aria-checked="' + String(!(host.state?.codexFallbackDisabledProviderIds || []).includes(provider.id)) + '" aria-label="参与自动备选" title="控制新会话分组选路时是否将此上游作为备用；排在分组首位时仍可作首选。不会在单次请求失败后自动重试，已绑定会话也不会因此切线"></button></span>' +
+              '<span class="codex-fallback-control route-group-fallback-control"><small>备选</small><button class="switch codex-fallback-switch" type="button" role="switch" data-codex-fallback-toggle="' + escape(provider.id) + '" data-route-group-id="' + escape(group.id) + '" aria-checked="' + String(!(group.fallback_disabled_provider_ids || []).includes(provider.id)) + '" aria-label="参与自动备选" title="此开关只影响当前分组。排在首位的上游始终作为首选"></button></span>' +
               '<button class="balance-probe-chip ' + balanceProbeTone(provider.balance) + '" type="button" data-balance-probe="' + escape(provider.id) + '" title="探测当前可用 Key 的余额">' + icon("wallet-cards", 12) + '<span>' + escape(balanceProbeLabel(provider.balance)) + '</span></button>' +
               '<button class="secondary-button route-provider-test" type="button" data-test-provider="' + escape(provider.id) + '" title="测试上游连通性">' + icon("plug-zap", 13) + '<span>测试连通</span></button>' +
               '<button class="secondary-button route-provider-test route-provider-health" type="button" data-health-probe-provider="' + escape(provider.id) + '" title="发送轻量请求测活">' + icon("activity", 13) + '<span>测活</span></button>' +
@@ -1526,12 +1528,19 @@ const bridgeSource = String.raw`
     const previousModels = previousState?.providerDetails?.[providerId]?.models || [];
     const nextModels = nextState?.providerDetails?.[providerId]?.models || [];
     if (!previousModels.length || !nextModels.length) return;
-    const previousById = new Map(previousModels.map((model) => [model.id, model]));
-    const nextById = new Map(nextModels.map((model) => [model.id, model]));
+    const previousByMapping = new Map(previousModels.map((model) => [
+      modelMappingKey(model.id, model.request_model_id),
+      model
+    ]));
+    const nextByMapping = new Map(nextModels.map((model) => [
+      modelMappingKey(model.id, model.request_model_id),
+      model
+    ]));
     let changed = false;
     mappings.forEach((mapping) => {
-      const previous = previousById.get(mapping.actual);
-      const next = nextById.get(mapping.actual);
+      const mappingKey = modelMappingKey(mapping.actual, mapping.request);
+      const previous = previousByMapping.get(mappingKey);
+      const next = nextByMapping.get(mappingKey);
       if (!previous?.reasoning_effort_override_enabled || !next?.reasoning_effort_override_enabled) return;
       const from = String(previous.reasoning_effort || "").trim();
       const to = String(next.reasoning_effort || "").trim();
@@ -1875,6 +1884,7 @@ const bridgeSource = String.raw`
       event.preventDefault(); event.stopImmediatePropagation();
       send("set-codex-fallback-enabled", {
         providerId: target.dataset.codexFallbackToggle,
+        groupId: target.dataset.routeGroupId,
         enabled: target.getAttribute("aria-checked") !== "true"
       });
       return;
@@ -2271,12 +2281,31 @@ const bridgeSource = String.raw`
     const metricState = host.state?.metrics || {};
     const scope = activeRequestScope(metricState);
     renderRequestScopeTabs(metricState);
+    const groupFilter = $bridge("#requestRouteGroupFilter");
+    if (groupFilter) {
+      const successfulGroups = new Map();
+      for (const request of requests) {
+        if (request.failed || !request.routeGroupId) continue;
+        successfulGroups.set(request.routeGroupId, request.routeGroupName || request.routeGroupId);
+      }
+      if (!successfulGroups.has(requestRouteGroupId)) requestRouteGroupId = "";
+      groupFilter.innerHTML = '<option value="">全部分组</option>' + [...successfulGroups]
+        .sort((left, right) => left[1].localeCompare(right[1], "zh-CN"))
+        .map(([id, name]) => '<option value="' + escape(id) + '"' + (id === requestRouteGroupId ? ' selected' : '') + '>' + escape(name) + '</option>')
+        .join("");
+      groupFilter.onchange = () => {
+        requestRouteGroupId = groupFilter.value;
+        requestPage = 1;
+        renderRequests();
+      };
+      groupFilter.disabled = successfulGroups.size === 0;
+    }
     const columnLabels = document.querySelectorAll(".request-column-head span");
     if (columnLabels[2]) columnLabels[2].textContent = "传输";
     if (columnLabels[6]) columnLabels[6].textContent = "状态";
-    const scoped = scope.providerId
+    const scoped = (scope.providerId
       ? requests.filter((request) => request.providerId === scope.providerId)
-      : requests.slice();
+      : requests.slice()).filter((request) => !requestRouteGroupId || request.routeGroupId === requestRouteGroupId);
     const totalPages = Math.min(REQUEST_PAGE_LIMIT, Math.max(1, Math.ceil(scoped.length / REQUESTS_PER_PAGE)));
     requestPage = Math.max(1, Math.min(requestPage, totalPages));
     const start = (requestPage - 1) * REQUESTS_PER_PAGE;
@@ -2294,6 +2323,7 @@ const bridgeSource = String.raw`
       const statusDetail = request.statusDetail
         ? '<small>' + escape(request.statusDetail) + '</small>'
         : '';
+      const routeContext = [request.sessionDisplayName, request.routeGroupName].filter(Boolean).join(" · ");
       const cacheShortfallTokens = Number(request.cacheShortfallTokens || 0);
       const cacheNewTailTokens = Number(request.cacheNewTailGapTokens || 0);
       const cacheTailSegments = requestCacheTailSegments(
@@ -2304,7 +2334,7 @@ const bridgeSource = String.raw`
         ? cacheTailSegments.join(" · ")
         : "满桶";
       return '<article class="request-row status-' + escape(rowTone) + (request.failed ? ' failed' : '') + '" tabindex="0" data-request-id="' + escape(request.id) + '">' +
-        '<div class="request-identity" title="' + escape(request.provider + " · " + request.agentLabel) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span>' + escape(request.time) + '</span></div>' +
+        '<div class="request-identity" title="' + escape([request.provider, request.agentLabel, routeContext, request.time].filter(Boolean).join(" · ")) + '"><b><span class="request-provider-name">' + escape(request.provider) + '</span><span class="request-agent-badge agent-' + escape(request.agentTone || "generic") + '">' + escape(request.agentLabel) + '</span></b><span class="request-route-context">' + escape(routeContext ? routeContext + " · " + request.time : request.time) + '</span></div>' +
         '<div class="request-model" title="' + escape(request.provider + " · " + request.model) + '"><div class="request-model-stack"><span class="request-model-name">' + escape(model) + '</span><span class="request-reasoning">' + escape(request.reasoning || "—") + '</span></div></div>' +
         '<div class="request-stream transport-' + escape(request.transportTone || "stream") + '"><b>' + escape(request.transport) + '</b><small>' + (outputRate ? outputRate + ' t/s' : '—') + '</small></div>' +
         '<div class="request-tokens"><b>' + escape(requestTokens(request.inputTokens)) + ' / ' + escape(requestTokens(request.outputTokens)) + '</b><small>缓存 ' + escape(requestTokens(request.cachedTokens)) + ' (' + escape(cachePercent) + ')</small></div>' +
@@ -2546,6 +2576,8 @@ const bridgeSource = String.raw`
       '<div class="status-band"><span class="status-icon">' + icon(request.stateTone === "error" ? "circle-x" : "circle-check", 17) + '</span><div><b>' + escape(request.state) + '</b><small>' + escape(request.stateTone === "error" ? (request.errorDetail || request.detail) : "成功流已完整收尾并记录 usage") + '</small></div></div>' +
       '<div class="detail-list">' +
       '<div class="detail-row"><span>请求 ID</span><code>' + escape(request.id) + '</code></div>' +
+      (request.sessionDisplayName ? '<div class="detail-row"><span>会话备注</span><b>' + escape(request.sessionDisplayName) + '</b></div>' : '') +
+      (request.routeGroupName ? '<div class="detail-row"><span>实际分组</span><b>' + escape(request.routeGroupName) + '</b></div>' : '') +
       '<div class="detail-row"><span>模型首字 / 总耗时</span><b>' + escape(request.ttft) + ' / ' + escape(request.total) + '</b></div>' +
       visibleTextTtftRow +
       upstreamFirstEventRow +
@@ -3021,6 +3053,9 @@ function buildState(
       model,
       agentLabel: badge.label,
       agentTone: badge.tone,
+      routeGroupId: request.codex_route_group_id ?? null,
+      routeGroupName: request.codex_route_group_name ?? null,
+      sessionDisplayName: request.codex_session_display_name ?? null,
       clientChannel: request.client_channel ?? "Responses",
       channel: `${request.client_channel ?? "Responses"} · ${request.agent_id ?? "Agent"} · 流式`,
       ttft: formatDuration(displayModelFirstTokenMs),
@@ -3294,7 +3329,6 @@ function buildState(
     agents,
     codexContextSettings,
     codexRouteGroups: config?.codex_route_groups ?? [{ id: "default", name: "默认分组", provider_ids: [] }],
-    codexFallbackDisabledProviderIds: config?.codex_fallback_disabled_provider_ids ?? [],
     codexSessionRoutes: config?.codex_session_routes ?? [],
     codexSessionRoutePins: config?.codex_session_route_pins ?? [],
     providers: providerState,

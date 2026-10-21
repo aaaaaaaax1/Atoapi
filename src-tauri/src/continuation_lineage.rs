@@ -832,6 +832,26 @@ impl ContinuationLineageIndex {
         })
     }
 
+    pub async fn has_managed_response_in_scope(
+        &self,
+        current_key: &str,
+        response_id: &str,
+    ) -> bool {
+        let response_id = response_id.trim();
+        if response_id.is_empty() {
+            return false;
+        }
+        self.slots
+            .lock()
+            .await
+            .get(current_key)
+            .is_some_and(|slot| {
+                slot.head
+                    .as_ref()
+                    .is_some_and(|head| head.response_id == response_id)
+            })
+    }
+
     /// Reports whether an opaque local-only response id belongs to any other
     /// scope. Unlike `managed_response_in_other_scope`, no replay material is
     /// returned: the caller can only strip the id before one ordinary request.
@@ -1350,6 +1370,16 @@ mod tests {
                 .await
                 .is_none(),
             "a response id owned by the current scope must never recover replay material from an old route"
+        );
+        assert!(
+            index
+                .has_managed_response_in_scope("current-route", "resp-shared")
+                .await
+        );
+        assert!(
+            !index
+                .has_managed_response_in_scope("missing-route", "resp-shared")
+                .await
         );
     }
 
