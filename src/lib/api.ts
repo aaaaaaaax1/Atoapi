@@ -286,12 +286,14 @@ export interface CodexSessionRouteConfig {
   last_provider_id?: string | null;
   last_seen_at?: string | null;
   consecutive_503_failures?: number;
+  primary_model?: string | null;
 }
 
 export interface CodexSessionRoutePin {
   session_id: string;
   group_id: string;
   provider_id: string;
+  primary_model?: string | null;
   last_seen_at?: string | null;
 }
 

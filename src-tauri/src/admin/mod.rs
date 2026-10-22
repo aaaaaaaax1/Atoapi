@@ -1099,6 +1099,10 @@ pub async fn save_codex_routing(
                         .map(|previous| previous.consecutive_503_failures)
                         .unwrap_or_default();
                 }
+                if session.primary_model.is_none() {
+                    session.primary_model =
+                        previous.and_then(|previous| previous.primary_model.clone());
+                }
                 if previous.is_some_and(|previous| {
                     previous.group_id != session.group_id
                         || previous.last_provider_id != session.last_provider_id
@@ -1130,6 +1134,16 @@ pub async fn save_codex_routing(
                 }
             }
             let sessions = validate_codex_session_routes(&groups, sessions)?;
+            let mut pins = input.pins;
+            for pin in &mut pins {
+                if pin.primary_model.is_none() {
+                    pin.primary_model = current
+                        .codex_session_route_pins
+                        .iter()
+                        .find(|previous| previous.session_id == pin.session_id)
+                        .and_then(|previous| previous.primary_model.clone());
+                }
+            }
             pending_group_switches.retain(|session_id| {
                 sessions
                     .iter()
@@ -1140,7 +1154,7 @@ pub async fn save_codex_routing(
             next.codex_fallback_disabled_provider_ids.clear();
             next.codex_session_routes = sessions;
             next.codex_pending_group_switches = pending_group_switches;
-            next.codex_session_route_pins = validate_codex_session_route_pins(&next, input.pins)?;
+            next.codex_session_route_pins = validate_codex_session_route_pins(&next, pins)?;
             next.updated_at = Utc::now();
             Ok(next)
         })
@@ -4640,6 +4654,8 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         };
         let mut sessions = vec![managed];
         sessions.extend(
@@ -4651,6 +4667,8 @@ mod tests {
                 last_provider_id: Some("primary".to_string()),
                 last_seen_at: None,
                 consecutive_503_failures: 0,
+
+                primary_model: None,
             }),
         );
         assert_eq!(
@@ -4667,6 +4685,8 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         assert!(validate_codex_session_routes(&groups, sessions).is_err());
     }
@@ -4691,12 +4711,16 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "managed-session".to_string(),
             group_id: "work".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         config.codex_route_groups[0].fallback_disabled_provider_ids = vec!["primary".to_string()];
 
@@ -5945,6 +5969,8 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 1,
+
+            primary_model: None,
         });
         let input = CodexRoutingConfigInput {
             groups: config.codex_route_groups.clone(),
@@ -5956,6 +5982,8 @@ mod tests {
                 last_provider_id: None,
                 last_seen_at: None,
                 consecutive_503_failures: 0,
+
+                primary_model: None,
             }],
             pins: Vec::new(),
         };

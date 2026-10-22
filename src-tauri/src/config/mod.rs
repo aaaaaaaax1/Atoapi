@@ -1039,10 +1039,15 @@ pub struct CodexSessionRouteConfig {
     pub display_name: Option<String>,
     #[serde(default)]
     pub last_provider_id: Option<String>,
+    /// Model identity that owns this route.  A stale pin from a previous
+    /// primary model must never influence the next session turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
-    /// A single HTTP 503 is often an upstream transient blip. Keep the session
-    /// on its current provider until the same route fails twice consecutively.
+    /// Counts consecutive transferable failures for the same session, provider,
+    /// and primary model. The historical field name is kept for config
+    /// compatibility; a route advances only on the third failure.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub consecutive_503_failures: u32,
 }
@@ -1052,6 +1057,8 @@ pub struct CodexSessionRoutePin {
     pub session_id: String,
     pub group_id: String,
     pub provider_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_model: Option<String>,
     #[serde(default)]
     pub last_seen_at: Option<DateTime<Utc>>,
 }
@@ -1107,6 +1114,13 @@ pub struct PublicProviderKey {
     pub last_checked_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub disabled_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProviderKeyMaterial {
+    pub encrypted_secret: String,
+    pub key_id: Option<String>,
+    pub encrypted_material_digest: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2301,6 +2315,30 @@ impl AppConfig {
         preferred_key_id: Option<&str>,
         exclude_key_id: Option<&str>,
     ) -> Result<Option<SelectedProviderKey>> {
+        let Some(material) = self.select_provider_key_material_for_request(
+            provider_id,
+            preferred_key_id,
+            exclude_key_id,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SelectedProviderKey {
+            secret: decrypt_secret(&material.encrypted_secret)?,
+            key_id: material.key_id,
+            encrypted_material_digest: material.encrypted_material_digest,
+        }))
+    }
+
+    /// Select locked Key metadata while holding the config lock, then decrypt
+    /// after the caller releases it. DPAPI is comparatively slow and must not
+    /// serialize independent sessions sharing a config snapshot.
+    pub(crate) fn select_provider_key_material_for_request(
+        &mut self,
+        provider_id: &str,
+        preferred_key_id: Option<&str>,
+        exclude_key_id: Option<&str>,
+    ) -> Result<Option<ProviderKeyMaterial>> {
         let now = Utc::now();
         if let Some(pool) = self
             .provider_key_pools
@@ -2380,14 +2418,9 @@ impl AppConfig {
                     .key_encrypted
                     .as_deref()
                     .and_then(encrypted_provider_key_material_digest);
-                let secret = selected
-                    .key_encrypted
-                    .as_deref()
-                    .map(decrypt_secret)
-                    .transpose()?;
-                if let Some(secret) = secret {
-                    return Ok(Some(SelectedProviderKey {
-                        secret,
+                if let Some(encrypted_secret) = selected.key_encrypted.clone() {
+                    return Ok(Some(ProviderKeyMaterial {
+                        encrypted_secret,
                         key_id: Some(selected.id.clone()),
                         encrypted_material_digest,
                     }));
@@ -2402,13 +2435,18 @@ impl AppConfig {
             ));
         }
 
-        self.provider_api_key(provider_id).map(|key| {
-            key.map(|secret| SelectedProviderKey {
-                secret,
+        let encrypted_secret = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .and_then(|provider| provider.api_key_encrypted.clone());
+        Ok(
+            encrypted_secret.map(|encrypted_secret| ProviderKeyMaterial {
+                encrypted_secret,
                 key_id: None,
                 encrypted_material_digest: None,
-            })
-        })
+            }),
+        )
     }
 
     pub fn mark_provider_key_success(&mut self, provider_id: &str, key_id: Option<&str>) {
@@ -3892,6 +3930,8 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 1,
+
+            primary_model: None,
         });
 
         let roundtrip: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();

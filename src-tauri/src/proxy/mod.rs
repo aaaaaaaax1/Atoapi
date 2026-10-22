@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::continuation_lineage::ResponseSessionState;
+use crate::crypto::decrypt_secret;
 use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
@@ -10,9 +11,8 @@ use crate::{
         CodexSessionRouteConfig, CodexSessionRoutePin, ModelConfig, ProviderCacheCapabilityField,
         ProviderCacheCapabilityProbeFieldResult, ProviderCacheCapabilityProbeInput,
         ProviderCacheCapabilityProbeResult, ProviderCacheCapabilityStatus,
-        ProviderCacheEffectStatus, ProviderChannelMode, ProviderConfig, SelectedProviderKey,
-        CODEX_DEFAULT_ROUTE_GROUP_ID, CODEX_RECENT_SESSION_LIMIT, CODEX_SESSION_ROUTE_PIN_LIMIT,
-        REASONING_EFFORT_VALUES,
+        ProviderCacheEffectStatus, ProviderChannelMode, ProviderConfig, ProviderKeyMaterial,
+        SelectedProviderKey, CODEX_SESSION_ROUTE_PIN_LIMIT, REASONING_EFFORT_VALUES,
     },
     continuation_lineage::{
         ControlOnlyReplayCandidate, LineageCommitOutcome, LineageInvalidateOutcome, LineageLease,
@@ -442,6 +442,7 @@ struct CodexRouteSelection {
     session_id: Option<String>,
     group_id: String,
     provider_id: String,
+    primary_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -539,6 +540,8 @@ struct UpstreamRequestDiagnostics {
     codex_route_session_id: Option<String>,
     codex_route_group_id: Option<String>,
     codex_route_group_name: Option<String>,
+    codex_primary_model: Option<String>,
+    codex_auxiliary_request: bool,
     codex_session_display_name: Option<String>,
 }
 impl UpstreamRequestDiagnostics {
@@ -623,6 +626,10 @@ impl UpstreamRequestDiagnostics {
         if next.codex_route_group_id.is_some() {
             self.codex_route_group_id = next.codex_route_group_id.clone();
         }
+        if next.codex_primary_model.is_some() {
+            self.codex_primary_model = next.codex_primary_model.clone();
+        }
+        self.codex_auxiliary_request |= next.codex_auxiliary_request;
         if next.codex_route_group_name.is_some() {
             self.codex_route_group_name = next.codex_route_group_name.clone();
         }
@@ -2284,7 +2291,7 @@ async fn run_responses_compact_for_authorized_agent(
     state: Arc<AppState>,
     headers: HeaderMap,
     body: Bytes,
-    response_id: Option<String>,
+    mut response_id: Option<String>,
     forced_agent_id: Option<&'static str>,
     authorized_agent: Option<String>,
     started: Instant,
@@ -2309,11 +2316,48 @@ async fn run_responses_compact_for_authorized_agent(
         &client_request,
         forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
     );
+    let auxiliary_codex_request = authorized_agent.as_deref() == Some("codex")
+        && client_request
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_codex_internal_auxiliary_model);
+    let codex_primary_model = codex_primary_route_model(&client_request);
     if let Some(response_id) = response_id.as_deref() {
         compact_request_set_response_id(&mut client_request, response_id);
     }
     set_stream_flag(&mut client_request, false);
     let config = state.config.read().await.clone();
+    let codex_previous_provider_unknown_for_continuation = authorized_agent.as_deref()
+        == Some("codex")
+        && codex_previous_provider_is_unknown_for_continuation(
+            &config,
+            &client_request,
+            trusted_codex_metadata.as_ref(),
+        );
+    if codex_previous_provider_unknown_for_continuation {
+        if !client_request.get("input").is_some_and(Value::is_array) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "agent_route_session_conflict: 无法确认旧会话的原上游，且本地没有可重建的完整历史；请新建会话后使用当前分组",
+            );
+        }
+        if let Some(request) = client_request.as_object_mut() {
+            request.remove("previous_response_id");
+        }
+        // The provider-scoped compact URL cannot be sent to an arbitrary new
+        // upstream. Fall back to the self-contained compact body once.
+        response_id = None;
+    }
+    if authorized_agent.as_deref() == Some("codex") {
+        if let Ok(Some(selection)) = select_codex_route(
+            &config,
+            &client_request,
+            trusted_codex_metadata.as_ref(),
+            response_id.as_deref(),
+        ) {
+            bind_codex_route_before_request(&state, Some(selection)).await;
+        }
+    }
     let decision = match decide_route_with_runtime_model_for_session(
         &config,
         &client_request,
@@ -2699,8 +2743,11 @@ async fn run_responses_compact_for_authorized_agent(
             let transport_diagnostics = upstream_transport_error_diagnostics(&err);
             let transport_error_category = upstream_transport_error_category(&err);
             let transport_error_metric = upstream_transport_error_metric_message(&err);
-            if agent_compact && authorized_agent.as_deref() == Some("codex") {
-                failover_codex_route_after_failure(
+            if agent_compact
+                && authorized_agent.as_deref() == Some("codex")
+                && !auxiliary_codex_request
+            {
+                failover_codex_route_after_failure_for_model(
                     &state,
                     trusted_codex_metadata
                         .as_ref()
@@ -2711,6 +2758,7 @@ async fn run_responses_compact_for_authorized_agent(
                     None,
                     Some(&transport_error_metric),
                     true,
+                    codex_primary_model.as_deref(),
                 )
                 .await;
             }
@@ -2809,6 +2857,8 @@ async fn run_responses_compact_for_authorized_agent(
         .as_ref()
         .and_then(|metadata| codex_route_session_id(Some(metadata)));
     upstream_request_diagnostics.codex_route_group_id = codex_log_fields.group_id.clone();
+    upstream_request_diagnostics.codex_primary_model = codex_primary_model.clone();
+    upstream_request_diagnostics.codex_auxiliary_request = auxiliary_codex_request;
     upstream_request_diagnostics.codex_route_group_name = codex_log_fields.group_name.clone();
     upstream_request_diagnostics.codex_session_display_name =
         codex_log_fields.session_display_name.clone();
@@ -2872,8 +2922,11 @@ async fn run_responses_compact_for_authorized_agent(
     {
         Ok(outcome) => outcome,
         Err(err) => {
-            if agent_compact && authorized_agent.as_deref() == Some("codex") {
-                failover_codex_route_after_failure(
+            if agent_compact
+                && authorized_agent.as_deref() == Some("codex")
+                && !auxiliary_codex_request
+            {
+                failover_codex_route_after_failure_for_model(
                     &state,
                     upstream_request_diagnostics
                         .codex_route_session_id
@@ -2883,6 +2936,7 @@ async fn run_responses_compact_for_authorized_agent(
                     None,
                     Some("compact response body transport failure"),
                     true,
+                    codex_primary_model.as_deref(),
                 )
                 .await;
             }
@@ -3005,16 +3059,22 @@ async fn run_responses_compact_for_authorized_agent(
     {
         note_compact_endpoint_cooldown(&state, &compact_chat_compat_cooldown_key).await;
     }
-    note_selected_provider_key_status(
-        &state,
-        &decision.provider.id,
-        &selected_provider_key,
-        status,
-        key_error_summary.as_deref(),
-    )
-    .await;
-    if agent_compact && !compact_success_for_cache && authorized_agent.as_deref() == Some("codex") {
-        failover_codex_route_after_failure(
+    if !auxiliary_codex_request {
+        note_selected_provider_key_status(
+            &state,
+            &decision.provider.id,
+            &selected_provider_key,
+            status,
+            key_error_summary.as_deref(),
+        )
+        .await;
+    }
+    if agent_compact
+        && !compact_success_for_cache
+        && authorized_agent.as_deref() == Some("codex")
+        && !auxiliary_codex_request
+    {
+        failover_codex_route_after_failure_for_model(
             &state,
             upstream_request_diagnostics
                 .codex_route_session_id
@@ -3024,17 +3084,22 @@ async fn run_responses_compact_for_authorized_agent(
             Some(status),
             key_error_summary.as_deref(),
             false,
+            codex_primary_model.as_deref(),
         )
         .await;
     }
-    if compact_success_for_cache && authorized_agent.as_deref() == Some("codex") {
+    if compact_success_for_cache
+        && authorized_agent.as_deref() == Some("codex")
+        && !auxiliary_codex_request
+    {
         observe_codex_route(
             state.clone(),
-            codex_route_selection_for_provider(
+            codex_route_selection_for_provider_for_model(
                 &config,
                 trusted_codex_metadata.as_ref(),
                 &decision.provider.id,
                 upstream_request_diagnostics.codex_route_group_id.as_deref(),
+                upstream_request_diagnostics.codex_primary_model.as_deref(),
             ),
         );
     }
@@ -3697,13 +3762,39 @@ async fn run_generation_for_authorized_agent(
         &client_request,
         forced_agent_id == Some("codex") || authorized_agent.as_deref() == Some("codex"),
     );
+    let auxiliary_codex_request = authorized_agent.as_deref() == Some("codex")
+        && client_request
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(is_codex_internal_auxiliary_model);
     let config = state.config.read().await.clone();
     let runtime_primary_model = runtime_primary_model_for_internal_codex_request(
         &state,
         &config,
         &client_request,
         authorized_agent.as_deref(),
+        trusted_codex_metadata.as_ref(),
     );
+    // Capture this before route binding creates a pin. A stale response id with
+    // no recorded provider can still be recovered from the caller's complete
+    // input or process-local lineage, but its original upstream is unknown.
+    let codex_previous_provider_unknown_for_continuation = authorized_agent.as_deref()
+        == Some("codex")
+        && codex_previous_provider_is_unknown_for_continuation(
+            &config,
+            &client_request,
+            trusted_codex_metadata.as_ref(),
+        );
+    if authorized_agent.as_deref() == Some("codex") {
+        if let Ok(Some(selection)) = select_codex_route(
+            &config,
+            &client_request,
+            trusted_codex_metadata.as_ref(),
+            None,
+        ) {
+            bind_codex_route_before_request(&state, Some(selection)).await;
+        }
+    }
     // TOOL_DIAGNOSTICS: before model, history, tool, or call-ID mutations.
     if config.tool_diagnostics_enabled {
         state
@@ -3736,6 +3827,7 @@ async fn run_generation_for_authorized_agent(
         &state,
         &client_request,
         authorized_agent.as_deref(),
+        trusted_codex_metadata.as_ref(),
         &decision,
     );
     let codex_responses_chat_compat = should_preempt_codex_responses_via_chat(
@@ -4352,6 +4444,23 @@ async fn run_generation_for_authorized_agent(
             }
         }
     }
+    if codex_previous_provider_unknown_for_continuation
+        && upstream_body.get("previous_response_id").is_some()
+    {
+        // The old response id has no trustworthy upstream scope. A complete
+        // Responses input array can be replayed once without that id; a
+        // scalar or missing input cannot prove history and remains fail-closed.
+        if !upstream_body.get("input").is_some_and(Value::is_array) {
+            return json_error(
+                StatusCode::CONFLICT,
+                "agent_route_session_conflict: 无法确认旧会话的原上游，且本地没有可重建的完整历史；请新建会话后使用当前分组",
+            );
+        }
+        if let Some(request) = upstream_body.as_object_mut() {
+            request.remove("previous_response_id");
+        }
+        full_replay_ambiguous_local_lineage = true;
+    }
     // Only an unreconstructable external continuation remains after the local
     // full-replay recovery above. It must not affect local lineage state.
     let final_body_has_no_external_previous_response_id =
@@ -4590,6 +4699,7 @@ async fn run_generation_for_authorized_agent(
     if responses_non_stream_chat_compat {
         prefix_state_update_key = None;
     }
+    let codex_primary_model = codex_primary_route_model(&client_request);
     let mut upstream_request_diagnostics = UpstreamRequestDiagnostics::default();
     upstream_request_diagnostics.codex_route_session_id = trusted_codex_metadata
         .as_ref()
@@ -4602,6 +4712,8 @@ async fn run_generation_for_authorized_agent(
         authorized_agent.as_deref() == Some("codex"),
     );
     upstream_request_diagnostics.codex_route_group_id = codex_log_fields.group_id.clone();
+    upstream_request_diagnostics.codex_primary_model = codex_primary_model.clone();
+    upstream_request_diagnostics.codex_auxiliary_request = auxiliary_codex_request;
     upstream_request_diagnostics.codex_route_group_name = codex_log_fields.group_name.clone();
     upstream_request_diagnostics.codex_session_display_name =
         codex_log_fields.session_display_name.clone();
@@ -5445,8 +5557,8 @@ async fn run_generation_for_authorized_agent(
             let transport_diagnostics = upstream_transport_error_diagnostics(&err);
             let transport_error_category = upstream_transport_error_category(&err);
             let transport_error_metric = upstream_transport_error_metric_message(&err);
-            if authorized_agent.as_deref() == Some("codex") {
-                failover_codex_route_after_failure(
+            if authorized_agent.as_deref() == Some("codex") && !auxiliary_codex_request {
+                failover_codex_route_after_failure_for_model(
                     &state,
                     upstream_request_diagnostics
                         .codex_route_session_id
@@ -5456,6 +5568,7 @@ async fn run_generation_for_authorized_agent(
                     None,
                     Some(&transport_error_metric),
                     true,
+                    codex_primary_model.as_deref(),
                 )
                 .await;
             }
@@ -5790,9 +5903,9 @@ async fn run_generation_for_authorized_agent(
                 upstream_request_diagnostics.final_scope_waterline = final_scope_dispatch
                     .take()
                     .and_then(|guard| guard.finish(None, false, false, None, None));
-                if authorized_agent.as_deref() == Some("codex") {
+                if authorized_agent.as_deref() == Some("codex") && !auxiliary_codex_request {
                     let error_summary = err.to_string();
-                    failover_codex_route_after_failure(
+                    failover_codex_route_after_failure_for_model(
                         &state,
                         upstream_request_diagnostics
                             .codex_route_session_id
@@ -5802,6 +5915,7 @@ async fn run_generation_for_authorized_agent(
                         Some(status),
                         Some(&error_summary),
                         true,
+                        codex_primary_model.as_deref(),
                     )
                     .await;
                 }
@@ -5962,14 +6076,16 @@ async fn run_generation_for_authorized_agent(
         status = StatusCode::BAD_GATEWAY.as_u16();
         is_success_status = false;
     }
-    if is_success_status && authorized_agent.as_deref() == Some("codex") {
+    if is_success_status && authorized_agent.as_deref() == Some("codex") && !auxiliary_codex_request
+    {
         observe_codex_route(
             state.clone(),
-            codex_route_selection_for_provider(
+            codex_route_selection_for_provider_for_model(
                 &config,
                 trusted_codex_metadata.as_ref(),
                 &decision.provider.id,
                 upstream_request_diagnostics.codex_route_group_id.as_deref(),
+                upstream_request_diagnostics.codex_primary_model.as_deref(),
             ),
         );
     }
@@ -6115,16 +6231,21 @@ async fn run_generation_for_authorized_agent(
         )
         .await;
     }
-    note_selected_provider_key_status(
-        &state,
-        &decision.provider.id,
-        &selected_provider_key,
-        status,
-        key_error_summary.as_deref(),
-    )
-    .await;
-    if !is_success_status && authorized_agent.as_deref() == Some("codex") {
-        failover_codex_route_after_failure(
+    if !auxiliary_codex_request {
+        note_selected_provider_key_status(
+            &state,
+            &decision.provider.id,
+            &selected_provider_key,
+            status,
+            key_error_summary.as_deref(),
+        )
+        .await;
+    }
+    if !is_success_status
+        && authorized_agent.as_deref() == Some("codex")
+        && !auxiliary_codex_request
+    {
+        failover_codex_route_after_failure_for_model(
             &state,
             upstream_request_diagnostics
                 .codex_route_session_id
@@ -6134,6 +6255,7 @@ async fn run_generation_for_authorized_agent(
             Some(upstream_status_for_cache_capability),
             key_error_summary.as_deref(),
             false,
+            codex_primary_model.as_deref(),
         )
         .await;
     }
@@ -11148,6 +11270,34 @@ fn codex_route_session_id(metadata: Option<&TrustedCodexRequestMetadata>) -> Opt
     })
 }
 
+fn codex_previous_provider_id<'a>(
+    config: &'a AppConfig,
+    metadata: Option<&TrustedCodexRequestMetadata>,
+) -> Option<&'a str> {
+    let session_id = codex_route_session_id(metadata)?;
+    config
+        .codex_session_route_pins
+        .iter()
+        .find(|pin| pin.session_id == session_id)
+        .map(|pin| pin.provider_id.as_str())
+        .or_else(|| {
+            config
+                .codex_session_routes
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .and_then(|session| session.last_provider_id.as_deref())
+        })
+}
+
+fn codex_previous_provider_is_unknown_for_continuation(
+    config: &AppConfig,
+    request: &Value,
+    metadata: Option<&TrustedCodexRequestMetadata>,
+) -> bool {
+    request.get("previous_response_id").is_some()
+        && codex_previous_provider_id(config, metadata).is_none()
+}
+
 fn codex_managed_group_switch_requires_replay(
     config: &AppConfig,
     metadata: Option<&TrustedCodexRequestMetadata>,
@@ -11156,19 +11306,21 @@ fn codex_managed_group_switch_requires_replay(
     let Some(session_id) = codex_route_session_id(metadata) else {
         return false;
     };
-    let Some(session) = config
+    let session = config
         .codex_session_routes
         .iter()
-        .find(|session| session.session_id == session_id)
-    else {
-        return false;
-    };
+        .find(|session| session.session_id == session_id);
+    // Legacy installations can retain a route pin after their older session
+    // record has been pruned. The pin still identifies the upstream that owns
+    // the response id, so a missing session record must not let that id leak to
+    // a newly selected provider.
     let pinned_provider_id = config
         .codex_session_route_pins
         .iter()
         .find(|pin| pin.session_id == session_id)
         .map(|pin| pin.provider_id.as_str());
-    let previous_provider_id = pinned_provider_id.or(session.last_provider_id.as_deref());
+    let previous_provider_id = pinned_provider_id
+        .or_else(|| session.and_then(|session| session.last_provider_id.as_deref()));
     previous_provider_id.is_some_and(|provider_id| provider_id != selected_provider_id)
 }
 
@@ -11285,23 +11437,35 @@ fn select_codex_route(
     config: &AppConfig,
     request: &Value,
     metadata: Option<&TrustedCodexRequestMetadata>,
-    compact_response_id: Option<&str>,
+    _compact_response_id: Option<&str>,
 ) -> Result<Option<CodexRouteSelection>, String> {
     let session_id = codex_route_session_id(metadata);
     let (group, session) = codex_group_for_session(config, session_id.as_deref());
+    let pin = session_id.as_deref().and_then(|session_id| {
+        config
+            .codex_session_route_pins
+            .iter()
+            .find(|pin| pin.session_id == session_id)
+    });
+    let primary_model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !is_codex_internal_auxiliary_model(model))
+        .map(ToOwned::to_owned);
+    // Missing primary_model is a legacy config. Once populated, a model switch
+    // invalidates that session's old provider and failure counter.
+    let model_changed = primary_model.as_deref().is_some_and(|model| {
+        pin.and_then(|pin| pin.primary_model.as_deref())
+            .or_else(|| session.and_then(|session| session.primary_model.as_deref()))
+            .is_some_and(|saved| saved != model)
+    });
     let pending_group_switch = session_id.as_deref().is_some_and(|session_id| {
         session.is_some_and(|session| session.managed)
             && config
                 .codex_pending_group_switches
                 .iter()
                 .any(|pending| pending == session_id)
-    });
-    let pinned_provider_id = session_id.as_deref().and_then(|session_id| {
-        config
-            .codex_session_route_pins
-            .iter()
-            .find(|pin| pin.session_id == session_id)
-            .map(|pin| pin.provider_id.as_str())
     });
     if let Some(session_id) = session_id.as_deref() {
         if !config
@@ -11316,224 +11480,209 @@ fn select_codex_route(
             );
         }
     }
-    let previous_response_id = compact_response_id.is_some()
-        || request
-            .get("previous_response_id")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.trim().is_empty());
-    let session_route_changed = session.is_some_and(|route| {
-        (compact_response_id.is_none() && route.managed && pending_group_switch)
-            || config
-                .codex_session_route_pins
-                .iter()
-                .find(|pin| Some(pin.session_id.as_str()) == session_id.as_deref())
-                .map(|pin| {
-                    pin.group_id != group.id
-                        || !codex_group_provider_participates(group, &pin.provider_id)
-                })
-                .unwrap_or_else(|| {
-                    route.last_provider_id.as_ref().is_some_and(|provider_id| {
-                        !codex_group_provider_participates(group, provider_id)
-                    })
-                })
-    });
-
-    if previous_response_id {
-        if let Some(provider_id) = pinned_provider_id
-            .or_else(|| session.and_then(|route| route.last_provider_id.as_deref()))
-        {
-            if !session_route_changed && codex_group_provider_participates(&group, provider_id) {
-                if !codex_provider_is_visible(config, provider_id) {
-                    return Err(
-                    "agent_route_session_conflict: 该会话原上游不可用；为避免续接 ID 跨上游失效，请恢复原上游及其 Key，或新建会话"
-                        .to_string(),
-                );
-                }
-                if provider_has_usable_key(config, provider_id) {
-                    let continuity_group_id = session_id
-                        .as_deref()
-                        .and_then(|session_id| {
-                            config
-                                .codex_session_route_pins
-                                .iter()
-                                .find(|pin| pin.session_id == session_id)
-                        })
-                        .map(|pin| pin.group_id.clone())
-                        .unwrap_or_else(|| group.id.clone());
-                    return Ok(Some(CodexRouteSelection {
-                        session_id,
-                        group_id: continuity_group_id,
-                        provider_id: provider_id.to_string(),
-                    }));
-                }
-                // A failed provider may no longer have a usable Key (or may
-                // have failed before a Key health record was written). For a
-                // new inbound continuation, advance through the same group
-                // before rejecting the session. The request is still rebuilt
-                // locally and sent only once on the selected next route.
-                if previous_response_id {
-                    let provider_index = group
-                        .provider_ids
-                        .iter()
-                        .position(|candidate| candidate == provider_id);
-                    if let Some(provider_index) = provider_index {
-                        if let Some(next_provider_id) = group
-                            .provider_ids
-                            .iter()
-                            .enumerate()
-                            .skip(provider_index + 1)
-                            .find(|(_, candidate)| {
-                                codex_group_provider_participates(group, candidate)
-                                    && codex_provider_is_visible(config, candidate)
-                                    && provider_has_usable_key(config, candidate)
-                            })
-                            .map(|(_, candidate)| candidate)
-                        {
-                            return Ok(Some(CodexRouteSelection {
-                                session_id,
-                                group_id: group.id.clone(),
-                                provider_id: next_provider_id.clone(),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-        if session.is_some_and(|route| route.managed) && !session_route_changed {
-            return Err(
-                "agent_route_session_conflict: 已续接会话缺少原上游绑定；为避免上下文串线，请恢复其原线路记录，或新建会话"
-                    .to_string(),
-            );
-        }
-    }
-
-    let mut candidates = group
+    let candidate_ids = group
         .provider_ids
         .iter()
         .filter(|provider_id| {
             codex_group_provider_participates(group, provider_id)
                 && codex_provider_is_visible(config, provider_id)
-                && config
-                    .providers
-                    .iter()
-                    .any(|provider| provider.id == **provider_id && provider.enabled)
+                && provider_has_usable_key(config, provider_id)
         })
         .cloned()
         .collect::<Vec<_>>();
-    if candidates.is_empty() && group.provider_ids.is_empty() {
+    let original_index = |provider_id: &str| {
+        group
+            .provider_ids
+            .iter()
+            .position(|candidate| candidate == provider_id)
+    };
+    let next_usable_after = |provider_id: &str| {
+        let index = original_index(provider_id)?;
+        group
+            .provider_ids
+            .iter()
+            .skip(index + 1)
+            .find(|candidate| candidate_ids.iter().any(|id| id == *candidate))
+            .cloned()
+    };
+
+    if group.provider_ids.is_empty() {
         if let Some(provider_id) = config
             .agent_injections
             .iter()
             .find(|agent| agent.id == "codex")
             .and_then(|agent| agent.provider_id.as_ref())
-            .filter(|provider_id| codex_provider_is_visible(config, provider_id))
+            .filter(|provider_id| {
+                codex_provider_is_visible(config, provider_id)
+                    && provider_has_usable_key(config, provider_id)
+            })
         {
-            candidates.push(provider_id.clone());
+            return Ok(Some(CodexRouteSelection {
+                session_id,
+                group_id: group.id.clone(),
+                provider_id: provider_id.clone(),
+                primary_model: primary_model.clone(),
+            }));
         }
+        return Err("agent_route_unbound: Codex 默认分组还没有可用上游".to_string());
     }
-    if candidates.is_empty() {
-        return if group.provider_ids.is_empty() {
-            Err("agent_route_unbound: Codex 默认分组还没有可用上游".to_string())
-        } else {
-            Err(format!(
-                "agent_route_unavailable: 分组「{}」没有开启参与选路的可用上游",
-                group.name
-            ))
-        };
+    if candidate_ids.is_empty() {
+        return Err(format!(
+            "agent_route_unavailable: 分组「{}」没有开启参与选路的可用上游",
+            group.name
+        ));
     }
 
-    if !session_route_changed {
-        if let Some(session) = session {
-            if let Some(last_provider_id) =
-                session.last_provider_id.as_deref().or(pinned_provider_id)
-            {
-                let remains_in_group = candidates.iter().any(|id| id == last_provider_id);
-                let has_usable_key =
-                    remains_in_group && provider_has_usable_key(config, last_provider_id);
-                if has_usable_key {
-                    return Ok(Some(CodexRouteSelection {
-                        session_id,
-                        group_id: group.id.clone(),
-                        provider_id: last_provider_id.to_string(),
-                    }));
-                }
-                if previous_response_id {
-                    if remains_in_group {
-                        let current_index = candidates
-                            .iter()
-                            .position(|id| id == last_provider_id)
-                            .expect("a provider that remains in the group has an index");
-                        if let Some((_, provider_id)) =
-                            candidates.iter().enumerate().skip(current_index + 1).find(
-                                |(_, provider_id)| {
-                                    codex_group_provider_participates(group, provider_id)
-                                        && provider_has_usable_key(config, provider_id)
-                                },
-                            )
-                        {
-                            return Ok(Some(CodexRouteSelection {
-                                session_id,
-                                group_id: group.id.clone(),
-                                provider_id: provider_id.clone(),
-                            }));
-                        }
-                    }
-                    return Err(format!(
-                    "agent_route_session_conflict: 该会话续接绑定的上游已无可用 Key 或已不在当前分组；为避免续接 ID 跨上游失效，请恢复该上游 Key，或新建会话后再使用备用上游"
-                ));
-                }
-            }
+    let route_changed =
+        pending_group_switch || pin.is_some_and(|pin| pin.group_id != group.id) || model_changed;
+    let known_previous_provider_id = codex_previous_provider_id(config, metadata);
+    let previous_provider_id = if route_changed {
+        None
+    } else {
+        known_previous_provider_id
+    };
+    if let Some(provider_id) = previous_provider_id {
+        if candidate_ids
+            .iter()
+            .any(|candidate| candidate == provider_id)
+        {
+            let continuity_group_id = pin
+                .map(|pin| pin.group_id.clone())
+                .unwrap_or_else(|| group.id.clone());
+            return Ok(Some(CodexRouteSelection {
+                session_id,
+                group_id: continuity_group_id,
+                provider_id: provider_id.to_string(),
+                primary_model: primary_model.clone(),
+            }));
         }
-
-        if let Some(pinned_provider_id) = pinned_provider_id {
-            if let Some(current_index) = candidates.iter().position(|id| id == pinned_provider_id) {
-                if provider_has_usable_key(config, pinned_provider_id) {
-                    return Ok(Some(CodexRouteSelection {
-                        session_id,
-                        group_id: group.id.clone(),
-                        provider_id: pinned_provider_id.to_string(),
-                    }));
-                }
-                if previous_response_id {
-                    if let Some((_, provider_id)) =
-                        candidates.iter().enumerate().skip(current_index + 1).find(
-                            |(_, provider_id)| {
-                                codex_group_provider_participates(group, provider_id)
-                                    && provider_has_usable_key(config, provider_id)
-                            },
-                        )
-                    {
-                        return Ok(Some(CodexRouteSelection {
-                            session_id,
-                            group_id: group.id.clone(),
-                            provider_id: provider_id.clone(),
-                        }));
-                    }
-                    return Err(
-                        "agent_route_session_conflict: 该会话绑定的上游已无可用 Key，且没有可用备用上游"
-                            .to_string(),
-                    );
-                }
-            }
+        // A hidden, disabled, or exhausted original route is no longer a
+        // reason to strand an existing conversation. Continue strictly forward
+        // in configured order; the caller rebuilds FullReplay when provider
+        // identity changes before the next upstream request.
+        if let Some(next_provider_id) = next_usable_after(provider_id) {
+            return Ok(Some(CodexRouteSelection {
+                session_id,
+                group_id: group.id.clone(),
+                provider_id: next_provider_id,
+                primary_model: primary_model.clone(),
+            }));
+        }
+        if original_index(provider_id).is_some() {
+            return Err("agent_route_unavailable: 原上游之后没有可用备用上游".to_string());
         }
     }
 
-    let provider_id = candidates
-        .iter()
-        .enumerate()
-        .find(|(index, provider_id)| {
-            (*index == 0 || codex_group_provider_participates(group, provider_id))
-                && provider_has_usable_key(config, provider_id)
-        })
-        .map(|(_, provider_id)| provider_id)
+    let provider_id = candidate_ids
+        .first()
         .cloned()
-        .or_else(|| group.provider_ids.is_empty().then(|| candidates[0].clone()))
         .ok_or_else(|| "agent_route_unavailable: 当前分组及备用上游都没有可用 Key".to_string())?;
     Ok(Some(CodexRouteSelection {
         session_id,
         group_id: group.id.clone(),
         provider_id,
+        primary_model: primary_model.clone(),
     }))
+}
+async fn bind_codex_route_before_request(state: &AppState, selection: Option<CodexRouteSelection>) {
+    let Some(CodexRouteSelection {
+        session_id: Some(session_id),
+        group_id,
+        provider_id,
+        primary_model: Some(primary_model),
+    }) = selection
+    else {
+        return;
+    };
+    let already_bound = {
+        let config = state.config.read().await;
+        !config
+            .codex_pending_group_switches
+            .iter()
+            .any(|pending| pending == &session_id)
+            && config.codex_session_route_pins.iter().any(|pin| {
+                pin.session_id == session_id
+                    && pin.group_id == group_id
+                    && pin.provider_id == provider_id
+                    && pin.primary_model.as_deref() == Some(primary_model.as_str())
+            })
+    };
+    if already_bound {
+        return;
+    }
+
+    let mut config = state.config.write().await;
+    if !config
+        .codex_pending_group_switches
+        .iter()
+        .any(|pending| pending == &session_id)
+        && config.codex_session_route_pins.iter().any(|pin| {
+            pin.session_id == session_id
+                && pin.group_id == group_id
+                && pin.provider_id == provider_id
+                && pin.primary_model.as_deref() == Some(primary_model.as_str())
+        })
+    {
+        return;
+    }
+    let mut next = config.clone();
+    let now = Utc::now();
+    let managed = next
+        .codex_session_routes
+        .iter()
+        .find(|route| route.session_id == session_id)
+        .is_some_and(|route| route.managed);
+    if let Some(route) = next
+        .codex_session_routes
+        .iter_mut()
+        .find(|route| route.session_id == session_id)
+    {
+        route.group_id = group_id.clone();
+        route.last_provider_id = Some(provider_id.clone());
+        route.primary_model = Some(primary_model.clone());
+        route.last_seen_at = Some(now);
+        // Binding a new model or provider starts a fresh failure streak. A
+        // matching route returns above, so an active primary is never reset.
+        route.consecutive_503_failures = 0;
+    } else {
+        next.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: session_id.clone(),
+            group_id: group_id.clone(),
+            managed,
+            display_name: None,
+            last_provider_id: Some(provider_id.clone()),
+            primary_model: Some(primary_model.clone()),
+            last_seen_at: Some(now),
+            consecutive_503_failures: 0,
+        });
+    }
+    next.codex_pending_group_switches
+        .retain(|pending| pending != &session_id);
+    if let Some(pin) = next
+        .codex_session_route_pins
+        .iter_mut()
+        .find(|pin| pin.session_id == session_id)
+    {
+        pin.group_id = group_id;
+        pin.provider_id = provider_id;
+        pin.primary_model = Some(primary_model);
+        pin.last_seen_at = Some(now);
+    } else if next.codex_session_route_pins.len() < CODEX_SESSION_ROUTE_PIN_LIMIT {
+        next.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id,
+            group_id,
+            provider_id,
+            primary_model: Some(primary_model),
+            last_seen_at: Some(now),
+        });
+    } else {
+        return;
+    }
+    next.updated_at = now;
+    if state.publish_config_snapshot(&next).is_err() {
+        return;
+    }
+    *config = next;
 }
 
 fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelection>) {
@@ -11541,8 +11690,15 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
         session_id: Some(session_id),
         group_id,
         provider_id,
+        primary_model,
     }) = selection
     else {
+        return;
+    };
+    // Auxiliary requests must not own or refresh a primary route. Their
+    // success would otherwise reset a primary failure streak, while their
+    // failure must already be ignored by the caller.
+    let Some(primary_model) = primary_model else {
         return;
     };
     tokio::spawn(async move {
@@ -11553,6 +11709,7 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
                 &session_id,
                 &group_id,
                 &provider_id,
+                Some(&primary_model),
                 Utc::now(),
             ) {
                 return;
@@ -11565,6 +11722,7 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
             &session_id,
             &group_id,
             &provider_id,
+            Some(&primary_model),
             Utc::now(),
         ) {
             return;
@@ -11577,6 +11735,7 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
             .find(|route| route.session_id == session_id)
         {
             existing.last_provider_id = Some(provider_id.clone());
+            existing.primary_model = Some(primary_model.clone());
             existing.last_seen_at = Some(now);
             existing.consecutive_503_failures = 0;
             if !existing.managed {
@@ -11589,6 +11748,7 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
                 managed: false,
                 display_name: None,
                 last_provider_id: Some(provider_id.clone()),
+                primary_model: Some(primary_model.clone()),
                 last_seen_at: Some(now),
                 consecutive_503_failures: 0,
             });
@@ -11614,22 +11774,22 @@ fn observe_codex_route(state: Arc<AppState>, selection: Option<CodexRouteSelecti
         {
             pin.group_id = group_id.clone();
             pin.provider_id = provider_id.clone();
+            pin.primary_model = Some(primary_model.clone());
             pin.last_seen_at = Some(now);
         } else {
             next.codex_session_route_pins.push(CodexSessionRoutePin {
                 session_id,
                 group_id,
                 provider_id,
+                primary_model: Some(primary_model),
                 last_seen_at: Some(now),
             });
         }
         next.updated_at = Utc::now();
-        let Ok(version) = state.publish_config_snapshot(&next) else {
+        if state.publish_config_snapshot(&next).is_err() {
             return;
-        };
+        }
         *config = next;
-        drop(config);
-        let _ = state.wait_for_config_snapshot(version).await;
     });
 }
 
@@ -11638,8 +11798,15 @@ fn codex_route_observation_should_skip(
     session_id: &str,
     group_id: &str,
     provider_id: &str,
+    primary_model: Option<&str>,
     now: chrono::DateTime<Utc>,
 ) -> bool {
+    let Some(primary_model) = primary_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return true;
+    };
     let Some(group) = config
         .codex_route_groups
         .iter()
@@ -11649,6 +11816,25 @@ fn codex_route_observation_should_skip(
     };
     if !codex_group_provider_participates(group, provider_id)
         || !codex_provider_is_visible(config, provider_id)
+        || !provider_has_usable_key(config, provider_id)
+    {
+        return true;
+    }
+    if config
+        .codex_session_route_pins
+        .iter()
+        .find(|pin| pin.session_id == session_id)
+        .and_then(|pin| pin.primary_model.as_deref())
+        .is_some_and(|saved| saved != primary_model)
+    {
+        return true;
+    }
+    if config
+        .codex_session_routes
+        .iter()
+        .find(|route| route.session_id == session_id)
+        .and_then(|route| route.primary_model.as_deref())
+        .is_some_and(|saved| saved != primary_model)
     {
         return true;
     }
@@ -11745,10 +11931,42 @@ async fn failover_codex_route_after_failure(
     error_summary: Option<&str>,
     transport_failure: bool,
 ) {
+    failover_codex_route_after_failure_for_model(
+        state,
+        session_id,
+        expected_group_id,
+        current_provider_id,
+        status,
+        error_summary,
+        transport_failure,
+        None,
+    )
+    .await;
+}
+
+async fn failover_codex_route_after_failure_for_model(
+    state: &AppState,
+    session_id: Option<&str>,
+    expected_group_id: Option<&str>,
+    current_provider_id: &str,
+    status: Option<u16>,
+    error_summary: Option<&str>,
+    transport_failure: bool,
+    primary_model: Option<&str>,
+) {
     let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
         return;
     };
     let Some(expected_group_id) = expected_group_id else {
+        return;
+    };
+    let Some(primary_model) = primary_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !is_codex_internal_auxiliary_model(model))
+    else {
+        // Title, review, and other helper-model failures are not evidence
+        // about the primary route, even if an older caller passes the model
+        // through this function directly.
         return;
     };
     let mut config = state.config.write().await;
@@ -11784,42 +12002,35 @@ async fn failover_codex_route_after_failure(
         .any(|pool| pool.provider_id == current_provider_id && pool.enabled);
     let keys_exhausted = !provider_has_usable_key(&config, current_provider_id);
     let key_failure_without_pool = key_failure && !has_enabled_key_pool;
+    let key_route_unavailable = key_failure && (key_failure_without_pool || keys_exhausted);
     // A Key-specific failure should rotate through the current Provider's
-    // configured pool first. Provider-wide transport/5xx failures still move
-    // the session immediately because they do not implicate an individual Key.
+    // configured pool first. Once every configured Key is unavailable there
+    // is no request left to rotate to on this Provider, so advance immediately.
     if key_failure && has_enabled_key_pool && !keys_exhausted {
         return;
     }
-    let repeated_503 = status == Some(503)
-        && !transport_failure
-        && !key_failure
-        && config
-            .codex_session_routes
-            .iter()
-            .find(|route| route.session_id == session_id)
-            .is_some_and(|route| {
-                route.last_provider_id.as_deref() == Some(current_provider_id)
-                    && route.consecutive_503_failures >= 1
-            });
     let provider_failure = transport_failure
         || status.is_some_and(should_failover_codex_http_status)
         || error_summary.is_some_and(is_transient_upstream_error_message)
-        || key_failure_without_pool
-        || (key_failure && keys_exhausted);
-    if !provider_failure && !repeated_503 {
+        || key_route_unavailable;
+    if !provider_failure {
         return;
     }
 
-    // A request may finish after the user changes the session route, or after
-    // another concurrent request has already failed over. Only advance if the
-    // saved binding still identifies this request's route. The one exception
-    // is a managed session that has just moved groups: its old pin is expected
-    // until the first request on the new group establishes a fresh route.
+    // A late result from another model, group, or already-advanced route must
+    // never move this session's current binding.
     let managed_group_transition = managed_session
         && pin
             .as_ref()
             .is_some_and(|pin| pin.group_id != expected_group_id);
     if let Some(pin) = pin.as_ref() {
+        if pin
+            .primary_model
+            .as_deref()
+            .is_some_and(|saved| saved != primary_model)
+        {
+            return;
+        }
         if !managed_group_transition
             && (pin.group_id != expected_group_id || pin.provider_id != current_provider_id)
         {
@@ -11829,76 +12040,90 @@ async fn failover_codex_route_after_failure(
         .codex_session_routes
         .iter()
         .find(|route| route.session_id == session_id)
-        .and_then(|route| route.last_provider_id.as_deref())
-        .is_some_and(|provider_id| provider_id != current_provider_id)
-        && !managed_session
+        .is_some_and(|route| {
+            route
+                .primary_model
+                .as_deref()
+                .is_some_and(|saved| saved != primary_model)
+                || (route
+                    .last_provider_id
+                    .as_deref()
+                    .is_some_and(|provider_id| provider_id != current_provider_id)
+                    && !managed_session)
+        })
     {
         return;
     }
 
-    // A lone 503 is frequently a short-lived upstream capacity blip. Keep the
-    // session sticky for one retry on the next inbound; only a second 503 from
-    // the same provider advances the group. Other failures retain their
-    // immediate, explicitly-classified failover behavior.
-    if status == Some(503) && !transport_failure && !key_failure && !repeated_503 {
-        if let Some(route) = config
-            .codex_session_routes
-            .iter_mut()
-            .find(|route| route.session_id == session_id)
+    let now = Utc::now();
+    let failure_count = if let Some(route) = config
+        .codex_session_routes
+        .iter_mut()
+        .find(|route| route.session_id == session_id)
+    {
+        if route.last_provider_id.as_deref() != Some(current_provider_id)
+            || route.group_id != group_id
+            || route
+                .primary_model
+                .as_deref()
+                .is_some_and(|saved| saved != primary_model)
         {
-            if route.last_provider_id.as_deref() != Some(current_provider_id) {
-                route.last_provider_id = Some(current_provider_id.to_string());
-                route.consecutive_503_failures = 0;
-            }
-            route.consecutive_503_failures = route.consecutive_503_failures.saturating_add(1);
-            route.last_seen_at = Some(Utc::now());
-        } else {
-            config.codex_session_routes.push(CodexSessionRouteConfig {
-                session_id: session_id.to_string(),
-                group_id: group_id.clone(),
-                managed: false,
-                display_name: None,
-                last_provider_id: Some(current_provider_id.to_string()),
-                last_seen_at: Some(Utc::now()),
-                consecutive_503_failures: 1,
-            });
+            route.last_provider_id = Some(current_provider_id.to_string());
+            route.group_id = group_id.clone();
+            route.primary_model = Some(primary_model.to_string());
+            route.consecutive_503_failures = 0;
         }
-        config.updated_at = Utc::now();
-        let Ok(version) = state.publish_config_snapshot(&config) else {
-            return;
-        };
-        drop(config);
-        let _ = state.wait_for_config_snapshot(version).await;
+        route.consecutive_503_failures = route.consecutive_503_failures.saturating_add(1);
+        route.last_seen_at = Some(now);
+        route.consecutive_503_failures
+    } else {
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: session_id.to_string(),
+            group_id: group_id.clone(),
+            managed: false,
+            display_name: None,
+            last_provider_id: Some(current_provider_id.to_string()),
+            primary_model: Some(primary_model.to_string()),
+            last_seen_at: Some(now),
+            consecutive_503_failures: 1,
+        });
+        1
+    };
+
+    // Ordinary primary-model failures advance after three consecutive
+    // failures. Key exhaustion has no usable attempt left on this Provider,
+    // so it advances immediately while preserving the three-strike rule for
+    // transport, HTTP, and other transient upstream failures.
+    if failure_count < 3 && !key_route_unavailable {
+        config.updated_at = now;
+        let _ = state.publish_config_snapshot(&config);
         return;
     }
+
+    let group = config
+        .codex_route_groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .cloned();
     let next_provider_id = provider_ids
         .iter()
         .skip(current_index.saturating_add(1))
         .find(|provider_id| {
-            codex_group_provider_participates(
-                config
-                    .codex_route_groups
-                    .iter()
-                    .find(|group| group.id == group_id)
-                    .expect("the selected route group remains configured"),
-                provider_id,
-            ) && codex_provider_is_visible(&config, provider_id)
+            group
+                .as_ref()
+                .is_some_and(|group| codex_group_provider_participates(group, provider_id))
+                && codex_provider_is_visible(&config, provider_id)
                 && provider_has_usable_key(&config, provider_id)
         })
         .cloned();
     let Some(next_provider_id) = next_provider_id else {
+        config.updated_at = now;
+        let _ = state.publish_config_snapshot(&config);
         return;
     };
-
-    // The session has now entered its selected group through a real failover
-    // decision. Keep the provider that actually carried the request sticky;
-    // replaying the pending first-provider preference on every later request
-    // would undo the two-503 failover behaviour.
     config
         .codex_pending_group_switches
         .retain(|pending| pending != session_id);
-
-    let now = Utc::now();
     if let Some(route) = config
         .codex_session_routes
         .iter_mut()
@@ -11907,32 +12132,7 @@ async fn failover_codex_route_after_failure(
         route.last_provider_id = Some(next_provider_id.clone());
         route.last_seen_at = Some(now);
         route.consecutive_503_failures = 0;
-        if !route.managed {
-            route.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
-        }
-    } else {
-        config.codex_session_routes.push(CodexSessionRouteConfig {
-            session_id: session_id.to_string(),
-            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
-            managed: false,
-            display_name: None,
-            last_provider_id: Some(next_provider_id.clone()),
-            last_seen_at: Some(now),
-            consecutive_503_failures: 0,
-        });
-        let mut recent = config
-            .codex_session_routes
-            .iter()
-            .filter(|route| !route.managed)
-            .cloned()
-            .collect::<Vec<_>>();
-        recent.sort_by_key(|route| route.last_seen_at);
-        while recent.len() > CODEX_RECENT_SESSION_LIMIT {
-            let oldest = recent.remove(0).session_id;
-            config
-                .codex_session_routes
-                .retain(|route| route.managed || route.session_id != oldest);
-        }
+        route.primary_model = Some(primary_model.to_string());
     }
     if let Some(pin) = config
         .codex_session_route_pins
@@ -11941,21 +12141,19 @@ async fn failover_codex_route_after_failure(
     {
         pin.group_id = group_id;
         pin.provider_id = next_provider_id;
+        pin.primary_model = Some(primary_model.to_string());
         pin.last_seen_at = Some(now);
     } else if config.codex_session_route_pins.len() < CODEX_SESSION_ROUTE_PIN_LIMIT {
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: session_id.to_string(),
             group_id,
             provider_id: next_provider_id,
+            primary_model: Some(primary_model.to_string()),
             last_seen_at: Some(now),
         });
     }
     config.updated_at = now;
-    let Ok(version) = state.publish_config_snapshot(&config) else {
-        return;
-    };
-    drop(config);
-    let _ = state.wait_for_config_snapshot(version).await;
+    let _ = state.publish_config_snapshot(&config);
 }
 
 fn should_failover_codex_http_status(status: u16) -> bool {
@@ -11997,14 +12195,33 @@ fn codex_route_selection_for_provider(
     provider_id: &str,
     request_group_id: Option<&str>,
 ) -> Option<CodexRouteSelection> {
+    codex_route_selection_for_provider_for_model(
+        config,
+        metadata,
+        provider_id,
+        request_group_id,
+        None,
+    )
+}
+
+fn codex_route_selection_for_provider_for_model(
+    config: &AppConfig,
+    metadata: Option<&TrustedCodexRequestMetadata>,
+    provider_id: &str,
+    request_group_id: Option<&str>,
+    primary_model: Option<&str>,
+) -> Option<CodexRouteSelection> {
     let session_id = codex_route_session_id(metadata)?;
     let Some(group_id) = request_group_id.filter(|group_id| !group_id.trim().is_empty()) else {
-        return codex_route_selection_for_session(config, &session_id, provider_id);
+        let mut selection = codex_route_selection_for_session(config, &session_id, provider_id)?;
+        selection.primary_model = primary_model.map(ToOwned::to_owned);
+        return Some(selection);
     };
     Some(CodexRouteSelection {
         session_id: Some(session_id),
         group_id: group_id.to_string(),
         provider_id: provider_id.to_string(),
+        primary_model: primary_model.map(ToOwned::to_owned),
     })
 }
 
@@ -12069,6 +12286,7 @@ fn codex_route_selection_for_session(
         session_id: Some(session_id.to_string()),
         group_id: group.id.clone(),
         provider_id: provider_id.to_string(),
+        primary_model: None,
     })
 }
 
@@ -13799,24 +14017,34 @@ async fn select_provider_api_key(
     // healthy Key remains governed by the user's configured pool strategy and
     // order; only an explicit exclusion (for example quota exhaustion) may
     // move the next request past a Key.
-    let selected = {
+    let material: Option<ProviderKeyMaterial> = {
         let mut config = state.config.write().await;
         let preferred_key_id = exclude_key_id
             .is_none()
             .then(|| config.sticky_provider_key_id(provider_id))
             .flatten();
         config
-            .select_provider_key_for_request(
+            .select_provider_key_material_for_request(
                 provider_id,
                 preferred_key_id.as_deref(),
                 exclude_key_id,
             )
             .with_context(|| format!("failed to select provider key for {provider_id}"))?
     };
-    let Some(selected) = selected else {
+    let Some(material) = material else {
         return Err(anyhow!("provider API key is not configured"));
     };
-    Ok(selected)
+    // The global config lock is released before DPAPI is entered. Concurrent
+    // sessions can therefore decrypt independently after their short,
+    // metadata-only selection step.
+    let secret = tokio::task::spawn_blocking(move || decrypt_secret(&material.encrypted_secret))
+        .await
+        .context("provider key decrypt task failed")??;
+    Ok(SelectedProviderKey {
+        secret,
+        key_id: material.key_id,
+        encrypted_material_digest: material.encrypted_material_digest,
+    })
 }
 
 fn provider_key_configuration_error_message(error: &anyhow::Error) -> Option<&'static str> {
@@ -15527,7 +15755,17 @@ fn decide_route_with_runtime_model_for_session(
 }
 
 fn is_codex_internal_auxiliary_model(model: &str) -> bool {
-    model.trim().eq_ignore_ascii_case("codex-auto-review")
+    let model = model.trim();
+    model.eq_ignore_ascii_case("codex-auto-review") || model.eq_ignore_ascii_case("gpt-6.1-luna")
+}
+
+fn codex_primary_route_model(request: &Value) -> Option<String> {
+    request
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && !is_codex_internal_auxiliary_model(model))
+        .map(ToOwned::to_owned)
 }
 
 fn resolve_codex_auxiliary_model(
@@ -15560,8 +15798,14 @@ fn resolve_codex_auxiliary_model(
         })
 }
 
-fn agent_runtime_model_key(agent_id: &str, provider_id: &str) -> String {
-    format!("{agent_id}\0{provider_id}")
+fn agent_runtime_model_key(agent_id: &str, provider_id: &str, session_id: Option<&str>) -> String {
+    match session_id
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    {
+        Some(session_id) => format!("{agent_id}\0{session_id}\0{provider_id}"),
+        None => format!("{agent_id}\0{provider_id}"),
+    }
 }
 
 fn runtime_primary_model_for_internal_codex_request(
@@ -15569,6 +15813,7 @@ fn runtime_primary_model_for_internal_codex_request(
     config: &AppConfig,
     request: &Value,
     authorized_agent_id: Option<&str>,
+    metadata: Option<&TrustedCodexRequestMetadata>,
 ) -> Option<String> {
     if authorized_agent_id != Some("codex")
         || !request
@@ -15578,19 +15823,48 @@ fn runtime_primary_model_for_internal_codex_request(
     {
         return None;
     }
-    let provider_id = config
+    let session_id = codex_route_session_id(metadata);
+    let agent = config
         .agent_injections
         .iter()
-        .find(|agent| agent.id == "codex" && agent.enabled)
-        .and_then(|agent| agent.provider_id.as_deref())?;
+        .find(|agent| agent.id == "codex" && agent.enabled)?;
+    let provider_id = session_id
+        .as_deref()
+        .and_then(|session_id| {
+            config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == session_id)
+                .map(|pin| pin.provider_id.as_str())
+        })
+        .or(agent.provider_id.as_deref());
     state
         .agent_runtime_models
         .try_lock()
         .ok()
         .and_then(|models| {
-            models
-                .get(&agent_runtime_model_key("codex", provider_id))
-                .cloned()
+            provider_id
+                .and_then(|provider_id| {
+                    models
+                        .get(&agent_runtime_model_key(
+                            "codex",
+                            provider_id,
+                            session_id.as_deref(),
+                        ))
+                        .cloned()
+                })
+                .or_else(|| {
+                    let prefix = session_id
+                        .as_deref()
+                        .map(|session_id| format!("codex\0{session_id}\0"));
+                    prefix.and_then(|prefix| {
+                        models
+                            .iter()
+                            .find(|(key, _)| key.starts_with(&prefix))
+                            .map(|(_, model)| model.clone())
+                    })
+                })
+                .or_else(|| agent.model_id.clone())
         })
 }
 
@@ -15598,6 +15872,7 @@ fn note_agent_runtime_model_for_primary_request(
     state: &AppState,
     request: &Value,
     authorized_agent_id: Option<&str>,
+    metadata: Option<&TrustedCodexRequestMetadata>,
     decision: &RouteDecision,
 ) {
     let Some(agent_id) = authorized_agent_id else {
@@ -15611,7 +15886,11 @@ fn note_agent_runtime_model_for_primary_request(
     }
     if let Ok(mut models) = state.agent_runtime_models.try_lock() {
         models.insert(
-            agent_runtime_model_key(agent_id, &decision.provider.id),
+            agent_runtime_model_key(
+                agent_id,
+                &decision.provider.id,
+                codex_route_session_id(metadata).as_deref(),
+            ),
             decision.model.clone(),
         );
     }
@@ -21761,6 +22040,8 @@ mod tests {
                 last_provider_id: None,
                 last_seen_at: None,
                 consecutive_503_failures: 0,
+
+                primary_model: None,
             },
             CodexSessionRouteConfig {
                 session_id: "work-session".to_string(),
@@ -21770,6 +22051,8 @@ mod tests {
                 last_provider_id: None,
                 last_seen_at: None,
                 consecutive_503_failures: 0,
+
+                primary_model: None,
             },
         ]);
         let request = json!({"model":"gpt-5.6-sol", "input":[]});
@@ -21837,12 +22120,16 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "default".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         let metadata = TrustedCodexRequestMetadata {
             session_id: Some("session-1".to_string()),
@@ -21863,7 +22150,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_managed_session_ignores_a_pin_opted_out_of_its_group() {
+    fn codex_managed_session_fails_closed_instead_of_reusing_a_pin_opted_out_of_its_group() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
         primary.id = "primary".to_string();
@@ -21888,12 +22175,16 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "work".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         config.codex_route_groups[1].fallback_disabled_provider_ids = vec!["primary".to_string()];
         let metadata = TrustedCodexRequestMetadata {
@@ -21901,7 +22192,7 @@ mod tests {
             ..TrustedCodexRequestMetadata::default()
         };
 
-        let decision = decide_route_with_runtime_model_for_session(
+        let error = decide_route_with_runtime_model_for_session(
             &config,
             &json!({"model":"gpt-5.6-sol", "input":[]}),
             &Channel::Responses,
@@ -21909,9 +22200,9 @@ mod tests {
             None,
             Some(&metadata),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(decision.provider.id, "backup");
+        assert!(error.contains("agent_route_unavailable"));
     }
 
     #[test]
@@ -21940,12 +22231,16 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "default".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         let metadata = TrustedCodexRequestMetadata {
             session_id: Some("session-1".to_string()),
@@ -21992,12 +22287,16 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: Some(Utc::now()),
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "work".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: Some(Utc::now()),
+
+            primary_model: None,
         });
         config
             .codex_pending_group_switches
@@ -22046,6 +22345,8 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: Some(Utc::now()),
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         let metadata = TrustedCodexRequestMetadata {
             session_id: Some("session-1".to_string()),
@@ -22070,6 +22371,7 @@ mod tests {
             "session-1",
             "default",
             "primary",
+            Some("gpt-5"),
             Utc::now()
         ));
     }
@@ -22085,12 +22387,16 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "default".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         let metadata = TrustedCodexRequestMetadata {
             session_id: Some("session-1".to_string()),
@@ -22110,7 +22416,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_continuation_without_a_known_provider_fails_closed() {
+    fn codex_continuation_without_a_known_provider_can_replay_on_the_first_route() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
         primary.id = "primary".to_string();
@@ -22125,21 +22431,25 @@ mod tests {
             last_provider_id: None,
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         let metadata = TrustedCodexRequestMetadata {
             session_id: Some("session-without-route".to_string()),
             ..TrustedCodexRequestMetadata::default()
         };
 
-        let error = select_codex_route(
-            &config,
-            &json!({"previous_response_id":"resp-existing"}),
-            Some(&metadata),
-            None,
-        )
-        .unwrap_err();
+        let request = json!({"previous_response_id":"resp-existing"});
+        let route = select_codex_route(&config, &request, Some(&metadata), None)
+            .unwrap()
+            .expect("the first configured route can own a complete replay");
 
-        assert!(error.starts_with("agent_route_session_conflict:"));
+        assert_eq!(route.provider_id, "primary");
+        assert!(codex_previous_provider_is_unknown_for_continuation(
+            &config,
+            &request,
+            Some(&metadata)
+        ));
     }
 
     #[test]
@@ -22162,12 +22472,20 @@ mod tests {
             group_id: "default".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: None,
+            primary_model: None,
         });
         config.codex_route_groups[0].fallback_disabled_provider_ids = vec!["primary".to_string()];
+        assert!(
+            config.codex_session_routes.is_empty(),
+            "the legacy session record must be pruned to exercise pin-only recovery"
+        );
 
         let route = select_codex_route(
             &config,
-            &json!({"previous_response_id":"resp_old"}),
+            &json!({
+                "model": "gpt-5",
+                "previous_response_id": "resp_old"
+            }),
             Some(&metadata),
             None,
         )
@@ -22176,6 +22494,12 @@ mod tests {
 
         assert_eq!(route.provider_id, "backup");
         assert_eq!(route.group_id, "default");
+        assert_eq!(route.primary_model.as_deref(), Some("gpt-5"));
+        assert!(codex_managed_group_switch_requires_replay(
+            &config,
+            Some(&metadata),
+            "backup"
+        ));
     }
 
     #[test]
@@ -22215,6 +22539,8 @@ mod tests {
             group_id: "default".to_string(),
             provider_id: "backup".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
 
         assert!(codex_route_observation_would_regress(
@@ -22248,12 +22574,16 @@ mod tests {
             last_provider_id: Some("primary".to_string()),
             last_seen_at: Some(now),
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "default".to_string(),
             provider_id: "primary".to_string(),
             last_seen_at: Some(now),
+
+            primary_model: None,
         });
 
         assert!(codex_route_observation_should_skip(
@@ -22261,6 +22591,7 @@ mod tests {
             "session-1",
             "default",
             "primary",
+            Some("gpt-5"),
             now
         ));
 
@@ -22270,6 +22601,7 @@ mod tests {
             "session-1",
             "default",
             "primary",
+            Some("gpt-5"),
             now
         ));
     }
@@ -22295,8 +22627,8 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..2 {
-            failover_codex_route_after_failure(
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
                 &state,
                 Some("session-1"),
                 Some("default"),
@@ -22304,6 +22636,7 @@ mod tests {
                 Some(503),
                 Some("upstream unavailable"),
                 false,
+                Some("gpt-5"),
             )
             .await;
         }
@@ -22343,7 +22676,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_runtime_failover_requires_two_consecutive_503s() {
+    async fn codex_runtime_failover_requires_three_consecutive_503s() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
         primary.id = "primary".to_string();
@@ -22363,7 +22696,7 @@ mod tests {
         )
         .unwrap();
 
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22371,6 +22704,7 @@ mod tests {
             Some(503),
             Some("service unavailable"),
             false,
+            Some("gpt-5"),
         )
         .await;
         {
@@ -22384,7 +22718,7 @@ mod tests {
             assert_eq!(route.consecutive_503_failures, 1);
         }
 
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22392,6 +22726,29 @@ mod tests {
             Some(503),
             Some("service unavailable"),
             false,
+            Some("gpt-5"),
+        )
+        .await;
+        {
+            let config = state.config.read().await;
+            let route = config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-1")
+                .unwrap();
+            assert_eq!(route.last_provider_id.as_deref(), Some("primary"));
+            assert_eq!(route.consecutive_503_failures, 2);
+        }
+
+        failover_codex_route_after_failure_for_model(
+            &state,
+            Some("session-1"),
+            Some("default"),
+            "primary",
+            Some(503),
+            Some("service unavailable"),
+            false,
+            Some("gpt-5"),
         )
         .await;
         {
@@ -22410,6 +22767,384 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_runtime_failover_is_isolated_between_sessions() {
+        let mut config = AppConfig::default();
+        let mut primary = test_responses_provider("https://primary.example/v1".to_string());
+        primary.id = "primary".to_string();
+        let mut backup = test_responses_provider("https://backup.example/v1".to_string());
+        backup.id = "backup".to_string();
+        config.providers = vec![primary, backup];
+        configure_test_codex_agent(&mut config, "primary");
+        register_test_codex_providers(&mut config, &["primary", "backup"]);
+        for session_id in ["session-a", "session-b"] {
+            config.codex_session_route_pins.push(CodexSessionRoutePin {
+                session_id: session_id.to_string(),
+                group_id: "default".to_string(),
+                provider_id: "primary".to_string(),
+                primary_model: Some("gpt-5".to_string()),
+                last_seen_at: Some(Utc::now()),
+            });
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-session-isolation-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-a"),
+                Some("default"),
+                "primary",
+                Some(503),
+                Some("service unavailable"),
+                false,
+                Some("gpt-5"),
+            )
+            .await;
+        }
+
+        let config = state.config.read().await;
+        let provider_for = |session_id| {
+            config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == session_id)
+                .map(|pin| pin.provider_id.as_str())
+        };
+        assert_eq!(provider_for("session-a"), Some("backup"));
+        assert_eq!(provider_for("session-b"), Some("primary"));
+        assert!(!config
+            .codex_session_routes
+            .iter()
+            .any(|route| route.session_id == "session-b"));
+        drop(config);
+        drop(state);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_failover_advances_strictly_forward_and_never_round_robins() {
+        let mut config = AppConfig::default();
+        let mut provider_a = test_responses_provider("https://a.example/v1".to_string());
+        provider_a.id = "provider-a".to_string();
+        let mut provider_b = test_responses_provider("https://b.example/v1".to_string());
+        provider_b.id = "provider-b".to_string();
+        let mut provider_c = test_responses_provider("https://c.example/v1".to_string());
+        provider_c.id = "provider-c".to_string();
+        config.providers = vec![provider_a, provider_b, provider_c];
+        configure_test_codex_agent(&mut config, "provider-a");
+        register_test_codex_providers(&mut config, &["provider-a", "provider-b", "provider-c"]);
+        config.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id: "session-ordered".to_string(),
+            group_id: "default".to_string(),
+            provider_id: "provider-a".to_string(),
+            primary_model: Some("gpt-5".to_string()),
+            last_seen_at: Some(Utc::now()),
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-ordered-failover-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-ordered"),
+                Some("default"),
+                "provider-a",
+                Some(503),
+                Some("service unavailable"),
+                false,
+                Some("gpt-5"),
+            )
+            .await;
+        }
+        {
+            let config = state.config.read().await;
+            let pin = config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == "session-ordered")
+                .unwrap();
+            assert_eq!(pin.provider_id, "provider-b");
+        }
+
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-ordered"),
+                Some("default"),
+                "provider-b",
+                Some(503),
+                Some("service unavailable"),
+                false,
+                Some("gpt-5"),
+            )
+            .await;
+        }
+        {
+            let config = state.config.read().await;
+            let pin = config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == "session-ordered")
+                .unwrap();
+            assert_eq!(pin.provider_id, "provider-c");
+        }
+
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-ordered"),
+                Some("default"),
+                "provider-c",
+                Some(503),
+                Some("service unavailable"),
+                false,
+                Some("gpt-5"),
+            )
+            .await;
+        }
+        let config = state.config.read().await;
+        let pin = config
+            .codex_session_route_pins
+            .iter()
+            .find(|pin| pin.session_id == "session-ordered")
+            .unwrap();
+        assert_eq!(
+            pin.provider_id, "provider-c",
+            "the final configured provider must stay sticky instead of wrapping or choosing another provider"
+        );
+        assert_eq!(
+            config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-ordered")
+                .unwrap()
+                .consecutive_503_failures,
+            3
+        );
+        drop(config);
+        drop(state);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_model_switch_ignores_late_failures_from_the_old_model() {
+        let mut config = AppConfig::default();
+        let mut primary = test_responses_provider("https://primary.example/v1".to_string());
+        primary.id = "primary".to_string();
+        let mut backup = test_responses_provider("https://backup.example/v1".to_string());
+        backup.id = "backup".to_string();
+        config.providers = vec![primary, backup];
+        configure_test_codex_agent(&mut config, "primary");
+        register_test_codex_providers(&mut config, &["primary", "backup"]);
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: "session-switched".to_string(),
+            group_id: "default".to_string(),
+            managed: false,
+            display_name: None,
+            last_provider_id: Some("primary".to_string()),
+            primary_model: Some("gpt-5-old".to_string()),
+            last_seen_at: Some(Utc::now()),
+            consecutive_503_failures: 2,
+        });
+        config.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id: "session-switched".to_string(),
+            group_id: "default".to_string(),
+            provider_id: "primary".to_string(),
+            primary_model: Some("gpt-5-old".to_string()),
+            last_seen_at: Some(Utc::now()),
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-model-switch-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+        let metadata = TrustedCodexRequestMetadata {
+            session_id: Some("session-switched".to_string()),
+            ..TrustedCodexRequestMetadata::default()
+        };
+        let selection = {
+            let config = state.config.read().await;
+            select_codex_route(
+                &config,
+                &json!({"model":"gpt-5-new"}),
+                Some(&metadata),
+                None,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(selection.provider_id, "primary");
+        bind_codex_route_before_request(&state, Some(selection)).await;
+
+        failover_codex_route_after_failure_for_model(
+            &state,
+            Some("session-switched"),
+            Some("default"),
+            "primary",
+            Some(503),
+            Some("service unavailable"),
+            false,
+            Some("gpt-5-old"),
+        )
+        .await;
+
+        {
+            let config = state.config.read().await;
+            let pin = config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == "session-switched")
+                .unwrap();
+            let route = config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-switched")
+                .unwrap();
+            assert_eq!(pin.provider_id, "primary");
+            assert_eq!(pin.primary_model.as_deref(), Some("gpt-5-new"));
+            assert_eq!(route.last_provider_id.as_deref(), Some("primary"));
+            assert_eq!(route.primary_model.as_deref(), Some("gpt-5-new"));
+            assert_eq!(route.consecutive_503_failures, 0);
+        }
+
+        failover_codex_route_after_failure_for_model(
+            &state,
+            Some("session-switched"),
+            Some("default"),
+            "primary",
+            Some(503),
+            Some("service unavailable"),
+            false,
+            Some("gpt-5-new"),
+        )
+        .await;
+        let config = state.config.read().await;
+        assert_eq!(
+            config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-switched")
+                .unwrap()
+                .consecutive_503_failures,
+            1
+        );
+        drop(config);
+        drop(state);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_auxiliary_failures_do_not_consume_primary_failure_budget() {
+        let mut config = AppConfig::default();
+        let mut primary = test_responses_provider("https://primary.example/v1".to_string());
+        primary.id = "primary".to_string();
+        let mut backup = test_responses_provider("https://backup.example/v1".to_string());
+        backup.id = "backup".to_string();
+        config.providers = vec![primary, backup];
+        configure_test_codex_agent(&mut config, "primary");
+        register_test_codex_providers(&mut config, &["primary", "backup"]);
+        config.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id: "session-aux".to_string(),
+            group_id: "default".to_string(),
+            provider_id: "primary".to_string(),
+            primary_model: Some("gpt-5".to_string()),
+            last_seen_at: Some(Utc::now()),
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-auxiliary-budget-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-aux"),
+                Some("default"),
+                "primary",
+                Some(503),
+                Some("service unavailable"),
+                false,
+                Some("gpt-5"),
+            )
+            .await;
+        }
+        for auxiliary_model in ["gpt-6.1-luna", "codex-auto-review"] {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-aux"),
+                Some("default"),
+                "primary",
+                Some(503),
+                Some("helper model unavailable"),
+                true,
+                Some(auxiliary_model),
+            )
+            .await;
+        }
+        {
+            let config = state.config.read().await;
+            let route = config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-aux")
+                .unwrap();
+            assert_eq!(route.last_provider_id.as_deref(), Some("primary"));
+            assert_eq!(route.consecutive_503_failures, 2);
+        }
+
+        failover_codex_route_after_failure_for_model(
+            &state,
+            Some("session-aux"),
+            Some("default"),
+            "primary",
+            Some(503),
+            Some("service unavailable"),
+            false,
+            Some("gpt-5"),
+        )
+        .await;
+        let config = state.config.read().await;
+        assert_eq!(
+            config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == "session-aux")
+                .unwrap()
+                .provider_id,
+            "backup"
+        );
+        drop(config);
+        drop(state);
+        fs::remove_dir_all(dir).ok();
+    }
+    #[tokio::test]
     async fn codex_pending_group_switch_is_consumed_by_failover_and_stays_sticky() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
@@ -22427,6 +23162,8 @@ mod tests {
             last_provider_id: None,
             last_seen_at: Some(Utc::now()),
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config
             .codex_pending_group_switches
@@ -22442,8 +23179,8 @@ mod tests {
         )
         .unwrap();
 
-        for _ in 0..2 {
-            failover_codex_route_after_failure(
+        for _ in 0..3 {
+            failover_codex_route_after_failure_for_model(
                 &state,
                 Some("session-1"),
                 Some(crate::config::CODEX_DEFAULT_ROUTE_GROUP_ID),
@@ -22451,6 +23188,7 @@ mod tests {
                 Some(503),
                 Some("service unavailable"),
                 false,
+                Some("gpt-5"),
             )
             .await;
         }
@@ -22499,7 +23237,7 @@ mod tests {
         )
         .unwrap();
 
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22507,9 +23245,10 @@ mod tests {
             Some(400),
             Some("invalid request"),
             false,
+            Some("gpt-5"),
         )
         .await;
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22517,9 +23256,10 @@ mod tests {
             Some(200),
             Some("Failed to parse request body"),
             false,
+            Some("gpt-5"),
         )
         .await;
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22527,6 +23267,7 @@ mod tests {
             Some(200),
             Some("No tool output found for custom tool call call_123"),
             false,
+            Some("gpt-5"),
         )
         .await;
 
@@ -22563,12 +23304,16 @@ mod tests {
             last_provider_id: Some("backup".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-1".to_string(),
             group_id: "work".to_string(),
             provider_id: "backup".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         config.codex_session_routes.push(CodexSessionRouteConfig {
             session_id: "session-2".to_string(),
@@ -22578,12 +23323,16 @@ mod tests {
             last_provider_id: Some("backup".to_string()),
             last_seen_at: None,
             consecutive_503_failures: 0,
+
+            primary_model: None,
         });
         config.codex_session_route_pins.push(CodexSessionRoutePin {
             session_id: "session-2".to_string(),
             group_id: "default".to_string(),
             provider_id: "backup".to_string(),
             last_seen_at: None,
+
+            primary_model: None,
         });
         let dir = std::env::temp_dir().join(format!(
             "atoapi-codex-runtime-manual-route-{}",
@@ -22598,7 +23347,7 @@ mod tests {
 
         // This is a late failure from an old request that was sent on the
         // default group before the user moved the session to `work`.
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22606,9 +23355,10 @@ mod tests {
             Some(503),
             Some("upstream unavailable"),
             false,
+            Some("gpt-5"),
         )
         .await;
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-2"),
             Some("default"),
@@ -22616,6 +23366,7 @@ mod tests {
             Some(503),
             Some("upstream unavailable"),
             false,
+            Some("gpt-5"),
         )
         .await;
 
@@ -22695,7 +23446,7 @@ mod tests {
             "HTTP 429 rate limit",
             true,
         );
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22703,6 +23454,7 @@ mod tests {
             Some(429),
             Some("rate limit exceeded"),
             false,
+            Some("gpt-5"),
         )
         .await;
         assert!(state
@@ -22718,7 +23470,7 @@ mod tests {
             "HTTP 429 rate limit",
             true,
         );
-        failover_codex_route_after_failure(
+        failover_codex_route_after_failure_for_model(
             &state,
             Some("session-1"),
             Some("default"),
@@ -22726,6 +23478,7 @@ mod tests {
             Some(429),
             Some("rate limit exceeded"),
             false,
+            Some("gpt-5"),
         )
         .await;
         assert_eq!(
@@ -30975,7 +31728,7 @@ mod tests {
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
                 use_system_proxy: false,
-                api_key_encrypted: None,
+                api_key_encrypted: Some("test-key".to_string()),
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
                     request_model_id: None,
@@ -31004,7 +31757,7 @@ mod tests {
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
                 use_system_proxy: false,
-                api_key_encrypted: None,
+                api_key_encrypted: Some("test-key".to_string()),
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
                     request_model_id: None,
@@ -31565,7 +32318,7 @@ mod tests {
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
             use_system_proxy: false,
-            api_key_encrypted: None,
+            api_key_encrypted: Some("test-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "nc/gpt-5.6-sol".to_string(),
                 request_model_id: None,
@@ -31657,7 +32410,7 @@ mod tests {
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
             use_system_proxy: false,
-            api_key_encrypted: None,
+            api_key_encrypted: Some("test-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "gpt-5.6-sol".to_string(),
                 request_model_id: Some("gpt-5.5".to_string()),
@@ -31763,7 +32516,7 @@ mod tests {
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
             use_system_proxy: false,
-            api_key_encrypted: None,
+            api_key_encrypted: Some("test-key".to_string()),
             models: vec![crate::config::ModelConfig {
                 id: "ui-fallback-model".to_string(),
                 request_model_id: None,
@@ -31816,7 +32569,7 @@ mod tests {
             prompt_cache_retention_enabled: false,
             request_body_gzip_enabled: false,
             use_system_proxy: false,
-            api_key_encrypted: None,
+            api_key_encrypted: Some("test-key".to_string()),
             models: Vec::new(),
             enabled: true,
             created_at: Utc::now(),
@@ -31908,7 +32661,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("agent_route_unavailable"));
+        assert!(error.contains("agent_route_"), "{error}");
     }
 
     #[test]
@@ -31926,7 +32679,7 @@ mod tests {
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
                 use_system_proxy: false,
-                api_key_encrypted: None,
+                api_key_encrypted: Some("test-key".to_string()),
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
                     request_model_id: None,
@@ -31955,7 +32708,7 @@ mod tests {
                 prompt_cache_retention_enabled: false,
                 request_body_gzip_enabled: false,
                 use_system_proxy: false,
-                api_key_encrypted: None,
+                api_key_encrypted: Some("test-key".to_string()),
                 models: vec![crate::config::ModelConfig {
                     id: "gpt-5.5".to_string(),
                     request_model_id: None,
@@ -37182,6 +37935,161 @@ mod tests {
         assert_eq!(metrics.agent_generation.inbound_requests, 3);
         assert_eq!(metrics.agent_generation.generation_attempts, 3);
         assert_eq!(metrics.retries, 0);
+
+        fs::remove_dir_all(config_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn orphaned_previous_response_id_uses_complete_history_once_without_leaking() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let hits_for_route = hits.clone();
+        let bodies_for_route = bodies.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let hits = hits_for_route.clone();
+                let bodies = bodies_for_route.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    bodies.lock().await.push(body);
+                    raw_response(
+                        200,
+                        "text/event-stream",
+                        concat!(
+                            "event: response.output_text.delta\n",
+                            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\n",
+                            "event: response.completed\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_orphan_recovered\",\"status\":\"completed\"}}\n\n",
+                            "data: [DONE]\n\n"
+                        )
+                        .as_bytes()
+                        .to_vec(),
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let mut config = AppConfig::default();
+        config.local_key = "local-test-key".to_string();
+        config.workspace_fingerprint = "codex-orphan-replay-workspace".to_string();
+        config.cache.enabled = true;
+        config.cache.mode = CacheMode::PrefixPrewarm;
+        let provider_id = "codex-orphan-replay";
+        let mut provider = test_responses_provider(format!("http://{upstream_addr}/v1"));
+        provider.id = provider_id.to_string();
+        config.providers = vec![provider];
+        configure_test_codex_agent(&mut config, provider_id);
+        register_test_codex_providers(&mut config, &[provider_id]);
+        assert!(config.codex_session_route_pins.is_empty());
+        assert!(config.codex_session_routes.is_empty());
+        let config_dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-orphan-replay-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = Arc::new(
+            AppState::for_test(
+                config,
+                config_dir.join("config.toml"),
+                CacheStore::load(cache_path(&config_dir)).unwrap(),
+            )
+            .unwrap(),
+        );
+        let mut headers = test_local_auth_headers();
+        headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(
+                r#"{"session_id":"orphan-replay-session","thread_id":"orphan-replay-thread","request_kind":"turn"}"#,
+            ),
+        );
+        let complete_history = json!([
+            {"type": "message", "role": "user", "content": "before restart"},
+            {"type": "message", "role": "assistant", "content": "previous answer"},
+            {"type": "message", "role": "user", "content": "continue after restart"}
+        ]);
+
+        let recovered = handle_generation_for_agent(
+            state.clone(),
+            headers.clone(),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_unknown_old_upstream",
+                    "input": complete_history
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(recovered.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let captured = bodies.lock().await.clone();
+        assert_eq!(captured.len(), 1);
+        assert!(captured[0].get("previous_response_id").is_none());
+        assert_eq!(captured[0]["input"], complete_history);
+
+        let metrics = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = state.metrics.snapshot().await;
+                if snapshot.recent_requests.len() == 1 {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the recovered FullReplay must settle");
+        assert_eq!(metrics.retries, 0);
+        assert_eq!(metrics.agent_generation.generation_attempts, 1);
+        assert_eq!(
+            metrics.recent_requests[0].response_context_plan.as_deref(),
+            Some("full_replay_ambiguous_local_lineage")
+        );
+
+        {
+            let mut live_config = state.config.write().await;
+            live_config.codex_session_route_pins.clear();
+            live_config.codex_session_routes.clear();
+        }
+        let rejected = handle_generation_for_agent(
+            state.clone(),
+            headers,
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "previous_response_id": "resp_unrecoverable",
+                    "input": "not complete history"
+                }))
+                .unwrap(),
+            ),
+            Channel::Responses,
+            Some("codex"),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let rejected_body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&rejected_body).contains("agent_route_session_conflict"));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an unrecoverable previous response id must never reach an upstream"
+        );
+        assert_eq!(state.metrics.snapshot().await.upstream_requests, 1);
 
         fs::remove_dir_all(config_dir).ok();
     }
@@ -47257,7 +48165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_prefix_guard_is_released_before_upstream_headers() {
+    async fn different_agent_sessions_share_upstream_without_waiting_for_headers() {
         let hits = Arc::new(AtomicUsize::new(0));
         let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
         let (second_seen_tx, second_seen_rx) = tokio::sync::oneshot::channel();
@@ -47350,14 +48258,22 @@ mod tests {
             )
             .unwrap(),
         );
-        let mut headers = HeaderMap::new();
-        headers.insert(
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer local-test-key"),
         );
+        first_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(r#"{"thread_id":"guard-lifecycle-session-a"}"#),
+        );
+        let mut second_headers = first_headers.clone();
+        second_headers.insert(
+            X_CODEX_TURN_METADATA_HEADER,
+            HeaderValue::from_static(r#"{"thread_id":"guard-lifecycle-session-b"}"#),
+        );
         let request = Bytes::from(
             serde_json::to_vec(&json!({
-                "thread_id": "guard-lifecycle-session",
                 "model": "gpt-5.5",
                 "stream": true,
                 "input": [{"type": "message", "role": "user", "content": "hello"}]
@@ -47367,7 +48283,7 @@ mod tests {
 
         let first_task = tokio::spawn(handle_generation_for_agent(
             state.clone(),
-            headers.clone(),
+            first_headers,
             request.clone(),
             Channel::Responses,
             Some("codex"),
@@ -47378,7 +48294,7 @@ mod tests {
 
         let second_task = tokio::spawn(handle_generation_for_agent(
             state.clone(),
-            headers,
+            second_headers,
             request,
             Channel::Responses,
             Some("codex"),
@@ -47401,7 +48317,7 @@ mod tests {
             .unwrap();
         assert!(
             second_reached_before_headers,
-            "same-prefix request must reach upstream before the first response headers arrive"
+            "a second session must reach the shared upstream before the first session response headers arrive"
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 

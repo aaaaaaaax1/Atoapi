@@ -1227,19 +1227,22 @@ pub(super) async fn stream_upstream(
                 .as_deref()
                 .unwrap_or("upstream stream failed")
         });
-        note_selected_provider_key_stream_terminal(
-            &state_for_stream,
-            &decision.provider.id,
-            upstream_request_diagnostics
-                .cache_capability_key_id
-                .as_deref(),
-            stream_success_for_cache,
-            stream_error_summary,
-        )
-        .await;
+        if !upstream_request_diagnostics.codex_auxiliary_request {
+            note_selected_provider_key_stream_terminal(
+                &state_for_stream,
+                &decision.provider.id,
+                upstream_request_diagnostics
+                    .cache_capability_key_id
+                    .as_deref(),
+                stream_success_for_cache,
+                stream_error_summary,
+            )
+            .await;
+        }
         if let Some(session_id) = upstream_request_diagnostics
             .codex_route_session_id
             .as_deref()
+            .filter(|_| !upstream_request_diagnostics.codex_auxiliary_request)
         {
             let stream_failure_requires_failover = terminal_failure_code.is_some_and(|code| {
                 matches!(
@@ -1248,7 +1251,7 @@ pub(super) async fn stream_upstream(
                         | ResponsesFailureCode::UpstreamStreamError
                 )
             });
-            super::failover_codex_route_after_failure(
+            super::failover_codex_route_after_failure_for_model(
                 &state_for_stream,
                 Some(session_id),
                 upstream_request_diagnostics.codex_route_group_id.as_deref(),
@@ -1256,6 +1259,7 @@ pub(super) async fn stream_upstream(
                 Some(status),
                 stream_metadata.error_summary.as_deref(),
                 stream_failure_requires_failover,
+                upstream_request_diagnostics.codex_primary_model.as_deref(),
             )
             .await;
             if stream_success_for_cache {
@@ -1269,6 +1273,7 @@ pub(super) async fn stream_upstream(
                             session_id: Some(session_id),
                             group_id,
                             provider_id: decision.provider.id.clone(),
+                            primary_model: upstream_request_diagnostics.codex_primary_model.clone(),
                         }),
                     );
                 }
