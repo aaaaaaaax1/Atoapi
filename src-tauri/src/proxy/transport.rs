@@ -18,7 +18,7 @@ const EXPLICIT_PROXY_POOL_LIMIT: usize = 16;
 // after every successful body read, so a long-lived SSE response can continue
 // indefinitely while a provider that stops sending bytes eventually releases
 // the task and connection.
-const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// A protocol diagnostic is meaningful only for an explicitly disposable
 /// verifier process. Normal desktop traffic keeps HTTP/2 negotiation and its

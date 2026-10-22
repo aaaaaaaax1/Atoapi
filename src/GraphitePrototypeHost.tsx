@@ -2545,15 +2545,12 @@ const bridgeSource = String.raw`
     session.group_id = groupId;
     session.managed = true;
     session.consecutive_503_failures = 0;
-    const pins = clone(host.state?.codexSessionRoutePins || []);
-    const pin = pins.find((item) => item.session_id === sessionId);
-    // Keep the old pin as provenance; the next request switches only after
-    // the backend can rebuild the continuation from locally verified history.
-    const targetGroup = (host.state?.codexRouteGroups || []).find((item) => item.id === groupId);
-    session.last_provider_id = pin && targetGroup?.provider_ids.includes(pin.provider_id)
-      ? pin.provider_id
-      : null;
-    saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "会话分组已保存；当前回复不切换，下一次请求按新分组生效", pins);
+    // A group switch invalidates this session's old upstream immediately. The
+    // backend rebuilds the continuation when it sends the next request.
+    const pins = clone(host.state?.codexSessionRoutePins || [])
+      .filter((item) => item.session_id !== sessionId);
+    session.last_provider_id = null;
+    saveCodexRouting(clone(host.state?.codexRouteGroups || []), sessions, "会话分组已保存；下一次请求使用新分组，旧上游绑定已清理", pins);
   }, true);
   document.addEventListener("dblclick", (event) => {
     const target = event.target instanceof Element ? event.target.closest("[data-session-name]") : null;

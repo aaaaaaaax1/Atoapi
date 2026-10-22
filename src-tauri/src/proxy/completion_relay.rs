@@ -4,6 +4,32 @@ pub(super) const STREAM_RELAY_CHANNEL_CAPACITY: usize = 32;
 pub(super) const STREAM_RELAY_BYTE_BUDGET: usize = 2 * 1024 * 1024;
 pub(super) const STREAM_CACHE_CAPTURE_BYTE_LIMIT: usize = STREAM_RELAY_BYTE_BUDGET;
 
+#[derive(Debug, PartialEq, Eq)]
+enum FirstChunkReadError {
+    Timeout,
+    Eof,
+    Transport(String),
+}
+
+async fn read_first_nonempty_stream_chunk<S, E>(
+    source: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<Bytes, FirstChunkReadError>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    loop {
+        match tokio::time::timeout_at(deadline, futures_util::StreamExt::next(source)).await {
+            Ok(Some(Ok(bytes))) if !bytes.is_empty() => return Ok(bytes),
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(error))) => return Err(FirstChunkReadError::Transport(error.to_string())),
+            Ok(None) => return Err(FirstChunkReadError::Eof),
+            Err(_) => return Err(FirstChunkReadError::Timeout),
+        }
+    }
+}
+
 struct RelayBodyChunk {
     bytes: Bytes,
     permit: OwnedSemaphorePermit,
@@ -44,9 +70,35 @@ mod tests {
     use super::{
         canonical_responses_failure_frame,
         completed_native_full_replay_cache_control_acceptance_allowed,
-        GenericResponsesErrorFrameGate, GenericResponsesErrorFrameGateEvent, TerminalFailure,
+        read_first_nonempty_stream_chunk, FirstChunkReadError, GenericResponsesErrorFrameGate,
+        GenericResponsesErrorFrameGateEvent, TerminalFailure,
     };
     use crate::{config::Channel, continuation_lineage::LineageParent};
+    use bytes::Bytes;
+
+    #[tokio::test]
+    async fn first_stream_chunk_wait_is_bounded_and_ignores_empty_chunks() {
+        let mut chunks = futures_util::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::new()),
+            Ok(Bytes::from_static(b"data: ready\n\n")),
+        ]);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert_eq!(
+            read_first_nonempty_stream_chunk(&mut chunks, deadline)
+                .await
+                .unwrap(),
+            Bytes::from_static(b"data: ready\n\n")
+        );
+
+        let mut pending = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        assert_eq!(
+            read_first_nonempty_stream_chunk(&mut pending, deadline)
+                .await
+                .unwrap_err(),
+            FirstChunkReadError::Timeout
+        );
+    }
 
     #[test]
     fn passive_cache_control_acceptance_requires_a_completed_unambiguous_full_replay() {
@@ -640,6 +692,113 @@ pub(super) async fn stream_upstream(
     // and inflates TTFT/total time.
     drop(_prefix_guard);
 
+    // Do not expose an HTTP 200 to the client until this individual upstream
+    // has produced at least one body byte. Some providers send SSE headers and
+    // then leave the body pending forever; returning 200 first makes that look
+    // like a successful generation that never renders. This deadline is scoped
+    // to the current response and never serializes other sessions.
+    let mut upstream_source: std::pin::Pin<
+        Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>,
+    > = Box::pin(upstream.bytes_stream());
+    let first_chunk_remaining =
+        UPSTREAM_STREAM_FIRST_CHUNK_TIMEOUT.saturating_sub(started.elapsed());
+    let first_chunk_deadline = tokio::time::Instant::now() + first_chunk_remaining;
+    let first_upstream_chunk =
+        match read_first_nonempty_stream_chunk(&mut upstream_source, first_chunk_deadline).await {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let (message, category, response_status) = match error {
+                    FirstChunkReadError::Timeout => (
+                        format!(
+                            "upstream stream first chunk timed out after {} ms",
+                            UPSTREAM_STREAM_FIRST_CHUNK_TIMEOUT.as_millis()
+                        ),
+                        "first_chunk_timeout",
+                        StatusCode::GATEWAY_TIMEOUT,
+                    ),
+                    FirstChunkReadError::Eof => (
+                        "upstream stream closed before the first chunk".to_string(),
+                        "first_chunk_eof",
+                        StatusCode::BAD_GATEWAY,
+                    ),
+                    FirstChunkReadError::Transport(error) => (
+                        format!("upstream stream failed before the first chunk: {error}"),
+                        "first_chunk_transport",
+                        StatusCode::BAD_GATEWAY,
+                    ),
+                };
+                let request_errors = vec![("upstream_first_chunk".to_string(), message.clone())];
+                let failure_body = json!({ "stream": true });
+                let mut log = upstream_transport_failure_log(
+                    &request_id,
+                    &started,
+                    &client_channel,
+                    &decision.upstream_channel,
+                    &decision,
+                    eligible.then_some(metrics_cache_key.as_str()),
+                    provider_prefix_key.as_deref(),
+                    provider_prefix_fingerprint.as_deref(),
+                    &prefix_guard_wait,
+                    local_prepare_ms,
+                    &diagnostics,
+                    &failure_body,
+                    used_response_session,
+                    &response_session_reuse_diagnostics,
+                    requested_model.clone(),
+                    "stream-first-chunk",
+                    Some(&upstream_request_diagnostics),
+                    Some(category),
+                );
+                log.agent_id = agent_log_id.clone();
+                log.agent_label = agent_log_label.clone();
+                log.upstream_attempt_total = Some(upstream_request_diagnostics.attempts.max(1));
+                log.upstream_attempts = log.upstream_attempt_total;
+                log.final_scope_waterline = final_scope_dispatch
+                    .take()
+                    .and_then(|guard| guard.finish(None, false, false, None, None));
+                if agent_generation {
+                    finalize_agent_generation(
+                        &state,
+                        &request_id,
+                        agent_attempt_id,
+                        log,
+                        AgentAttemptOutcome::TransportError,
+                        AgentInboundOutcome::TransportError,
+                        Some(status),
+                        Some("upstream_first_chunk".to_string()),
+                        "transport_error_before_first_chunk",
+                        None,
+                        response_session_key.clone(),
+                        request_errors,
+                        shadow_affinity_decision,
+                        Some(&upstream_request_diagnostics),
+                    )
+                    .await;
+                } else {
+                    let mut transaction = MetricsTransaction::upstream(log);
+                    for (scope, error) in request_errors {
+                        transaction.observe_error(scope, error);
+                    }
+                    state.metrics.commit(transaction).await;
+                }
+                failover_codex_route_after_failure_for_model(
+                    &state,
+                    upstream_request_diagnostics
+                        .codex_route_session_id
+                        .as_deref(),
+                    upstream_request_diagnostics.codex_route_group_id.as_deref(),
+                    &decision.provider.id,
+                    None,
+                    Some(&message),
+                    true,
+                    upstream_request_diagnostics.codex_primary_model.as_deref(),
+                )
+                .await;
+                return json_error(response_status, &message);
+            }
+        };
+    let first_chunk_at_ms = started.elapsed().as_millis() as u64;
+
     let convert_codex_chat_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
         && matches!(decision.upstream_channel, Channel::Chat);
     let convert_anthropic_sse_to_responses_sse = matches!(client_channel, Channel::Responses)
@@ -723,9 +882,10 @@ pub(super) async fn stream_upstream(
         let diagnostic_request_id = request_id.clone();
         let diagnostic_enabled = config.tool_diagnostics_enabled;
         let raw_stream = async_stream::stream! {
-            let source = upstream.bytes_stream();
-            futures_util::pin_mut!(source);
+            let mut source = upstream_source;
             let mut observer = diagnostic_enabled.then(|| tool_diagnostics::ResponseObserver::new(diagnostic_store, &diagnostic_request_id, "upstream_response"));
+            if let Some(observer) = observer.as_mut() { observer.push(&first_upstream_chunk); }
+            yield Ok::<Bytes, reqwest::Error>(first_upstream_chunk);
             while let Some(item) = source.next().await {
                 if let (Some(observer), Ok(bytes)) = (observer.as_mut(), &item) { observer.push(bytes); }
                 yield item;
@@ -814,7 +974,7 @@ pub(super) async fn stream_upstream(
             } else {
                 Box::pin(raw_stream.map(|item| item.map_err(|err| err.to_string())))
             };
-        let mut first_chunk_at: Option<u64> = None;
+        let mut first_chunk_at: Option<u64> = Some(first_chunk_at_ms);
         let mut first_model_output_at: Option<u64> = None;
         let mut first_visible_text_output_at: Option<u64> = None;
         let mut cache_capture = BoundedCacheCapture::new(eligible);

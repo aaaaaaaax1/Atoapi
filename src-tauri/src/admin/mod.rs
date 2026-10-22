@@ -1076,11 +1076,19 @@ pub async fn save_codex_routing(
     state: State<'_, Arc<AppState>>,
     input: CodexRoutingConfigInput,
 ) -> CommandResult<PublicConfig> {
+    let CodexRoutingConfigInput {
+        groups: input_groups,
+        sessions: input_sessions,
+        // Route pins are backend runtime state. A stale renderer snapshot must
+        // never overwrite a newer failover decision or resurrect an old route.
+        pins: _,
+    } = input;
     state
         .commit_config_update(|current| {
-            let groups = validate_codex_route_groups(current, input.groups)?;
-            let mut sessions = input.sessions;
+            let groups = validate_codex_route_groups(current, input_groups)?;
+            let mut sessions = input_sessions;
             let mut pending_group_switches = current.codex_pending_group_switches.clone();
+            let mut switched_sessions = HashSet::new();
             let group_ids = groups
                 .iter()
                 .map(|group| group.id.as_str())
@@ -1103,17 +1111,20 @@ pub async fn save_codex_routing(
                     session.primary_model =
                         previous.and_then(|previous| previous.primary_model.clone());
                 }
-                if previous.is_some_and(|previous| {
-                    previous.group_id != session.group_id
-                        || previous.last_provider_id != session.last_provider_id
-                }) {
-                    session.consecutive_503_failures = 0;
-                }
-                if previous.is_some_and(|previous| previous.group_id != session.group_id) {
+                let group_changed =
+                    previous.is_some_and(|previous| previous.group_id != session.group_id);
+                if group_changed {
+                    switched_sessions.insert(session.session_id.clone());
                     session.last_provider_id = None;
+                    session.consecutive_503_failures = 0;
                     if session.managed && !pending_group_switches.contains(&session.session_id) {
                         pending_group_switches.push(session.session_id.clone());
                     }
+                } else if let Some(previous) = previous {
+                    // Ordinary routing/UI saves must not replace the latest
+                    // backend-owned sticky provider or failure streak.
+                    session.last_provider_id = previous.last_provider_id.clone();
+                    session.consecutive_503_failures = previous.consecutive_503_failures;
                 }
                 if !group_ids.contains(session.group_id.as_str()) {
                     session.group_id = CODEX_DEFAULT_ROUTE_GROUP_ID.to_string();
@@ -1134,14 +1145,34 @@ pub async fn save_codex_routing(
                 }
             }
             let sessions = validate_codex_session_routes(&groups, sessions)?;
-            let mut pins = input.pins;
+            let session_ids = sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<HashSet<_>>();
+            let mut pins = current.codex_session_route_pins.clone();
+            pins.retain(|pin| {
+                if switched_sessions.contains(&pin.session_id)
+                    || !session_ids.contains(pin.session_id.as_str())
+                {
+                    return false;
+                }
+                let Some(session) = sessions
+                    .iter()
+                    .find(|session| session.session_id == pin.session_id)
+                else {
+                    return false;
+                };
+                let Some(group) = groups.iter().find(|group| group.id == session.group_id) else {
+                    return false;
+                };
+                pin.group_id == session.group_id && group.provider_ids.contains(&pin.provider_id)
+            });
             for pin in &mut pins {
                 if pin.primary_model.is_none() {
-                    pin.primary_model = current
-                        .codex_session_route_pins
+                    pin.primary_model = sessions
                         .iter()
-                        .find(|previous| previous.session_id == pin.session_id)
-                        .and_then(|previous| previous.primary_model.clone());
+                        .find(|session| session.session_id == pin.session_id)
+                        .and_then(|session| session.primary_model.clone());
                 }
             }
             pending_group_switches.retain(|session_id| {
@@ -4249,6 +4280,15 @@ fn stage_agent_injection_route_update(
     mut input: AgentInjectionRouteUpdate,
 ) -> Result<(AppConfig, Vec<AgentInjectionResult>)> {
     let agent_id = input.id.clone();
+    let previous_codex_route = (agent_id == "codex")
+        .then(|| {
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "codex")
+                .map(|agent| (agent.provider_id.clone(), agent.model_id.clone()))
+        })
+        .flatten();
     let mut staged = config.clone();
     if let Some(provider_id) = input.provider_id.clone() {
         // A legacy shared row may be visible in an Agent's saved list for
@@ -4266,6 +4306,24 @@ fn stage_agent_injection_route_update(
         }
     }
     let results = agent_injection::update_route(&mut staged, input)?;
+    if let Some(previous_codex_route) = previous_codex_route {
+        let next_codex_route = staged
+            .agent_injections
+            .iter()
+            .find(|agent| agent.id == "codex")
+            .map(|agent| (agent.provider_id.clone(), agent.model_id.clone()));
+        if next_codex_route.as_ref() != Some(&previous_codex_route) {
+            // An explicit provider/model switch is an authoritative new route.
+            // Old pins and sticky provider ids must not keep a conversation on
+            // the previous upstream. Automatic failover pins are created only
+            // after this update and remain intact during ordinary UI saves.
+            staged.codex_session_route_pins.clear();
+            for route in &mut staged.codex_session_routes {
+                route.last_provider_id = None;
+                route.consecutive_503_failures = 0;
+            }
+        }
+    }
     Ok((staged, results))
 }
 
@@ -6598,6 +6656,57 @@ mod tests {
         assert!(staged.agent_provider_orders.iter().any(|order| {
             order.agent_id == "codex" && order.provider_ids == vec![codex_provider_id.to_string()]
         }));
+    }
+
+    #[test]
+    fn explicit_codex_provider_switch_clears_old_session_pins() {
+        let mut config = AppConfig::default();
+        config.providers.push(test_provider("old-upstream"));
+        config.providers.push(test_provider("new-upstream"));
+        config.codex_route_groups[0].provider_ids =
+            vec!["old-upstream".to_string(), "new-upstream".to_string()];
+        let codex = config
+            .agent_injections
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.provider_id = Some("old-upstream".to_string());
+        config.codex_session_routes.push(CodexSessionRouteConfig {
+            session_id: "old-session".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            managed: true,
+            display_name: None,
+            last_provider_id: Some("old-upstream".to_string()),
+            primary_model: Some("gpt-5".to_string()),
+            last_seen_at: Some(Utc::now()),
+            consecutive_503_failures: 2,
+        });
+        config.codex_session_route_pins.push(CodexSessionRoutePin {
+            session_id: "old-session".to_string(),
+            group_id: CODEX_DEFAULT_ROUTE_GROUP_ID.to_string(),
+            provider_id: "old-upstream".to_string(),
+            primary_model: Some("gpt-5".to_string()),
+            last_seen_at: Some(Utc::now()),
+        });
+
+        let (staged, _) = stage_agent_injection_route_update(
+            &config,
+            AgentInjectionRouteUpdate {
+                id: "codex".to_string(),
+                provider_id: Some("new-upstream".to_string()),
+                model_id: None,
+            },
+        )
+        .unwrap();
+
+        assert!(staged.codex_session_route_pins.is_empty());
+        let route = staged
+            .codex_session_routes
+            .iter()
+            .find(|route| route.session_id == "old-session")
+            .unwrap();
+        assert_eq!(route.last_provider_id, None);
+        assert_eq!(route.consecutive_503_failures, 0);
     }
 
     #[test]

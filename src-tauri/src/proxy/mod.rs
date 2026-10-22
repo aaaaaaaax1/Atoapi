@@ -166,6 +166,15 @@ const BACKGROUND_PREWARM_MIN_NET_SAVE_TOKENS: u64 = 512;
 const PREFIX_BACKGROUND_PREWARM_COOLDOWN_SECS: u64 = 60 * 60;
 const REQUEST_BODY_GZIP_MIN_BYTES: usize = 614_400;
 const REQUEST_BODY_GZIP_WARM_MIN_BYTES: usize = 262_144;
+// `RequestBuilder::send` includes body upload, upstream body parsing, and the
+// wait for response headers. A provider may accept a large historical replay
+// and then leave that request waiting indefinitely. Bound only this phase:
+// once the response head arrives, normal (including long-lived SSE) body reads
+// continue under the transport's independent idle timeout.
+const UPSTREAM_RESPONSE_HEADERS_TIMEOUT: TokioDuration = TokioDuration::from_secs(90);
+// A provider may return HTTP response headers long before it emits the first
+// streamed body byte. Bound only that wait, independently for every session.
+const UPSTREAM_STREAM_FIRST_CHUNK_TIMEOUT: TokioDuration = TokioDuration::from_secs(90);
 // A native Responses FullReplay is already a complete conversation, so an
 // unusually large frozen wire is not made safer by sending it to a provider
 // that may reject the entity while parsing or decompressing it.  Keep this
@@ -871,10 +880,30 @@ struct UpstreamSendOutcome {
 /// reconstruct them from the route defaults or inspect the raw reqwest error.
 #[derive(Debug)]
 struct UpstreamTransportError {
-    source: reqwest::Error,
+    source: UpstreamTransportErrorSource,
     diagnostics: UpstreamRequestDiagnostics,
     category: &'static str,
 }
+
+#[derive(Debug)]
+enum UpstreamTransportErrorSource {
+    Reqwest(reqwest::Error),
+    ResponseHeadersTimeout { limit_ms: u128 },
+}
+
+impl std::fmt::Display for UpstreamTransportErrorSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reqwest(error) => error.fmt(formatter),
+            Self::ResponseHeadersTimeout { limit_ms } => write!(
+                formatter,
+                "upstream response headers timed out after {limit_ms} ms"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UpstreamTransportErrorSource {}
 
 impl std::fmt::Display for UpstreamTransportError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -884,7 +913,10 @@ impl std::fmt::Display for UpstreamTransportError {
 
 impl std::error::Error for UpstreamTransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
+        match &self.source {
+            UpstreamTransportErrorSource::Reqwest(error) => Some(error),
+            UpstreamTransportErrorSource::ResponseHeadersTimeout { .. } => None,
+        }
     }
 }
 
@@ -938,6 +970,26 @@ fn classify_reqwest_transport_error(error: &reqwest::Error) -> &'static str {
         "connection"
     } else {
         "other"
+    }
+}
+
+fn classify_upstream_transport_error_source(source: &UpstreamTransportErrorSource) -> &'static str {
+    match source {
+        UpstreamTransportErrorSource::Reqwest(error) => classify_reqwest_transport_error(error),
+        UpstreamTransportErrorSource::ResponseHeadersTimeout { .. } => "header_timeout",
+    }
+}
+
+async fn send_upstream_request_with_header_deadline(
+    request: reqwest::RequestBuilder,
+    deadline: TokioDuration,
+) -> std::result::Result<reqwest::Response, UpstreamTransportErrorSource> {
+    match tokio::time::timeout(deadline, request.send()).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(error)) => Err(UpstreamTransportErrorSource::Reqwest(error)),
+        Err(_) => Err(UpstreamTransportErrorSource::ResponseHeadersTimeout {
+            limit_ms: deadline.as_millis(),
+        }),
     }
 }
 
@@ -11573,9 +11625,23 @@ fn select_codex_route(
         }
     }
 
-    let provider_id = candidate_ids
-        .first()
-        .cloned()
+    let preferred_provider_id = (!pending_group_switch)
+        .then(|| {
+            config
+                .agent_injections
+                .iter()
+                .find(|agent| agent.id == "codex")
+                .and_then(|agent| agent.provider_id.as_deref())
+                .filter(|provider_id| {
+                    candidate_ids
+                        .iter()
+                        .any(|candidate| candidate == provider_id)
+                })
+                .map(ToOwned::to_owned)
+        })
+        .flatten();
+    let provider_id = preferred_provider_id
+        .or_else(|| candidate_ids.first().cloned())
         .ok_or_else(|| "agent_route_unavailable: 当前分组及备用上游都没有可用 Key".to_string())?;
     Ok(Some(CodexRouteSelection {
         session_id,
@@ -15021,7 +15087,9 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
         }
     }
     let send_started = Instant::now();
-    match request.send().await {
+    match send_upstream_request_with_header_deadline(request, UPSTREAM_RESPONSE_HEADERS_TIMEOUT)
+        .await
+    {
         Ok(response) => {
             let headers_ms = send_started.elapsed().as_millis() as u64;
             diagnostics.headers_ms = headers_ms;
@@ -15046,7 +15114,7 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
                 diagnostics,
             })
         }
-        Err(err) => {
+        Err(source) => {
             let headers_ms = send_started.elapsed().as_millis() as u64;
             diagnostics.headers_ms = headers_ms;
             diagnostics.last_attempt_headers_ms = headers_ms;
@@ -15064,8 +15132,8 @@ async fn dispatch_prepared_one_shot_with_diagnostics(
             }
             annotate_upstream_affinity_test_diagnostic(&mut diagnostics);
             Err(UpstreamTransportError {
-                category: classify_reqwest_transport_error(&err),
-                source: err,
+                category: classify_upstream_transport_error_source(&source),
+                source,
                 diagnostics,
             }
             .into())
@@ -22077,6 +22145,35 @@ mod tests {
     }
 
     #[test]
+    fn codex_new_session_prefers_the_explicit_agent_provider() {
+        let mut config = AppConfig::default();
+        let mut primary = test_responses_provider("https://primary.example/v1".to_string());
+        primary.id = "primary".to_string();
+        let mut backup = test_responses_provider("https://backup.example/v1".to_string());
+        backup.id = "backup".to_string();
+        config.providers = vec![primary, backup];
+        configure_test_codex_agent(&mut config, "backup");
+        register_test_codex_providers(&mut config, &["primary", "backup"]);
+        config.codex_route_groups[0].provider_ids =
+            vec!["primary".to_string(), "backup".to_string()];
+        let metadata = TrustedCodexRequestMetadata {
+            session_id: Some("new-session".to_string()),
+            ..TrustedCodexRequestMetadata::default()
+        };
+
+        let route = select_codex_route(
+            &config,
+            &json!({"model":"gpt-5", "input":[]}),
+            Some(&metadata),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(route.provider_id, "backup");
+    }
+
+    #[test]
     fn codex_group_with_all_providers_opted_out_is_unavailable() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
@@ -22762,6 +22859,74 @@ mod tests {
             assert_eq!(route.consecutive_503_failures, 0);
         }
 
+        drop(state);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn codex_runtime_header_timeouts_use_the_same_strict_three_strike_budget() {
+        let mut config = AppConfig::default();
+        let mut primary = test_responses_provider("https://primary.example/v1".to_string());
+        primary.id = "primary".to_string();
+        let mut backup = test_responses_provider("https://backup.example/v1".to_string());
+        backup.id = "backup".to_string();
+        config.providers = vec![primary, backup];
+        configure_test_codex_agent(&mut config, "primary");
+        register_test_codex_providers(&mut config, &["primary", "backup"]);
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-header-timeout-failover-{}",
+            Uuid::new_v4().simple()
+        ));
+        let state = AppState::for_test(
+            config,
+            dir.join("config.toml"),
+            CacheStore::load(dir.join("cache.bin")).unwrap(),
+        )
+        .unwrap();
+
+        for expected_failures in 1..=2 {
+            failover_codex_route_after_failure_for_model(
+                &state,
+                Some("session-header-timeout"),
+                Some("default"),
+                "primary",
+                None,
+                Some("transport:header_timeout"),
+                true,
+                Some("gpt-5"),
+            )
+            .await;
+            let config = state.config.read().await;
+            let route = config
+                .codex_session_routes
+                .iter()
+                .find(|route| route.session_id == "session-header-timeout")
+                .unwrap();
+            assert_eq!(route.last_provider_id.as_deref(), Some("primary"));
+            assert_eq!(route.consecutive_503_failures, expected_failures);
+        }
+
+        failover_codex_route_after_failure_for_model(
+            &state,
+            Some("session-header-timeout"),
+            Some("default"),
+            "primary",
+            None,
+            Some("transport:header_timeout"),
+            true,
+            Some("gpt-5"),
+        )
+        .await;
+        let config = state.config.read().await;
+        assert_eq!(
+            config
+                .codex_session_route_pins
+                .iter()
+                .find(|pin| pin.session_id == "session-header-timeout")
+                .map(|pin| pin.provider_id.as_str()),
+            Some("backup")
+        );
+        drop(config);
         drop(state);
         fs::remove_dir_all(dir).ok();
     }
@@ -48322,6 +48487,152 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 2);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn bounded_header_wait_releases_a_stuck_session() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/hang",
+            post(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                raw_response(200, "text/event-stream", b"data: [DONE]\n\n".to_vec())
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("local test client must build");
+
+        let started = Instant::now();
+        let result = send_upstream_request_with_header_deadline(
+            client.post(format!("http://{upstream_addr}/hang")),
+            std::time::Duration::from_millis(80),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(UpstreamTransportErrorSource::ResponseHeadersTimeout { limit_ms: 80 })
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_stuck_header_wait_never_serializes_another_session() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let hits_for_route = hits.clone();
+        let release_for_route = release.clone();
+        let first_seen_tx = Arc::new(std::sync::Mutex::new(Some(first_seen_tx)));
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/responses",
+            post(move || {
+                let hit = hits_for_route.fetch_add(1, Ordering::SeqCst) + 1;
+                let release = release_for_route.clone();
+                let first_seen_tx = first_seen_tx.clone();
+                async move {
+                    if hit == 1 {
+                        if let Some(sender) = first_seen_tx
+                            .lock()
+                            .expect("first-hit notifier lock must not be poisoned")
+                            .take()
+                        {
+                            let _ = sender.send(());
+                        }
+                        release.notified().await;
+                    }
+                    raw_response(200, "text/event-stream", b"data: [DONE]\n\n".to_vec())
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+        let url = format!("http://{upstream_addr}/responses");
+        let first_url = url.clone();
+        let first_task = tokio::spawn(async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            send_upstream_request_with_header_deadline(
+                client.post(first_url),
+                std::time::Duration::from_millis(120),
+            )
+            .await
+        });
+        first_seen_rx
+            .await
+            .expect("the first held request must reach upstream");
+
+        let second_client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_upstream_request_with_header_deadline(
+                second_client.post(url),
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("the second session must not wait for the first session's headers");
+        assert!(second.is_ok());
+        assert!(matches!(
+            first_task.await.unwrap(),
+            Err(UpstreamTransportErrorSource::ResponseHeadersTimeout { .. })
+        ));
+        release.notify_waiters();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_header_deadline_does_not_cap_sse_body_streaming() {
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let stream = async_stream::stream! {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"data: {\"type\":\"response.created\"}\n\n",
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                        b"data: {\"type\":\"response.completed\"}\n\n",
+                    ));
+                };
+                AxumResponse::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let started = Instant::now();
+        let response = send_upstream_request_with_header_deadline(
+            client.get(format!("http://{upstream_addr}/stream")),
+            std::time::Duration::from_millis(200),
+        )
+        .await
+        .expect("the response headers arrive before their deadline");
+        let headers_elapsed = started.elapsed();
+        let body = response.bytes().await.unwrap();
+
+        assert!(headers_elapsed < std::time::Duration::from_millis(400));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(350));
+        assert!(String::from_utf8_lossy(&body).contains("response.completed"));
+        server.abort();
     }
 
     #[tokio::test]
