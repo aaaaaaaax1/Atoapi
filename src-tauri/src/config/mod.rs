@@ -833,19 +833,61 @@ pub fn model_request_alias(model: &ModelConfig) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Rank how a configured model matches a request-facing model name.
+///
+/// An explicit request alias is authoritative even when the provider also has
+/// a canonical model with the same ID. Without this precedence a user mapping
+/// such as `gpt-6.1-sol -> deepseek-v4.1-flash` is silently shadowed by an
+/// upstream model named `gpt-6.1-sol`, which can make the request hang on the
+/// canonical model.
+pub fn model_match_priority(model: &ModelConfig, requested: &str) -> Option<u8> {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return None;
+    }
+    if let Some(alias) = model_request_alias(model) {
+        if alias == requested {
+            return Some(0);
+        }
+        if alias.eq_ignore_ascii_case(requested) {
+            return Some(1);
+        }
+    }
+    let id = model.id.trim();
+    if id == requested {
+        return Some(2);
+    }
+    if id.eq_ignore_ascii_case(requested) {
+        return Some(3);
+    }
+    let requested_lower = requested.to_ascii_lowercase();
+    codex_model_alias(id)
+        .is_some_and(|alias| alias == requested_lower)
+        .then_some(4)
+}
+
+/// Return the configured model with the strongest request-name match.
+pub fn best_model_match<'a>(
+    models: &'a [ModelConfig],
+    requested: &str,
+    enabled_only: bool,
+) -> Option<&'a ModelConfig> {
+    models
+        .iter()
+        .filter(|model| !enabled_only || model.enabled)
+        .filter_map(|model| {
+            model_match_priority(model, requested).map(|priority| (priority, model))
+        })
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, model)| model)
+}
+
 pub fn provider_model_cache_key(provider: &ProviderConfig, requested_model: &str) -> String {
     let requested = requested_model.trim();
     if requested.is_empty() {
         return String::new();
     }
-    let requested_lower = requested.to_ascii_lowercase();
-    if let Some(model) = provider.models.iter().find(|model| {
-        model.enabled
-            && (model.id == requested
-                || model_request_alias(model)
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(requested))
-                || codex_model_alias(&model.id).is_some_and(|alias| alias == requested_lower))
-    }) {
+    if let Some(model) = best_model_match(&provider.models, requested, true) {
         return model.id.clone();
     }
 
@@ -4984,6 +5026,49 @@ updated_at = "2026-06-21T00:00:00Z"
         assert_eq!(
             provider_model_cache_key(&provider, "gpt-5.6-sol"),
             "gpt-5.6-sol"
+        );
+    }
+
+    #[test]
+    fn provider_cache_model_key_prefers_explicit_mapping_over_same_id_model() {
+        let mut provider = ProviderConfig {
+            id: "agent-codex-mapped".to_string(),
+            name: "mapped".to_string(),
+            base_url: "https://mapped.example/v1".to_string(),
+            models_url: None,
+            is_full_url: false,
+            custom_user_agent: None,
+            channel: Channel::Responses,
+            prompt_cache_retention_enabled: true,
+            request_body_gzip_enabled: false,
+            use_system_proxy: false,
+            api_key_encrypted: None,
+            models: Vec::new(),
+            enabled: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let model = |id: &str, request_model_id: Option<&str>| ModelConfig {
+            id: id.to_string(),
+            request_model_id: request_model_id.map(ToOwned::to_owned),
+            display_name: id.to_string(),
+            context_window: Some(128_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        };
+        provider.models = vec![
+            model("gpt-6.1-sol", None),
+            model("deepseek-v4.1-flash", Some("gpt-6.1-sol")),
+        ];
+
+        assert_eq!(
+            provider_model_cache_key(&provider, "gpt-6.1-sol"),
+            "deepseek-v4.1-flash"
         );
     }
 

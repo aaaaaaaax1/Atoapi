@@ -292,6 +292,23 @@ pub fn run() {
                             .await;
                     }
                 }
+                if !isolated_test_instance {
+                    // Other Codex launchers can rewrite config.toml after
+                    // Atoapi starts. Keep the enabled Codex route authoritative
+                    // without touching unrelated user-managed fields.
+                    let guard_state = state.clone();
+                    tauri::async_runtime::spawn(async move {
+                        loop {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if let Err(err) = guard_state.refresh_enabled_codex_injection().await {
+                                guard_state
+                                    .metrics
+                                    .record_error("codex_injection_guard", &err.to_string())
+                                    .await;
+                            }
+                        }
+                    });
+                }
             });
             Ok(())
         })

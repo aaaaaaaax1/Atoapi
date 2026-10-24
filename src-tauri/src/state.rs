@@ -35,7 +35,7 @@ use crate::{
     cache::{cache_path, CacheStore},
     config::{
         app_config_dir, config_path, isolated_test_listen_port, provider_model_cache_key,
-        AppConfig, ProviderConfig, PublicConfig,
+        AgentInjectionKind, AppConfig, ProviderConfig, PublicConfig,
     },
     continuation_lineage::ContinuationLineageIndex,
     metrics::MetricsStore,
@@ -1042,6 +1042,23 @@ impl AppState {
         #[cfg(not(test))]
         agent_injection::cleanup_stale_codex_artifacts(&config);
         Ok(())
+    }
+
+    pub async fn refresh_enabled_codex_injection(&self) -> Result<bool> {
+        let mut config = self.config.write().await;
+        let codex_enabled = config.agent_injections.iter().any(|item| {
+            item.id == "codex" && item.enabled && item.kind == AgentInjectionKind::Codex
+        });
+        if !codex_enabled {
+            return Ok(false);
+        }
+        let before = toml::to_string(&*config)?;
+        let results = agent_injection::apply_one_by_id(&mut config, "codex")?;
+        if toml::to_string(&*config)? != before {
+            config.updated_at = Utc::now();
+            self.persist_config_snapshot(&config).await?;
+        }
+        Ok(results.iter().any(|result| result.changed))
     }
 
     pub async fn start_proxy(self: &Arc<Self>) -> Result<ProxyStatus> {

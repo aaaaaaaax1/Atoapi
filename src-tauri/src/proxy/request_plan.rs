@@ -4,6 +4,23 @@ use crate::config::{Channel, ProviderConfig};
 
 use super::{prepared_wire_request::PreparedWireRequest, upstream_affinity::UpstreamAffinityScope};
 
+/// Loopback traffic must never be sent to a desktop proxy. Some local upstream
+/// bridges are fast by themselves but queue large request bodies behind a
+/// system proxy, producing long header waits and apparently stuck sessions.
+pub(super) fn is_loopback_endpoint(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 #[derive(Debug)]
 pub(super) struct RequestPlan {
     url: String,
@@ -46,10 +63,11 @@ impl RequestPlan {
         url: impl Into<String>,
         wire: PreparedWireRequest,
     ) -> Self {
+        let url: String = url.into();
         Self {
-            url: url.into(),
+            use_system_proxy: provider.use_system_proxy && !is_loopback_endpoint(&url),
+            url,
             channel: wire.channel().clone(),
-            use_system_proxy: provider.use_system_proxy,
             explicit_proxy_url: None,
             custom_user_agent: provider.custom_user_agent.clone(),
             request_body_gzip_enabled: provider.request_body_gzip_enabled,

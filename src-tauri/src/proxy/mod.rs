@@ -5,7 +5,7 @@ use crate::{
     agent_injection,
     cache::{self, CacheEntry, CacheLookupStatus},
     config::{
-        codex_model_alias, codex_model_display_name, model_request_alias,
+        best_model_match, codex_model_alias, codex_model_display_name, model_request_alias,
         normalize_reasoning_effort, provider_model_cache_key, AgentInjectionConfig,
         AgentInjectionKind, AppConfig, CacheMode, Channel, CodexRouteGroupConfig,
         CodexSessionRouteConfig, CodexSessionRoutePin, ModelConfig, ProviderCacheCapabilityField,
@@ -136,7 +136,7 @@ use prepared_wire_request::{
 use prepared_wire_request::{
     serialize_responses_body_bytes_for_provider_prefix, PreparedResponseBody,
 };
-use request_plan::{OneShotRequestPlan, RequestPlan};
+use request_plan::{is_loopback_endpoint, OneShotRequestPlan, RequestPlan};
 use responses_full_replay_risk::{BlockedFullReplayShape, FullReplayRiskSignals};
 pub(crate) use responses_full_replay_risk::{
     ResponsesFullReplayRiskObservations, ResponsesRouteScope,
@@ -1864,16 +1864,30 @@ fn provider_model_list_items(
 ) -> Vec<Value> {
     let mut items = Vec::new();
     let mut seen_ids = HashSet::new();
+    // A user mapping is authoritative for its request name. If the same ID is
+    // also present as a canonical catalog entry, expose the mapping rather than
+    // letting the canonical entry shadow it in the Codex picker.
+    let explicit_aliases = provider
+        .models
+        .iter()
+        .filter(|model| model.enabled)
+        .filter_map(model_request_alias)
+        .map(|alias| alias.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
     for model in provider.models.iter().filter(|model| model.enabled) {
-        seen_ids.insert(model.id.clone());
-        items.push(json!({
-            "id": model.id,
-            "object": "model",
-            "owned_by": provider.name,
-            "provider": provider.id,
-            "context_window": model.context_window,
-            "display_name": model.display_name
-        }));
+        if explicit_aliases.contains(&model.id.to_ascii_lowercase()) {
+            continue;
+        }
+        if seen_ids.insert(model.id.clone()) {
+            items.push(json!({
+                "id": model.id,
+                "object": "model",
+                "owned_by": provider.name,
+                "provider": provider.id,
+                "context_window": model.context_window,
+                "display_name": model.display_name
+            }));
+        }
         if include_codex_aliases {
             let mut aliases = Vec::new();
             if let Some(alias) = model_request_alias(model) {
@@ -1989,13 +2003,20 @@ async fn fetch_codex_provider_models(
     plan: &CodexModelDiscoveryPlan,
 ) -> Result<Vec<Value>> {
     let endpoints = codex_model_discovery_endpoints(&plan.provider)?;
-    let client = match plan.explicit_proxy_url.as_deref() {
-        Some(proxy_url) => state
-            .transport_clients
-            .explicit_proxy_client(proxy_url, false)?,
-        None => state
-            .upstream_client(plan.provider.use_system_proxy)
-            .clone(),
+    let loopback = endpoints
+        .first()
+        .is_some_and(|endpoint| is_loopback_endpoint(endpoint));
+    let client = if loopback {
+        state.upstream_client(false).clone()
+    } else {
+        match plan.explicit_proxy_url.as_deref() {
+            Some(proxy_url) => state
+                .transport_clients
+                .explicit_proxy_client(proxy_url, false)?,
+            None => state
+                .upstream_client(plan.provider.use_system_proxy)
+                .clone(),
+        }
     };
     let headers = build_management_probe_headers(
         &plan.selected_key.secret,
@@ -2115,18 +2136,28 @@ fn upstream_model_list_items(value: &Value, provider: &ProviderConfig) -> Option
 }
 
 fn merge_model_list_items(primary: Vec<Value>, secondary: Vec<Value>) -> Vec<Value> {
-    let mut seen = HashSet::new();
-    primary
-        .into_iter()
-        .chain(secondary)
-        .filter(|item| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
-                .is_some_and(|id| seen.insert(id.to_string()))
-        })
-        .collect()
+    // Preserve discovery order while allowing local explicit mappings to
+    // replace a same-ID canonical model from the upstream catalog.
+    let mut items = Vec::with_capacity(primary.len().saturating_add(secondary.len()));
+    let mut positions = HashMap::new();
+    for item in primary.into_iter().chain(secondary) {
+        let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+        if let Some(position) = positions.get(&id).copied() {
+            items[position] = item;
+        } else {
+            positions.insert(id, items.len());
+            items.push(item);
+        }
+    }
+    items
 }
 
 fn codex_model_discovery_cache_key(plan: &CodexModelDiscoveryPlan) -> String {
@@ -2702,7 +2733,11 @@ async fn run_responses_compact_for_authorized_agent(
     );
     let gzip_enabled = gzip_request_body_enabled_for_scope(
         &state,
-        decision.provider.request_body_gzip_enabled,
+        gzip_request_body_enabled_for_endpoint(
+            authorized_agent.is_some(),
+            &active_url,
+            decision.provider.request_body_gzip_enabled,
+        ),
         &gzip_capability_scope,
     );
     let mut request_plan = Some(
@@ -5519,7 +5554,11 @@ async fn run_generation_for_authorized_agent(
     );
     let gzip_enabled = gzip_request_body_enabled_for_scope(
         &state,
-        decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+        gzip_request_body_enabled_for_endpoint(
+            authorized_agent.is_some(),
+            generation_plan.request_plan().url(),
+            decision.provider.request_body_gzip_enabled && !skip_gzip_for_cold_stream,
+        ),
         &gzip_capability_scope,
     );
     // Only an unchanged, adapter-attested route may inherit upstream
@@ -8227,6 +8266,18 @@ fn should_skip_request_body_gzip_for_cold_stream(
         return false;
     }
     false
+}
+
+fn gzip_request_body_enabled_for_endpoint(
+    agent_transport: bool,
+    endpoint: &str,
+    user_enabled: bool,
+) -> bool {
+    // A local bridge receives bytes without WAN transport cost. Compression can
+    // trigger upstream-side buffering or decompression stalls on large agent
+    // requests, so agent traffic to loopback stays raw. The ordinary OpenAI
+    // proxy surface retains its explicitly configured gzip behavior.
+    user_enabled && !(agent_transport && is_loopback_endpoint(endpoint))
 }
 
 fn gzip_request_body_enabled_for_scope(
@@ -16014,40 +16065,7 @@ fn resolve_provider_model_id(provider: &ProviderConfig, requested_model: &str) -
     if provider.models.is_empty() {
         return Some(requested.to_string());
     }
-    if let Some(model) = provider
-        .models
-        .iter()
-        .find(|item| item.enabled && item.id == requested)
-    {
-        return Some(model.id.clone());
-    }
-    if let Some(model) = provider.models.iter().find(|item| {
-        item.enabled
-            && model_request_alias(item)
-                .map(|alias| alias == requested)
-                .unwrap_or(false)
-    }) {
-        return Some(model.id.clone());
-    }
-    let requested_alias = requested.to_ascii_lowercase();
-    provider
-        .models
-        .iter()
-        .find(|item| {
-            item.enabled
-                && model_request_alias(item)
-                    .map(|alias| alias.to_ascii_lowercase() == requested_alias)
-                    .unwrap_or(false)
-        })
-        .or_else(|| {
-            provider.models.iter().find(|item| {
-                item.enabled
-                    && codex_model_alias(&item.id)
-                        .map(|alias| alias == requested_alias)
-                        .unwrap_or(false)
-            })
-        })
-        .map(|model| model.id.clone())
+    best_model_match(&provider.models, requested, true).map(|model| model.id.clone())
 }
 
 fn set_request_model(request: &mut Value, model: &str) {
@@ -16111,17 +16129,7 @@ fn apply_model_reasoning_effort(
 }
 
 fn model_for_route_decision(decision: &RouteDecision) -> Option<&ModelConfig> {
-    decision
-        .provider
-        .models
-        .iter()
-        .find(|model| model.id == decision.model)
-        .or_else(|| {
-            decision.provider.models.iter().find(|model| {
-                model_request_alias(model)
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(&decision.model))
-            })
-        })
+    best_model_match(&decision.provider.models, &decision.model, false)
 }
 
 fn reasoning_effort_rank(effort: &str) -> Option<usize> {
@@ -21539,6 +21547,22 @@ mod tests {
             enabled: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn test_model(id: &str, request_model_id: Option<&str>) -> ModelConfig {
+        ModelConfig {
+            id: id.to_string(),
+            request_model_id: request_model_id.map(ToOwned::to_owned),
+            display_name: id.to_string(),
+            context_window: Some(128_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
         }
     }
 
@@ -32108,6 +32132,57 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mapping_wins_over_same_id_canonical_model() {
+        let mut provider = test_responses_provider("https://mapped.example/v1".to_string());
+        provider.models = vec![
+            test_model("gpt-6.1-sol", None),
+            test_model("deepseek-v4.1-flash", Some("gpt-6.1-sol")),
+        ];
+
+        assert_eq!(
+            resolve_provider_model_id(&provider, "gpt-6.1-sol").as_deref(),
+            Some("deepseek-v4.1-flash")
+        );
+        let items = provider_model_list_items(&provider, true, None);
+        let sol = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("gpt-6.1-sol"))
+            .expect("mapped request model must remain visible");
+        assert_eq!(
+            sol.get("canonical_id").and_then(Value::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+    }
+
+    #[test]
+    fn local_mapping_replaces_same_id_discovered_canonical_model() {
+        let upstream = vec![json!({
+            "id": "gpt-6.1-sol",
+            "object": "model",
+            "owned_by": "upstream",
+            "display_name": "Upstream GPT-6.1 Sol"
+        })];
+        let local = vec![json!({
+            "id": "gpt-6.1-sol",
+            "object": "model",
+            "owned_by": "local",
+            "display_name": "DeepSeek V4.1 Flash",
+            "canonical_id": "deepseek-v4.1-flash"
+        })];
+
+        let merged = merge_model_list_items(upstream, local);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].get("canonical_id").and_then(Value::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            merged[0].get("owned_by").and_then(Value::as_str),
+            Some("local")
+        );
+    }
+
+    #[test]
     fn codex_model_list_includes_alias_without_dropping_canonical_id() {
         let provider = ProviderConfig {
             id: "share".to_string(),
@@ -33158,6 +33233,67 @@ mod tests {
         assert!(plan.request_body_gzip_enabled());
         assert_eq!(plan.wire().body().as_ref(), expected.as_bytes());
         assert_eq!(cached_gzip.as_ptr(), retained_gzip.as_ptr());
+    }
+
+    #[test]
+    fn loopback_request_plan_bypasses_system_proxy() {
+        let mut provider = test_responses_provider("http://127.0.0.1:8788/v1".to_string());
+        provider.use_system_proxy = true;
+        for endpoint in [
+            "http://127.0.0.1:8788/v1/responses",
+            "http://localhost:8788/v1/responses",
+            "http://[::1]:8788/v1/responses",
+        ] {
+            let plan = RequestPlan::new(
+                &provider,
+                endpoint,
+                Channel::Responses,
+                &json!({"model": "gpt-test", "input": "ping"}),
+            )
+            .with_explicit_proxy_url(Some("http://127.0.0.1:7897".to_string()));
+            assert!(
+                !plan.use_system_proxy(),
+                "loopback endpoint {endpoint} must be direct"
+            );
+            assert_eq!(plan.explicit_proxy_url(), None);
+        }
+    }
+
+    #[test]
+    fn agent_loopback_requests_skip_gzip_without_changing_other_paths() {
+        assert!(!gzip_request_body_enabled_for_endpoint(
+            true,
+            "http://127.0.0.1:8788/v1/responses",
+            true
+        ));
+        assert!(!gzip_request_body_enabled_for_endpoint(
+            true,
+            "http://[::1]:8788/v1/responses",
+            true
+        ));
+        assert!(gzip_request_body_enabled_for_endpoint(
+            false,
+            "http://127.0.0.1:8788/v1/responses",
+            true
+        ));
+        assert!(gzip_request_body_enabled_for_endpoint(
+            true,
+            "https://example.test/v1/responses",
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_request_plan_still_honors_system_proxy() {
+        let mut provider = test_responses_provider("https://example.test/v1".to_string());
+        provider.use_system_proxy = true;
+        let plan = RequestPlan::new(
+            &provider,
+            "https://example.test/v1/responses",
+            Channel::Responses,
+            &json!({"model": "gpt-test", "input": "ping"}),
+        );
+        assert!(plan.use_system_proxy());
     }
 
     #[test]

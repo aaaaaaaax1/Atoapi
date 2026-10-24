@@ -13,8 +13,9 @@ use toml_edit::{value, DocumentMut};
 use uuid::Uuid;
 
 use crate::config::{
-    app_config_dir, codex_model_alias, model_request_alias, normalize_agent_injections,
-    AgentInjectionConfig, AgentInjectionKind, AppConfig, CodexContextSettings, ModelConfig,
+    app_config_dir, best_model_match, codex_model_alias, model_request_alias,
+    normalize_agent_injections, AgentInjectionConfig, AgentInjectionKind, AppConfig,
+    CodexContextSettings, ModelConfig,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
@@ -278,10 +279,7 @@ pub fn update_route(
         requested_model_id
             .as_deref()
             .map(|model_id| {
-                provider
-                    .models
-                    .iter()
-                    .find(|model| model.enabled && injection_model_matches(model, model_id))
+                best_model_match(&provider.models, model_id, true)
                     .map(|model| model.id.clone())
                     .ok_or_else(|| {
                         anyhow!(
@@ -710,6 +708,15 @@ fn is_managed_codex_catalog_path(path: &Path) -> bool {
             file == CODEX_MODEL_CATALOG_LEGACY_FILE
                 || (file.starts_with(CODEX_MODEL_CATALOG_FILE_PREFIX) && file.ends_with(".json"))
         })
+}
+
+fn is_competing_codex_catalog_path(path: &Path) -> bool {
+    // CC Switch installs a global Codex catalog override. If Atoapi leaves it
+    // active, Codex loads CC Switch's startup snapshot instead of querying the
+    // Atoapi provider's live `/models` endpoint. Preserve the original value in
+    // the encrypted restore state, but suppress it while Atoapi owns the route.
+    let normalized = path.to_string_lossy().to_ascii_lowercase();
+    normalized.contains("cc-switch") || normalized.contains("ccswitch")
 }
 
 /// A catalog may be deleted only when it is registered in the encrypted
@@ -1167,12 +1174,8 @@ impl InjectionContext {
         });
         let configured_model_id = item.and_then(|item| item.model_id.as_deref());
         let explicit_model_config = provider.and_then(|provider| {
-            configured_model_id.and_then(|model_id| {
-                provider
-                    .models
-                    .iter()
-                    .find(|model| injection_model_matches(model, model_id))
-            })
+            configured_model_id
+                .and_then(|model_id| best_model_match(&provider.models, model_id, true))
         });
         let model_config = explicit_model_config.or_else(|| {
             provider.and_then(|provider| provider.models.iter().find(|model| model.enabled))
@@ -1227,23 +1230,6 @@ fn local_base_url(host: &str, port: u16) -> String {
         IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
         IpAddr::V4(ip) => format!("http://{ip}:{port}"),
     }
-}
-
-fn injection_model_matches(model: &crate::config::ModelConfig, requested: &str) -> bool {
-    let requested = requested.trim();
-    if model.id == requested {
-        return true;
-    }
-    if model_request_alias(model)
-        .map(|alias| alias == requested || alias.eq_ignore_ascii_case(requested))
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    let requested_lower = requested.to_ascii_lowercase();
-    codex_model_alias(&model.id)
-        .map(|alias| alias == requested_lower)
-        .unwrap_or(false)
 }
 
 pub(crate) fn agent_local_key(local_key: &str, agent_id: &str) -> String {
@@ -1374,6 +1360,10 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         configured_codex_catalog_path(&doc, path)
             .is_some_and(|catalog| catalog_manifest_owns(&state.catalog_manifest, path, &catalog))
     });
+    let restore_catalog_is_competing = restore_fragment.as_ref().is_some_and(|fragment| {
+        configured_codex_catalog_path(fragment, path)
+            .is_some_and(|catalog| is_competing_codex_catalog_path(&catalog))
+    });
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     // New Codex versions reject this retired root key. Storage behavior is
     // handled by the relay request path, not this ignored configuration flag.
@@ -1384,9 +1374,17 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     // from the user. If an older injection has no ownership record, preserve
     // the live value rather than guessing from its filename.
     if let Some(fragment) = restore_fragment.as_ref() {
-        if current_catalog_is_owned || fragment.as_table().contains_key("model_catalog_json") {
+        if current_catalog_is_owned
+            || (fragment.as_table().contains_key("model_catalog_json")
+                && !restore_catalog_is_competing)
+        {
             restore_codex_root_fields(&mut doc, fragment, &["model_catalog_json"]);
         }
+    }
+    if configured_codex_catalog_path(&doc, path)
+        .is_some_and(|catalog| is_competing_codex_catalog_path(&catalog))
+    {
+        doc.as_table_mut().remove("model_catalog_json");
     }
     if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
         doc["model_auto_compact_token_limit"] = value(i64::from(limit));
@@ -1411,13 +1409,11 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         } else if let Some(fragment) = restore_fragment.as_ref() {
             restore_codex_root_fields(&mut doc, fragment, &["model_context_window"]);
         }
-        if let Some(reasoning_effort) = context
-            .codex_models
-            .iter()
-            .find(|model| injection_model_matches(model, &context.default_model))
-            .filter(|model| model.reasoning_effort_override_enabled)
-            .and_then(|model| model.reasoning_effort.as_deref())
-            .and_then(crate::config::normalize_reasoning_effort)
+        if let Some(reasoning_effort) =
+            best_model_match(&context.codex_models, &context.default_model, true)
+                .filter(|model| model.reasoning_effort_override_enabled)
+                .and_then(|model| model.reasoning_effort.as_deref())
+                .and_then(crate::config::normalize_reasoning_effort)
         {
             doc["model_reasoning_effort"] = value(reasoning_effort);
         } else if let Some(fragment) = restore_fragment.as_ref() {
@@ -2441,6 +2437,69 @@ command = "npx"
             .filter(|candidate| is_managed_codex_catalog_path(candidate))
             .collect::<Vec<_>>();
         assert!(managed_catalogs.is_empty());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_injection_suppresses_cc_switch_catalog_while_atoapi_is_active() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-competing-catalog-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let path = dir.join("config.toml");
+        let competing_catalog = dir.join("cc-switch-model-catalog.json");
+        write_text(&competing_catalog, "{}\n").unwrap();
+        let competing_config = r#"model_provider = "custom"
+model_catalog_json = "cc-switch-model-catalog.json"
+
+[model_providers.custom]
+name = "Atoapi"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+"#;
+        write_text(&path, competing_config).unwrap();
+        let context = InjectionContext {
+            anthropic_base_url: "http://127.0.0.1:18883".to_string(),
+            openai_base_url: "http://127.0.0.1:18883/v1".to_string(),
+            codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
+            local_key: "ato-competing-catalog".to_string(),
+            default_channel: "responses".to_string(),
+            default_model: "deepseek-v4.1-flash".to_string(),
+            default_model_is_explicit: true,
+            model_context_window: None,
+            auto_compact_token_limit: None,
+            codex_context_settings: None,
+            codex_models: Vec::new(),
+        };
+
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:18883/codex/v1")
+        );
+        assert!(competing_catalog.exists());
+
+        // Simulate another launcher overwriting config.toml after startup.
+        // The periodic guard must restore Atoapi's route and suppress the
+        // competing catalog again without requiring a manual refresh.
+        write_text(&path, competing_config).unwrap();
+        write_codex_config(&path, &context).unwrap();
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_providers")
+                .and_then(|providers| providers.get(CODEX_PROVIDER_ID))
+                .and_then(|provider| provider.get("base_url"))
+                .and_then(toml::Value::as_str),
+            Some("http://127.0.0.1:18883/codex/v1")
+        );
         fs::remove_dir_all(dir).ok();
     }
 
