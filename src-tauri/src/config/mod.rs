@@ -815,6 +815,29 @@ pub fn normalize_reasoning_efforts(values: &[String]) -> Vec<String> {
     normalized
 }
 
+/// Visible native Codex models, ordered by the catalog priority embedded in
+/// the installed Codex client. Atoapi uses this as the picker surface and only
+/// applies request mappings behind it; upstream backend model names never
+/// become picker entries.
+pub const CODEX_NATIVE_VISIBLE_MODELS: [(&str, &str, u32); 8] = [
+    ("gpt-6.1-sol", "GPT-6.1-Sol", 1),
+    ("gpt-6-astra", "GPT-6-Astra", 2),
+    ("gpt-6-sol", "GPT-6-Sol", 3),
+    ("gpt-6-luna", "GPT-6-Luna", 4),
+    ("gpt-5.6-sol", "GPT-5.6-Sol", 5),
+    ("gpt-5.6-terra", "GPT-5.6-Terra", 8),
+    ("gpt-5.6-luna", "GPT-5.6-Luna", 9),
+    ("gpt-5.5", "GPT-5.5", 13),
+];
+
+pub fn codex_native_visible_model(value: &str) -> Option<(&'static str, &'static str, u32)> {
+    let id = value.trim();
+    CODEX_NATIVE_VISIBLE_MODELS
+        .iter()
+        .find(|(candidate, _, _)| candidate.eq_ignore_ascii_case(id))
+        .copied()
+}
+
 pub fn codex_model_alias(model_id: &str) -> Option<String> {
     let trimmed = model_id.trim();
     let alias = trimmed.rsplit('/').next().unwrap_or(trimmed).trim();

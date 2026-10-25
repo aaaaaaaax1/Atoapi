@@ -79,6 +79,10 @@ struct InjectionContext {
     auto_compact_token_limit: Option<u32>,
     codex_context_settings: Option<CodexContextSettings>,
     codex_models: Vec<ModelConfig>,
+    /// Raw model records discovered from the currently selected upstream.
+    /// `None` means discovery did not complete, so the last managed catalog is
+    /// retained instead of replacing it with an incomplete local list.
+    discovered_codex_models: Option<Vec<Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +130,15 @@ pub fn set_enabled(
     id: &str,
     enabled: bool,
 ) -> Result<Vec<AgentInjectionResult>> {
+    set_enabled_with_discovered_models(config, id, enabled, None)
+}
+
+pub fn set_enabled_with_discovered_models(
+    config: &mut AppConfig,
+    id: &str,
+    enabled: bool,
+    discovered_models: Option<&[Value]>,
+) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
     let Some(index) = config
         .agent_injections
@@ -158,7 +171,7 @@ pub fn set_enabled(
         let item = &mut config.agent_injections[index];
         item.enabled = enabled;
     }
-    match apply_one_by_id(config, id) {
+    match apply_one_by_id_with_discovered_models(config, id, discovered_models) {
         Ok(results) => Ok(results),
         Err(err) => {
             config.agent_injections[index] = previous;
@@ -167,6 +180,14 @@ pub fn set_enabled(
     }
 }
 pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInjectionResult>> {
+    apply_one_by_id_with_discovered_models(config, id, None)
+}
+
+pub fn apply_one_by_id_with_discovered_models(
+    config: &mut AppConfig,
+    id: &str,
+    discovered_models: Option<&[Value]>,
+) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
     let Some(index) = config
         .agent_injections
@@ -176,7 +197,8 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
         return Err(anyhow!("agent injection {id} was not found"));
     };
     ensure_agent_route_is_ready(config, &config.agent_injections[index])?;
-    let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
+    let mut context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
+    context.discovered_codex_models = discovered_models.map(<[Value]>::to_vec);
     let result = apply_item(&config.agent_injections[index], &context)?;
     {
         let item = &mut config.agent_injections[index];
@@ -191,6 +213,13 @@ pub fn apply_one_by_id(config: &mut AppConfig, id: &str) -> Result<Vec<AgentInje
 }
 
 pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>> {
+    apply_enabled_with_discovered_models(config, None)
+}
+
+pub fn apply_enabled_with_discovered_models(
+    config: &mut AppConfig,
+    discovered_models: Option<&[Value]>,
+) -> Result<Vec<AgentInjectionResult>> {
     ensure_defaults(config);
     let before = config.clone();
     let ids = config
@@ -212,7 +241,9 @@ pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>
             config.agent_injections[index].last_status = Some(format!("未应用本地注入：{error}"));
             continue;
         }
-        let context = InjectionContext::from_config(config, Some(&config.agent_injections[index]));
+        let mut context =
+            InjectionContext::from_config(config, Some(&config.agent_injections[index]));
+        context.discovered_codex_models = discovered_models.map(<[Value]>::to_vec);
         let result = match apply_item(&config.agent_injections[index], &context) {
             Ok(result) => result,
             Err(error) => {
@@ -225,8 +256,10 @@ pub fn apply_enabled(config: &mut AppConfig) -> Result<Vec<AgentInjectionResult>
                         .find(|item| item.id == current_item.id)
                     {
                         if previous_item.enabled {
-                            let prior_context =
+                            let mut prior_context =
                                 InjectionContext::from_config(&before, Some(previous_item));
+                            prior_context.discovered_codex_models =
+                                discovered_models.map(<[Value]>::to_vec);
                             let _ = apply_item(previous_item, &prior_context);
                         } else {
                             let _ = remove_item(current_item);
@@ -1213,6 +1246,7 @@ impl InjectionContext {
                 .and_then(|provider| config.auto_compact_token_limit_for_provider(&provider.id)),
             codex_context_settings: config.codex_context_settings.clone(),
             codex_models,
+            discovered_codex_models: None,
         }
     }
 }
@@ -1426,8 +1460,163 @@ fn codex_model_catalog_item(
     })
 }
 
-fn codex_model_catalog_value(context: &InjectionContext) -> Value {
+fn codex_discovered_catalog_item(item: &Value, priority: usize) -> Option<Value> {
+    let id = item
+        .get("id")
+        .or_else(|| item.get("slug"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    if crate::config::codex_native_visible_model(id).is_none() {
+        return None;
+    }
+    let priority = item
+        .get("priority")
+        .and_then(Value::as_u64)
+        .and_then(|priority| usize::try_from(priority).ok())
+        .unwrap_or(priority);
+    let display_name = item
+        .get("display_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(id);
+    let mut supplied_efforts = item
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .map(|levels| {
+            levels
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .filter_map(normalize_reasoning_effort)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if supplied_efforts.is_empty() {
+        supplied_efforts = item
+            .get("supported_reasoning_efforts")
+            .and_then(Value::as_array)
+            .map(|efforts| {
+                efforts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(normalize_reasoning_effort)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+    }
+    // Codex exposes reasoning controls from the selected model's declared
+    // levels. Always keep Atoapi's complete ladder while retaining any extra
+    // levels reported by the upstream. This prevents an upstream that omits
+    // xhigh/max/ultra from silently hiding those choices in Codex.
+    supplied_efforts.extend(
+        CODEX_DEFAULT_REASONING_EFFORTS
+            .iter()
+            .map(|effort| (*effort).to_string()),
+    );
+    let supported_efforts = crate::config::normalize_reasoning_efforts(&supplied_efforts);
+    let supported_levels = supported_efforts
+        .iter()
+        .map(|effort| {
+            json!({
+                "effort": effort,
+                "description": codex_reasoning_description(effort)
+            })
+        })
+        .collect::<Vec<_>>();
+    let default_reasoning_level = item
+        .get("default_reasoning_level")
+        .and_then(Value::as_str)
+        .and_then(normalize_reasoning_effort)
+        .filter(|effort| {
+            supported_efforts
+                .iter()
+                .any(|candidate| candidate == effort)
+        })
+        .unwrap_or_else(|| {
+            if supported_efforts.iter().any(|effort| effort == "high") {
+                "high".to_string()
+            } else {
+                supported_efforts
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "medium".to_string())
+            }
+        });
+    let context_window = item
+        .get("context_window")
+        .and_then(Value::as_u64)
+        .unwrap_or(128_000);
+    let supports_parallel_tool_calls = item
+        .get("supports_parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    Some(json!({
+        "additional_speed_tiers": [],
+        "availability_nux": Value::Null,
+        "base_instructions": CODEX_CHINESE_BASE_INSTRUCTIONS,
+        "context_window": context_window,
+        "default_reasoning_level": default_reasoning_level,
+        "default_reasoning_summary": "none",
+        "description": format!("Atoapi 动态模型 {id}，支持 Atoapi 路由、缓存和多会话隔离。"),
+        "display_name": display_name,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": item
+            .get("input_modalities")
+            .cloned()
+            .unwrap_or_else(|| json!(["text"])),
+        "max_context_window": item
+            .get("max_context_window")
+            .and_then(Value::as_u64)
+            .unwrap_or(context_window),
+        "model_messages": {"instructions_template": CODEX_CHINESE_BASE_INSTRUCTIONS},
+        "prefer_websockets": false,
+        "priority": priority,
+        "service_tiers": [],
+        "shell_type": "shell_command",
+        "slug": id,
+        "support_verbosity": false,
+        "supported_in_api": true,
+        "supported_reasoning_levels": supported_levels,
+        "supports_image_detail_original": false,
+        "supports_parallel_tool_calls": supports_parallel_tool_calls,
+        "supports_reasoning_effort_updates": true,
+        "supports_reasoning_summaries": true,
+        "supports_search_tool": item
+            .get("supports_search_tool")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "truncation_policy": item
+            .get("truncation_policy")
+            .cloned()
+            .unwrap_or_else(|| json!({"limit": 10_000, "mode": "bytes"})),
+        "upgrade": Value::Null,
+        "visibility": "list"
+    }))
+}
+
+fn codex_model_catalog_value(
+    context: &InjectionContext,
+    discovered_models: Option<&[Value]>,
+) -> Value {
     let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    if let Some(discovered_models) = discovered_models {
+        for item in discovered_models {
+            if let Some(catalog_item) = codex_discovered_catalog_item(item, models.len() + 1) {
+                upsert_codex_catalog_model(&mut models, &mut seen, catalog_item);
+            }
+        }
+    }
+    for (id, display_name, priority) in crate::config::CODEX_NATIVE_VISIBLE_MODELS {
+        let model = best_model_match(&context.codex_models, id, true);
+        upsert_codex_catalog_model(
+            &mut models,
+            &mut seen,
+            codex_model_catalog_item(id, display_name, model, priority as usize),
+        );
+    }
     let explicit_aliases = context
         .codex_models
         .iter()
@@ -1435,17 +1624,19 @@ fn codex_model_catalog_value(context: &InjectionContext) -> Value {
         .filter_map(model_request_alias)
         .map(|alias| alias.to_ascii_lowercase())
         .collect::<HashSet<_>>();
-    let mut models = Vec::new();
     for model in context.codex_models.iter().filter(|model| model.enabled) {
         if !explicit_aliases.contains(&model.id.to_ascii_lowercase())
-            && seen.insert(model.id.clone())
+            && crate::config::codex_native_visible_model(&model.id).is_some()
         {
-            models.push(codex_model_catalog_item(
-                &model.id,
-                &model.display_name,
-                Some(model),
-                models.len() + 1,
-            ));
+            let display_name = crate::config::codex_native_visible_model(&model.id)
+                .map(|(_, display_name, _)| display_name)
+                .unwrap_or(&model.display_name);
+            let priority = models.len() + 1;
+            upsert_codex_catalog_model(
+                &mut models,
+                &mut seen,
+                codex_model_catalog_item(&model.id, display_name, Some(model), priority),
+            );
         }
         let mut aliases = Vec::new();
         if let Some(alias) = model_request_alias(model) {
@@ -1455,28 +1646,56 @@ fn codex_model_catalog_value(context: &InjectionContext) -> Value {
             aliases.push(alias);
         }
         for alias in aliases {
-            if seen.insert(alias.clone()) {
-                models.push(codex_model_catalog_item(
-                    &alias,
-                    &crate::config::codex_model_display_name(&alias),
-                    Some(model),
-                    models.len() + 1,
-                ));
-            }
+            let Some((_, display_name, _)) = crate::config::codex_native_visible_model(&alias)
+            else {
+                continue;
+            };
+            let priority = models.len() + 1;
+            upsert_codex_catalog_model(
+                &mut models,
+                &mut seen,
+                codex_model_catalog_item(&alias, display_name, Some(model), priority),
+            );
         }
     }
-    if seen.insert(context.default_model.clone()) {
+    if let Some((id, display_name, _)) =
+        crate::config::codex_native_visible_model(&context.default_model)
+    {
         let model = best_model_match(&context.codex_models, &context.default_model, true);
-        models.push(codex_model_catalog_item(
-            &context.default_model,
-            model
-                .map(|model| model.display_name.as_str())
-                .unwrap_or(&context.default_model),
-            model,
-            models.len() + 1,
-        ));
+        let priority = models.len() + 1;
+        upsert_codex_catalog_model(
+            &mut models,
+            &mut seen,
+            codex_model_catalog_item(id, display_name, model, priority),
+        );
     }
     json!({"models": models})
+}
+
+fn upsert_codex_catalog_model(
+    models: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    mut catalog_item: Value,
+) {
+    let Some(slug) = catalog_item
+        .get("slug")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    if seen.insert(slug.clone()) {
+        models.push(catalog_item);
+    } else if let Some(position) = models.iter().position(|item| {
+        item.get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|candidate| candidate == slug)
+    }) {
+        if let Some(priority) = models[position].get("priority").cloned() {
+            catalog_item["priority"] = priority;
+        }
+        models[position] = catalog_item;
+    }
 }
 
 fn write_codex_model_catalog(
@@ -1487,9 +1706,25 @@ fn write_codex_model_catalog(
         .parent()
         .ok_or_else(|| anyhow!("Codex config target has no parent directory"))?
         .join(CODEX_MODEL_CATALOG_ACTIVE_FILE);
+    // If the selected upstream is temporarily unavailable, retain the last
+    // complete catalog. Explicit mappings are still applied below and replace
+    // same-name entries from that retained catalog.
+    let persisted_models = if context.discovered_codex_models.is_none() {
+        fs::read_to_string(&catalog_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|catalog| catalog.get("models").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let discovered_models = context
+        .discovered_codex_models
+        .as_deref()
+        .or_else(|| (!persisted_models.is_empty()).then_some(persisted_models.as_slice()));
     let rendered = format!(
         "{}\n",
-        serde_json::to_string_pretty(&codex_model_catalog_value(context))?
+        serde_json::to_string_pretty(&codex_model_catalog_value(context, discovered_models))?
     );
     let changed = fs::read_to_string(&catalog_path)
         .map(|current| current != rendered)
@@ -1596,7 +1831,13 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
             ],
         );
     }
-    if context.default_model_is_explicit {
+    let repair_backend_model_id = !context.default_model_is_explicit
+        && crate::config::codex_native_visible_model(&context.default_model).is_some()
+        && doc
+            .get("model")
+            .and_then(|model| model.as_str())
+            .is_none_or(|model| crate::config::codex_native_visible_model(model).is_none());
+    if context.default_model_is_explicit || repair_backend_model_id {
         doc["model"] = value(context.default_model.as_str());
         if let Some(context_window) = context.model_context_window.filter(|value| *value > 0) {
             doc["model_context_window"] = value(i64::from(context_window));
@@ -2552,6 +2793,7 @@ command = "npx"
                 supports_streaming: true,
                 enabled: true,
             }],
+            discovered_codex_models: None,
         };
 
         assert!(write_codex_config(&path, &context).unwrap());
@@ -2625,6 +2867,7 @@ command = "npx"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
 
         write_codex_config(&path, &context).unwrap();
@@ -2670,12 +2913,13 @@ wire_api = "responses"
             codex_base_url: "http://127.0.0.1:18883/codex/v1".to_string(),
             local_key: "ato-competing-catalog".to_string(),
             default_channel: "responses".to_string(),
-            default_model: "deepseek-v4.1-flash".to_string(),
+            default_model: "gpt-6.1-sol".to_string(),
             default_model_is_explicit: true,
             model_context_window: None,
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
 
         write_codex_config(&path, &context).unwrap();
@@ -2694,7 +2938,7 @@ wire_api = "responses"
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["slug"].as_str() == Some("deepseek-v4.1-flash"))
+            .find(|item| item["slug"].as_str() == Some("gpt-6.1-sol"))
             .unwrap();
         let efforts = model["supported_reasoning_levels"]
             .as_array()
@@ -2778,6 +3022,7 @@ base_url = "http://127.0.0.1:18883/codex/v1"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
 
         write_codex_config(&path, &context).unwrap();
@@ -2908,6 +3153,7 @@ command = "npx"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
         write_codex_config(&path, &context).unwrap();
         let managed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
@@ -3400,6 +3646,7 @@ model_reasoning_effort = "max"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
 
         write_proxy_mode_profile(&path, &context).unwrap();
@@ -3770,6 +4017,7 @@ model_reasoning_effort = "max"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         };
 
         write_claude_code_settings(&path, &context).unwrap();
@@ -4021,6 +4269,111 @@ model_reasoning_effort = "max"
         fs::remove_dir_all(dir).ok();
     }
 
+    #[test]
+    fn codex_injection_replaces_a_backend_model_id_with_its_request_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "atoapi-codex-model-alias-{}",
+            Uuid::new_v4().simple()
+        ));
+        let path = dir.join("config.toml");
+        write_text(&path, "model = \"deepseek-v4.1-flash\"\n").unwrap();
+        let mut context = test_context();
+        context.default_model = "gpt-6-sol".to_string();
+        context.default_model_is_explicit = false;
+        context.codex_models = vec![ModelConfig {
+            id: "deepseek-v4.1-flash".to_string(),
+            request_model_id: Some("gpt-6-sol".to_string()),
+            display_name: "DeepSeek V4.1 Flash".to_string(),
+            context_window: Some(272_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
+
+        write_codex_config(&path, &context).unwrap();
+
+        let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["model"].as_str(), Some("gpt-6-sol"));
+        let catalog: Value = serde_json::from_str(
+            &fs::read_to_string(dir.join(CODEX_MODEL_CATALOG_ACTIVE_FILE)).unwrap(),
+        )
+        .unwrap();
+        let selected = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"].as_str() == Some("gpt-6-sol"))
+            .unwrap();
+        assert_eq!(selected["display_name"].as_str(), Some("GPT-6-Sol"));
+        assert!(!catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["slug"].as_str() == Some("deepseek-v4.1-flash")));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn codex_catalog_shows_only_codex_request_models_with_all_reasoning_levels() {
+        let mut context = test_context();
+        context.discovered_codex_models = Some(vec![
+            json!({
+                "id": "gpt-6.1-sol",
+                "display_name": "GPT-6.1-Sol",
+                "supported_reasoning_efforts": ["low"]
+            }),
+            json!({
+                "id": "gpt-6.1-luna",
+                "display_name": "GPT-6.1-Luna",
+                "supported_reasoning_levels": [{"effort": "medium"}]
+            }),
+            json!({
+                "id": "gpt-5.6-luna",
+                "display_name": "GPT-5.6-Luna"
+            }),
+            json!({
+                "id": "deepseek-v4.1-flash",
+                "display_name": "DeepSeek V4.1 Flash"
+            }),
+        ]);
+
+        let catalog =
+            codex_model_catalog_value(&context, context.discovered_codex_models.as_deref());
+        let models = catalog["models"].as_array().unwrap();
+        let slugs = models
+            .iter()
+            .filter_map(|model| model["slug"].as_str())
+            .collect::<Vec<_>>();
+
+        assert!(slugs.contains(&"gpt-6.1-sol"));
+        assert!(slugs.contains(&"gpt-5.6-luna"));
+        assert!(!slugs.contains(&"gpt-6.1-luna"));
+        assert!(!slugs.contains(&"deepseek-v4.1-flash"));
+        assert_eq!(
+            slugs.len(),
+            crate::config::CODEX_NATIVE_VISIBLE_MODELS.len()
+        );
+        for (slug, _, _) in crate::config::CODEX_NATIVE_VISIBLE_MODELS {
+            let model = models
+                .iter()
+                .find(|model| model["slug"].as_str() == Some(slug))
+                .unwrap();
+            let efforts = model["supported_reasoning_levels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|level| level["effort"].as_str())
+                .collect::<Vec<_>>();
+            for effort in CODEX_DEFAULT_REASONING_EFFORTS {
+                assert!(efforts.contains(&effort));
+            }
+        }
+    }
+
     fn test_context() -> InjectionContext {
         InjectionContext {
             anthropic_base_url: "http://127.0.0.1:18883".to_string(),
@@ -4034,6 +4387,7 @@ model_reasoning_effort = "max"
             auto_compact_token_limit: None,
             codex_context_settings: None,
             codex_models: Vec::new(),
+            discovered_codex_models: None,
         }
     }
 }

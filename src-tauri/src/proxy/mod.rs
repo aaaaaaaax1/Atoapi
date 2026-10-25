@@ -1841,12 +1841,10 @@ async fn list_models_for_agent(
 
         // Only the explicit Codex route gets dynamic discovery. Other local
         // agent endpoints retain their configured catalog behavior.
-        let discovery_plan = (forced_agent_id == Some("codex")
-            && authorized_agent.as_deref() == Some("codex"))
-        .then(|| {
-            authorized_agent_config.and_then(|agent| codex_model_discovery_plan(&config, agent))
-        })
-        .flatten();
+        // Codex's picker is the native visible catalog embedded in the client.
+        // Upstream discovery is used for request routing, never to replace that
+        // picker with provider-specific backend names.
+        let discovery_plan: Option<CodexModelDiscoveryPlan> = None;
         (data, discovery_plan)
     };
 
@@ -1854,6 +1852,9 @@ async fn list_models_for_agent(
         if let Ok(upstream_models) = discover_codex_provider_models(&state, &plan).await {
             data = merge_model_list_items(upstream_models, data);
         }
+    }
+    if forced_agent_id == Some("codex") {
+        data = complete_native_codex_model_items(data);
     }
     Json(model_list_payload(data, forced_agent_id == Some("codex"))).into_response()
 }
@@ -1873,6 +1874,7 @@ fn model_list_payload(data: Vec<Value>, include_codex_catalog: bool) -> Value {
 
 const CODEX_DEFAULT_REASONING_EFFORTS: [&str; 6] =
     ["low", "medium", "high", "xhigh", "max", "ultra"];
+const CODEX_CHINESE_BASE_INSTRUCTIONS: &str = "你是 Codex，一个编码代理。你与用户共享同一个工作区，并持续协作，直到用户的意图被完整、可核验地处理完毕。请使用中文思考和回复；代码、命令、路径、协议字段和上游原文可以保持原样。";
 
 fn codex_reasoning_level_description(effort: &str) -> &'static str {
     match effort {
@@ -2049,6 +2051,9 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())?;
+            if crate::config::codex_native_visible_model(id).is_none() {
+                return None;
+            }
             seen.insert(id.to_string()).then_some((id, item))
         })
         .enumerate()
@@ -2059,31 +2064,32 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or(id);
-            let supported_levels = item
+            let mut efforts = item
                 .get("supported_reasoning_levels")
                 .and_then(Value::as_array)
-                .filter(|levels| !levels.is_empty())
-                .cloned()
-                .unwrap_or_else(|| {
-                    let efforts = item
-                        .get("supported_reasoning_efforts")
-                        .and_then(Value::as_array)
-                        .map(|efforts| {
-                            efforts
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .filter_map(normalize_reasoning_effort)
-                                .collect::<Vec<_>>()
-                        })
-                        .filter(|efforts| !efforts.is_empty())
-                        .unwrap_or_else(|| {
-                            CODEX_DEFAULT_REASONING_EFFORTS
-                                .iter()
-                                .map(|effort| (*effort).to_string())
-                                .collect()
-                        });
-                    codex_reasoning_levels_for_efforts(&efforts)
-                });
+                .map(|levels| {
+                    levels
+                        .iter()
+                        .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                        .filter_map(normalize_reasoning_effort)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            efforts.extend(
+                item.get("supported_reasoning_efforts")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .filter_map(normalize_reasoning_effort),
+            );
+            efforts.extend(
+                CODEX_DEFAULT_REASONING_EFFORTS
+                    .iter()
+                    .map(|effort| (*effort).to_string()),
+            );
+            let supported_efforts = crate::config::normalize_reasoning_efforts(&efforts);
+            let supported_levels = codex_reasoning_levels_for_efforts(&supported_efforts);
             let supported_efforts = supported_levels
                 .iter()
                 .filter_map(|level| level.get("effort").and_then(Value::as_str))
@@ -2092,12 +2098,19 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
             let default_reasoning_level = item
                 .get("default_reasoning_level")
                 .and_then(Value::as_str)
-                .filter(|effort| supported_efforts.iter().any(|candidate| candidate == effort))
+                .filter(|effort| {
+                    supported_efforts
+                        .iter()
+                        .any(|candidate| candidate == effort)
+                })
                 .unwrap_or_else(|| {
                     if supported_efforts.iter().any(|effort| effort == "high") {
                         "high"
                     } else {
-                        supported_efforts.first().map(String::as_str).unwrap_or("medium")
+                        supported_efforts
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("medium")
                     }
                 });
             let context_window = item
@@ -2107,7 +2120,7 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
             json!({
                 "additional_speed_tiers": [],
                 "availability_nux": Value::Null,
-                "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+                "base_instructions": CODEX_CHINESE_BASE_INSTRUCTIONS,
                 "context_window": context_window,
                 "default_reasoning_level": default_reasoning_level,
                 "default_reasoning_summary": "none",
@@ -2117,6 +2130,7 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
                 "experimental_supported_tools": [],
                 "input_modalities": ["text"],
                 "max_context_window": context_window,
+                "model_messages": {"instructions_template": CODEX_CHINESE_BASE_INSTRUCTIONS},
                 "priority": index + 1,
                 "service_tiers": [],
                 "shell_type": "shell_command",
@@ -2168,6 +2182,48 @@ fn codex_model_discovery_plan(
         provider,
         selected_key,
     })
+}
+
+fn merged_codex_agent_model_items(
+    agent: &AgentInjectionConfig,
+    provider: &ProviderConfig,
+    discovered_models: Option<Vec<Value>>,
+) -> Vec<Value> {
+    let configured_models = provider_model_list_items(provider, true, agent.model_id.as_deref());
+    let merged = match discovered_models {
+        Some(upstream_models) => merge_model_list_items(upstream_models, configured_models),
+        None => configured_models,
+    };
+    complete_native_codex_model_items(merged)
+}
+
+/// Return the authoritative model surface for Codex's currently selected
+/// upstream. The result is limited to that one provider, discovers the real
+/// upstream catalog, and lets explicit Atoapi mappings replace same-name
+/// canonical entries. Fallback providers do not contribute picker entries.
+pub(crate) async fn codex_injection_model_items(
+    state: &AppState,
+    config: &AppConfig,
+) -> Result<Vec<Value>> {
+    let agent = config
+        .agent_injections
+        .iter()
+        .find(|agent| agent.id == "codex")
+        .ok_or_else(|| anyhow!("Codex agent injection is not configured"))?;
+    let provider_id = agent
+        .provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| anyhow!("Codex has no selected upstream"))?;
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id && provider.enabled)
+        .ok_or_else(|| anyhow!("selected Codex upstream is not available"))?;
+
+    let _ = state;
+    Ok(merged_codex_agent_model_items(agent, provider, None))
 }
 
 async fn discover_codex_provider_models(
@@ -2363,6 +2419,50 @@ fn merge_model_list_items(primary: Vec<Value>, secondary: Vec<Value>) -> Vec<Val
         }
     }
     items
+}
+
+fn native_codex_model_items() -> Vec<Value> {
+    crate::config::CODEX_NATIVE_VISIBLE_MODELS
+        .iter()
+        .map(|(id, display_name, priority)| {
+            let supported_efforts = CODEX_DEFAULT_REASONING_EFFORTS
+                .iter()
+                .map(|effort| (*effort).to_string())
+                .collect::<Vec<_>>();
+            json!({
+                "id": id,
+                "object": "model",
+                "owned_by": "Codex",
+                "provider": "codex-native",
+                "context_window": 272_000,
+                "display_name": display_name,
+                "default_reasoning_level": "high",
+                "priority": priority,
+                "supported_reasoning_efforts": supported_efforts.clone(),
+                "supported_reasoning_levels": codex_reasoning_levels_for_efforts(
+                    &supported_efforts,
+                )
+            })
+        })
+        .collect()
+}
+
+fn complete_native_codex_model_items(configured_items: Vec<Value>) -> Vec<Value> {
+    codex_model_items_only(merge_model_list_items(
+        native_codex_model_items(),
+        configured_items,
+    ))
+}
+
+fn codex_model_items_only(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter(|item| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| crate::config::codex_native_visible_model(id).is_some())
+        })
+        .collect()
 }
 
 fn codex_model_discovery_cache_key(plan: &CodexModelDiscoveryPlan) -> String {
@@ -16079,8 +16179,9 @@ fn decide_route_with_runtime_model_for_session(
 }
 
 fn is_codex_internal_auxiliary_model(model: &str) -> bool {
-    let model = model.trim();
-    model.eq_ignore_ascii_case("codex-auto-review") || model.eq_ignore_ascii_case("gpt-6.1-luna")
+    let model = model.trim().to_ascii_lowercase();
+    model == "codex-auto-review"
+        || (model.starts_with("gpt-") && model.split('-').any(|part| part == "luna"))
 }
 
 fn codex_primary_route_model(request: &Value) -> Option<String> {
@@ -32250,14 +32351,14 @@ mod tests {
 
         let decision = decide_route_with_runtime_model(
             &config,
-            &json!({ "model": "gpt-5.6-luna", "input": "continue" }),
+            &json!({ "model": "gpt-5.6-terra", "input": "continue" }),
             &Channel::Responses,
             Some("codex"),
             Some("gpt-5.6-sol"),
         )
         .unwrap();
 
-        assert_eq!(decision.model, "gpt-5.6-luna");
+        assert_eq!(decision.model, "gpt-5.6-terra");
     }
     #[test]
     fn requested_model_provider_wins_when_active_provider_lacks_model() {
@@ -32360,6 +32461,35 @@ mod tests {
     }
 
     #[test]
+    fn codex_picker_keeps_mapping_aliases_and_hides_backend_model_ids() {
+        let mut provider = test_responses_provider("https://mapped.example/v1".to_string());
+        provider.models = vec![
+            test_model("gpt-6-sol", None),
+            test_model("deepseek-v4.1-flash", Some("gpt-6.1-sol")),
+        ];
+
+        let items =
+            complete_native_codex_model_items(provider_model_list_items(&provider, true, None));
+        let ids = items
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), crate::config::CODEX_NATIVE_VISIBLE_MODELS.len());
+        assert!(ids.contains(&"gpt-6-sol"));
+        assert!(ids.contains(&"gpt-6.1-sol"));
+        assert!(!ids.contains(&"deepseek-v4.1-flash"));
+        let mapped = items
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some("gpt-6.1-sol"))
+            .unwrap();
+        assert_eq!(
+            mapped.get("canonical_id").and_then(Value::as_str),
+            Some("deepseek-v4.1-flash")
+        );
+    }
+
+    #[test]
     fn codex_model_list_payload_contains_standard_and_catalog_views() {
         let mut provider = test_responses_provider("https://mapped.example/v1".to_string());
         provider.models = vec![test_model("deepseek-v4.1-flash", Some("gpt-6.1-sol"))];
@@ -32412,7 +32542,7 @@ mod tests {
 
     #[test]
     fn codex_catalog_respects_explicit_model_reasoning_capabilities() {
-        let mut model = test_model("vendor/reasoning-model", Some("reasoning-model"));
+        let mut model = test_model("vendor/reasoning-model", Some("gpt-5.6-terra"));
         model.supported_reasoning_efforts =
             vec!["medium".to_string(), "high".to_string(), "max".to_string()];
         model.reasoning_effort_override_enabled = true;
@@ -32426,7 +32556,7 @@ mod tests {
         let catalog = codex_model_catalog_items(&items);
         let mapped = catalog
             .iter()
-            .find(|item| item.get("slug").and_then(Value::as_str) == Some("reasoning-model"))
+            .find(|item| item.get("slug").and_then(Value::as_str) == Some("gpt-5.6-terra"))
             .expect("request alias must be present");
         let efforts = mapped
             .get("supported_reasoning_levels")
@@ -32436,7 +32566,10 @@ mod tests {
             .filter_map(|level| level.get("effort").and_then(Value::as_str))
             .collect::<Vec<_>>();
 
-        assert_eq!(efforts, vec!["medium", "high", "max"]);
+        assert_eq!(
+            efforts,
+            vec!["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
         assert_eq!(
             mapped
                 .get("default_reasoning_level")
@@ -32553,7 +32686,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scoped_agent_model_list_keeps_local_models_when_codex_discovery_fails() {
+    async fn codex_model_list_uses_native_catalog_without_upstream_discovery() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let upstream_hits_for_route = upstream_hits.clone();
         let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -32638,8 +32771,8 @@ mod tests {
 
         assert_eq!(
             upstream_hits.load(Ordering::SeqCst),
-            1,
-            "only the explicit Codex route should attempt dynamic model discovery"
+            0,
+            "the Codex picker must come from its native catalog, not upstream discovery"
         );
         server.abort();
         upstream_server.abort();
@@ -32664,7 +32797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_model_list_merges_upstream_models_and_reuses_the_short_ttl_catalog() {
+    async fn codex_model_list_ignores_upstream_backend_catalog() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));
         let upstream_hits_for_route = upstream_hits.clone();
         let authorizations = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
@@ -32781,22 +32914,16 @@ mod tests {
                 .filter_map(|model| model.get("id").and_then(Value::as_str))
                 .collect::<Vec<_>>();
             assert!(ids.contains(&"gpt-6-astra"));
-            assert!(ids.contains(&"gpt-configured-local"));
-            assert!(ids.contains(&"gpt-configured-agent"));
-            assert_eq!(
-                ids.iter().filter(|id| **id == "gpt-shared").count(),
-                1,
-                "upstream and configured copies of the same model must merge"
-            );
+            assert!(ids.contains(&"gpt-6.1-sol"));
+            assert_eq!(ids.len(), crate::config::CODEX_NATIVE_VISIBLE_MODELS.len());
+            assert!(!ids.contains(&"gpt-configured-local"));
+            assert!(!ids.contains(&"gpt-configured-agent"));
+            assert!(!ids.contains(&"gpt-shared"));
             assert!(!ids.contains(&"gpt-5.2"));
         }
 
-        assert_eq!(upstream_hits.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            authorizations.lock().await.as_slice(),
-            ["Bearer upstream-model-key"],
-            "dynamic discovery must use the selected provider Key"
-        );
+        assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
+        assert!(authorizations.lock().await.is_empty());
 
         proxy_server.abort();
         upstream_server.abort();

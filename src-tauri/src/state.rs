@@ -1020,11 +1020,28 @@ impl AppState {
     }
 
     pub async fn apply_enabled_agent_injections_on_startup(&self) -> Result<()> {
+        let config_snapshot = self.config.read().await.clone();
+        let discovered_codex_models = if config_snapshot.agent_injections.iter().any(|item| {
+            item.id == "codex" && item.enabled && item.kind == AgentInjectionKind::Codex
+        }) {
+            proxy::codex_injection_model_items(self, &config_snapshot)
+                .await
+                .ok()
+        } else {
+            None
+        };
         let mut config = self.config.write().await;
         let has_enabled_agent = config.agent_injections.iter().any(|item| item.enabled);
         if has_enabled_agent {
             let before = toml::to_string(&*config)?;
-            agent_injection::apply_enabled(&mut config)?;
+            if let Some(discovered_models) = discovered_codex_models.as_deref() {
+                agent_injection::apply_enabled_with_discovered_models(
+                    &mut config,
+                    Some(discovered_models),
+                )?;
+            } else {
+                agent_injection::apply_enabled(&mut config)?;
+            }
             // An already-current Codex injection must not churn Atoapi's
             // persisted status on every launch.  More importantly, this
             // makes the startup reconciler a true no-op after the target
@@ -1045,15 +1062,50 @@ impl AppState {
     }
 
     pub async fn refresh_enabled_codex_injection(&self) -> Result<bool> {
-        let mut config = self.config.write().await;
-        let codex_enabled = config.agent_injections.iter().any(|item| {
-            item.id == "codex" && item.enabled && item.kind == AgentInjectionKind::Codex
-        });
+        let (codex_enabled, selected_provider_id, selected_model_id) = {
+            let config = self.config.read().await;
+            let codex = config.agent_injections.iter().find(|item| {
+                item.id == "codex" && item.enabled && item.kind == AgentInjectionKind::Codex
+            });
+            (
+                codex.is_some(),
+                codex.and_then(|item| item.provider_id.clone()),
+                codex.and_then(|item| item.model_id.clone()),
+            )
+        };
         if !codex_enabled {
             return Ok(false);
         }
+
+        // Upstream model discovery can take several seconds. Never hold the
+        // global config write lock across that network wait: proxy requests and
+        // the desktop UI must continue reading the current configuration.
+        let config_snapshot = self.config.read().await.clone();
+        let discovered_codex_models = proxy::codex_injection_model_items(self, &config_snapshot)
+            .await
+            .ok();
+
+        let mut config = self.config.write().await;
+        let selected_route_unchanged = config.agent_injections.iter().any(|item| {
+            item.id == "codex"
+                && item.enabled
+                && item.kind == AgentInjectionKind::Codex
+                && item.provider_id == selected_provider_id
+                && item.model_id == selected_model_id
+        });
+        if !selected_route_unchanged {
+            return Ok(false);
+        }
         let before = toml::to_string(&*config)?;
-        let results = agent_injection::apply_one_by_id(&mut config, "codex")?;
+        let results = if let Some(discovered_models) = discovered_codex_models.as_deref() {
+            agent_injection::apply_one_by_id_with_discovered_models(
+                &mut config,
+                "codex",
+                Some(discovered_models),
+            )?
+        } else {
+            agent_injection::apply_one_by_id(&mut config, "codex")?
+        };
         if toml::to_string(&*config)? != before {
             config.updated_at = Utc::now();
             self.persist_config_snapshot(&config).await?;

@@ -3967,9 +3967,21 @@ pub async fn set_agent_injection_enabled(
     let enabled = input.enabled;
     let agent_id = input.id.clone();
     let previous = state.config.read().await.clone();
+    let discovered_codex_models = if agent_id == "codex" && enabled {
+        proxy::codex_injection_model_items(&state, &previous)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let mut committed = previous.clone();
-    let mut results = agent_injection::set_enabled(&mut committed, &input.id, input.enabled)
-        .map_err(to_command_error)?;
+    let mut results = agent_injection::set_enabled_with_discovered_models(
+        &mut committed,
+        &input.id,
+        input.enabled,
+        discovered_codex_models.as_deref(),
+    )
+    .map_err(to_command_error)?;
     committed.updated_at = Utc::now();
     if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
         let restore_error = restore_agent_injection_artifacts(&previous, &committed, &agent_id);
@@ -4036,9 +4048,24 @@ pub async fn apply_agent_injection(
     id: String,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
     let previous = state.config.read().await.clone();
+    let discovered_codex_models = if id == "codex" {
+        proxy::codex_injection_model_items(&state, &previous)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let mut committed = previous.clone();
-    let results =
-        agent_injection::apply_one_by_id(&mut committed, &id).map_err(to_command_error)?;
+    let results = if let Some(discovered_models) = discovered_codex_models.as_deref() {
+        agent_injection::apply_one_by_id_with_discovered_models(
+            &mut committed,
+            &id,
+            Some(discovered_models),
+        )
+        .map_err(to_command_error)?
+    } else {
+        agent_injection::apply_one_by_id(&mut committed, &id).map_err(to_command_error)?
+    };
     committed.updated_at = Utc::now();
     if let Err(commit_error) = state.commit_config_snapshot(committed.clone()).await {
         let restore_error = restore_agent_injection_artifacts(&previous, &committed, &id);
@@ -4091,9 +4118,28 @@ pub async fn apply_agent_injection(
 pub async fn apply_enabled_agent_injections(
     state: State<'_, Arc<AppState>>,
 ) -> CommandResult<Vec<AgentInjectionResult>> {
+    let config_snapshot = state.config.read().await.clone();
+    let codex_enabled = config_snapshot.agent_injections.iter().any(|item| {
+        item.id == "codex" && item.enabled && item.kind == crate::config::AgentInjectionKind::Codex
+    });
+    let discovered_codex_models = if codex_enabled {
+        proxy::codex_injection_model_items(&state, &config_snapshot)
+            .await
+            .ok()
+    } else {
+        None
+    };
     let (results, version) = {
         let mut config = state.config.write().await;
-        let results = agent_injection::apply_enabled(&mut config).map_err(to_command_error)?;
+        let results = if let Some(discovered_models) = discovered_codex_models.as_deref() {
+            agent_injection::apply_enabled_with_discovered_models(
+                &mut config,
+                Some(discovered_models),
+            )
+            .map_err(to_command_error)?
+        } else {
+            agent_injection::apply_enabled(&mut config).map_err(to_command_error)?
+        };
         config.updated_at = Utc::now();
         let version = state
             .publish_config_snapshot(&config)
