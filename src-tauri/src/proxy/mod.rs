@@ -1855,8 +1855,89 @@ async fn list_models_for_agent(
             data = merge_model_list_items(upstream_models, data);
         }
     }
-    Json(json!({ "object": "list", "data": data })).into_response()
+    Json(model_list_payload(data, forced_agent_id == Some("codex"))).into_response()
 }
+
+fn model_list_payload(data: Vec<Value>, include_codex_catalog: bool) -> Value {
+    let mut payload = json!({ "object": "list", "data": data });
+    if include_codex_catalog {
+        let codex_models = codex_model_catalog_items(
+            payload["data"]
+                .as_array()
+                .expect("model list data must remain an array"),
+        );
+        payload["models"] = Value::Array(codex_models);
+    }
+    payload
+}
+
+const CODEX_DEFAULT_REASONING_EFFORTS: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+fn codex_reasoning_level_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Maximum reasoning with automatic task delegation",
+        _ => "Model-supported reasoning effort",
+    }
+}
+
+fn codex_reasoning_levels_for_efforts(efforts: &[String]) -> Vec<Value> {
+    efforts
+        .iter()
+        .map(|effort| {
+            json!({
+                "effort": effort,
+                "description": codex_reasoning_level_description(effort)
+            })
+        })
+        .collect()
+}
+
+fn model_codex_reasoning_efforts(model: &ModelConfig) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let configured = model
+        .supported_reasoning_efforts
+        .iter()
+        .filter_map(|effort| normalize_reasoning_effort(effort))
+        .filter(|effort| seen.insert(effort.clone()))
+        .collect::<Vec<_>>();
+    if configured.is_empty() {
+        CODEX_DEFAULT_REASONING_EFFORTS
+            .iter()
+            .map(|effort| (*effort).to_string())
+            .collect()
+    } else {
+        configured
+    }
+}
+
+fn model_codex_default_reasoning_level(model: &ModelConfig, supported: &[String]) -> String {
+    if model.reasoning_effort_override_enabled {
+        if let Some(configured) = model
+            .reasoning_effort
+            .as_deref()
+            .and_then(normalize_reasoning_effort)
+            .filter(|effort| supported.iter().any(|candidate| candidate == effort))
+        {
+            return configured;
+        }
+    }
+    for preferred in ["high", "medium", "low"] {
+        if supported.iter().any(|effort| effort == preferred) {
+            return preferred.to_string();
+        }
+    }
+    supported
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "medium".to_string())
+}
+
 fn provider_model_list_items(
     provider: &ProviderConfig,
     include_codex_aliases: bool,
@@ -1879,13 +1960,22 @@ fn provider_model_list_items(
             continue;
         }
         if seen_ids.insert(model.id.clone()) {
+            let supported_reasoning_efforts = model_codex_reasoning_efforts(model);
             items.push(json!({
                 "id": model.id,
                 "object": "model",
                 "owned_by": provider.name,
                 "provider": provider.id,
                 "context_window": model.context_window,
-                "display_name": model.display_name
+                "display_name": model.display_name,
+                "default_reasoning_level": model_codex_default_reasoning_level(
+                    model,
+                    &supported_reasoning_efforts,
+                ),
+                "supported_reasoning_efforts": supported_reasoning_efforts.clone(),
+                "supported_reasoning_levels": codex_reasoning_levels_for_efforts(
+                    &supported_reasoning_efforts,
+                )
             }));
         }
         if include_codex_aliases {
@@ -1900,6 +1990,7 @@ fn provider_model_list_items(
                 if !seen_ids.insert(alias.clone()) {
                     continue;
                 }
+                let supported_reasoning_efforts = model_codex_reasoning_efforts(model);
                 items.push(json!({
                     "id": alias,
                     "object": "model",
@@ -1907,7 +1998,15 @@ fn provider_model_list_items(
                     "provider": provider.id,
                     "context_window": model.context_window,
                     "display_name": codex_model_display_name(&alias),
-                    "canonical_id": model.id
+                    "canonical_id": model.id,
+                    "default_reasoning_level": model_codex_default_reasoning_level(
+                        model,
+                        &supported_reasoning_efforts,
+                    ),
+                    "supported_reasoning_efforts": supported_reasoning_efforts.clone(),
+                    "supported_reasoning_levels": codex_reasoning_levels_for_efforts(
+                        &supported_reasoning_efforts,
+                    )
                 }));
             }
         }
@@ -1918,17 +2017,123 @@ fn provider_model_list_items(
     {
         let model_id = model_id.to_string();
         if seen_ids.insert(model_id.clone()) {
+            let supported_reasoning_efforts = CODEX_DEFAULT_REASONING_EFFORTS
+                .iter()
+                .map(|effort| (*effort).to_string())
+                .collect::<Vec<_>>();
             items.push(json!({
                 "id": model_id,
                 "object": "model",
                 "owned_by": provider.name,
                 "provider": provider.id,
                 "display_name": model_id,
-                "atoapi_configured_agent_model": true
+                "atoapi_configured_agent_model": true,
+                "default_reasoning_level": "high",
+                "supported_reasoning_efforts": supported_reasoning_efforts.clone(),
+                "supported_reasoning_levels": codex_reasoning_levels_for_efforts(
+                    &supported_reasoning_efforts,
+                )
             }));
         }
     }
     items
+}
+
+fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    items
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())?;
+            seen.insert(id.to_string()).then_some((id, item))
+        })
+        .enumerate()
+        .map(|(index, (id, item))| {
+            let display_name = item
+                .get("display_name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(id);
+            let supported_levels = item
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .filter(|levels| !levels.is_empty())
+                .cloned()
+                .unwrap_or_else(|| {
+                    let efforts = item
+                        .get("supported_reasoning_efforts")
+                        .and_then(Value::as_array)
+                        .map(|efforts| {
+                            efforts
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .filter_map(normalize_reasoning_effort)
+                                .collect::<Vec<_>>()
+                        })
+                        .filter(|efforts| !efforts.is_empty())
+                        .unwrap_or_else(|| {
+                            CODEX_DEFAULT_REASONING_EFFORTS
+                                .iter()
+                                .map(|effort| (*effort).to_string())
+                                .collect()
+                        });
+                    codex_reasoning_levels_for_efforts(&efforts)
+                });
+            let supported_efforts = supported_levels
+                .iter()
+                .filter_map(|level| level.get("effort").and_then(Value::as_str))
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            let default_reasoning_level = item
+                .get("default_reasoning_level")
+                .and_then(Value::as_str)
+                .filter(|effort| supported_efforts.iter().any(|candidate| candidate == effort))
+                .unwrap_or_else(|| {
+                    if supported_efforts.iter().any(|effort| effort == "high") {
+                        "high"
+                    } else {
+                        supported_efforts.first().map(String::as_str).unwrap_or("medium")
+                    }
+                });
+            let context_window = item
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .unwrap_or(128_000);
+            json!({
+                "additional_speed_tiers": [],
+                "availability_nux": Value::Null,
+                "base_instructions": "You are Codex, a coding agent. You and the user share the same workspace and collaborate to achieve the user's goals.",
+                "context_window": context_window,
+                "default_reasoning_level": default_reasoning_level,
+                "default_reasoning_summary": "none",
+                "description": display_name,
+                "display_name": display_name,
+                "effective_context_window_percent": 95,
+                "experimental_supported_tools": [],
+                "input_modalities": ["text"],
+                "max_context_window": context_window,
+                "priority": index + 1,
+                "service_tiers": [],
+                "shell_type": "shell_command",
+                "slug": id,
+                "support_verbosity": false,
+                "supported_in_api": true,
+                "supported_reasoning_levels": supported_levels,
+                "supports_image_detail_original": false,
+                "supports_parallel_tool_calls": true,
+                "supports_reasoning_summaries": true,
+                "supports_search_tool": false,
+                "truncation_policy": {"limit": 10_000, "mode": "bytes"},
+                "upgrade": Value::Null,
+                "visibility": "list"
+            })
+        })
+        .collect()
 }
 
 fn codex_model_discovery_plan(
@@ -32151,6 +32356,92 @@ mod tests {
         assert_eq!(
             sol.get("canonical_id").and_then(Value::as_str),
             Some("deepseek-v4.1-flash")
+        );
+    }
+
+    #[test]
+    fn codex_model_list_payload_contains_standard_and_catalog_views() {
+        let mut provider = test_responses_provider("https://mapped.example/v1".to_string());
+        provider.models = vec![test_model("deepseek-v4.1-flash", Some("gpt-6.1-sol"))];
+        let payload = model_list_payload(provider_model_list_items(&provider, true, None), true);
+        let mapped = payload["models"]
+            .as_array()
+            .expect("Codex catalog view must be present")
+            .iter()
+            .find(|item| item.get("slug").and_then(Value::as_str) == Some("gpt-6.1-sol"))
+            .expect("mapped Codex model must be present");
+        let efforts = mapped["supported_reasoning_levels"]
+            .as_array()
+            .expect("reasoning levels must be present")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(payload["data"].is_array());
+        assert!(efforts.contains(&"max"));
+        assert!(efforts.contains(&"ultra"));
+    }
+
+    #[test]
+    fn codex_catalog_exposes_max_and_ultra_for_mapped_models() {
+        let mut provider = test_responses_provider("https://mapped.example/v1".to_string());
+        provider.models = vec![test_model("deepseek-v4.1-flash", Some("gpt-6.1-sol"))];
+        let items = provider_model_list_items(&provider, true, None);
+        let catalog = codex_model_catalog_items(&items);
+        let mapped = catalog
+            .iter()
+            .find(|item| item.get("slug").and_then(Value::as_str) == Some("gpt-6.1-sol"))
+            .expect("mapped model must be present in the Codex catalog");
+        let efforts = mapped
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("Codex reasoning levels must be present")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert!(efforts.contains(&"xhigh"));
+        assert!(efforts.contains(&"max"));
+        assert!(efforts.contains(&"ultra"));
+        assert_eq!(
+            mapped
+                .get("default_reasoning_level")
+                .and_then(Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn codex_catalog_respects_explicit_model_reasoning_capabilities() {
+        let mut model = test_model("vendor/reasoning-model", Some("reasoning-model"));
+        model.supported_reasoning_efforts =
+            vec!["medium".to_string(), "high".to_string(), "max".to_string()];
+        model.reasoning_effort_override_enabled = true;
+        model.reasoning_effort = Some("max".to_string());
+        let provider = ProviderConfig {
+            models: vec![model],
+            ..test_responses_provider("https://reasoning.example/v1".to_string())
+        };
+
+        let items = provider_model_list_items(&provider, true, None);
+        let catalog = codex_model_catalog_items(&items);
+        let mapped = catalog
+            .iter()
+            .find(|item| item.get("slug").and_then(Value::as_str) == Some("reasoning-model"))
+            .expect("request alias must be present");
+        let efforts = mapped
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .expect("reasoning levels must be present")
+            .iter()
+            .filter_map(|level| level.get("effort").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(efforts, vec!["medium", "high", "max"]);
+        assert_eq!(
+            mapped
+                .get("default_reasoning_level")
+                .and_then(Value::as_str),
+            Some("max")
         );
     }
 
