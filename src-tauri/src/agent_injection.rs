@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     net::IpAddr,
     path::{Component, Path, PathBuf},
@@ -14,13 +14,14 @@ use uuid::Uuid;
 
 use crate::config::{
     app_config_dir, best_model_match, codex_model_alias, model_request_alias,
-    normalize_agent_injections, AgentInjectionConfig, AgentInjectionKind, AppConfig,
-    CodexContextSettings, ModelConfig,
+    normalize_agent_injections, normalize_reasoning_effort, AgentInjectionConfig,
+    AgentInjectionKind, AppConfig, CodexContextSettings, ModelConfig,
 };
 
 const CODEX_PROVIDER_ID: &str = "custom";
 const CODEX_MODEL_CATALOG_LEGACY_FILE: &str = "atoapi-model-catalog.json";
 const CODEX_MODEL_CATALOG_FILE_PREFIX: &str = "atoapi-model-catalog-";
+const CODEX_MODEL_CATALOG_ACTIVE_FILE: &str = "atoapi-model-catalog-active.json";
 const CODEX_RESTORE_STATE_FILE: &str = "atoapi-codex-restore-state.json";
 const CODEX_RESTORE_STATE_VERSION: u32 = 1;
 const CODEX_MANAGED_ROOT_FIELDS: [&str; 8] = [
@@ -758,7 +759,6 @@ fn validate_codex_catalog_path(config_path: &Path, path: &Path) -> Result<PathBu
     Ok(path)
 }
 
-#[cfg(test)]
 fn register_owned_codex_catalog(
     manifest: &mut CodexCatalogManifest,
     config_path: &Path,
@@ -1311,6 +1311,195 @@ fn write_claude_code_settings(path: &Path, context: &InjectionContext) -> Result
     write_json_pretty(path, &value)
 }
 
+const CODEX_DEFAULT_REASONING_EFFORTS: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "max", "ultra"];
+const CODEX_CHINESE_BASE_INSTRUCTIONS: &str = "你是 Codex，一个编码代理。你与用户共享同一个工作区，并持续协作，直到用户的意图被完整、可核验地处理完毕。请使用中文思考和回复；代码、命令、路径、协议字段和上游原文可以保持原样。";
+
+fn codex_reasoning_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "更快响应，适合轻量推理",
+        "medium" => "兼顾速度和推理深度",
+        "high" => "更深入的复杂问题推理",
+        "xhigh" => "面向复杂问题的超高推理",
+        "max" => "面向最难问题的最大推理深度",
+        "ultra" => "最大推理深度，并自动进行任务委派",
+        _ => "模型支持的推理档位",
+    }
+}
+
+fn codex_model_reasoning_efforts(model: Option<&ModelConfig>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let configured = model
+        .map(|model| {
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .filter_map(|effort| normalize_reasoning_effort(effort))
+                .filter(|effort| seen.insert(effort.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if configured.is_empty() {
+        CODEX_DEFAULT_REASONING_EFFORTS
+            .iter()
+            .map(|effort| (*effort).to_string())
+            .collect()
+    } else {
+        configured
+    }
+}
+
+fn codex_model_default_reasoning_level(
+    model: Option<&ModelConfig>,
+    supported: &[String],
+) -> String {
+    if let Some(configured) = model
+        .filter(|model| model.reasoning_effort_override_enabled)
+        .and_then(|model| model.reasoning_effort.as_deref())
+        .and_then(normalize_reasoning_effort)
+        .filter(|effort| supported.iter().any(|candidate| candidate == effort))
+    {
+        return configured;
+    }
+    for preferred in ["high", "medium", "low"] {
+        if supported.iter().any(|effort| effort == preferred) {
+            return preferred.to_string();
+        }
+    }
+    supported
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "medium".to_string())
+}
+
+fn codex_model_catalog_item(
+    id: &str,
+    display_name: &str,
+    model: Option<&ModelConfig>,
+    priority: usize,
+) -> Value {
+    let supported_efforts = codex_model_reasoning_efforts(model);
+    let supported_levels = supported_efforts
+        .iter()
+        .map(|effort| {
+            json!({
+                "effort": effort,
+                "description": codex_reasoning_description(effort)
+            })
+        })
+        .collect::<Vec<_>>();
+    let default_reasoning_level = codex_model_default_reasoning_level(model, &supported_efforts);
+    let context_window = model
+        .and_then(|model| model.context_window)
+        .unwrap_or(128_000);
+    let supports_tools = model.map(|model| model.supports_tools).unwrap_or(true);
+    json!({
+        "additional_speed_tiers": [],
+        "availability_nux": Value::Null,
+        "base_instructions": CODEX_CHINESE_BASE_INSTRUCTIONS,
+        "context_window": context_window,
+        "default_reasoning_level": default_reasoning_level,
+        "default_reasoning_summary": "none",
+        "description": format!("Atoapi 模型 {id}，支持 Atoapi 路由、缓存和多会话隔离。"),
+        "display_name": display_name,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text"],
+        "max_context_window": context_window,
+        "model_messages": {"instructions_template": CODEX_CHINESE_BASE_INSTRUCTIONS},
+        "prefer_websockets": false,
+        "priority": priority,
+        "service_tiers": [],
+        "shell_type": "shell_command",
+        "slug": id,
+        "support_verbosity": false,
+        "supported_in_api": true,
+        "supported_reasoning_levels": supported_levels,
+        "supports_image_detail_original": false,
+        "supports_parallel_tool_calls": supports_tools,
+        "supports_reasoning_effort_updates": true,
+        "supports_reasoning_summaries": true,
+        "supports_search_tool": false,
+        "truncation_policy": {"limit": 10_000, "mode": "bytes"},
+        "upgrade": Value::Null,
+        "visibility": "list"
+    })
+}
+
+fn codex_model_catalog_value(context: &InjectionContext) -> Value {
+    let mut seen = HashSet::new();
+    let explicit_aliases = context
+        .codex_models
+        .iter()
+        .filter(|model| model.enabled)
+        .filter_map(model_request_alias)
+        .map(|alias| alias.to_ascii_lowercase())
+        .collect::<HashSet<_>>();
+    let mut models = Vec::new();
+    for model in context.codex_models.iter().filter(|model| model.enabled) {
+        if !explicit_aliases.contains(&model.id.to_ascii_lowercase())
+            && seen.insert(model.id.clone())
+        {
+            models.push(codex_model_catalog_item(
+                &model.id,
+                &model.display_name,
+                Some(model),
+                models.len() + 1,
+            ));
+        }
+        let mut aliases = Vec::new();
+        if let Some(alias) = model_request_alias(model) {
+            aliases.push(alias);
+        }
+        if let Some(alias) = codex_model_alias(&model.id) {
+            aliases.push(alias);
+        }
+        for alias in aliases {
+            if seen.insert(alias.clone()) {
+                models.push(codex_model_catalog_item(
+                    &alias,
+                    &crate::config::codex_model_display_name(&alias),
+                    Some(model),
+                    models.len() + 1,
+                ));
+            }
+        }
+    }
+    if seen.insert(context.default_model.clone()) {
+        let model = best_model_match(&context.codex_models, &context.default_model, true);
+        models.push(codex_model_catalog_item(
+            &context.default_model,
+            model
+                .map(|model| model.display_name.as_str())
+                .unwrap_or(&context.default_model),
+            model,
+            models.len() + 1,
+        ));
+    }
+    json!({"models": models})
+}
+
+fn write_codex_model_catalog(
+    target_path: &Path,
+    context: &InjectionContext,
+) -> Result<(PathBuf, bool)> {
+    let catalog_path = target_path
+        .parent()
+        .ok_or_else(|| anyhow!("Codex config target has no parent directory"))?
+        .join(CODEX_MODEL_CATALOG_ACTIVE_FILE);
+    let rendered = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&codex_model_catalog_value(context))?
+    );
+    let changed = fs::read_to_string(&catalog_path)
+        .map(|current| current != rendered)
+        .unwrap_or(true);
+    if changed {
+        write_text(&catalog_path, &rendered)?;
+    }
+    Ok((catalog_path, changed))
+}
+
 fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     if let Some(settings) = context.codex_context_settings.as_ref() {
         settings.validate()?;
@@ -1360,32 +1549,37 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
         configured_codex_catalog_path(&doc, path)
             .is_some_and(|catalog| catalog_manifest_owns(&state.catalog_manifest, path, &catalog))
     });
-    let restore_catalog_is_competing = restore_fragment.as_ref().is_some_and(|fragment| {
+    let current_catalog_is_competing = configured_codex_catalog_path(&doc, path)
+        .is_some_and(|catalog| is_competing_codex_catalog_path(&catalog));
+    let restore_catalog_is_user_owned = restore_fragment.as_ref().is_some_and(|fragment| {
         configured_codex_catalog_path(fragment, path)
-            .is_some_and(|catalog| is_competing_codex_catalog_path(&catalog))
+            .is_some_and(|catalog| !is_competing_codex_catalog_path(&catalog))
     });
     doc["model_provider"] = value(CODEX_PROVIDER_ID);
     // New Codex versions reject this retired root key. Storage behavior is
     // handled by the relay request path, not this ignored configuration flag.
     doc.as_table_mut().remove("disable_response_storage");
-    // model_catalog_json is an optional Codex-owned override. Do not replace
-    // it with an Atoapi snapshot, otherwise every new official model requires
-    // an Atoapi catalog update. Restore a value that was explicitly captured
-    // from the user. If an older injection has no ownership record, preserve
-    // the live value rather than guessing from its filename.
-    if let Some(fragment) = restore_fragment.as_ref() {
-        if current_catalog_is_owned
-            || (fragment.as_table().contains_key("model_catalog_json")
-                && !restore_catalog_is_competing)
-        {
-            restore_codex_root_fields(&mut doc, fragment, &["model_catalog_json"]);
-        }
-    }
-    if configured_codex_catalog_path(&doc, path)
-        .is_some_and(|catalog| is_competing_codex_catalog_path(&catalog))
+    // Atoapi must own the catalog when no user catalog exists, when CC Switch
+    // is competing, or when a previous Atoapi catalog is already active. The
+    // generated catalog carries complete reasoning capabilities and Chinese
+    // model instructions. A distinct user-owned catalog remains untouched.
+    let managed_catalog_changed = if restore_catalog_is_user_owned
+        && !current_catalog_is_owned
+        && !current_catalog_is_competing
     {
-        doc.as_table_mut().remove("model_catalog_json");
-    }
+        None
+    } else {
+        let (catalog_path, changed) = write_codex_model_catalog(path, context)?;
+        if let Some(state) = restore_state.as_mut() {
+            register_owned_codex_catalog(&mut state.catalog_manifest, path, &catalog_path)?;
+        }
+        let catalog_name = catalog_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("Atoapi Codex catalog has no valid file name"))?;
+        doc["model_catalog_json"] = value(catalog_name);
+        Some(changed)
+    };
     if let Some(limit) = context.auto_compact_token_limit.filter(|limit| *limit > 0) {
         doc["model_auto_compact_token_limit"] = value(i64::from(limit));
         // Count only the content that has accumulated after the compacted
@@ -1463,19 +1657,21 @@ fn write_codex_config(path: &Path, context: &InjectionContext) -> Result<bool> {
     }
 
     let rendered = doc.to_string();
-    if rendered == text {
-        return Ok(false);
-    }
-    if let Err(error) = write_text(path, &rendered) {
-        return Err(error);
+    let config_changed = rendered != text;
+    if config_changed {
+        write_text(path, &rendered)?;
     }
     if let Some(state) = restore_state.as_mut() {
+        let before_manifest = serde_json::to_string(&state.catalog_manifest)?;
         let keep = managed_codex_catalog_path(&doc, path, &state.catalog_manifest);
-        if cleanup_owned_codex_catalogs_except(path, &mut state.catalog_manifest, keep.as_deref()) {
+        let cleanup_changed =
+            cleanup_owned_codex_catalogs_except(path, &mut state.catalog_manifest, keep.as_deref());
+        let manifest_changed = before_manifest != serde_json::to_string(&state.catalog_manifest)?;
+        if cleanup_changed || manifest_changed {
             save_codex_restore_state(&restore_path, state)?;
         }
     }
-    Ok(true)
+    Ok(config_changed || managed_catalog_changed.unwrap_or(false))
 }
 
 /// Removes only Atoapi-owned Codex artifacts that are no longer referenced by
@@ -2361,7 +2557,12 @@ command = "npx"
         assert!(write_codex_config(&path, &context).unwrap());
         let first_document: toml::Value =
             toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(first_document.get("model_catalog_json").is_none());
+        assert_eq!(
+            first_document
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
         assert!(!write_codex_config(&path, &context).unwrap());
         let text = fs::read_to_string(&path).unwrap();
         let parsed: toml::Value = toml::from_str(&text).unwrap();
@@ -2385,14 +2586,19 @@ command = "npx"
             Some(128_000)
         );
         assert!(parsed.get("mcp_servers").is_some());
-        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
         let active_catalogs = fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .map(|entry| entry.path())
             .filter(|candidate| is_managed_codex_catalog_path(candidate))
             .collect::<Vec<_>>();
-        assert!(active_catalogs.is_empty());
+        assert_eq!(active_catalogs.len(), 1);
         fs::remove_dir_all(dir).ok();
     }
 
@@ -2474,7 +2680,35 @@ wire_api = "responses"
 
         write_codex_config(&path, &context).unwrap();
         let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
+        let catalog: Value = serde_json::from_str(
+            &fs::read_to_string(dir.join(CODEX_MODEL_CATALOG_ACTIVE_FILE)).unwrap(),
+        )
+        .unwrap();
+        let model = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["slug"].as_str() == Some("deepseek-v4.1-flash"))
+            .unwrap();
+        let efforts = model["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|level| level["effort"].as_str())
+            .collect::<Vec<_>>();
+        assert!(efforts.contains(&"xhigh"));
+        assert!(efforts.contains(&"max"));
+        assert!(efforts.contains(&"ultra"));
+        assert!(model["base_instructions"]
+            .as_str()
+            .unwrap()
+            .contains("中文"));
         assert_eq!(
             parsed
                 .get("model_providers")
@@ -2491,7 +2725,12 @@ wire_api = "responses"
         write_text(&path, competing_config).unwrap();
         write_codex_config(&path, &context).unwrap();
         let parsed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
         assert_eq!(
             parsed
                 .get("model_providers")
@@ -3324,7 +3563,12 @@ model_reasoning_effort = "max"
             Some("ultra")
         );
 
-        assert!(parsed.get("model_catalog_json").is_none());
+        assert_eq!(
+            parsed
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3686,7 +3930,12 @@ model_reasoning_effort = "max"
             Some(740_000)
         );
         assert!(first.get("disable_response_storage").is_none());
-        assert!(first.get("model_catalog_json").is_none());
+        assert_eq!(
+            first
+                .get("model_catalog_json")
+                .and_then(toml::Value::as_str),
+            Some(CODEX_MODEL_CATALOG_ACTIVE_FILE)
+        );
         assert_eq!(
             first["features"]["guardianv2"]["thread_context"].as_bool(),
             Some(true)
