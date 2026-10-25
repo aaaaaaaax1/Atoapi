@@ -1669,6 +1669,21 @@ fn codex_model_catalog_value(
             codex_model_catalog_item(id, display_name, model, priority),
         );
     }
+    // Apply the agent-wide override after discovery and mapping reconciliation,
+    // so every visible model agrees with config.toml. Rebuilding the native
+    // entries above also prevents retained catalogs from keeping an old limit
+    // after the override is cleared or the route changes.
+    if let Some(context_window) = context
+        .codex_context_settings
+        .as_ref()
+        .and_then(|settings| settings.model_context_window)
+        .filter(|window| *window > 0)
+    {
+        for model in &mut models {
+            model["context_window"] = json!(context_window);
+            model["max_context_window"] = json!(context_window);
+        }
+    }
     json!({"models": models})
 }
 
@@ -4161,9 +4176,57 @@ model_reasoning_effort = "max"
             ),
         )
         .unwrap();
+        let assert_catalog = |window: Option<u64>, mapped_window: Option<u64>| {
+            let catalog: Value = serde_json::from_str(
+                &fs::read_to_string(dir.join(CODEX_MODEL_CATALOG_ACTIVE_FILE)).unwrap(),
+            )
+            .unwrap();
+            let models = catalog["models"].as_array().unwrap();
+            assert_eq!(
+                models.len(),
+                crate::config::CODEX_NATIVE_VISIBLE_MODELS.len()
+            );
+            for (slug, _, _) in crate::config::CODEX_NATIVE_VISIBLE_MODELS {
+                let model = models
+                    .iter()
+                    .find(|model| model["slug"].as_str() == Some(slug))
+                    .unwrap();
+                let expected_window = window.unwrap_or_else(|| {
+                    if slug == "gpt-6.1-sol" {
+                        mapped_window.unwrap_or(128_000)
+                    } else {
+                        128_000
+                    }
+                });
+                assert_eq!(
+                    model["context_window"].as_u64(),
+                    Some(expected_window),
+                    "{slug}"
+                );
+                assert_eq!(
+                    model["max_context_window"].as_u64(),
+                    Some(expected_window),
+                    "{slug}"
+                );
+                let efforts = model["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|level| level["effort"].as_str())
+                    .collect::<Vec<_>>();
+                for effort in CODEX_DEFAULT_REASONING_EFFORTS {
+                    assert!(efforts.contains(&effort), "{slug}: {effort}");
+                }
+            }
+        };
         let mut context = test_context();
         context.default_model_is_explicit = false;
         context.auto_compact_token_limit = Some(111_000);
+        context.discovered_codex_models = Some(vec![json!({
+            "id": "gpt-6.1-sol",
+            "context_window": 128_000,
+            "max_context_window": 128_000,
+        })]);
         context.codex_context_settings = Some(CodexContextSettings {
             model_context_window: Some(872_000),
             model_auto_compact_token_limit: Some(740_000),
@@ -4173,6 +4236,7 @@ model_reasoning_effort = "max"
         let first: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(first["model"].as_str(), Some("official-next-model"));
         assert_eq!(first["model_context_window"].as_integer(), Some(872_000));
+        assert_catalog(Some(872_000), None);
         assert_eq!(
             first["model_auto_compact_token_limit"].as_integer(),
             Some(740_000)
@@ -4194,7 +4258,22 @@ model_reasoning_effort = "max"
         context.model_context_window = Some(128_000);
         context.auto_compact_token_limit = Some(90_000);
         context.local_key = "ato-other-route".to_string();
+        context.discovered_codex_models = None;
+        context.codex_models = vec![ModelConfig {
+            id: "deepseek-v4.1-flash".to_string(),
+            request_model_id: Some("gpt-6.1-sol".to_string()),
+            display_name: "DeepSeek V4.1 Flash".to_string(),
+            context_window: Some(256_000),
+            output_window: None,
+            reasoning_effort_override_enabled: false,
+            reasoning_effort: None,
+            supported_reasoning_efforts: Vec::new(),
+            supports_tools: true,
+            supports_streaming: true,
+            enabled: true,
+        }];
         write_codex_config(&path, &context).unwrap();
+        assert_catalog(Some(872_000), Some(256_000));
         let routed: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(routed["model_context_window"].as_integer(), Some(872_000));
         assert_eq!(
@@ -4202,7 +4281,12 @@ model_reasoning_effort = "max"
             Some(740_000)
         );
 
-        for (window, limit) in [(Some(872_000), None), (None, Some(740_000)), (None, None)] {
+        for (window, limit) in [
+            (Some(500_000), Some(400_000)),
+            (Some(872_000), None),
+            (None, Some(740_000)),
+            (None, None),
+        ] {
             context.codex_context_settings = Some(CodexContextSettings {
                 model_context_window: window,
                 model_auto_compact_token_limit: limit,
@@ -4224,8 +4308,24 @@ model_reasoning_effort = "max"
                     .and_then(toml::Value::as_str),
                 limit.map(|_| "body_after_prefix")
             );
+            assert_catalog(window.map(u64::from), Some(256_000));
             assert!(!write_codex_config(&path, &context).unwrap());
         }
+        // A route without a mapping must not inherit the last route's window
+        // or any global override from the persisted catalog during discovery failure.
+        context.codex_models.clear();
+        context.default_model_is_explicit = false;
+        context.codex_context_settings = Some(CodexContextSettings {
+            model_context_window: Some(500_000),
+            model_auto_compact_token_limit: Some(400_000),
+        });
+        assert!(write_codex_config(&path, &context).unwrap());
+        assert_catalog(Some(500_000), None);
+        assert!(!write_codex_config(&path, &context).unwrap());
+        context.codex_context_settings = Some(CodexContextSettings::default());
+        assert!(write_codex_config(&path, &context).unwrap());
+        assert_catalog(None, None);
+        assert!(!write_codex_config(&path, &context).unwrap());
         remove_codex_config_injection(&path).unwrap();
         let restored: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(restored["model_context_window"].as_integer(), Some(900_000));
