@@ -1438,7 +1438,7 @@ fn codex_model_catalog_item(
         "display_name": display_name,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        "input_modalities": ["text", "image"],
         "max_context_window": context_window,
         "model_messages": {"instructions_template": CODEX_CHINESE_BASE_INSTRUCTIONS},
         "prefer_websockets": false,
@@ -1565,7 +1565,7 @@ fn codex_discovered_catalog_item(item: &Value, priority: usize) -> Option<Value>
         "input_modalities": item
             .get("input_modalities")
             .cloned()
-            .unwrap_or_else(|| json!(["text"])),
+            .unwrap_or_else(|| json!(["text", "image"])),
         "max_context_window": item
             .get("max_context_window")
             .and_then(Value::as_u64)
@@ -4471,6 +4471,7 @@ model_reasoning_effort = "max"
             for effort in CODEX_DEFAULT_REASONING_EFFORTS {
                 assert!(efforts.contains(&effort));
             }
+            assert_eq!(model["input_modalities"], json!(["text", "image"]));
         }
     }
 

@@ -2128,7 +2128,7 @@ fn codex_model_catalog_items(items: &[Value]) -> Vec<Value> {
                 "display_name": display_name,
                 "effective_context_window_percent": 95,
                 "experimental_supported_tools": [],
-                "input_modalities": ["text"],
+                "input_modalities": ["text", "image"],
                 "max_context_window": context_window,
                 "model_messages": {"instructions_template": CODEX_CHINESE_BASE_INSTRUCTIONS},
                 "priority": index + 1,
@@ -11975,9 +11975,6 @@ fn select_codex_route(
                 provider_id: next_provider_id,
                 primary_model: primary_model.clone(),
             }));
-        }
-        if original_index(provider_id).is_some() {
-            return Err("agent_route_unavailable: 原上游之后没有可用备用上游".to_string());
         }
     }
 
@@ -22577,7 +22574,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_managed_session_fails_closed_instead_of_reusing_a_pin_opted_out_of_its_group() {
+    fn codex_managed_session_falls_back_when_its_pin_is_opted_out_of_the_group() {
         let mut config = AppConfig::default();
         let mut primary = test_responses_provider("https://primary.example/v1".to_string());
         primary.id = "primary".to_string();
@@ -22619,7 +22616,7 @@ mod tests {
             ..TrustedCodexRequestMetadata::default()
         };
 
-        let error = decide_route_with_runtime_model_for_session(
+        let decision = decide_route_with_runtime_model_for_session(
             &config,
             &json!({"model":"gpt-5.6-sol", "input":[]}),
             &Channel::Responses,
@@ -22627,9 +22624,9 @@ mod tests {
             None,
             Some(&metadata),
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("agent_route_unavailable"));
+        assert_eq!(decision.provider.id, "backup");
     }
 
     #[test]
@@ -32532,6 +32529,10 @@ mod tests {
         assert!(efforts.contains(&"xhigh"));
         assert!(efforts.contains(&"max"));
         assert!(efforts.contains(&"ultra"));
+        assert_eq!(
+            mapped.get("input_modalities"),
+            Some(&json!(["text", "image"]))
+        );
         assert_eq!(
             mapped
                 .get("default_reasoning_level")
